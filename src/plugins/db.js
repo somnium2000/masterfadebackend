@@ -1,11 +1,8 @@
+import fp from "fastify-plugin";
 import pool from "../config/db-connection.js";
 import { createClient } from "@supabase/supabase-js";
 
-export default async function dbPlugin(app) {
-  // NUEVO:
-  // PORQUE: Antes el plugin fallaba si NO existían SUPABASE_URL/SUPABASE_ANON_KEY.
-  // IMPACTO: Ahora la DB principal es PostgreSQL vía node-postgres (pg) y Supabase JS queda opcional.
-
+async function dbPlugin(app) {
   // Validación mínima para PostgreSQL (requerido)
   const required = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"];
   const missing = required.filter(
@@ -18,7 +15,7 @@ export default async function dbPlugin(app) {
     );
   }
 
-  // Decoramos el pool para usarlo como app.db
+  // Decoración GLOBAL (gracias a fastify-plugin)
   app.decorate("db", pool);
 
   // Cerramos el pool al apagar el servidor
@@ -26,7 +23,7 @@ export default async function dbPlugin(app) {
     pool.end().then(() => done()).catch(done);
   });
 
-  // Supabase client (OPCIONAL) — no tumba el arranque si no está configurado
+  // Supabase client (OPCIONAL)
   const supabaseUrl = process.env.SUPABASE_URL?.trim();
   const supabaseAnonKey = process.env.SUPABASE_ANON_KEY?.trim();
 
@@ -44,3 +41,6 @@ export default async function dbPlugin(app) {
     );
   }
 }
+
+// 👇 Esto hace que las decoraciones NO queden encapsuladas
+export default fp(dbPlugin, { name: "db-plugin" });
