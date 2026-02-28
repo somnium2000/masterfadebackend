@@ -2,30 +2,17 @@ file:///C:/Users/academico/Documents/Proyectos/master%20fade/APP%20WEB1/back-end
       throw new Error(
             ^
 
-Error: Error al conectar con la base de datos: Tenant or user not found. Si usas pooler, usa usuario postgres.<PROJECT_REF> (o <usuario>.<PROJECT_REF>) y puerto 6543. Si usas direct, usa host db.<PROJECT_REF>.supabase.co y puerto 5432.
+Error: Error al conectar con la base de datos: getaddrinfo ENOTFOUND db.pdzsmkjnyazpkoocjbpw.supabase.co. Si usas pooler, usa usuario postgres.<PROJECT_REF> (o <usuario>.<PROJECT_REF>) y puerto 6543. Si usas direct, usa host db.<PROJECT_REF>.supabase.co y puerto 5432.
     at dbPlugin (file:///C:/Users/academico/Documents/Proyectos/master%20fade/APP%20WEB1/back-end/src/plugins/db.js:22:13)
     at process.processTicksAndRejections (node:internal/process/task_queues:105:5) {
-  [cause]: error: Tenant or user not found
+  [cause]: Error: getaddrinfo ENOTFOUND db.pdzsmkjnyazpkoocjbpw.supabase.co
       at C:\Users\academico\Documents\Proyectos\master fade\APP WEB1\back-end\node_modules\pg-pool\index.js:45:11
       at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
       at async dbPlugin (file:///C:/Users/academico/Documents/Proyectos/master%20fade/APP%20WEB1/back-end/src/plugins/db.js:17:7) {
-    length: 52,
-    severity: 'FATAL',
-    code: 'XX000',
-    detail: undefined,
-    hint: undefined,
-    position: undefined,
-    internalPosition: undefined,
-    internalQuery: undefined,
-    where: undefined,
-    schema: undefined,
-    table: undefined,
-    column: undefined,
-    dataType: undefined,
-    constraint: undefined,
-    file: undefined,
-    line: undefined,
-    routine: undefined
+    errno: -3008,
+    code: 'ENOTFOUND',
+    syscall: 'getaddrinfo',
+    hostname: 'db.pdzsmkjnyazpkoocjbpw.supabase.co'
   }
 }
 
