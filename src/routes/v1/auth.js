@@ -143,7 +143,7 @@ const AUTH_ME_SQL = `
   empresa_scope AS (
     SELECT
       CASE
-        WHEN COUNT(DISTINCT s.id_empresa) = 1 THEN MIN(s.id_empresa)
+        WHEN COUNT(DISTINCT s.id_empresa) = 1 THEN MIN(s.id_empresa::text)::uuid
         ELSE NULL
       END AS empresa_id
     FROM public.roles_usuarios ru
@@ -156,14 +156,14 @@ const AUTH_ME_SQL = `
       AND s.estado IS TRUE
   ),
   empleado_scope AS (
-    SELECT MIN(e.id_empleado) AS empleado_id
+    SELECT MIN(e.id_empleado::text)::uuid AS empleado_id
     FROM base_user bu
     JOIN public.empleados e
       ON e.id_persona = bu.id_persona
     WHERE e.estado IS TRUE
   ),
   cliente_scope AS (
-    SELECT MIN(c.id_cliente) AS cliente_id
+    SELECT MIN(c.id_cliente::text)::uuid AS cliente_id
     FROM public.clientes c
     WHERE c.id_usuario = $1::uuid
       AND c.estado IS TRUE
@@ -299,7 +299,7 @@ export default async function authRoutes(app) {
         const row = rows?.[0];
 
         if (!row) {
-          return sendError(reply, 401, "No se pudo resolver la sesion autenticada", {
+          return sendError(reply, 401, "El usuario autenticado no esta vinculado a un usuario interno de Masterfade", {
             code: "AUTH_SESSION_NOT_FOUND",
           });
         }
