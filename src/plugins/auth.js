@@ -1,5 +1,6 @@
 import fp from "fastify-plugin";
 import jwt from "jsonwebtoken";
+import { getAuthClaims } from "../utils/authClaims.js";
 import { sendError } from "../utils/errors.js";
 
 const UUID_PATTERN =
@@ -15,6 +16,7 @@ function getBearerToken(headerValue) {
 
 export default fp(async function authPlugin(app) {
   app.decorateRequest("auth", null);
+  app.decorateRequest("claims", null);
 
   app.decorate("authenticate", async function authenticate(request, reply) {
     const token = getBearerToken(request.headers.authorization);
@@ -57,5 +59,47 @@ export default fp(async function authPlugin(app) {
         code: "AUTH_TOKEN_INVALID",
       });
     }
+  });
+
+  app.decorate("requireRoles", function requireRoles(allowedRoles = []) {
+    const normalizedAllowedRoles = Array.isArray(allowedRoles) ? allowedRoles.filter(Boolean) : [];
+
+    return async function roleGuard(request, reply) {
+      await app.authenticate(request, reply);
+
+      if (reply.sent) {
+        return;
+      }
+
+      try {
+        const claims = await getAuthClaims(app, request.auth?.sub);
+
+        if (!claims) {
+          return sendError(reply, 401, "El usuario autenticado no esta vinculado a un usuario interno de Masterfade", {
+            code: "AUTH_SESSION_NOT_FOUND",
+          });
+        }
+
+        request.claims = claims;
+
+        if (normalizedAllowedRoles.length === 0) {
+          return;
+        }
+
+        const hasRole = normalizedAllowedRoles.some((role) => claims.roles.includes(role));
+
+        if (!hasRole) {
+          return sendError(reply, 403, "No tienes permisos para acceder a este recurso", {
+            code: "AUTH_FORBIDDEN",
+          });
+        }
+      } catch (error) {
+        request.log.error({ err: error }, "Role guard failed");
+        return sendError(reply, 500, "No se pudo validar el contexto del usuario autenticado", {
+          code: "AUTH_CLAIMS_ERROR",
+          details: error instanceof Error ? error.message : "Unknown auth claims error",
+        });
+      }
+    };
   });
 });
