@@ -174,7 +174,7 @@ const LIST_SERVICES_SQL = `
         ORDER BY st.activo DESC, st.vigente_hasta IS NULL DESC, st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
       ) AS rn
     FROM public.servicios_tarifas st
-    WHERE st.id_sucursal = $1::uuid
+    WHERE ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
       AND st.id_empleado IS NULL
       AND st.deleted_at IS NULL
   )
@@ -205,7 +205,7 @@ const GET_SERVICE_SQL = `
         ORDER BY st.activo DESC, st.vigente_hasta IS NULL DESC, st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
       ) AS rn
     FROM public.servicios_tarifas st
-    WHERE st.id_sucursal = $2::uuid
+    WHERE ($2::uuid IS NULL OR st.id_sucursal = $2::uuid)
       AND st.id_empleado IS NULL
       AND st.deleted_at IS NULL
   )
@@ -379,15 +379,15 @@ function mapAdminPackageRow(row) {
     activo: Boolean(row.activo),
     items: Array.isArray(row.items)
       ? row.items.map((item) => ({
-          id_servicio: item.id_servicio,
-          nombre_servicio: item.nombre_servicio,
-          cantidad: Number(item.cantidad ?? 1),
-        }))
+        id_servicio: item.id_servicio,
+        nombre_servicio: item.nombre_servicio,
+        cantidad: Number(item.cantidad ?? 1),
+      }))
       : [],
   };
 }
 
-async function resolveBranchId(client, claims, requestedBranchId) {
+async function resolveBranchId(client, claims, requestedBranchId, allowAllForSuperAdmin = false) {
   const claimBranchIds = Array.isArray(claims?.branch_ids) ? claims.branch_ids.filter(Boolean) : [];
   const isSuperAdmin = Array.isArray(claims?.roles) && claims.roles.includes("super_admin");
 
@@ -428,6 +428,10 @@ async function resolveBranchId(client, claims, requestedBranchId) {
     throw new AppError(400, "Debes indicar id_sucursal cuando tu acceso cubre multiples sucursales", {
       code: "CATALOG_BRANCH_REQUIRED",
     });
+  }
+
+  if (allowAllForSuperAdmin) {
+    return null;
   }
 
   const { rows } = await client.query(ACTIVE_BRANCHES_SQL);
@@ -616,7 +620,7 @@ export default async function adminCatalogRoutes(app) {
               data: {
                 type: "object",
                 properties: {
-                  id_sucursal: { type: "string", format: "uuid" },
+                  id_sucursal: { type: ["string", "null"], format: "uuid" },
                   servicios: { type: "array", items: serviceResponseSchema },
                 },
                 required: ["id_sucursal", "servicios"],
@@ -638,7 +642,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
+        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_SERVICES_SQL, [branchId]);
 
         return sendOk(reply, {
@@ -744,7 +748,7 @@ export default async function adminCatalogRoutes(app) {
           requestId: request.id,
         });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
           reply,
           request,
@@ -853,7 +857,7 @@ export default async function adminCatalogRoutes(app) {
 
         return sendOk(reply, mapAdminServiceRow(finalResult.rows[0]), { requestId: request.id });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
           reply,
           request,
@@ -971,7 +975,7 @@ export default async function adminCatalogRoutes(app) {
           inactivated: true,
         });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
           reply,
           request,
@@ -1097,7 +1101,7 @@ export default async function adminCatalogRoutes(app) {
           requestId: request.id,
         });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
           reply,
           request,
@@ -1204,7 +1208,7 @@ export default async function adminCatalogRoutes(app) {
 
         return sendOk(reply, mapAdminPackageRow(finalResult.rows[0]), { requestId: request.id });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
           reply,
           request,

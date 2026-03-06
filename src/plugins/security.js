@@ -6,8 +6,9 @@ import cookie from "@fastify/cookie";
 import formbody from "@fastify/formbody";
 
 async function securityPlugin(app) {
-  // Permite 1 origen (CORS_ORIGIN) o varios (CORS_ORIGINS separados por coma)
+  // Lee CORS_ORIGENES (nombre canónico del proyecto) con fallback a CORS_ORIGINS y default local
   const rawOrigins =
+    process.env.CORS_ORIGENES ||
     process.env.CORS_ORIGINS ||
     process.env.CORS_ORIGIN ||
     "http://localhost:5173";
@@ -28,7 +29,13 @@ async function securityPlugin(app) {
       // Bloquear lo demás
       return cb(null, false);
     },
-    credentials: true
+    // Declarar TODOS los métodos que la API utiliza para que el preflight (OPTIONS) los autorice
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
+    exposedHeaders: ["X-Request-Id", "Retry-After"],
+    credentials: true,
+    // Permitir el preflight cacheado por 1 hora en el browser
+    maxAge: 3600,
   });
 
   await app.register(helmet);
@@ -44,3 +51,4 @@ async function securityPlugin(app) {
 
 // ✅ Esto hace el plugin GLOBAL (sin encapsulación)
 export default fp(securityPlugin, { name: "security-plugin" });
+

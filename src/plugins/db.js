@@ -21,7 +21,7 @@ async function dbPlugin(app) {
         error instanceof Error ? error.message : "Error desconocido";
       throw new Error(
         `Error al conectar con la base de datos: ${baseMessage}. ${getSupabaseDbConnectionHints()}`,
-        { cause: error instanceof Error ? error : undefined }
+        { cause: error }
       );
     }
   }
