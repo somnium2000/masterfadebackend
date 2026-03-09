@@ -21,6 +21,8 @@ export const AUTH_CLAIMS_SQL = `
     WHERE u.id_usuario = $1::uuid
       AND u.deleted_at IS NULL
       AND u.estado IS TRUE
+      AND u.estado_acceso <> 'bloqueado'
+      AND u.estado_acceso <> 'inactivo'
   ),
   role_scope AS (
     SELECT
