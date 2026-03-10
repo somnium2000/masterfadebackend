@@ -1,4 +1,3 @@
-import { deriveServiceCatalogGroup, isBarberBookable } from "../../../utils/catalogMetadata.js";
 import { sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
@@ -31,8 +30,10 @@ const servicioSchema = {
     nombre_servicio: { type: "string" },
     descripcion: { type: ["string", "null"] },
     duracion_min: { type: "integer" },
+    buffer_min: { type: "integer" },
     precio_hnl: { type: "number" },
     grupo_catalogo: { type: "string", enum: ["barberia", "otros"] },
+    agendable: { type: "boolean" },
     agendable_barbero: { type: "boolean" },
   },
   required: [
@@ -40,8 +41,10 @@ const servicioSchema = {
     "nombre_servicio",
     "descripcion",
     "duracion_min",
+    "buffer_min",
     "precio_hnl",
     "grupo_catalogo",
+    "agendable",
     "agendable_barbero",
   ],
   additionalProperties: false,
@@ -113,13 +116,17 @@ const PUBLIC_SERVICES_SQL = `
     s.nombre_servicio,
     s.descripcion,
     s.duracion_min,
+    s.buffer_min,
+    s.grupo_catalogo,
+    s.agendable,
     sp.precio_hnl
   FROM public.servicios s
   JOIN service_prices sp
     ON sp.id_servicio = s.id_servicio
   WHERE s.deleted_at IS NULL
     AND s.activo IS TRUE
-  ORDER BY s.nombre_servicio ASC
+    AND s.visible_publico IS TRUE
+  ORDER BY s.orden_visual ASC, s.nombre_servicio ASC
 `;
 
 const PUBLIC_PACKAGES_SQL = `
@@ -153,16 +160,20 @@ const PUBLIC_PACKAGES_SQL = `
 `;
 
 function mapServiceRow(row) {
-  const grupoCatalogo = deriveServiceCatalogGroup(row.nombre_servicio);
+  const grupoCatalogo = String(row.grupo_catalogo || "barberia").trim().toLowerCase() === "otros" ? "otros" : "barberia";
+  const agendable = Boolean(row.agendable ?? (grupoCatalogo === "barberia"));
 
   return {
     id_servicio: row.id_servicio,
     nombre_servicio: row.nombre_servicio,
     descripcion: row.descripcion ?? null,
     duracion_min: Number(row.duracion_min),
+    buffer_min: Number(row.buffer_min ?? 0),
     precio_hnl: Number(row.precio_hnl ?? 0),
     grupo_catalogo: grupoCatalogo,
-    agendable_barbero: isBarberBookable(row.nombre_servicio),
+    agendable,
+    // AM: Campo legado conservado temporalmente para frontend ya integrado.
+    agendable_barbero: agendable,
   };
 }
 
