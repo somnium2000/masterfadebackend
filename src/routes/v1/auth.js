@@ -2,17 +2,24 @@ import jwt from "jsonwebtoken";
 import { getAuthClaims } from "../../utils/authClaims.js";
 import { sendOk } from "../../utils/response.js";
 import { sendError } from "../../utils/errors.js";
+import { generateRecoveryActionLink } from "../../services/authRecovery.js";
 
 const loginBodySchema = {
   type: "object",
   properties: {
+    identifier: { type: "string", minLength: 1 },
     nombre_usuario: { type: "string", minLength: 1 },
     username: { type: "string", minLength: 1 },
     email: { type: "string", minLength: 1 },
     contrasena: { type: "string", minLength: 1 },
     password: { type: "string", minLength: 1 },
   },
-  anyOf: [{ required: ["nombre_usuario"] }, { required: ["username"] }, { required: ["email"] }],
+  anyOf: [
+    { required: ["identifier"] },
+    { required: ["email"] },
+    { required: ["nombre_usuario"] },
+    { required: ["username"] },
+  ],
 };
 
 const requestIdSchema = { type: "string" };
@@ -100,6 +107,12 @@ const RESET_MAX_ATTEMPTS = Number(process.env.RESET_MAX_ATTEMPTS || 3);
 const RESET_WINDOW_MS = Number(process.env.RESET_WINDOW_MS || 15 * 60_000);
 const RESET_BLOCK_MS = Number(process.env.RESET_BLOCK_MS || 30 * 60_000);
 const resetAttemptsByEmail = new Map();
+const ACCESS_STATUS = {
+  PENDING_PASSWORD: "pendiente_password",
+  ACTIVE: "activo",
+  BLOCKED: "bloqueado",
+  INACTIVE: "inactivo",
+};
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -174,6 +187,48 @@ function signAppToken(payload, jwtSecret) {
     issuer: process.env.APP_JWT_ISSUER || "masterfade-api",
     audience: process.env.APP_JWT_AUDIENCE || "masterfade-app",
   });
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
+}
+
+async function syncAccessStateAfterLogin(app, userId) {
+  const stateResult = await app.db.query(
+    `
+      SELECT estado_acceso, credenciales_completadas_at
+      FROM public.usuarios
+      WHERE id_usuario = $1::uuid
+        AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [userId]
+  );
+
+  if (!stateResult.rowCount) {
+    return { ok: false, code: "AUTH_USER_NOT_ONBOARDED" };
+  }
+
+  const currentState = stateResult.rows[0].estado_acceso;
+  if (currentState === ACCESS_STATUS.BLOCKED || currentState === ACCESS_STATUS.INACTIVE) {
+    return { ok: false, code: "AUTH_ACCESS_BLOCKED", estado_acceso: currentState };
+  }
+
+  // AM: Login exitoso actualiza trazabilidad y promueve pendiente_password -> activo.
+  const updateResult = await app.db.query(
+    `
+      UPDATE public.usuarios
+      SET estado_acceso = CASE WHEN estado_acceso = $2 THEN $3 ELSE estado_acceso END,
+          credenciales_completadas_at = COALESCE(credenciales_completadas_at, NOW()),
+          ultimo_login_at = NOW(),
+          updated_at = NOW()
+      WHERE id_usuario = $1::uuid
+      RETURNING estado_acceso, credenciales_completadas_at, ultimo_login_at
+    `,
+    [userId, ACCESS_STATUS.PENDING_PASSWORD, ACCESS_STATUS.ACTIVE]
+  );
+
+  return { ok: true, state: updateResult.rows[0] };
 }
 
 export default async function authRoutes(app) {
@@ -252,28 +307,37 @@ export default async function authRoutes(app) {
       });
     }
 
-    if (!app.supabase) {
-      return sendError(reply, 500, "Supabase Auth no esta configurado en el backend", {
-        code: "SUPABASE_NOT_CONFIGURED",
+    if (!app.supabaseAdmin) {
+      return sendError(reply, 500, "Supabase Admin no esta configurado en el backend", {
+        code: "SUPABASE_ADMIN_NOT_CONFIGURED",
       });
     }
 
-    const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:5173").trim();
-    const redirectTo = `${frontendUrl}/login`;
-    const { error } = await app.supabase.auth.resetPasswordForEmail(email, { redirectTo });
+    if (!app.mailer?.configured) {
+      return sendError(reply, 500, "Servicio SMTP no configurado en backend", {
+        code: "MAILER_NOT_CONFIGURED",
+      });
+    }
 
-    if (error) {
-      const message = error.message || "Unknown reset password error";
-
-      if (message.toLowerCase().includes("rate limit")) {
-        return sendError(reply, 429, "Rate limit del proveedor de correo alcanzado. Intenta mas tarde.", {
-          code: "SUPABASE_EMAIL_RATE_LIMIT",
+    try {
+      // AM: Flujo Opcion 2: generar recovery link con Supabase Admin y enviar correo desde backend SMTP.
+      const recovery = await generateRecoveryActionLink(app, email);
+      if (recovery.found) {
+        const delivery = await app.mailer.sendPasswordRecoveryEmail({
+          to: email,
+          actionLink: recovery.action_link,
+          kind: "reset",
         });
-      }
 
+        if (!delivery.sent) {
+          request.log.error({ email, delivery }, "No se pudo enviar recovery email por SMTP");
+        }
+      }
+    } catch (error) {
+      request.log.error({ err: error, email }, "No se pudo procesar forgot-password");
       return sendError(reply, 500, "No se pudo iniciar la recuperacion de contrasena", {
         code: "AUTH_RESET_ERROR",
-        details: message,
+        details: error instanceof Error ? error.message : "Unknown forgot-password error",
       });
     }
 
@@ -293,18 +357,21 @@ export default async function authRoutes(app) {
     },
     async (request, reply) => {
       const body = request.body || {};
-      const nombreUsuario = String(body.nombre_usuario ?? body.username ?? body.email ?? "").trim();
+      // AM: Alias de compatibilidad temporal, pero la credencial oficial de Fase 1 es correo.
+      const identifier = normalizeEmail(
+        body.identifier ?? body.email ?? body.nombre_usuario ?? body.username ?? ""
+      );
       const contrasena = String(body.contrasena ?? body.password ?? "").trim();
 
-      if (!nombreUsuario || !contrasena) {
-        return sendError(reply, 400, "Faltan credenciales: se requiere usuario y contrasena", {
+      if (!identifier || !contrasena) {
+        return sendError(reply, 400, "Faltan credenciales: se requiere correo y contrasena", {
           code: "AUTH_MISSING_CREDENTIALS",
         });
       }
 
-      if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
+      if (!isValidEmail(identifier)) {
+        return sendError(reply, 400, "El login de esta etapa requiere un correo valido", {
+          code: "AUTH_IDENTIFIER_EMAIL_REQUIRED",
         });
       }
 
@@ -316,67 +383,69 @@ export default async function authRoutes(app) {
       }
 
       try {
-        const isEmail = nombreUsuario.includes("@");
-
-        if (isEmail) {
-          if (!app.supabase) {
-            return sendError(reply, 500, "Supabase Auth no esta configurado en el backend", {
-              code: "SUPABASE_NOT_CONFIGURED",
-              details: "Configura SUPABASE_URL y SUPABASE_ANON_KEY en el entorno del backend.",
-            });
-          }
-
-          const { data, error } = await app.supabase.auth.signInWithPassword({
-            email: nombreUsuario,
-            password: contrasena,
-          });
-
-          if (error || !data?.user) {
-            return sendError(reply, 401, error?.message || "Credenciales invalidas", {
-              code: "AUTH_INVALID_CREDENTIALS",
-            });
-          }
-
-          const supabaseUser = data.user;
-          const token = signAppToken(
-            {
-              sub: String(supabaseUser.id),
-              email: supabaseUser.email,
-              token_type: "app",
-              "mf:roles": [],
-            },
-            jwtSecret
-          );
-
-          return sendOk(reply, {
-            token,
-            user: {
-              id_usuario: supabaseUser.id,
-              email: supabaseUser.email,
-            },
+        if (!app.db) {
+          return sendError(reply, 500, "Base de datos no configurada", {
+            code: "DB_NOT_CONFIGURED",
           });
         }
 
-        const { rows } = await app.db.query("SELECT public.fn_login_usuario($1, $2) AS result", [
-          nombreUsuario,
-          contrasena,
-        ]);
+        if (!app.supabase) {
+          return sendError(reply, 500, "Supabase Auth no esta configurado en el backend", {
+            code: "SUPABASE_NOT_CONFIGURED",
+            details: "Configura SUPABASE_URL y SUPABASE_ANON_KEY en el entorno del backend.",
+          });
+        }
 
-        const result = rows?.[0]?.result;
+        const { data, error } = await app.supabase.auth.signInWithPassword({
+          email: identifier,
+          password: contrasena,
+        });
 
-        if (!result || result.ok !== true) {
-          return sendError(reply, 401, result?.message || "Credenciales invalidas", {
+        if (error || !data?.user?.id) {
+          return sendError(reply, 401, error?.message || "Credenciales invalidas", {
             code: "AUTH_INVALID_CREDENTIALS",
           });
         }
 
-        const user = result.user;
+        // AM: Validacion de autorizacion interna: no emitimos APP JWT si no existe usuario activo en public.usuarios.
+        const claims = await getAuthClaims(app, data.user.id);
+        if (!claims) {
+          return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
+            code: "AUTH_USER_NOT_ONBOARDED",
+          });
+        }
+
+        const accessSync = await syncAccessStateAfterLogin(app, claims.user.id_usuario);
+        if (!accessSync.ok) {
+          if (accessSync.code === "AUTH_ACCESS_BLOCKED") {
+            return sendError(reply, 403, "Tu acceso esta bloqueado o inactivo. Contacta al administrador.", {
+              code: "AUTH_ACCESS_BLOCKED",
+              details: { estado_acceso: accessSync.estado_acceso },
+            });
+          }
+          return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
+            code: "AUTH_USER_NOT_ONBOARDED",
+          });
+        }
+
+        const user = {
+          ...claims.user,
+          roles: claims.roles,
+          branch_ids: claims.branch_ids,
+          empresa_id: claims.empresa_id,
+          empleado_id: claims.empleado_id,
+          cliente_id: claims.cliente_id,
+          estado_acceso: accessSync.state?.estado_acceso ?? null,
+          credenciales_completadas_at: accessSync.state?.credenciales_completadas_at ?? null,
+          ultimo_login_at: accessSync.state?.ultimo_login_at ?? null,
+        };
+
         const token = signAppToken(
           {
-            sub: String(user.id_usuario),
-            nombre_usuario: user.nombre_usuario,
-            "mf:roles": user.roles || [],
-            "mf:branch_ids": user.branch_ids || [],
+            sub: String(claims.user.id_usuario),
+            email: user.email ?? data.user.email ?? null,
+            "mf:roles": claims.roles || [],
+            "mf:branch_ids": claims.branch_ids || [],
             token_type: "app",
           },
           jwtSecret
@@ -389,9 +458,7 @@ export default async function authRoutes(app) {
 
         return sendError(reply, 500, "Error al procesar login", {
           code: "AUTH_LOGIN_ERROR",
-          details: message.includes("fn_login_usuario")
-            ? "La funcion public.fn_login_usuario no existe."
-            : message,
+          details: message,
         });
       }
     }
