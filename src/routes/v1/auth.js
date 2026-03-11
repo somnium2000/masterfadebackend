@@ -22,6 +22,29 @@ const loginBodySchema = {
   ],
 };
 
+const registerBodySchema = {
+  type: "object",
+  properties: {
+    nombres: { type: "string", minLength: 1, maxLength: 120 },
+    apellidos: { type: "string", minLength: 1, maxLength: 120 },
+    email: { type: "string", minLength: 5, maxLength: 160 },
+    contrasena: { type: "string", minLength: 8, maxLength: 120 },
+    confirmar_contrasena: { type: "string", minLength: 8, maxLength: 120 },
+    acepta_terminos: { type: "boolean" },
+    consentimiento_marketing: { type: "boolean" },
+    id_sucursal_origen: { type: ["string", "null"], format: "uuid" },
+  },
+  required: [
+    "nombres",
+    "apellidos",
+    "email",
+    "contrasena",
+    "confirmar_contrasena",
+    "acepta_terminos",
+  ],
+  additionalProperties: false,
+};
+
 const requestIdSchema = { type: "string" };
 
 const errorResponseSchema = {
@@ -63,6 +86,76 @@ const loginResponseSchema = {
     required: ["ok", "data"],
     additionalProperties: true,
   },
+};
+
+const registerResponseSchema = {
+  201: {
+    type: "object",
+    properties: {
+      ok: { type: "boolean" },
+      data: {
+        type: "object",
+        properties: {
+          user: {
+            type: "object",
+            properties: {
+              id_usuario: { type: "string", format: "uuid" },
+              id_persona: { type: "string", format: "uuid" },
+              id_cliente: { type: "string", format: "uuid" },
+              email: { type: "string" },
+              nombres: { type: "string" },
+              apellidos: { type: "string" },
+              estado_acceso: { type: "string" },
+            },
+            required: [
+              "id_usuario",
+              "id_persona",
+              "id_cliente",
+              "email",
+              "nombres",
+              "apellidos",
+              "estado_acceso",
+            ],
+            additionalProperties: false,
+          },
+          cliente: {
+            type: "object",
+            properties: {
+              id_cliente: { type: "string", format: "uuid" },
+              id_sucursal_origen: { type: "string", format: "uuid" },
+              estado: { type: "boolean" },
+            },
+            required: ["id_cliente", "id_sucursal_origen", "estado"],
+            additionalProperties: false,
+          },
+          consentimientos: {
+            type: "object",
+            properties: {
+              acepta_terminos: { type: "boolean" },
+              acepta_terminos_at: { type: ["string", "null"] },
+              consentimiento_marketing: { type: "boolean" },
+              consentimiento_marketing_at: { type: ["string", "null"] },
+            },
+            required: [
+              "acepta_terminos",
+              "acepta_terminos_at",
+              "consentimiento_marketing",
+              "consentimiento_marketing_at",
+            ],
+            additionalProperties: false,
+          },
+        },
+        required: ["user", "cliente", "consentimientos"],
+        additionalProperties: false,
+      },
+      requestId: requestIdSchema,
+    },
+    required: ["ok", "data"],
+    additionalProperties: true,
+  },
+  400: errorResponseSchema,
+  409: errorResponseSchema,
+  500: errorResponseSchema,
 };
 
 const meResponseSchema = {
@@ -113,9 +206,235 @@ const ACCESS_STATUS = {
   BLOCKED: "bloqueado",
   INACTIVE: "inactivo",
 };
+const PASSWORD_COMPLEXITY_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$/;
+let clientsConsentColumnsCache = null;
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
+}
+
+function normalizeRequiredText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeOptionalUuid(value) {
+  const raw = String(value || "").trim();
+  return raw || null;
+}
+
+function isSupabaseDuplicateError(error) {
+  const code = String(error?.code || "").toLowerCase();
+  const message = String(error?.message || "").toLowerCase();
+  return code === "email_exists" || code === "user_already_exists" || message.includes("already registered");
+}
+
+function validatePublicPassword(password) {
+  if (password.length < 8) return "La contrasena debe tener al menos 8 caracteres.";
+  if (!PASSWORD_COMPLEXITY_REGEX.test(password)) {
+    return "La contrasena debe incluir mayuscula, minuscula y numero.";
+  }
+  return null;
+}
+
+async function resolveRegisterBranchId(client, requestedBranchId) {
+  const normalizedBranchId = normalizeOptionalUuid(requestedBranchId);
+
+  if (normalizedBranchId) {
+    const scoped = await client.query(
+      `
+        SELECT id_sucursal
+        FROM public.sucursales
+        WHERE id_sucursal = $1::uuid
+          AND deleted_at IS NULL
+          AND estado IS TRUE
+        LIMIT 1
+      `,
+      [normalizedBranchId]
+    );
+    if (!scoped.rowCount) {
+      throw {
+        statusCode: 400,
+        message: "La sucursal seleccionada no existe o no esta activa.",
+        code: "AUTH_REGISTER_BRANCH_INVALID",
+      };
+    }
+    return normalizedBranchId;
+  }
+
+  const fallback = await client.query(
+    `
+      SELECT id_sucursal
+      FROM public.sucursales
+      WHERE deleted_at IS NULL
+        AND estado IS TRUE
+      ORDER BY nombre_sucursal ASC, id_sucursal ASC
+      LIMIT 1
+    `
+  );
+  if (!fallback.rowCount) {
+    throw {
+      statusCode: 409,
+      message: "No hay sucursales activas para registrar clientes en este momento.",
+      code: "AUTH_REGISTER_BRANCH_REQUIRED",
+    };
+  }
+  return fallback.rows[0].id_sucursal;
+}
+
+async function ensureRegisterEmailAvailability(client, email) {
+  const correoResult = await client.query(
+    `
+      SELECT 1
+      FROM public.correos
+      WHERE LOWER(direccion_correo::text) = LOWER($1)
+      LIMIT 1
+    `,
+    [email]
+  );
+  if (correoResult.rowCount) {
+    throw {
+      statusCode: 409,
+      message: "El correo ya esta registrado.",
+      code: "AUTH_REGISTER_EMAIL_EXISTS",
+    };
+  }
+
+  const authResult = await client.query(
+    `
+      SELECT 1
+      FROM auth.users
+      WHERE LOWER(email::text) = LOWER($1)
+      LIMIT 1
+    `,
+    [email]
+  );
+  if (authResult.rowCount) {
+    throw {
+      statusCode: 409,
+      message: "El correo ya esta registrado.",
+      code: "AUTH_REGISTER_EMAIL_EXISTS",
+    };
+  }
+}
+
+async function getClienteRoleId(client) {
+  const roleResult = await client.query(
+    `
+      SELECT id_rol
+      FROM public.roles
+      WHERE nombre = 'cliente'
+      LIMIT 1
+    `
+  );
+  if (!roleResult.rowCount) {
+    throw {
+      statusCode: 500,
+      message: "No existe el rol cliente en la configuracion interna.",
+      code: "AUTH_REGISTER_CLIENT_ROLE_MISSING",
+    };
+  }
+  return roleResult.rows[0].id_rol;
+}
+
+async function hasClientsConsentTimestampColumns(client) {
+  if (clientsConsentColumnsCache !== null) {
+    return clientsConsentColumnsCache;
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'clientes'
+        AND column_name IN ('acepta_terminos_at', 'consentimiento_marketing_at')
+    `
+  );
+
+  const columns = new Set(rows.map((row) => String(row.column_name)));
+  clientsConsentColumnsCache =
+    columns.has("acepta_terminos_at") && columns.has("consentimiento_marketing_at");
+  return clientsConsentColumnsCache;
+}
+
+async function insertClientWithConsents(client, params) {
+  const {
+    idPersona,
+    authUserId,
+    branchId,
+    consentimientoMarketing,
+    aceptaTerminos,
+    aceptaTerminosAt,
+    consentimientoMarketingAt,
+  } = params;
+
+  const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
+  if (hasConsentTimestampColumns) {
+    const insertWithTimestamps = await client.query(
+      `
+        INSERT INTO public.clientes (
+          id_persona,
+          id_usuario,
+          fecha_ingreso,
+          id_sucursal_origen,
+          estado,
+          consentimiento_marketing,
+          acepta_terminos,
+          consentimiento_marketing_at,
+          acepta_terminos_at
+        )
+        VALUES (
+          $1::uuid,
+          $2::uuid,
+          CURRENT_DATE,
+          $3::uuid,
+          TRUE,
+          $4::boolean,
+          $5::boolean,
+          $6::timestamptz,
+          $7::timestamptz
+        )
+        RETURNING id_cliente
+      `,
+      [
+        idPersona,
+        authUserId,
+        branchId,
+        consentimientoMarketing,
+        aceptaTerminos,
+        consentimientoMarketingAt,
+        aceptaTerminosAt,
+      ]
+    );
+    return insertWithTimestamps.rows[0].id_cliente;
+  }
+
+  // AM: Compatibilidad temporal por si aun no aplican la migracion de trazabilidad de consentimientos.
+  const insertLegacy = await client.query(
+    `
+      INSERT INTO public.clientes (
+        id_persona,
+        id_usuario,
+        fecha_ingreso,
+        id_sucursal_origen,
+        estado,
+        consentimiento_marketing,
+        acepta_terminos
+      )
+      VALUES (
+        $1::uuid,
+        $2::uuid,
+        CURRENT_DATE,
+        $3::uuid,
+        TRUE,
+        $4::boolean,
+        $5::boolean
+      )
+      RETURNING id_cliente
+    `,
+    [idPersona, authUserId, branchId, consentimientoMarketing, aceptaTerminos]
+  );
+  return insertLegacy.rows[0].id_cliente;
 }
 
 function registerResetAttempt(emailKey) {
@@ -280,6 +599,224 @@ export default async function authRoutes(app) {
           code: "AUTH_ME_ERROR",
           details: error instanceof Error ? error.message : "Unknown auth/me error",
         });
+      }
+    }
+  );
+
+  app.post(
+    "/register",
+    {
+      schema: {
+        body: registerBodySchema,
+        response: registerResponseSchema,
+      },
+    },
+    async (request, reply) => {
+      const body = request.body || {};
+      const nombres = normalizeRequiredText(body.nombres);
+      const apellidos = normalizeRequiredText(body.apellidos);
+      const email = normalizeEmail(body.email);
+      const contrasena = String(body.contrasena || "");
+      const confirmarContrasena = String(body.confirmar_contrasena || "");
+      const consentimientoMarketing = Boolean(body.consentimiento_marketing);
+      const aceptaTerminos = body.acepta_terminos === true;
+      const requestedBranchId = normalizeOptionalUuid(body.id_sucursal_origen);
+      const aceptaTerminosAt = new Date().toISOString();
+      const consentimientoMarketingAt = consentimientoMarketing ? aceptaTerminosAt : null;
+
+      if (!nombres || !apellidos) {
+        return sendError(reply, 400, "Nombre y apellido son obligatorios.", {
+          code: "AUTH_REGISTER_REQUIRED_NAME",
+        });
+      }
+      if (!email || !isValidEmail(email)) {
+        return sendError(reply, 400, "Debes ingresar un correo valido.", {
+          code: "AUTH_REGISTER_INVALID_EMAIL",
+        });
+      }
+      const passwordValidationError = validatePublicPassword(contrasena);
+      if (passwordValidationError) {
+        return sendError(reply, 400, passwordValidationError, {
+          code: "AUTH_REGISTER_WEAK_PASSWORD",
+        });
+      }
+      if (contrasena !== confirmarContrasena) {
+        return sendError(reply, 400, "La confirmacion de contrasena no coincide.", {
+          code: "AUTH_REGISTER_PASSWORD_MISMATCH",
+        });
+      }
+      if (!aceptaTerminos) {
+        return sendError(reply, 400, "Debes aceptar terminos y condiciones para crear la cuenta.", {
+          code: "AUTH_REGISTER_TERMS_REQUIRED",
+        });
+      }
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+      if (!app.supabaseAdmin) {
+        return sendError(reply, 500, "Supabase Admin no esta configurado en el backend", {
+          code: "SUPABASE_ADMIN_NOT_CONFIGURED",
+        });
+      }
+
+      const client = await app.db.connect();
+      let authUserId = null;
+      let transactionStarted = false;
+
+      try {
+        const branchId = await resolveRegisterBranchId(client, requestedBranchId);
+        await ensureRegisterEmailAvailability(client, email);
+        const clienteRoleId = await getClienteRoleId(client);
+
+        const authCreateResult = await app.supabaseAdmin.auth.admin.createUser({
+          email,
+          password: contrasena,
+          email_confirm: true,
+          user_metadata: {
+            full_name: `${nombres} ${apellidos}`.trim(),
+            source: "public_register",
+          },
+        });
+
+        if (authCreateResult.error || !authCreateResult.data?.user?.id) {
+          if (isSupabaseDuplicateError(authCreateResult.error)) {
+            return sendError(reply, 409, "El correo ya esta registrado.", {
+              code: "AUTH_REGISTER_EMAIL_EXISTS",
+            });
+          }
+          return sendError(reply, 500, "No se pudo crear la identidad de autenticacion.", {
+            code: "AUTH_REGISTER_AUTH_CREATE_ERROR",
+            details: authCreateResult.error?.message || "AUTH_CREATE_FAILED",
+          });
+        }
+
+        authUserId = authCreateResult.data.user.id;
+
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        const personaInsert = await client.query(
+          `
+            INSERT INTO public.personas (nombres, apellidos)
+            VALUES ($1, $2)
+            RETURNING id_persona
+          `,
+          [nombres, apellidos]
+        );
+        const idPersona = personaInsert.rows[0].id_persona;
+
+        await client.query(
+          `
+            INSERT INTO public.correos (id_persona, direccion_correo, es_principal, verificado)
+            VALUES ($1::uuid, $2, TRUE, TRUE)
+          `,
+          [idPersona, email]
+        );
+
+        await client.query(
+          `
+            INSERT INTO public.usuarios (
+              id_usuario,
+              id_persona,
+              estado,
+              estado_acceso,
+              credenciales_completadas_at,
+              ultimo_login_at
+            )
+            VALUES ($1::uuid, $2::uuid, TRUE, $3, NOW(), NULL)
+          `,
+          [authUserId, idPersona, ACCESS_STATUS.ACTIVE]
+        );
+
+        await client.query(
+          `
+            INSERT INTO public.roles_usuarios (
+              id_rol,
+              id_usuario,
+              id_sucursal,
+              activo
+            )
+            VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE)
+          `,
+          [clienteRoleId, authUserId, branchId]
+        );
+
+        const idCliente = await insertClientWithConsents(client, {
+          idPersona,
+          authUserId,
+          branchId,
+          consentimientoMarketing,
+          aceptaTerminos,
+          aceptaTerminosAt,
+          consentimientoMarketingAt,
+        });
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        return sendOk(
+          reply,
+          {
+            user: {
+              id_usuario: authUserId,
+              id_persona: idPersona,
+              id_cliente: idCliente,
+              email,
+              nombres,
+              apellidos,
+              estado_acceso: ACCESS_STATUS.ACTIVE,
+            },
+            cliente: {
+              id_cliente: idCliente,
+              id_sucursal_origen: branchId,
+              estado: true,
+            },
+            consentimientos: {
+              acepta_terminos: true,
+              acepta_terminos_at: aceptaTerminosAt,
+              consentimiento_marketing: consentimientoMarketing,
+              consentimiento_marketing_at: consentimientoMarketingAt,
+            },
+          },
+          { statusCode: 201, requestId: request.id }
+        );
+      } catch (error) {
+        if (transactionStarted) {
+          await client.query("ROLLBACK").catch(() => { });
+        }
+        if (authUserId) {
+          // AM: Compensacion segura para no dejar auth.users huerfano si falla el dominio interno.
+          const rollback = await app.supabaseAdmin.auth.admin.deleteUser(authUserId);
+          if (rollback.error) {
+            request.log.error(
+              { err: rollback.error, authUserId },
+              "Compensacion de auth.users fallo durante registro publico"
+            );
+          }
+        }
+
+        if (error?.statusCode && error?.code) {
+          return sendError(reply, error.statusCode, error.message, {
+            code: error.code,
+            details: error.details,
+          });
+        }
+
+        if (error?.code === "23505") {
+          return sendError(reply, 409, "El correo ya esta registrado.", {
+            code: "AUTH_REGISTER_EMAIL_EXISTS",
+          });
+        }
+
+        request.log.error({ err: error }, "Public register error");
+        return sendError(reply, 500, "No se pudo completar el registro de cliente.", {
+          code: "AUTH_REGISTER_ERROR",
+          details: error instanceof Error ? error.message : "Unknown register error",
+        });
+      } finally {
+        client.release();
       }
     }
   );
