@@ -74,12 +74,24 @@ const paqueteSchema = {
   additionalProperties: false,
 };
 
+const sucursalSchema = {
+  type: "object",
+  properties: {
+    id_sucursal: { type: "string", format: "uuid" },
+    nombre_sucursal: { type: "string" },
+  },
+  required: ["id_sucursal", "nombre_sucursal"],
+  additionalProperties: false,
+};
+
 const PUBLIC_SERVICES_SQL = `
   WITH active_tariffs AS (
     SELECT
       st.id_servicio,
       st.id_sucursal,
       st.precio_hnl,
+      st.duracion_min,
+      st.buffer_min,
       ROW_NUMBER() OVER (
         PARTITION BY st.id_servicio, st.id_sucursal
         ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
@@ -97,17 +109,25 @@ const PUBLIC_SERVICES_SQL = `
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
   ),
   picked_tariffs AS (
-    SELECT id_servicio, id_sucursal, precio_hnl
+    SELECT id_servicio, id_sucursal, precio_hnl, duracion_min, buffer_min
     FROM active_tariffs
     WHERE rn = 1
   ),
-  service_prices AS (
+  service_scope AS (
     SELECT
       pt.id_servicio,
       CASE
         WHEN $1::uuid IS NULL THEN MIN(pt.precio_hnl)
         ELSE MAX(pt.precio_hnl)
-      END AS precio_hnl
+      END AS precio_hnl,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(pt.duracion_min)
+        ELSE MAX(pt.duracion_min)
+      END AS duracion_min,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(pt.buffer_min)
+        ELSE MAX(pt.buffer_min)
+      END AS buffer_min
     FROM picked_tariffs pt
     GROUP BY pt.id_servicio
   )
@@ -115,14 +135,15 @@ const PUBLIC_SERVICES_SQL = `
     s.id_servicio,
     s.nombre_servicio,
     s.descripcion,
-    s.duracion_min,
-    s.buffer_min,
+    -- AM: Usa tiempos por sucursal cuando existen; fallback al servicio base para compatibilidad legacy.
+    COALESCE(ss.duracion_min, s.duracion_min) AS duracion_min,
+    COALESCE(ss.buffer_min, s.buffer_min) AS buffer_min,
     s.grupo_catalogo,
     s.agendable,
-    sp.precio_hnl
+    ss.precio_hnl
   FROM public.servicios s
-  JOIN service_prices sp
-    ON sp.id_servicio = s.id_servicio
+  JOIN service_scope ss
+    ON ss.id_servicio = s.id_servicio
   WHERE s.deleted_at IS NULL
     AND s.activo IS TRUE
     AND s.visible_publico IS TRUE
@@ -130,11 +151,53 @@ const PUBLIC_SERVICES_SQL = `
 `;
 
 const PUBLIC_PACKAGES_SQL = `
+  -- AM: Oferta publica de paquetes filtrada por sucursal y validada contra servicios operativos de esa sucursal.
+  WITH scoped_offers AS (
+    SELECT
+      ps.id_paquete,
+      ps.id_sucursal,
+      ps.precio_hnl,
+      ROW_NUMBER() OVER (
+        PARTITION BY ps.id_paquete, ps.id_sucursal
+        ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
+      ) AS rn
+    FROM public.paquetes_sucursal ps
+    JOIN public.sucursales su
+      ON su.id_sucursal = ps.id_sucursal
+    WHERE ps.activo IS TRUE
+      AND ps.visible_publico IS TRUE
+      AND su.deleted_at IS NULL
+      AND su.estado IS TRUE
+      AND ($1::uuid IS NULL OR ps.id_sucursal = $1::uuid)
+  ),
+  picked_offers AS (
+    SELECT
+      so.id_paquete,
+      so.id_sucursal,
+      so.precio_hnl
+    FROM scoped_offers so
+    WHERE so.rn = 1
+  ),
+  effective_offers AS (
+    SELECT
+      po.id_paquete,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
+        ELSE MAX(po.precio_hnl)
+      END AS precio_hnl,
+      CASE
+        -- AM: PostgreSQL no soporta min/max directo sobre UUID en algunos entornos; se castea via text para seleccion determinista.
+        WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
+        ELSE MAX(po.id_sucursal::text)::uuid
+      END AS id_sucursal
+    FROM picked_offers po
+    GROUP BY po.id_paquete
+  )
   SELECT
     p.id_paquete,
     p.nombre_paquete,
     p.descripcion,
-    NULLIF(to_jsonb(p)->>'precio_hnl', '')::numeric AS precio_hnl,
+    COALESCE(eo.precio_hnl, NULLIF(to_jsonb(p)->>'precio_hnl', '')::numeric) AS precio_hnl,
     COALESCE(
       json_agg(
         json_build_object(
@@ -147,16 +210,44 @@ const PUBLIC_PACKAGES_SQL = `
       '[]'::json
     ) AS items
   FROM public.paquetes p
+  JOIN effective_offers eo
+    ON eo.id_paquete = p.id_paquete
   LEFT JOIN public.paquetes_detalles pd
     ON pd.id_paquete = p.id_paquete
   LEFT JOIN public.servicios s
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
    AND s.activo IS TRUE
+  LEFT JOIN LATERAL (
+    SELECT 1 AS has_tarifa
+    FROM public.servicios_tarifas st
+    WHERE st.id_servicio = pd.id_servicio
+      AND st.id_sucursal = eo.id_sucursal
+      AND st.id_empleado IS NULL
+      AND st.deleted_at IS NULL
+      AND st.activo IS TRUE
+      AND st.vigente_desde <= CURRENT_DATE
+      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+    ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
+    LIMIT 1
+  ) tariff_scope ON TRUE
   WHERE p.deleted_at IS NULL
     AND p.activo IS TRUE
-  GROUP BY p.id_paquete
+  GROUP BY p.id_paquete, eo.precio_hnl, eo.id_sucursal
+  HAVING COUNT(pd.id_servicio) > 0
+     AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
+     AND COUNT(tariff_scope.has_tarifa) = COUNT(pd.id_servicio)
   ORDER BY p.nombre_paquete ASC
+`;
+
+const PUBLIC_BRANCHES_SQL = `
+  SELECT
+    s.id_sucursal,
+    s.nombre_sucursal
+  FROM public.sucursales s
+  WHERE s.deleted_at IS NULL
+    AND s.estado IS TRUE
+  ORDER BY s.nombre_sucursal ASC
 `;
 
 function mapServiceRow(row) {
@@ -193,7 +284,62 @@ function mapPackageRow(row) {
   };
 }
 
+function mapBranchRow(row) {
+  return {
+    id_sucursal: row.id_sucursal,
+    nombre_sucursal: row.nombre_sucursal,
+  };
+}
+
 export default async function publicCatalogRoutes(app) {
+  app.get(
+    "/sucursales",
+    {
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  sucursales: { type: "array", items: sucursalSchema },
+                },
+                required: ["sucursales"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      try {
+        const { rows } = await app.db.query(PUBLIC_BRANCHES_SQL);
+        return sendOk(reply, {
+          sucursales: rows.map(mapBranchRow),
+        });
+      } catch (error) {
+        request.log.error({ err: error }, "Public catalog sucursales error");
+        return sendError(reply, 500, "No se pudo consultar sucursales publicas del catalogo", {
+          code: "PUBLIC_CATALOG_BRANCHES_ERROR",
+          details: error instanceof Error ? error.message : "Unknown public catalog branches error",
+        });
+      }
+    }
+  );
+
   app.get(
     "/servicios",
     {
@@ -253,6 +399,13 @@ export default async function publicCatalogRoutes(app) {
     "/paquetes",
     {
       schema: {
+        querystring: {
+          type: "object",
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
         response: {
           200: {
             type: "object",
@@ -283,7 +436,7 @@ export default async function publicCatalogRoutes(app) {
       }
 
       try {
-        const { rows } = await app.db.query(PUBLIC_PACKAGES_SQL);
+        const { rows } = await app.db.query(PUBLIC_PACKAGES_SQL, [request.query?.id_sucursal ?? null]);
         return sendOk(reply, {
           paquetes: rows.map(mapPackageRow),
         });
