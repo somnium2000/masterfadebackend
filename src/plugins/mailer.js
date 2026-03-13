@@ -76,6 +76,12 @@ async function mailerPlugin(app) {
     app.decorate("mailer", {
       configured: false,
       provider: "smtp",
+      async sendMail() {
+        return {
+          sent: false,
+          message: "Servicio SMTP no configurado (requiere SMTP_HOST y SMTP_FROM).",
+        };
+      },
       async sendPasswordRecoveryEmail() {
         return {
           sent: false,
@@ -105,15 +111,14 @@ async function mailerPlugin(app) {
   app.decorate("mailer", {
     configured: true,
     provider: "smtp",
-    async sendPasswordRecoveryEmail({ to, actionLink, fullName = null, kind = "reset" }) {
+    async sendMail({ to, subject, text, html }) {
       try {
-        const template = buildPasswordEmailTemplate({ actionLink, fullName, kind });
         const result = await transporter.sendMail({
           from,
           to,
-          subject: template.subject,
-          text: template.text,
-          html: template.html,
+          subject,
+          text,
+          html,
         });
         return {
           sent: true,
@@ -121,10 +126,27 @@ async function mailerPlugin(app) {
           provider_message_id: result.messageId || null,
         };
       } catch (error) {
-        app.log.error({ err: error, to }, "Fallo envio SMTP");
+        app.log.error({ err: error, to, subject }, "Fallo envio SMTP");
         return {
           sent: false,
           message: error instanceof Error ? error.message : "No se pudo enviar el correo SMTP",
+        };
+      }
+    },
+    async sendPasswordRecoveryEmail({ to, actionLink, fullName = null, kind = "reset" }) {
+      try {
+        const template = buildPasswordEmailTemplate({ actionLink, fullName, kind });
+        return this.sendMail({
+          to,
+          subject: template.subject,
+          text: template.text,
+          html: template.html,
+        });
+      } catch (error) {
+        app.log.error({ err: error, to }, "Fallo construccion email SMTP");
+        return {
+          sent: false,
+          message: error instanceof Error ? error.message : "No se pudo preparar el correo SMTP",
         };
       }
     },

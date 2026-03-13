@@ -1,4 +1,5 @@
 import catalogRoutes from "./catalog.js";
+import adminCitasRoutes from "./citas.js";
 import empleadosRoutes from "./empleados.js";
 import personasRoutes from "./personas.js";
 import sucursalesRoutes from "./sucursales.js";
@@ -8,4 +9,5 @@ export default async function adminRoutes(app) {
   await app.register(catalogRoutes, { prefix: "/catalog" });
   await app.register(empleadosRoutes, { prefix: "/empleados" });
   await app.register(sucursalesRoutes, { prefix: "/sucursales" });
+  await app.register(adminCitasRoutes, { prefix: "/citas" });
 }
