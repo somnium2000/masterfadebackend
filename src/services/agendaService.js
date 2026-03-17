@@ -206,6 +206,13 @@ function toTimeLabel(date) {
   return `${hours}:${minutes}`;
 }
 
+function toHourMinute(value) {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  const match = normalized.match(/^(\d{2}:\d{2})/);
+  return match ? match[1] : null;
+}
+
 function isFullDayInterval(start, end) {
   const nextDayStart = startOfDay(formatDateOnly(addMinutes(start, 24 * 60)));
   return start.getHours() === 0
@@ -674,6 +681,30 @@ export async function getAvailableSlotsForBarber(client, empleadoId, dateString,
   return buildSlotsFromIntervals(freeIntervals, serviceTotalMinutes, SLOT_INTERVAL_MINUTES);
 }
 
+export async function getBarberScheduleBounds(client, empleadoId, dateString) {
+  const safeBarberId = assertUuid(empleadoId, "id_barbero");
+  const safeDate = parseDateOnly(dateString, "fecha");
+  const schedules = await getSchedulesForBarberOnDate(client, safeBarberId, safeDate);
+  if (!schedules.length) {
+    return { hora_inicio: null, hora_fin: null };
+  }
+
+  let horaInicio = null;
+  let horaFin = null;
+  for (const row of schedules) {
+    const start = toHourMinute(row?.hora_inicio);
+    const end = toHourMinute(row?.hora_fin);
+    if (!start || !end) continue;
+    if (!horaInicio || start < horaInicio) horaInicio = start;
+    if (!horaFin || end > horaFin) horaFin = end;
+  }
+
+  return {
+    hora_inicio: horaInicio,
+    hora_fin: horaFin,
+  };
+}
+
 export async function findFirstAvailableBarber(client, branchId, dateString, serviceTotalMinutes) {
   const barbers = await listBarbersForBranch(client, branchId);
   const withSlots = await mapWithConcurrency(barbers, 4, async (barber) => ({
@@ -699,12 +730,15 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
     }
 
     const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, safeDate, serviceTotalMinutes);
+    const bounds = await getBarberScheduleBounds(client, barber.id_empleado, safeDate);
     return {
       fecha: safeDate,
       disponible: slots.length > 0,
       barberos_disponibles: slots.length > 0 ? 1 : 0,
       primer_horario_disponible: slots[0]?.hora ?? null,
       barbero_autoasignado: barber,
+      hora_inicio: bounds.hora_inicio,
+      hora_fin: bounds.hora_fin,
       slots,
     };
   }
@@ -717,6 +751,8 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
       barberos_disponibles: 0,
       primer_horario_disponible: null,
       barbero_autoasignado: null,
+      hora_inicio: null,
+      hora_fin: null,
       slots: [],
     };
   }
@@ -746,6 +782,8 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
     barberos_disponibles: availableCount,
     primer_horario_disponible: firstSlot?.hora ?? null,
     barbero_autoasignado: autoBarber,
+    hora_inicio: null,
+    hora_fin: null,
     slots: [],
   };
 }

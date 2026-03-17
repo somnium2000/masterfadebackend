@@ -7,6 +7,7 @@ import {
   assertUuid,
   buildDayAvailability,
   findFirstAvailableBarber,
+  getBarberScheduleBounds,
   getServiceSelectionDetails,
   listAvailabilityByDateRange,
   listBarbersForBranch,
@@ -250,10 +251,21 @@ export default async function publicAgendaRoutes(app) {
                     ],
                   },
                   horarios: { type: "array", items: slotSchema },
+                  hora_inicio: { type: ["string", "null"] },
+                  hora_fin: { type: ["string", "null"] },
                   duracion_total_min: { type: "integer" },
                   buffer_total_min: { type: "integer" },
                 },
-                required: ["fecha", "id_barbero", "barbero", "horarios", "duracion_total_min", "buffer_total_min"],
+                required: [
+                  "fecha",
+                  "id_barbero",
+                  "barbero",
+                  "horarios",
+                  "hora_inicio",
+                  "hora_fin",
+                  "duracion_total_min",
+                  "buffer_total_min",
+                ],
                 additionalProperties: false,
               },
               requestId: requestIdSchema,
@@ -283,17 +295,24 @@ export default async function publicAgendaRoutes(app) {
             id_barbero: idBarbero,
             barbero: availability.barbero_autoasignado,
             horarios: mapSlotsForResponse(availability.slots),
+            hora_inicio: availability.hora_inicio ?? null,
+            hora_fin: availability.hora_fin ?? null,
             duracion_total_min: serviceSelection.duracion_total_min,
             buffer_total_min: serviceSelection.buffer_total_min,
           });
         }
 
         const result = await findFirstAvailableBarber(app.db, idSucursal, fecha, serviceTotalMinutes);
+        const bounds = result?.barber
+          ? await getBarberScheduleBounds(app.db, result.barber.id_empleado, fecha)
+          : { hora_inicio: null, hora_fin: null };
         return sendOk(reply, {
           fecha,
           id_barbero: result?.barber?.id_empleado ?? null,
           barbero: result?.barber ?? null,
           horarios: mapSlotsForResponse(result?.slots ?? []),
+          hora_inicio: bounds.hora_inicio ?? null,
+          hora_fin: bounds.hora_fin ?? null,
           duracion_total_min: serviceSelection.duracion_total_min,
           buffer_total_min: serviceSelection.buffer_total_min,
         });
