@@ -22,6 +22,16 @@ const loginBodySchema = {
   ],
 };
 
+const exchangeBodySchema = {
+  type: ["object", "null"],
+  properties: {
+    supabase_token: { type: "string", minLength: 1 },
+    access_token: { type: "string", minLength: 1 },
+    token: { type: "string", minLength: 1 },
+  },
+  additionalProperties: true,
+};
+
 const registerBodySchema = {
   type: "object",
   properties: {
@@ -86,6 +96,15 @@ const loginResponseSchema = {
     required: ["ok", "data"],
     additionalProperties: true,
   },
+};
+
+const exchangeResponseSchema = {
+  ...loginResponseSchema,
+  400: errorResponseSchema,
+  401: errorResponseSchema,
+  403: errorResponseSchema,
+  409: errorResponseSchema,
+  500: errorResponseSchema,
 };
 
 const registerResponseSchema = {
@@ -207,6 +226,7 @@ const ACCESS_STATUS = {
   INACTIVE: "inactivo",
 };
 const PASSWORD_COMPLEXITY_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let clientsConsentColumnsCache = null;
 
 function normalizeEmail(email) {
@@ -512,6 +532,270 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
 
+function getBearerToken(headerValue) {
+  const raw = String(headerValue || "").trim();
+  if (!raw) return null;
+  const match = raw.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function extractSupabaseToken(request) {
+  const body = request.body || {};
+  const bodyToken = String(
+    body.supabase_token ?? body.access_token ?? body.token ?? ""
+  ).trim();
+  if (bodyToken) return bodyToken;
+  return getBearerToken(request.headers.authorization);
+}
+
+function extractEmailFromSupabaseUser(user) {
+  const directEmail = normalizeEmail(user?.email);
+  if (directEmail) return directEmail;
+
+  const metadataEmail = normalizeEmail(user?.user_metadata?.email);
+  if (metadataEmail) return metadataEmail;
+
+  const identities = Array.isArray(user?.identities) ? user.identities : [];
+  for (const identity of identities) {
+    const identityEmail = normalizeEmail(identity?.identity_data?.email);
+    if (identityEmail) return identityEmail;
+  }
+
+  return "";
+}
+
+function normalizePgErrorText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isEmailConflictError(error) {
+  const detail = normalizePgErrorText(error?.detail);
+  const constraint = normalizePgErrorText(error?.constraint);
+  return (
+    detail.includes("direccion_correo") ||
+    detail.includes("(email)") ||
+    constraint.includes("correo")
+  );
+}
+
+function isUserIdConflictError(error) {
+  const detail = normalizePgErrorText(error?.detail);
+  const constraint = normalizePgErrorText(error?.constraint);
+  return detail.includes("(id_usuario)") || constraint.includes("usuarios_pkey");
+}
+
+async function resolveExchangeBranchId(client) {
+  const preferredBranchId = normalizeOptionalUuid(process.env.AUTH_EXCHANGE_DEFAULT_BRANCH_ID);
+
+  if (preferredBranchId) {
+    if (!UUID_REGEX.test(preferredBranchId)) {
+      throw {
+        statusCode: 500,
+        message: "AUTH_EXCHANGE_DEFAULT_BRANCH_ID no tiene formato UUID valido.",
+        code: "AUTH_EXCHANGE_BRANCH_CONFIG_INVALID",
+      };
+    }
+    return resolveRegisterBranchId(client, preferredBranchId);
+  }
+
+  return resolveRegisterBranchId(client, null);
+}
+
+function buildSocialPersonaNames(supabaseUser) {
+  const metadata = supabaseUser?.user_metadata || {};
+  const givenName = normalizeRequiredText(metadata.given_name);
+  const familyName = normalizeRequiredText(metadata.family_name);
+  const fullName = normalizeRequiredText(
+    metadata.full_name || metadata.name || `${givenName} ${familyName}`.trim()
+  );
+
+  let nombres = givenName;
+  let apellidos = familyName;
+
+  if (!nombres && fullName) {
+    const parts = fullName.split(/\s+/).filter(Boolean);
+    if (parts.length === 1) {
+      nombres = parts[0];
+      apellidos = "Cliente";
+    } else {
+      nombres = parts.shift() || "Cliente";
+      apellidos = parts.join(" ") || "Cliente";
+    }
+  }
+
+  if (!nombres) nombres = "Cliente";
+  if (!apellidos) apellidos = "Google";
+
+  return { nombres, apellidos };
+}
+
+async function ensureExchangeEmailAvailability(client, email, authUserId) {
+  const conflict = await client.query(
+    `
+      SELECT 1
+      FROM public.correos c
+      JOIN public.usuarios u
+        ON u.id_persona = c.id_persona
+      WHERE LOWER(c.direccion_correo::text) = LOWER($1)
+        AND u.deleted_at IS NULL
+        AND u.id_usuario <> $2::uuid
+      LIMIT 1
+    `,
+    [email, authUserId]
+  );
+
+  if (conflict.rowCount) {
+    throw {
+      statusCode: 409,
+      message: "El correo ya esta vinculado a otra cuenta interna.",
+      code: "AUTH_EXCHANGE_EMAIL_EXISTS",
+    };
+  }
+}
+
+async function ensureExchangeInternalUser(app, supabaseUser) {
+  const authUserId = String(supabaseUser?.id || "").trim();
+  if (!authUserId) {
+    throw {
+      statusCode: 401,
+      message: "Token de Supabase invalido",
+      code: "AUTH_SUPABASE_INVALID",
+    };
+  }
+
+  const existing = await app.db.query(
+    `
+      SELECT id_usuario
+      FROM public.usuarios
+      WHERE id_usuario = $1::uuid
+        AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [authUserId]
+  );
+  if (existing.rowCount) {
+    return { created: false, authUserId };
+  }
+
+  const email = extractEmailFromSupabaseUser(supabaseUser);
+  if (!email || !isValidEmail(email)) {
+    throw {
+      statusCode: 400,
+      message: "No se pudo resolver un correo valido desde la identidad social.",
+      code: "AUTH_EXCHANGE_EMAIL_REQUIRED",
+    };
+  }
+
+  const { nombres, apellidos } = buildSocialPersonaNames(supabaseUser);
+  const client = await app.db.connect();
+  let transactionStarted = false;
+
+  try {
+    const branchId = await resolveExchangeBranchId(client);
+    const clienteRoleId = await getClienteRoleId(client);
+    await ensureExchangeEmailAvailability(client, email, authUserId);
+
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const personaInsert = await client.query(
+      `
+        INSERT INTO public.personas (nombres, apellidos)
+        VALUES ($1, $2)
+        RETURNING id_persona
+      `,
+      [nombres, apellidos]
+    );
+    const idPersona = personaInsert.rows[0].id_persona;
+
+    await client.query(
+      `
+        INSERT INTO public.correos (id_persona, direccion_correo, es_principal, verificado)
+        VALUES ($1::uuid, $2, TRUE, TRUE)
+      `,
+      [idPersona, email]
+    );
+
+    await client.query(
+      `
+        INSERT INTO public.usuarios (
+          id_usuario,
+          id_persona,
+          estado,
+          estado_acceso,
+          credenciales_completadas_at,
+          ultimo_login_at
+        )
+        VALUES ($1::uuid, $2::uuid, TRUE, $3, NOW(), NULL)
+      `,
+      [authUserId, idPersona, ACCESS_STATUS.ACTIVE]
+    );
+
+    await client.query(
+      `
+        INSERT INTO public.roles_usuarios (
+          id_rol,
+          id_usuario,
+          id_sucursal,
+          activo
+        )
+        VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE)
+      `,
+      [clienteRoleId, authUserId, branchId]
+    );
+
+    await insertClientWithConsents(client, {
+      idPersona,
+      authUserId,
+      branchId,
+      consentimientoMarketing: false,
+      aceptaTerminos: true,
+      aceptaTerminosAt: new Date().toISOString(),
+      consentimientoMarketingAt: null,
+    });
+
+    await client.query("COMMIT");
+    transactionStarted = false;
+
+    return { created: true, authUserId };
+  } catch (error) {
+    if (transactionStarted) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
+    if (error?.code === "23505") {
+      if (isEmailConflictError(error)) {
+        throw {
+          statusCode: 409,
+          message: "El correo de Google ya esta vinculado a otra cuenta de MasterFade. Usa tu login actual o contacta soporte.",
+          code: "AUTH_EXCHANGE_EMAIL_EXISTS",
+        };
+      }
+
+      if (isUserIdConflictError(error)) {
+        const userNowExists = await app.db.query(
+          `
+            SELECT 1
+            FROM public.usuarios
+            WHERE id_usuario = $1::uuid
+              AND deleted_at IS NULL
+            LIMIT 1
+          `,
+          [authUserId]
+        );
+
+        if (userNowExists.rowCount) {
+          return { created: false, authUserId };
+        }
+      }
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function syncAccessStateAfterLogin(app, userId) {
   const stateResult = await app.db.query(
     `
@@ -598,6 +882,114 @@ export default async function authRoutes(app) {
         return sendError(reply, 500, "No se pudo obtener la sesion actual", {
           code: "AUTH_ME_ERROR",
           details: error instanceof Error ? error.message : "Unknown auth/me error",
+        });
+      }
+    }
+  );
+
+  app.post(
+    "/exchange",
+    {
+      schema: {
+        body: exchangeBodySchema,
+        response: exchangeResponseSchema,
+      },
+    },
+    async (request, reply) => {
+      const supabaseToken = extractSupabaseToken(request);
+      if (!supabaseToken) {
+        return sendError(reply, 400, "Debes enviar el token de Supabase para realizar el exchange.", {
+          code: "AUTH_MISSING_TOKEN",
+        });
+      }
+
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      if (!app.supabaseAdmin) {
+        return sendError(reply, 500, "Supabase Admin no esta configurado en el backend", {
+          code: "SUPABASE_ADMIN_NOT_CONFIGURED",
+        });
+      }
+
+      const jwtSecret = process.env.JWT_SECRET?.trim();
+      if (!jwtSecret) {
+        return sendError(reply, 500, "Falta JWT_SECRET en la configuracion del servidor", {
+          code: "JWT_SECRET_MISSING",
+        });
+      }
+
+      try {
+        const authResult = await app.supabaseAdmin.auth.getUser(supabaseToken);
+        const supabaseUser = authResult.data?.user;
+        if (authResult.error || !supabaseUser?.id) {
+          return sendError(reply, 401, "Token de Supabase invalido o expirado.", {
+            code: "AUTH_SUPABASE_INVALID",
+            details: authResult.error?.message || "SUPABASE_GET_USER_FAILED",
+          });
+        }
+
+        await ensureExchangeInternalUser(app, supabaseUser);
+
+        const claims = await getAuthClaims(app, supabaseUser.id);
+        if (!claims) {
+          return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
+            code: "AUTH_USER_NOT_ONBOARDED",
+          });
+        }
+
+        const accessSync = await syncAccessStateAfterLogin(app, claims.user.id_usuario);
+        if (!accessSync.ok) {
+          if (accessSync.code === "AUTH_ACCESS_BLOCKED") {
+            return sendError(reply, 403, "Tu acceso esta bloqueado o inactivo. Contacta al administrador.", {
+              code: "AUTH_ACCESS_BLOCKED",
+              details: { estado_acceso: accessSync.estado_acceso },
+            });
+          }
+          return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
+            code: "AUTH_USER_NOT_ONBOARDED",
+          });
+        }
+
+        const user = {
+          ...claims.user,
+          roles: claims.roles,
+          branch_ids: claims.branch_ids,
+          empresa_id: claims.empresa_id,
+          empleado_id: claims.empleado_id,
+          cliente_id: claims.cliente_id,
+          estado_acceso: accessSync.state?.estado_acceso ?? null,
+          credenciales_completadas_at: accessSync.state?.credenciales_completadas_at ?? null,
+          ultimo_login_at: accessSync.state?.ultimo_login_at ?? null,
+        };
+
+        const token = signAppToken(
+          {
+            sub: String(claims.user.id_usuario),
+            email: user.email ?? extractEmailFromSupabaseUser(supabaseUser) ?? null,
+            "mf:roles": claims.roles || [],
+            "mf:branch_ids": claims.branch_ids || [],
+            token_type: "app",
+          },
+          jwtSecret
+        );
+
+        return sendOk(reply, { token, user });
+      } catch (error) {
+        if (error?.statusCode && error?.code) {
+          return sendError(reply, error.statusCode, error.message, {
+            code: error.code,
+            details: error.details,
+          });
+        }
+
+        request.log.error({ err: error }, "Auth exchange error");
+        return sendError(reply, 500, "No se pudo completar el exchange de autenticacion", {
+          code: "AUTH_EXCHANGE_ERROR",
+          details: error instanceof Error ? error.message : "Unknown auth exchange error",
         });
       }
     }
