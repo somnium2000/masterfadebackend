@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "checkJs": false
+  },
+  "include": [
+    "app.js",
+    "src/**/*.js",
+    "eslint.config.js"
+  ],
+  "exclude": [
+    "node_modules",
+    "db",
+    "stdout.log",
+    "stderr.log",
+    "stdout-direct.log",
+    "stderr-direct.log"
+  ]
+}
+
