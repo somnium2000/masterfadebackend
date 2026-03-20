@@ -61,12 +61,14 @@ export const AUTH_CLAIMS_SQL = `
     JOIN public.empleados e
       ON e.id_persona = bu.id_persona
     WHERE e.estado IS TRUE
+      AND e.deleted_at IS NULL
   ),
   cliente_scope AS (
     SELECT ((array_agg(c.id_cliente::text ORDER BY c.id_cliente::text))[1])::uuid AS cliente_id
     FROM public.clientes c
     WHERE c.id_usuario = $1::uuid
       AND c.estado IS TRUE
+      AND c.deleted_at IS NULL
   )
   SELECT
     bu.id_usuario,

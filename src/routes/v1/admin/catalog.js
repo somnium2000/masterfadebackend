@@ -37,14 +37,9 @@ const serviceBodySchema = {
   type: "object",
   properties: {
     nombre_servicio: { type: "string", minLength: 1, maxLength: 140 },
-    descripcion: { type: ["string", "null"], maxLength: 500 },
     duracion_min: { type: "integer", minimum: 1 },
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
-    grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
-    visible_publico: { type: "boolean" },
-    agendable: { type: "boolean" },
-    orden_visual: { type: "integer", minimum: 0 },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
   required: ["nombre_servicio", "duracion_min", "buffer_min", "precio_hnl"],
@@ -55,14 +50,9 @@ const servicePatchSchema = {
   type: "object",
   properties: {
     nombre_servicio: { type: "string", minLength: 1, maxLength: 140 },
-    descripcion: { type: ["string", "null"], maxLength: 500 },
     duracion_min: { type: "integer", minimum: 1 },
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
-    grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
-    visible_publico: { type: "boolean" },
-    agendable: { type: "boolean" },
-    orden_visual: { type: "integer", minimum: 0 },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
   minProperties: 1,
@@ -281,24 +271,6 @@ const GET_SERVICE_SQL = `
    AND st.rn = 1
   WHERE s.id_servicio = $1::uuid
     AND s.deleted_at IS NULL
-`;
-
-const GET_SERVICE_BY_NAME_SQL = `
-  SELECT
-    s.id_servicio,
-    s.nombre_servicio,
-    s.descripcion,
-    s.duracion_min,
-    s.buffer_min,
-    s.grupo_catalogo,
-    s.visible_publico,
-    s.agendable,
-    s.orden_visual,
-    s.deleted_at,
-    s.activo
-  FROM public.servicios s
-  WHERE UPPER(TRIM(s.nombre_servicio)) = UPPER(TRIM($1))
-  LIMIT 1
 `;
 
 const GET_SERVICE_BASE_SQL = `
@@ -630,17 +602,15 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
       });
     }
 
-    if (isSuperAdmin) {
-      const { rowCount } = await client.query(
-        "SELECT 1 FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL AND estado IS TRUE",
-        [requestedBranchId]
-      );
+    const { rowCount } = await client.query(
+      "SELECT 1 FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL AND estado IS TRUE",
+      [requestedBranchId]
+    );
 
-      if (!rowCount) {
-        throw new AppError(404, "La sucursal indicada no existe o no esta activa", {
-          code: "CATALOG_BRANCH_NOT_FOUND",
-        });
-      }
+    if (!rowCount) {
+      throw new AppError(404, "La sucursal indicada no existe o no esta activa", {
+        code: "CATALOG_BRANCH_NOT_FOUND",
+      });
     }
 
     return requestedBranchId;
@@ -648,7 +618,17 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
 
   if (!isSuperAdmin) {
     if (claimBranchIds.length === 1) {
-      return claimBranchIds[0];
+      const onlyBranchId = claimBranchIds[0];
+      const { rowCount } = await client.query(
+        "SELECT 1 FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL AND estado IS TRUE",
+        [onlyBranchId]
+      );
+      if (!rowCount) {
+        throw new AppError(404, "La sucursal indicada no existe o no esta activa", {
+          code: "CATALOG_BRANCH_NOT_FOUND",
+        });
+      }
+      return onlyBranchId;
     }
 
     if (claimBranchIds.length === 0) {
@@ -677,40 +657,24 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
   });
 }
 
-async function ensureUniqueServiceName(client, serviceId, nombreServicio) {
+async function ensureUniquePackageNameByBranch(client, packageId, branchId, nombrePaquete) {
   const { rows } = await client.query(
     `
-      SELECT id_servicio
-      FROM public.servicios
-      WHERE UPPER(TRIM(nombre_servicio)) = UPPER(TRIM($1))
-        AND ($2::uuid IS NULL OR id_servicio <> $2::uuid)
+      SELECT p.id_paquete
+      FROM public.paquetes p
+      JOIN public.paquetes_sucursal ps
+        ON ps.id_paquete = p.id_paquete
+      WHERE UPPER(TRIM(p.nombre_paquete)) = UPPER(TRIM($1))
+        AND p.deleted_at IS NULL
+        AND ps.id_sucursal = $2::uuid
+        AND ($3::uuid IS NULL OR p.id_paquete <> $3::uuid)
       LIMIT 1
     `,
-    [nombreServicio, serviceId ?? null]
+    [nombrePaquete, branchId, packageId ?? null]
   );
 
   if (rows[0]) {
-    throw new AppError(409, "Ya existe un servicio con ese nombre", {
-      code: "CATALOG_SERVICE_DUPLICATE",
-    });
-  }
-}
-
-async function ensureUniquePackageName(client, packageId, nombrePaquete) {
-  const { rows } = await client.query(
-    `
-      SELECT id_paquete
-      FROM public.paquetes
-      WHERE UPPER(TRIM(nombre_paquete)) = UPPER(TRIM($1))
-        AND deleted_at IS NULL
-        AND ($2::uuid IS NULL OR id_paquete <> $2::uuid)
-      LIMIT 1
-    `,
-    [nombrePaquete, packageId ?? null]
-  );
-
-  if (rows[0]) {
-    throw new AppError(409, "Ya existe un paquete con ese nombre", {
+    throw new AppError(409, "Ya existe un paquete con ese nombre en la sucursal", {
       code: "CATALOG_PACKAGE_DUPLICATE",
     });
   }
@@ -805,6 +769,94 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
       });
     }
   }
+}
+
+async function ensureUniqueServiceNameByBranch(client, serviceId, branchId, nombreServicio) {
+  const { rows } = await client.query(
+    `
+      SELECT s.id_servicio
+      FROM public.servicios s
+      JOIN public.servicios_tarifas st
+        ON st.id_servicio = s.id_servicio
+       AND st.id_sucursal = $2::uuid
+       AND st.id_empleado IS NULL
+       AND st.deleted_at IS NULL
+      WHERE UPPER(TRIM(s.nombre_servicio)) = UPPER(TRIM($1))
+        AND s.deleted_at IS NULL
+        AND ($3::uuid IS NULL OR s.id_servicio <> $3::uuid)
+      LIMIT 1
+    `,
+    [nombreServicio, branchId, serviceId ?? null]
+  );
+
+  if (rows[0]) {
+    throw new AppError(409, "Ya existe un servicio con ese nombre en la sucursal", {
+      code: "CATALOG_SERVICE_DUPLICATE",
+    });
+  }
+}
+
+async function hasServiceTariffsInOtherBranches(client, idServicio, branchId) {
+  const { rows } = await client.query(
+    `
+      SELECT 1
+      FROM public.servicios_tarifas st
+      WHERE st.id_servicio = $1::uuid
+        AND st.id_empleado IS NULL
+        AND st.deleted_at IS NULL
+        AND st.id_sucursal <> $2::uuid
+      LIMIT 1
+    `,
+    [idServicio, branchId]
+  );
+  return rows.length > 0;
+}
+
+async function cloneServiceForBranch(client, sourceService, branchId) {
+  const cloneResult = await client.query(
+    `
+      INSERT INTO public.servicios (
+        nombre_servicio,
+        descripcion,
+        duracion_min,
+        buffer_min,
+        grupo_catalogo,
+        visible_publico,
+        agendable,
+        orden_visual,
+        activo
+      )
+      VALUES ($1, $2, $3::int, $4::int, $5, $6::boolean, $7::boolean, $8::int, TRUE)
+      RETURNING id_servicio
+    `,
+    [
+      sourceService.nombre_servicio,
+      sourceService.descripcion ?? null,
+      Number(sourceService.duracion_min ?? 1),
+      Number(sourceService.buffer_min ?? 0),
+      normalizeServiceGroup(sourceService.grupo_catalogo, "barberia"),
+      normalizeBoolean(sourceService.visible_publico, true),
+      normalizeBoolean(sourceService.agendable, true),
+      normalizeOrderVisual(sourceService.orden_visual, 100),
+    ]
+  );
+  const clonedServiceId = cloneResult.rows[0].id_servicio;
+
+  // AM: Reasigna la operacion de la sucursal al clon para aislar cambios de nombre.
+  await client.query(
+    `
+      UPDATE public.servicios_tarifas
+      SET
+        id_servicio = $1::uuid,
+        updated_at = NOW()
+      WHERE id_servicio = $2::uuid
+        AND id_sucursal = $3::uuid
+        AND id_empleado IS NULL
+    `,
+    [clonedServiceId, sourceService.id_servicio, branchId]
+  );
+
+  return clonedServiceId;
 }
 
 async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, options = {}) {
@@ -1033,6 +1085,71 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
   );
 }
 
+async function hasPackageOffersInOtherBranches(client, idPaquete, branchId) {
+  const { rows } = await client.query(
+    `
+      SELECT 1
+      FROM public.paquetes_sucursal ps
+      WHERE ps.id_paquete = $1::uuid
+        AND ps.id_sucursal <> $2::uuid
+      LIMIT 1
+    `,
+    [idPaquete, branchId]
+  );
+  return rows.length > 0;
+}
+
+async function clonePackageForBranch(client, sourcePackage, branchId) {
+  const sourcePrice =
+    sourcePackage?.precio_hnl === undefined || sourcePackage?.precio_hnl === null
+      ? 0
+      : Number(sourcePackage.precio_hnl);
+  const sourceItems = Array.isArray(sourcePackage?.items)
+    ? sourcePackage.items.map((item) => ({
+      id_servicio: item.id_servicio,
+      cantidad: Number(item.cantidad ?? 1),
+    }))
+    : [];
+
+  const clonedPackageResult = await client.query(
+    `
+      INSERT INTO public.paquetes (
+        nombre_paquete,
+        descripcion,
+        precio_hnl,
+        activo
+      )
+      VALUES ($1, $2, $3::numeric, TRUE)
+      RETURNING id_paquete
+    `,
+    [sourcePackage.nombre_paquete, sourcePackage.descripcion ?? null, sourcePrice]
+  );
+  const clonedPackageId = clonedPackageResult.rows[0].id_paquete;
+
+  if (sourceItems.length > 0) {
+    await replacePackageItems(client, clonedPackageId, sourceItems);
+  }
+
+  // AM: Reasigna la oferta de la sucursal al clon para evitar contaminar otras sucursales.
+  const reassignedOffer = await client.query(
+    `
+      UPDATE public.paquetes_sucursal
+      SET
+        id_paquete = $1::uuid,
+        updated_at = NOW()
+      WHERE id_paquete = $2::uuid
+        AND id_sucursal = $3::uuid
+    `,
+    [clonedPackageId, sourcePackage.id_paquete, branchId]
+  );
+
+  if (!reassignedOffer.rowCount) {
+    await upsertPackageBranchOffer(client, clonedPackageId, branchId, {});
+  }
+
+  return clonedPackageId;
+}
+
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -1139,76 +1256,41 @@ export default async function adminCatalogRoutes(app) {
       try {
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const nombreServicio = normalizeRequiredText(request.body.nombre_servicio);
-        const descripcion = normalizeOptionalText(request.body.descripcion);
         const duracionMin = Number(request.body.duracion_min);
         const bufferMin = Number(request.body.buffer_min);
         const precioHnl = Number(request.body.precio_hnl);
-        const grupoCatalogo = normalizeServiceGroup(request.body.grupo_catalogo, "barberia");
-        const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
-        const agendable = normalizeBoolean(request.body.agendable, grupoCatalogo === "barberia");
-        const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
 
         await client.query("BEGIN");
 
-        const existingResult = await client.query(GET_SERVICE_BY_NAME_SQL, [nombreServicio]);
-        let idServicio = existingResult.rows[0]?.id_servicio;
+        await ensureUniqueServiceNameByBranch(client, null, branchId, nombreServicio);
 
-        if (idServicio) {
-          // AM: En multi-sucursal, duracion/buffer se persisten por tarifa de sucursal; no se pisan globalmente aqui.
-          await client.query(
-            `
-              UPDATE public.servicios
-              SET
-                nombre_servicio = $2,
-                descripcion = $3,
-                grupo_catalogo = $4,
-                visible_publico = $5::boolean,
-                agendable = $6::boolean,
-                orden_visual = $7::int,
-                activo = TRUE,
-                deleted_at = NULL,
-                updated_at = NOW()
-              WHERE id_servicio = $1::uuid
-            `,
-            [
-              idServicio,
-              nombreServicio,
-              descripcion ?? null,
-              grupoCatalogo,
-              visiblePublico,
-              agendable,
-              ordenVisual,
-            ]
-          );
-        } else {
+        let idServicio = null;
+        try {
           const insertResult = await client.query(
             `
               INSERT INTO public.servicios (
                 nombre_servicio,
-                descripcion,
                 duracion_min,
                 buffer_min,
-                grupo_catalogo,
-                visible_publico,
-                agendable,
-                orden_visual,
                 activo
               )
-              VALUES ($1, $2, $3::int, $4::int, $5, $6::boolean, $7::boolean, $8::int, TRUE)
+              VALUES ($1, $2::int, $3::int, TRUE)
               RETURNING id_servicio
             `,
-            [
-              nombreServicio,
-              descripcion ?? null,
-              duracionMin,
-              bufferMin,
-              grupoCatalogo,
-              visiblePublico,
-              agendable,
-              ordenVisual,
-            ]
+            [nombreServicio, duracionMin, bufferMin]
           );
           idServicio = insertResult.rows[0].id_servicio;
+        } catch (insertError) {
+          if (insertError?.code === "23505") {
+            throw new AppError(409, "Existe una restriccion de BD que impide repetir nombre de servicio globalmente", {
+              code: "CATALOG_SERVICE_DUPLICATE_GLOBAL_CONSTRAINT",
+              details: {
+                constraint: insertError?.constraint ?? null,
+                message: insertError?.message ?? null,
+              },
+            });
+          }
+          throw insertError;
         }
 
         await upsertServiceTariff(client, idServicio, branchId, precioHnl, {
@@ -1288,13 +1370,36 @@ export default async function adminCatalogRoutes(app) {
             code: "CATALOG_SERVICE_NOT_FOUND",
           });
         }
+        const shouldMutateServiceBase = request.body.nombre_servicio !== undefined;
+        let targetServiceId = request.params.id;
 
+        if (shouldMutateServiceBase) {
+          const serviceSharedAcrossBranches = await hasServiceTariffsInOtherBranches(client, request.params.id, branchId);
+          if (serviceSharedAcrossBranches) {
+            const sourceBaseResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id]);
+            const sourceBase = sourceBaseResult.rows[0];
+            if (!sourceBase) {
+              throw new AppError(404, "El servicio solicitado no existe", {
+                code: "CATALOG_SERVICE_NOT_FOUND",
+              });
+            }
+            targetServiceId = await cloneServiceForBranch(client, sourceBase, branchId);
+          }
+        }
+
+        const targetBaseResult = await client.query(GET_SERVICE_BASE_SQL, [targetServiceId]);
+        const targetBase = targetBaseResult.rows[0];
+        if (!targetBase) {
+          throw new AppError(404, "El servicio solicitado no existe", {
+            code: "CATALOG_SERVICE_NOT_FOUND",
+          });
+        }
         const nombreServicio =
           request.body.nombre_servicio !== undefined
             ? normalizeRequiredText(request.body.nombre_servicio)
-            : current.nombre_servicio;
-        const descripcion =
-          request.body.descripcion !== undefined ? normalizeOptionalText(request.body.descripcion) : current.descripcion;
+            : targetBase.nombre_servicio;
+        await ensureUniqueServiceNameByBranch(client, targetServiceId, branchId, nombreServicio);
+
         const duracionMin =
           request.body.duracion_min !== undefined ? Number(request.body.duracion_min) : Number(current.duracion_min);
         const bufferMin =
@@ -1305,50 +1410,33 @@ export default async function adminCatalogRoutes(app) {
             : current.precio_hnl == null
               ? null
               : Number(current.precio_hnl);
-        const grupoCatalogo =
-          request.body.grupo_catalogo !== undefined
-            ? normalizeServiceGroup(request.body.grupo_catalogo)
-            : normalizeServiceGroup(current.grupo_catalogo);
-        const visiblePublico =
-          request.body.visible_publico !== undefined
-            ? normalizeBoolean(request.body.visible_publico)
-            : normalizeBoolean(current.visible_publico, true);
-        const agendable =
-          request.body.agendable !== undefined
-            ? normalizeBoolean(request.body.agendable)
-            : normalizeBoolean(current.agendable, grupoCatalogo === "barberia");
-        const ordenVisual =
-          request.body.orden_visual !== undefined
-            ? normalizeOrderVisual(request.body.orden_visual)
-            : normalizeOrderVisual(current.orden_visual, 100);
 
-        await ensureUniqueServiceName(client, request.params.id, nombreServicio);
-
-        await client.query(
-          `
-            UPDATE public.servicios
-            SET
-              nombre_servicio = $2,
-              descripcion = $3,
-              grupo_catalogo = $4,
-              visible_publico = $5::boolean,
-              agendable = $6::boolean,
-              orden_visual = $7::int,
-              activo = TRUE,
-              deleted_at = NULL,
-              updated_at = NOW()
-            WHERE id_servicio = $1::uuid
-          `,
-          [
-            request.params.id,
-            nombreServicio,
-            descripcion ?? null,
-            grupoCatalogo,
-            visiblePublico,
-            agendable,
-            ordenVisual,
-          ]
-        );
+        if (shouldMutateServiceBase) {
+          await client.query(
+            `
+              UPDATE public.servicios
+              SET
+                nombre_servicio = $2,
+                activo = TRUE,
+                deleted_at = NULL,
+                updated_at = NOW()
+              WHERE id_servicio = $1::uuid
+            `,
+            [targetServiceId, nombreServicio]
+          );
+        } else {
+          await client.query(
+            `
+              UPDATE public.servicios
+              SET
+                activo = TRUE,
+                deleted_at = NULL,
+                updated_at = NOW()
+              WHERE id_servicio = $1::uuid
+            `,
+            [targetServiceId]
+          );
+        }
 
         if (precioHnl !== null || request.body.duracion_min !== undefined || request.body.buffer_min !== undefined) {
           if (precioHnl === null) {
@@ -1358,13 +1446,13 @@ export default async function adminCatalogRoutes(app) {
           }
 
           // AM: Guarda precio + tiempos operativos en el alcance de sucursal.
-          await upsertServiceTariff(client, request.params.id, branchId, precioHnl, {
+          await upsertServiceTariff(client, targetServiceId, branchId, precioHnl, {
             duracionMin,
             bufferMin,
           });
         }
 
-        const finalResult = await client.query(GET_SERVICE_SQL, [request.params.id, branchId]);
+        const finalResult = await client.query(GET_SERVICE_SQL, [targetServiceId, branchId]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapAdminServiceRow(finalResult.rows[0]), { requestId: request.id });
@@ -1736,7 +1824,7 @@ export default async function adminCatalogRoutes(app) {
         const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const items = normalizePackageItems(request.body.items);
 
-        await ensureUniquePackageName(client, null, nombrePaquete);
+        await ensureUniquePackageNameByBranch(client, null, branchId, nombrePaquete);
         await ensurePackageItemsAccessible(client, request.claims, items, branchId);
 
         await client.query("BEGIN");
@@ -1838,6 +1926,19 @@ export default async function adminCatalogRoutes(app) {
           });
         }
 
+        const shouldMutatePackageBase =
+          request.body.nombre_paquete !== undefined ||
+          request.body.descripcion !== undefined ||
+          request.body.items !== undefined;
+        let targetPackageId = request.params.id;
+
+        if (shouldMutatePackageBase) {
+          const packageSharedAcrossBranches = await hasPackageOffersInOtherBranches(client, request.params.id, branchId);
+          if (packageSharedAcrossBranches) {
+            targetPackageId = await clonePackageForBranch(client, basePackage, branchId);
+          }
+        }
+
         const nombrePaquete =
           request.body.nombre_paquete !== undefined
             ? normalizeRequiredText(request.body.nombre_paquete)
@@ -1859,39 +1960,40 @@ export default async function adminCatalogRoutes(app) {
         const nextActivo = normalizeBoolean(scopedPackage?.activo, true);
         const nextItems = request.body.items !== undefined ? normalizePackageItems(request.body.items) : null;
 
-        await ensureUniquePackageName(client, request.params.id, nombrePaquete);
+        await ensureUniquePackageNameByBranch(client, targetPackageId, branchId, nombrePaquete);
 
         if (nextItems) {
           await ensurePackageItemsAccessible(client, request.claims, nextItems, branchId);
         }
 
-        await client.query(
-          `
-            UPDATE public.paquetes
-            SET
-              nombre_paquete = $2,
-              descripcion = $3,
-              precio_hnl = $4::numeric,
-              activo = TRUE,
-              deleted_at = NULL,
-              updated_at = NOW()
-            WHERE id_paquete = $1::uuid
-          `,
-          [request.params.id, nombrePaquete, descripcion ?? null, precioHnl]
-        );
+        if (shouldMutatePackageBase) {
+          await client.query(
+            `
+              UPDATE public.paquetes
+              SET
+                nombre_paquete = $2,
+                descripcion = $3,
+                activo = TRUE,
+                deleted_at = NULL,
+                updated_at = NOW()
+              WHERE id_paquete = $1::uuid
+            `,
+            [targetPackageId, nombrePaquete, descripcion ?? null]
+          );
+        }
 
         if (nextItems) {
-          await replacePackageItems(client, request.params.id, nextItems);
+          await replacePackageItems(client, targetPackageId, nextItems);
         }
 
         // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
-        await upsertPackageBranchOffer(client, request.params.id, branchId, {
+        await upsertPackageBranchOffer(client, targetPackageId, branchId, {
           precioHnl,
           activo: nextActivo,
           visiblePublico,
         });
 
-        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [request.params.id, branchId]);
+        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [targetPackageId, branchId]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapAdminPackageRow(finalResult.rows[0]), { requestId: request.id });

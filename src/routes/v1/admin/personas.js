@@ -140,7 +140,31 @@ const usuarioAccessStatusBodySchema = {
 };
 
 const clienteUpdateBodySchema = {
-  ...clienteCreateBodySchema,
+  type: "object",
+  properties: {
+    persona: personaInputSchema,
+    acceso: {
+      type: "object",
+      properties: {
+        habilitar_acceso: { type: "boolean" },
+        correo_principal: { type: "string", minLength: 5, maxLength: 160 },
+      },
+      additionalProperties: false,
+    },
+    cliente: {
+      type: "object",
+      properties: {
+        id_sucursal_origen: { type: ["string", "null"], format: "uuid" },
+        fecha_ingreso: { type: ["string", "null"], format: "date-time" },
+        estado: { type: "boolean" },
+        consentimiento_marketing: { type: "boolean" },
+        acepta_terminos: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  required: ["persona"],
+  additionalProperties: false,
 };
 
 const LIST_PERSONAS_SQL = `
@@ -1388,6 +1412,11 @@ async function createCliente(app, request, payload) {
     const correoPrincipal = normalizeEmail(acceso.correo_principal);
     const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
+    const consentimientoMarketing = Boolean(cliente.consentimiento_marketing);
+    const aceptaTerminos = Boolean(cliente.acepta_terminos);
+    const consentimientosAt = new Date().toISOString();
+    const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
+    const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
     if (!correoPrincipal) {
       throw new AppError(400, "Cliente requiere correo_principal obligatorio", {
@@ -1484,7 +1513,9 @@ async function createCliente(app, request, payload) {
           id_sucursal_origen,
           estado,
           consentimiento_marketing,
-          acepta_terminos
+          acepta_terminos,
+          consentimiento_marketing_at,
+          acepta_terminos_at
         )
         VALUES (
           $1::uuid,
@@ -1493,7 +1524,9 @@ async function createCliente(app, request, payload) {
           $4::uuid,
           COALESCE($5::boolean, TRUE),
           COALESCE($6::boolean, FALSE),
-          COALESCE($7::boolean, FALSE)
+          COALESCE($7::boolean, FALSE),
+          $8::timestamptz,
+          $9::timestamptz
         )
         RETURNING id_cliente
       `,
@@ -1503,8 +1536,10 @@ async function createCliente(app, request, payload) {
         fechaIngreso,
         idSucursalOrigen,
         cliente.estado,
-        cliente.consentimiento_marketing,
-        cliente.acepta_terminos,
+        consentimientoMarketing,
+        aceptaTerminos,
+        consentimientoMarketingAt,
+        aceptaTerminosAt,
       ]
     );
 
@@ -1876,17 +1911,6 @@ async function updateUsuario(app, request, userId, payload) {
 
     if (targetRoleName) {
       const roleId = roleIdsByName.get(targetRoleName);
-      await client.query(
-        `
-          UPDATE public.roles_usuarios
-          SET activo = FALSE,
-              updated_at = NOW()
-          WHERE id_usuario = $1::uuid
-            AND activo IS TRUE
-        `,
-        [raw.id_usuario]
-      );
-
       const revived = await client.query(
         `
           UPDATE public.roles_usuarios
@@ -1911,7 +1935,20 @@ async function updateUsuario(app, request, userId, payload) {
       }
 
       if (currentUsuario.tiene_empleado) {
-        const nextIsBarber = targetRoleName === "barbero";
+        const activeBarberRole = await client.query(
+          `
+            SELECT 1
+            FROM public.roles_usuarios ru
+            JOIN public.roles r
+              ON r.id_rol = ru.id_rol
+            WHERE ru.id_usuario = $1::uuid
+              AND ru.activo IS TRUE
+              AND r.nombre = 'barbero'
+            LIMIT 1
+          `,
+          [raw.id_usuario]
+        );
+        const nextIsBarber = activeBarberRole.rowCount > 0;
         await client.query(
           `
             UPDATE public.empleados
@@ -2197,8 +2234,19 @@ async function updateCliente(app, request, idCliente, payload) {
     const persona = buildPersonaPayload(payload?.persona || {});
     const acceso = payload?.acceso || {};
     const cliente = payload?.cliente || {};
+    const consentimientosAt = new Date().toISOString();
 
-    const habilitarAcceso = Boolean(acceso.habilitar_acceso);
+    const hasHabilitarAccesoPatch = acceso.habilitar_acceso !== undefined;
+    const hasCurrentAccessState =
+      currentRow?.id_usuario !== undefined || currentRow?.tiene_acceso !== undefined;
+    if (!hasHabilitarAccesoPatch && !hasCurrentAccessState) {
+      throw new AppError(500, "No se pudo resolver el estado actual de acceso del cliente", {
+        code: "PERSONAS_CLIENT_ACCESS_STATE_UNRESOLVED",
+      });
+    }
+    const currentHabilitarAcceso =
+      currentRow?.tiene_acceso !== undefined ? Boolean(currentRow.tiene_acceso) : Boolean(currentRow?.id_usuario);
+    const habilitarAcceso = hasHabilitarAccesoPatch ? Boolean(acceso.habilitar_acceso) : currentHabilitarAcceso;
     const correoPrincipal = normalizeEmail(acceso.correo_principal ?? currentRow.correo_principal ?? "");
     const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? currentRow.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
@@ -2228,6 +2276,48 @@ async function updateCliente(app, request, idCliente, payload) {
       excludePersonaId: currentRow.id_persona,
       excludeUserId: currentRow.id_usuario ?? null,
     });
+
+    const currentConsents = await client.query(
+      `
+        SELECT
+          COALESCE(consentimiento_marketing, FALSE) AS consentimiento_marketing,
+          COALESCE(acepta_terminos, FALSE) AS acepta_terminos,
+          consentimiento_marketing_at,
+          acepta_terminos_at
+        FROM public.clientes
+        WHERE id_cliente = $1::uuid
+          AND deleted_at IS NULL
+        LIMIT 1
+      `,
+      [idCliente]
+    );
+    if (!currentConsents.rowCount) {
+      throw new AppError(404, "Cliente no encontrado", {
+        code: "PERSONAS_CLIENT_NOT_FOUND",
+      });
+    }
+    const currentConsentRow = currentConsents.rows[0];
+
+    const nextConsentimientoMarketing =
+      cliente.consentimiento_marketing === undefined
+        ? Boolean(currentConsentRow.consentimiento_marketing)
+        : Boolean(cliente.consentimiento_marketing);
+    const nextAceptaTerminos =
+      cliente.acepta_terminos === undefined
+        ? Boolean(currentConsentRow.acepta_terminos)
+        : Boolean(cliente.acepta_terminos);
+
+    const nextConsentimientoMarketingAt = nextConsentimientoMarketing
+      ? (Boolean(currentConsentRow.consentimiento_marketing) &&
+        currentConsentRow.consentimiento_marketing_at
+          ? currentConsentRow.consentimiento_marketing_at
+          : consentimientosAt)
+      : null;
+    const nextAceptaTerminosAt = nextAceptaTerminos
+      ? (Boolean(currentConsentRow.acepta_terminos) && currentConsentRow.acepta_terminos_at
+          ? currentConsentRow.acepta_terminos_at
+          : consentimientosAt)
+      : null;
 
     const roleIdsByName = await loadRoleIdByName(client);
     if (habilitarAcceso && !currentRow.id_usuario) {
@@ -2329,8 +2419,10 @@ async function updateCliente(app, request, idCliente, payload) {
             fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
             id_sucursal_origen = $4::uuid,
             estado = COALESCE($5::boolean, estado),
-            consentimiento_marketing = COALESCE($6::boolean, consentimiento_marketing),
-            acepta_terminos = COALESCE($7::boolean, acepta_terminos),
+            consentimiento_marketing = $6::boolean,
+            acepta_terminos = $7::boolean,
+            consentimiento_marketing_at = $8::timestamptz,
+            acepta_terminos_at = $9::timestamptz,
             updated_at = NOW()
         WHERE id_cliente = $1::uuid
       `,
@@ -2340,8 +2432,10 @@ async function updateCliente(app, request, idCliente, payload) {
         fechaIngreso,
         idSucursalOrigen,
         cliente.estado,
-        cliente.consentimiento_marketing,
-        cliente.acepta_terminos,
+        nextConsentimientoMarketing,
+        nextAceptaTerminos,
+        nextConsentimientoMarketingAt,
+        nextAceptaTerminosAt,
       ]
     );
 

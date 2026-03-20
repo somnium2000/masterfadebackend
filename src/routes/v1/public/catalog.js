@@ -115,21 +115,27 @@ const PUBLIC_SERVICES_SQL = `
   ),
   service_scope AS (
     SELECT
-      pt.id_servicio,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(pt.precio_hnl)
-        ELSE MAX(pt.precio_hnl)
-      END AS precio_hnl,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(pt.duracion_min)
-        ELSE MAX(pt.duracion_min)
-      END AS duracion_min,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(pt.buffer_min)
-        ELSE MAX(pt.buffer_min)
-      END AS buffer_min
-    FROM picked_tariffs pt
-    GROUP BY pt.id_servicio
+      ranked.id_servicio,
+      ranked.precio_hnl,
+      ranked.duracion_min,
+      ranked.buffer_min
+    FROM (
+      SELECT
+        pt.id_servicio,
+        pt.precio_hnl,
+        pt.duracion_min,
+        pt.buffer_min,
+        ROW_NUMBER() OVER (
+          PARTITION BY pt.id_servicio
+          ORDER BY
+            pt.precio_hnl ASC NULLS LAST,
+            pt.duracion_min ASC NULLS LAST,
+            pt.buffer_min ASC NULLS LAST,
+            pt.id_sucursal::text ASC
+        ) AS rn
+      FROM picked_tariffs pt
+    ) ranked
+    WHERE ranked.rn = 1
   )
   SELECT
     s.id_servicio,
