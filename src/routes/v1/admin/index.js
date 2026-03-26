@@ -1,4 +1,5 @@
 import catalogRoutes from "./catalog.js";
+import configuracionRoutes from "./configuracion.js";
 import adminCitasRoutes from "./citas.js";
 import empleadosRoutes from "./empleados.js";
 import masterPuntosRoutes from "./masterpuntos.js";
@@ -14,4 +15,5 @@ export default async function adminRoutes(app) {
   await app.register(sucursalesRoutes, { prefix: "/sucursales" });
   await app.register(masterPuntosRoutes, { prefix: "/masterpuntos" });
   await app.register(adminCitasRoutes, { prefix: "/citas" });
+
 }
