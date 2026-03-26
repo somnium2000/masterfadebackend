@@ -84,6 +84,49 @@ const sucursalSchema = {
   additionalProperties: false,
 };
 
+const promocionSchema = {
+  type: "object",
+  properties: {
+    id_promocion: { type: "string", format: "uuid" },
+    id_sucursal: { type: ["string", "null"], format: "uuid" },
+    slug: { type: "string" },
+    titulo: { type: "string" },
+    subtitulo: { type: ["string", "null"] },
+    parrafos: { type: "array", items: { type: "string" } },
+    imagen_principal_url: { type: ["string", "null"] },
+    imagen_mobile_url: { type: ["string", "null"] },
+    imagen_alt: { type: ["string", "null"] },
+    cta_texto: { type: ["string", "null"] },
+    cta_url: { type: ["string", "null"] },
+    cta_tipo: { type: "string", enum: ["interno", "externo", "none"] },
+    estado: { type: "string", enum: ["publicada"] },
+    vigencia_desde: { type: ["string", "null"], format: "date" },
+    vigencia_hasta: { type: ["string", "null"], format: "date" },
+    orden_visual: { type: "integer" },
+    destacada: { type: "boolean" },
+  },
+  required: [
+    "id_promocion",
+    "id_sucursal",
+    "slug",
+    "titulo",
+    "subtitulo",
+    "parrafos",
+    "imagen_principal_url",
+    "imagen_mobile_url",
+    "imagen_alt",
+    "cta_texto",
+    "cta_url",
+    "cta_tipo",
+    "estado",
+    "vigencia_desde",
+    "vigencia_hasta",
+    "orden_visual",
+    "destacada",
+  ],
+  additionalProperties: false,
+};
+
 const PUBLIC_SERVICES_SQL = `
   WITH active_tariffs AS (
     SELECT
@@ -256,6 +299,76 @@ const PUBLIC_BRANCHES_SQL = `
   ORDER BY s.nombre_sucursal ASC
 `;
 
+const PUBLIC_PROMOTIONS_SQL = `
+  -- AM: Publica promociones vigentes por sucursal. Si no llega id_sucursal, retorna una version determinista por promocion.
+  WITH scoped_promotions AS (
+    SELECT
+      p.id_promocion,
+      ps.id_sucursal,
+      p.slug,
+      p.titulo,
+      p.subtitulo,
+      p.parrafos,
+      p.imagen_principal_url,
+      p.imagen_mobile_url,
+      p.imagen_alt,
+      p.cta_texto,
+      p.cta_url,
+      p.cta_tipo,
+      p.estado,
+      ps.vigencia_desde,
+      ps.vigencia_hasta,
+      ps.orden_visual,
+      ps.destacada
+    FROM public.promociones p
+    JOIN public.promociones_sucursal ps
+      ON ps.id_promocion = p.id_promocion
+    JOIN public.sucursales s
+      ON s.id_sucursal = ps.id_sucursal
+    WHERE s.deleted_at IS NULL
+      AND s.estado IS TRUE
+      AND p.estado = 'publicada'
+      AND ps.visible_publico IS TRUE
+      AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= CURRENT_DATE)
+      AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= CURRENT_DATE)
+      AND ($1::uuid IS NULL OR ps.id_sucursal = $1::uuid)
+  ),
+  ranked AS (
+    SELECT
+      sp.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY sp.id_promocion
+        ORDER BY
+          CASE WHEN $1::uuid IS NULL THEN 0 ELSE 1 END ASC,
+          sp.destacada DESC,
+          sp.orden_visual ASC,
+          sp.id_sucursal::text ASC
+      ) AS rn
+    FROM scoped_promotions sp
+  )
+  SELECT
+    id_promocion,
+    id_sucursal,
+    slug,
+    titulo,
+    subtitulo,
+    parrafos,
+    imagen_principal_url,
+    imagen_mobile_url,
+    imagen_alt,
+    cta_texto,
+    cta_url,
+    cta_tipo,
+    estado,
+    vigencia_desde,
+    vigencia_hasta,
+    orden_visual,
+    destacada
+  FROM ranked
+  WHERE ($1::uuid IS NULL AND rn = 1) OR ($1::uuid IS NOT NULL)
+  ORDER BY destacada DESC, orden_visual ASC, titulo ASC
+`;
+
 function mapServiceRow(row) {
   const grupoCatalogo = String(row.grupo_catalogo || "barberia").trim().toLowerCase() === "otros" ? "otros" : "barberia";
   const agendable = Boolean(row.agendable ?? (grupoCatalogo === "barberia"));
@@ -294,6 +407,28 @@ function mapBranchRow(row) {
   return {
     id_sucursal: row.id_sucursal,
     nombre_sucursal: row.nombre_sucursal,
+  };
+}
+
+function mapPromotionRow(row) {
+  return {
+    id_promocion: row.id_promocion,
+    id_sucursal: row.id_sucursal ?? null,
+    slug: row.slug,
+    titulo: row.titulo,
+    subtitulo: row.subtitulo ?? null,
+    parrafos: Array.isArray(row.parrafos) ? row.parrafos : [],
+    imagen_principal_url: row.imagen_principal_url ?? null,
+    imagen_mobile_url: row.imagen_mobile_url ?? null,
+    imagen_alt: row.imagen_alt ?? null,
+    cta_texto: row.cta_texto ?? null,
+    cta_url: row.cta_url ?? null,
+    cta_tipo: row.cta_tipo || "none",
+    estado: "publicada",
+    vigencia_desde: row.vigencia_desde ?? null,
+    vigencia_hasta: row.vigencia_hasta ?? null,
+    orden_visual: Number(row.orden_visual ?? 100),
+    destacada: Boolean(row.destacada),
   };
 }
 
@@ -451,6 +586,70 @@ export default async function publicCatalogRoutes(app) {
         return sendError(reply, 500, "No se pudo consultar el catalogo de paquetes", {
           code: "PUBLIC_CATALOG_PACKAGES_ERROR",
           details: error instanceof Error ? error.message : "Unknown public catalog packages error",
+        });
+      }
+    }
+  );
+
+  app.get(
+    "/promociones",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  promociones: { type: "array", items: promocionSchema },
+                },
+                required: ["promociones"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      try {
+        const { rows } = await app.db.query(PUBLIC_PROMOTIONS_SQL, [request.query?.id_sucursal ?? null]);
+        return sendOk(reply, {
+          promociones: rows.map(mapPromotionRow),
+        });
+      } catch (error) {
+        request.log.error({ err: error }, "Public catalog promociones error");
+        if (
+          error?.code === "42P01" &&
+          (String(error?.message || "").includes("promociones_sucursal") || String(error?.message || "").includes("promociones"))
+        ) {
+          return sendError(reply, 500, "Falta aplicar migracion de PROMOCIONES multi-sucursal en la base de datos", {
+            code: "PUBLIC_PROMOTIONS_MIGRATION_REQUIRED",
+            details: error.message,
+          });
+        }
+        return sendError(reply, 500, "No se pudo consultar el catalogo de promociones", {
+          code: "PUBLIC_CATALOG_PROMOTIONS_ERROR",
+          details: error instanceof Error ? error.message : "Unknown public catalog promotions error",
         });
       }
     }

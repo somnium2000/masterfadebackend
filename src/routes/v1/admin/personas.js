@@ -354,6 +354,7 @@ const USUARIO_BY_ID_SQL = `
 `;
 
 const FK_RELATIONS_CACHE = new Map();
+let clientsConsentColumnsCache = null;
 
 function normalizeRequired(value) {
   return String(value || "").trim();
@@ -795,6 +796,27 @@ async function ensureActiveBranch(client, branchId) {
     });
   }
   return raw;
+}
+
+async function hasClientsConsentTimestampColumns(client) {
+  if (clientsConsentColumnsCache !== null) {
+    return clientsConsentColumnsCache;
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'clientes'
+        AND column_name IN ('acepta_terminos_at', 'consentimiento_marketing_at')
+    `
+  );
+
+  const columns = new Set(rows.map((row) => String(row.column_name)));
+  clientsConsentColumnsCache =
+    columns.has("acepta_terminos_at") && columns.has("consentimiento_marketing_at");
+  return clientsConsentColumnsCache;
 }
 
 async function ensureEmailAvailability(client, email, { excludePersonaId = null, excludeUserId = null } = {}) {
@@ -1504,44 +1526,78 @@ async function createCliente(app, request, payload) {
       );
     }
 
-    const clienteInsert = await client.query(
-      `
-        INSERT INTO public.clientes (
-          id_persona,
-          id_usuario,
-          fecha_ingreso,
-          id_sucursal_origen,
-          estado,
-          consentimiento_marketing,
-          acepta_terminos,
-          consentimiento_marketing_at,
-          acepta_terminos_at
+    const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
+    const clienteInsert = hasConsentTimestampColumns
+      ? await client.query(
+          `
+            INSERT INTO public.clientes (
+              id_persona,
+              id_usuario,
+              fecha_ingreso,
+              id_sucursal_origen,
+              estado,
+              consentimiento_marketing,
+              acepta_terminos,
+              consentimiento_marketing_at,
+              acepta_terminos_at
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              COALESCE($3::timestamptz, NOW()),
+              $4::uuid,
+              COALESCE($5::boolean, TRUE),
+              COALESCE($6::boolean, FALSE),
+              COALESCE($7::boolean, FALSE),
+              $8::timestamptz,
+              $9::timestamptz
+            )
+            RETURNING id_cliente
+          `,
+          [
+            idPersona,
+            authUserId,
+            fechaIngreso,
+            idSucursalOrigen,
+            cliente.estado,
+            consentimientoMarketing,
+            aceptaTerminos,
+            consentimientoMarketingAt,
+            aceptaTerminosAt,
+          ]
         )
-        VALUES (
-          $1::uuid,
-          $2::uuid,
-          COALESCE($3::timestamptz, NOW()),
-          $4::uuid,
-          COALESCE($5::boolean, TRUE),
-          COALESCE($6::boolean, FALSE),
-          COALESCE($7::boolean, FALSE),
-          $8::timestamptz,
-          $9::timestamptz
-        )
-        RETURNING id_cliente
-      `,
-      [
-        idPersona,
-        authUserId,
-        fechaIngreso,
-        idSucursalOrigen,
-        cliente.estado,
-        consentimientoMarketing,
-        aceptaTerminos,
-        consentimientoMarketingAt,
-        aceptaTerminosAt,
-      ]
-    );
+      : await client.query(
+          `
+            INSERT INTO public.clientes (
+              id_persona,
+              id_usuario,
+              fecha_ingreso,
+              id_sucursal_origen,
+              estado,
+              consentimiento_marketing,
+              acepta_terminos
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              COALESCE($3::timestamptz, NOW()),
+              $4::uuid,
+              COALESCE($5::boolean, TRUE),
+              COALESCE($6::boolean, FALSE),
+              COALESCE($7::boolean, FALSE)
+            )
+            RETURNING id_cliente
+          `,
+          [
+            idPersona,
+            authUserId,
+            fechaIngreso,
+            idSucursalOrigen,
+            cliente.estado,
+            consentimientoMarketing,
+            aceptaTerminos,
+          ]
+        );
 
     const detail = await client.query(CLIENTE_BY_ID_SQL, [clienteInsert.rows[0].id_cliente]);
 
@@ -2277,20 +2333,36 @@ async function updateCliente(app, request, idCliente, payload) {
       excludeUserId: currentRow.id_usuario ?? null,
     });
 
-    const currentConsents = await client.query(
-      `
-        SELECT
-          COALESCE(consentimiento_marketing, FALSE) AS consentimiento_marketing,
-          COALESCE(acepta_terminos, FALSE) AS acepta_terminos,
-          consentimiento_marketing_at,
-          acepta_terminos_at
-        FROM public.clientes
-        WHERE id_cliente = $1::uuid
-          AND deleted_at IS NULL
-        LIMIT 1
-      `,
-      [idCliente]
-    );
+    const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
+    const currentConsents = hasConsentTimestampColumns
+      ? await client.query(
+          `
+            SELECT
+              COALESCE(consentimiento_marketing, FALSE) AS consentimiento_marketing,
+              COALESCE(acepta_terminos, FALSE) AS acepta_terminos,
+              consentimiento_marketing_at,
+              acepta_terminos_at
+            FROM public.clientes
+            WHERE id_cliente = $1::uuid
+              AND deleted_at IS NULL
+            LIMIT 1
+          `,
+          [idCliente]
+        )
+      : await client.query(
+          `
+            SELECT
+              COALESCE(consentimiento_marketing, FALSE) AS consentimiento_marketing,
+              COALESCE(acepta_terminos, FALSE) AS acepta_terminos,
+              NULL::timestamptz AS consentimiento_marketing_at,
+              NULL::timestamptz AS acepta_terminos_at
+            FROM public.clientes
+            WHERE id_cliente = $1::uuid
+              AND deleted_at IS NULL
+            LIMIT 1
+          `,
+          [idCliente]
+        );
     if (!currentConsents.rowCount) {
       throw new AppError(404, "Cliente no encontrado", {
         code: "PERSONAS_CLIENT_NOT_FOUND",
@@ -2412,32 +2484,57 @@ async function updateCliente(app, request, idCliente, payload) {
       }
     }
 
-    await client.query(
-      `
-        UPDATE public.clientes
-        SET id_usuario = $2::uuid,
-            fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
-            id_sucursal_origen = $4::uuid,
-            estado = COALESCE($5::boolean, estado),
-            consentimiento_marketing = $6::boolean,
-            acepta_terminos = $7::boolean,
-            consentimiento_marketing_at = $8::timestamptz,
-            acepta_terminos_at = $9::timestamptz,
-            updated_at = NOW()
-        WHERE id_cliente = $1::uuid
-      `,
-      [
-        idCliente,
-        nextUserId,
-        fechaIngreso,
-        idSucursalOrigen,
-        cliente.estado,
-        nextConsentimientoMarketing,
-        nextAceptaTerminos,
-        nextConsentimientoMarketingAt,
-        nextAceptaTerminosAt,
-      ]
-    );
+    if (hasConsentTimestampColumns) {
+      await client.query(
+        `
+          UPDATE public.clientes
+          SET id_usuario = $2::uuid,
+              fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
+              id_sucursal_origen = $4::uuid,
+              estado = COALESCE($5::boolean, estado),
+              consentimiento_marketing = $6::boolean,
+              acepta_terminos = $7::boolean,
+              consentimiento_marketing_at = $8::timestamptz,
+              acepta_terminos_at = $9::timestamptz,
+              updated_at = NOW()
+          WHERE id_cliente = $1::uuid
+        `,
+        [
+          idCliente,
+          nextUserId,
+          fechaIngreso,
+          idSucursalOrigen,
+          cliente.estado,
+          nextConsentimientoMarketing,
+          nextAceptaTerminos,
+          nextConsentimientoMarketingAt,
+          nextAceptaTerminosAt,
+        ]
+      );
+    } else {
+      await client.query(
+        `
+          UPDATE public.clientes
+          SET id_usuario = $2::uuid,
+              fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
+              id_sucursal_origen = $4::uuid,
+              estado = COALESCE($5::boolean, estado),
+              consentimiento_marketing = $6::boolean,
+              acepta_terminos = $7::boolean,
+              updated_at = NOW()
+          WHERE id_cliente = $1::uuid
+        `,
+        [
+          idCliente,
+          nextUserId,
+          fechaIngreso,
+          idSucursalOrigen,
+          cliente.estado,
+          nextConsentimientoMarketing,
+          nextAceptaTerminos,
+        ]
+      );
+    }
 
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 

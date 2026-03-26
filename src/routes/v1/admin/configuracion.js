@@ -102,6 +102,66 @@ const BASE_PARAMETER_DEFS = {
   },
 };
 
+const PROMOTION_STATES = ["borrador", "publicada", "archivada"];
+const PROMOTION_CTA_TYPES = ["interno", "externo", "none"];
+
+const promotionParagraphSchema = {
+  type: "array",
+  maxItems: 8,
+  items: { type: "string", minLength: 1, maxLength: 420 },
+};
+
+const promotionBodySchema = {
+  type: "object",
+  properties: {
+    id_sucursal: { type: "string", format: "uuid" },
+    slug: { type: "string", minLength: 3, maxLength: 140 },
+    titulo: { type: "string", minLength: 3, maxLength: 120 },
+    subtitulo: { type: ["string", "null"], maxLength: 180 },
+    parrafos: promotionParagraphSchema,
+    imagen_principal_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_mobile_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_alt: { type: ["string", "null"], maxLength: 180 },
+    cta_texto: { type: ["string", "null"], maxLength: 80 },
+    cta_url: { type: ["string", "null"], maxLength: 500 },
+    cta_tipo: { type: "string", enum: PROMOTION_CTA_TYPES },
+    estado: { type: "string", enum: PROMOTION_STATES },
+    visible_publico: { type: "boolean" },
+    vigencia_desde: { type: ["string", "null"], format: "date" },
+    vigencia_hasta: { type: ["string", "null"], format: "date" },
+    orden_visual: { type: "integer", minimum: 0 },
+    destacada: { type: "boolean" },
+  },
+  required: ["id_sucursal", "titulo"],
+  additionalProperties: false,
+};
+
+const promotionPatchSchema = {
+  type: "object",
+  properties: {
+    id_sucursal: { type: "string", format: "uuid" },
+    slug: { type: "string", minLength: 3, maxLength: 140 },
+    titulo: { type: "string", minLength: 3, maxLength: 120 },
+    subtitulo: { type: ["string", "null"], maxLength: 180 },
+    parrafos: promotionParagraphSchema,
+    imagen_principal_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_mobile_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_alt: { type: ["string", "null"], maxLength: 180 },
+    cta_texto: { type: ["string", "null"], maxLength: 80 },
+    cta_url: { type: ["string", "null"], maxLength: 500 },
+    cta_tipo: { type: "string", enum: PROMOTION_CTA_TYPES },
+    estado: { type: "string", enum: PROMOTION_STATES },
+    visible_publico: { type: "boolean" },
+    vigencia_desde: { type: ["string", "null"], format: "date" },
+    vigencia_hasta: { type: ["string", "null"], format: "date" },
+    orden_visual: { type: "integer", minimum: 0 },
+    destacada: { type: "boolean" },
+  },
+  required: ["id_sucursal"],
+  minProperties: 2,
+  additionalProperties: false,
+};
+
 function normalizeRequiredText(value, fieldName) {
   const trimmed = String(value || "").trim();
   if (!trimmed) {
@@ -439,11 +499,298 @@ async function buildBaseParametersPayload(client, idSucursal) {
   };
 }
 
+function normalizeSlug(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized;
+}
+
+function normalizeParagraphs(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "parrafos debe ser un arreglo de texto", {
+      code: "CONFIG_PROMOTION_PARAGRAPHS_INVALID",
+    });
+  }
+  const normalized = value
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean);
+  if (normalized.length > 8) {
+    throw new AppError(400, "parrafos no puede tener mas de 8 elementos", {
+      code: "CONFIG_PROMOTION_PARAGRAPHS_INVALID",
+    });
+  }
+  return normalized;
+}
+
+function normalizePromotionState(value, fallback = "borrador") {
+  const normalized = String(value || fallback).trim().toLowerCase();
+  if (!PROMOTION_STATES.includes(normalized)) {
+    throw new AppError(400, "estado de promocion invalido", {
+      code: "CONFIG_PROMOTION_STATE_INVALID",
+    });
+  }
+  return normalized;
+}
+
+function normalizePromotionCtaType(value, fallback = "none") {
+  const normalized = String(value || fallback).trim().toLowerCase();
+  if (!PROMOTION_CTA_TYPES.includes(normalized)) {
+    throw new AppError(400, "cta_tipo invalido", {
+      code: "CONFIG_PROMOTION_CTA_TYPE_INVALID",
+    });
+  }
+  return normalized;
+}
+
+function normalizeDateOnly(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const raw = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new AppError(400, "Formato de fecha invalido; usa YYYY-MM-DD", {
+      code: "CONFIG_PROMOTION_DATE_INVALID",
+    });
+  }
+  return raw;
+}
+
+function mapPromotionRow(row) {
+  return {
+    id_promocion: row.id_promocion,
+    id_sucursal: row.id_sucursal,
+    slug: row.slug,
+    titulo: row.titulo,
+    subtitulo: row.subtitulo ?? null,
+    parrafos: Array.isArray(row.parrafos) ? row.parrafos : [],
+    imagen_principal_url: row.imagen_principal_url ?? null,
+    imagen_mobile_url: row.imagen_mobile_url ?? null,
+    imagen_alt: row.imagen_alt ?? null,
+    cta_texto: row.cta_texto ?? null,
+    cta_url: row.cta_url ?? null,
+    cta_tipo: row.cta_tipo ?? "none",
+    estado: row.estado,
+    visible_publico: Boolean(row.visible_publico),
+    vigencia_desde: row.vigencia_desde ?? null,
+    vigencia_hasta: row.vigencia_hasta ?? null,
+    orden_visual: Number(row.orden_visual ?? 100),
+    destacada: Boolean(row.destacada),
+    created_at: row.created_at ?? null,
+    updated_at: row.updated_at ?? null,
+  };
+}
+
+async function getPromotionScoped(client, idPromocion, idSucursal) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        p.id_promocion,
+        ps.id_sucursal,
+        p.slug,
+        p.titulo,
+        p.subtitulo,
+        p.parrafos,
+        p.imagen_principal_url,
+        p.imagen_mobile_url,
+        p.imagen_alt,
+        p.cta_texto,
+        p.cta_url,
+        p.cta_tipo,
+        p.estado,
+        ps.visible_publico,
+        ps.vigencia_desde,
+        ps.vigencia_hasta,
+        ps.orden_visual,
+        ps.destacada,
+        p.created_at,
+        GREATEST(p.updated_at, ps.updated_at) AS updated_at
+      FROM public.promociones p
+      JOIN public.promociones_sucursal ps
+        ON ps.id_promocion = p.id_promocion
+      WHERE p.id_promocion = $1::uuid
+        AND ps.id_sucursal = $2::uuid
+      LIMIT 1
+    `,
+    [idPromocion, idSucursal]
+  );
+  return rows[0] ?? null;
+}
+
+async function listPromotions(client, idSucursal = null) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        p.id_promocion,
+        ps.id_sucursal,
+        p.slug,
+        p.titulo,
+        p.subtitulo,
+        p.parrafos,
+        p.imagen_principal_url,
+        p.imagen_mobile_url,
+        p.imagen_alt,
+        p.cta_texto,
+        p.cta_url,
+        p.cta_tipo,
+        p.estado,
+        ps.visible_publico,
+        ps.vigencia_desde,
+        ps.vigencia_hasta,
+        ps.orden_visual,
+        ps.destacada,
+        p.created_at,
+        GREATEST(p.updated_at, ps.updated_at) AS updated_at
+      FROM public.promociones p
+      JOIN public.promociones_sucursal ps
+        ON ps.id_promocion = p.id_promocion
+      JOIN public.sucursales s
+        ON s.id_sucursal = ps.id_sucursal
+      WHERE s.deleted_at IS NULL
+        AND s.estado IS TRUE
+        AND ($1::uuid IS NULL OR ps.id_sucursal = $1::uuid)
+      ORDER BY ps.orden_visual ASC, p.titulo ASC, ps.id_sucursal ASC
+    `,
+    [idSucursal]
+  );
+  return rows.map(mapPromotionRow);
+}
+
+function validatePromotionPublication(values) {
+  if (!Number.isInteger(Number(values.orden_visual)) || Number(values.orden_visual) < 0) {
+    throw new AppError(400, "orden_visual debe ser un entero mayor o igual a 0", {
+      code: "CONFIG_PROMOTION_ORDER_INVALID",
+    });
+  }
+
+  if (values.vigencia_desde && values.vigencia_hasta && values.vigencia_hasta < values.vigencia_desde) {
+    throw new AppError(400, "vigencia_hasta no puede ser menor que vigencia_desde", {
+      code: "CONFIG_PROMOTION_VIGENCY_INVALID",
+    });
+  }
+
+  if (values.cta_tipo === "none") {
+    if (String(values.cta_texto || "").trim() || String(values.cta_url || "").trim()) {
+      throw new AppError(400, "Si cta_tipo es none, cta_texto y cta_url deben ir vacios", {
+        code: "CONFIG_PROMOTION_CTA_NONE_INVALID",
+      });
+    }
+  } else {
+    if (!String(values.cta_texto || "").trim()) {
+      throw new AppError(400, "cta_texto es requerido cuando cta_tipo es interno o externo", {
+        code: "CONFIG_PROMOTION_CTA_TEXT_REQUIRED",
+      });
+    }
+    if (!String(values.cta_url || "").trim()) {
+      throw new AppError(400, "cta_url es requerido cuando cta_tipo es interno o externo", {
+        code: "CONFIG_PROMOTION_CTA_URL_REQUIRED",
+      });
+    }
+  }
+
+  if (values.estado === "archivada" && values.visible_publico) {
+    throw new AppError(400, "Una promocion archivada no puede estar visible_publico=true", {
+      code: "CONFIG_PROMOTION_ARCHIVED_VISIBILITY_INVALID",
+    });
+  }
+
+  if (values.estado === "publicada") {
+    if (!values.visible_publico) {
+      throw new AppError(400, "Una promocion publicada debe ser visible_publico=true", {
+        code: "CONFIG_PROMOTION_PUBLIC_VISIBILITY_REQUIRED",
+      });
+    }
+    if (!values.vigencia_desde) {
+      throw new AppError(400, "Una promocion publicada requiere vigencia_desde", {
+        code: "CONFIG_PROMOTION_VIGENCY_REQUIRED",
+      });
+    }
+    if (!String(values.titulo || "").trim()) {
+      throw new AppError(400, "Una promocion publicada requiere titulo", {
+        code: "CONFIG_PROMOTION_TITLE_REQUIRED",
+      });
+    }
+    if (!Array.isArray(values.parrafos) || values.parrafos.length === 0) {
+      throw new AppError(400, "Una promocion publicada requiere al menos un parrafo", {
+        code: "CONFIG_PROMOTION_PARAGRAPHS_REQUIRED",
+      });
+    }
+    if (!String(values.imagen_principal_url || "").trim()) {
+      throw new AppError(400, "Una promocion publicada requiere imagen_principal_url", {
+        code: "CONFIG_PROMOTION_IMAGE_REQUIRED",
+      });
+    }
+  }
+}
+
+async function ensurePromotionSlugUnique(client, slug, excludePromotionId = null) {
+  const { rows } = await client.query(
+    `
+      SELECT id_promocion
+      FROM public.promociones
+      WHERE LOWER(TRIM(slug)) = LOWER(TRIM($1))
+        AND ($2::uuid IS NULL OR id_promocion <> $2::uuid)
+      LIMIT 1
+    `,
+    [slug, excludePromotionId]
+  );
+  if (rows[0]) {
+    throw new AppError(409, "Ya existe una promocion con ese slug", {
+      code: "CONFIG_PROMOTION_DUPLICATE_SLUG",
+    });
+  }
+}
+
+async function ensureFeaturedPromotionConflict(client, { idSucursal, idPromocion = null, estado, visiblePublico, destacada, vigenciaDesde, vigenciaHasta }) {
+  if (!(destacada && estado === "publicada" && visiblePublico)) {
+    return;
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT 1
+      FROM public.promociones_sucursal ps
+      JOIN public.promociones p
+        ON p.id_promocion = ps.id_promocion
+      WHERE ps.id_sucursal = $1::uuid
+        AND ps.destacada IS TRUE
+        AND p.estado = 'publicada'
+        AND ps.visible_publico IS TRUE
+        AND ($2::uuid IS NULL OR ps.id_promocion <> $2::uuid)
+        AND COALESCE(ps.vigencia_hasta, 'infinity'::date) >= COALESCE($3::date, '-infinity'::date)
+        AND COALESCE($4::date, 'infinity'::date) >= COALESCE(ps.vigencia_desde, '-infinity'::date)
+      LIMIT 1
+    `,
+    [idSucursal, idPromocion, vigenciaDesde, vigenciaHasta]
+  );
+
+  if (rows[0]) {
+    throw new AppError(409, "Ya existe una promocion destacada publicada en el rango de vigencia para esta sucursal", {
+      code: "CONFIG_PROMOTION_FEATURED_CONFLICT",
+    });
+  }
+}
+
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
       details: error.details,
+      requestId: request.id,
+    });
+  }
+
+  if (
+    error?.code === "42P01" &&
+    (String(error?.message || "").includes("promociones_sucursal") || String(error?.message || "").includes("promociones"))
+  ) {
+    return sendError(reply, 500, "Falta aplicar migracion de PROMOCIONES multi-sucursal en la base de datos", {
+      code: "CONFIG_PROMOTIONS_MIGRATION_REQUIRED",
+      details: error.message,
       requestId: request.id,
     });
   }
@@ -934,6 +1281,444 @@ export default async function adminConfiguracionRoutes(app) {
       } catch (error) {
         await client.query("ROLLBACK").catch(() => {});
         return sendHandledError(reply, request, error, "No se pudieron actualizar parametros base de configuracion", "CONFIG_PARAMETERS_PATCH_ERROR");
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.get(
+    "/promociones",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      schema: {
+        querystring: optionalQuerySchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+      try {
+        const branchId = request.query?.id_sucursal
+          ? await ensureBranchExists(client, request.query.id_sucursal)
+          : null;
+        const promociones = await listPromotions(client, branchId);
+        return sendOk(reply, { id_sucursal: branchId, promociones }, { requestId: request.id });
+      } catch (error) {
+        return sendHandledError(reply, request, error, "No se pudo consultar promociones de configuracion", "CONFIG_PROMOTIONS_GET_ERROR");
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.get(
+    "/promociones/:id",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        querystring: {
+          type: "object",
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          required: ["id_sucursal"],
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+      try {
+        const branchId = await ensureBranchExists(client, request.query?.id_sucursal);
+        const promocion = await getPromotionScoped(client, request.params.id, branchId);
+        if (!promocion) {
+          throw new AppError(404, "La promocion indicada no existe para la sucursal", {
+            code: "CONFIG_PROMOTION_NOT_FOUND",
+          });
+        }
+        return sendOk(reply, { promocion: mapPromotionRow(promocion) }, { requestId: request.id });
+      } catch (error) {
+        return sendHandledError(reply, request, error, "No se pudo consultar el detalle de promocion", "CONFIG_PROMOTION_DETAIL_ERROR");
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/promociones",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      schema: {
+        body: promotionBodySchema,
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+      try {
+        const branchId = await ensureBranchExists(client, request.body.id_sucursal);
+        const titulo = normalizeRequiredText(request.body.titulo, "titulo");
+        const slug = normalizeSlug(request.body.slug || titulo);
+        if (!slug) {
+          throw new AppError(400, "No se pudo generar un slug valido para la promocion", {
+            code: "CONFIG_PROMOTION_SLUG_INVALID",
+          });
+        }
+
+        const subtitulo = normalizeOptionalText(request.body.subtitulo) ?? null;
+        const parrafos = normalizeParagraphs(request.body.parrafos) ?? [];
+        const imagenPrincipalUrl = normalizeOptionalText(request.body.imagen_principal_url) ?? null;
+        const imagenMobileUrl = normalizeOptionalText(request.body.imagen_mobile_url) ?? null;
+        const imagenAlt = normalizeOptionalText(request.body.imagen_alt) ?? null;
+        const ctaTexto = normalizeOptionalText(request.body.cta_texto) ?? null;
+        const ctaUrl = normalizeOptionalText(request.body.cta_url) ?? null;
+        const ctaTipo = normalizePromotionCtaType(request.body.cta_tipo, "none");
+        const normalizedCtaTexto = ctaTipo === "none" ? null : ctaTexto;
+        const normalizedCtaUrl = ctaTipo === "none" ? null : ctaUrl;
+        const estado = normalizePromotionState(request.body.estado, "borrador");
+        const visiblePublico = Boolean(request.body.visible_publico ?? false);
+        const vigenciaDesde = normalizeDateOnly(request.body.vigencia_desde) ?? null;
+        const vigenciaHasta = normalizeDateOnly(request.body.vigencia_hasta) ?? null;
+        const ordenVisual = Number.isFinite(Number(request.body.orden_visual)) ? Number(request.body.orden_visual) : 100;
+        const destacada = Boolean(request.body.destacada ?? false);
+
+        const publicationSnapshot = {
+          titulo,
+          parrafos,
+          imagen_principal_url: imagenPrincipalUrl,
+          cta_texto: normalizedCtaTexto,
+          cta_url: normalizedCtaUrl,
+          cta_tipo: ctaTipo,
+          estado,
+          visible_publico: visiblePublico,
+          vigencia_desde: vigenciaDesde,
+          vigencia_hasta: vigenciaHasta,
+          orden_visual: ordenVisual,
+        };
+        validatePromotionPublication(publicationSnapshot);
+
+        await ensurePromotionSlugUnique(client, slug);
+        await ensureFeaturedPromotionConflict(client, {
+          idSucursal: branchId,
+          estado,
+          visiblePublico,
+          destacada,
+          vigenciaDesde,
+          vigenciaHasta,
+        });
+
+        await client.query("BEGIN");
+        const inserted = await client.query(
+          `
+            INSERT INTO public.promociones (
+              slug,
+              titulo,
+              subtitulo,
+              parrafos,
+              imagen_principal_url,
+              imagen_mobile_url,
+              imagen_alt,
+              cta_texto,
+              cta_url,
+              cta_tipo,
+              estado,
+              updated_at
+            )
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, NOW())
+            RETURNING id_promocion
+          `,
+          [slug, titulo, subtitulo, JSON.stringify(parrafos), imagenPrincipalUrl, imagenMobileUrl, imagenAlt, normalizedCtaTexto, normalizedCtaUrl, ctaTipo, estado]
+        );
+
+        const idPromocion = inserted.rows[0].id_promocion;
+
+        await client.query(
+          `
+            INSERT INTO public.promociones_sucursal (
+              id_promocion,
+              id_sucursal,
+              visible_publico,
+              vigencia_desde,
+              vigencia_hasta,
+              orden_visual,
+              destacada,
+              updated_at
+            )
+            VALUES ($1::uuid, $2::uuid, $3::boolean, $4::date, $5::date, $6::int, $7::boolean, NOW())
+          `,
+          [idPromocion, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, ordenVisual, destacada]
+        );
+
+        const finalPromotion = await getPromotionScoped(client, idPromocion, branchId);
+        if (!finalPromotion) {
+          throw new AppError(404, "No se pudo recuperar la promocion creada para la sucursal", {
+            code: "CONFIG_PROMOTION_NOT_FOUND",
+          });
+        }
+        await client.query("COMMIT");
+
+        return sendOk(reply, { promocion: mapPromotionRow(finalPromotion) }, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        return sendHandledError(reply, request, error, "No se pudo crear la promocion", "CONFIG_PROMOTION_CREATE_ERROR");
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.patch(
+    "/promociones/:id",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        body: promotionPatchSchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+      try {
+        const branchId = await ensureBranchExists(client, request.body.id_sucursal);
+        const currentPromotion = await getPromotionScoped(client, request.params.id, branchId);
+        if (!currentPromotion) {
+          throw new AppError(404, "La promocion indicada no existe para la sucursal", {
+            code: "CONFIG_PROMOTION_NOT_FOUND",
+          });
+        }
+
+        const titulo =
+          request.body.titulo !== undefined
+            ? normalizeRequiredText(request.body.titulo, "titulo")
+            : currentPromotion.titulo;
+        const slug =
+          request.body.slug !== undefined
+            ? normalizeSlug(request.body.slug)
+            : currentPromotion.slug;
+        if (!slug) {
+          throw new AppError(400, "slug invalido", {
+            code: "CONFIG_PROMOTION_SLUG_INVALID",
+          });
+        }
+
+        const subtitulo =
+          request.body.subtitulo !== undefined
+            ? normalizeOptionalText(request.body.subtitulo) ?? null
+            : currentPromotion.subtitulo;
+        const parrafos =
+          request.body.parrafos !== undefined
+            ? normalizeParagraphs(request.body.parrafos) ?? []
+            : (Array.isArray(currentPromotion.parrafos) ? currentPromotion.parrafos : []);
+        const imagenPrincipalUrl =
+          request.body.imagen_principal_url !== undefined
+            ? normalizeOptionalText(request.body.imagen_principal_url) ?? null
+            : currentPromotion.imagen_principal_url;
+        const imagenMobileUrl =
+          request.body.imagen_mobile_url !== undefined
+            ? normalizeOptionalText(request.body.imagen_mobile_url) ?? null
+            : currentPromotion.imagen_mobile_url;
+        const imagenAlt =
+          request.body.imagen_alt !== undefined
+            ? normalizeOptionalText(request.body.imagen_alt) ?? null
+            : currentPromotion.imagen_alt;
+        const ctaTexto =
+          request.body.cta_texto !== undefined
+            ? normalizeOptionalText(request.body.cta_texto) ?? null
+            : currentPromotion.cta_texto;
+        const ctaUrl =
+          request.body.cta_url !== undefined
+            ? normalizeOptionalText(request.body.cta_url) ?? null
+            : currentPromotion.cta_url;
+        const ctaTipo =
+          request.body.cta_tipo !== undefined
+            ? normalizePromotionCtaType(request.body.cta_tipo)
+            : normalizePromotionCtaType(currentPromotion.cta_tipo, "none");
+        const normalizedCtaTexto = ctaTipo === "none" ? null : ctaTexto;
+        const normalizedCtaUrl = ctaTipo === "none" ? null : ctaUrl;
+        const estado =
+          request.body.estado !== undefined
+            ? normalizePromotionState(request.body.estado)
+            : normalizePromotionState(currentPromotion.estado, "borrador");
+        const visiblePublico =
+          request.body.visible_publico !== undefined
+            ? Boolean(request.body.visible_publico)
+            : Boolean(currentPromotion.visible_publico);
+        const vigenciaDesde =
+          request.body.vigencia_desde !== undefined
+            ? normalizeDateOnly(request.body.vigencia_desde)
+            : currentPromotion.vigencia_desde;
+        const vigenciaHasta =
+          request.body.vigencia_hasta !== undefined
+            ? normalizeDateOnly(request.body.vigencia_hasta)
+            : currentPromotion.vigencia_hasta;
+        const ordenVisual =
+          request.body.orden_visual !== undefined
+            ? Number(request.body.orden_visual)
+            : Number(currentPromotion.orden_visual ?? 100);
+        const destacada =
+          request.body.destacada !== undefined
+            ? Boolean(request.body.destacada)
+            : Boolean(currentPromotion.destacada);
+
+        const publicationSnapshot = {
+          titulo,
+          parrafos,
+          imagen_principal_url: imagenPrincipalUrl,
+          cta_texto: normalizedCtaTexto,
+          cta_url: normalizedCtaUrl,
+          cta_tipo: ctaTipo,
+          estado,
+          visible_publico: visiblePublico,
+          vigencia_desde: vigenciaDesde,
+          vigencia_hasta: vigenciaHasta,
+          orden_visual: ordenVisual,
+        };
+        validatePromotionPublication(publicationSnapshot);
+
+        await ensurePromotionSlugUnique(client, slug, request.params.id);
+        await ensureFeaturedPromotionConflict(client, {
+          idSucursal: branchId,
+          idPromocion: request.params.id,
+          estado,
+          visiblePublico,
+          destacada,
+          vigenciaDesde,
+          vigenciaHasta,
+        });
+
+        await client.query("BEGIN");
+        await client.query(
+          `
+            UPDATE public.promociones
+            SET
+              slug = $2,
+              titulo = $3,
+              subtitulo = $4,
+              parrafos = $5::jsonb,
+              imagen_principal_url = $6,
+              imagen_mobile_url = $7,
+              imagen_alt = $8,
+              cta_texto = $9,
+              cta_url = $10,
+              cta_tipo = $11,
+              estado = $12,
+              updated_at = NOW()
+            WHERE id_promocion = $1::uuid
+          `,
+          [request.params.id, slug, titulo, subtitulo, JSON.stringify(parrafos), imagenPrincipalUrl, imagenMobileUrl, imagenAlt, normalizedCtaTexto, normalizedCtaUrl, ctaTipo, estado]
+        );
+
+        await client.query(
+          `
+            UPDATE public.promociones_sucursal
+            SET
+              visible_publico = $3::boolean,
+              vigencia_desde = $4::date,
+              vigencia_hasta = $5::date,
+              orden_visual = $6::int,
+              destacada = $7::boolean,
+              updated_at = NOW()
+            WHERE id_promocion = $1::uuid
+              AND id_sucursal = $2::uuid
+          `,
+          [request.params.id, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, ordenVisual, destacada]
+        );
+
+        const finalPromotion = await getPromotionScoped(client, request.params.id, branchId);
+        if (!finalPromotion) {
+          throw new AppError(404, "No se pudo recuperar la promocion actualizada para la sucursal", {
+            code: "CONFIG_PROMOTION_NOT_FOUND",
+          });
+        }
+        await client.query("COMMIT");
+
+        return sendOk(reply, { promocion: mapPromotionRow(finalPromotion) }, { requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        return sendHandledError(reply, request, error, "No se pudo actualizar la promocion", "CONFIG_PROMOTION_UPDATE_ERROR");
       } finally {
         client.release();
       }
