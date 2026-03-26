@@ -17,6 +17,14 @@ const idParamSchema = {
   additionalProperties: false,
 };
 
+const listSucursalesQuerySchema = {
+  type: "object",
+  properties: {
+    solo_activas: { type: "boolean" },
+  },
+  additionalProperties: false,
+};
+
 const sucursalCreateBodySchema = {
   type: "object",
   required: ["id_empresa", "nombre_sucursal"],
@@ -62,6 +70,11 @@ const SUCURSAL_SELECT_SQL = `
 `;
 
 const LIST_SUCURSALES_SQL = `${SUCURSAL_SELECT_SQL}
+  ORDER BY s.nombre_sucursal ASC
+`;
+
+const LIST_ACTIVE_SUCURSALES_SQL = `${SUCURSAL_SELECT_SQL}
+  AND COALESCE(s.estado, TRUE) IS TRUE
   ORDER BY s.nombre_sucursal ASC
 `;
 
@@ -428,9 +441,10 @@ async function setSucursalState(client, idSucursal, targetState) {
 
 export default async function adminSucursalesRoutes(app) {
   // JK: Listado principal para el modulo SUCURSALES, restringido a SUPER_ADMIN en esta fase.
-  app.get("/", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_SUCURSALES_SQL);
+      const onlyActive = request.query?.solo_activas === true || request.query?.solo_activas === "true";
+      const { rows } = await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL);
       return sendOk(reply, { sucursales: rows.map(mapSucursal) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar sucursales", "SUCURSALES_LIST_ERROR");

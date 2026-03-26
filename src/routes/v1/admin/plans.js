@@ -434,24 +434,34 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
       });
     }
 
-    if (isSuperAdmin) {
-      const { rowCount } = await client.query(
-        "SELECT 1 FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL AND estado IS TRUE",
-        [requestedBranchId]
-      );
+    const { rowCount } = await client.query(
+      "SELECT 1 FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL AND estado IS TRUE",
+      [requestedBranchId]
+    );
 
-      if (!rowCount) {
-        throw new AppError(404, "La sucursal indicada no existe o no esta activa", {
-          code: "CATALOG_BRANCH_NOT_FOUND",
-        });
-      }
+    if (!rowCount) {
+      throw new AppError(404, "La sucursal indicada no existe o no esta activa", {
+        code: "CATALOG_BRANCH_NOT_FOUND",
+      });
     }
 
     return requestedBranchId;
   }
 
   if (!isSuperAdmin) {
-    if (claimBranchIds.length === 1) return claimBranchIds[0];
+    if (claimBranchIds.length === 1) {
+      const onlyBranchId = claimBranchIds[0];
+      const { rowCount } = await client.query(
+        "SELECT 1 FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL AND estado IS TRUE",
+        [onlyBranchId]
+      );
+      if (!rowCount) {
+        throw new AppError(404, "La sucursal indicada no existe o no esta activa", {
+          code: "CATALOG_BRANCH_NOT_FOUND",
+        });
+      }
+      return onlyBranchId;
+    }
     if (claimBranchIds.length === 0) {
       throw new AppError(400, "El usuario autenticado no tiene una sucursal asociada para gestionar planes", {
         code: "CATALOG_BRANCH_REQUIRED",
@@ -485,20 +495,23 @@ async function ensurePeriodExists(client, periodCode) {
   }
 }
 
-async function ensureUniquePlanName(client, planId, nombrePlan) {
+async function ensureUniquePlanNameByBranch(client, planId, branchId, nombrePlan) {
   const { rows } = await client.query(
     `
-      SELECT id_plan
-      FROM public.membership_plans
-      WHERE LOWER(TRIM(nombre_plan)) = LOWER(TRIM($1))
-        AND ($2::uuid IS NULL OR id_plan <> $2::uuid)
+      SELECT mp.id_plan
+      FROM public.membership_plans mp
+      JOIN public.membership_plans_sucursal mps
+        ON mps.id_plan = mp.id_plan
+      WHERE LOWER(TRIM(mp.nombre_plan)) = LOWER(TRIM($1))
+        AND mps.id_sucursal = $2::uuid
+        AND ($3::uuid IS NULL OR mp.id_plan <> $3::uuid)
       LIMIT 1
     `,
-    [nombrePlan, planId ?? null]
+    [nombrePlan, branchId, planId ?? null]
   );
 
   if (rows[0]) {
-    throw new AppError(409, "Ya existe un plan con ese nombre", {
+    throw new AppError(409, "Ya existe un plan con ese nombre en la sucursal", {
       code: "CATALOG_PLAN_DUPLICATE",
     });
   }
@@ -580,6 +593,70 @@ async function upsertPlanBranchOffer(client, idPlan, idSucursal, payload = {}) {
     `,
     [idPlan, idSucursal, precioHnl, activo, visiblePublico, ordenVisual]
   );
+}
+
+async function hasPlanOffersInOtherBranches(client, idPlan, branchId) {
+  const { rows } = await client.query(
+    `
+      SELECT 1
+      FROM public.membership_plans_sucursal mps
+      WHERE mps.id_plan = $1::uuid
+        AND mps.id_sucursal <> $2::uuid
+      LIMIT 1
+    `,
+    [idPlan, branchId]
+  );
+  return rows.length > 0;
+}
+
+async function clonePlanForBranch(client, sourcePlan, branchId) {
+  const sourcePrice =
+    sourcePlan?.precio_hnl === undefined || sourcePlan?.precio_hnl === null
+      ? 0
+      : Number(sourcePlan.precio_hnl);
+
+  const cloneResult = await client.query(
+    `
+      INSERT INTO public.membership_plans (
+        nombre_plan,
+        descripcion,
+        precio_hnl,
+        periodo_membresia_codigo,
+        beneficios,
+        activo,
+        updated_at
+      )
+      VALUES ($1, $2, $3::numeric, $4, $5::jsonb, TRUE, NOW())
+      RETURNING id_plan
+    `,
+    [
+      sourcePlan.nombre_plan,
+      sourcePlan.descripcion ?? null,
+      sourcePrice,
+      sourcePlan.periodo_membresia_codigo,
+      sourcePlan.beneficios,
+    ]
+  );
+  const clonedPlanId = cloneResult.rows[0].id_plan;
+
+  // AM: Reasigna la oferta de la sucursal al clon para aislar metadata y beneficios.
+  const reassignedOffer = await client.query(
+    `
+      UPDATE public.membership_plans_sucursal
+      SET
+        id_plan = $1::uuid,
+        updated_at = NOW()
+      WHERE id_plan = $2::uuid
+        AND id_sucursal = $3::uuid
+    `,
+    [clonedPlanId, sourcePlan.id_plan, branchId]
+  );
+
+  if (!reassignedOffer.rowCount) {
+    await upsertPlanBranchOffer(client, clonedPlanId, branchId, {});
+  }
+
+  return clonedPlanId;
 }
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
@@ -710,7 +787,7 @@ export default async function adminPlansRoutes(app) {
         }
 
         await ensurePeriodExists(client, periodCode);
-        await ensureUniquePlanName(client, null, nombrePlan);
+        await ensureUniquePlanNameByBranch(client, null, branchId, nombrePlan);
 
         await client.query("BEGIN");
 
@@ -814,24 +891,46 @@ export default async function adminPlansRoutes(app) {
         const scopedResult = await client.query(GET_PLAN_SCOPED_SQL, [request.params.id, branchId]);
         const scopedPlan = scopedResult.rows[0] ?? null;
 
+        const shouldMutatePlanBase =
+          request.body.nombre_plan !== undefined ||
+          request.body.descripcion !== undefined ||
+          request.body.periodo_membresia_codigo !== undefined ||
+          request.body.beneficios !== undefined;
+        let targetPlanId = request.params.id;
+
+        if (shouldMutatePlanBase) {
+          const planSharedAcrossBranches = await hasPlanOffersInOtherBranches(client, request.params.id, branchId);
+          if (planSharedAcrossBranches) {
+            targetPlanId = await clonePlanForBranch(client, basePlan, branchId);
+          }
+        }
+
+        const targetBaseResult = await client.query(GET_PLAN_BASE_SQL, [targetPlanId]);
+        const targetBasePlan = targetBaseResult.rows[0];
+        if (!targetBasePlan) {
+          throw new AppError(404, "El plan solicitado no existe", {
+            code: "CATALOG_PLAN_NOT_FOUND",
+          });
+        }
+
         const nombrePlan =
           request.body.nombre_plan !== undefined
             ? normalizeRequiredText(request.body.nombre_plan)
-            : basePlan.nombre_plan;
+            : targetBasePlan.nombre_plan;
         const descripcion =
           request.body.descripcion !== undefined
             ? normalizeOptionalText(request.body.descripcion)
-            : basePlan.descripcion;
+            : targetBasePlan.descripcion;
         const precioHnl =
           request.body.precio_hnl !== undefined
             ? Number(request.body.precio_hnl)
             : scopedPlan?.precio_hnl == null
-              ? Number(basePlan.precio_hnl)
+              ? Number(targetBasePlan.precio_hnl)
               : Number(scopedPlan.precio_hnl);
         const periodCode =
           request.body.periodo_membresia_codigo !== undefined
             ? normalizePeriodCode(request.body.periodo_membresia_codigo)
-            : normalizePeriodCode(basePlan.periodo_membresia_codigo);
+            : normalizePeriodCode(targetBasePlan.periodo_membresia_codigo);
         const visiblePublico =
           request.body.visible_publico !== undefined
             ? normalizeBoolean(request.body.visible_publico, true)
@@ -844,7 +943,7 @@ export default async function adminPlansRoutes(app) {
         const sourceBenefits =
           request.body.beneficios !== undefined
             ? normalizePlanBenefits(request.body.beneficios)
-            : parseStoredBenefits(basePlan.beneficios);
+            : parseStoredBenefits(targetBasePlan.beneficios);
 
         if (!Number.isFinite(precioHnl) || precioHnl < 0) {
           throw new AppError(400, "El precio del plan debe ser mayor o igual a 0", {
@@ -853,40 +952,40 @@ export default async function adminPlansRoutes(app) {
         }
 
         await ensurePeriodExists(client, periodCode);
-        await ensureUniquePlanName(client, request.params.id, nombrePlan);
+        await ensureUniquePlanNameByBranch(client, targetPlanId, branchId, nombrePlan);
         const canonicalBenefits = await ensurePlanServiceBenefitsAccessible(client, sourceBenefits, branchId);
 
-        await client.query(
-          `
-            UPDATE public.membership_plans
-            SET
-              nombre_plan = $2,
-              descripcion = $3,
-              precio_hnl = $4::numeric,
-              periodo_membresia_codigo = $5,
-              beneficios = $6::jsonb,
-              activo = TRUE,
-              updated_at = NOW()
-            WHERE id_plan = $1::uuid
-          `,
-          [
-            request.params.id,
-            nombrePlan,
-            descripcion ?? null,
-            precioHnl,
-            periodCode,
-            serializePlanBenefits(canonicalBenefits),
-          ]
-        );
+        if (shouldMutatePlanBase) {
+          await client.query(
+            `
+              UPDATE public.membership_plans
+              SET
+                nombre_plan = $2,
+                descripcion = $3,
+                periodo_membresia_codigo = $4,
+                beneficios = $5::jsonb,
+                activo = TRUE,
+                updated_at = NOW()
+              WHERE id_plan = $1::uuid
+            `,
+            [
+              targetPlanId,
+              nombrePlan,
+              descripcion ?? null,
+              periodCode,
+              serializePlanBenefits(canonicalBenefits),
+            ]
+          );
+        }
 
-        await upsertPlanBranchOffer(client, request.params.id, branchId, {
+        await upsertPlanBranchOffer(client, targetPlanId, branchId, {
           precioHnl,
           activo: nextActive,
           visiblePublico,
           ordenVisual,
         });
 
-        const finalResult = await client.query(GET_PLAN_SCOPED_SQL, [request.params.id, branchId]);
+        const finalResult = await client.query(GET_PLAN_SCOPED_SQL, [targetPlanId, branchId]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapPlanRow(finalResult.rows[0]), { requestId: request.id });
