@@ -6,6 +6,7 @@ import { sendOk } from "../../../utils/response.js";
 import {
   assertUuid,
   buildDayAvailability,
+  expireStaleAppointmentReservations,
   findFirstAvailableBarber,
   getBarberScheduleBounds,
   getServiceSelectionDetails,
@@ -138,6 +139,7 @@ export default async function publicAgendaRoutes(app) {
     },
     async (request, reply) => {
       try {
+        await expireStaleAppointmentReservations(app.db, { logger: request.log });
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const barberos = await listBarbersForBranch(app.db, idSucursal);
         return sendOk(reply, {
@@ -194,6 +196,7 @@ export default async function publicAgendaRoutes(app) {
     },
     async (request, reply) => {
       try {
+        await expireStaleAppointmentReservations(app.db, { logger: request.log });
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
@@ -282,6 +285,7 @@ export default async function publicAgendaRoutes(app) {
     },
     async (request, reply) => {
       try {
+        await expireStaleAppointmentReservations(app.db, { logger: request.log });
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const fecha = parseDateOnly(request.query?.fecha, "fecha");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
