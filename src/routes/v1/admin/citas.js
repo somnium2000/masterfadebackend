@@ -1,14 +1,23 @@
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
+  ACTIVE_PAYMENT_INTENT_STATES,
+  APPOINTMENT_STATE_TRANSITIONS,
   assertUuid,
+  expireStaleAppointmentReservations,
   getSystemParameters,
   mapBlockRow,
+  OPERATIONAL_APPOINTMENT_STATES,
   parseDateOnly,
+  resolveBookingSelection,
   resolveBranchIdsForClaims,
 } from "../../../services/agendaService.js";
 
-const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const CONFIG_ALLOWED_ROLES = ["admin", "super_admin"];
+const OPERATIONAL_ALLOWED_ROLES = ["admin", "super_admin", "barbero"];
+const EMERGENCY_ALLOWED_ROLES = ["admin", "super_admin"];
+const HISTORICAL_DEFAULT_STATES = ["cancelada", "expirada", "completada", "no_show", "anulada"];
+const STATUS_CHANGE_WINDOW_MINUTES = 10;
 
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
@@ -41,6 +50,10 @@ function parseDateTime(value, field) {
     });
   }
   return parsed;
+}
+
+function subMinutes(dateValue, minutes) {
+  return new Date(dateValue.getTime() - (minutes * 60 * 1000));
 }
 
 function normalizeTime(value, field) {
@@ -93,6 +106,7 @@ function selectParams(values) {
     no_show_min: Number(values.no_show_min?.valor_numero ?? 10),
     permitir_acompanantes: Boolean(values.permitir_acompanantes?.valor_booleano ?? false),
     pago_total_obligatorio: Boolean(values.pago_total_obligatorio?.valor_booleano ?? true),
+    simulacion_sin_pago: Boolean(values.simulacion_sin_pago?.valor_booleano ?? true),
   };
 }
 
@@ -104,6 +118,447 @@ async function getScopeBranches(app, claims) {
     });
   }
   return branchIds;
+}
+
+function getRoleScope(claims) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  const elevated = roles.includes("admin") || roles.includes("super_admin");
+  const isBarberOnly = !elevated && roles.includes("barbero");
+  const empleadoId = claims?.empleado_id ?? null;
+
+  if (isBarberOnly && !empleadoId) {
+    throw new AppError(403, "No tienes perfil de barbero activo para operar citas", {
+      code: "ADMIN_CITAS_BARBER_SCOPE_MISSING",
+    });
+  }
+
+  return {
+    elevated,
+    barber_empleado_id: isBarberOnly ? empleadoId : null,
+    actor_usuario_id: claims?.user?.id_usuario ?? null,
+  };
+}
+
+function parseLimit(value, fallback = 100, max = 250) {
+  if (value == null || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new AppError(400, "limit debe ser un entero positivo", {
+      code: "ADMIN_CITAS_LIMIT_INVALID",
+      details: { value },
+    });
+  }
+  return Math.min(Math.trunc(parsed), max);
+}
+
+function parseStatusFilter(rawValue, fallbackStates = []) {
+  const raw = Array.isArray(rawValue) ? rawValue.join(",") : String(rawValue || "").trim();
+  if (!raw) return Array.from(new Set(fallbackStates.filter(Boolean)));
+  return Array.from(new Set(raw.split(",").map((item) => String(item || "").trim()).filter(Boolean)));
+}
+
+function mapOperationalAppointment(row) {
+  return {
+    id_cita: row.id_cita,
+    id_grupo_cita: row.id_grupo_cita ?? null,
+    orden_integrante: row.orden_integrante == null ? null : Number(row.orden_integrante),
+    alias_integrante: row.alias_integrante ?? null,
+    id_sucursal: row.id_sucursal,
+    nombre_sucursal: row.nombre_sucursal ?? null,
+    id_empleado_barbero: row.id_empleado_barbero,
+    nombre_barbero: row.nombre_barbero ?? "Sin nombre",
+    id_persona_cliente: row.id_persona_cliente,
+    id_cliente: row.id_cliente ?? null,
+    nombre_cliente: row.nombre_cliente ?? "Sin nombre",
+    estado_cita_codigo: row.estado_cita_codigo,
+    inicio_at: new Date(row.inicio_at).toISOString(),
+    fin_at: new Date(row.fin_at).toISOString(),
+    duracion_total_min: Number(row.duracion_total_min ?? 0),
+    buffer_total_min: Number(row.buffer_total_min ?? 0),
+    total_pagar_hnl: Number(row.total_pagar_hnl ?? 0),
+    moneda_codigo: row.moneda_codigo ?? "HNL",
+    asignada_automaticamente: Boolean(row.asignada_automaticamente),
+    notas: row.notas ?? null,
+    hold_actual: row.hold_estado
+      ? {
+          estado_hold_codigo: row.hold_estado,
+          expires_at: row.hold_expires_at ? new Date(row.hold_expires_at).toISOString() : null,
+        }
+      : null,
+    intent_actual: row.intent_estado
+      ? {
+          estado_intent_codigo: row.intent_estado,
+          expires_at: row.intent_expires_at ? new Date(row.intent_expires_at).toISOString() : null,
+        }
+      : null,
+  };
+}
+
+function resolveDateRange(query = {}) {
+  const fechaDesde = query?.fecha_desde ? parseDateOnly(query.fecha_desde, "fecha_desde") : null;
+  const fechaHasta = query?.fecha_hasta ? parseDateOnly(query.fecha_hasta, "fecha_hasta") : null;
+  if (fechaDesde && fechaHasta && fechaHasta < fechaDesde) {
+    throw new AppError(400, "fecha_hasta no puede ser menor que fecha_desde", {
+      code: "ADMIN_CITAS_DATE_RANGE_INVALID",
+      details: { fecha_desde: fechaDesde, fecha_hasta: fechaHasta },
+    });
+  }
+  return { fechaDesde, fechaHasta };
+}
+
+async function listOperationalAppointments(client, {
+  branchIds,
+  barberScopeId = null,
+  idEmpleadoBarbero = null,
+  idSucursal = null,
+  states = [],
+  q = null,
+  fechaDesde = null,
+  fechaHasta = null,
+  limit = 100,
+} = {}) {
+  const params = [branchIds];
+  const where = [
+    "c.deleted_at IS NULL",
+    "c.id_sucursal = ANY($1::uuid[])",
+  ];
+
+  if (barberScopeId) {
+    params.push(assertUuid(barberScopeId, "id_empleado_barbero"));
+    where.push(`c.id_empleado_barbero = $${params.length}::uuid`);
+  }
+  if (idEmpleadoBarbero) {
+    const safeBarberId = assertUuid(idEmpleadoBarbero, "id_empleado_barbero");
+    if (barberScopeId && safeBarberId !== barberScopeId) {
+      throw new AppError(403, "No puedes consultar citas de otro barbero", {
+        code: "ADMIN_CITAS_BARBER_FORBIDDEN",
+      });
+    }
+    params.push(safeBarberId);
+    where.push(`c.id_empleado_barbero = $${params.length}::uuid`);
+  }
+
+  if (idSucursal) {
+    const safeBranch = assertUuid(idSucursal, "id_sucursal");
+    if (!branchIds.includes(safeBranch)) {
+      throw new AppError(403, "Sucursal fuera de tu alcance", {
+        code: "ADMIN_CITAS_BRANCH_FORBIDDEN",
+        details: { id_sucursal: safeBranch },
+      });
+    }
+    params.push(safeBranch);
+    where.push(`c.id_sucursal = $${params.length}::uuid`);
+  }
+
+  if (states.length) {
+    params.push(states);
+    where.push(`c.estado_cita_codigo = ANY($${params.length}::text[])`);
+  }
+
+  if (fechaDesde) {
+    params.push(`${fechaDesde}T00:00:00`);
+    where.push(`c.inicio_at >= $${params.length}::timestamptz`);
+  }
+
+  if (fechaHasta) {
+    params.push(`${fechaHasta}T23:59:59.999`);
+    where.push(`c.inicio_at <= $${params.length}::timestamptz`);
+  }
+
+  if (q) {
+    const value = `%${String(q || "").trim().toLowerCase()}%`;
+    params.push(value);
+    const idx = params.length;
+    where.push(`
+      (
+        lower(coalesce(concat(pc.nombres, ' ', pc.apellidos), '')) LIKE $${idx}
+        OR lower(coalesce(concat(pb.nombres, ' ', pb.apellidos), '')) LIKE $${idx}
+        OR lower(c.id_cita::text) LIKE $${idx}
+      )
+    `);
+  }
+
+  params.push(limit);
+  const limitIdx = params.length;
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id_cita,
+        c.id_grupo_cita,
+        c.orden_integrante,
+        c.alias_integrante,
+        c.id_sucursal,
+        s.nombre_sucursal,
+        c.id_empleado_barbero,
+        c.id_persona_cliente,
+        c.id_cliente,
+        c.estado_cita_codigo,
+        c.inicio_at,
+        c.fin_at,
+        c.duracion_total_min,
+        c.buffer_total_min,
+        c.total_pagar_hnl,
+        c.moneda_codigo,
+        c.asignada_automaticamente,
+        c.notas,
+        COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
+        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre') AS nombre_cliente,
+        hold.estado_hold_codigo AS hold_estado,
+        hold.expires_at AS hold_expires_at,
+        intent.estado_intent_codigo AS intent_estado,
+        intent.expires_at AS intent_expires_at
+      FROM public.citas c
+      JOIN public.sucursales s
+        ON s.id_sucursal = c.id_sucursal
+      JOIN public.empleados eb
+        ON eb.id_empleado = c.id_empleado_barbero
+      JOIN public.personas pb
+        ON pb.id_persona = eb.id_persona
+      JOIN public.personas pc
+        ON pc.id_persona = c.id_persona_cliente
+      LEFT JOIN LATERAL (
+        SELECT h.estado_hold_codigo, h.expires_at
+        FROM public.citas_holds h
+        WHERE h.id_cita = c.id_cita
+        ORDER BY h.created_at DESC
+        LIMIT 1
+      ) hold ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT pi.estado_intent_codigo, pi.expires_at
+        FROM public.payment_intents pi
+        WHERE pi.id_cita = c.id_cita
+        ORDER BY pi.created_at DESC
+        LIMIT 1
+      ) intent ON TRUE
+      WHERE ${where.join(" AND ")}
+      ORDER BY c.inicio_at ASC, c.id_cita ASC
+      LIMIT $${limitIdx}::int
+    `,
+    params
+  );
+
+  return rows.map(mapOperationalAppointment);
+}
+
+async function getScopedAppointment(client, { idCita, branchIds, barberScopeId = null, forUpdate = false }) {
+  const safeId = assertUuid(idCita, "id_cita");
+  const params = [safeId, branchIds];
+  const where = [
+    "c.id_cita = $1::uuid",
+    "c.deleted_at IS NULL",
+    "c.id_sucursal = ANY($2::uuid[])",
+  ];
+
+  if (barberScopeId) {
+    params.push(assertUuid(barberScopeId, "id_empleado_barbero"));
+    where.push(`c.id_empleado_barbero = $${params.length}::uuid`);
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id_cita,
+        c.id_grupo_cita,
+        c.orden_integrante,
+        c.alias_integrante,
+        c.id_sucursal,
+        s.nombre_sucursal,
+        c.id_empleado_barbero,
+        c.id_persona_cliente,
+        c.id_cliente,
+        c.estado_cita_codigo,
+        c.inicio_at,
+        c.fin_at,
+        c.duracion_total_min,
+        c.buffer_total_min,
+        c.total_pagar_hnl,
+        c.moneda_codigo,
+        c.asignada_automaticamente,
+        c.notas,
+        c.llegada_real_at,
+        c.no_show_at,
+        COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
+        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre') AS nombre_cliente
+      FROM public.citas c
+      JOIN public.sucursales s
+        ON s.id_sucursal = c.id_sucursal
+      JOIN public.empleados eb
+        ON eb.id_empleado = c.id_empleado_barbero
+      JOIN public.personas pb
+        ON pb.id_persona = eb.id_persona
+      JOIN public.personas pc
+        ON pc.id_persona = c.id_persona_cliente
+      WHERE ${where.join(" AND ")}
+      ${forUpdate ? "FOR UPDATE" : ""}
+      LIMIT 1
+    `,
+    params
+  );
+
+  if (!rows[0]) {
+    throw new AppError(404, "Cita no encontrada dentro de tu alcance", {
+      code: "ADMIN_CITAS_NOT_FOUND",
+      details: { id_cita: safeId },
+    });
+  }
+
+  return rows[0];
+}
+
+async function listAppointmentServiceIds(client, citaId) {
+  const { rows } = await client.query(
+    `
+      SELECT id_servicio
+      FROM public.citas_detalles
+      WHERE id_cita = $1::uuid
+      ORDER BY id_cita_detalle ASC
+    `,
+    [citaId]
+  );
+
+  return rows.map((row) => row.id_servicio);
+}
+
+async function registerEmergencyReschedule(client, payload = {}) {
+  const {
+    id_cita,
+    id_sucursal,
+    id_empleado_barbero_anterior,
+    id_empleado_barbero_nuevo,
+    inicio_at_anterior,
+    fin_at_anterior,
+    inicio_at_nuevo,
+    fin_at_nuevo,
+    motivo = null,
+    id_usuario_accion = null,
+  } = payload;
+
+  await client.query(
+    `
+      INSERT INTO public.citas_reagendaciones (
+        id_cita,
+        id_sucursal,
+        id_empleado_barbero_anterior,
+        id_empleado_barbero_nuevo,
+        inicio_at_anterior,
+        fin_at_anterior,
+        inicio_at_nuevo,
+        fin_at_nuevo,
+        motivo,
+        tipo_reagendacion_codigo,
+        id_usuario_accion
+      )
+      VALUES (
+        $1::uuid,
+        $2::uuid,
+        $3::uuid,
+        $4::uuid,
+        $5::timestamptz,
+        $6::timestamptz,
+        $7::timestamptz,
+        $8::timestamptz,
+        $9::text,
+        'emergencia',
+        $10::uuid
+      )
+    `,
+    [
+      id_cita,
+      id_sucursal,
+      id_empleado_barbero_anterior,
+      id_empleado_barbero_nuevo,
+      inicio_at_anterior,
+      fin_at_anterior,
+      inicio_at_nuevo,
+      fin_at_nuevo,
+      cleanText(motivo),
+      id_usuario_accion,
+    ]
+  );
+}
+
+async function performEmergencyReschedule(client, {
+  appointment,
+  fechaInicioNueva,
+  idBarberoNuevo = null,
+  motivo = null,
+  actorUsuarioId = null,
+} = {}) {
+  const serviceIds = await listAppointmentServiceIds(client, appointment.id_cita);
+  if (!serviceIds.length) {
+    throw new AppError(409, "La cita no tiene servicios para recalcular agenda", {
+      code: "ADMIN_CITAS_REBOOK_SERVICES_MISSING",
+      details: { id_cita: appointment.id_cita },
+    });
+  }
+
+  const selection = await resolveBookingSelection(client, {
+    id_sucursal: appointment.id_sucursal,
+    servicios: serviceIds,
+    fecha_inicio: fechaInicioNueva,
+    id_barbero: idBarberoNuevo,
+  });
+
+  const totalMinutes = Number(selection.serviceSelection.duracion_total_min || 0)
+    + Number(selection.serviceSelection.buffer_total_min || 0);
+  const finAtNuevo = new Date(selection.startDateTime.getTime() + totalMinutes * 60 * 1000);
+  const estadoActual = String(appointment.estado_cita_codigo || "");
+  const estadoDestino = estadoActual === "en_salon" ? "confirmada" : estadoActual;
+
+  await client.query(
+    `
+      UPDATE public.citas
+      SET id_empleado_barbero = $2::uuid,
+          asignada_automaticamente = $3::boolean,
+          inicio_at = $4::timestamptz,
+          fin_at = $5::timestamptz,
+          duracion_total_min = $6::int,
+          buffer_total_min = $7::int,
+          estado_cita_codigo = $8::text,
+          llegada_real_at = CASE WHEN $8::text = 'confirmada' THEN NULL ELSE llegada_real_at END,
+          no_show_at = NULL,
+          updated_at = now()
+      WHERE id_cita = $1::uuid
+    `,
+    [
+      appointment.id_cita,
+      selection.barber.id_empleado,
+      !idBarberoNuevo,
+      selection.startDateTime.toISOString(),
+      finAtNuevo.toISOString(),
+      Number(selection.serviceSelection.duracion_total_min || appointment.duracion_total_min || 0),
+      Number(selection.serviceSelection.buffer_total_min || appointment.buffer_total_min || 0),
+      estadoDestino,
+    ]
+  );
+
+  await registerEmergencyReschedule(client, {
+    id_cita: appointment.id_cita,
+    id_sucursal: appointment.id_sucursal,
+    id_empleado_barbero_anterior: appointment.id_empleado_barbero,
+    id_empleado_barbero_nuevo: selection.barber.id_empleado,
+    inicio_at_anterior: appointment.inicio_at,
+    fin_at_anterior: appointment.fin_at,
+    inicio_at_nuevo: selection.startDateTime.toISOString(),
+    fin_at_nuevo: finAtNuevo.toISOString(),
+    motivo,
+    id_usuario_accion: actorUsuarioId,
+  });
+
+  return {
+    id_cita: appointment.id_cita,
+    id_sucursal: appointment.id_sucursal,
+    id_empleado_barbero_anterior: appointment.id_empleado_barbero,
+    id_empleado_barbero_nuevo: selection.barber.id_empleado,
+    nombre_barbero_nuevo: selection.barber.nombre_completo,
+    inicio_at_anterior: new Date(appointment.inicio_at).toISOString(),
+    fin_at_anterior: new Date(appointment.fin_at).toISOString(),
+    inicio_at_nuevo: selection.startDateTime.toISOString(),
+    fin_at_nuevo: finAtNuevo.toISOString(),
+    estado_cita_codigo: estadoDestino,
+    reasignada_automaticamente: !idBarberoNuevo,
+  };
 }
 
 async function getEmployeeInScope(client, idEmpleado, branchIds) {
@@ -294,7 +749,500 @@ async function getDayOffType(client) {
 }
 
 export default async function adminCitasRoutes(app) {
-  app.get("/contexto", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/operativas/contexto", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    try {
+      await expireStaleAppointmentReservations(app.db, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+
+      const [sucursalesResult, barberosResult, estadosResult] = await Promise.all([
+        app.db.query(
+          `
+            SELECT id_sucursal, nombre_sucursal
+            FROM public.sucursales
+            WHERE id_sucursal = ANY($1::uuid[])
+            ORDER BY nombre_sucursal ASC
+          `,
+          [branchIds]
+        ),
+        app.db.query(
+          `
+            SELECT
+              e.id_empleado,
+              e.id_sucursal,
+              COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Sin nombre') AS nombre_completo
+            FROM public.empleados e
+            JOIN public.personas p
+              ON p.id_persona = e.id_persona
+            WHERE e.deleted_at IS NULL
+              AND e.estado IS TRUE
+              AND e.es_barbero IS TRUE
+              AND e.id_sucursal = ANY($1::uuid[])
+              ${roleScope.barber_empleado_id ? "AND e.id_empleado = $2::uuid" : ""}
+            ORDER BY nombre_completo ASC
+          `,
+          roleScope.barber_empleado_id ? [branchIds, roleScope.barber_empleado_id] : [branchIds]
+        ),
+        app.db.query(
+          `
+            SELECT estado_cita_codigo, descripcion
+            FROM public.estados_cita
+            ORDER BY estado_cita_codigo ASC
+          `
+        ),
+      ]);
+
+      return sendOk(reply, {
+        sucursales: sucursalesResult.rows,
+        barberos: barberosResult.rows,
+        estados: estadosResult.rows,
+        estados_operativos_default: OPERATIONAL_APPOINTMENT_STATES,
+      });
+    } catch (error) {
+      return sendHandled(
+        reply,
+        request,
+        error,
+        "No se pudo consultar el contexto operativo de citas",
+        "ADMIN_CITAS_OPERATIVE_CONTEXT_ERROR"
+      );
+    }
+  });
+
+  app.get("/operativas", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    try {
+      await expireStaleAppointmentReservations(app.db, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
+      const states = parseStatusFilter(request.query?.estado, OPERATIONAL_APPOINTMENT_STATES);
+      const citas = await listOperationalAppointments(app.db, {
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        idSucursal: request.query?.id_sucursal ?? null,
+        idEmpleadoBarbero: request.query?.id_empleado_barbero ?? null,
+        states,
+        q: cleanText(request.query?.q),
+        fechaDesde,
+        fechaHasta,
+        limit: parseLimit(request.query?.limit, 120, 400),
+      });
+      return sendOk(reply, {
+        citas,
+        filtros: {
+          id_sucursal: request.query?.id_sucursal ?? null,
+          id_empleado_barbero: request.query?.id_empleado_barbero ?? null,
+          estado: states,
+          fecha_desde: fechaDesde,
+          fecha_hasta: fechaHasta,
+          q: cleanText(request.query?.q),
+        },
+      });
+    } catch (error) {
+      return sendHandled(reply, request, error, "No se pudieron consultar las citas operativas", "ADMIN_CITAS_OPERATIVE_LIST_ERROR");
+    }
+  });
+
+  app.get("/historial", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    try {
+      await expireStaleAppointmentReservations(app.db, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
+      const states = parseStatusFilter(request.query?.estado, []);
+      const citas = await listOperationalAppointments(app.db, {
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        idSucursal: request.query?.id_sucursal ?? null,
+        idEmpleadoBarbero: request.query?.id_empleado_barbero ?? null,
+        states,
+        q: cleanText(request.query?.q),
+        fechaDesde,
+        fechaHasta,
+        limit: parseLimit(request.query?.limit, 200, 500),
+      });
+      return sendOk(reply, {
+        citas,
+        filtros: {
+          id_sucursal: request.query?.id_sucursal ?? null,
+          id_empleado_barbero: request.query?.id_empleado_barbero ?? null,
+          estado: states,
+          fecha_desde: fechaDesde,
+          fecha_hasta: fechaHasta,
+          q: cleanText(request.query?.q),
+        },
+        estados_historicos_sugeridos: HISTORICAL_DEFAULT_STATES,
+      });
+    } catch (error) {
+      return sendHandled(reply, request, error, "No se pudo consultar el historial de citas", "ADMIN_CITAS_HISTORY_LIST_ERROR");
+    }
+  });
+
+  app.patch("/:id_cita/estado", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idCita = assertUuid(request.params?.id_cita, "id_cita");
+      const estadoDestino = cleanText(request.body?.estado_cita_codigo);
+      if (!estadoDestino) {
+        throw new AppError(400, "estado_cita_codigo es obligatorio", {
+          code: "ADMIN_CITAS_STATUS_REQUIRED",
+        });
+      }
+
+      await dbClient.query("BEGIN");
+      const cita = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        forUpdate: true,
+      });
+      const estadoOrigen = String(cita.estado_cita_codigo || "");
+      const allowedTargets = APPOINTMENT_STATE_TRANSITIONS[estadoOrigen] || [];
+      if (!allowedTargets.includes(estadoDestino)) {
+        throw new AppError(409, "Transicion de estado no permitida", {
+          code: "ADMIN_CITAS_STATUS_TRANSITION_INVALID",
+          details: {
+            id_cita: idCita,
+            estado_origen: estadoOrigen,
+            estado_destino: estadoDestino,
+            permitidos: allowedTargets,
+          },
+        });
+      }
+
+      if (["en_salon", "completada", "no_show"].includes(estadoDestino)) {
+        const inicioAt = new Date(cita.inicio_at);
+        const now = new Date();
+        const threshold = subMinutes(inicioAt, STATUS_CHANGE_WINDOW_MINUTES);
+        if (Number.isNaN(inicioAt.getTime())) {
+          throw new AppError(409, "La cita no tiene una hora de inicio válida para cambiar de estado", {
+            code: "ADMIN_CITAS_STATUS_START_INVALID",
+            details: { id_cita: idCita },
+          });
+        }
+        if (now.getTime() < threshold.getTime()) {
+          throw new AppError(
+            409,
+            `Solo puedes cambiar el estado ${STATUS_CHANGE_WINDOW_MINUTES} minutos antes de la hora de la cita`,
+            {
+              code: "ADMIN_CITAS_STATUS_WINDOW_NOT_OPEN",
+              details: {
+                id_cita: idCita,
+                estado_destino: estadoDestino,
+                inicio_at: inicioAt.toISOString(),
+                permitido_desde: threshold.toISOString(),
+              },
+            }
+          );
+        }
+      }
+
+      await dbClient.query(
+        `
+          UPDATE public.citas
+          SET estado_cita_codigo = $2::text,
+              llegada_real_at = CASE
+                WHEN $2::text = 'en_salon' AND llegada_real_at IS NULL THEN now()
+                WHEN $2::text <> 'en_salon' THEN NULL
+                ELSE llegada_real_at
+              END,
+              no_show_at = CASE
+                WHEN $2::text = 'no_show' THEN now()
+                WHEN $2::text <> 'no_show' THEN NULL
+                ELSE no_show_at
+              END,
+              updated_at = now()
+          WHERE id_cita = $1::uuid
+        `,
+        [idCita, estadoDestino]
+      );
+
+      if (["cancelada", "expirada"].includes(estadoDestino)) {
+        await dbClient.query(
+          `
+            UPDATE public.citas_holds
+            SET estado_hold_codigo = CASE
+              WHEN $2::text = 'expirada' THEN 'expirado'
+              ELSE 'cancelado'
+            END,
+            updated_at = now()
+            WHERE id_cita = $1::uuid
+              AND estado_hold_codigo = 'activo'
+          `,
+          [idCita, estadoDestino]
+        );
+        await dbClient.query(
+          `
+            UPDATE public.payment_intents
+            SET estado_intent_codigo = 'expirado',
+                updated_at = now()
+            WHERE id_cita = $1::uuid
+              AND estado_intent_codigo = ANY($2::text[])
+          `,
+          [idCita, ACTIVE_PAYMENT_INTENT_STATES]
+        );
+      }
+
+      const updated = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+      });
+      await dbClient.query("COMMIT");
+      return sendOk(reply, {
+        cita: mapOperationalAppointment(updated),
+        transicion: {
+          estado_origen: estadoOrigen,
+          estado_destino: estadoDestino,
+        },
+      });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(reply, request, error, "No se pudo actualizar el estado de la cita", "ADMIN_CITAS_STATUS_PATCH_ERROR");
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.get("/reagendacion/afectadas", { preHandler: app.requireRoles(EMERGENCY_ALLOWED_ROLES) }, async (request, reply) => {
+    try {
+      await expireStaleAppointmentReservations(app.db, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const fecha = parseDateOnly(request.query?.fecha, "fecha");
+      const idBarbero = cleanText(request.query?.id_empleado_barbero) || roleScope.barber_empleado_id;
+      if (!idBarbero) {
+        throw new AppError(400, "id_empleado_barbero es obligatorio", {
+          code: "ADMIN_CITAS_EMERGENCY_BARBER_REQUIRED",
+        });
+      }
+      if (roleScope.barber_empleado_id && idBarbero !== roleScope.barber_empleado_id) {
+        throw new AppError(403, "No puedes consultar citas de otro barbero", {
+          code: "ADMIN_CITAS_EMERGENCY_BARBER_FORBIDDEN",
+        });
+      }
+
+      await getEmployeeInScope(app.db, idBarbero, branchIds);
+      const citas = await listOperationalAppointments(app.db, {
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        idEmpleadoBarbero: idBarbero,
+        idSucursal: request.query?.id_sucursal ?? null,
+        states: OPERATIONAL_APPOINTMENT_STATES,
+        fechaDesde: fecha,
+        fechaHasta: fecha,
+        limit: parseLimit(request.query?.limit, 300, 500),
+      });
+
+      return sendOk(reply, {
+        id_empleado_barbero: idBarbero,
+        fecha,
+        citas_afectadas: citas,
+      });
+    } catch (error) {
+      return sendHandled(reply, request, error, "No se pudieron consultar las citas afectadas", "ADMIN_CITAS_EMERGENCY_AFFECTED_ERROR");
+    }
+  });
+
+  app.post("/:id_cita/reagendar-emergencia", { preHandler: app.requireRoles(EMERGENCY_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idCita = assertUuid(request.params?.id_cita, "id_cita");
+      const fechaInicioNueva = new Date(String(request.body?.fecha_inicio_nueva || "").trim());
+      if (Number.isNaN(fechaInicioNueva.getTime())) {
+        throw new AppError(400, "fecha_inicio_nueva debe ser una fecha-hora valida", {
+          code: "ADMIN_CITAS_EMERGENCY_DATETIME_INVALID",
+        });
+      }
+
+      const idBarberoNuevo = cleanText(request.body?.id_empleado_barbero_nuevo);
+      await dbClient.query("BEGIN");
+
+      const cita = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        forUpdate: true,
+      });
+      if (!OPERATIONAL_APPOINTMENT_STATES.includes(String(cita.estado_cita_codigo || ""))) {
+        throw new AppError(409, "Solo se pueden reagendar citas activas", {
+          code: "ADMIN_CITAS_EMERGENCY_STATE_INVALID",
+          details: { estado_cita_codigo: cita.estado_cita_codigo },
+        });
+      }
+
+      if (idBarberoNuevo) {
+        const empleadoNuevo = await getEmployeeInScope(dbClient, idBarberoNuevo, branchIds);
+        if (!empleadoNuevo.es_barbero) {
+          throw new AppError(409, "El empleado de destino no es barbero", {
+            code: "ADMIN_CITAS_EMERGENCY_TARGET_NOT_BARBER",
+          });
+        }
+      }
+
+      const resultado = await performEmergencyReschedule(dbClient, {
+        appointment: cita,
+        fechaInicioNueva: fechaInicioNueva.toISOString(),
+        idBarberoNuevo,
+        motivo: cleanText(request.body?.motivo),
+        actorUsuarioId: roleScope.actor_usuario_id,
+      });
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, { reagendacion: resultado });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(
+        reply,
+        request,
+        error,
+        "No se pudo reagendar la cita por emergencia",
+        "ADMIN_CITAS_EMERGENCY_REBOOK_ERROR"
+      );
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.post("/reagendar-emergencia/lote", { preHandler: app.requireRoles(EMERGENCY_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idBarbero = cleanText(request.body?.id_empleado_barbero) || roleScope.barber_empleado_id;
+      const fecha = parseDateOnly(request.body?.fecha, "fecha");
+      const motivoGeneral = cleanText(request.body?.motivo);
+      const items = Array.isArray(request.body?.items) ? request.body.items : [];
+
+      if (!idBarbero) {
+        throw new AppError(400, "id_empleado_barbero es obligatorio para lote", {
+          code: "ADMIN_CITAS_EMERGENCY_BATCH_BARBER_REQUIRED",
+        });
+      }
+      if (roleScope.barber_empleado_id && idBarbero !== roleScope.barber_empleado_id) {
+        throw new AppError(403, "No puedes reagendar citas de otro barbero", {
+          code: "ADMIN_CITAS_EMERGENCY_BATCH_FORBIDDEN",
+        });
+      }
+      if (!items.length) {
+        throw new AppError(400, "Debes enviar al menos un item para reagendar", {
+          code: "ADMIN_CITAS_EMERGENCY_BATCH_ITEMS_REQUIRED",
+        });
+      }
+
+      const seen = new Set();
+      for (const item of items) {
+        const itemId = assertUuid(item?.id_cita, "id_cita");
+        if (seen.has(itemId)) {
+          throw new AppError(400, "No se permiten id_cita repetidos en lote", {
+            code: "ADMIN_CITAS_EMERGENCY_BATCH_DUPLICATED",
+            details: { id_cita: itemId },
+          });
+        }
+        seen.add(itemId);
+      }
+
+      await getEmployeeInScope(dbClient, idBarbero, branchIds);
+      await dbClient.query("BEGIN");
+      const resultados = [];
+
+      for (const item of items) {
+        const idCita = assertUuid(item?.id_cita, "id_cita");
+        const cita = await getScopedAppointment(dbClient, {
+          idCita,
+          branchIds,
+          barberScopeId: roleScope.barber_empleado_id,
+          forUpdate: true,
+        });
+        if (cita.id_empleado_barbero !== idBarbero) {
+          throw new AppError(409, "La cita no pertenece al barbero origen indicado", {
+            code: "ADMIN_CITAS_EMERGENCY_BATCH_SOURCE_MISMATCH",
+            details: { id_cita: idCita, id_empleado_barbero: cita.id_empleado_barbero, esperado: idBarbero },
+          });
+        }
+        const fechaCita = String(new Date(cita.inicio_at).toISOString()).slice(0, 10);
+        if (fechaCita !== fecha) {
+          throw new AppError(409, "La cita no pertenece a la fecha origen indicada", {
+            code: "ADMIN_CITAS_EMERGENCY_BATCH_DATE_MISMATCH",
+            details: { id_cita: idCita, fecha_cita: fechaCita, fecha_origen: fecha },
+          });
+        }
+        if (!OPERATIONAL_APPOINTMENT_STATES.includes(String(cita.estado_cita_codigo || ""))) {
+          throw new AppError(409, "Solo se pueden reagendar citas activas", {
+            code: "ADMIN_CITAS_EMERGENCY_BATCH_STATE_INVALID",
+            details: { id_cita: idCita, estado_cita_codigo: cita.estado_cita_codigo },
+          });
+        }
+
+        const fechaInicioNueva = new Date(String(item?.fecha_inicio_nueva || "").trim());
+        if (Number.isNaN(fechaInicioNueva.getTime())) {
+          throw new AppError(400, "Cada item debe incluir fecha_inicio_nueva valida", {
+            code: "ADMIN_CITAS_EMERGENCY_BATCH_DATETIME_INVALID",
+            details: { id_cita: idCita },
+          });
+        }
+        const idBarberoNuevo = cleanText(item?.id_empleado_barbero_nuevo);
+        if (idBarberoNuevo) {
+          const destino = await getEmployeeInScope(dbClient, idBarberoNuevo, branchIds);
+          if (!destino.es_barbero) {
+            throw new AppError(409, "El empleado de destino no es barbero", {
+              code: "ADMIN_CITAS_EMERGENCY_BATCH_TARGET_NOT_BARBER",
+              details: { id_cita: idCita, id_empleado: idBarberoNuevo },
+            });
+          }
+        }
+
+        const resultado = await performEmergencyReschedule(dbClient, {
+          appointment: cita,
+          fechaInicioNueva: fechaInicioNueva.toISOString(),
+          idBarberoNuevo,
+          motivo: cleanText(item?.motivo) || motivoGeneral,
+          actorUsuarioId: roleScope.actor_usuario_id,
+        });
+        resultados.push(resultado);
+      }
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, {
+        total_reagendadas: resultados.length,
+        fecha_origen: fecha,
+        id_empleado_barbero_origen: idBarbero,
+        resultados,
+      });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(
+        reply,
+        request,
+        error,
+        "No se pudo completar la reagendacion de emergencia por lote",
+        "ADMIN_CITAS_EMERGENCY_BATCH_ERROR"
+      );
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.get("/contexto", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const [sucursales, barberos, tiposBloqueo, params] = await Promise.all([
@@ -327,7 +1275,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.get("/horarios/:id_empleado", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/horarios/:id_empleado", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const empleado = await getEmployeeInScope(app.db, request.params.id_empleado, branchIds);
@@ -346,7 +1294,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.put("/horarios/:id_empleado", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.put("/horarios/:id_empleado", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     const dbClient = await app.db.connect();
     try {
       const branchIds = await getScopeBranches(app, request.claims);
@@ -411,7 +1359,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.get("/bloqueos", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/bloqueos", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const bloqueos = await listBlocks(app.db, branchIds, {
@@ -426,7 +1374,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.post("/bloqueos", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.post("/bloqueos", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const empleado = await getEmployeeInScope(app.db, request.body?.id_empleado, branchIds);
@@ -473,7 +1421,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.delete("/bloqueos", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.delete("/bloqueos", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const idBloqueo = assertUuid(request.query?.id_bloqueo, "id_bloqueo");
@@ -491,7 +1439,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.get("/dias-inhabilitados", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/dias-inhabilitados", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const bloqueos = await listBlocks(app.db, branchIds, {
@@ -510,7 +1458,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.post("/dias-inhabilitados", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.post("/dias-inhabilitados", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     const dbClient = await app.db.connect();
     try {
       const branchIds = await getScopeBranches(app, request.claims);
@@ -634,7 +1582,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.delete("/dias-inhabilitados", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.delete("/dias-inhabilitados", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const idBloqueo = assertUuid(request.query?.id_bloqueo, "id_bloqueo");
@@ -676,7 +1624,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.get("/parametros", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/parametros", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       await getScopeBranches(app, request.claims);
       const values = await getSystemParameters(app.db);
@@ -686,7 +1634,7 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.patch("/parametros", { preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/parametros", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     const dbClient = await app.db.connect();
     try {
       await getScopeBranches(app, request.claims);
@@ -716,6 +1664,13 @@ export default async function adminCitasRoutes(app) {
           "pago_total_obligatorio",
           true,
           "Define si se exige el pago total para confirmar la cita",
+        ]);
+      }
+      if (request.body?.simulacion_sin_pago !== undefined) {
+        booleanUpdates.push([
+          "simulacion_sin_pago",
+          normalizeBoolean(request.body.simulacion_sin_pago, "simulacion_sin_pago"),
+          "Permite habilitar temporalmente el flujo de agendamiento sin cobro para pruebas",
         ]);
       }
 
@@ -771,3 +1726,4 @@ export default async function adminCitasRoutes(app) {
     }
   });
 }
+

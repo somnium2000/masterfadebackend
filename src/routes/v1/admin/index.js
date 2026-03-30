@@ -15,5 +15,5 @@ export default async function adminRoutes(app) {
   await app.register(sucursalesRoutes, { prefix: "/sucursales" });
   await app.register(masterPuntosRoutes, { prefix: "/masterpuntos" });
   await app.register(adminCitasRoutes, { prefix: "/citas" });
-
+  await app.register(configuracionRoutes, { prefix: "/configuracion" });
 }

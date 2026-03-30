@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { AppError, sendError } from "../../utils/errors.js";
 import { sendOk } from "../../utils/response.js";
-import { assertUuid } from "../../services/agendaService.js";
+import { assertUuid, expireStaleAppointmentReservations } from "../../services/agendaService.js";
 import { PaymentProviderFactory } from "../../services/payments/PaymentProviderFactory.js";
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
 
@@ -285,6 +285,7 @@ export default async function pagosRoutes(app) {
       const dbClient = await app.db.connect();
 
       try {
+        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
         const citaId = assertUuid(request.body?.id_cita, "id_cita");
         const configuredProvider = safeText(process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";

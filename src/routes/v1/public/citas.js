@@ -3,6 +3,7 @@ import { sendOk } from "../../../utils/response.js";
 import {
   assertUuid,
   ensureActiveBranch,
+  expireStaleAppointmentReservations,
   getHoldDurationMinutes,
   getSystemParameters,
   parseDateTime,
@@ -59,12 +60,14 @@ const contextSchema = {
         no_show_min: { type: "number" },
         permitir_acompanantes: { type: "boolean" },
         pago_total_obligatorio: { type: "boolean" },
+        simulacion_sin_pago: { type: "boolean" },
       },
       required: [
         "hold_duracion_min",
         "no_show_min",
         "permitir_acompanantes",
         "pago_total_obligatorio",
+        "simulacion_sin_pago",
       ],
       additionalProperties: false,
     },
@@ -111,12 +114,14 @@ function normalizePublicParams(paramsMap) {
   const noShow = paramsMap?.no_show_min?.valor_numero;
   const companions = paramsMap?.permitir_acompanantes?.valor_booleano;
   const fullPayment = paramsMap?.pago_total_obligatorio?.valor_booleano;
+  const simulationNoPayment = paramsMap?.simulacion_sin_pago?.valor_booleano;
 
   return {
     hold_duracion_min: Number.isFinite(Number(hold)) ? Number(hold) : 5,
     no_show_min: Number.isFinite(Number(noShow)) ? Number(noShow) : 10,
     permitir_acompanantes: typeof companions === "boolean" ? companions : false,
     pago_total_obligatorio: typeof fullPayment === "boolean" ? fullPayment : true,
+    simulacion_sin_pago: typeof simulationNoPayment === "boolean" ? simulationNoPayment : true,
   };
 }
 
@@ -565,9 +570,12 @@ export default async function publicCitasRoutes(app) {
 
       const dbClient = await app.db.connect();
       try {
+        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const clientePayload = validateClientPayload(request.body?.cliente);
         const integrantes = normalizeBlocksPayload(request.body);
+        const publicParams = normalizePublicParams(await getSystemParameters(dbClient));
+        const simulationNoPayment = Boolean(publicParams.simulacion_sin_pago);
 
         const branch = await ensureActiveBranch(dbClient, idSucursal);
 
@@ -580,6 +588,8 @@ export default async function publicCitasRoutes(app) {
 
         const holdDurationMin = await getHoldDurationMinutes(dbClient);
         const expiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
+        const targetAppointmentState = simulationNoPayment ? "confirmada" : "en_espera";
+        const holdState = simulationNoPayment ? "consumido" : "activo";
 
         const groupInsert = await dbClient.query(
           `
@@ -649,15 +659,15 @@ export default async function publicCitasRoutes(app) {
                 $7::uuid,
                 NULL,
                 $8::boolean,
-                'en_espera',
-                $9::timestamptz,
+                $9::text,
                 $10::timestamptz,
-                $11::int,
+                $11::timestamptz,
                 $12::int,
-                $13::numeric,
-                0,
+                $13::int,
                 $14::numeric,
-                $15
+                0,
+                $15::numeric,
+                $16
               )
               RETURNING id_cita
             `,
@@ -670,6 +680,7 @@ export default async function publicCitasRoutes(app) {
               clientProfile.id_persona,
               clientProfile.id_cliente,
               !integrante.id_barbero,
+              targetAppointmentState,
               selection.startDateTime.toISOString(),
               finAt.toISOString(),
               selection.serviceSelection.duracion_total_min,
@@ -715,9 +726,9 @@ export default async function publicCitasRoutes(app) {
                 estado_hold_codigo,
                 expires_at
               )
-              VALUES ($1::uuid, NULL, 'activo', $2::timestamptz)
+              VALUES ($1::uuid, NULL, $2::text, $3::timestamptz)
             `,
-            [citaId, expiresAt.toISOString()]
+            [citaId, holdState, expiresAt.toISOString()]
           );
 
           totalGrupo += Number(selection.serviceSelection.monto_total_hnl || 0);
@@ -732,7 +743,7 @@ export default async function publicCitasRoutes(app) {
             fecha: fecha || "",
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: "en_espera",
+            estado_cita_codigo: targetAppointmentState,
             monto_total_hnl: Number(selection.serviceSelection.monto_total_hnl || 0),
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
