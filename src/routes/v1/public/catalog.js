@@ -206,6 +206,7 @@ const PUBLIC_PACKAGES_SQL = `
       ps.id_paquete,
       ps.id_sucursal,
       ps.precio_hnl,
+      ps.orden_visual,
       ROW_NUMBER() OVER (
         PARTITION BY ps.id_paquete, ps.id_sucursal
         ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
@@ -223,7 +224,8 @@ const PUBLIC_PACKAGES_SQL = `
     SELECT
       so.id_paquete,
       so.id_sucursal,
-      so.precio_hnl
+      so.precio_hnl,
+      so.orden_visual
     FROM scoped_offers so
     WHERE so.rn = 1
   ),
@@ -234,6 +236,10 @@ const PUBLIC_PACKAGES_SQL = `
         WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
         ELSE MAX(po.precio_hnl)
       END AS precio_hnl,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.orden_visual)
+        ELSE MAX(po.orden_visual)
+      END AS orden_visual,
       CASE
         -- AM: PostgreSQL no soporta min/max directo sobre UUID en algunos entornos; se castea via text para seleccion determinista.
         WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
@@ -247,6 +253,7 @@ const PUBLIC_PACKAGES_SQL = `
     p.nombre_paquete,
     p.descripcion,
     COALESCE(eo.precio_hnl, NULLIF(to_jsonb(p)->>'precio_hnl', '')::numeric) AS precio_hnl,
+    COALESCE(eo.orden_visual, 100) AS orden_visual,
     COALESCE(
       json_agg(
         json_build_object(
@@ -282,11 +289,11 @@ const PUBLIC_PACKAGES_SQL = `
   ) tariff_scope ON TRUE
   WHERE p.deleted_at IS NULL
     AND p.activo IS TRUE
-  GROUP BY p.id_paquete, eo.precio_hnl, eo.id_sucursal
+  GROUP BY p.id_paquete, eo.precio_hnl, eo.orden_visual, eo.id_sucursal
   HAVING COUNT(pd.id_servicio) > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
      AND COUNT(tariff_scope.has_tarifa) = COUNT(pd.id_servicio)
-  ORDER BY p.nombre_paquete ASC
+  ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
 `;
 
 const PUBLIC_BRANCHES_SQL = `

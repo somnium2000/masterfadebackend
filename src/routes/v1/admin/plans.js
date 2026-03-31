@@ -270,12 +270,12 @@ const GET_ACTIVE_SERVICES_IN_BRANCH_SQL = `
 `;
 
 function normalizeRequiredText(value) {
-  return String(value || "").trim();
+  return String(value || "").normalize("NFC").trim();
 }
 
 function normalizeOptionalText(value) {
   if (value === undefined) return undefined;
-  const trimmed = String(value ?? "").trim();
+  const trimmed = String(value ?? "").normalize("NFC").trim();
   return trimmed ? trimmed : null;
 }
 

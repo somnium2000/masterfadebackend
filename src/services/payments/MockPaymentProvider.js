@@ -1,7 +1,7 @@
 import { PaymentProvider } from "./PaymentProvider.js";
 
 /**
- * MockPaymentProvider — Proveedor de pagos simulado para desarrollo y pruebas.
+ * MockPaymentProvider â€” Proveedor de pagos simulado para desarrollo y pruebas.
  *
  * Comportamiento:
  *  - createIntent: retorna URL de callback con resultado hardcodeado (PAID o FAILED)
@@ -14,7 +14,7 @@ import { PaymentProvider } from "./PaymentProvider.js";
 export class MockPaymentProvider extends PaymentProvider {
     /**
      * @param {Object} [opts]
-     * @param {'PAID'|'FAILED'|'EXPIRED'} [opts.mockResult='PAID'] — resultado simulado
+     * @param {'PAID'|'FAILED'|'EXPIRED'} [opts.mockResult='PAID'] â€” resultado simulado
      */
     constructor({ mockResult = "PAID" } = {}) {
         super();
@@ -50,7 +50,7 @@ export class MockPaymentProvider extends PaymentProvider {
     }
 
     verifyWebhookSignature(_rawBody, _signature) {
-        // En mock siempre válida — en producción verificar HMAC o firma del proveedor
+        // En mock siempre válida â€” en producción verificar HMAC o firma del proveedor
         return true;
     }
 }

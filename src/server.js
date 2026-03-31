@@ -43,7 +43,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // NUEVO:
 // PORQUE: Si algo explota, cerramos ordenadamente en vez de dejar el proceso colgado.
-// IMPACTO: Menos puertos “pegados” por procesos zombie.
+// IMPACTO: Menos puertos "pegados" por procesos zombie.
 process.on("uncaughtException", (err) => shutdown("uncaughtException", err));
 process.on("unhandledRejection", (reason) =>
   shutdown("unhandledRejection", reason instanceof Error ? reason : new Error(String(reason)))
