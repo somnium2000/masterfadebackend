@@ -49,6 +49,6 @@ async function securityPlugin(app) {
   await app.register(formbody);
 }
 
-// ✅ Esto hace el plugin GLOBAL (sin encapsulación)
+// Esto hace el plugin GLOBAL (sin encapsulación)
 export default fp(securityPlugin, { name: "security-plugin" });
 

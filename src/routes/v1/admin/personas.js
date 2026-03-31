@@ -357,12 +357,12 @@ const FK_RELATIONS_CACHE = new Map();
 let clientsConsentColumnsCache = null;
 
 function normalizeRequired(value) {
-  return String(value || "").trim();
+  return String(value || "").normalize("NFC").trim();
 }
 
 function normalizeOptional(value) {
   if (value === undefined) return undefined;
-  const trimmed = String(value ?? "").trim();
+  const trimmed = String(value ?? "").normalize("NFC").trim();
   return trimmed ? trimmed : null;
 }
 
@@ -1080,7 +1080,14 @@ async function deleteAuthIdentity(app, request, authUserId) {
   }
 }
 
-async function sendPasswordSetupEmail(app, email) {
+function buildFullName(nombres, apellidos) {
+  const firstName = normalizeOptional(nombres) ?? "";
+  const lastName = normalizeOptional(apellidos) ?? "";
+  const fullName = `${firstName} ${lastName}`.trim();
+  return fullName || null;
+}
+
+async function sendPasswordSetupEmail(app, email, fullName = null) {
   if (!app.supabaseAdmin) {
     return {
       sent: false,
@@ -1108,6 +1115,7 @@ async function sendPasswordSetupEmail(app, email) {
     const delivery = await app.mailer.sendPasswordRecoveryEmail({
       to: email,
       actionLink: recovery.action_link,
+      fullName,
       kind: "setup",
     });
 
@@ -1285,7 +1293,11 @@ async function createEmpleado(app, request, payload) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    const setupResult = await sendPasswordSetupEmail(app, correoPrincipal);
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      correoPrincipal,
+      buildFullName(persona.nombres, persona.apellidos)
+    );
 
     return {
       empleado: mapEmpleado(detail.rows[0]),
@@ -1606,7 +1618,11 @@ async function createCliente(app, request, payload) {
 
     let setupPassword = null;
     if (habilitarAcceso) {
-      const setupResult = await sendPasswordSetupEmail(app, correoPrincipal);
+      const setupResult = await sendPasswordSetupEmail(
+        app,
+        correoPrincipal,
+        buildFullName(persona.nombres, persona.apellidos)
+      );
       setupPassword = {
         requerido: true,
         enviado: setupResult.sent,
@@ -1641,8 +1657,11 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
         SELECT
           u.id_usuario,
           u.estado_acceso,
+          p.nombres,
+          p.apellidos,
           COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS email
         FROM public.usuarios u
+        LEFT JOIN public.personas p ON p.id_persona = u.id_persona
         LEFT JOIN auth.users au ON au.id = u.id_usuario
         LEFT JOIN LATERAL (
           SELECT c.direccion_correo::text AS email
@@ -1688,7 +1707,11 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    const setupResult = await sendPasswordSetupEmail(app, email);
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      email,
+      buildFullName(userRow.nombres, userRow.apellidos)
+    );
     if (!setupResult.sent) {
       // AM: En reenvio manual se exige entrega real para evitar falso positivo en UI.
       throw new AppError(502, "No se pudo enviar el correo de configuracion", {
@@ -2543,7 +2566,11 @@ async function updateCliente(app, request, idCliente, payload) {
 
     let setupPassword = null;
     if (habilitarAcceso && !currentRow.id_usuario) {
-      const setupResult = await sendPasswordSetupEmail(app, correoPrincipal);
+      const setupResult = await sendPasswordSetupEmail(
+        app,
+        correoPrincipal,
+        buildFullName(persona.nombres, persona.apellidos)
+      );
       setupPassword = {
         requerido: true,
         enviado: setupResult.sent,

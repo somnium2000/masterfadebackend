@@ -234,7 +234,7 @@ function normalizeEmail(email) {
 }
 
 function normalizeRequiredText(value) {
-  return String(value || "").trim();
+  return String(value || "").normalize("NFC").trim();
 }
 
 function normalizeOptionalUuid(value) {

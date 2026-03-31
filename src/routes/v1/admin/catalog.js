@@ -37,9 +37,11 @@ const serviceBodySchema = {
   type: "object",
   properties: {
     nombre_servicio: { type: "string", minLength: 1, maxLength: 140 },
+    descripcion: { type: ["string", "null"], maxLength: 500 },
     duracion_min: { type: "integer", minimum: 1 },
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
+    orden_visual: { type: "integer", minimum: 0 },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
   required: ["nombre_servicio", "duracion_min", "buffer_min", "precio_hnl"],
@@ -50,9 +52,11 @@ const servicePatchSchema = {
   type: "object",
   properties: {
     nombre_servicio: { type: "string", minLength: 1, maxLength: 140 },
+    descripcion: { type: ["string", "null"], maxLength: 500 },
     duracion_min: { type: "integer", minimum: 1 },
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
+    orden_visual: { type: "integer", minimum: 0 },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
   minProperties: 1,
@@ -65,6 +69,7 @@ const packageBodySchema = {
     nombre_paquete: { type: "string", minLength: 1, maxLength: 140 },
     descripcion: { type: ["string", "null"], maxLength: 500 },
     precio_hnl: { type: "number", minimum: 0 },
+    orden_visual: { type: "integer", minimum: 0 },
     // AM: Operacion multi-sucursal: alta y edicion de paquetes siempre debe poder fijar sucursal objetivo.
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     visible_publico: { type: "boolean" },
@@ -92,6 +97,7 @@ const packagePatchSchema = {
     nombre_paquete: { type: "string", minLength: 1, maxLength: 140 },
     descripcion: { type: ["string", "null"], maxLength: 500 },
     precio_hnl: { type: "number", minimum: 0 },
+    orden_visual: { type: "integer", minimum: 0 },
     // AM: Permite ajustar visibilidad/oferta en la sucursal seleccionada sin romper metadata global.
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     visible_publico: { type: "boolean" },
@@ -190,12 +196,13 @@ const packageResponseSchema = {
     nombre_paquete: { type: "string" },
     descripcion: { type: ["string", "null"] },
     precio_hnl: { type: ["number", "null"] },
+    orden_visual: { type: "integer" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     activo: { type: "boolean" },
     visible_publico: { type: "boolean" },
     items: { type: "array", items: packageItemResponseSchema },
   },
-  required: ["id_paquete", "nombre_paquete", "descripcion", "precio_hnl", "id_sucursal", "activo", "visible_publico", "items"],
+  required: ["id_paquete", "nombre_paquete", "descripcion", "precio_hnl", "orden_visual", "id_sucursal", "activo", "visible_publico", "items"],
   additionalProperties: false,
 };
 
@@ -350,6 +357,7 @@ const LIST_PACKAGES_SQL = `
       ps.precio_hnl,
       ps.activo,
       ps.visible_publico,
+      ps.orden_visual,
       ROW_NUMBER() OVER (
         PARTITION BY ps.id_paquete, ps.id_sucursal
         ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
@@ -363,7 +371,8 @@ const LIST_PACKAGES_SQL = `
       so.id_sucursal,
       so.precio_hnl,
       so.activo,
-      so.visible_publico
+      so.visible_publico,
+      so.orden_visual
     FROM scoped_offers so
     WHERE so.rn = 1
   )
@@ -375,6 +384,7 @@ const LIST_PACKAGES_SQL = `
     COALESCE(po.precio_hnl, NULLIF(to_jsonb(p)->>'precio_hnl', '')::numeric) AS precio_hnl,
     (COALESCE(po.activo, FALSE) AND p.activo IS TRUE) AS activo,
     COALESCE(po.visible_publico, FALSE) AS visible_publico,
+    COALESCE(po.orden_visual, 100) AS orden_visual,
     COALESCE(
       json_agg(
         json_build_object(
@@ -410,11 +420,11 @@ const LIST_PACKAGES_SQL = `
     LIMIT 1
   ) tariff_scope ON TRUE
   WHERE p.deleted_at IS NULL
-  GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico
+  GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico, po.orden_visual
   HAVING COUNT(pd.id_servicio) > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
      AND COUNT(tariff_scope.has_tarifa) = COUNT(pd.id_servicio)
-  ORDER BY p.nombre_paquete ASC, po.id_sucursal ASC
+  ORDER BY COALESCE(po.orden_visual, 100) ASC, p.nombre_paquete ASC, po.id_sucursal ASC
 `;
 
 const GET_PACKAGE_BASE_SQL = `
@@ -454,7 +464,8 @@ const GET_PACKAGE_SCOPED_SQL = `
       ps.id_sucursal,
       ps.precio_hnl,
       ps.activo,
-      ps.visible_publico
+      ps.visible_publico,
+      ps.orden_visual
     FROM public.paquetes_sucursal ps
     WHERE ps.id_paquete = $1::uuid
       AND ps.id_sucursal = $2::uuid
@@ -469,6 +480,7 @@ const GET_PACKAGE_SCOPED_SQL = `
     COALESCE(po.precio_hnl, NULLIF(to_jsonb(p)->>'precio_hnl', '')::numeric) AS precio_hnl,
     (COALESCE(po.activo, FALSE) AND p.activo IS TRUE) AS activo,
     COALESCE(po.visible_publico, FALSE) AS visible_publico,
+    COALESCE(po.orden_visual, 100) AS orden_visual,
     COALESCE(
       json_agg(
         json_build_object(
@@ -490,7 +502,7 @@ const GET_PACKAGE_SCOPED_SQL = `
    AND s.deleted_at IS NULL
   WHERE p.id_paquete = $1::uuid
     AND p.deleted_at IS NULL
-  GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico
+  GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico, po.orden_visual
 `;
 
 const GET_PACKAGE_OFFER_SQL = `
@@ -500,7 +512,8 @@ const GET_PACKAGE_OFFER_SQL = `
     ps.id_sucursal,
     ps.precio_hnl,
     ps.activo,
-    ps.visible_publico
+    ps.visible_publico,
+    ps.orden_visual
   FROM public.paquetes_sucursal ps
   WHERE ps.id_paquete = $1::uuid
     AND ps.id_sucursal = $2::uuid
@@ -514,12 +527,12 @@ function normalizeOptionalText(value) {
     return undefined;
   }
 
-  const trimmed = String(value ?? "").trim();
+  const trimmed = String(value ?? "").normalize("NFC").trim();
   return trimmed ? trimmed : null;
 }
 
 function normalizeRequiredText(value) {
-  return String(value || "").trim();
+  return String(value || "").normalize("NFC").trim();
 }
 
 function normalizeServiceGroup(value, fallback = "barberia") {
@@ -573,11 +586,13 @@ function mapAdminServiceRow(row) {
 }
 
 function mapAdminPackageRow(row) {
+  const ordenVisual = normalizeOrderVisual(row.orden_visual, 100);
   return {
     id_paquete: row.id_paquete,
     nombre_paquete: row.nombre_paquete,
     descripcion: row.descripcion ?? null,
     precio_hnl: row.precio_hnl == null ? null : Number(row.precio_hnl),
+    orden_visual: ordenVisual,
     id_sucursal: row.id_sucursal ?? null,
     activo: Boolean(row.activo),
     visible_publico: normalizeBoolean(row.visible_publico, Boolean(row.activo)),
@@ -1043,6 +1058,7 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
   const hasPrecio = payload?.precioHnl !== undefined && payload?.precioHnl !== null;
   const hasActivo = payload?.activo !== undefined && payload?.activo !== null;
   const hasVisiblePublico = payload?.visiblePublico !== undefined && payload?.visiblePublico !== null;
+  const hasOrdenVisual = payload?.ordenVisual !== undefined && payload?.ordenVisual !== null;
 
   const precioHnl = hasPrecio
     ? Number(payload.precioHnl)
@@ -1053,6 +1069,9 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
   const visiblePublico = hasVisiblePublico
     ? Boolean(payload.visiblePublico)
     : Boolean(currentOffer?.visible_publico ?? true);
+  const ordenVisual = hasOrdenVisual
+    ? normalizeOrderVisual(payload.ordenVisual, 100)
+    : normalizeOrderVisual(currentOffer?.orden_visual, 100);
 
   if (currentOffer?.id_paquete_sucursal) {
     await client.query(
@@ -1062,10 +1081,11 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
           precio_hnl = $2::numeric,
           activo = $3::boolean,
           visible_publico = $4::boolean,
+          orden_visual = $5::int,
           updated_at = NOW()
         WHERE id_paquete_sucursal = $1::uuid
       `,
-      [currentOffer.id_paquete_sucursal, precioHnl, activo, visiblePublico]
+      [currentOffer.id_paquete_sucursal, precioHnl, activo, visiblePublico, ordenVisual]
     );
     return;
   }
@@ -1077,11 +1097,12 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
         id_sucursal,
         precio_hnl,
         activo,
-        visible_publico
+        visible_publico,
+        orden_visual
       )
-      VALUES ($1::uuid, $2::uuid, $3::numeric, $4::boolean, $5::boolean)
+      VALUES ($1::uuid, $2::uuid, $3::numeric, $4::boolean, $5::boolean, $6::int)
     `,
-    [idPaquete, idSucursal, precioHnl, activo, visiblePublico]
+    [idPaquete, idSucursal, precioHnl, activo, visiblePublico, ordenVisual]
   );
 }
 
@@ -1256,9 +1277,11 @@ export default async function adminCatalogRoutes(app) {
       try {
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const nombreServicio = normalizeRequiredText(request.body.nombre_servicio);
+        const descripcion = normalizeOptionalText(request.body.descripcion);
         const duracionMin = Number(request.body.duracion_min);
         const bufferMin = Number(request.body.buffer_min);
         const precioHnl = Number(request.body.precio_hnl);
+        const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
 
         await client.query("BEGIN");
 
@@ -1270,14 +1293,16 @@ export default async function adminCatalogRoutes(app) {
             `
               INSERT INTO public.servicios (
                 nombre_servicio,
+                descripcion,
                 duracion_min,
                 buffer_min,
+                orden_visual,
                 activo
               )
-              VALUES ($1, $2::int, $3::int, TRUE)
+              VALUES ($1, $2, $3::int, $4::int, $5::int, TRUE)
               RETURNING id_servicio
             `,
-            [nombreServicio, duracionMin, bufferMin]
+            [nombreServicio, descripcion ?? null, duracionMin, bufferMin, ordenVisual]
           );
           idServicio = insertResult.rows[0].id_servicio;
         } catch (insertError) {
@@ -1370,7 +1395,10 @@ export default async function adminCatalogRoutes(app) {
             code: "CATALOG_SERVICE_NOT_FOUND",
           });
         }
-        const shouldMutateServiceBase = request.body.nombre_servicio !== undefined;
+        const shouldMutateServiceBase =
+          request.body.nombre_servicio !== undefined ||
+          request.body.descripcion !== undefined ||
+          request.body.orden_visual !== undefined;
         let targetServiceId = request.params.id;
 
         if (shouldMutateServiceBase) {
@@ -1398,6 +1426,12 @@ export default async function adminCatalogRoutes(app) {
           request.body.nombre_servicio !== undefined
             ? normalizeRequiredText(request.body.nombre_servicio)
             : targetBase.nombre_servicio;
+        const descripcion =
+          request.body.descripcion !== undefined ? normalizeOptionalText(request.body.descripcion) : targetBase.descripcion;
+        const ordenVisual =
+          request.body.orden_visual !== undefined
+            ? normalizeOrderVisual(request.body.orden_visual, 100)
+            : normalizeOrderVisual(targetBase.orden_visual, 100);
         await ensureUniqueServiceNameByBranch(client, targetServiceId, branchId, nombreServicio);
 
         const duracionMin =
@@ -1417,12 +1451,14 @@ export default async function adminCatalogRoutes(app) {
               UPDATE public.servicios
               SET
                 nombre_servicio = $2,
+                descripcion = $3,
+                orden_visual = $4::int,
                 activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
             `,
-            [targetServiceId, nombreServicio]
+            [targetServiceId, nombreServicio, descripcion ?? null, ordenVisual]
           );
         } else {
           await client.query(
@@ -1821,6 +1857,7 @@ export default async function adminCatalogRoutes(app) {
         const nombrePaquete = normalizeRequiredText(request.body.nombre_paquete);
         const descripcion = normalizeOptionalText(request.body.descripcion);
         const precioHnl = Number(request.body.precio_hnl);
+        const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
         const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const items = normalizePackageItems(request.body.items);
 
@@ -1850,6 +1887,7 @@ export default async function adminCatalogRoutes(app) {
           precioHnl,
           activo: true,
           visiblePublico,
+          ordenVisual,
         });
 
         const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [idPaquete, branchId]);
@@ -1953,6 +1991,10 @@ export default async function adminCatalogRoutes(app) {
                 ? 0
                 : Number(basePackage.precio_hnl)
               : Number(scopedPackage.precio_hnl);
+        const ordenVisual =
+          request.body.orden_visual !== undefined
+            ? normalizeOrderVisual(request.body.orden_visual, 100)
+            : normalizeOrderVisual(scopedPackage?.orden_visual, 100);
         const visiblePublico =
           request.body.visible_publico !== undefined
             ? normalizeBoolean(request.body.visible_publico)
@@ -1991,6 +2033,7 @@ export default async function adminCatalogRoutes(app) {
           precioHnl,
           activo: nextActivo,
           visiblePublico,
+          ordenVisual,
         });
 
         const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [targetPackageId, branchId]);
