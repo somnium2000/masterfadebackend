@@ -583,6 +583,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
         SELECT
           st.id_servicio,
           st.precio_hnl,
+          COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
           ROW_NUMBER() OVER (
             PARTITION BY st.id_servicio
             ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
@@ -608,6 +609,8 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
       WHERE s.id_servicio = ANY($2::uuid[])
         AND s.deleted_at IS NULL
         AND s.activo IS TRUE
+        AND COALESCE(s.agendable, TRUE) IS TRUE
+        AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
     [safeBranchId, uniqueIds]

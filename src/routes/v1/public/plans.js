@@ -47,6 +47,7 @@ const planSchema = {
     periodo_membresia_codigo: { type: "string" },
     periodo_membresia_label: { type: "string" },
     precio_hnl: { type: ["number", "null"] },
+    orden_visual: { type: "integer" },
     beneficios: { type: "array", items: planBenefitSchema },
   },
   required: [
@@ -57,6 +58,7 @@ const planSchema = {
     "periodo_membresia_codigo",
     "periodo_membresia_label",
     "precio_hnl",
+    "orden_visual",
     "beneficios",
   ],
   additionalProperties: false,
@@ -159,6 +161,7 @@ function mapPlanRow(row) {
     periodo_membresia_codigo: row.periodo_membresia_codigo,
     periodo_membresia_label: row.periodo_membresia_label || row.periodo_membresia_codigo,
     precio_hnl: row.precio_hnl == null ? null : Number(row.precio_hnl),
+    orden_visual: Number(row.orden_visual ?? 100),
     beneficios: parseStoredBenefits(row.beneficios),
   };
 }

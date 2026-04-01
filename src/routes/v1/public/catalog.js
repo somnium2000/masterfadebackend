@@ -34,6 +34,8 @@ const servicioSchema = {
     precio_hnl: { type: "number" },
     grupo_catalogo: { type: "string", enum: ["barberia", "otros"] },
     agendable: { type: "boolean" },
+    servicio_informativo: { type: "boolean" },
+    orden_visual: { type: "integer" },
     agendable_barbero: { type: "boolean" },
   },
   required: [
@@ -45,6 +47,8 @@ const servicioSchema = {
     "precio_hnl",
     "grupo_catalogo",
     "agendable",
+    "servicio_informativo",
+    "orden_visual",
     "agendable_barbero",
   ],
   additionalProperties: false,
@@ -68,9 +72,10 @@ const paqueteSchema = {
     nombre_paquete: { type: "string" },
     descripcion: { type: ["string", "null"] },
     precio_hnl: { type: ["number", "null"] },
+    orden_visual: { type: "integer" },
     items: { type: "array", items: paqueteItemSchema },
   },
-  required: ["id_paquete", "nombre_paquete", "descripcion", "precio_hnl", "items"],
+  required: ["id_paquete", "nombre_paquete", "descripcion", "precio_hnl", "orden_visual", "items"],
   additionalProperties: false,
 };
 
@@ -135,6 +140,7 @@ const PUBLIC_SERVICES_SQL = `
       st.precio_hnl,
       st.duracion_min,
       st.buffer_min,
+      COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
       ROW_NUMBER() OVER (
         PARTITION BY st.id_servicio, st.id_sucursal
         ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
@@ -152,7 +158,7 @@ const PUBLIC_SERVICES_SQL = `
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
   ),
   picked_tariffs AS (
-    SELECT id_servicio, id_sucursal, precio_hnl, duracion_min, buffer_min
+    SELECT id_servicio, id_sucursal, precio_hnl, duracion_min, buffer_min, servicio_informativo
     FROM active_tariffs
     WHERE rn = 1
   ),
@@ -161,13 +167,15 @@ const PUBLIC_SERVICES_SQL = `
       ranked.id_servicio,
       ranked.precio_hnl,
       ranked.duracion_min,
-      ranked.buffer_min
+      ranked.buffer_min,
+      ranked.servicio_informativo
     FROM (
       SELECT
         pt.id_servicio,
         pt.precio_hnl,
         pt.duracion_min,
         pt.buffer_min,
+        pt.servicio_informativo,
         ROW_NUMBER() OVER (
           PARTITION BY pt.id_servicio
           ORDER BY
@@ -188,6 +196,8 @@ const PUBLIC_SERVICES_SQL = `
     COALESCE(ss.duracion_min, s.duracion_min) AS duracion_min,
     COALESCE(ss.buffer_min, s.buffer_min) AS buffer_min,
     s.grupo_catalogo,
+    COALESCE(ss.servicio_informativo, FALSE) AS servicio_informativo,
+    s.orden_visual,
     s.agendable,
     ss.precio_hnl
   FROM public.servicios s
@@ -200,7 +210,7 @@ const PUBLIC_SERVICES_SQL = `
 `;
 
 const PUBLIC_PACKAGES_SQL = `
-  -- AM: Oferta publica de paquetes filtrada por sucursal y validada contra servicios operativos de esa sucursal.
+  -- AM: Oferta publica de paquetes filtrada por sucursal y validada contra servicios operativos.
   WITH scoped_offers AS (
     SELECT
       ps.id_paquete,
@@ -274,25 +284,11 @@ const PUBLIC_PACKAGES_SQL = `
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
    AND s.activo IS TRUE
-  LEFT JOIN LATERAL (
-    SELECT 1 AS has_tarifa
-    FROM public.servicios_tarifas st
-    WHERE st.id_servicio = pd.id_servicio
-      AND st.id_sucursal = eo.id_sucursal
-      AND st.id_empleado IS NULL
-      AND st.deleted_at IS NULL
-      AND st.activo IS TRUE
-      AND st.vigente_desde <= CURRENT_DATE
-      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-    ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
-    LIMIT 1
-  ) tariff_scope ON TRUE
   WHERE p.deleted_at IS NULL
     AND p.activo IS TRUE
   GROUP BY p.id_paquete, eo.precio_hnl, eo.orden_visual, eo.id_sucursal
   HAVING COUNT(pd.id_servicio) > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
-     AND COUNT(tariff_scope.has_tarifa) = COUNT(pd.id_servicio)
   ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
 `;
 
@@ -378,7 +374,8 @@ const PUBLIC_PROMOTIONS_SQL = `
 
 function mapServiceRow(row) {
   const grupoCatalogo = String(row.grupo_catalogo || "barberia").trim().toLowerCase() === "otros" ? "otros" : "barberia";
-  const agendable = Boolean(row.agendable ?? (grupoCatalogo === "barberia"));
+  const servicioInformativo = Boolean(row.servicio_informativo ?? false);
+  const agendable = Boolean(row.agendable ?? (grupoCatalogo === "barberia")) && !servicioInformativo;
 
   return {
     id_servicio: row.id_servicio,
@@ -389,6 +386,8 @@ function mapServiceRow(row) {
     precio_hnl: Number(row.precio_hnl ?? 0),
     grupo_catalogo: grupoCatalogo,
     agendable,
+    servicio_informativo: servicioInformativo,
+    orden_visual: Number(row.orden_visual ?? 100),
     // AM: Campo legado conservado temporalmente para frontend ya integrado.
     agendable_barbero: agendable,
   };
@@ -400,6 +399,7 @@ function mapPackageRow(row) {
     nombre_paquete: row.nombre_paquete,
     descripcion: row.descripcion ?? null,
     precio_hnl: row.precio_hnl == null ? null : Number(row.precio_hnl),
+    orden_visual: Number(row.orden_visual ?? 100),
     items: Array.isArray(row.items)
       ? row.items.map((item) => ({
           id_servicio: item.id_servicio,
