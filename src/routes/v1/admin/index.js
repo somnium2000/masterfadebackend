@@ -5,6 +5,7 @@ import empleadosRoutes from "./empleados.js";
 import masterPuntosRoutes from "./masterpuntos.js";
 import personasRoutes from "./personas.js";
 import plansRoutes from "./plans.js";
+import storageRoutes from "./storage.js";
 import sucursalesRoutes from "./sucursales.js";
 
 export default async function adminRoutes(app) {
@@ -16,4 +17,5 @@ export default async function adminRoutes(app) {
   await app.register(masterPuntosRoutes, { prefix: "/masterpuntos" });
   await app.register(adminCitasRoutes, { prefix: "/citas" });
   await app.register(configuracionRoutes, { prefix: "/configuracion" });
+  await app.register(storageRoutes, { prefix: "/storage" });
 }

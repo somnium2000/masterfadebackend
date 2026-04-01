@@ -1,5 +1,10 @@
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
+import {
+  activateAssetForEntity,
+  replaceAssetIfNeeded,
+  resolveAssetForBinding,
+} from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ALLOWED_ROLES = ["super_admin"];
 const requestIdSchema = { type: "string" };
@@ -121,6 +126,7 @@ const COMMUNICATION_SEND_STATUS_SENT = "enviado";
 const COMMUNICATION_SEND_STATUS_FAILED = "fallido";
 const COMMUNICATION_FALLBACK_SEND_DELAY_MINUTES = 1440;
 const COMMUNICATION_SEND_ERROR_MAX_LENGTH = 500;
+const COMMUNICATION_MANUAL_EXCLUSION_REASON = "exclusion_manual";
 const COMMUNICATION_SEND_LOCK_NAMESPACE = 82051;
 const COMMUNICATION_SCHEDULER_INTERVAL_MS_DEFAULT = 60000;
 const COMMUNICATION_SCHEDULER_MAX_CAMPAIGNS_PER_TICK = 10;
@@ -131,6 +137,12 @@ const COMMUNICATION_ELIGIBILITY_REASONS = [
   "sin_aceptacion_terminos",
   "sin_consentimiento_marketing",
 ];
+const COMMUNICATION_EMAIL_FROM_ADDRESS =
+  String(process.env.SMTP_FROM_PROMOTIONS || process.env.SMTP_FROM_COMMUNICATIONS || "promociones@masterfadeapp.com")
+    .trim();
+const COMMUNICATION_EMAIL_BANNER_URL = String(process.env.COMMUNICATION_EMAIL_BANNER_URL || "").trim();
+const STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN = "public_promotion_main";
+const STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE = "public_promotion_mobile";
 
 const promotionParagraphSchema = {
   type: "array",
@@ -147,7 +159,9 @@ const promotionBodySchema = {
     subtitulo: { type: ["string", "null"], maxLength: 180 },
     parrafos: promotionParagraphSchema,
     imagen_principal_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_principal_asset_id: { type: ["string", "null"], format: "uuid" },
     imagen_mobile_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_mobile_asset_id: { type: ["string", "null"], format: "uuid" },
     imagen_alt: { type: ["string", "null"], maxLength: 180 },
     cta_texto: { type: ["string", "null"], maxLength: 80 },
     cta_url: { type: ["string", "null"], maxLength: 500 },
@@ -172,7 +186,9 @@ const promotionPatchSchema = {
     subtitulo: { type: ["string", "null"], maxLength: 180 },
     parrafos: promotionParagraphSchema,
     imagen_principal_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_principal_asset_id: { type: ["string", "null"], format: "uuid" },
     imagen_mobile_url: { type: ["string", "null"], maxLength: 500 },
+    imagen_mobile_asset_id: { type: ["string", "null"], format: "uuid" },
     imagen_alt: { type: ["string", "null"], maxLength: 180 },
     cta_texto: { type: ["string", "null"], maxLength: 80 },
     cta_url: { type: ["string", "null"], maxLength: 500 },
@@ -265,6 +281,7 @@ const communicationCampaignsQuerySchema = {
     tipo_campania: { type: "string", enum: COMMUNICATION_CAMPAIGN_TYPES },
     estado: { type: "string", enum: COMMUNICATION_CAMPAIGN_DB_STATES },
     estado_operativo: { type: "string", enum: COMMUNICATION_CAMPAIGN_OPERATIONAL_STATES },
+    incluir_canceladas: { type: "boolean" },
     limit: { type: "integer", minimum: 1, maximum: 100 },
     offset: { type: "integer", minimum: 0, maximum: 10000 },
     sort: { type: "string", enum: COMMUNICATION_CAMPAIGNS_SORTS },
@@ -288,6 +305,15 @@ function normalizeOptionalText(value) {
   if (value === null) return null;
   const trimmed = String(value).normalize("NFC").trim();
   return trimmed || null;
+}
+
+function parseBooleanQueryValue(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on", "si"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 function mapRowsByKey(rows = []) {
@@ -657,6 +683,25 @@ function resolveCommunicationOperationalState(row = {}) {
   return rawState || "sin_estado";
 }
 
+function normalizeCommunicationExclusionsSnapshot(rawValue) {
+  if (!rawValue) return null;
+  if (Array.isArray(rawValue)) {
+    return {
+      excluidos: rawValue,
+      resumen_por_motivo: [],
+    };
+  }
+  if (typeof rawValue !== "object") return null;
+  const exclusions = Array.isArray(rawValue.excluidos) ? rawValue.excluidos : [];
+  const summary = Array.isArray(rawValue.resumen_por_motivo) ? rawValue.resumen_por_motivo : [];
+  return {
+    generado_at: rawValue.generado_at ?? null,
+    tipo_campania: rawValue.tipo_campania ?? null,
+    excluidos: exclusions,
+    resumen_por_motivo: summary,
+  };
+}
+
 function mapCommunicationCampaignRow(row) {
   return {
     id_campania: row.id_campania,
@@ -675,6 +720,7 @@ function mapCommunicationCampaignRow(row) {
     total_enviados: Number(row.total_enviados ?? 0),
     total_fallidos: Number(row.total_fallidos ?? 0),
     total_omitidos: Number(row.total_omitidos ?? 0),
+    exclusiones_snapshot: normalizeCommunicationExclusionsSnapshot(row.exclusiones_snapshot),
     estado_operativo: row.estado_operativo ?? resolveCommunicationOperationalState(row),
     creada_por: row.creada_por ?? null,
     actualizada_por: row.actualizada_por ?? null,
@@ -707,6 +753,7 @@ function buildCommunicationCampaignsFilters(rawQuery = {}) {
   const tipoCampania = rawQuery.tipo_campania ? String(rawQuery.tipo_campania).trim().toLowerCase() : null;
   const estado = rawQuery.estado ? String(rawQuery.estado).trim().toLowerCase() : null;
   const estadoOperativo = rawQuery.estado_operativo ? String(rawQuery.estado_operativo).trim().toLowerCase() : null;
+  const incluirCanceladas = parseBooleanQueryValue(rawQuery.incluir_canceladas, false);
   const limit = Number.isFinite(Number(rawQuery.limit)) ? Math.max(1, Math.min(100, Number(rawQuery.limit))) : 25;
   const offset = Number.isFinite(Number(rawQuery.offset)) ? Math.max(0, Math.min(10000, Number(rawQuery.offset))) : 0;
   const sort = resolveCommunicationCampaignsSort(rawQuery.sort);
@@ -716,6 +763,7 @@ function buildCommunicationCampaignsFilters(rawQuery = {}) {
     tipo_campania: tipoCampania && COMMUNICATION_CAMPAIGN_TYPES.includes(tipoCampania) ? tipoCampania : null,
     estado: estado && COMMUNICATION_CAMPAIGN_DB_STATES.includes(estado) ? estado : null,
     estado_operativo: estadoOperativo && COMMUNICATION_CAMPAIGN_OPERATIONAL_STATES.includes(estadoOperativo) ? estadoOperativo : null,
+    incluir_canceladas: incluirCanceladas,
     limit,
     offset,
     sort,
@@ -770,6 +818,7 @@ async function listCommunicationCampaigns(client, rawQuery = {}) {
         AND ($2::text IS NULL OR tipo_campania = $2::text)
         AND ($3::text IS NULL OR estado = $3::text)
         AND ($4::text IS NULL OR estado_operativo = $4::text)
+        AND ($5::boolean IS TRUE OR estado <> 'cancelada')
     )
   `;
 
@@ -800,10 +849,10 @@ async function listCommunicationCampaigns(client, rawQuery = {}) {
         updated_at
       FROM filtered
       ORDER BY ${filters.sort.clause}
-      LIMIT $5::int
-      OFFSET $6::int
+      LIMIT $6::int
+      OFFSET $7::int
     `,
-    [filters.q, filters.tipo_campania, filters.estado, filters.estado_operativo, filters.limit, filters.offset]
+    [filters.q, filters.tipo_campania, filters.estado, filters.estado_operativo, filters.incluir_canceladas, filters.limit, filters.offset]
   );
 
   const totalResult = await client.query(
@@ -812,7 +861,7 @@ async function listCommunicationCampaigns(client, rawQuery = {}) {
       SELECT COUNT(*)::int AS total
       FROM filtered
     `,
-    [filters.q, filters.tipo_campania, filters.estado, filters.estado_operativo]
+    [filters.q, filters.tipo_campania, filters.estado, filters.estado_operativo, filters.incluir_canceladas]
   );
 
   return {
@@ -820,6 +869,7 @@ async function listCommunicationCampaigns(client, rawQuery = {}) {
     tipo_campania: filters.tipo_campania,
     estado: filters.estado,
     estado_operativo: filters.estado_operativo,
+    incluir_canceladas: filters.incluir_canceladas,
     sort: filters.sort.key,
     limit: filters.limit,
     offset: filters.offset,
@@ -848,6 +898,7 @@ async function getCommunicationCampaignById(client, idCampania) {
         total_enviados,
         total_fallidos,
         total_omitidos,
+        exclusiones_snapshot,
         creada_por,
         actualizada_por,
         created_at,
@@ -882,6 +933,7 @@ async function getCommunicationCampaignByIdForUpdate(client, idCampania) {
         total_enviados,
         total_fallidos,
         total_omitidos,
+        exclusiones_snapshot,
         creada_por,
         actualizada_por,
         created_at,
@@ -1204,6 +1256,7 @@ async function listEligibleRecipientsForScheduling(client, campaignType) {
         id_cliente,
         id_persona,
         id_usuario,
+        concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
         btrim(correo_destino) AS correo_destino
       FROM resultado
       WHERE estado_elegibilidad = 'elegible'
@@ -1215,8 +1268,62 @@ async function listEligibleRecipientsForScheduling(client, campaignType) {
     id_cliente: row.id_cliente,
     id_persona: row.id_persona,
     id_usuario: row.id_usuario ?? null,
+    nombre_cliente: row.nombre_cliente || null,
     correo_destino: row.correo_destino,
   }));
+}
+
+async function listExcludedRecipientsForSnapshot(client, campaignType) {
+  const { rows } = await client.query(
+    `
+      ${buildEligibilityEvaluationCte()}
+      SELECT
+        id_cliente,
+        id_persona,
+        concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
+        correo_destino,
+        estado_elegibilidad AS motivo_exclusion
+      FROM resultado
+      WHERE estado_elegibilidad <> 'elegible'
+      ORDER BY estado_elegibilidad ASC, nombre_cliente ASC NULLS LAST, id_cliente ASC
+    `,
+    [campaignType]
+  );
+
+  return rows.map((row) => ({
+    id_cliente: row.id_cliente,
+    id_persona: row.id_persona,
+    nombre_cliente: row.nombre_cliente || null,
+    correo_destino: row.correo_destino || null,
+    motivo_exclusion: row.motivo_exclusion,
+    origen_exclusion: "regla",
+  }));
+}
+
+function buildCommunicationExclusionsSnapshot({ campaignType, excludedByRules = [], excludedByManual = [] }) {
+  const allExclusions = [...excludedByRules, ...excludedByManual];
+  const summaryMap = new Map();
+  for (const row of allExclusions) {
+    const key = String(row?.motivo_exclusion || "sin_motivo").trim().toLowerCase() || "sin_motivo";
+    summaryMap.set(key, Number(summaryMap.get(key) || 0) + 1);
+  }
+
+  return {
+    generado_at: new Date().toISOString(),
+    tipo_campania: campaignType,
+    excluidos: allExclusions.map((row) => ({
+      id_cliente: row.id_cliente,
+      id_persona: row.id_persona ?? null,
+      nombre_cliente: row.nombre_cliente ?? null,
+      correo_destino: row.correo_destino ?? null,
+      motivo_exclusion: row.motivo_exclusion ?? null,
+      origen_exclusion: row.origen_exclusion ?? null,
+    })),
+    resumen_por_motivo: Array.from(summaryMap.entries()).map(([motivo, total]) => ({
+      motivo,
+      total,
+    })),
+  };
 }
 
 async function listCampaignShipments(client, idCampania, options = {}) {
@@ -1304,14 +1411,96 @@ function normalizeCommunicationSendError(rawValue) {
   return message.slice(0, COMMUNICATION_SEND_ERROR_MAX_LENGTH);
 }
 
+function escapeHtmlForEmail(input) {
+  return String(input || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildCommunicationCampaignEmailPayload(campaign = {}, recipientFullName = null) {
+  const normalizedSubject = String(campaign?.asunto || "Comunicado MasterFade").trim() || "Comunicado MasterFade";
+  const normalizedRecipientName = String(recipientFullName || "").trim();
+  const greetingText = normalizedRecipientName ? `Hola ${normalizedRecipientName},` : "Hola,";
+  const bodyLines = String(campaign?.contenido_texto || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const contentParagraphs = bodyLines.length > 0 ? bodyLines : ["Tenemos una actualización importante para ti."];
+  const bodyHtml = contentParagraphs
+    .map(
+      (line) =>
+        `<p style="margin:0 0 14px;color:#d9dce4;font-size:15px;line-height:1.7;">${escapeHtmlForEmail(line)}</p>`
+    )
+    .join("");
+
+  const bannerHtml = COMMUNICATION_EMAIL_BANNER_URL
+    ? `
+      <div style="margin:0 0 20px;border-radius:14px;overflow:hidden;border:1px solid #2b2f3f;">
+        <img src="${escapeHtmlForEmail(COMMUNICATION_EMAIL_BANNER_URL)}" alt="MasterFade Banner" style="display:block;width:100%;height:auto;" />
+      </div>
+    `
+    : "";
+
+  const html = `
+    <!doctype html>
+    <html lang="es">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>${escapeHtmlForEmail(normalizedSubject)}</title>
+      </head>
+      <body style="margin:0;padding:0;background:#0b0d12;font-family:Inter,Segoe UI,Arial,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:20px 12px;background:#0b0d12;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#141722;border:1px solid #2b2f3f;border-radius:18px;overflow:hidden;">
+                <tr>
+                  <td style="padding:26px 24px;background:linear-gradient(135deg,#1c2234 0%,#131722 50%,#2f2614 100%);border-bottom:1px solid #2b2f3f;">
+                    <p style="margin:0;color:#f1f4fa;font-size:12px;letter-spacing:0.28em;text-transform:uppercase;">MasterFade</p>
+                    <h1 style="margin:10px 0 0;color:#f8f9fb;font-size:24px;line-height:1.25;">${escapeHtmlForEmail(normalizedSubject)}</h1>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:22px 24px 26px;">
+                    ${bannerHtml}
+                    <p style="margin:0 0 14px;color:#f4f6fb;font-size:16px;font-weight:600;">${escapeHtmlForEmail(greetingText)}</p>
+                    ${bodyHtml}
+                    <p style="margin:18px 0 0;color:#d9dce4;font-size:14px;line-height:1.6;">
+                      Este correo es informativo y fue enviado por el equipo de MasterFade.
+                    </p>
+                    <p style="margin:8px 0 0;color:#97a0b8;font-size:12px;line-height:1.5;">
+                      Si tienes dudas, escríbenos a <a href="mailto:soporte@masterfadeapp.com" style="color:#d4b068;text-decoration:none;">soporte@masterfadeapp.com</a>.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `;
+
+  const text = [`${normalizedSubject}`, "", ...contentParagraphs, "", "Soporte: soporte@masterfadeapp.com", "MasterFade"].join("\n");
+  return { subject: normalizedSubject, html, text };
+}
+
 async function listCampaignShipmentsByStatus(client, campaignId, status, options = {}) {
   const dueOnly = options?.dueOnly === true;
   const { rows } = await client.query(
     `
       SELECT
         ce.id_envio,
-        ce.correo_destino::text AS correo_destino
+        ce.correo_destino::text AS correo_destino,
+        concat_ws(' ', NULLIF(btrim(p.nombres), ''), NULLIF(btrim(p.apellidos), '')) AS nombre_cliente
       FROM public.comunicaciones_envios ce
+      LEFT JOIN public.personas p
+        ON p.id_persona = ce.id_persona
       WHERE ce.id_campania = $1::uuid
         AND ce.estado_envio = $2::text
         AND ($3::boolean IS FALSE OR ce.enviar_en <= NOW())
@@ -1330,10 +1519,13 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
 
   for (const row of rows) {
     totalIntentados += 1;
+    const emailPayload = buildCommunicationCampaignEmailPayload(campaign, row.nombre_cliente);
     const mailResult = await mailer.sendMail({
       to: row.correo_destino,
-      subject: campaign.asunto,
-      text: campaign.contenido_texto,
+      from: COMMUNICATION_EMAIL_FROM_ADDRESS,
+      subject: emailPayload.subject,
+      text: emailPayload.text,
+      html: emailPayload.html,
     });
 
     if (mailResult?.sent) {
@@ -1564,7 +1756,11 @@ function mapPromotionRow(row) {
     titulo: row.titulo,
     subtitulo: row.subtitulo ?? null,
     parrafos: Array.isArray(row.parrafos) ? row.parrafos : [],
+    imagen_principal_asset_id: row.imagen_principal_asset_id ?? null,
+    imagen_principal_path: row.imagen_principal_path ?? null,
     imagen_principal_url: row.imagen_principal_url ?? null,
+    imagen_mobile_asset_id: row.imagen_mobile_asset_id ?? null,
+    imagen_mobile_path: row.imagen_mobile_path ?? null,
     imagen_mobile_url: row.imagen_mobile_url ?? null,
     imagen_alt: row.imagen_alt ?? null,
     cta_texto: row.cta_texto ?? null,
@@ -1591,7 +1787,11 @@ async function getPromotionScoped(client, idPromocion, idSucursal) {
         p.titulo,
         p.subtitulo,
         p.parrafos,
+        p.imagen_principal_asset_id,
+        p.imagen_principal_path,
         p.imagen_principal_url,
+        p.imagen_mobile_asset_id,
+        p.imagen_mobile_path,
         p.imagen_mobile_url,
         p.imagen_alt,
         p.cta_texto,
@@ -1627,7 +1827,11 @@ async function listPromotions(client, idSucursal = null) {
         p.titulo,
         p.subtitulo,
         p.parrafos,
+        p.imagen_principal_asset_id,
+        p.imagen_principal_path,
         p.imagen_principal_url,
+        p.imagen_mobile_asset_id,
+        p.imagen_mobile_path,
         p.imagen_mobile_url,
         p.imagen_alt,
         p.cta_texto,
@@ -1792,6 +1996,23 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
   ) {
     return sendError(reply, 500, "Falta aplicar la estructura de COMUNICACION en la base de datos", {
       code: "CONFIG_COMMUNICATION_MIGRATION_REQUIRED",
+      details: error.message,
+      requestId: request.id,
+    });
+  }
+
+  if (
+    (error?.code === "42P01" || error?.code === "42703") &&
+    (
+      String(error?.message || "").includes("storage_assets")
+      || String(error?.message || "").includes("imagen_principal_asset_id")
+      || String(error?.message || "").includes("imagen_mobile_asset_id")
+      || String(error?.message || "").includes("imagen_principal_path")
+      || String(error?.message || "").includes("imagen_mobile_path")
+    )
+  ) {
+    return sendError(reply, 500, "Falta aplicar migracion de STORAGE para promociones", {
+      code: "CONFIG_STORAGE_MIGRATION_REQUIRED",
       details: error.message,
       requestId: request.id,
     });
@@ -2155,6 +2376,7 @@ export default async function adminConfiguracionRoutes(app) {
               total_enviados,
               total_fallidos,
               total_omitidos,
+              exclusiones_snapshot,
               creada_por,
               actualizada_por,
               created_at,
@@ -2320,6 +2542,7 @@ export default async function adminConfiguracionRoutes(app) {
               total_enviados,
               total_fallidos,
               total_omitidos,
+              exclusiones_snapshot,
               creada_por,
               actualizada_por,
               created_at,
@@ -2587,6 +2810,7 @@ export default async function adminConfiguracionRoutes(app) {
         }
 
         const eligibleRecipients = await listEligibleRecipientsForScheduling(client, campaignType);
+        const excludedByRules = await listExcludedRecipientsForSnapshot(client, campaignType);
         if (!eligibleRecipients.length) {
           throw new AppError(409, "No hay destinatarios elegibles para programar esta campania", {
             code: "CONFIG_COMM_CAMPAIGN_NO_ELIGIBLE_RECIPIENTS",
@@ -2596,6 +2820,16 @@ export default async function adminConfiguracionRoutes(app) {
         const excludedSet = new Set(excludedClientIds.map((id) => String(id)));
         const recipientsToSchedule = eligibleRecipients.filter((recipient) => !excludedSet.has(String(recipient.id_cliente)));
         const manualExcludedCount = eligibleRecipients.length - recipientsToSchedule.length;
+        const manuallyExcludedRecipients = eligibleRecipients
+          .filter((recipient) => excludedSet.has(String(recipient.id_cliente)))
+          .map((recipient) => ({
+            id_cliente: recipient.id_cliente,
+            id_persona: recipient.id_persona ?? null,
+            nombre_cliente: recipient.nombre_cliente ?? null,
+            correo_destino: recipient.correo_destino || null,
+            motivo_exclusion: COMMUNICATION_MANUAL_EXCLUSION_REASON,
+            origen_exclusion: "manual",
+          }));
         if (!recipientsToSchedule.length) {
           throw new AppError(409, "No hay destinatarios elegibles luego de aplicar exclusiones manuales", {
             code: "CONFIG_COMM_CAMPAIGN_NO_ELIGIBLE_AFTER_EXCLUSIONS",
@@ -2632,6 +2866,11 @@ export default async function adminConfiguracionRoutes(app) {
         }
 
         const totalExcluidosConAjustes = totalExcluidos + manualExcludedCount;
+        const exclusionsSnapshot = buildCommunicationExclusionsSnapshot({
+          campaignType,
+          excludedByRules,
+          excludedByManual: manuallyExcludedRecipients,
+        });
         const updatedCampaignResult = await client.query(
           `
             UPDATE public.comunicaciones_campanias
@@ -2643,7 +2882,8 @@ export default async function adminConfiguracionRoutes(app) {
               total_enviados = 0,
               total_fallidos = 0,
               total_omitidos = $4::int,
-              actualizada_por = $5::uuid,
+              exclusiones_snapshot = $5::jsonb,
+              actualizada_por = $6::uuid,
               updated_at = NOW()
             WHERE id_campania = $1::uuid
               AND deleted_at IS NULL
@@ -2655,9 +2895,17 @@ export default async function adminConfiguracionRoutes(app) {
               total_pendientes,
               total_enviados,
               total_fallidos,
-              total_omitidos
+              total_omitidos,
+              exclusiones_snapshot
           `,
-          [campaign.id_campania, scheduledAt, recipientsToSchedule.length, totalExcluidosConAjustes, actorUserId]
+          [
+            campaign.id_campania,
+            scheduledAt,
+            recipientsToSchedule.length,
+            totalExcluidosConAjustes,
+            JSON.stringify(exclusionsSnapshot),
+            actorUserId,
+          ]
         );
 
         await client.query("COMMIT");
@@ -3528,8 +3776,44 @@ export default async function adminConfiguracionRoutes(app) {
 
         const subtitulo = normalizeOptionalText(request.body.subtitulo) ?? null;
         const parrafos = normalizeParagraphs(request.body.parrafos) ?? [];
-        const imagenPrincipalUrl = normalizeOptionalText(request.body.imagen_principal_url) ?? null;
-        const imagenMobileUrl = normalizeOptionalText(request.body.imagen_mobile_url) ?? null;
+        const imagenPrincipalUrlInput = normalizeOptionalText(request.body.imagen_principal_url) ?? null;
+        const imagenMobileUrlInput = normalizeOptionalText(request.body.imagen_mobile_url) ?? null;
+        const imagenPrincipalAssetId =
+          request.body.imagen_principal_asset_id !== undefined
+            ? normalizeOptionalText(request.body.imagen_principal_asset_id)
+            : null;
+        const imagenMobileAssetId =
+          request.body.imagen_mobile_asset_id !== undefined
+            ? normalizeOptionalText(request.body.imagen_mobile_asset_id)
+            : null;
+        const imagenPrincipalAsset = imagenPrincipalAssetId
+          ? await resolveAssetForBinding(client, {
+            assetId: imagenPrincipalAssetId,
+            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
+            entityType: "promocion",
+            entityId: null,
+            idSucursal: branchId,
+            claims: request.claims,
+            allowUnboundEntity: true,
+            allowedStatuses: ["temporal", "activo"],
+          })
+          : null;
+        const imagenMobileAsset = imagenMobileAssetId
+          ? await resolveAssetForBinding(client, {
+            assetId: imagenMobileAssetId,
+            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
+            entityType: "promocion",
+            entityId: null,
+            idSucursal: branchId,
+            claims: request.claims,
+            allowUnboundEntity: true,
+            allowedStatuses: ["temporal", "activo"],
+          })
+          : null;
+        const imagenPrincipalUrl = imagenPrincipalAsset?.public_url ?? imagenPrincipalUrlInput;
+        const imagenMobileUrl = imagenMobileAsset?.public_url ?? imagenMobileUrlInput;
+        const imagenPrincipalPath = imagenPrincipalAsset?.object_path ?? null;
+        const imagenMobilePath = imagenMobileAsset?.object_path ?? null;
         const imagenAlt = normalizeOptionalText(request.body.imagen_alt) ?? null;
         const ctaTexto = normalizeOptionalText(request.body.cta_texto) ?? null;
         const ctaUrl = normalizeOptionalText(request.body.cta_url) ?? null;
@@ -3576,7 +3860,11 @@ export default async function adminConfiguracionRoutes(app) {
               titulo,
               subtitulo,
               parrafos,
+              imagen_principal_asset_id,
+              imagen_principal_path,
               imagen_principal_url,
+              imagen_mobile_asset_id,
+              imagen_mobile_path,
               imagen_mobile_url,
               imagen_alt,
               cta_texto,
@@ -3585,13 +3873,52 @@ export default async function adminConfiguracionRoutes(app) {
               estado,
               updated_at
             )
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, NOW())
+            VALUES ($1, $2, $3, $4::jsonb, $5::uuid, $6, $7, $8::uuid, $9, $10, $11, $12, $13, $14, $15, NOW())
             RETURNING id_promocion
           `,
-          [slug, titulo, subtitulo, JSON.stringify(parrafos), imagenPrincipalUrl, imagenMobileUrl, imagenAlt, normalizedCtaTexto, normalizedCtaUrl, ctaTipo, estado]
+          [
+            slug,
+            titulo,
+            subtitulo,
+            JSON.stringify(parrafos),
+            imagenPrincipalAsset?.id_asset ?? null,
+            imagenPrincipalPath,
+            imagenPrincipalUrl,
+            imagenMobileAsset?.id_asset ?? null,
+            imagenMobilePath,
+            imagenMobileUrl,
+            imagenAlt,
+            normalizedCtaTexto,
+            normalizedCtaUrl,
+            ctaTipo,
+            estado,
+          ]
         );
 
         const idPromocion = inserted.rows[0].id_promocion;
+
+        if (imagenPrincipalAsset?.id_asset) {
+          await activateAssetForEntity(app, client, {
+            assetId: imagenPrincipalAsset.id_asset,
+            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
+            entityType: "promocion",
+            entityId: idPromocion,
+            idSucursal: branchId,
+            claims: request.claims,
+            replaceCurrent: false,
+          });
+        }
+        if (imagenMobileAsset?.id_asset) {
+          await activateAssetForEntity(app, client, {
+            assetId: imagenMobileAsset.id_asset,
+            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
+            entityType: "promocion",
+            entityId: idPromocion,
+            idSucursal: branchId,
+            claims: request.claims,
+            replaceCurrent: false,
+          });
+        }
 
         await client.query(
           `
@@ -3695,14 +4022,71 @@ export default async function adminConfiguracionRoutes(app) {
           request.body.parrafos !== undefined
             ? normalizeParagraphs(request.body.parrafos) ?? []
             : (Array.isArray(currentPromotion.parrafos) ? currentPromotion.parrafos : []);
-        const imagenPrincipalUrl =
-          request.body.imagen_principal_url !== undefined
-            ? normalizeOptionalText(request.body.imagen_principal_url) ?? null
-            : currentPromotion.imagen_principal_url;
-        const imagenMobileUrl =
-          request.body.imagen_mobile_url !== undefined
-            ? normalizeOptionalText(request.body.imagen_mobile_url) ?? null
-            : currentPromotion.imagen_mobile_url;
+        const hasPrincipalAssetPatch = Object.prototype.hasOwnProperty.call(request.body, "imagen_principal_asset_id");
+        const hasMobileAssetPatch = Object.prototype.hasOwnProperty.call(request.body, "imagen_mobile_asset_id");
+        const hasPrincipalUrlPatch = Object.prototype.hasOwnProperty.call(request.body, "imagen_principal_url");
+        const hasMobileUrlPatch = Object.prototype.hasOwnProperty.call(request.body, "imagen_mobile_url");
+        let imagenPrincipalAssetId = currentPromotion.imagen_principal_asset_id ?? null;
+        let imagenPrincipalPath = currentPromotion.imagen_principal_path ?? null;
+        let imagenPrincipalUrl = currentPromotion.imagen_principal_url ?? null;
+        let imagenMobileAssetId = currentPromotion.imagen_mobile_asset_id ?? null;
+        let imagenMobilePath = currentPromotion.imagen_mobile_path ?? null;
+        let imagenMobileUrl = currentPromotion.imagen_mobile_url ?? null;
+
+        if (hasPrincipalAssetPatch) {
+          const rawPrincipalAssetId = normalizeOptionalText(request.body.imagen_principal_asset_id);
+          if (!rawPrincipalAssetId) {
+            imagenPrincipalAssetId = null;
+            imagenPrincipalPath = null;
+            imagenPrincipalUrl = hasPrincipalUrlPatch
+              ? (normalizeOptionalText(request.body.imagen_principal_url) ?? null)
+              : null;
+          } else {
+            const resolvedPrincipal = await resolveAssetForBinding(client, {
+              assetId: rawPrincipalAssetId,
+              scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
+              entityType: "promocion",
+              entityId: request.params.id,
+              idSucursal: branchId,
+              claims: request.claims,
+              allowUnboundEntity: true,
+              allowedStatuses: ["temporal", "activo"],
+            });
+            imagenPrincipalAssetId = resolvedPrincipal.id_asset;
+            imagenPrincipalPath = resolvedPrincipal.object_path;
+            imagenPrincipalUrl = resolvedPrincipal.public_url;
+          }
+        } else if (hasPrincipalUrlPatch) {
+          imagenPrincipalUrl = normalizeOptionalText(request.body.imagen_principal_url) ?? null;
+        }
+
+        if (hasMobileAssetPatch) {
+          const rawMobileAssetId = normalizeOptionalText(request.body.imagen_mobile_asset_id);
+          if (!rawMobileAssetId) {
+            imagenMobileAssetId = null;
+            imagenMobilePath = null;
+            imagenMobileUrl = hasMobileUrlPatch
+              ? (normalizeOptionalText(request.body.imagen_mobile_url) ?? null)
+              : null;
+          } else {
+            const resolvedMobile = await resolveAssetForBinding(client, {
+              assetId: rawMobileAssetId,
+              scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
+              entityType: "promocion",
+              entityId: request.params.id,
+              idSucursal: branchId,
+              claims: request.claims,
+              allowUnboundEntity: true,
+              allowedStatuses: ["temporal", "activo"],
+            });
+            imagenMobileAssetId = resolvedMobile.id_asset;
+            imagenMobilePath = resolvedMobile.object_path;
+            imagenMobileUrl = resolvedMobile.public_url;
+          }
+        } else if (hasMobileUrlPatch) {
+          imagenMobileUrl = normalizeOptionalText(request.body.imagen_mobile_url) ?? null;
+        }
+
         const imagenAlt =
           request.body.imagen_alt !== undefined
             ? normalizeOptionalText(request.body.imagen_alt) ?? null
@@ -3773,6 +4157,30 @@ export default async function adminConfiguracionRoutes(app) {
         });
 
         await client.query("BEGIN");
+
+        if (imagenPrincipalAssetId) {
+          await activateAssetForEntity(app, client, {
+            assetId: imagenPrincipalAssetId,
+            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
+            entityType: "promocion",
+            entityId: request.params.id,
+            idSucursal: branchId,
+            claims: request.claims,
+            replaceCurrent: false,
+          });
+        }
+        if (imagenMobileAssetId) {
+          await activateAssetForEntity(app, client, {
+            assetId: imagenMobileAssetId,
+            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
+            entityType: "promocion",
+            entityId: request.params.id,
+            idSucursal: branchId,
+            claims: request.claims,
+            replaceCurrent: false,
+          });
+        }
+
         await client.query(
           `
             UPDATE public.promociones
@@ -3781,17 +4189,38 @@ export default async function adminConfiguracionRoutes(app) {
               titulo = $3,
               subtitulo = $4,
               parrafos = $5::jsonb,
-              imagen_principal_url = $6,
-              imagen_mobile_url = $7,
-              imagen_alt = $8,
-              cta_texto = $9,
-              cta_url = $10,
-              cta_tipo = $11,
-              estado = $12,
+              imagen_principal_asset_id = $6::uuid,
+              imagen_principal_path = $7,
+              imagen_principal_url = $8,
+              imagen_mobile_asset_id = $9::uuid,
+              imagen_mobile_path = $10,
+              imagen_mobile_url = $11,
+              imagen_alt = $12,
+              cta_texto = $13,
+              cta_url = $14,
+              cta_tipo = $15,
+              estado = $16,
               updated_at = NOW()
             WHERE id_promocion = $1::uuid
           `,
-          [request.params.id, slug, titulo, subtitulo, JSON.stringify(parrafos), imagenPrincipalUrl, imagenMobileUrl, imagenAlt, normalizedCtaTexto, normalizedCtaUrl, ctaTipo, estado]
+          [
+            request.params.id,
+            slug,
+            titulo,
+            subtitulo,
+            JSON.stringify(parrafos),
+            imagenPrincipalAssetId,
+            imagenPrincipalPath,
+            imagenPrincipalUrl,
+            imagenMobileAssetId,
+            imagenMobilePath,
+            imagenMobileUrl,
+            imagenAlt,
+            normalizedCtaTexto,
+            normalizedCtaUrl,
+            ctaTipo,
+            estado,
+          ]
         );
 
         await client.query(
@@ -3817,6 +4246,17 @@ export default async function adminConfiguracionRoutes(app) {
           });
         }
         await client.query("COMMIT");
+
+        await replaceAssetIfNeeded(app, client, {
+          previousAssetId: currentPromotion.imagen_principal_asset_id,
+          nextAssetId: imagenPrincipalAssetId,
+          claims: request.claims,
+        });
+        await replaceAssetIfNeeded(app, client, {
+          previousAssetId: currentPromotion.imagen_mobile_asset_id,
+          nextAssetId: imagenMobileAssetId,
+          claims: request.claims,
+        });
 
         return sendOk(reply, { promocion: mapPromotionRow(finalPromotion) }, { requestId: request.id });
       } catch (error) {

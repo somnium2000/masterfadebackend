@@ -21,8 +21,9 @@ function escapeHtml(input) {
     .replace(/'/g, "&#39;");
 }
 
-function buildPasswordEmailTemplate({ actionLink, fullName, kind }) {
-  const safeName = escapeHtml(fullName || "usuario");
+function buildPasswordEmailTemplate({ actionLink, fullName, kind, bannerUrl = null }) {
+  const normalizedName = String(fullName || "").trim();
+  const greetingText = normalizedName ? `Hola ${normalizedName},` : "Hola,";
   const isSetup = kind === "setup";
   const title = isSetup ? "Configura tu contrasena en MasterFade" : "Restablece tu contrasena de MasterFade";
   const intro = isSetup
@@ -30,35 +31,130 @@ function buildPasswordEmailTemplate({ actionLink, fullName, kind }) {
     : "Recibimos una solicitud para restablecer tu contrasena.";
   const cta = isSetup ? "Configurar contrasena" : "Restablecer contrasena";
   const footer = "Si no solicitaste esta accion, puedes ignorar este correo.";
+  const normalizedBannerUrl = String(bannerUrl || "").trim();
+  const bannerHtml = normalizedBannerUrl
+    ? `
+      <div style="margin:0 0 20px;border-radius:14px;overflow:hidden;border:1px solid #2b2f3f;">
+        <img src="${escapeHtml(normalizedBannerUrl)}" alt="MasterFade Banner" style="display:block;width:100%;height:auto;" />
+      </div>
+    `
+    : "";
 
   const html = `
-    <div style="font-family:Arial,sans-serif;line-height:1.5;color:#1f2937">
-      <h2 style="margin-bottom:8px">${title}</h2>
-      <p>Hola ${safeName},</p>
-      <p>${intro}</p>
-      <p style="margin:24px 0">
-        <a href="${escapeHtml(actionLink)}" style="background:#111827;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">
-          ${cta}
-        </a>
-      </p>
-      <p>Tambien puedes abrir este enlace manualmente:</p>
-      <p style="word-break:break-all"><a href="${escapeHtml(actionLink)}">${escapeHtml(actionLink)}</a></p>
-      <p style="margin-top:20px;color:#6b7280">${footer}</p>
-    </div>
+    <!doctype html>
+    <html lang="es">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>${escapeHtml(title)}</title>
+      </head>
+      <body style="margin:0;padding:0;background:#0b0d12;font-family:Inter,Segoe UI,Arial,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:20px 12px;background:#0b0d12;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#141722;border:1px solid #2b2f3f;border-radius:18px;overflow:hidden;">
+                <tr>
+                  <td style="padding:26px 24px;background:linear-gradient(135deg,#1c2234 0%,#131722 50%,#2f2614 100%);border-bottom:1px solid #2b2f3f;">
+                    <p style="margin:0;color:#f1f4fa;font-size:12px;letter-spacing:0.28em;text-transform:uppercase;">MasterFade</p>
+                    <h1 style="margin:10px 0 0;color:#f8f9fb;font-size:24px;line-height:1.25;">${escapeHtml(title)}</h1>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:22px 24px 26px;">
+                    ${bannerHtml}
+                    <p style="margin:0 0 14px;color:#f4f6fb;font-size:16px;font-weight:600;">${escapeHtml(greetingText)}</p>
+                    <p style="margin:0 0 14px;color:#d9dce4;font-size:15px;line-height:1.7;">${escapeHtml(intro)}</p>
+                    <div style="margin:20px 0 18px;">
+                      <a href="${escapeHtml(actionLink)}" style="display:inline-block;background:#d4b068;color:#121317;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:700;">
+                        ${escapeHtml(cta)}
+                      </a>
+                    </div>
+                    <p style="margin:0 0 8px;color:#d9dce4;font-size:14px;line-height:1.6;">Tambien puedes abrir este enlace manualmente:</p>
+                    <p style="margin:0 0 16px;word-break:break-all;">
+                      <a href="${escapeHtml(actionLink)}" style="color:#9fb2f8;text-decoration:none;">${escapeHtml(actionLink)}</a>
+                    </p>
+                    <p style="margin:0;color:#97a0b8;font-size:12px;line-height:1.5;">${escapeHtml(footer)}</p>
+                    <p style="margin:8px 0 0;color:#97a0b8;font-size:12px;line-height:1.5;">
+                      Soporte: <a href="mailto:soporte@masterfadeapp.com" style="color:#d4b068;text-decoration:none;">soporte@masterfadeapp.com</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
   `;
 
   const text = [
     title,
     "",
-    `Hola ${fullName || "usuario"},`,
+    greetingText,
     intro,
     "",
     `${cta}: ${actionLink}`,
+    "",
+    "Soporte: soporte@masterfadeapp.com",
     "",
     footer,
   ].join("\n");
 
   return { html, text, subject: title };
+}
+
+function buildUserWelcomeTemplate({ fullName = null, bannerUrl = null }) {
+  const normalizedName = String(fullName || "").trim();
+  const greetingText = normalizedName ? `Hola ${normalizedName},` : "Hola,";
+  const title = "Tu acceso a MasterFade esta listo";
+  const intro = "Tu usuario fue creado correctamente. Ya puedes ingresar y disfrutar tu experiencia MasterFade.";
+  const supportText = "Si tienes dudas, responde este correo o escribe a soporte@masterfadeapp.com.";
+  const normalizedBannerUrl = String(bannerUrl || "").trim();
+  const bannerHtml = normalizedBannerUrl
+    ? `
+      <div style="margin:0 0 20px;border-radius:14px;overflow:hidden;border:1px solid #2b2f3f;">
+        <img src="${escapeHtml(normalizedBannerUrl)}" alt="MasterFade Banner" style="display:block;width:100%;height:auto;" />
+      </div>
+    `
+    : "";
+
+  const html = `
+    <!doctype html>
+    <html lang="es">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>${escapeHtml(title)}</title>
+      </head>
+      <body style="margin:0;padding:0;background:#0b0d12;font-family:Inter,Segoe UI,Arial,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:20px 12px;background:#0b0d12;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#141722;border:1px solid #2b2f3f;border-radius:18px;overflow:hidden;">
+                <tr>
+                  <td style="padding:26px 24px;background:linear-gradient(135deg,#1c2234 0%,#131722 50%,#2f2614 100%);border-bottom:1px solid #2b2f3f;">
+                    <p style="margin:0;color:#f1f4fa;font-size:12px;letter-spacing:0.28em;text-transform:uppercase;">MasterFade</p>
+                    <h1 style="margin:10px 0 0;color:#f8f9fb;font-size:24px;line-height:1.25;">${escapeHtml(title)}</h1>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:22px 24px 26px;">
+                    ${bannerHtml}
+                    <p style="margin:0 0 14px;color:#f4f6fb;font-size:16px;font-weight:600;">${escapeHtml(greetingText)}</p>
+                    <p style="margin:0 0 14px;color:#d9dce4;font-size:15px;line-height:1.7;">${escapeHtml(intro)}</p>
+                    <p style="margin:0;color:#97a0b8;font-size:13px;line-height:1.6;">${escapeHtml(supportText)}</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `;
+
+  const text = [title, "", greetingText, intro, "", supportText].join("\n");
+  return { subject: title, html, text };
 }
 
 async function mailerPlugin(app) {
@@ -69,6 +165,9 @@ async function mailerPlugin(app) {
   const user = normalizeOptional(process.env.SMTP_USER);
   const pass = normalizeOptional(process.env.SMTP_PASS);
   const from = normalizeOptional(process.env.SMTP_FROM) || user;
+  const supportFrom = normalizeOptional(process.env.SMTP_FROM_SUPPORT || "soporte@masterfadeapp.com");
+  const noReplyFrom = normalizeOptional(process.env.SMTP_FROM_NO_REPLY || "noresponder@masterfadeapp.com");
+  const passwordEmailBannerUrl = normalizeOptional(process.env.COMMUNICATION_EMAIL_BANNER_URL);
   const secure = parseBool(process.env.SMTP_SECURE, port === 465);
   const verifyOnBoot = parseBool(process.env.SMTP_VERIFY_ON_BOOT, false);
 
@@ -83,6 +182,12 @@ async function mailerPlugin(app) {
         };
       },
       async sendPasswordRecoveryEmail() {
+        return {
+          sent: false,
+          message: "Servicio SMTP no configurado (requiere SMTP_HOST y SMTP_FROM).",
+        };
+      },
+      async sendUserWelcomeEmail() {
         return {
           sent: false,
           message: "Servicio SMTP no configurado (requiere SMTP_HOST y SMTP_FROM).",
@@ -111,10 +216,11 @@ async function mailerPlugin(app) {
   app.decorate("mailer", {
     configured: true,
     provider: "smtp",
-    async sendMail({ to, subject, text, html }) {
+    async sendMail({ to, subject, text, html, from: customFrom = null }) {
       try {
+        const resolvedFrom = normalizeOptional(customFrom) || from;
         const result = await transporter.sendMail({
-          from,
+          from: resolvedFrom,
           to,
           subject,
           text,
@@ -133,20 +239,45 @@ async function mailerPlugin(app) {
         };
       }
     },
-    async sendPasswordRecoveryEmail({ to, actionLink, fullName = null, kind = "reset" }) {
+    async sendPasswordRecoveryEmail({ to, actionLink, fullName = null, kind = "reset", from: customFrom = null }) {
       try {
-        const template = buildPasswordEmailTemplate({ actionLink, fullName, kind });
+        const template = buildPasswordEmailTemplate({
+          actionLink,
+          fullName,
+          kind,
+          bannerUrl: passwordEmailBannerUrl,
+        });
+        const defaultFrom = kind === "setup" ? noReplyFrom : supportFrom;
         return this.sendMail({
           to,
           subject: template.subject,
           text: template.text,
           html: template.html,
+          from: normalizeOptional(customFrom) || defaultFrom,
         });
       } catch (error) {
         app.log.error({ err: error, to }, "Fallo construccion email SMTP");
         return {
           sent: false,
           message: error instanceof Error ? error.message : "No se pudo preparar el correo SMTP",
+        };
+      }
+    },
+    async sendUserWelcomeEmail({ to, fullName = null }) {
+      try {
+        const template = buildUserWelcomeTemplate({ fullName, bannerUrl: passwordEmailBannerUrl });
+        return this.sendMail({
+          to,
+          subject: template.subject,
+          text: template.text,
+          html: template.html,
+          from: noReplyFrom,
+        });
+      } catch (error) {
+        app.log.error({ err: error, to }, "Fallo construccion de correo de bienvenida");
+        return {
+          sent: false,
+          message: error instanceof Error ? error.message : "No se pudo preparar el correo de bienvenida",
         };
       }
     },

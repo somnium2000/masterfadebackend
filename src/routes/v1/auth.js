@@ -237,6 +237,27 @@ function normalizeRequiredText(value) {
   return String(value || "").normalize("NFC").trim();
 }
 
+async function resolvePasswordRecipientFullNameByEmail(app, email) {
+  if (!app.db) return null;
+
+  const { rows } = await app.db.query(
+    `
+      SELECT
+        concat_ws(' ', NULLIF(btrim(p.nombres), ''), NULLIF(btrim(p.apellidos), '')) AS full_name
+      FROM public.correos c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+      WHERE LOWER(c.direccion_correo::text) = LOWER($1)
+      ORDER BY c.es_principal DESC NULLS LAST
+      LIMIT 1
+    `,
+    [email]
+  );
+
+  const fullName = String(rows?.[0]?.full_name || "").trim();
+  return fullName || null;
+}
+
 function normalizeOptionalUuid(value) {
   const raw = String(value || "").trim();
   return raw || null;
@@ -457,6 +478,41 @@ async function insertClientWithConsents(client, params) {
   return insertLegacy.rows[0].id_cliente;
 }
 
+async function enforceExchangeClientConsents(client, authUserId) {
+  const safeAuthUserId = String(authUserId || "").trim();
+  if (!safeAuthUserId) return;
+
+  const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
+  if (hasConsentTimestampColumns) {
+    await client.query(
+      `
+        UPDATE public.clientes
+        SET
+          acepta_terminos = TRUE,
+          consentimiento_marketing = TRUE,
+          acepta_terminos_at = COALESCE(acepta_terminos_at, NOW()),
+          consentimiento_marketing_at = COALESCE(consentimiento_marketing_at, NOW())
+        WHERE id_usuario = $1::uuid
+          AND deleted_at IS NULL
+      `,
+      [safeAuthUserId]
+    );
+    return;
+  }
+
+  await client.query(
+    `
+      UPDATE public.clientes
+      SET
+        acepta_terminos = TRUE,
+        consentimiento_marketing = TRUE
+      WHERE id_usuario = $1::uuid
+        AND deleted_at IS NULL
+    `,
+    [safeAuthUserId]
+  );
+}
+
 function registerResetAttempt(emailKey) {
   const now = Date.now();
   let record = resetAttemptsByEmail.get(emailKey);
@@ -674,7 +730,8 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
     [authUserId]
   );
   if (existing.rowCount) {
-    return { created: false, authUserId };
+    await enforceExchangeClientConsents(app.db, authUserId);
+    return { created: false, authUserId, email: null, fullName: null };
   }
 
   const email = extractEmailFromSupabaseUser(supabaseUser);
@@ -748,16 +805,21 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
       idPersona,
       authUserId,
       branchId,
-      consentimientoMarketing: false,
+      consentimientoMarketing: true,
       aceptaTerminos: true,
       aceptaTerminosAt: new Date().toISOString(),
-      consentimientoMarketingAt: null,
+      consentimientoMarketingAt: new Date().toISOString(),
     });
 
     await client.query("COMMIT");
     transactionStarted = false;
 
-    return { created: true, authUserId };
+    return {
+      created: true,
+      authUserId,
+      email,
+      fullName: `${nombres} ${apellidos}`.trim() || null,
+    };
   } catch (error) {
     if (transactionStarted) {
       await client.query("ROLLBACK").catch(() => {});
@@ -785,7 +847,8 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
         );
 
         if (userNowExists.rowCount) {
-          return { created: false, authUserId };
+          await enforceExchangeClientConsents(app.db, authUserId);
+          return { created: false, authUserId, email: null, fullName: null };
         }
       }
     }
@@ -932,7 +995,7 @@ export default async function authRoutes(app) {
           });
         }
 
-        await ensureExchangeInternalUser(app, supabaseUser);
+        const provision = await ensureExchangeInternalUser(app, supabaseUser);
 
         const claims = await getAuthClaims(app, supabaseUser.id);
         if (!claims) {
@@ -952,6 +1015,29 @@ export default async function authRoutes(app) {
           return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
             code: "AUTH_USER_NOT_ONBOARDED",
           });
+        }
+
+        if (provision?.created && app.mailer?.configured) {
+          try {
+            const to = normalizeEmail(provision.email || extractEmailFromSupabaseUser(supabaseUser));
+            if (to) {
+              const welcomeDelivery = await app.mailer.sendUserWelcomeEmail({
+                to,
+                fullName: provision.fullName || null,
+              });
+              if (!welcomeDelivery?.sent) {
+                request.log.warn(
+                  { email: to, reason: welcomeDelivery?.message || "WELCOME_EMAIL_NOT_SENT_OAUTH" },
+                  "Alta OAuth creada sin confirmacion de correo de bienvenida"
+                );
+              }
+            }
+          } catch (welcomeError) {
+            request.log.warn(
+              { err: welcomeError, userId: claims.user.id_usuario },
+              "No se pudo enviar correo de bienvenida tras OAuth Google"
+            );
+          }
         }
 
         const user = {
@@ -1148,6 +1234,24 @@ export default async function authRoutes(app) {
         await client.query("COMMIT");
         transactionStarted = false;
 
+        if (app.mailer?.configured) {
+          try {
+            const fullName = `${nombres} ${apellidos}`.trim() || null;
+            const welcomeDelivery = await app.mailer.sendUserWelcomeEmail({
+              to: email,
+              fullName,
+            });
+            if (!welcomeDelivery?.sent) {
+              request.log.warn(
+                { email, reason: welcomeDelivery?.message || "WELCOME_EMAIL_NOT_SENT" },
+                "Registro publico creado sin confirmacion de correo de bienvenida"
+              );
+            }
+          } catch (welcomeError) {
+            request.log.warn({ err: welcomeError, email }, "No se pudo enviar correo de bienvenida tras registro publico");
+          }
+        }
+
         return sendOk(
           reply,
           {
@@ -1252,9 +1356,17 @@ export default async function authRoutes(app) {
       // AM: Flujo Opcion 2: generar recovery link con Supabase Admin y enviar correo desde backend SMTP.
       const recovery = await generateRecoveryActionLink(app, email);
       if (recovery.found) {
+        let fullName = null;
+        try {
+          fullName = await resolvePasswordRecipientFullNameByEmail(app, email);
+        } catch (lookupError) {
+          request.log.warn({ err: lookupError, email }, "No se pudo resolver fullName para correo de recuperacion");
+        }
+
         const delivery = await app.mailer.sendPasswordRecoveryEmail({
           to: email,
           actionLink: recovery.action_link,
+          fullName,
           kind: "reset",
         });
 

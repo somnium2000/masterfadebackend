@@ -2,6 +2,12 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
+import {
+  activateAssetForEntity,
+  buildAssetReadUrl,
+  replaceAssetIfNeeded,
+  resolveAssetForBinding,
+} from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
 const ACCESS_STATUS = {
@@ -16,6 +22,7 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // AM: Regla operativa de identidad hondurena para esta fase (13 digitos).
 const DNI_PATTERN = /^\d{13}$/;
 const RTN_PATTERN = /^\d{14}$/;
+const STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE = "private_client_profile";
 
 const personaInputSchema = {
   type: "object",
@@ -89,6 +96,7 @@ const clienteCreateBodySchema = {
         estado: { type: "boolean" },
         consentimiento_marketing: { type: "boolean" },
         acepta_terminos: { type: "boolean" },
+        foto_perfil_asset_id: { type: ["string", "null"], format: "uuid" },
       },
       additionalProperties: false,
     },
@@ -102,6 +110,15 @@ const usuarioSetupBodySchema = {
   properties: {
     marcar_pendiente_password: { type: "boolean" },
   },
+  additionalProperties: false,
+};
+
+const roleCreateBodySchema = {
+  type: "object",
+  properties: {
+    nombre: { type: "string", minLength: 2, maxLength: 50 },
+  },
+  required: ["nombre"],
   additionalProperties: false,
 };
 
@@ -159,6 +176,7 @@ const clienteUpdateBodySchema = {
         estado: { type: "boolean" },
         consentimiento_marketing: { type: "boolean" },
         acepta_terminos: { type: "boolean" },
+        foto_perfil_asset_id: { type: ["string", "null"], format: "uuid" },
       },
       additionalProperties: false,
     },
@@ -245,6 +263,8 @@ const EMPLEADO_BASE_SQL = `
     p.telefono_principal,
     p.direccion_texto,
     p.observaciones,
+    p.foto_perfil_asset_id,
+    p.foto_perfil_path,
     COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo_principal,
     e.id_sucursal,
     s.nombre_sucursal,
@@ -370,6 +390,19 @@ function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normalizeRoleName(value) {
+  const normalized = String(value || "").normalize("NFC").trim().toLowerCase();
+  if (!normalized) {
+    throw new AppError(400, "nombre es requerido", { code: "PERSONAS_ROLE_NAME_REQUIRED" });
+  }
+  if (!/^[a-z0-9_]{2,50}$/.test(normalized)) {
+    throw new AppError(400, "nombre de rol invalido. Usa solo minusculas, numeros o guion bajo", {
+      code: "PERSONAS_ROLE_NAME_INVALID",
+    });
+  }
+  return normalized;
+}
+
 function normalizeDateOnly(value) {
   const raw = normalizeOptional(value);
   if (!raw) return null;
@@ -472,6 +505,9 @@ function mapEmpleado(row) {
     telefono_principal: row.telefono_principal ?? null,
     direccion_texto: row.direccion_texto ?? null,
     observaciones: row.observaciones ?? null,
+    foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
+    foto_perfil_path: row.foto_perfil_path ?? null,
+    foto_perfil_signed_url: null,
     correo_principal: row.correo_principal ?? null,
     id_sucursal: row.id_sucursal,
     nombre_sucursal: row.nombre_sucursal ?? null,
@@ -516,11 +552,54 @@ function mapCliente(row) {
   };
 }
 
+async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
+  if (!cliente?.foto_perfil_asset_id) {
+    return cliente;
+  }
+  try {
+    const readUrl = await buildAssetReadUrl(app, {
+      claims,
+      assetId: cliente.foto_perfil_asset_id,
+    });
+    return {
+      ...cliente,
+      foto_perfil_signed_url: readUrl?.url ?? null,
+    };
+  } catch (error) {
+    app.log.warn(
+      {
+        err: error,
+        id_cliente: cliente?.id_cliente,
+        id_asset: cliente?.foto_perfil_asset_id,
+      },
+      "No se pudo generar signed URL de foto de perfil"
+    );
+    return {
+      ...cliente,
+      foto_perfil_signed_url: null,
+    };
+  }
+}
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
       details: error.details,
+      requestId: request.id,
+    });
+  }
+  if (
+    (error?.code === "42P01" || error?.code === "42703") &&
+    (
+      String(error?.message || "").includes("storage_assets")
+      || String(error?.message || "").includes("foto_perfil_asset_id")
+      || String(error?.message || "").includes("foto_perfil_path")
+    )
+  ) {
+    return sendError(reply, 500, "Falta aplicar migracion de STORAGE para clientes", {
+      code: "PERSONAS_STORAGE_MIGRATION_REQUIRED",
+      details: error.message,
       requestId: request.id,
     });
   }
@@ -1448,6 +1527,7 @@ async function createCliente(app, request, payload) {
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
     const consentimientoMarketing = Boolean(cliente.consentimiento_marketing);
     const aceptaTerminos = Boolean(cliente.acepta_terminos);
+    const fotoPerfilAssetId = normalizeOptional(cliente.foto_perfil_asset_id ?? null);
     const consentimientosAt = new Date().toISOString();
     const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
@@ -1611,7 +1691,42 @@ async function createCliente(app, request, payload) {
           ]
         );
 
-    const detail = await client.query(CLIENTE_BY_ID_SQL, [clienteInsert.rows[0].id_cliente]);
+    const createdClientId = clienteInsert.rows[0].id_cliente;
+    if (fotoPerfilAssetId) {
+      const fotoAsset = await resolveAssetForBinding(client, {
+        assetId: fotoPerfilAssetId,
+        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+        entityType: "cliente",
+        entityId: createdClientId,
+        idSucursal: idSucursalOrigen,
+        claims: request.claims,
+        allowUnboundEntity: true,
+        allowedStatuses: ["temporal", "activo"],
+      });
+      const activatedPhoto = await activateAssetForEntity(app, client, {
+        assetId: fotoAsset.id_asset,
+        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+        entityType: "cliente",
+        entityId: createdClientId,
+        idSucursal: idSucursalOrigen,
+        ownerClienteId: createdClientId,
+        claims: request.claims,
+        replaceCurrent: false,
+      });
+      await client.query(
+        `
+          UPDATE public.personas
+          SET
+            foto_perfil_asset_id = $2::uuid,
+            foto_perfil_path = $3,
+            updated_at = NOW()
+          WHERE id_persona = $1::uuid
+        `,
+        [idPersona, activatedPhoto.asset.id_asset, activatedPhoto.asset.object_path]
+      );
+    }
+
+    const detail = await client.query(CLIENTE_BY_ID_SQL, [createdClientId]);
 
     await client.query("COMMIT");
     transactionStarted = false;
@@ -1631,7 +1746,7 @@ async function createCliente(app, request, payload) {
     }
 
     return {
-      cliente: mapCliente(detail.rows[0]),
+      cliente: await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(detail.rows[0])),
       ...(setupPassword ? { setup_password: setupPassword } : {}),
     };
   } catch (error) {
@@ -2329,6 +2444,10 @@ async function updateCliente(app, request, idCliente, payload) {
     const correoPrincipal = normalizeEmail(acceso.correo_principal ?? currentRow.correo_principal ?? "");
     const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? currentRow.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
+    const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(cliente, "foto_perfil_asset_id");
+    const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
+      ? normalizeOptional(cliente.foto_perfil_asset_id ?? null)
+      : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
 
     if (currentRow.id_usuario && !habilitarAcceso) {
       throw new AppError(400, "El cliente ya tiene acceso. Usa accion de inactivar para restringirlo.", {
@@ -2415,6 +2534,18 @@ async function updateCliente(app, request, idCliente, payload) {
       : null;
 
     const roleIdsByName = await loadRoleIdByName(client);
+    const nextFotoPerfilAsset = nextFotoPerfilAssetIdRaw
+      ? await resolveAssetForBinding(client, {
+        assetId: nextFotoPerfilAssetIdRaw,
+        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+        entityType: "cliente",
+        entityId: idCliente,
+        idSucursal: idSucursalOrigen,
+        claims: request.claims,
+        allowUnboundEntity: true,
+        allowedStatuses: ["temporal", "activo"],
+      })
+      : null;
     if (habilitarAcceso && !currentRow.id_usuario) {
       authUserId = await createAuthIdentity(app, {
         email: correoPrincipal,
@@ -2507,6 +2638,40 @@ async function updateCliente(app, request, idCliente, payload) {
       }
     }
 
+    let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
+    let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
+    if (hasFotoPerfilPatch) {
+      if (!nextFotoPerfilAsset) {
+        nextFotoPerfilAssetId = null;
+        nextFotoPerfilPath = null;
+      } else {
+        const activatedPhoto = await activateAssetForEntity(app, client, {
+          assetId: nextFotoPerfilAsset.id_asset,
+          scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+          entityType: "cliente",
+          entityId: idCliente,
+          idSucursal: idSucursalOrigen,
+          ownerClienteId: idCliente,
+          claims: request.claims,
+          replaceCurrent: false,
+        });
+        nextFotoPerfilAssetId = activatedPhoto.asset.id_asset;
+        nextFotoPerfilPath = activatedPhoto.asset.object_path;
+      }
+
+      await client.query(
+        `
+          UPDATE public.personas
+          SET
+            foto_perfil_asset_id = $2::uuid,
+            foto_perfil_path = $3,
+            updated_at = NOW()
+          WHERE id_persona = $1::uuid
+        `,
+        [currentRow.id_persona, nextFotoPerfilAssetId, nextFotoPerfilPath]
+      );
+    }
+
     if (hasConsentTimestampColumns) {
       await client.query(
         `
@@ -2564,6 +2729,14 @@ async function updateCliente(app, request, idCliente, payload) {
     await client.query("COMMIT");
     transactionStarted = false;
 
+    if (hasFotoPerfilPatch) {
+      await replaceAssetIfNeeded(app, client, {
+        previousAssetId: currentRow.foto_perfil_asset_id,
+        nextAssetId: nextFotoPerfilAssetIdRaw,
+        claims: request.claims,
+      });
+    }
+
     let setupPassword = null;
     if (habilitarAcceso && !currentRow.id_usuario) {
       const setupResult = await sendPasswordSetupEmail(
@@ -2579,7 +2752,7 @@ async function updateCliente(app, request, idCliente, payload) {
     }
 
     return {
-      cliente: mapCliente(detail.rows[0]),
+      cliente: await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(detail.rows[0])),
       ...(setupPassword ? { setup_password: setupPassword } : {}),
     };
   } catch (error) {
@@ -3101,6 +3274,69 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
+  app.get("/roles", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+    try {
+      const { rows } = await app.db.query(
+        `
+          SELECT id_rol, nombre, created_at, updated_at
+          FROM public.roles
+          ORDER BY nombre ASC
+        `
+      );
+      return sendOk(reply, { roles: rows });
+    } catch (error) {
+      return sendHandled(reply, request, error, "No se pudo consultar roles", "PERSONAS_ROLES_LIST_ERROR");
+    }
+  });
+
+  app.post(
+    "/roles",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ONLY),
+      schema: { body: roleCreateBodySchema },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+      try {
+        const roleName = normalizeRoleName(request.body?.nombre);
+        await client.query("BEGIN");
+
+        const existsResult = await client.query(
+          `
+            SELECT id_rol
+            FROM public.roles
+            WHERE lower(nombre) = $1::text
+            LIMIT 1
+          `,
+          [roleName]
+        );
+        if (existsResult.rowCount > 0) {
+          throw new AppError(409, "Ya existe un rol con ese nombre", {
+            code: "PERSONAS_ROLE_DUPLICATE",
+            details: { nombre: roleName },
+          });
+        }
+
+        const insertResult = await client.query(
+          `
+            INSERT INTO public.roles (nombre)
+            VALUES ($1::text)
+            RETURNING id_rol, nombre, created_at, updated_at
+          `,
+          [roleName]
+        );
+
+        await client.query("COMMIT");
+        return sendOk(reply, { rol: insertResult.rows[0] }, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        return sendHandled(reply, request, error, "No se pudo crear rol", "PERSONAS_ROLE_CREATE_ERROR");
+      } finally {
+        client.release();
+      }
+    }
+  );
+
   app.get("/usuarios", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(LIST_USUARIOS_SQL);
@@ -3276,7 +3512,8 @@ export default async function adminPersonasRoutes(app) {
           requestId: request.id,
         });
       }
-      return sendOk(reply, { cliente: mapCliente(rows[0]) });
+      const cliente = await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(rows[0]));
+      return sendOk(reply, { cliente });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar detalle de cliente", "PERSONAS_CLIENT_DETAIL_ERROR");
     }

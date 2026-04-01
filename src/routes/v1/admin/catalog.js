@@ -4,6 +4,7 @@ import { sendOk } from "../../../utils/response.js";
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
 const requestIdSchema = { type: "string" };
 const SERVICE_GROUPS = ["barberia", "otros"];
+const LEGACY_SERVICE_BUFFER_FALLBACK = 5;
 
 const errorResponseSchema = {
   type: "object",
@@ -42,9 +43,10 @@ const serviceBodySchema = {
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
     orden_visual: { type: "integer", minimum: 0 },
+    servicio_informativo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
-  required: ["nombre_servicio", "duracion_min", "buffer_min", "precio_hnl"],
+  required: ["nombre_servicio", "duracion_min", "precio_hnl"],
   additionalProperties: false,
 };
 
@@ -57,6 +59,7 @@ const servicePatchSchema = {
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
     orden_visual: { type: "integer", minimum: 0 },
+    servicio_informativo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
   minProperties: 1,
@@ -134,6 +137,7 @@ const serviceResponseSchema = {
     grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
     visible_publico: { type: "boolean" },
     agendable: { type: "boolean" },
+    servicio_informativo: { type: "boolean" },
     orden_visual: { type: "integer" },
     agendable_barbero: { type: "boolean" },
   },
@@ -150,6 +154,7 @@ const serviceResponseSchema = {
     "grupo_catalogo",
     "visible_publico",
     "agendable",
+    "servicio_informativo",
     "orden_visual",
     "agendable_barbero",
   ],
@@ -233,6 +238,7 @@ const LIST_SERVICES_SQL = `
     s.activo,
     st.id_sucursal,
     st.precio_hnl,
+    COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
     COALESCE(st.activo, FALSE) AS tarifa_activa
   FROM public.servicios s
   LEFT JOIN scoped_tariffs st
@@ -271,6 +277,7 @@ const GET_SERVICE_SQL = `
     s.activo,
     st.id_sucursal,
     st.precio_hnl,
+    COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
     COALESCE(st.activo, FALSE) AS tarifa_activa
   FROM public.servicios s
   LEFT JOIN scoped_tariffs st
@@ -304,6 +311,7 @@ const GET_LATEST_SERVICE_TARIFF_SQL = `
     st.precio_hnl,
     st.duracion_min,
     st.buffer_min,
+    COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
     st.activo
   FROM public.servicios_tarifas st
   WHERE st.id_servicio = $1::uuid
@@ -320,6 +328,7 @@ const GET_LATEST_ANY_SERVICE_TARIFF_SQL = `
     st.precio_hnl,
     st.duracion_min,
     st.buffer_min,
+    COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
     st.activo,
     st.deleted_at
   FROM public.servicios_tarifas st
@@ -405,25 +414,10 @@ const LIST_PACKAGES_SQL = `
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
    AND s.activo IS TRUE
-  LEFT JOIN LATERAL (
-    -- AM: El paquete solo es operativo en una sucursal si cada servicio tiene tarifa vigente en esa sucursal.
-    SELECT 1 AS has_tarifa
-    FROM public.servicios_tarifas st
-    WHERE st.id_servicio = pd.id_servicio
-      AND st.id_sucursal = po.id_sucursal
-      AND st.id_empleado IS NULL
-      AND st.deleted_at IS NULL
-      AND st.activo IS TRUE
-      AND st.vigente_desde <= CURRENT_DATE
-      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-    ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
-    LIMIT 1
-  ) tariff_scope ON TRUE
   WHERE p.deleted_at IS NULL
   GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico, po.orden_visual
   HAVING COUNT(pd.id_servicio) > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
-     AND COUNT(tariff_scope.has_tarifa) = COUNT(pd.id_servicio)
   ORDER BY COALESCE(po.orden_visual, 100) ASC, p.nombre_paquete ASC, po.id_sucursal ASC
 `;
 
@@ -562,7 +556,9 @@ function normalizeOrderVisual(value, fallback = 100) {
 
 function mapAdminServiceRow(row) {
   const grupoCatalogo = normalizeServiceGroup(row.grupo_catalogo);
-  const agendable = normalizeBoolean(row.agendable, grupoCatalogo === "barberia");
+  const servicioInformativo = normalizeBoolean(row.servicio_informativo, false);
+  const baseAgendable = normalizeBoolean(row.agendable, grupoCatalogo === "barberia");
+  const agendable = baseAgendable && !servicioInformativo;
   const visiblePublico = normalizeBoolean(row.visible_publico, true);
   const ordenVisual = normalizeOrderVisual(row.orden_visual, 100);
 
@@ -579,6 +575,7 @@ function mapAdminServiceRow(row) {
     grupo_catalogo: grupoCatalogo,
     visible_publico: visiblePublico,
     agendable,
+    servicio_informativo: servicioInformativo,
     orden_visual: ordenVisual,
     // AM: Campo legado conservado para compatibilidad de clientes frontend antiguos.
     agendable_barbero: agendable,
@@ -879,6 +876,10 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
     options?.duracionMin === undefined || options?.duracionMin === null ? null : Number(options.duracionMin);
   const parsedBuffer =
     options?.bufferMin === undefined || options?.bufferMin === null ? null : Number(options.bufferMin);
+  const servicioInformativo =
+    options?.servicioInformativo === undefined || options?.servicioInformativo === null
+      ? null
+      : Boolean(options.servicioInformativo);
   const duracionMin = Number.isFinite(parsedDuration) ? Math.max(1, Math.floor(parsedDuration)) : null;
   const bufferMin = Number.isFinite(parsedBuffer) ? Math.max(0, Math.floor(parsedBuffer)) : null;
 
@@ -894,13 +895,14 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
           precio_hnl = $2::numeric,
           duracion_min = COALESCE($3::int, duracion_min),
           buffer_min = COALESCE($4::int, buffer_min),
+          servicio_informativo = COALESCE($5::boolean, servicio_informativo),
           activo = TRUE,
           vigente_hasta = NULL,
           deleted_at = NULL,
           updated_at = NOW()
         WHERE id_tarifa = $1::uuid
       `,
-      [currentTariff.id_tarifa, precioHnl, duracionMin, bufferMin]
+      [currentTariff.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
     );
     return;
   }
@@ -915,12 +917,13 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
           precio_hnl,
           duracion_min,
           buffer_min,
+          servicio_informativo,
           vigente_desde,
           activo
         )
-        VALUES ($1::uuid, $2::uuid, NULL, $3::numeric, $4::int, $5::int, CURRENT_DATE, TRUE)
+        VALUES ($1::uuid, $2::uuid, NULL, $3::numeric, $4::int, $5::int, $6::boolean, CURRENT_DATE, TRUE)
       `,
-      [idServicio, idSucursal, precioHnl, duracionMin, bufferMin]
+      [idServicio, idSucursal, precioHnl, duracionMin, bufferMin, servicioInformativo ?? false]
     );
   } catch (error) {
     if (error?.code !== "23505") {
@@ -942,13 +945,14 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
           precio_hnl = $2::numeric,
           duracion_min = COALESCE($3::int, duracion_min),
           buffer_min = COALESCE($4::int, buffer_min),
+          servicio_informativo = COALESCE($5::boolean, servicio_informativo),
           activo = TRUE,
           vigente_hasta = NULL,
           deleted_at = NULL,
           updated_at = NOW()
         WHERE id_tarifa = $1::uuid
       `,
-      [candidate.id_tarifa, precioHnl, duracionMin, bufferMin]
+      [candidate.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
     );
   }
 }
@@ -1279,9 +1283,11 @@ export default async function adminCatalogRoutes(app) {
         const nombreServicio = normalizeRequiredText(request.body.nombre_servicio);
         const descripcion = normalizeOptionalText(request.body.descripcion);
         const duracionMin = Number(request.body.duracion_min);
-        const bufferMin = Number(request.body.buffer_min);
+        // AM: buffer queda deprecado en modulo Servicios; se conserva fallback para agenda legacy.
+        const bufferMin = LEGACY_SERVICE_BUFFER_FALLBACK;
         const precioHnl = Number(request.body.precio_hnl);
         const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
+        const servicioInformativo = normalizeBoolean(request.body.servicio_informativo, false);
 
         await client.query("BEGIN");
 
@@ -1295,14 +1301,13 @@ export default async function adminCatalogRoutes(app) {
                 nombre_servicio,
                 descripcion,
                 duracion_min,
-                buffer_min,
                 orden_visual,
                 activo
               )
-              VALUES ($1, $2, $3::int, $4::int, $5::int, TRUE)
+              VALUES ($1, $2, $3::int, $4::int, TRUE)
               RETURNING id_servicio
             `,
-            [nombreServicio, descripcion ?? null, duracionMin, bufferMin, ordenVisual]
+            [nombreServicio, descripcion ?? null, duracionMin, ordenVisual]
           );
           idServicio = insertResult.rows[0].id_servicio;
         } catch (insertError) {
@@ -1321,6 +1326,7 @@ export default async function adminCatalogRoutes(app) {
         await upsertServiceTariff(client, idServicio, branchId, precioHnl, {
           duracionMin,
           bufferMin,
+          servicioInformativo,
         });
 
         const finalResult = await client.query(GET_SERVICE_SQL, [idServicio, branchId]);
@@ -1395,10 +1401,21 @@ export default async function adminCatalogRoutes(app) {
             code: "CATALOG_SERVICE_NOT_FOUND",
           });
         }
+        const requestedNombreServicio =
+          request.body.nombre_servicio !== undefined ? normalizeRequiredText(request.body.nombre_servicio) : undefined;
+        const requestedDescripcion =
+          request.body.descripcion !== undefined ? normalizeOptionalText(request.body.descripcion) : undefined;
+        const requestedOrdenVisual =
+          request.body.orden_visual !== undefined
+            ? normalizeOrderVisual(request.body.orden_visual, 100)
+            : undefined;
+        const currentNombreServicio = normalizeRequiredText(current.nombre_servicio);
+        const currentDescripcion = normalizeOptionalText(current.descripcion);
+        const currentOrdenVisual = normalizeOrderVisual(current.orden_visual, 100);
         const shouldMutateServiceBase =
-          request.body.nombre_servicio !== undefined ||
-          request.body.descripcion !== undefined ||
-          request.body.orden_visual !== undefined;
+          (requestedNombreServicio !== undefined && requestedNombreServicio !== currentNombreServicio) ||
+          (requestedDescripcion !== undefined && requestedDescripcion !== currentDescripcion) ||
+          (requestedOrdenVisual !== undefined && requestedOrdenVisual !== currentOrdenVisual);
         let targetServiceId = request.params.id;
 
         if (shouldMutateServiceBase) {
@@ -1423,27 +1440,31 @@ export default async function adminCatalogRoutes(app) {
           });
         }
         const nombreServicio =
-          request.body.nombre_servicio !== undefined
-            ? normalizeRequiredText(request.body.nombre_servicio)
+          requestedNombreServicio !== undefined
+            ? requestedNombreServicio
             : targetBase.nombre_servicio;
         const descripcion =
-          request.body.descripcion !== undefined ? normalizeOptionalText(request.body.descripcion) : targetBase.descripcion;
+          requestedDescripcion !== undefined ? requestedDescripcion : targetBase.descripcion;
         const ordenVisual =
-          request.body.orden_visual !== undefined
-            ? normalizeOrderVisual(request.body.orden_visual, 100)
+          requestedOrdenVisual !== undefined
+            ? requestedOrdenVisual
             : normalizeOrderVisual(targetBase.orden_visual, 100);
         await ensureUniqueServiceNameByBranch(client, targetServiceId, branchId, nombreServicio);
 
         const duracionMin =
           request.body.duracion_min !== undefined ? Number(request.body.duracion_min) : Number(current.duracion_min);
-        const bufferMin =
-          request.body.buffer_min !== undefined ? Number(request.body.buffer_min) : Number(current.buffer_min ?? 0);
+        // AM: buffer de Servicios queda congelado para compatibilidad con agenda/citas legacy.
+        const bufferMin = Number(current.buffer_min ?? LEGACY_SERVICE_BUFFER_FALLBACK);
         const precioHnl =
           request.body.precio_hnl !== undefined
             ? Number(request.body.precio_hnl)
             : current.precio_hnl == null
               ? null
               : Number(current.precio_hnl);
+        const servicioInformativo =
+          request.body.servicio_informativo !== undefined
+            ? normalizeBoolean(request.body.servicio_informativo, false)
+            : normalizeBoolean(current.servicio_informativo, false);
 
         if (shouldMutateServiceBase) {
           await client.query(
@@ -1474,9 +1495,13 @@ export default async function adminCatalogRoutes(app) {
           );
         }
 
-        if (precioHnl !== null || request.body.duracion_min !== undefined || request.body.buffer_min !== undefined) {
+        if (
+          precioHnl !== null ||
+          request.body.duracion_min !== undefined ||
+          request.body.servicio_informativo !== undefined
+        ) {
           if (precioHnl === null) {
-            throw new AppError(400, "No existe una tarifa previa en la sucursal para guardar la duracion y buffer", {
+            throw new AppError(400, "No existe una tarifa previa en la sucursal para guardar la duracion", {
               code: "CATALOG_SERVICE_PRICE_REQUIRED",
             });
           }
@@ -1485,6 +1510,7 @@ export default async function adminCatalogRoutes(app) {
           await upsertServiceTariff(client, targetServiceId, branchId, precioHnl, {
             duracionMin,
             bufferMin,
+            servicioInformativo,
           });
         }
 
