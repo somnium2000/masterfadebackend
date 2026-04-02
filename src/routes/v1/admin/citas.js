@@ -18,6 +18,7 @@ const OPERATIONAL_ALLOWED_ROLES = ["admin", "super_admin", "barbero"];
 const EMERGENCY_ALLOWED_ROLES = ["admin", "super_admin"];
 const HISTORICAL_DEFAULT_STATES = ["cancelada", "expirada", "completada", "no_show", "anulada"];
 const STATUS_CHANGE_WINDOW_MINUTES = 10;
+let appointmentContactColumnsSupportCache = null;
 
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
@@ -104,9 +105,13 @@ function selectParams(values) {
   return {
     hold_duracion_min: Number(values.hold_duracion_min?.valor_numero ?? 5),
     no_show_min: Number(values.no_show_min?.valor_numero ?? 10),
+    agenda_buffer_global_min: Number(values.agenda_buffer_global_min?.valor_numero ?? 0),
     permitir_acompanantes: Boolean(values.permitir_acompanantes?.valor_booleano ?? false),
     pago_total_obligatorio: Boolean(values.pago_total_obligatorio?.valor_booleano ?? true),
     simulacion_sin_pago: Boolean(values.simulacion_sin_pago?.valor_booleano ?? true),
+    masterpuntos_migracion_manual_habilitada: Boolean(
+      values.masterpuntos_migracion_manual_habilitada?.valor_booleano ?? false
+    ),
   };
 }
 
@@ -170,6 +175,8 @@ function mapOperationalAppointment(row) {
     id_persona_cliente: row.id_persona_cliente,
     id_cliente: row.id_cliente ?? null,
     nombre_cliente: row.nombre_cliente ?? "Sin nombre",
+    telefono_cliente: row.telefono_cliente ?? null,
+    correo_cliente: row.correo_cliente ?? null,
     estado_cita_codigo: row.estado_cita_codigo,
     inicio_at: new Date(row.inicio_at).toISOString(),
     fin_at: new Date(row.fin_at).toISOString(),
@@ -179,6 +186,7 @@ function mapOperationalAppointment(row) {
     moneda_codigo: row.moneda_codigo ?? "HNL",
     asignada_automaticamente: Boolean(row.asignada_automaticamente),
     notas: row.notas ?? null,
+    servicios: Array.isArray(row.servicios) ? row.servicios : [],
     hold_actual: row.hold_estado
       ? {
           estado_hold_codigo: row.hold_estado,
@@ -206,6 +214,26 @@ function resolveDateRange(query = {}) {
   return { fechaDesde, fechaHasta };
 }
 
+async function getAppointmentContactColumnsSupport(client) {
+  if (appointmentContactColumnsSupportCache) return appointmentContactColumnsSupportCache;
+  const { rows } = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'citas'
+        AND column_name = ANY($1::text[])
+    `,
+    [["contacto_email", "contacto_telefono"]]
+  );
+  const names = new Set(rows.map((row) => String(row.column_name || "").trim()));
+  appointmentContactColumnsSupportCache = {
+    has_contacto_email: names.has("contacto_email"),
+    has_contacto_telefono: names.has("contacto_telefono"),
+  };
+  return appointmentContactColumnsSupportCache;
+}
+
 async function listOperationalAppointments(client, {
   branchIds,
   barberScopeId = null,
@@ -216,7 +244,16 @@ async function listOperationalAppointments(client, {
   fechaDesde = null,
   fechaHasta = null,
   limit = 100,
+  sortDirection = "asc",
 } = {}) {
+  const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
+  const clientPhoneSql = contactColumnsSupport.has_contacto_telefono
+    ? "COALESCE(c.contacto_telefono, pc.telefono_principal)"
+    : "pc.telefono_principal";
+  const clientEmailSql = contactColumnsSupport.has_contacto_email
+    ? "COALESCE(c.contacto_email, cp.email)"
+    : "cp.email";
+
   const params = [branchIds];
   const where = [
     "c.deleted_at IS NULL",
@@ -281,6 +318,7 @@ async function listOperationalAppointments(client, {
   params.push(limit);
   const limitIdx = params.length;
 
+  const normalizedSortDirection = String(sortDirection || "asc").toLowerCase() === "desc" ? "DESC" : "ASC";
   const { rows } = await client.query(
     `
       SELECT
@@ -302,8 +340,11 @@ async function listOperationalAppointments(client, {
         c.moneda_codigo,
         c.asignada_automaticamente,
         c.notas,
+        ${clientPhoneSql} AS telefono_cliente,
+        ${clientEmailSql} AS correo_cliente,
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
         COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre') AS nombre_cliente,
+        COALESCE(srv.servicios, '[]'::jsonb) AS servicios,
         hold.estado_hold_codigo AS hold_estado,
         hold.expires_at AS hold_expires_at,
         intent.estado_intent_codigo AS intent_estado,
@@ -317,6 +358,22 @@ async function listOperationalAppointments(client, {
         ON pb.id_persona = eb.id_persona
       JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona_cliente
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(
+          jsonb_agg(cd.id_servicio ORDER BY cd.id_cita_detalle),
+          '[]'::jsonb
+        ) AS servicios
+        FROM public.citas_detalles cd
+        WHERE cd.id_cita = c.id_cita
+      ) srv ON TRUE
       LEFT JOIN LATERAL (
         SELECT h.estado_hold_codigo, h.expires_at
         FROM public.citas_holds h
@@ -332,7 +389,7 @@ async function listOperationalAppointments(client, {
         LIMIT 1
       ) intent ON TRUE
       WHERE ${where.join(" AND ")}
-      ORDER BY c.inicio_at ASC, c.id_cita ASC
+      ORDER BY c.inicio_at ${normalizedSortDirection}, c.id_cita ${normalizedSortDirection}
       LIMIT $${limitIdx}::int
     `,
     params
@@ -860,6 +917,7 @@ export default async function adminCitasRoutes(app) {
         fechaDesde,
         fechaHasta,
         limit: parseLimit(request.query?.limit, 200, 500),
+        sortDirection: "desc",
       });
       return sendOk(reply, {
         citas,
@@ -1646,6 +1704,13 @@ export default async function adminCitasRoutes(app) {
       if (request.body?.no_show_min !== undefined) {
         numericUpdates.push(["no_show_min", Number(request.body.no_show_min), "Minutos para marcar no_show"]);
       }
+      if (request.body?.agenda_buffer_global_min !== undefined) {
+        numericUpdates.push([
+          "agenda_buffer_global_min",
+          Number(request.body.agenda_buffer_global_min),
+          "Buffer global en minutos entre citas",
+        ]);
+      }
       if (request.body?.permitir_acompanantes !== undefined) {
         booleanUpdates.push([
           "permitir_acompanantes",
@@ -1671,6 +1736,16 @@ export default async function adminCitasRoutes(app) {
           "simulacion_sin_pago",
           normalizeBoolean(request.body.simulacion_sin_pago, "simulacion_sin_pago"),
           "Permite habilitar temporalmente el flujo de agendamiento sin cobro para pruebas",
+        ]);
+      }
+      if (request.body?.masterpuntos_migracion_manual_habilitada !== undefined) {
+        booleanUpdates.push([
+          "masterpuntos_migracion_manual_habilitada",
+          normalizeBoolean(
+            request.body.masterpuntos_migracion_manual_habilitada,
+            "masterpuntos_migracion_manual_habilitada"
+          ),
+          "Habilita la carga manual unica de puntos legacy en MasterPuntos",
         ]);
       }
 

@@ -2,6 +2,7 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
   createMasterPuntosCanje,
+  createMasterPuntosLegacyMigration,
   getMasterPuntosClienteMovimientos,
   getMasterPuntosContext,
   listMasterPuntosClientes,
@@ -63,6 +64,17 @@ const canjeBodySchema = {
     id_cliente: { type: "string", format: "uuid" },
     id_servicio: { type: "string", format: "uuid" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
+    motivo: { type: ["string", "null"], maxLength: 280 },
+  },
+  additionalProperties: false,
+};
+
+const legacyBodySchema = {
+  type: "object",
+  required: ["id_cliente", "puntos"],
+  properties: {
+    id_cliente: { type: "string", format: "uuid" },
+    puntos: { type: "integer", minimum: 1 },
     motivo: { type: ["string", "null"], maxLength: 280 },
   },
   additionalProperties: false,
@@ -155,6 +167,22 @@ export default async function adminMasterPuntosRoutes(app) {
         return sendOk(reply, data, { statusCode: 201, requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo registrar el canje de masterpuntos", "MASTERPUNTOS_REDEEM_CREATE_ERROR");
+      }
+    }
+  );
+
+  app.post(
+    "/legacy-migracion",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: { body: legacyBodySchema },
+    },
+    async (request, reply) => {
+      try {
+        const data = await createMasterPuntosLegacyMigration(app, request.claims, request.body || {});
+        return sendOk(reply, data, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo registrar la migracion legacy de puntos", "MASTERPUNTOS_LEGACY_MIGRATION_ERROR");
       }
     }
   );

@@ -19,9 +19,11 @@ export const APPOINTMENT_STATE_TRANSITIONS = {
 export const SYSTEM_PARAMETER_KEYS = [
   "hold_duracion_min",
   "no_show_min",
+  "agenda_buffer_global_min",
   "permitir_acompanantes",
   "pago_total_obligatorio",
   "simulacion_sin_pago",
+  "masterpuntos_migracion_manual_habilitada",
 ];
 export const SLOT_INTERVAL_MINUTES = 30;
 
@@ -312,6 +314,19 @@ export async function getHoldDurationMinutes(client) {
   return rows[0]?.hold_duracion_min ?? 5;
 }
 
+export async function getGlobalBufferMinutes(client) {
+  const { rows } = await client.query(
+    `
+      SELECT COALESCE(valor_numero, 0)::int AS agenda_buffer_global_min
+      FROM public.parametros_sistema
+      WHERE clave = 'agenda_buffer_global_min'
+      LIMIT 1
+    `
+  );
+  const value = Number(rows[0]?.agenda_buffer_global_min ?? 0);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
 export async function getSystemParameters(client) {
   const { rows } = await client.query(
     `
@@ -577,8 +592,9 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
   const uniqueIds = Array.from(new Set(requestedIds));
 
-  const { rows } = await client.query(
-    `
+  const [servicesResult, globalBufferMin] = await Promise.all([
+    client.query(
+      `
       WITH active_tariffs AS (
         SELECT
           st.id_servicio,
@@ -613,8 +629,11 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
         AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
-    [safeBranchId, uniqueIds]
-  );
+      [safeBranchId, uniqueIds]
+    ),
+    getGlobalBufferMinutes(client),
+  ]);
+  const { rows } = servicesResult;
 
   if (rows.length !== uniqueIds.length) {
     throw new AppError(404, "Uno o mas servicios no existen o estan inactivos", {
@@ -646,7 +665,8 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
     branchId: safeBranchId,
     items: details,
     duracion_total_min: details.reduce((total, item) => total + item.duracion_min, 0),
-    buffer_total_min: details.reduce((total, item) => total + item.buffer_min, 0),
+    // El buffer se configura globalmente y se aplica una sola vez por cita.
+    buffer_total_min: details.length > 0 ? Number(globalBufferMin || 0) : 0,
     monto_total_hnl: details.reduce((total, item) => total + item.precio_hnl, 0),
   };
 }
@@ -716,7 +736,23 @@ async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
     [empleadoId, dayOfWeek]
   );
 
-  return fallback.rows;
+  if (fallback.rows.length) {
+    return fallback.rows;
+  }
+
+  // Fallback defensivo para no dejar el calendario inutilizable si aun no se ha configurado horario por barbero.
+  if (dayOfWeek === 0) {
+    return [];
+  }
+  const isWeekend = dayOfWeek === 6;
+  return [
+    {
+      hora_inicio: "08:00:00",
+      hora_fin: isWeekend ? "17:00:00" : "19:00:00",
+      almuerzo_inicio: "12:00:00",
+      almuerzo_fin: "13:00:00",
+    },
+  ];
 }
 
 async function getBusyIntervalsForBarber(client, empleadoId, dateString) {
