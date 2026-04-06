@@ -716,8 +716,7 @@ export default async function publicCitasRoutes(app) {
                 $16,
                 $17,
                 $18,
-                $19,
-                $20
+                $19
               )
               RETURNING id_cita
             `,

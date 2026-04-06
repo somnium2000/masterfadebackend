@@ -224,10 +224,11 @@ async function getAppointmentContactColumnsSupport(client) {
         AND table_name = 'citas'
         AND column_name = ANY($1::text[])
     `,
-    [["contacto_email", "contacto_telefono"]]
+    [["contacto_nombre", "contacto_email", "contacto_telefono"]]
   );
   const names = new Set(rows.map((row) => String(row.column_name || "").trim()));
   appointmentContactColumnsSupportCache = {
+    has_contacto_nombre: names.has("contacto_nombre"),
     has_contacto_email: names.has("contacto_email"),
     has_contacto_telefono: names.has("contacto_telefono"),
   };
@@ -247,6 +248,9 @@ async function listOperationalAppointments(client, {
   sortDirection = "asc",
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
+  const clientNameSql = contactColumnsSupport.has_contacto_nombre
+    ? "COALESCE(NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
+    : "COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
   const clientPhoneSql = contactColumnsSupport.has_contacto_telefono
     ? "COALESCE(c.contacto_telefono, pc.telefono_principal)"
     : "pc.telefono_principal";
@@ -308,7 +312,7 @@ async function listOperationalAppointments(client, {
     const idx = params.length;
     where.push(`
       (
-        lower(coalesce(concat(pc.nombres, ' ', pc.apellidos), '')) LIKE $${idx}
+        lower(coalesce(${clientNameSql}, '')) LIKE $${idx}
         OR lower(coalesce(concat(pb.nombres, ' ', pb.apellidos), '')) LIKE $${idx}
         OR lower(c.id_cita::text) LIKE $${idx}
       )
@@ -343,7 +347,7 @@ async function listOperationalAppointments(client, {
         ${clientPhoneSql} AS telefono_cliente,
         ${clientEmailSql} AS correo_cliente,
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
-        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre') AS nombre_cliente,
+        ${clientNameSql} AS nombre_cliente,
         COALESCE(srv.servicios, '[]'::jsonb) AS servicios,
         hold.estado_hold_codigo AS hold_estado,
         hold.expires_at AS hold_expires_at,
@@ -412,6 +416,11 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
     where.push(`c.id_empleado_barbero = $${params.length}::uuid`);
   }
 
+  const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
+  const clientNameSql = contactColumnsSupport.has_contacto_nombre
+    ? "COALESCE(NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
+    : "COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
+
   const { rows } = await client.query(
     `
       SELECT
@@ -436,7 +445,7 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
         c.llegada_real_at,
         c.no_show_at,
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
-        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre') AS nombre_cliente
+        ${clientNameSql} AS nombre_cliente
       FROM public.citas c
       JOIN public.sucursales s
         ON s.id_sucursal = c.id_sucursal
