@@ -7,6 +7,11 @@ import {
   prepareStorageUpload,
   replaceAssetIfNeeded,
 } from "../../services/storage/storageService.js";
+import {
+  acquireMembershipPlan,
+  getClienteMembershipState,
+  registerSubscriptionAlertEvent,
+} from "../../services/membershipService.js";
 
 const CLIENT_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
@@ -381,6 +386,34 @@ async function buildClienteMePayload(app, claims, { expiresIn = 300 } = {}) {
   }
 }
 
+async function getClienteMailContext(client, clienteId) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id_cliente,
+        COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Cliente') AS nombre_completo,
+        cp.email AS correo_principal
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      WHERE c.id_cliente = $1::uuid
+        AND c.deleted_at IS NULL
+      LIMIT 1
+    `,
+    [clienteId]
+  );
+
+  return rows?.[0] ?? null;
+}
+
 function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -631,6 +664,162 @@ export default async function clienteRoutes(app) {
     }
   );
 
+  app.get(
+    "/planes/estado",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      try {
+        const estado = await getClienteMembershipState(client, context.clienteId);
+        return sendOk(reply, estado, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo consultar el estado de la membresía del cliente",
+          "CLIENTE_MEMBERSHIP_STATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/adquirir",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_plan", "id_sucursal"],
+          properties: {
+            id_plan: { type: "string", format: "uuid" },
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        const idPlan = String(request.body?.id_plan || "").trim();
+        const idSucursal = String(request.body?.id_sucursal || "").trim();
+
+        if (!idPlan || !idSucursal) {
+          throw new AppError(400, "Debes indicar id_plan e id_sucursal para adquirir el plan", {
+            code: "CLIENTE_MEMBERSHIP_ACQUIRE_INVALID_BODY",
+          });
+        }
+
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const acquisition = await acquireMembershipPlan(client, {
+          clienteId: context.clienteId,
+          usuarioId: context.userId,
+          idPlan,
+          idSucursal,
+        });
+
+        const alertPayload = {
+          tipo: "adquisicion",
+          id_plan: acquisition?.plan?.id_plan || idPlan,
+          nombre_plan: acquisition?.plan?.nombre_plan || null,
+          precio_hnl: acquisition?.plan?.precio_hnl ?? null,
+        };
+        const shouldSendAcquisitionMail = await registerSubscriptionAlertEvent(client, {
+          idSuscripcion: acquisition.subscription.id_suscripcion,
+          alertType: "adquisicion",
+          payload: alertPayload,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        const estado = await getClienteMembershipState(client, context.clienteId);
+        const mailContext = shouldSendAcquisitionMail
+          ? await getClienteMailContext(client, context.clienteId)
+          : null;
+
+        if (shouldSendAcquisitionMail && app.mailer?.configured && mailContext?.correo_principal) {
+          void app.mailer.sendMembershipPlanAcquiredEmail({
+            to: mailContext.correo_principal,
+            fullName: mailContext.nombre_completo,
+            planName: acquisition?.plan?.nombre_plan || "Plan MasterFade",
+            startAt: acquisition?.subscription?.inicio_at,
+            endAt: acquisition?.subscription?.fin_at,
+            amountHnl: acquisition?.plan?.precio_hnl ?? null,
+          });
+        }
+
+        return sendOk(
+          reply,
+          {
+            adquisicion: {
+              id_suscripcion: acquisition.subscription.id_suscripcion,
+              id_plan: acquisition.plan.id_plan,
+              nombre_plan: acquisition.plan.nombre_plan,
+              categoria_nivel: acquisition.plan.categoria_nivel,
+              precio_hnl: acquisition.plan.precio_hnl,
+              inicio_at: acquisition.subscription.inicio_at,
+              fin_at: acquisition.subscription.fin_at,
+            },
+            estado_plan: estado,
+          },
+          { statusCode: 201, requestId: request.id }
+        );
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo adquirir el plan de membresía",
+          "CLIENTE_MEMBERSHIP_ACQUIRE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
   app.post(
     "/me/profile-image/prepare",
     {
@@ -785,3 +974,4 @@ export default async function clienteRoutes(app) {
     }
   );
 }
+

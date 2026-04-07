@@ -32,6 +32,15 @@ const exchangeBodySchema = {
   additionalProperties: true,
 };
 
+const socialConfirmBodySchema = {
+  type: "object",
+  properties: {
+    social_confirm_token: { type: "string", minLength: 16 },
+  },
+  required: ["social_confirm_token"],
+  additionalProperties: false,
+};
+
 const registerBodySchema = {
   type: "object",
   properties: {
@@ -100,6 +109,34 @@ const loginResponseSchema = {
 
 const exchangeResponseSchema = {
   ...loginResponseSchema,
+  202: {
+    type: "object",
+    properties: {
+      ok: { type: "boolean" },
+      data: {
+        type: "object",
+        properties: {
+          pending_social_confirmation: { type: "boolean" },
+          message: { type: "string" },
+          email_masked: { type: ["string", "null"] },
+        },
+        required: ["pending_social_confirmation", "message", "email_masked"],
+        additionalProperties: false,
+      },
+      requestId: requestIdSchema,
+    },
+    required: ["ok", "data"],
+    additionalProperties: true,
+  },
+  400: errorResponseSchema,
+  401: errorResponseSchema,
+  403: errorResponseSchema,
+  409: errorResponseSchema,
+  500: errorResponseSchema,
+};
+
+const socialConfirmResponseSchema = {
+  ...loginResponseSchema,
   400: errorResponseSchema,
   401: errorResponseSchema,
   403: errorResponseSchema,
@@ -141,7 +178,7 @@ const registerResponseSchema = {
             type: "object",
             properties: {
               id_cliente: { type: "string", format: "uuid" },
-              id_sucursal_origen: { type: "string", format: "uuid" },
+              id_sucursal_origen: { type: ["string", "null"], format: "uuid" },
               estado: { type: "boolean" },
             },
             required: ["id_cliente", "id_sucursal_origen", "estado"],
@@ -228,6 +265,7 @@ const ACCESS_STATUS = {
 const PASSWORD_COMPLEXITY_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$/;
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let clientsConsentColumnsCache = null;
+const SOCIAL_CONFIRM_TOKEN_TYPE = "social_confirm";
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
@@ -275,51 +313,6 @@ function validatePublicPassword(password) {
     return "La contrasena debe incluir mayuscula, minuscula y numero.";
   }
   return null;
-}
-
-async function resolveRegisterBranchId(client, requestedBranchId) {
-  const normalizedBranchId = normalizeOptionalUuid(requestedBranchId);
-
-  if (normalizedBranchId) {
-    const scoped = await client.query(
-      `
-        SELECT id_sucursal
-        FROM public.sucursales
-        WHERE id_sucursal = $1::uuid
-          AND deleted_at IS NULL
-          AND estado IS TRUE
-        LIMIT 1
-      `,
-      [normalizedBranchId]
-    );
-    if (!scoped.rowCount) {
-      throw {
-        statusCode: 400,
-        message: "La sucursal seleccionada no existe o no esta activa.",
-        code: "AUTH_REGISTER_BRANCH_INVALID",
-      };
-    }
-    return normalizedBranchId;
-  }
-
-  const fallback = await client.query(
-    `
-      SELECT id_sucursal
-      FROM public.sucursales
-      WHERE deleted_at IS NULL
-        AND estado IS TRUE
-      ORDER BY nombre_sucursal ASC, id_sucursal ASC
-      LIMIT 1
-    `
-  );
-  if (!fallback.rowCount) {
-    throw {
-      statusCode: 409,
-      message: "No hay sucursales activas para registrar clientes en este momento.",
-      code: "AUTH_REGISTER_BRANCH_REQUIRED",
-    };
-  }
-  return fallback.rows[0].id_sucursal;
 }
 
 async function ensureRegisterEmailAvailability(client, email) {
@@ -584,6 +577,48 @@ function signAppToken(payload, jwtSecret) {
   });
 }
 
+function signSocialConfirmToken(payload, jwtSecret) {
+  return jwt.sign(payload, jwtSecret, {
+    expiresIn: process.env.AUTH_SOCIAL_CONFIRM_EXPIRES_IN?.trim() || "30m",
+    issuer: process.env.APP_JWT_ISSUER || "masterfade-api",
+    audience: process.env.APP_JWT_AUDIENCE || "masterfade-app",
+  });
+}
+
+function verifySocialConfirmToken(token, jwtSecret) {
+  const decoded = jwt.verify(token, jwtSecret, {
+    issuer: process.env.APP_JWT_ISSUER || "masterfade-api",
+    audience: process.env.APP_JWT_AUDIENCE || "masterfade-app",
+  });
+
+  if (decoded?.token_type !== SOCIAL_CONFIRM_TOKEN_TYPE) {
+    throw new Error("SOCIAL_CONFIRM_TOKEN_TYPE_INVALID");
+  }
+
+  return decoded;
+}
+
+function getFrontendBaseUrl() {
+  return (process.env.FRONTEND_URL || "http://localhost:5173").trim().replace(/\/+$/, "");
+}
+
+function buildSocialConfirmFrontendUrl(token) {
+  const frontendBase = getFrontendBaseUrl();
+  const query = new URLSearchParams({ social_confirm_token: token }).toString();
+  return `${frontendBase}/auth/callback?${query}`;
+}
+
+function maskEmail(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized.includes("@")) return null;
+  const [localPart, domain] = normalized.split("@");
+  if (!localPart || !domain) return null;
+  if (localPart.length <= 2) {
+    return `${localPart[0] || "*"}*@${domain}`;
+  }
+  return `${localPart.slice(0, 2)}***@${domain}`;
+}
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
@@ -638,6 +673,75 @@ function isUserIdConflictError(error) {
   const detail = normalizePgErrorText(error?.detail);
   const constraint = normalizePgErrorText(error?.constraint);
   return detail.includes("(id_usuario)") || constraint.includes("usuarios_pkey");
+}
+
+async function resolveRegisterBranchId(client, preferredBranchId) {
+  const preferred = normalizeOptionalUuid(preferredBranchId);
+
+  if (preferred) {
+    const preferredResult = await client.query(
+      `
+        SELECT id_sucursal
+        FROM public.sucursales
+        WHERE id_sucursal = $1::uuid
+          AND deleted_at IS NULL
+          AND estado IS TRUE
+        LIMIT 1
+      `,
+      [preferred]
+    );
+    if (preferredResult.rowCount) {
+      return preferredResult.rows[0].id_sucursal;
+    }
+  }
+
+  const fallbackResult = await client.query(
+    `
+      SELECT id_sucursal
+      FROM public.sucursales
+      WHERE deleted_at IS NULL
+        AND estado IS TRUE
+      ORDER BY id_sucursal ASC
+      LIMIT 1
+    `
+  );
+
+  if (!fallbackResult.rowCount) {
+    throw {
+      statusCode: 500,
+      message: "No hay sucursales activas disponibles para completar el flujo.",
+      code: "AUTH_EXCHANGE_BRANCH_NOT_AVAILABLE",
+    };
+  }
+
+  return fallbackResult.rows[0].id_sucursal;
+}
+
+async function resolveRegisterBranchIdOrFail(client, requestedBranchId) {
+  const requested = normalizeOptionalUuid(requestedBranchId);
+  if (requested) {
+    const scopedResult = await client.query(
+      `
+        SELECT id_sucursal
+        FROM public.sucursales
+        WHERE id_sucursal = $1::uuid
+          AND deleted_at IS NULL
+          AND estado IS TRUE
+        LIMIT 1
+      `,
+      [requested]
+    );
+    if (!scopedResult.rowCount) {
+      throw {
+        statusCode: 400,
+        message: "La sucursal de origen indicada no existe o no esta activa.",
+        code: "AUTH_REGISTER_BRANCH_INVALID",
+      };
+    }
+    return scopedResult.rows[0].id_sucursal;
+  }
+
+  return resolveRegisterBranchId(client, null);
 }
 
 async function resolveExchangeBranchId(client) {
@@ -707,6 +811,20 @@ async function ensureExchangeEmailAvailability(client, email, authUserId) {
       code: "AUTH_EXCHANGE_EMAIL_EXISTS",
     };
   }
+}
+
+async function hasInternalUserByAuthId(db, authUserId) {
+  const existing = await db.query(
+    `
+      SELECT 1
+      FROM public.usuarios
+      WHERE id_usuario = $1::uuid
+        AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [authUserId]
+  );
+  return existing.rowCount > 0;
 }
 
 async function ensureExchangeInternalUser(app, supabaseUser) {
@@ -995,6 +1113,66 @@ export default async function authRoutes(app) {
           });
         }
 
+        const socialAuthUserId = String(supabaseUser.id || "").trim();
+        const internalUserExists = await hasInternalUserByAuthId(app.db, socialAuthUserId);
+        if (!internalUserExists) {
+          const socialEmail = extractEmailFromSupabaseUser(supabaseUser);
+          if (!socialEmail || !isValidEmail(socialEmail)) {
+            return sendError(reply, 400, "No se pudo resolver un correo valido desde la identidad social.", {
+              code: "AUTH_EXCHANGE_EMAIL_REQUIRED",
+            });
+          }
+
+          if (!app.mailer?.configured) {
+            return sendError(reply, 500, "No se pudo iniciar la confirmacion social por correo.", {
+              code: "AUTH_SOCIAL_CONFIRM_MAILER_UNAVAILABLE",
+              details: "Configura SMTP en backend para enviar confirmaciones de seguridad.",
+            });
+          }
+
+          const socialNames = buildSocialPersonaNames(supabaseUser);
+          const socialConfirmToken = signSocialConfirmToken(
+            {
+              sub: socialAuthUserId,
+              token_type: SOCIAL_CONFIRM_TOKEN_TYPE,
+              email: socialEmail,
+              nombres: socialNames.nombres,
+              apellidos: socialNames.apellidos,
+              provider: "google",
+            },
+            jwtSecret
+          );
+          const socialConfirmUrl = buildSocialConfirmFrontendUrl(socialConfirmToken);
+          const delivery = await app.mailer.sendSocialProvisionConfirmationEmail({
+            to: socialEmail,
+            actionLink: socialConfirmUrl,
+            fullName: `${socialNames.nombres} ${socialNames.apellidos}`.trim() || null,
+          });
+
+          if (!delivery?.sent) {
+            request.log.error(
+              {
+                email: socialEmail,
+                reason: delivery?.message || "SOCIAL_CONFIRM_EMAIL_NOT_SENT",
+              },
+              "No se pudo enviar correo de confirmacion para alta social"
+            );
+            return sendError(reply, 500, "No se pudo enviar el correo de confirmacion de seguridad.", {
+              code: "AUTH_SOCIAL_CONFIRM_EMAIL_SEND_FAILED",
+            });
+          }
+
+          return sendOk(
+            reply,
+            {
+              pending_social_confirmation: true,
+              message: "Te enviamos un correo de seguridad para confirmar la creacion de tu perfil.",
+              email_masked: maskEmail(socialEmail),
+            },
+            { statusCode: 202 }
+          );
+        }
+
         const provision = await ensureExchangeInternalUser(app, supabaseUser);
 
         const claims = await getAuthClaims(app, supabaseUser.id);
@@ -1082,6 +1260,169 @@ export default async function authRoutes(app) {
   );
 
   app.post(
+    "/social/confirm",
+    {
+      schema: {
+        body: socialConfirmBodySchema,
+        response: socialConfirmResponseSchema,
+      },
+    },
+    async (request, reply) => {
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      if (!app.supabaseAdmin) {
+        return sendError(reply, 500, "Supabase Admin no esta configurado en el backend", {
+          code: "SUPABASE_ADMIN_NOT_CONFIGURED",
+        });
+      }
+
+      const jwtSecret = process.env.JWT_SECRET?.trim();
+      if (!jwtSecret) {
+        return sendError(reply, 500, "Falta JWT_SECRET en la configuracion del servidor", {
+          code: "JWT_SECRET_MISSING",
+        });
+      }
+
+      try {
+        const rawToken = String(request.body?.social_confirm_token || "").trim();
+        if (!rawToken) {
+          return sendError(reply, 400, "Token de confirmacion social requerido.", {
+            code: "AUTH_SOCIAL_CONFIRM_TOKEN_REQUIRED",
+          });
+        }
+
+        let decoded = null;
+        try {
+          decoded = verifySocialConfirmToken(rawToken, jwtSecret);
+        } catch (verifyError) {
+          const verifyMessage = String(verifyError?.message || "").trim();
+          const isExpired = verifyMessage.includes("jwt expired");
+          return sendError(
+            reply,
+            401,
+            isExpired ? "El enlace de confirmacion expiro. Inicia de nuevo con Google." : "Token de confirmacion invalido.",
+            {
+              code: isExpired ? "AUTH_SOCIAL_CONFIRM_TOKEN_EXPIRED" : "AUTH_SOCIAL_CONFIRM_TOKEN_INVALID",
+            }
+          );
+        }
+
+        const authUserId = String(decoded?.sub || "").trim();
+        if (!authUserId || !UUID_REGEX.test(authUserId)) {
+          return sendError(reply, 400, "Token de confirmacion social invalido.", {
+            code: "AUTH_SOCIAL_CONFIRM_SUB_INVALID",
+          });
+        }
+
+        const authLookup = await app.supabaseAdmin.auth.admin.getUserById(authUserId);
+        const supabaseUser = authLookup?.data?.user;
+        if (authLookup?.error || !supabaseUser?.id) {
+          return sendError(reply, 401, "No se pudo validar la identidad social para confirmar.", {
+            code: "AUTH_SOCIAL_CONFIRM_USER_NOT_FOUND",
+            details: authLookup?.error?.message || "SUPABASE_USER_NOT_FOUND",
+          });
+        }
+
+        const tokenEmail = normalizeEmail(decoded?.email || "");
+        const socialEmail = extractEmailFromSupabaseUser(supabaseUser);
+        if (!socialEmail || !isValidEmail(socialEmail)) {
+          return sendError(reply, 400, "No se pudo resolver un correo valido de la identidad social.", {
+            code: "AUTH_SOCIAL_CONFIRM_EMAIL_REQUIRED",
+          });
+        }
+        if (tokenEmail && tokenEmail !== socialEmail) {
+          return sendError(reply, 409, "El correo del token no coincide con la identidad social actual.", {
+            code: "AUTH_SOCIAL_CONFIRM_EMAIL_MISMATCH",
+          });
+        }
+
+        const provision = await ensureExchangeInternalUser(app, supabaseUser);
+        const claims = await getAuthClaims(app, supabaseUser.id);
+        if (!claims) {
+          return sendError(reply, 403, "No se pudo completar la creacion del perfil interno.", {
+            code: "AUTH_USER_NOT_ONBOARDED",
+          });
+        }
+
+        const accessSync = await syncAccessStateAfterLogin(app, claims.user.id_usuario);
+        if (!accessSync.ok) {
+          if (accessSync.code === "AUTH_ACCESS_BLOCKED") {
+            return sendError(reply, 403, "Tu acceso esta bloqueado o inactivo. Contacta al administrador.", {
+              code: "AUTH_ACCESS_BLOCKED",
+              details: { estado_acceso: accessSync.estado_acceso },
+            });
+          }
+          return sendError(reply, 403, "No se pudo completar tu acceso en MasterFade.", {
+            code: "AUTH_USER_NOT_ONBOARDED",
+          });
+        }
+
+        if (provision?.created && app.mailer?.configured) {
+          try {
+            const to = normalizeEmail(provision.email || socialEmail);
+            if (to) {
+              const welcomeDelivery = await app.mailer.sendUserWelcomeEmail({
+                to,
+                fullName: provision.fullName || null,
+              });
+              if (!welcomeDelivery?.sent) {
+                request.log.warn(
+                  { email: to, reason: welcomeDelivery?.message || "WELCOME_EMAIL_NOT_SENT_SOCIAL_CONFIRM" },
+                  "Confirmacion social completada sin envio de bienvenida"
+                );
+              }
+            }
+          } catch (welcomeError) {
+            request.log.warn({ err: welcomeError, authUserId }, "No se pudo enviar correo de bienvenida tras confirmacion social");
+          }
+        }
+
+        const user = {
+          ...claims.user,
+          roles: claims.roles,
+          branch_ids: claims.branch_ids,
+          empresa_id: claims.empresa_id,
+          empleado_id: claims.empleado_id,
+          cliente_id: claims.cliente_id,
+          estado_acceso: accessSync.state?.estado_acceso ?? null,
+          credenciales_completadas_at: accessSync.state?.credenciales_completadas_at ?? null,
+          ultimo_login_at: accessSync.state?.ultimo_login_at ?? null,
+        };
+
+        const token = signAppToken(
+          {
+            sub: String(claims.user.id_usuario),
+            email: user.email ?? socialEmail ?? null,
+            "mf:roles": claims.roles || [],
+            "mf:branch_ids": claims.branch_ids || [],
+            token_type: "app",
+          },
+          jwtSecret
+        );
+
+        return sendOk(reply, { token, user });
+      } catch (error) {
+        if (error?.statusCode && error?.code) {
+          return sendError(reply, error.statusCode, error.message, {
+            code: error.code,
+            details: error.details,
+          });
+        }
+
+        request.log.error({ err: error }, "Auth social confirm error");
+        return sendError(reply, 500, "No se pudo confirmar el acceso social.", {
+          code: "AUTH_SOCIAL_CONFIRM_ERROR",
+          details: error instanceof Error ? error.message : "Unknown auth social confirm error",
+        });
+      }
+    }
+  );
+
+  app.post(
     "/register",
     {
       schema: {
@@ -1096,9 +1437,9 @@ export default async function authRoutes(app) {
       const email = normalizeEmail(body.email);
       const contrasena = String(body.contrasena || "");
       const confirmarContrasena = String(body.confirmar_contrasena || "");
+      const requestedBranchId = normalizeOptionalUuid(body.id_sucursal_origen);
       const consentimientoMarketing = Boolean(body.consentimiento_marketing);
       const aceptaTerminos = body.acepta_terminos === true;
-      const requestedBranchId = normalizeOptionalUuid(body.id_sucursal_origen);
       const aceptaTerminosAt = new Date().toISOString();
       const consentimientoMarketingAt = consentimientoMarketing ? aceptaTerminosAt : null;
 
@@ -1144,7 +1485,7 @@ export default async function authRoutes(app) {
       let transactionStarted = false;
 
       try {
-        const branchId = await resolveRegisterBranchId(client, requestedBranchId);
+        const branchId = await resolveRegisterBranchIdOrFail(client, requestedBranchId);
         await ensureRegisterEmailAvailability(client, email);
         const clienteRoleId = await getClienteRoleId(client);
 
@@ -1402,7 +1743,7 @@ export default async function authRoutes(app) {
       const identifier = normalizeEmail(
         body.identifier ?? body.email ?? body.nombre_usuario ?? body.username ?? ""
       );
-      const contrasena = String(body.contrasena ?? body.password ?? "").trim();
+      const contrasena = String(body.contrasena ?? body.password ?? "");
 
       if (!identifier || !contrasena) {
         return sendError(reply, 400, "Faltan credenciales: se requiere correo y contrasena", {

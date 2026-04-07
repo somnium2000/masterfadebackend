@@ -33,6 +33,7 @@ const servicioSchema = {
     buffer_min: { type: "integer" },
     precio_hnl: { type: "number" },
     grupo_catalogo: { type: "string", enum: ["barberia", "otros"] },
+    activo: { type: "boolean" },
     agendable: { type: "boolean" },
     servicio_informativo: { type: "boolean" },
     orden_visual: { type: "integer" },
@@ -46,6 +47,7 @@ const servicioSchema = {
     "buffer_min",
     "precio_hnl",
     "grupo_catalogo",
+    "activo",
     "agendable",
     "servicio_informativo",
     "orden_visual",
@@ -133,6 +135,7 @@ const promocionSchema = {
 };
 
 const PUBLIC_SERVICES_SQL = `
+  -- AM: Mantiene visibilidad de servicios aunque su tarifa actual esté inactiva.
   WITH active_tariffs AS (
     SELECT
       st.id_servicio,
@@ -149,10 +152,11 @@ const PUBLIC_SERVICES_SQL = `
     JOIN public.sucursales su
       ON su.id_sucursal = st.id_sucursal
     WHERE st.deleted_at IS NULL
-      AND st.activo IS TRUE
       AND st.id_empleado IS NULL
+      AND st.activo IS TRUE
       AND st.vigente_desde <= CURRENT_DATE
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+      AND st.precio_hnl IS NOT NULL
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -196,6 +200,7 @@ const PUBLIC_SERVICES_SQL = `
     COALESCE(ss.duracion_min, s.duracion_min) AS duracion_min,
     COALESCE(ss.buffer_min, s.buffer_min) AS buffer_min,
     s.grupo_catalogo,
+    s.activo,
     COALESCE(ss.servicio_informativo, FALSE) AS servicio_informativo,
     s.orden_visual,
     s.agendable,
@@ -283,7 +288,6 @@ const PUBLIC_PACKAGES_SQL = `
   LEFT JOIN public.servicios s
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
-   AND s.activo IS TRUE
   WHERE p.deleted_at IS NULL
     AND p.activo IS TRUE
   GROUP BY p.id_paquete, eo.precio_hnl, eo.orden_visual, eo.id_sucursal
@@ -375,7 +379,8 @@ const PUBLIC_PROMOTIONS_SQL = `
 function mapServiceRow(row) {
   const grupoCatalogo = String(row.grupo_catalogo || "barberia").trim().toLowerCase() === "otros" ? "otros" : "barberia";
   const servicioInformativo = Boolean(row.servicio_informativo ?? false);
-  const agendable = Boolean(row.agendable ?? (grupoCatalogo === "barberia")) && !servicioInformativo;
+  const activo = Boolean(row.activo ?? true);
+  const agendable = activo && Boolean(row.agendable ?? (grupoCatalogo === "barberia")) && !servicioInformativo;
 
   return {
     id_servicio: row.id_servicio,
@@ -385,6 +390,7 @@ function mapServiceRow(row) {
     buffer_min: Number(row.buffer_min ?? 0),
     precio_hnl: Number(row.precio_hnl ?? 0),
     grupo_catalogo: grupoCatalogo,
+    activo,
     agendable,
     servicio_informativo: servicioInformativo,
     orden_visual: Number(row.orden_visual ?? 100),
@@ -417,20 +423,41 @@ function mapBranchRow(row) {
   };
 }
 
+function normalizePromotionParagraphs(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry || "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split("\n")
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
 function mapPromotionRow(row) {
+  const ctaTipoRaw = String(row.cta_tipo || "none").trim().toLowerCase();
+  const ctaTexto = row.cta_texto == null ? null : String(row.cta_texto).trim() || null;
+  const ctaUrl = row.cta_url == null ? null : String(row.cta_url).trim() || null;
+  const ctaTipo =
+    (ctaTipoRaw === "interno" || ctaTipoRaw === "externo") && ctaUrl
+      ? ctaTipoRaw
+      : "none";
+
   return {
     id_promocion: row.id_promocion,
     id_sucursal: row.id_sucursal ?? null,
     slug: row.slug,
     titulo: row.titulo,
     subtitulo: row.subtitulo ?? null,
-    parrafos: Array.isArray(row.parrafos) ? row.parrafos : [],
+    parrafos: normalizePromotionParagraphs(row.parrafos),
     imagen_principal_url: row.imagen_principal_url ?? null,
     imagen_mobile_url: row.imagen_mobile_url ?? null,
     imagen_alt: row.imagen_alt ?? null,
-    cta_texto: row.cta_texto ?? null,
-    cta_url: row.cta_url ?? null,
-    cta_tipo: row.cta_tipo || "none",
+    cta_texto: ctaTipo === "none" ? null : (ctaTexto || "Ver mas"),
+    cta_url: ctaTipo === "none" ? null : ctaUrl,
+    cta_tipo: ctaTipo,
     estado: "publicada",
     vigencia_desde: row.vigencia_desde ?? null,
     vigencia_hasta: row.vigencia_hasta ?? null,

@@ -589,6 +589,45 @@ function sendHandled(reply, request, error, message, code) {
       requestId: request.id,
     });
   }
+  if (error?.code === "P0001" && String(error?.message || "").includes("ROL_REQUIERE_SUCURSAL")) {
+    return sendError(reply, 409, "El rol requiere id_sucursal activo", {
+      code: "PERSONAS_ROLE_SCOPE_REQUIRED",
+      details: {
+        db_code: error?.code,
+      },
+      requestId: request.id,
+    });
+  }
+  if (error?.code === "23505") {
+    const constraint = String(error?.constraint || "").toLowerCase();
+    if (constraint === "uq_correo_direccion") {
+      return sendError(reply, 409, "El correo ya esta vinculado a otra persona", {
+        code: "PERSONAS_EMAIL_ALREADY_EXISTS",
+        details: {
+          constraint: error?.constraint ?? null,
+        },
+        requestId: request.id,
+      });
+    }
+    if (constraint === "uq_personas_dni_norm") {
+      return sendError(reply, 409, "El dni ya esta vinculado a otra persona", {
+        code: "PERSONAS_DNI_ALREADY_EXISTS",
+        details: {
+          constraint: error?.constraint ?? null,
+        },
+        requestId: request.id,
+      });
+    }
+    if (constraint === "uq_personas_rtn_norm") {
+      return sendError(reply, 409, "El rtn ya esta vinculado a otra persona", {
+        code: "PERSONAS_RTN_ALREADY_EXISTS",
+        details: {
+          constraint: error?.constraint ?? null,
+        },
+        requestId: request.id,
+      });
+    }
+  }
   if (
     (error?.code === "42P01" || error?.code === "42703") &&
     (
@@ -938,6 +977,46 @@ async function ensureEmailAvailability(client, email, { excludePersonaId = null,
   }
 }
 
+async function ensurePersonaDocumentAvailability(client, { dni = null, rtn = null, excludePersonaId = null } = {}) {
+  if (dni) {
+    const dniResult = await client.query(
+      `
+        SELECT id_persona
+        FROM public.personas
+        WHERE deleted_at IS NULL
+          AND regexp_replace(COALESCE(dni, ''), '\\D', '', 'g') = $1
+          AND ($2::uuid IS NULL OR id_persona <> $2::uuid)
+        LIMIT 1
+      `,
+      [dni, excludePersonaId]
+    );
+    if (dniResult.rowCount) {
+      throw new AppError(409, "El dni ya esta vinculado a otra persona", {
+        code: "PERSONAS_DNI_ALREADY_EXISTS",
+      });
+    }
+  }
+
+  if (rtn) {
+    const rtnResult = await client.query(
+      `
+        SELECT id_persona
+        FROM public.personas
+        WHERE deleted_at IS NULL
+          AND regexp_replace(COALESCE(rtn, ''), '\\D', '', 'g') = $1
+          AND ($2::uuid IS NULL OR id_persona <> $2::uuid)
+        LIMIT 1
+      `,
+      [rtn, excludePersonaId]
+    );
+    if (rtnResult.rowCount) {
+      throw new AppError(409, "El rtn ya esta vinculado a otra persona", {
+        code: "PERSONAS_RTN_ALREADY_EXISTS",
+      });
+    }
+  }
+}
+
 async function upsertPrimaryEmail(client, personaId, email) {
   if (!email) return;
 
@@ -1093,12 +1172,6 @@ async function ensureClienteRoleAssignment(client, roleIdsByName, userId, branch
   if (!roleId) {
     throw new AppError(500, "Rol cliente no existe en catalogo", {
       code: "PERSONAS_CLIENT_ROLE_MISSING",
-    });
-  }
-
-  if (!branchId) {
-    throw new AppError(400, "Cliente con acceso requiere id_sucursal_origen activo", {
-      code: "PERSONAS_CLIENT_BRANCH_REQUIRED",
     });
   }
 
@@ -1262,6 +1335,10 @@ async function createEmpleado(app, request, payload) {
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, esBarbero);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
 
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+    });
     assertValidEmail(correoPrincipal);
     await ensureEmailAvailability(client, correoPrincipal);
 
@@ -1424,7 +1501,13 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     const esBarbero = Boolean(empleadoRaw.es_barbero);
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, esBarbero);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
+    const previousEmail = normalizeEmail(currentRow.correo_principal ?? "");
 
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+      excludePersonaId: currentRow.id_persona,
+    });
     assertValidEmail(correoPrincipal);
     await ensureEmailAvailability(client, correoPrincipal, {
       excludePersonaId: currentRow.id_persona,
@@ -1466,6 +1549,9 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     );
 
     await upsertPrimaryEmail(client, currentRow.id_persona, correoPrincipal);
+    if (previousEmail !== correoPrincipal) {
+      await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
+    }
 
     await client.query(
       `
@@ -1532,6 +1618,10 @@ async function createCliente(app, request, payload) {
     const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+    });
     if (!correoPrincipal) {
       throw new AppError(400, "Cliente requiere correo_principal obligatorio", {
         code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
@@ -2460,8 +2550,12 @@ async function updateCliente(app, request, idCliente, payload) {
         code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
       });
     }
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+      excludePersonaId: currentRow.id_persona,
+    });
     assertValidEmail(correoPrincipal);
-
     if (habilitarAcceso) {
       if (!idSucursalOrigen) {
         throw new AppError(400, "Cliente con acceso requiere id_sucursal_origen activo", {
@@ -2846,7 +2940,6 @@ async function activateCliente(app, request, idCliente) {
           code: "PERSONAS_CLIENT_ACTIVATE_BRANCH_REQUIRED",
         });
       }
-
       const roleIdsByName = await loadRoleIdByName(client);
       await ensureClienteRoleAssignment(
         client,
