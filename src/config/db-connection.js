@@ -227,4 +227,10 @@ export function getSanitizedDbTarget() {
 
 const pool = new Pool(getDbConfig());
 
+// AM: Fuerza UTF-8 por conexion para preservar caracteres Unicode (incluida la letra ñ)
+// de forma consistente entre app y PostgreSQL.
+pool.on("connect", (client) => {
+  client.query("SET client_encoding TO 'UTF8'").catch(() => {});
+});
+
 export default pool;

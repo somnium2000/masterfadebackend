@@ -42,7 +42,7 @@ export default async function healthRoutes(app) {
   });
 
   // Mantenemos la ruta anterior para compatibilidad.
-  // Si tienes SUPABASE_URL/SUPABASE_ANON_KEY, este endpoint seguirá sirviendo como “health” del REST.
+  // Si tienes SUPABASE_URL/SUPABASE_ANON_KEY, este endpoint seguirá sirviendo como "health" del REST.
   app.get("/supabase", async (request, reply) => {
     const supabaseUrl = process.env.SUPABASE_URL?.trim();
     const supabaseAnonKey = process.env.SUPABASE_ANON_KEY?.trim();

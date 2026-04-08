@@ -1,8 +1,22 @@
 import { sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
+// AM: Catalogo publico muestra beneficios comerciales de servicio y cortesia.
 const PLAN_BENEFIT_TYPES = ["servicio", "cortesia"];
+const PLAN_CATEGORY_MIN = 1;
+const PLAN_CATEGORY_MAX = 5;
+const DEFAULT_PLAN_CATEGORY = 1;
 const requestIdSchema = { type: "string" };
+
+const PLAN_CATEGORY_COLUMN_EXISTS_SQL = `
+  SELECT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'membership_plans'
+      AND column_name = 'categoria_nivel'
+  ) AS exists
+`;
 
 const errorResponseSchema = {
   type: "object",
@@ -46,7 +60,9 @@ const planSchema = {
     descripcion: { type: ["string", "null"] },
     periodo_membresia_codigo: { type: "string" },
     periodo_membresia_label: { type: "string" },
+    categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     precio_hnl: { type: ["number", "null"] },
+    orden_visual: { type: "integer" },
     beneficios: { type: "array", items: planBenefitSchema },
   },
   required: [
@@ -56,7 +72,9 @@ const planSchema = {
     "descripcion",
     "periodo_membresia_codigo",
     "periodo_membresia_label",
+    "categoria_nivel",
     "precio_hnl",
+    "orden_visual",
     "beneficios",
   ],
   additionalProperties: false,
@@ -116,6 +134,74 @@ const PUBLIC_PLANS_SQL = `
     mp.nombre_plan,
     mp.descripcion,
     mp.periodo_membresia_codigo,
+    mp.categoria_nivel,
+    pm.descripcion AS periodo_membresia_label,
+    COALESCE(eo.precio_hnl, mp.precio_hnl) AS precio_hnl,
+    mp.beneficios,
+    eo.orden_visual
+  FROM public.membership_plans mp
+  JOIN effective_offers eo
+    ON eo.id_plan = mp.id_plan
+  JOIN public.periodos_membresia pm
+    ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
+  WHERE mp.activo IS TRUE
+  ORDER BY eo.orden_visual ASC, mp.nombre_plan ASC
+`;
+
+const PUBLIC_PLANS_SQL_LEGACY = `
+  WITH scoped_offers AS (
+    SELECT
+      mps.id_plan,
+      mps.id_sucursal,
+      mps.precio_hnl,
+      mps.orden_visual,
+      ROW_NUMBER() OVER (
+        PARTITION BY mps.id_plan, mps.id_sucursal
+        ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
+      ) AS rn
+    FROM public.membership_plans_sucursal mps
+    JOIN public.sucursales su
+      ON su.id_sucursal = mps.id_sucursal
+    WHERE mps.activo IS TRUE
+      AND mps.visible_publico IS TRUE
+      AND su.deleted_at IS NULL
+      AND su.estado IS TRUE
+      AND ($1::uuid IS NULL OR mps.id_sucursal = $1::uuid)
+  ),
+  picked_offers AS (
+    SELECT
+      so.id_plan,
+      so.id_sucursal,
+      so.precio_hnl,
+      so.orden_visual
+    FROM scoped_offers so
+    WHERE so.rn = 1
+  ),
+  effective_offers AS (
+    SELECT
+      po.id_plan,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
+        ELSE MAX(po.precio_hnl)
+      END AS precio_hnl,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
+        ELSE MAX(po.id_sucursal::text)::uuid
+      END AS id_sucursal,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.orden_visual)
+        ELSE MAX(po.orden_visual)
+      END AS orden_visual
+    FROM picked_offers po
+    GROUP BY po.id_plan
+  )
+  SELECT
+    mp.id_plan,
+    eo.id_sucursal,
+    mp.nombre_plan,
+    mp.descripcion,
+    mp.periodo_membresia_codigo,
+    1::smallint AS categoria_nivel,
     pm.descripcion AS periodo_membresia_label,
     COALESCE(eo.precio_hnl, mp.precio_hnl) AS precio_hnl,
     mp.beneficios,
@@ -133,21 +219,53 @@ function parseStoredBenefits(rawBenefits) {
   if (!rawBenefits) return [];
 
   const data = rawBenefits && typeof rawBenefits === "object" ? rawBenefits : {};
-  const items = Array.isArray(data?.items) ? data.items : Array.isArray(rawBenefits) ? rawBenefits : [];
+  const looksLikeSingleBenefit =
+    data &&
+    !Array.isArray(data) &&
+    (data.tipo !== undefined ||
+      data.id_servicio !== undefined ||
+      data.nombre !== undefined ||
+      data.codigo !== undefined ||
+      data.cantidad !== undefined);
+  const items = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(rawBenefits)
+      ? rawBenefits
+      : looksLikeSingleBenefit
+        ? [data]
+        : [];
 
   return items
-    .map((beneficio) => ({
-      tipo: String(beneficio?.tipo || "").trim().toLowerCase() === "servicio" ? "servicio" : "cortesia",
-      id_servicio: beneficio?.id_servicio ? String(beneficio.id_servicio) : null,
-      codigo: beneficio?.codigo ? String(beneficio.codigo) : null,
-      nombre: String(beneficio?.nombre || "").trim(),
-      cantidad: Number(beneficio?.cantidad ?? 0),
-    }))
+    .map((beneficio) => {
+      const normalizedServiceId = String(beneficio?.id_servicio || "").trim();
+      const rawType = String(beneficio?.tipo || "").trim().toLowerCase();
+      // AM: Compatibilidad con payloads legacy de beneficios sin tipo pero con id_servicio.
+      const tipo = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId) ? "servicio" : "cortesia";
+      return {
+        tipo,
+        id_servicio: normalizedServiceId || null,
+        codigo: beneficio?.codigo ? String(beneficio.codigo) : null,
+        nombre: String(beneficio?.nombre || "").trim(),
+        cantidad: Number(beneficio?.cantidad ?? 0),
+      };
+    })
     .filter((beneficio) => Number.isInteger(beneficio.cantidad) && beneficio.cantidad > 0)
+    .filter((beneficio) => (beneficio.tipo === "servicio" ? Boolean(beneficio.id_servicio) : Boolean(beneficio.nombre || beneficio.codigo)))
     .map((beneficio) => ({
       ...beneficio,
-      nombre: beneficio.nombre || (beneficio.tipo === "servicio" ? "Servicio incluido" : "Cortesia"),
+      nombre: beneficio.nombre || (beneficio.tipo === "servicio" ? "Servicio incluido" : (beneficio.codigo || "Cortesia")),
     }));
+}
+
+function normalizePlanCategory(value, fallback = DEFAULT_PLAN_CATEGORY) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < PLAN_CATEGORY_MIN || parsed > PLAN_CATEGORY_MAX) return fallback;
+  return parsed;
+}
+
+async function hasPlanCategoryColumn(app) {
+  const { rows } = await app.db.query(PLAN_CATEGORY_COLUMN_EXISTS_SQL);
+  return Boolean(rows[0]?.exists);
 }
 
 function mapPlanRow(row) {
@@ -158,7 +276,9 @@ function mapPlanRow(row) {
     descripcion: row.descripcion ?? null,
     periodo_membresia_codigo: row.periodo_membresia_codigo,
     periodo_membresia_label: row.periodo_membresia_label || row.periodo_membresia_codigo,
+    categoria_nivel: normalizePlanCategory(row.categoria_nivel, DEFAULT_PLAN_CATEGORY),
     precio_hnl: row.precio_hnl == null ? null : Number(row.precio_hnl),
+    orden_visual: Number(row.orden_visual ?? 100),
     beneficios: parseStoredBenefits(row.beneficios),
   };
 }
@@ -205,7 +325,9 @@ export default async function publicPlansRoutes(app) {
       }
 
       try {
-        const { rows } = await app.db.query(PUBLIC_PLANS_SQL, [request.query?.id_sucursal ?? null]);
+        const supportsPlanCategoryColumn = await hasPlanCategoryColumn(app);
+        const querySql = supportsPlanCategoryColumn ? PUBLIC_PLANS_SQL : PUBLIC_PLANS_SQL_LEGACY;
+        const { rows } = await app.db.query(querySql, [request.query?.id_sucursal ?? null]);
         return sendOk(reply, {
           planes: rows.map(mapPlanRow),
         });
@@ -214,6 +336,12 @@ export default async function publicPlansRoutes(app) {
         if (error?.code === "42P01" && String(error?.message || "").includes("membership_plans_sucursal")) {
           return sendError(reply, 500, "Falta aplicar migracion de PLANES multi-sucursal en la base de datos", {
             code: "PUBLIC_PLAN_MIGRATION_REQUIRED",
+            details: error.message,
+          });
+        }
+        if (error?.code === "42703" && String(error?.message || "").includes("categoria_nivel")) {
+          return sendError(reply, 500, "Falta aplicar migracion de categoria de planes en la base de datos", {
+            code: "PUBLIC_PLAN_CATEGORY_MIGRATION_REQUIRED",
             details: error.message,
           });
         }

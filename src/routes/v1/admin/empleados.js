@@ -1,7 +1,7 @@
 import { sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
-const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const ADMIN_ALLOWED_ROLES = ["super_admin"];
 
 const requestIdSchema = { type: "string" };
 

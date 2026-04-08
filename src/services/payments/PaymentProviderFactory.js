@@ -2,15 +2,15 @@ import { MockPaymentProvider } from "./MockPaymentProvider.js";
 // import { BanpaisPaymentProvider } from "./BanpaisPaymentProvider.js"; // Descomentar en Sprint 3
 
 /**
- * PaymentProviderFactory — Selecciona el proveedor correcto según PAYMENT_PROVIDER env.
+ * PaymentProviderFactory - Selecciona el proveedor correcto según PAYMENT_PROVIDER env.
  *
  * Uso:
  *   const provider = PaymentProviderFactory.create();
  *   const { paymentUrl } = await provider.createIntent({...});
  *
  * Valores de PAYMENT_PROVIDER:
- *   - 'mock'   → MockPaymentProvider (desarrollo/pruebas)
- *   - 'banpais' → BanpaisPaymentProvider (producción) [Sprint 3]
+ *   - 'mock'   -> MockPaymentProvider (desarrollo/pruebas)
+ *   - 'banpais' -> BanpaisPaymentProvider (producción) [Sprint 3]
  */
 export class PaymentProviderFactory {
     static _instance = null;

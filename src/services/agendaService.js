@@ -1,16 +1,97 @@
 import { AppError } from "../utils/errors.js";
+import { MockPaymentProvider } from "./payments/MockPaymentProvider.js";
+import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export const OCCUPIED_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
+export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
+export const HOLD_EXPIRABLE_APPOINTMENT_STATES = ["en_espera", "pendiente_pago"];
+export const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+export const AUTO_NO_SHOW_GRACE_MINUTES = 5;
+export const APPOINTMENT_STATE_TRANSITIONS = {
+  en_espera: ["confirmada", "cancelada", "expirada"],
+  pendiente_pago: ["confirmada", "cancelada", "expirada"],
+  confirmada: ["en_salon", "cancelada", "no_show"],
+  en_salon: ["completada", "no_show"],
+};
 export const SYSTEM_PARAMETER_KEYS = [
   "hold_duracion_min",
   "no_show_min",
+  "agenda_buffer_global_min",
   "permitir_acompanantes",
   "pago_total_obligatorio",
+  "simulacion_sin_pago",
+  "masterpuntos_migracion_manual_habilitada",
 ];
 export const SLOT_INTERVAL_MINUTES = 30;
+
+function createProviderAdapterByCode(providerCode) {
+  const normalized = String(providerCode || "").trim().toLowerCase();
+  if (!normalized) return null;
+
+  if (normalized === "mock") {
+    return new MockPaymentProvider({
+      mockResult: String(process.env.MOCK_PAYMENT_RESULT || "PAID"),
+    });
+  }
+
+  const envProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
+  if (normalized === envProvider) {
+    return PaymentProviderFactory.create();
+  }
+
+  return null;
+}
+
+async function cancelProviderIntents(candidates, logger = null) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  if (!list.length) return 0;
+
+  const byProvider = new Map();
+  for (const item of list) {
+    if (!item?.referencia_externa || !item?.provider_code) continue;
+    const key = String(item.provider_code).toLowerCase();
+    if (!byProvider.has(key)) {
+      byProvider.set(key, []);
+    }
+    byProvider.get(key).push(String(item.referencia_externa));
+  }
+
+  let cancelled = 0;
+  for (const [providerCode, references] of byProvider.entries()) {
+    const adapter = createProviderAdapterByCode(providerCode);
+    if (!adapter) {
+      if (logger?.warn) {
+        logger.warn({ providerCode, intents: references.length }, "No existe adaptador de cancelacion para proveedor");
+      }
+      continue;
+    }
+
+    const outcomes = await Promise.allSettled(
+      references.map(async (reference) => {
+        await adapter.cancelIntent(reference);
+        return reference;
+      })
+    );
+
+    outcomes.forEach((result) => {
+      if (result.status === "fulfilled") {
+        cancelled += 1;
+        return;
+      }
+      if (logger?.warn) {
+        logger.warn(
+          { providerCode, err: result.reason instanceof Error ? result.reason.message : result.reason },
+          "Fallo la cancelacion del intent en proveedor"
+        );
+      }
+    });
+  }
+
+  return cancelled;
+}
 
 function assertDb(app) {
   if (!app?.db) {
@@ -233,6 +314,19 @@ export async function getHoldDurationMinutes(client) {
   return rows[0]?.hold_duracion_min ?? 5;
 }
 
+export async function getGlobalBufferMinutes(client) {
+  const { rows } = await client.query(
+    `
+      SELECT COALESCE(valor_numero, 0)::int AS agenda_buffer_global_min
+      FROM public.parametros_sistema
+      WHERE clave = 'agenda_buffer_global_min'
+      LIMIT 1
+    `
+  );
+  const value = Number(rows[0]?.agenda_buffer_global_min ?? 0);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
 export async function getSystemParameters(client) {
   const { rows } = await client.query(
     `
@@ -255,6 +349,97 @@ export async function getSystemParameters(client) {
     };
   }
   return values;
+}
+
+export async function expireStaleAppointmentReservations(client, { now = new Date(), logger = null } = {}) {
+  const referenceNow = now instanceof Date ? now : new Date(now);
+  if (Number.isNaN(referenceNow.getTime())) {
+    throw new AppError(400, "Parametro now invalido para expiracion de reservas", {
+      code: "AGENDA_EXPIRE_NOW_INVALID",
+    });
+  }
+
+  const expiredHoldsResult = await client.query(
+    `
+      UPDATE public.citas_holds h
+      SET estado_hold_codigo = 'expirado',
+          updated_at = now()
+      WHERE h.estado_hold_codigo = 'activo'
+        AND h.expires_at <= $1::timestamptz
+      RETURNING h.id_hold, h.id_cita
+    `,
+    [referenceNow.toISOString()]
+  );
+
+  const expiredHolds = expiredHoldsResult.rows;
+  const expiredHoldIds = expiredHolds.map((row) => row.id_hold);
+  const expiredCitaIds = Array.from(new Set(expiredHolds.map((row) => row.id_cita)));
+
+  let citasExpiradas = 0;
+  if (expiredCitaIds.length) {
+    const citaResult = await client.query(
+      `
+        UPDATE public.citas c
+        SET estado_cita_codigo = 'expirada',
+            updated_at = now()
+        WHERE c.id_cita = ANY($1::uuid[])
+          AND c.estado_cita_codigo = ANY($2::text[])
+      `,
+      [expiredCitaIds, HOLD_EXPIRABLE_APPOINTMENT_STATES]
+    );
+    citasExpiradas = Number(citaResult.rowCount || 0);
+  }
+
+  const expiredIntentResult = await client.query(
+    `
+      WITH target_intents AS (
+        SELECT
+          pi.id_intent,
+          pi.referencia_externa,
+          pp.codigo AS provider_code
+        FROM public.payment_intents pi
+        JOIN public.payment_providers pp
+          ON pp.id_provider = pi.id_provider
+        WHERE pi.estado_intent_codigo = ANY($2::text[])
+          AND (
+            pi.expires_at <= $1::timestamptz
+            OR (cardinality($3::uuid[]) > 0 AND pi.id_hold = ANY($3::uuid[]))
+            OR (cardinality($4::uuid[]) > 0 AND pi.id_cita = ANY($4::uuid[]))
+          )
+      )
+      UPDATE public.payment_intents pi
+      SET estado_intent_codigo = 'expirado',
+          updated_at = now()
+      FROM target_intents ti
+      WHERE pi.id_intent = ti.id_intent
+      RETURNING pi.id_intent, ti.referencia_externa, ti.provider_code
+    `,
+    [referenceNow.toISOString(), ACTIVE_PAYMENT_INTENT_STATES, expiredHoldIds, expiredCitaIds]
+  );
+
+  const cancelledProviderIntents = await cancelProviderIntents(expiredIntentResult.rows, logger);
+
+  const autoNoShowResult = await client.query(
+    `
+      UPDATE public.citas c
+      SET estado_cita_codigo = 'no_show',
+          no_show_at = COALESCE(c.no_show_at, now()),
+          updated_at = now()
+      WHERE c.deleted_at IS NULL
+        AND c.estado_cita_codigo = 'confirmada'
+        AND c.inicio_at + make_interval(mins => $1::int) <= $2::timestamptz
+      RETURNING c.id_cita
+    `,
+    [AUTO_NO_SHOW_GRACE_MINUTES, referenceNow.toISOString()]
+  );
+
+  return {
+    expired_holds: expiredHolds.length,
+    expired_citas: citasExpiradas,
+    expired_intents: expiredIntentResult.rowCount || 0,
+    canceled_provider_intents: cancelledProviderIntents,
+    auto_no_show: Number(autoNoShowResult.rowCount || 0),
+  };
 }
 
 export async function resolveBranchIdsForClaims(app, claims) {
@@ -402,17 +587,20 @@ function mapBarberRow(row) {
   };
 }
 
-export async function getServiceSelectionDetails(client, branchId, serviceIds) {
+export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
+  const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
   const uniqueIds = Array.from(new Set(requestedIds));
 
-  const { rows } = await client.query(
-    `
+  const [servicesResult, globalBufferMin] = await Promise.all([
+    client.query(
+      `
       WITH active_tariffs AS (
         SELECT
           st.id_servicio,
           st.precio_hnl,
+          COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
           ROW_NUMBER() OVER (
             PARTITION BY st.id_servicio
             ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
@@ -421,7 +609,10 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
         WHERE st.id_sucursal = $1::uuid
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
-          AND st.id_empleado IS NULL
+          AND (
+            ($3::uuid IS NULL AND st.id_empleado IS NULL)
+            OR ($3::uuid IS NOT NULL AND st.id_empleado = $3::uuid)
+          )
           AND st.vigente_desde <= CURRENT_DATE
           AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
       )
@@ -438,10 +629,15 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
       WHERE s.id_servicio = ANY($2::uuid[])
         AND s.deleted_at IS NULL
         AND s.activo IS TRUE
+        AND COALESCE(s.agendable, TRUE) IS TRUE
+        AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
-    [safeBranchId, uniqueIds]
-  );
+      [safeBranchId, uniqueIds, safeBarberId]
+    ),
+    getGlobalBufferMinutes(client),
+  ]);
+  const { rows } = servicesResult;
 
   if (rows.length !== uniqueIds.length) {
     throw new AppError(404, "Uno o mas servicios no existen o estan inactivos", {
@@ -453,9 +649,9 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
   const byId = new Map();
   for (const row of rows) {
     if (row.precio_hnl == null) {
-      throw new AppError(409, "Uno o mas servicios no tienen tarifa activa en la sucursal", {
+      throw new AppError(409, "Uno o mas servicios no tienen tarifa activa para el alcance solicitado", {
         code: "AGENDA_SERVICE_TARIFF_MISSING",
-        details: { id_servicio: row.id_servicio, id_sucursal: safeBranchId },
+        details: { id_servicio: row.id_servicio, id_sucursal: safeBranchId, id_barbero: safeBarberId },
       });
     }
     byId.set(row.id_servicio, {
@@ -473,7 +669,8 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
     branchId: safeBranchId,
     items: details,
     duracion_total_min: details.reduce((total, item) => total + item.duracion_min, 0),
-    buffer_total_min: details.reduce((total, item) => total + item.buffer_min, 0),
+    // El buffer se configura globalmente y se aplica una sola vez por cita.
+    buffer_total_min: details.length > 0 ? Number(globalBufferMin || 0) : 0,
     monto_total_hnl: details.reduce((total, item) => total + item.precio_hnl, 0),
   };
 }
@@ -543,7 +740,23 @@ async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
     [empleadoId, dayOfWeek]
   );
 
-  return fallback.rows;
+  if (fallback.rows.length) {
+    return fallback.rows;
+  }
+
+  // Fallback defensivo para no dejar el calendario inutilizable si aun no se ha configurado horario por barbero.
+  if (dayOfWeek === 0) {
+    return [];
+  }
+  const isWeekend = dayOfWeek === 6;
+  return [
+    {
+      hora_inicio: "08:00:00",
+      hora_fin: isWeekend ? "17:00:00" : "19:00:00",
+      almuerzo_inicio: "12:00:00",
+      almuerzo_fin: "13:00:00",
+    },
+  ];
 }
 
 async function getBusyIntervalsForBarber(client, empleadoId, dateString) {
@@ -648,8 +861,20 @@ function buildBaseIntervalsFromSchedules(dateString, schedules) {
 
 function buildSlotsFromIntervals(intervals, serviceDurationMinutes, stepMinutes = SLOT_INTERVAL_MINUTES) {
   const slots = [];
+
+  function alignIntervalStartToStep(dateValue) {
+    const aligned = new Date(dateValue);
+    aligned.setSeconds(0, 0);
+    const minutesFromDayStart = aligned.getHours() * 60 + aligned.getMinutes();
+    const remainder = minutesFromDayStart % stepMinutes;
+    if (remainder > 0) {
+      aligned.setMinutes(aligned.getMinutes() + (stepMinutes - remainder));
+    }
+    return aligned;
+  }
+
   for (const interval of intervals) {
-    let cursor = new Date(interval.start);
+    let cursor = alignIntervalStartToStep(interval.start);
     while (cursor.getTime() + serviceDurationMinutes * 60 * 1000 <= interval.end.getTime()) {
       const slotEnd = addMinutes(cursor, serviceDurationMinutes);
       slots.push({
@@ -891,13 +1116,13 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
 
 export async function resolveBookingSelection(client, { id_sucursal, servicios, fecha_inicio, id_barbero = null }) {
   const branch = await ensureActiveBranch(client, id_sucursal);
-  const serviceSelection = await getServiceSelectionDetails(client, branch.id_sucursal, servicios);
+  const serviceSelection = await getServiceSelectionDetails(client, branch.id_sucursal, servicios, id_barbero);
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
   const dateKey = formatDateOnly(startDateTime);
   const timeKey = toTimeLabel(startDateTime);
   const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
-  let selectedBarber = null;
+  let selectedBarber;
   if (id_barbero) {
     const barber = await getBarberById(client, id_barbero);
     if (barber.id_sucursal !== branch.id_sucursal) {
@@ -917,19 +1142,21 @@ export async function resolveBookingSelection(client, { id_sucursal, servicios, 
     selectedBarber = barber;
   } else {
     const barbers = await listBarbersForBranch(client, branch.id_sucursal);
+    const candidates = [];
     for (const barber of barbers) {
       const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes);
       if (slots.some((slot) => slot.hora === timeKey)) {
-        selectedBarber = barber;
-        break;
+        candidates.push(barber);
       }
     }
-    if (!selectedBarber) {
+    if (!candidates.length) {
       throw new AppError(409, "No existe un barbero disponible para el horario solicitado", {
         code: "AGENDA_AUTOASSIGN_NOT_AVAILABLE",
         details: { fecha: dateKey, hora: timeKey, id_sucursal: branch.id_sucursal },
       });
     }
+    const randomIndex = Math.floor(Math.random() * candidates.length);
+    selectedBarber = candidates[randomIndex];
   }
 
   return {

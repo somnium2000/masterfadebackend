@@ -80,7 +80,7 @@ export function globalErrorHandler(error, request, reply) {
     });
   }
 
-  // Error genérico — no exponer internals en producción
+  // Error genérico - no exponer internals en producción
   const statusCode = error.statusCode || 500;
   request.log.error(error);
 

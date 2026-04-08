@@ -2,6 +2,12 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
+import {
+  activateAssetForEntity,
+  buildAssetReadUrl,
+  replaceAssetIfNeeded,
+  resolveAssetForBinding,
+} from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
 const ACCESS_STATUS = {
@@ -16,6 +22,7 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // AM: Regla operativa de identidad hondurena para esta fase (13 digitos).
 const DNI_PATTERN = /^\d{13}$/;
 const RTN_PATTERN = /^\d{14}$/;
+const STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE = "private_client_profile";
 
 const personaInputSchema = {
   type: "object",
@@ -89,6 +96,7 @@ const clienteCreateBodySchema = {
         estado: { type: "boolean" },
         consentimiento_marketing: { type: "boolean" },
         acepta_terminos: { type: "boolean" },
+        foto_perfil_asset_id: { type: ["string", "null"], format: "uuid" },
       },
       additionalProperties: false,
     },
@@ -102,6 +110,15 @@ const usuarioSetupBodySchema = {
   properties: {
     marcar_pendiente_password: { type: "boolean" },
   },
+  additionalProperties: false,
+};
+
+const roleCreateBodySchema = {
+  type: "object",
+  properties: {
+    nombre: { type: "string", minLength: 2, maxLength: 50 },
+  },
+  required: ["nombre"],
   additionalProperties: false,
 };
 
@@ -140,7 +157,32 @@ const usuarioAccessStatusBodySchema = {
 };
 
 const clienteUpdateBodySchema = {
-  ...clienteCreateBodySchema,
+  type: "object",
+  properties: {
+    persona: personaInputSchema,
+    acceso: {
+      type: "object",
+      properties: {
+        habilitar_acceso: { type: "boolean" },
+        correo_principal: { type: "string", minLength: 5, maxLength: 160 },
+      },
+      additionalProperties: false,
+    },
+    cliente: {
+      type: "object",
+      properties: {
+        id_sucursal_origen: { type: ["string", "null"], format: "uuid" },
+        fecha_ingreso: { type: ["string", "null"], format: "date-time" },
+        estado: { type: "boolean" },
+        consentimiento_marketing: { type: "boolean" },
+        acepta_terminos: { type: "boolean" },
+        foto_perfil_asset_id: { type: ["string", "null"], format: "uuid" },
+      },
+      additionalProperties: false,
+    },
+  },
+  required: ["persona"],
+  additionalProperties: false,
 };
 
 const LIST_PERSONAS_SQL = `
@@ -221,6 +263,8 @@ const EMPLEADO_BASE_SQL = `
     p.telefono_principal,
     p.direccion_texto,
     p.observaciones,
+    p.foto_perfil_asset_id,
+    p.foto_perfil_path,
     COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo_principal,
     e.id_sucursal,
     s.nombre_sucursal,
@@ -330,19 +374,33 @@ const USUARIO_BY_ID_SQL = `
 `;
 
 const FK_RELATIONS_CACHE = new Map();
+let clientsConsentColumnsCache = null;
 
 function normalizeRequired(value) {
-  return String(value || "").trim();
+  return String(value || "").normalize("NFC").trim();
 }
 
 function normalizeOptional(value) {
   if (value === undefined) return undefined;
-  const trimmed = String(value ?? "").trim();
+  const trimmed = String(value ?? "").normalize("NFC").trim();
   return trimmed ? trimmed : null;
 }
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeRoleName(value) {
+  const normalized = String(value || "").normalize("NFC").trim().toLowerCase();
+  if (!normalized) {
+    throw new AppError(400, "nombre es requerido", { code: "PERSONAS_ROLE_NAME_REQUIRED" });
+  }
+  if (!/^[a-z0-9_]{2,50}$/.test(normalized)) {
+    throw new AppError(400, "nombre de rol invalido. Usa solo minusculas, numeros o guion bajo", {
+      code: "PERSONAS_ROLE_NAME_INVALID",
+    });
+  }
+  return normalized;
 }
 
 function normalizeDateOnly(value) {
@@ -447,6 +505,9 @@ function mapEmpleado(row) {
     telefono_principal: row.telefono_principal ?? null,
     direccion_texto: row.direccion_texto ?? null,
     observaciones: row.observaciones ?? null,
+    foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
+    foto_perfil_path: row.foto_perfil_path ?? null,
+    foto_perfil_signed_url: null,
     correo_principal: row.correo_principal ?? null,
     id_sucursal: row.id_sucursal,
     nombre_sucursal: row.nombre_sucursal ?? null,
@@ -491,11 +552,93 @@ function mapCliente(row) {
   };
 }
 
+async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
+  if (!cliente?.foto_perfil_asset_id) {
+    return cliente;
+  }
+  try {
+    const readUrl = await buildAssetReadUrl(app, {
+      claims,
+      assetId: cliente.foto_perfil_asset_id,
+    });
+    return {
+      ...cliente,
+      foto_perfil_signed_url: readUrl?.url ?? null,
+    };
+  } catch (error) {
+    app.log.warn(
+      {
+        err: error,
+        id_cliente: cliente?.id_cliente,
+        id_asset: cliente?.foto_perfil_asset_id,
+      },
+      "No se pudo generar signed URL de foto de perfil"
+    );
+    return {
+      ...cliente,
+      foto_perfil_signed_url: null,
+    };
+  }
+}
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
       details: error.details,
+      requestId: request.id,
+    });
+  }
+  if (error?.code === "P0001" && String(error?.message || "").includes("ROL_REQUIERE_SUCURSAL")) {
+    return sendError(reply, 409, "El rol requiere id_sucursal activo", {
+      code: "PERSONAS_ROLE_SCOPE_REQUIRED",
+      details: {
+        db_code: error?.code,
+      },
+      requestId: request.id,
+    });
+  }
+  if (error?.code === "23505") {
+    const constraint = String(error?.constraint || "").toLowerCase();
+    if (constraint === "uq_correo_direccion") {
+      return sendError(reply, 409, "El correo ya esta vinculado a otra persona", {
+        code: "PERSONAS_EMAIL_ALREADY_EXISTS",
+        details: {
+          constraint: error?.constraint ?? null,
+        },
+        requestId: request.id,
+      });
+    }
+    if (constraint === "uq_personas_dni_norm") {
+      return sendError(reply, 409, "El dni ya esta vinculado a otra persona", {
+        code: "PERSONAS_DNI_ALREADY_EXISTS",
+        details: {
+          constraint: error?.constraint ?? null,
+        },
+        requestId: request.id,
+      });
+    }
+    if (constraint === "uq_personas_rtn_norm") {
+      return sendError(reply, 409, "El rtn ya esta vinculado a otra persona", {
+        code: "PERSONAS_RTN_ALREADY_EXISTS",
+        details: {
+          constraint: error?.constraint ?? null,
+        },
+        requestId: request.id,
+      });
+    }
+  }
+  if (
+    (error?.code === "42P01" || error?.code === "42703") &&
+    (
+      String(error?.message || "").includes("storage_assets")
+      || String(error?.message || "").includes("foto_perfil_asset_id")
+      || String(error?.message || "").includes("foto_perfil_path")
+    )
+  ) {
+    return sendError(reply, 500, "Falta aplicar migracion de STORAGE para clientes", {
+      code: "PERSONAS_STORAGE_MIGRATION_REQUIRED",
+      details: error.message,
       requestId: request.id,
     });
   }
@@ -773,6 +916,27 @@ async function ensureActiveBranch(client, branchId) {
   return raw;
 }
 
+async function hasClientsConsentTimestampColumns(client) {
+  if (clientsConsentColumnsCache !== null) {
+    return clientsConsentColumnsCache;
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'clientes'
+        AND column_name IN ('acepta_terminos_at', 'consentimiento_marketing_at')
+    `
+  );
+
+  const columns = new Set(rows.map((row) => String(row.column_name)));
+  clientsConsentColumnsCache =
+    columns.has("acepta_terminos_at") && columns.has("consentimiento_marketing_at");
+  return clientsConsentColumnsCache;
+}
+
 async function ensureEmailAvailability(client, email, { excludePersonaId = null, excludeUserId = null } = {}) {
   const correoResult = await client.query(
     `
@@ -808,6 +972,46 @@ async function ensureEmailAvailability(client, email, { excludePersonaId = null,
     if (!excludeUserId || existingUserId !== excludeUserId) {
       throw new AppError(409, "El correo ya existe en auth.users", {
         code: "PERSONAS_AUTH_EMAIL_ALREADY_EXISTS",
+      });
+    }
+  }
+}
+
+async function ensurePersonaDocumentAvailability(client, { dni = null, rtn = null, excludePersonaId = null } = {}) {
+  if (dni) {
+    const dniResult = await client.query(
+      `
+        SELECT id_persona
+        FROM public.personas
+        WHERE deleted_at IS NULL
+          AND regexp_replace(COALESCE(dni, ''), '\\D', '', 'g') = $1
+          AND ($2::uuid IS NULL OR id_persona <> $2::uuid)
+        LIMIT 1
+      `,
+      [dni, excludePersonaId]
+    );
+    if (dniResult.rowCount) {
+      throw new AppError(409, "El dni ya esta vinculado a otra persona", {
+        code: "PERSONAS_DNI_ALREADY_EXISTS",
+      });
+    }
+  }
+
+  if (rtn) {
+    const rtnResult = await client.query(
+      `
+        SELECT id_persona
+        FROM public.personas
+        WHERE deleted_at IS NULL
+          AND regexp_replace(COALESCE(rtn, ''), '\\D', '', 'g') = $1
+          AND ($2::uuid IS NULL OR id_persona <> $2::uuid)
+        LIMIT 1
+      `,
+      [rtn, excludePersonaId]
+    );
+    if (rtnResult.rowCount) {
+      throw new AppError(409, "El rtn ya esta vinculado a otra persona", {
+        code: "PERSONAS_RTN_ALREADY_EXISTS",
       });
     }
   }
@@ -971,12 +1175,6 @@ async function ensureClienteRoleAssignment(client, roleIdsByName, userId, branch
     });
   }
 
-  if (!branchId) {
-    throw new AppError(400, "Cliente con acceso requiere id_sucursal_origen activo", {
-      code: "PERSONAS_CLIENT_BRANCH_REQUIRED",
-    });
-  }
-
   const revived = await client.query(
     `
       UPDATE public.roles_usuarios
@@ -1034,7 +1232,14 @@ async function deleteAuthIdentity(app, request, authUserId) {
   }
 }
 
-async function sendPasswordSetupEmail(app, email) {
+function buildFullName(nombres, apellidos) {
+  const firstName = normalizeOptional(nombres) ?? "";
+  const lastName = normalizeOptional(apellidos) ?? "";
+  const fullName = `${firstName} ${lastName}`.trim();
+  return fullName || null;
+}
+
+async function sendPasswordSetupEmail(app, email, fullName = null) {
   if (!app.supabaseAdmin) {
     return {
       sent: false,
@@ -1062,6 +1267,7 @@ async function sendPasswordSetupEmail(app, email) {
     const delivery = await app.mailer.sendPasswordRecoveryEmail({
       to: email,
       actionLink: recovery.action_link,
+      fullName,
       kind: "setup",
     });
 
@@ -1129,6 +1335,10 @@ async function createEmpleado(app, request, payload) {
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, esBarbero);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
 
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+    });
     assertValidEmail(correoPrincipal);
     await ensureEmailAvailability(client, correoPrincipal);
 
@@ -1239,7 +1449,11 @@ async function createEmpleado(app, request, payload) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    const setupResult = await sendPasswordSetupEmail(app, correoPrincipal);
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      correoPrincipal,
+      buildFullName(persona.nombres, persona.apellidos)
+    );
 
     return {
       empleado: mapEmpleado(detail.rows[0]),
@@ -1287,7 +1501,13 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     const esBarbero = Boolean(empleadoRaw.es_barbero);
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, esBarbero);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
+    const previousEmail = normalizeEmail(currentRow.correo_principal ?? "");
 
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+      excludePersonaId: currentRow.id_persona,
+    });
     assertValidEmail(correoPrincipal);
     await ensureEmailAvailability(client, correoPrincipal, {
       excludePersonaId: currentRow.id_persona,
@@ -1329,6 +1549,9 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     );
 
     await upsertPrimaryEmail(client, currentRow.id_persona, correoPrincipal);
+    if (previousEmail !== correoPrincipal) {
+      await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
+    }
 
     await client.query(
       `
@@ -1388,7 +1611,17 @@ async function createCliente(app, request, payload) {
     const correoPrincipal = normalizeEmail(acceso.correo_principal);
     const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
+    const consentimientoMarketing = Boolean(cliente.consentimiento_marketing);
+    const aceptaTerminos = Boolean(cliente.acepta_terminos);
+    const fotoPerfilAssetId = normalizeOptional(cliente.foto_perfil_asset_id ?? null);
+    const consentimientosAt = new Date().toISOString();
+    const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
+    const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+    });
     if (!correoPrincipal) {
       throw new AppError(400, "Cliente requiere correo_principal obligatorio", {
         code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
@@ -1475,47 +1708,126 @@ async function createCliente(app, request, payload) {
       );
     }
 
-    const clienteInsert = await client.query(
-      `
-        INSERT INTO public.clientes (
-          id_persona,
-          id_usuario,
-          fecha_ingreso,
-          id_sucursal_origen,
-          estado,
-          consentimiento_marketing,
-          acepta_terminos
+    const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
+    const clienteInsert = hasConsentTimestampColumns
+      ? await client.query(
+          `
+            INSERT INTO public.clientes (
+              id_persona,
+              id_usuario,
+              fecha_ingreso,
+              id_sucursal_origen,
+              estado,
+              consentimiento_marketing,
+              acepta_terminos,
+              consentimiento_marketing_at,
+              acepta_terminos_at
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              COALESCE($3::timestamptz, NOW()),
+              $4::uuid,
+              COALESCE($5::boolean, TRUE),
+              COALESCE($6::boolean, FALSE),
+              COALESCE($7::boolean, FALSE),
+              $8::timestamptz,
+              $9::timestamptz
+            )
+            RETURNING id_cliente
+          `,
+          [
+            idPersona,
+            authUserId,
+            fechaIngreso,
+            idSucursalOrigen,
+            cliente.estado,
+            consentimientoMarketing,
+            aceptaTerminos,
+            consentimientoMarketingAt,
+            aceptaTerminosAt,
+          ]
         )
-        VALUES (
-          $1::uuid,
-          $2::uuid,
-          COALESCE($3::timestamptz, NOW()),
-          $4::uuid,
-          COALESCE($5::boolean, TRUE),
-          COALESCE($6::boolean, FALSE),
-          COALESCE($7::boolean, FALSE)
-        )
-        RETURNING id_cliente
-      `,
-      [
-        idPersona,
-        authUserId,
-        fechaIngreso,
-        idSucursalOrigen,
-        cliente.estado,
-        cliente.consentimiento_marketing,
-        cliente.acepta_terminos,
-      ]
-    );
+      : await client.query(
+          `
+            INSERT INTO public.clientes (
+              id_persona,
+              id_usuario,
+              fecha_ingreso,
+              id_sucursal_origen,
+              estado,
+              consentimiento_marketing,
+              acepta_terminos
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              COALESCE($3::timestamptz, NOW()),
+              $4::uuid,
+              COALESCE($5::boolean, TRUE),
+              COALESCE($6::boolean, FALSE),
+              COALESCE($7::boolean, FALSE)
+            )
+            RETURNING id_cliente
+          `,
+          [
+            idPersona,
+            authUserId,
+            fechaIngreso,
+            idSucursalOrigen,
+            cliente.estado,
+            consentimientoMarketing,
+            aceptaTerminos,
+          ]
+        );
 
-    const detail = await client.query(CLIENTE_BY_ID_SQL, [clienteInsert.rows[0].id_cliente]);
+    const createdClientId = clienteInsert.rows[0].id_cliente;
+    if (fotoPerfilAssetId) {
+      const fotoAsset = await resolveAssetForBinding(client, {
+        assetId: fotoPerfilAssetId,
+        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+        entityType: "cliente",
+        entityId: createdClientId,
+        idSucursal: idSucursalOrigen,
+        claims: request.claims,
+        allowUnboundEntity: true,
+        allowedStatuses: ["temporal", "activo"],
+      });
+      const activatedPhoto = await activateAssetForEntity(app, client, {
+        assetId: fotoAsset.id_asset,
+        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+        entityType: "cliente",
+        entityId: createdClientId,
+        idSucursal: idSucursalOrigen,
+        ownerClienteId: createdClientId,
+        claims: request.claims,
+        replaceCurrent: false,
+      });
+      await client.query(
+        `
+          UPDATE public.personas
+          SET
+            foto_perfil_asset_id = $2::uuid,
+            foto_perfil_path = $3,
+            updated_at = NOW()
+          WHERE id_persona = $1::uuid
+        `,
+        [idPersona, activatedPhoto.asset.id_asset, activatedPhoto.asset.object_path]
+      );
+    }
+
+    const detail = await client.query(CLIENTE_BY_ID_SQL, [createdClientId]);
 
     await client.query("COMMIT");
     transactionStarted = false;
 
     let setupPassword = null;
     if (habilitarAcceso) {
-      const setupResult = await sendPasswordSetupEmail(app, correoPrincipal);
+      const setupResult = await sendPasswordSetupEmail(
+        app,
+        correoPrincipal,
+        buildFullName(persona.nombres, persona.apellidos)
+      );
       setupPassword = {
         requerido: true,
         enviado: setupResult.sent,
@@ -1524,7 +1836,7 @@ async function createCliente(app, request, payload) {
     }
 
     return {
-      cliente: mapCliente(detail.rows[0]),
+      cliente: await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(detail.rows[0])),
       ...(setupPassword ? { setup_password: setupPassword } : {}),
     };
   } catch (error) {
@@ -1550,8 +1862,11 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
         SELECT
           u.id_usuario,
           u.estado_acceso,
+          p.nombres,
+          p.apellidos,
           COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS email
         FROM public.usuarios u
+        LEFT JOIN public.personas p ON p.id_persona = u.id_persona
         LEFT JOIN auth.users au ON au.id = u.id_usuario
         LEFT JOIN LATERAL (
           SELECT c.direccion_correo::text AS email
@@ -1597,7 +1912,11 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    const setupResult = await sendPasswordSetupEmail(app, email);
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      email,
+      buildFullName(userRow.nombres, userRow.apellidos)
+    );
     if (!setupResult.sent) {
       // AM: En reenvio manual se exige entrega real para evitar falso positivo en UI.
       throw new AppError(502, "No se pudo enviar el correo de configuracion", {
@@ -1876,17 +2195,6 @@ async function updateUsuario(app, request, userId, payload) {
 
     if (targetRoleName) {
       const roleId = roleIdsByName.get(targetRoleName);
-      await client.query(
-        `
-          UPDATE public.roles_usuarios
-          SET activo = FALSE,
-              updated_at = NOW()
-          WHERE id_usuario = $1::uuid
-            AND activo IS TRUE
-        `,
-        [raw.id_usuario]
-      );
-
       const revived = await client.query(
         `
           UPDATE public.roles_usuarios
@@ -1911,7 +2219,20 @@ async function updateUsuario(app, request, userId, payload) {
       }
 
       if (currentUsuario.tiene_empleado) {
-        const nextIsBarber = targetRoleName === "barbero";
+        const activeBarberRole = await client.query(
+          `
+            SELECT 1
+            FROM public.roles_usuarios ru
+            JOIN public.roles r
+              ON r.id_rol = ru.id_rol
+            WHERE ru.id_usuario = $1::uuid
+              AND ru.activo IS TRUE
+              AND r.nombre = 'barbero'
+            LIMIT 1
+          `,
+          [raw.id_usuario]
+        );
+        const nextIsBarber = activeBarberRole.rowCount > 0;
         await client.query(
           `
             UPDATE public.empleados
@@ -2197,11 +2518,26 @@ async function updateCliente(app, request, idCliente, payload) {
     const persona = buildPersonaPayload(payload?.persona || {});
     const acceso = payload?.acceso || {};
     const cliente = payload?.cliente || {};
+    const consentimientosAt = new Date().toISOString();
 
-    const habilitarAcceso = Boolean(acceso.habilitar_acceso);
+    const hasHabilitarAccesoPatch = acceso.habilitar_acceso !== undefined;
+    const hasCurrentAccessState =
+      currentRow?.id_usuario !== undefined || currentRow?.tiene_acceso !== undefined;
+    if (!hasHabilitarAccesoPatch && !hasCurrentAccessState) {
+      throw new AppError(500, "No se pudo resolver el estado actual de acceso del cliente", {
+        code: "PERSONAS_CLIENT_ACCESS_STATE_UNRESOLVED",
+      });
+    }
+    const currentHabilitarAcceso =
+      currentRow?.tiene_acceso !== undefined ? Boolean(currentRow.tiene_acceso) : Boolean(currentRow?.id_usuario);
+    const habilitarAcceso = hasHabilitarAccesoPatch ? Boolean(acceso.habilitar_acceso) : currentHabilitarAcceso;
     const correoPrincipal = normalizeEmail(acceso.correo_principal ?? currentRow.correo_principal ?? "");
     const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? currentRow.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
+    const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(cliente, "foto_perfil_asset_id");
+    const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
+      ? normalizeOptional(cliente.foto_perfil_asset_id ?? null)
+      : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
 
     if (currentRow.id_usuario && !habilitarAcceso) {
       throw new AppError(400, "El cliente ya tiene acceso. Usa accion de inactivar para restringirlo.", {
@@ -2214,8 +2550,12 @@ async function updateCliente(app, request, idCliente, payload) {
         code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
       });
     }
+    await ensurePersonaDocumentAvailability(client, {
+      dni: persona.dni,
+      rtn: persona.rtn,
+      excludePersonaId: currentRow.id_persona,
+    });
     assertValidEmail(correoPrincipal);
-
     if (habilitarAcceso) {
       if (!idSucursalOrigen) {
         throw new AppError(400, "Cliente con acceso requiere id_sucursal_origen activo", {
@@ -2229,7 +2569,77 @@ async function updateCliente(app, request, idCliente, payload) {
       excludeUserId: currentRow.id_usuario ?? null,
     });
 
+    const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
+    const currentConsents = hasConsentTimestampColumns
+      ? await client.query(
+          `
+            SELECT
+              COALESCE(consentimiento_marketing, FALSE) AS consentimiento_marketing,
+              COALESCE(acepta_terminos, FALSE) AS acepta_terminos,
+              consentimiento_marketing_at,
+              acepta_terminos_at
+            FROM public.clientes
+            WHERE id_cliente = $1::uuid
+              AND deleted_at IS NULL
+            LIMIT 1
+          `,
+          [idCliente]
+        )
+      : await client.query(
+          `
+            SELECT
+              COALESCE(consentimiento_marketing, FALSE) AS consentimiento_marketing,
+              COALESCE(acepta_terminos, FALSE) AS acepta_terminos,
+              NULL::timestamptz AS consentimiento_marketing_at,
+              NULL::timestamptz AS acepta_terminos_at
+            FROM public.clientes
+            WHERE id_cliente = $1::uuid
+              AND deleted_at IS NULL
+            LIMIT 1
+          `,
+          [idCliente]
+        );
+    if (!currentConsents.rowCount) {
+      throw new AppError(404, "Cliente no encontrado", {
+        code: "PERSONAS_CLIENT_NOT_FOUND",
+      });
+    }
+    const currentConsentRow = currentConsents.rows[0];
+
+    const nextConsentimientoMarketing =
+      cliente.consentimiento_marketing === undefined
+        ? Boolean(currentConsentRow.consentimiento_marketing)
+        : Boolean(cliente.consentimiento_marketing);
+    const nextAceptaTerminos =
+      cliente.acepta_terminos === undefined
+        ? Boolean(currentConsentRow.acepta_terminos)
+        : Boolean(cliente.acepta_terminos);
+
+    const nextConsentimientoMarketingAt = nextConsentimientoMarketing
+      ? (Boolean(currentConsentRow.consentimiento_marketing) &&
+        currentConsentRow.consentimiento_marketing_at
+          ? currentConsentRow.consentimiento_marketing_at
+          : consentimientosAt)
+      : null;
+    const nextAceptaTerminosAt = nextAceptaTerminos
+      ? (Boolean(currentConsentRow.acepta_terminos) && currentConsentRow.acepta_terminos_at
+          ? currentConsentRow.acepta_terminos_at
+          : consentimientosAt)
+      : null;
+
     const roleIdsByName = await loadRoleIdByName(client);
+    const nextFotoPerfilAsset = nextFotoPerfilAssetIdRaw
+      ? await resolveAssetForBinding(client, {
+        assetId: nextFotoPerfilAssetIdRaw,
+        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+        entityType: "cliente",
+        entityId: idCliente,
+        idSucursal: idSucursalOrigen,
+        claims: request.claims,
+        allowUnboundEntity: true,
+        allowedStatuses: ["temporal", "activo"],
+      })
+      : null;
     if (habilitarAcceso && !currentRow.id_usuario) {
       authUserId = await createAuthIdentity(app, {
         email: correoPrincipal,
@@ -2322,37 +2732,112 @@ async function updateCliente(app, request, idCliente, payload) {
       }
     }
 
-    await client.query(
-      `
-        UPDATE public.clientes
-        SET id_usuario = $2::uuid,
-            fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
-            id_sucursal_origen = $4::uuid,
-            estado = COALESCE($5::boolean, estado),
-            consentimiento_marketing = COALESCE($6::boolean, consentimiento_marketing),
-            acepta_terminos = COALESCE($7::boolean, acepta_terminos),
+    let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
+    let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
+    if (hasFotoPerfilPatch) {
+      if (!nextFotoPerfilAsset) {
+        nextFotoPerfilAssetId = null;
+        nextFotoPerfilPath = null;
+      } else {
+        const activatedPhoto = await activateAssetForEntity(app, client, {
+          assetId: nextFotoPerfilAsset.id_asset,
+          scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
+          entityType: "cliente",
+          entityId: idCliente,
+          idSucursal: idSucursalOrigen,
+          ownerClienteId: idCliente,
+          claims: request.claims,
+          replaceCurrent: false,
+        });
+        nextFotoPerfilAssetId = activatedPhoto.asset.id_asset;
+        nextFotoPerfilPath = activatedPhoto.asset.object_path;
+      }
+
+      await client.query(
+        `
+          UPDATE public.personas
+          SET
+            foto_perfil_asset_id = $2::uuid,
+            foto_perfil_path = $3,
             updated_at = NOW()
-        WHERE id_cliente = $1::uuid
-      `,
-      [
-        idCliente,
-        nextUserId,
-        fechaIngreso,
-        idSucursalOrigen,
-        cliente.estado,
-        cliente.consentimiento_marketing,
-        cliente.acepta_terminos,
-      ]
-    );
+          WHERE id_persona = $1::uuid
+        `,
+        [currentRow.id_persona, nextFotoPerfilAssetId, nextFotoPerfilPath]
+      );
+    }
+
+    if (hasConsentTimestampColumns) {
+      await client.query(
+        `
+          UPDATE public.clientes
+          SET id_usuario = $2::uuid,
+              fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
+              id_sucursal_origen = $4::uuid,
+              estado = COALESCE($5::boolean, estado),
+              consentimiento_marketing = $6::boolean,
+              acepta_terminos = $7::boolean,
+              consentimiento_marketing_at = $8::timestamptz,
+              acepta_terminos_at = $9::timestamptz,
+              updated_at = NOW()
+          WHERE id_cliente = $1::uuid
+        `,
+        [
+          idCliente,
+          nextUserId,
+          fechaIngreso,
+          idSucursalOrigen,
+          cliente.estado,
+          nextConsentimientoMarketing,
+          nextAceptaTerminos,
+          nextConsentimientoMarketingAt,
+          nextAceptaTerminosAt,
+        ]
+      );
+    } else {
+      await client.query(
+        `
+          UPDATE public.clientes
+          SET id_usuario = $2::uuid,
+              fecha_ingreso = COALESCE($3::timestamptz, fecha_ingreso),
+              id_sucursal_origen = $4::uuid,
+              estado = COALESCE($5::boolean, estado),
+              consentimiento_marketing = $6::boolean,
+              acepta_terminos = $7::boolean,
+              updated_at = NOW()
+          WHERE id_cliente = $1::uuid
+        `,
+        [
+          idCliente,
+          nextUserId,
+          fechaIngreso,
+          idSucursalOrigen,
+          cliente.estado,
+          nextConsentimientoMarketing,
+          nextAceptaTerminos,
+        ]
+      );
+    }
 
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 
     await client.query("COMMIT");
     transactionStarted = false;
 
+    if (hasFotoPerfilPatch) {
+      await replaceAssetIfNeeded(app, client, {
+        previousAssetId: currentRow.foto_perfil_asset_id,
+        nextAssetId: nextFotoPerfilAssetIdRaw,
+        claims: request.claims,
+      });
+    }
+
     let setupPassword = null;
     if (habilitarAcceso && !currentRow.id_usuario) {
-      const setupResult = await sendPasswordSetupEmail(app, correoPrincipal);
+      const setupResult = await sendPasswordSetupEmail(
+        app,
+        correoPrincipal,
+        buildFullName(persona.nombres, persona.apellidos)
+      );
       setupPassword = {
         requerido: true,
         enviado: setupResult.sent,
@@ -2361,7 +2846,7 @@ async function updateCliente(app, request, idCliente, payload) {
     }
 
     return {
-      cliente: mapCliente(detail.rows[0]),
+      cliente: await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(detail.rows[0])),
       ...(setupPassword ? { setup_password: setupPassword } : {}),
     };
   } catch (error) {
@@ -2455,7 +2940,6 @@ async function activateCliente(app, request, idCliente) {
           code: "PERSONAS_CLIENT_ACTIVATE_BRANCH_REQUIRED",
         });
       }
-
       const roleIdsByName = await loadRoleIdByName(client);
       await ensureClienteRoleAssignment(
         client,
@@ -2883,6 +3367,69 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
+  app.get("/roles", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+    try {
+      const { rows } = await app.db.query(
+        `
+          SELECT id_rol, nombre, created_at, updated_at
+          FROM public.roles
+          ORDER BY nombre ASC
+        `
+      );
+      return sendOk(reply, { roles: rows });
+    } catch (error) {
+      return sendHandled(reply, request, error, "No se pudo consultar roles", "PERSONAS_ROLES_LIST_ERROR");
+    }
+  });
+
+  app.post(
+    "/roles",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ONLY),
+      schema: { body: roleCreateBodySchema },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+      try {
+        const roleName = normalizeRoleName(request.body?.nombre);
+        await client.query("BEGIN");
+
+        const existsResult = await client.query(
+          `
+            SELECT id_rol
+            FROM public.roles
+            WHERE lower(nombre) = $1::text
+            LIMIT 1
+          `,
+          [roleName]
+        );
+        if (existsResult.rowCount > 0) {
+          throw new AppError(409, "Ya existe un rol con ese nombre", {
+            code: "PERSONAS_ROLE_DUPLICATE",
+            details: { nombre: roleName },
+          });
+        }
+
+        const insertResult = await client.query(
+          `
+            INSERT INTO public.roles (nombre)
+            VALUES ($1::text)
+            RETURNING id_rol, nombre, created_at, updated_at
+          `,
+          [roleName]
+        );
+
+        await client.query("COMMIT");
+        return sendOk(reply, { rol: insertResult.rows[0] }, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        return sendHandled(reply, request, error, "No se pudo crear rol", "PERSONAS_ROLE_CREATE_ERROR");
+      } finally {
+        client.release();
+      }
+    }
+  );
+
   app.get("/usuarios", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(LIST_USUARIOS_SQL);
@@ -3058,7 +3605,8 @@ export default async function adminPersonasRoutes(app) {
           requestId: request.id,
         });
       }
-      return sendOk(reply, { cliente: mapCliente(rows[0]) });
+      const cliente = await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(rows[0]));
+      return sendOk(reply, { cliente });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar detalle de cliente", "PERSONAS_CLIENT_DETAIL_ERROR");
     }
