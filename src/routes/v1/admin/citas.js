@@ -15,16 +15,24 @@ import {
 
 const CONFIG_ALLOWED_ROLES = ["admin", "super_admin"];
 const OPERATIONAL_ALLOWED_ROLES = ["admin", "super_admin", "barbero"];
+const HISTORY_ALLOWED_ROLES = ["admin", "super_admin"];
 const EMERGENCY_ALLOWED_ROLES = ["admin", "super_admin"];
 const HISTORICAL_DEFAULT_STATES = ["cancelada", "expirada", "completada", "no_show", "anulada"];
 const STATUS_CHANGE_WINDOW_MINUTES = 10;
+const OPERATIONAL_TIMEZONE = "America/Tegucigalpa";
 let appointmentContactColumnsSupportCache = null;
 
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
-    return sendError(reply, error.statusCode, error.message, {
+    const safeMessageByCode = {
+      ADMIN_CITAS_STATUS_WINDOW_NOT_OPEN: "La cita aún no está disponible para ese cambio de estado.",
+      ADMIN_CITAS_STATUS_TRANSITION_INVALID: "El cambio de estado solicitado no está disponible para esta cita.",
+      ADMIN_CITAS_STATUS_START_INVALID: "La cita no se puede actualizar en este momento.",
+    };
+    const safeCodes = new Set(Object.keys(safeMessageByCode));
+    return sendError(reply, error.statusCode, safeMessageByCode[error.code] || error.message, {
       code: error.code,
-      details: error.details,
+      details: safeCodes.has(error.code) ? undefined : error.details,
       requestId: request.id,
     });
   }
@@ -156,6 +164,19 @@ function parseLimit(value, fallback = 100, max = 250) {
   return Math.min(Math.trunc(parsed), max);
 }
 
+function getCurrentDateInTimeZone(timeZone = OPERATIONAL_TIMEZONE) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  return year && month && day ? `${year}-${month}-${day}` : null;
+}
+
 function parseStatusFilter(rawValue, fallbackStates = []) {
   const raw = Array.isArray(rawValue) ? rawValue.join(",") : String(rawValue || "").trim();
   if (!raw) return Array.from(new Set(fallbackStates.filter(Boolean)));
@@ -163,6 +184,13 @@ function parseStatusFilter(rawValue, fallbackStates = []) {
 }
 
 function mapOperationalAppointment(row) {
+  const serviceDetails = Array.isArray(row.servicios_detalle)
+    ? row.servicios_detalle.map((item) => ({
+        id_servicio: item?.id_servicio ?? null,
+        nombre_servicio: item?.nombre_servicio ?? "Servicio",
+      }))
+    : [];
+
   return {
     id_cita: row.id_cita,
     id_grupo_cita: row.id_grupo_cita ?? null,
@@ -187,6 +215,7 @@ function mapOperationalAppointment(row) {
     asignada_automaticamente: Boolean(row.asignada_automaticamente),
     notas: row.notas ?? null,
     servicios: Array.isArray(row.servicios) ? row.servicios : [],
+    servicios_detalle: serviceDetails,
     hold_actual: row.hold_estado
       ? {
           estado_hold_codigo: row.hold_estado,
@@ -349,6 +378,7 @@ async function listOperationalAppointments(client, {
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
         ${clientNameSql} AS nombre_cliente,
         COALESCE(srv.servicios, '[]'::jsonb) AS servicios,
+        COALESCE(srv.servicios_detalle, '[]'::jsonb) AS servicios_detalle,
         hold.estado_hold_codigo AS hold_estado,
         hold.expires_at AS hold_expires_at,
         intent.estado_intent_codigo AS intent_estado,
@@ -374,8 +404,20 @@ async function listOperationalAppointments(client, {
         SELECT COALESCE(
           jsonb_agg(cd.id_servicio ORDER BY cd.id_cita_detalle),
           '[]'::jsonb
-        ) AS servicios
+        ) AS servicios,
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id_servicio', cd.id_servicio,
+              'nombre_servicio', COALESCE(NULLIF(TRIM(s.nombre_servicio), ''), 'Servicio')
+            )
+            ORDER BY cd.id_cita_detalle
+          ),
+          '[]'::jsonb
+        ) AS servicios_detalle
         FROM public.citas_detalles cd
+        LEFT JOIN public.servicios s
+          ON s.id_servicio = cd.id_servicio
         WHERE cd.id_cita = c.id_cita
       ) srv ON TRUE
       LEFT JOIN LATERAL (
@@ -909,7 +951,55 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.get("/historial", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/operativas/completadas-hoy", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    try {
+      await expireStaleAppointmentReservations(app.db, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const operationalDate = getCurrentDateInTimeZone();
+      if (!operationalDate) {
+        throw new AppError(500, "No fue posible resolver la fecha operativa actual", {
+          code: "ADMIN_CITAS_TODAY_RESOLUTION_FAILED",
+        });
+      }
+
+      const citas = await listOperationalAppointments(app.db, {
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        idSucursal: request.query?.id_sucursal ?? null,
+        idEmpleadoBarbero: request.query?.id_empleado_barbero ?? null,
+        states: ["completada"],
+        q: cleanText(request.query?.q),
+        fechaDesde: operationalDate,
+        fechaHasta: operationalDate,
+        limit: parseLimit(request.query?.limit, 200, 300),
+        sortDirection: "desc",
+      });
+
+      return sendOk(reply, {
+        citas,
+        fecha_operativa: operationalDate,
+        filtros: {
+          id_sucursal: request.query?.id_sucursal ?? null,
+          id_empleado_barbero: request.query?.id_empleado_barbero ?? null,
+          estado: ["completada"],
+          fecha_desde: operationalDate,
+          fecha_hasta: operationalDate,
+          q: cleanText(request.query?.q),
+        },
+      });
+    } catch (error) {
+      return sendHandled(
+        reply,
+        request,
+        error,
+        "No se pudieron consultar las citas completadas de hoy",
+        "ADMIN_CITAS_OPERATIVE_COMPLETED_TODAY_ERROR"
+      );
+    }
+  });
+
+  app.get("/historial", { preHandler: app.requireRoles(HISTORY_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       await expireStaleAppointmentReservations(app.db, { logger: request.log });
       const branchIds = await getScopeBranches(app, request.claims);

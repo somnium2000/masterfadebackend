@@ -150,7 +150,10 @@ const PUBLIC_SERVICES_SQL = `
       ON su.id_sucursal = st.id_sucursal
     WHERE st.deleted_at IS NULL
       AND st.activo IS TRUE
-      AND st.id_empleado IS NULL
+      AND (
+        ($2::uuid IS NULL AND st.id_empleado IS NULL)
+        OR ($2::uuid IS NOT NULL AND st.id_empleado = $2::uuid)
+      )
       AND st.vigente_desde <= CURRENT_DATE
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
       AND su.deleted_at IS NULL
@@ -496,6 +499,7 @@ export default async function publicCatalogRoutes(app) {
           type: "object",
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
+            id_barbero: { type: "string", format: "uuid" },
           },
           additionalProperties: false,
         },
@@ -529,7 +533,10 @@ export default async function publicCatalogRoutes(app) {
       }
 
       try {
-        const { rows } = await app.db.query(PUBLIC_SERVICES_SQL, [request.query?.id_sucursal ?? null]);
+        const { rows } = await app.db.query(PUBLIC_SERVICES_SQL, [
+          request.query?.id_sucursal ?? null,
+          request.query?.id_barbero ?? null,
+        ]);
         return sendOk(reply, {
           servicios: rows.map(mapServiceRow),
         });

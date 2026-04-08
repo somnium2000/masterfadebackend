@@ -587,8 +587,9 @@ function mapBarberRow(row) {
   };
 }
 
-export async function getServiceSelectionDetails(client, branchId, serviceIds) {
+export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
+  const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
   const uniqueIds = Array.from(new Set(requestedIds));
 
@@ -608,7 +609,10 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
         WHERE st.id_sucursal = $1::uuid
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
-          AND st.id_empleado IS NULL
+          AND (
+            ($3::uuid IS NULL AND st.id_empleado IS NULL)
+            OR ($3::uuid IS NOT NULL AND st.id_empleado = $3::uuid)
+          )
           AND st.vigente_desde <= CURRENT_DATE
           AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
       )
@@ -629,7 +633,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
         AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
-      [safeBranchId, uniqueIds]
+      [safeBranchId, uniqueIds, safeBarberId]
     ),
     getGlobalBufferMinutes(client),
   ]);
@@ -645,9 +649,9 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds) {
   const byId = new Map();
   for (const row of rows) {
     if (row.precio_hnl == null) {
-      throw new AppError(409, "Uno o mas servicios no tienen tarifa activa en la sucursal", {
+      throw new AppError(409, "Uno o mas servicios no tienen tarifa activa para el alcance solicitado", {
         code: "AGENDA_SERVICE_TARIFF_MISSING",
-        details: { id_servicio: row.id_servicio, id_sucursal: safeBranchId },
+        details: { id_servicio: row.id_servicio, id_sucursal: safeBranchId, id_barbero: safeBarberId },
       });
     }
     byId.set(row.id_servicio, {
@@ -1112,7 +1116,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
 
 export async function resolveBookingSelection(client, { id_sucursal, servicios, fecha_inicio, id_barbero = null }) {
   const branch = await ensureActiveBranch(client, id_sucursal);
-  const serviceSelection = await getServiceSelectionDetails(client, branch.id_sucursal, servicios);
+  const serviceSelection = await getServiceSelectionDetails(client, branch.id_sucursal, servicios, id_barbero);
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
   const dateKey = formatDateOnly(startDateTime);
   const timeKey = toTimeLabel(startDateTime);
