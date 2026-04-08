@@ -1,14 +1,24 @@
 import { AppError, sendError } from "../../utils/errors.js";
 import { sendOk } from "../../utils/response.js";
 import {
+  ensureActiveBranch,
+  expireStaleAppointmentReservations,
   OCCUPIED_APPOINTMENT_STATES,
-  resolveBookingSelection,
-  parseDateOnly,
   assertUuid,
+  parseDateOnly,
+  resolveBookingSelection,
 } from "../../services/agendaService.js";
+import {
+  createCoverageTracker,
+  consumeCoverageForServices,
+  ensureSubscriptionLifecycle,
+  getClienteMembershipState,
+  insertSubscriptionConsumptionRows,
+} from "../../services/membershipService.js";
 
-const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
+const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
+const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
 
 const errorResponseSchema = {
   type: "object",
@@ -225,6 +235,124 @@ async function getAppointmentDetails(client, citaId) {
 
 function isConflictError(error) {
   return error?.code === "23P01" || /YA_EXISTE_HOLD_ACTIVO_PARA_USUARIO/i.test(String(error?.message || ""));
+}
+
+function parseIsoDateAndTime(rawDateTime) {
+  const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (!match) return { fecha: null, hora: null };
+  return { fecha: match[1], hora: match[2] };
+}
+
+function getDateTimePartsInTimeZone(dateValue, timeZone = HONDURAS_TIME_ZONE) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+
+  const parts = formatter.formatToParts(dateValue);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  const hour = parts.find((part) => part.type === "hour")?.value;
+  const minute = parts.find((part) => part.type === "minute")?.value;
+  const second = parts.find((part) => part.type === "second")?.value;
+
+  if (!year || !month || !day || !hour || !minute || !second) return null;
+
+  return {
+    year: Number(year),
+    month: Number(month),
+    day: Number(day),
+    hour: Number(hour),
+    minute: Number(minute),
+    second: Number(second),
+  };
+}
+
+function compareDateTimeParts(left, right) {
+  if (!left || !right) return 0;
+  const leftKey = [left.year, left.month, left.day, left.hour, left.minute, left.second];
+  const rightKey = [right.year, right.month, right.day, right.hour, right.minute, right.second];
+  for (let index = 0; index < leftKey.length; index += 1) {
+    if (leftKey[index] > rightKey[index]) return 1;
+    if (leftKey[index] < rightKey[index]) return -1;
+  }
+  return 0;
+}
+
+function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
+  const parsed = new Date(String(rawDateTime || "").trim());
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError(400, `${field} no es valida`, {
+      code: "CITAS_HOLD_INVALID_DATETIME",
+      details: { field, value: rawDateTime },
+    });
+  }
+
+  const requestParts = getDateTimePartsInTimeZone(parsed, HONDURAS_TIME_ZONE);
+  const nowParts = getDateTimePartsInTimeZone(new Date(), HONDURAS_TIME_ZONE);
+  if (!requestParts || !nowParts) return parsed;
+
+  if (compareDateTimeParts(requestParts, nowParts) < 0) {
+    throw new AppError(400, `${field} no puede estar en el pasado`, {
+      code: "CITAS_HOLD_PAST_DATETIME",
+      details: { field, value: rawDateTime, time_zone: HONDURAS_TIME_ZONE },
+    });
+  }
+
+  return parsed;
+}
+
+function normalizeHoldBlocksPayload(body) {
+  const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
+  const legacyPayload = body?.fecha_inicio && Array.isArray(body?.servicios)
+    ? [{
+      orden_integrante: 1,
+      alias: "Titular",
+      id_barbero: body?.id_barbero ?? null,
+      fecha_inicio: body.fecha_inicio,
+      servicios: body.servicios,
+    }]
+    : [];
+
+  const rawBlocks = hasGroupedPayload ? body.integrantes : legacyPayload;
+  if (!rawBlocks.length) {
+    throw new AppError(400, "Debes enviar al menos un integrante para crear la reserva", {
+      code: "CITAS_HOLD_BLOCKS_REQUIRED",
+    });
+  }
+
+  return rawBlocks.map((item, index) => {
+    const aliasFallback = index === 0 ? "Titular" : `Acompanante ${index}`;
+    const alias = String(item?.alias || aliasFallback).trim().slice(0, 80) || aliasFallback;
+    const ordenIntegrante = Number(item?.orden_integrante);
+    const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
+
+    if (!servicios.length) {
+      throw new AppError(400, `El integrante ${alias} no tiene servicios seleccionados`, {
+        code: "CITAS_HOLD_BLOCK_SERVICES_REQUIRED",
+        details: { alias, index },
+      });
+    }
+
+    const serviceIds = servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"));
+    const fechaInicio = String(item?.fecha_inicio || "").trim();
+    assertDateTimeNotPastInHonduras(fechaInicio, "fecha_inicio");
+
+    return {
+      orden_integrante: Number.isFinite(ordenIntegrante) && ordenIntegrante > 0 ? Math.trunc(ordenIntegrante) : index + 1,
+      alias,
+      id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
+      fecha_inicio: fechaInicio,
+      serviceIds,
+    };
+  });
 }
 
 export default async function citasRoutes(app) {
@@ -444,6 +572,351 @@ export default async function citasRoutes(app) {
         }
 
         return sendHandled(reply, request, error, "No se pudo crear la cita", "CITAS_CREATE_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.post(
+    "/hold",
+    {
+      preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_sucursal"],
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+            integrantes: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                required: ["fecha_inicio", "servicios"],
+                properties: {
+                  orden_integrante: { type: "integer" },
+                  alias: { type: "string", maxLength: 80 },
+                  id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  fecha_inicio: { type: "string", format: "date-time" },
+                  servicios: {
+                    type: "array",
+                    minItems: 1,
+                    items: {
+                      type: "object",
+                      required: ["id_servicio"],
+                      properties: {
+                        id_servicio: { type: "string", format: "uuid" },
+                      },
+                      additionalProperties: false,
+                    },
+                  },
+                },
+                additionalProperties: false,
+              },
+            },
+            id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+            fecha_inicio: { type: "string", format: "date-time" },
+            servicios: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["id_servicio"],
+                properties: {
+                  id_servicio: { type: "string", format: "uuid" },
+                },
+                additionalProperties: false,
+              },
+            },
+            notas: { anyOf: [{ type: "string", maxLength: 500 }, { type: "null" }] },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const dbClient = await app.db.connect();
+      let txStarted = false;
+      try {
+        const { clienteId, personaId, usuarioId } = ensureClientContext(request);
+        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+
+        const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
+        const branch = await ensureActiveBranch(dbClient, idSucursal);
+        const integrantes = normalizeHoldBlocksPayload(request.body);
+
+        await dbClient.query("BEGIN");
+        txStarted = true;
+
+        const activeMembership = await ensureSubscriptionLifecycle(dbClient, clienteId, { forUpdate: true });
+        const coverageTracker = createCoverageTracker(activeMembership);
+        const hasMembership = Boolean(coverageTracker.hasPlan && coverageTracker.idSuscripcion);
+
+        const groupInsert = await dbClient.query(
+          `
+            INSERT INTO public.citas_grupos (
+              id_sucursal,
+              id_persona_titular,
+              id_cliente_titular,
+              estado_grupo_codigo,
+              notas
+            )
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'activo', $4)
+            RETURNING id_grupo_cita, estado_grupo_codigo
+          `,
+          [
+            branch.id_sucursal,
+            personaId,
+            clienteId,
+            request.body?.notas ?? null,
+          ]
+        );
+
+        const groupRecord = groupInsert.rows[0];
+        const holdExpiresAt = new Date(Date.now() + (5 * 60 * 1000));
+        const holdUserId = integrantes.length > 1 ? null : usuarioId;
+        const bloquesResponse = [];
+        let subtotalGrupo = 0;
+        let descuentoGrupo = 0;
+        let totalGrupo = 0;
+        let extrasPendientesGrupo = 0;
+        let coveredItemsCount = 0;
+        let extraItemsCount = 0;
+
+        for (let index = 0; index < integrantes.length; index += 1) {
+          const integrante = integrantes[index];
+          const selection = await resolveBookingSelection(dbClient, {
+            id_sucursal: branch.id_sucursal,
+            servicios: integrante.serviceIds,
+            fecha_inicio: integrante.fecha_inicio,
+            id_barbero: integrante.id_barbero,
+          });
+
+          const isTitular = integrante.orden_integrante <= 1;
+          const coverage = consumeCoverageForServices(coverageTracker, selection.serviceSelection.items, { isTitular });
+          const subtotalServicios = Number(selection.serviceSelection.monto_total_hnl || 0);
+          const descuento = Number(coverage.coveredTotalHnl || 0);
+          const totalPagar = Number(coverage.extraTotalHnl || 0);
+
+          const totalDuration = selection.serviceSelection.duracion_total_min + selection.serviceSelection.buffer_total_min;
+          const finAt = new Date(selection.startDateTime.getTime() + totalDuration * 60 * 1000);
+
+          const citaInsert = await dbClient.query(
+            `
+              INSERT INTO public.citas (
+                id_grupo_cita,
+                orden_integrante,
+                alias_integrante,
+                id_sucursal,
+                id_empleado_barbero,
+                id_persona_cliente,
+                id_cliente,
+                creada_por_usuario_id,
+                asignada_automaticamente,
+                estado_cita_codigo,
+                inicio_at,
+                fin_at,
+                duracion_total_min,
+                buffer_total_min,
+                subtotal_servicios_hnl,
+                descuento_hnl,
+                total_pagar_hnl,
+                notas
+              )
+              VALUES (
+                $1::uuid,
+                $2::int,
+                $3,
+                $4::uuid,
+                $5::uuid,
+                $6::uuid,
+                $7::uuid,
+                $8::uuid,
+                $9::boolean,
+                'en_espera',
+                $10::timestamptz,
+                $11::timestamptz,
+                $12::int,
+                $13::int,
+                $14::numeric,
+                $15::numeric,
+                $16::numeric,
+                $17
+              )
+              RETURNING id_cita
+            `,
+            [
+              groupRecord.id_grupo_cita,
+              integrante.orden_integrante,
+              integrante.alias,
+              branch.id_sucursal,
+              selection.barber.id_empleado,
+              personaId,
+              clienteId,
+              usuarioId,
+              !integrante.id_barbero,
+              selection.startDateTime.toISOString(),
+              finAt.toISOString(),
+              selection.serviceSelection.duracion_total_min,
+              selection.serviceSelection.buffer_total_min,
+              subtotalServicios,
+              descuento,
+              totalPagar,
+              request.body?.notas ?? null,
+            ]
+          );
+
+          const citaId = citaInsert.rows[0].id_cita;
+
+          for (const serviceItem of selection.serviceSelection.items) {
+            await dbClient.query(
+              `
+                INSERT INTO public.citas_detalles (
+                  id_cita,
+                  id_servicio,
+                  cantidad,
+                  duracion_min,
+                  buffer_min,
+                  precio_unitario_hnl,
+                  subtotal_hnl
+                )
+                VALUES ($1::uuid, $2::uuid, 1, $3::int, $4::int, $5::numeric, $6::numeric)
+              `,
+              [
+                citaId,
+                serviceItem.id_servicio,
+                serviceItem.duracion_min,
+                serviceItem.buffer_min,
+                serviceItem.precio_hnl,
+                serviceItem.precio_hnl,
+              ]
+            );
+          }
+
+          await dbClient.query(
+            `
+              INSERT INTO public.citas_holds (
+                id_cita,
+                id_usuario,
+                estado_hold_codigo,
+                expires_at
+              )
+              VALUES ($1::uuid, $2::uuid, 'activo', $3::timestamptz)
+            `,
+            [citaId, holdUserId, holdExpiresAt.toISOString()]
+          );
+
+          if (hasMembership && coverage.items.length > 0) {
+            await insertSubscriptionConsumptionRows(dbClient, {
+              idSuscripcion: coverageTracker.idSuscripcion,
+              idCliente: clienteId,
+              idCita: citaId,
+              ordenIntegrante: integrante.orden_integrante,
+              entries: coverage.items,
+            });
+          }
+
+          const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
+          const coveredCount = coverage.items.filter((entry) => entry.coverage_status === "cubierto_plan").length;
+          const extraCount = coverage.items.filter((entry) => entry.coverage_status === "extra_pendiente").length;
+          coveredItemsCount += coveredCount;
+          extraItemsCount += extraCount;
+          subtotalGrupo += subtotalServicios;
+          descuentoGrupo += descuento;
+          totalGrupo += totalPagar;
+          extrasPendientesGrupo += totalPagar;
+
+          bloquesResponse.push({
+            id_cita: citaId,
+            orden_integrante: integrante.orden_integrante,
+            alias: integrante.alias,
+            id_barbero: selection.barber.id_empleado,
+            nombre_barbero: selection.barber.nombre_completo,
+            fecha: fecha || "",
+            hora: hora || "",
+            fecha_inicio: selection.startDateTime.toISOString(),
+            estado_cita_codigo: "en_espera",
+            monto_total_hnl: subtotalServicios,
+            descuento_hnl: descuento,
+            total_pagar_hnl: totalPagar,
+            duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
+            buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
+            cobertura: {
+              items_cubiertos: coveredCount,
+              items_extra: extraCount,
+            },
+          });
+        }
+
+        const membershipState = await getClienteMembershipState(dbClient, clienteId);
+        await dbClient.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, {
+          id_grupo_cita: groupRecord.id_grupo_cita,
+          estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
+          expires_at: holdExpiresAt.toISOString(),
+          monto_total_hnl: subtotalGrupo,
+          descuento_total_hnl: descuentoGrupo,
+          total_pagar_hnl: totalGrupo,
+          extras_pendientes_hnl: extrasPendientesGrupo,
+          resumen_cobertura: {
+            items_cubiertos: coveredItemsCount,
+            items_extra: extraItemsCount,
+          },
+          membresia: hasMembership
+            ? {
+              cobertura_activa: true,
+              id_suscripcion: coverageTracker.idSuscripcion,
+              nombre_plan: coverageTracker.planName || null,
+              estado_plan: membershipState?.estado_plan || "sin_plan_activo",
+            }
+            : {
+              cobertura_activa: false,
+              id_suscripcion: null,
+              nombre_plan: null,
+              estado_plan: "sin_plan_activo",
+            },
+          bloques: bloquesResponse,
+        }, {
+          statusCode: 201,
+          requestId: request.id,
+        });
+      } catch (error) {
+        try {
+          if (txStarted) {
+            await dbClient.query("ROLLBACK");
+          }
+        } catch {
+          // no-op
+        }
+
+        if (isConflictError(error)) {
+          return sendError(reply, 409, "Ya existe un conflicto de disponibilidad para uno de los bloques", {
+            code: "CITAS_HOLD_CONFLICT",
+            details: error instanceof Error ? error.message : "Hold conflict",
+            requestId: request.id,
+          });
+        }
+
+        return sendHandled(reply, request, error, "No se pudo crear el hold de citas", "CITAS_HOLD_CREATE_ERROR");
       } finally {
         dbClient.release();
       }

@@ -2,7 +2,11 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+// AM: Se permite cortesia para exhibicion comercial; el motor operativo sigue en servicios.
 const PLAN_BENEFIT_TYPES = ["servicio", "cortesia"];
+const PLAN_CATEGORY_MIN = 1;
+const PLAN_CATEGORY_MAX = 5;
+const DEFAULT_PLAN_CATEGORY = 1;
 const requestIdSchema = { type: "string" };
 
 const errorResponseSchema = {
@@ -53,6 +57,7 @@ const planBodySchema = {
     descripcion: { type: ["string", "null"], maxLength: 500 },
     precio_hnl: { type: "number", minimum: 0 },
     periodo_membresia_codigo: { type: "string", minLength: 1, maxLength: 40 },
+    categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     beneficios: {
       type: "array",
       minItems: 1,
@@ -73,6 +78,7 @@ const planPatchSchema = {
     descripcion: { type: ["string", "null"], maxLength: 500 },
     precio_hnl: { type: "number", minimum: 0 },
     periodo_membresia_codigo: { type: "string", minLength: 1, maxLength: 40 },
+    categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     beneficios: {
       type: "array",
       minItems: 1,
@@ -118,6 +124,7 @@ const planResponseSchema = {
     descripcion: { type: ["string", "null"] },
     periodo_membresia_codigo: { type: "string" },
     periodo_membresia_label: { type: "string" },
+    categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     precio_hnl: { type: ["number", "null"] },
     activo: { type: "boolean" },
     visible_publico: { type: "boolean" },
@@ -131,6 +138,7 @@ const planResponseSchema = {
     "descripcion",
     "periodo_membresia_codigo",
     "periodo_membresia_label",
+    "categoria_nivel",
     "precio_hnl",
     "activo",
     "visible_publico",
@@ -146,6 +154,16 @@ const ACTIVE_BRANCHES_SQL = `
   WHERE s.deleted_at IS NULL
     AND s.estado IS TRUE
   ORDER BY s.nombre_sucursal ASC
+`;
+
+const PLAN_CATEGORY_COLUMN_EXISTS_SQL = `
+  SELECT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'membership_plans'
+      AND column_name = 'categoria_nivel'
+  ) AS exists
 `;
 
 const LIST_PLANS_SQL = `
@@ -181,6 +199,55 @@ const LIST_PLANS_SQL = `
     mp.nombre_plan,
     mp.descripcion,
     mp.periodo_membresia_codigo,
+    mp.categoria_nivel,
+    pm.descripcion AS periodo_membresia_label,
+    COALESCE(po.precio_hnl, mp.precio_hnl) AS precio_hnl,
+    (COALESCE(po.activo, FALSE) AND mp.activo IS TRUE) AS activo,
+    COALESCE(po.visible_publico, FALSE) AS visible_publico,
+    COALESCE(po.orden_visual, 100) AS orden_visual,
+    mp.beneficios
+  FROM public.membership_plans mp
+  JOIN picked_offers po
+    ON po.id_plan = mp.id_plan
+  JOIN public.periodos_membresia pm
+    ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
+  ORDER BY po.orden_visual ASC, mp.nombre_plan ASC, po.id_sucursal ASC
+`;
+
+const LIST_PLANS_SQL_LEGACY = `
+  WITH scoped_offers AS (
+    SELECT
+      mps.id_plan,
+      mps.id_sucursal,
+      mps.precio_hnl,
+      mps.activo,
+      mps.visible_publico,
+      mps.orden_visual,
+      ROW_NUMBER() OVER (
+        PARTITION BY mps.id_plan, mps.id_sucursal
+        ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
+      ) AS rn
+    FROM public.membership_plans_sucursal mps
+    WHERE ($1::uuid IS NULL OR mps.id_sucursal = $1::uuid)
+  ),
+  picked_offers AS (
+    SELECT
+      so.id_plan,
+      so.id_sucursal,
+      so.precio_hnl,
+      so.activo,
+      so.visible_publico,
+      so.orden_visual
+    FROM scoped_offers so
+    WHERE so.rn = 1
+  )
+  SELECT
+    mp.id_plan,
+    po.id_sucursal,
+    mp.nombre_plan,
+    mp.descripcion,
+    mp.periodo_membresia_codigo,
+    1::smallint AS categoria_nivel,
     pm.descripcion AS periodo_membresia_label,
     COALESCE(po.precio_hnl, mp.precio_hnl) AS precio_hnl,
     (COALESCE(po.activo, FALSE) AND mp.activo IS TRUE) AS activo,
@@ -201,6 +268,22 @@ const GET_PLAN_BASE_SQL = `
     mp.nombre_plan,
     mp.descripcion,
     mp.periodo_membresia_codigo,
+    mp.categoria_nivel,
+    mp.precio_hnl,
+    mp.beneficios,
+    mp.activo
+  FROM public.membership_plans mp
+  WHERE mp.id_plan = $1::uuid
+  LIMIT 1
+`;
+
+const GET_PLAN_BASE_SQL_LEGACY = `
+  SELECT
+    mp.id_plan,
+    mp.nombre_plan,
+    mp.descripcion,
+    mp.periodo_membresia_codigo,
+    1::smallint AS categoria_nivel,
     mp.precio_hnl,
     mp.beneficios,
     mp.activo
@@ -216,6 +299,31 @@ const GET_PLAN_SCOPED_SQL = `
     mp.nombre_plan,
     mp.descripcion,
     mp.periodo_membresia_codigo,
+    mp.categoria_nivel,
+    pm.descripcion AS periodo_membresia_label,
+    COALESCE(mps.precio_hnl, mp.precio_hnl) AS precio_hnl,
+    (COALESCE(mps.activo, FALSE) AND mp.activo IS TRUE) AS activo,
+    COALESCE(mps.visible_publico, FALSE) AS visible_publico,
+    COALESCE(mps.orden_visual, 100) AS orden_visual,
+    mp.beneficios
+  FROM public.membership_plans mp
+  JOIN public.membership_plans_sucursal mps
+    ON mps.id_plan = mp.id_plan
+   AND mps.id_sucursal = $2::uuid
+  JOIN public.periodos_membresia pm
+    ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
+  WHERE mp.id_plan = $1::uuid
+  LIMIT 1
+`;
+
+const GET_PLAN_SCOPED_SQL_LEGACY = `
+  SELECT
+    mp.id_plan,
+    mps.id_sucursal,
+    mp.nombre_plan,
+    mp.descripcion,
+    mp.periodo_membresia_codigo,
+    1::smallint AS categoria_nivel,
     pm.descripcion AS periodo_membresia_label,
     COALESCE(mps.precio_hnl, mp.precio_hnl) AS precio_hnl,
     (COALESCE(mps.activo, FALSE) AND mp.activo IS TRUE) AS activo,
@@ -260,6 +368,8 @@ const GET_ACTIVE_SERVICES_IN_BRANCH_SQL = `
         AND st.id_empleado IS NULL
         AND st.deleted_at IS NULL
         AND st.activo IS TRUE
+        -- AM: En planes operativos solo se permiten servicios agendables (no informativos).
+        AND COALESCE(st.servicio_informativo, FALSE) IS FALSE
         AND st.vigente_desde <= CURRENT_DATE
         AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
     ) AS has_scope_tariff
@@ -302,6 +412,23 @@ function normalizePeriodCode(value, fallback = "mensual") {
   return normalized;
 }
 
+function normalizePlanCategory(value, fallback = DEFAULT_PLAN_CATEGORY) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < PLAN_CATEGORY_MIN || parsed > PLAN_CATEGORY_MAX) {
+    throw new AppError(400, `La categoria del plan debe estar entre ${PLAN_CATEGORY_MIN} y ${PLAN_CATEGORY_MAX}`, {
+      code: "CATALOG_PLAN_CATEGORY_INVALID",
+    });
+  }
+  return parsed;
+}
+
+function parsePlanCategoryFromRow(value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < PLAN_CATEGORY_MIN || parsed > PLAN_CATEGORY_MAX) return DEFAULT_PLAN_CATEGORY;
+  return parsed;
+}
+
 function normalizePlanBenefits(beneficios) {
   if (!Array.isArray(beneficios) || beneficios.length === 0) {
     throw new AppError(400, "Debes registrar al menos un beneficio para el plan", {
@@ -311,7 +438,6 @@ function normalizePlanBenefits(beneficios) {
 
   const seenServiceIds = new Set();
   const seenCourtesyKeys = new Set();
-
   return beneficios.map((beneficio) => {
     const tipo = String(beneficio?.tipo || "").trim().toLowerCase();
     const cantidad = Number(beneficio?.cantidad);
@@ -354,18 +480,16 @@ function normalizePlanBenefits(beneficios) {
     }
 
     if (!nombre) {
-      throw new AppError(400, "Los beneficios de cortesia requieren nombre", {
+      throw new AppError(400, "Los beneficios tipo cortesia requieren nombre", {
         code: "CATALOG_PLAN_BENEFIT_INVALID",
       });
     }
-
-    const courtesyKey = (codigo || nombre).toLowerCase();
+    const courtesyKey = String((codigo || nombre)).trim().toLowerCase();
     if (seenCourtesyKeys.has(courtesyKey)) {
       throw new AppError(400, "No se permite repetir la misma cortesia dentro del plan", {
         code: "CATALOG_PLAN_BENEFIT_DUPLICATE",
       });
     }
-
     seenCourtesyKeys.add(courtesyKey);
     return {
       tipo: "cortesia",
@@ -381,22 +505,45 @@ function parseStoredBenefits(rawBenefits) {
   if (!rawBenefits) return [];
 
   const data = rawBenefits && typeof rawBenefits === "object" ? rawBenefits : {};
-  const items = Array.isArray(data?.items) ? data.items : Array.isArray(rawBenefits) ? rawBenefits : [];
+  const looksLikeSingleBenefit =
+    data &&
+    !Array.isArray(data) &&
+    (data.tipo !== undefined ||
+      data.id_servicio !== undefined ||
+      data.nombre !== undefined ||
+      data.codigo !== undefined ||
+      data.cantidad !== undefined);
+  const items = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(rawBenefits)
+      ? rawBenefits
+      : looksLikeSingleBenefit
+        ? [data]
+        : [];
 
   return items
-    .map((beneficio) => ({
-      tipo: String(beneficio?.tipo || "").trim().toLowerCase() === "servicio" ? "servicio" : "cortesia",
-      id_servicio: beneficio?.id_servicio ? String(beneficio.id_servicio) : null,
-      codigo: beneficio?.codigo ? String(beneficio.codigo) : null,
-      nombre: String(beneficio?.nombre || "").trim(),
-      cantidad: Number(beneficio?.cantidad ?? 0),
-    }))
+    .map((beneficio) => {
+      const normalizedServiceId = String(beneficio?.id_servicio || "").trim();
+      const rawType = String(beneficio?.tipo || "").trim().toLowerCase();
+      // AM: Compatibilidad con beneficios legacy sin tipo explicito pero con id_servicio.
+      const tipo = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId) ? "servicio" : "cortesia";
+      return {
+        tipo,
+        id_servicio: normalizedServiceId || null,
+        codigo: beneficio?.codigo ? String(beneficio.codigo) : null,
+        nombre: String(beneficio?.nombre || "").trim(),
+        cantidad: Number(beneficio?.cantidad ?? 0),
+      };
+    })
     .filter((beneficio) => Number.isInteger(beneficio.cantidad) && beneficio.cantidad > 0)
+    .filter((beneficio) => (beneficio.tipo === "servicio" ? Boolean(beneficio.id_servicio) : Boolean(beneficio.nombre || beneficio.codigo)))
     .map((beneficio) => ({
       ...beneficio,
       nombre:
         beneficio.nombre ||
-        (beneficio.tipo === "servicio" ? "Servicio del catalogo" : "Cortesia"),
+        (beneficio.tipo === "servicio"
+          ? "Servicio del catalogo"
+          : (beneficio.codigo || "Cortesia")),
     }));
 }
 
@@ -415,6 +562,7 @@ function mapPlanRow(row) {
     descripcion: row.descripcion ?? null,
     periodo_membresia_codigo: row.periodo_membresia_codigo,
     periodo_membresia_label: row.periodo_membresia_label || row.periodo_membresia_codigo,
+    categoria_nivel: parsePlanCategoryFromRow(row.categoria_nivel),
     precio_hnl: row.precio_hnl == null ? null : Number(row.precio_hnl),
     activo: Boolean(row.activo),
     visible_publico: Boolean(row.visible_publico),
@@ -495,6 +643,11 @@ async function ensurePeriodExists(client, periodCode) {
   }
 }
 
+async function hasPlanCategoryColumn(client) {
+  const { rows } = await client.query(PLAN_CATEGORY_COLUMN_EXISTS_SQL);
+  return Boolean(rows[0]?.exists);
+}
+
 async function ensureUniquePlanNameByBranch(client, planId, branchId, nombrePlan) {
   const { rows } = await client.query(
     `
@@ -530,13 +683,14 @@ async function ensurePlanServiceBenefitsAccessible(client, benefits, branchId) {
 
   const { rows } = await client.query(GET_ACTIVE_SERVICES_IN_BRANCH_SQL, [serviceBenefitIds, branchId]);
   if (rows.length !== serviceBenefitIds.length) {
-    throw new AppError(400, "Uno o mas servicios de beneficios no existen o no estan activos", {
+    throw new AppError(400, "Uno o más servicios de beneficios no existen o no están activos", {
       code: "CATALOG_PLAN_SERVICE_NOT_FOUND",
     });
   }
 
   if (rows.some((row) => !row.has_scope_tariff)) {
-    throw new AppError(409, "Uno o mas servicios de beneficios no estan disponibles en la sucursal seleccionada", {
+    // AM: Bloquea servicios fuera de sucursal, inactivos o informativos aunque el frontend falle.
+    throw new AppError(409, "Uno o más servicios no son operativos para la sucursal seleccionada", {
       code: "CATALOG_PLAN_SERVICE_OUT_OF_SCOPE",
     });
   }
@@ -609,34 +763,59 @@ async function hasPlanOffersInOtherBranches(client, idPlan, branchId) {
   return rows.length > 0;
 }
 
-async function clonePlanForBranch(client, sourcePlan, branchId) {
+async function clonePlanForBranch(client, sourcePlan, branchId, supportsPlanCategoryColumn) {
   const sourcePrice =
     sourcePlan?.precio_hnl === undefined || sourcePlan?.precio_hnl === null
       ? 0
       : Number(sourcePlan.precio_hnl);
 
-  const cloneResult = await client.query(
-    `
-      INSERT INTO public.membership_plans (
-        nombre_plan,
-        descripcion,
-        precio_hnl,
-        periodo_membresia_codigo,
-        beneficios,
-        activo,
-        updated_at
-      )
-      VALUES ($1, $2, $3::numeric, $4, $5::jsonb, TRUE, NOW())
-      RETURNING id_plan
-    `,
-    [
-      sourcePlan.nombre_plan,
-      sourcePlan.descripcion ?? null,
-      sourcePrice,
-      sourcePlan.periodo_membresia_codigo,
-      sourcePlan.beneficios,
-    ]
-  );
+  const cloneResult = supportsPlanCategoryColumn
+    ? await client.query(
+      `
+        INSERT INTO public.membership_plans (
+          nombre_plan,
+          descripcion,
+          precio_hnl,
+          periodo_membresia_codigo,
+          categoria_nivel,
+          beneficios,
+          activo,
+          updated_at
+        )
+        VALUES ($1, $2, $3::numeric, $4, $5::smallint, $6::jsonb, TRUE, NOW())
+        RETURNING id_plan
+      `,
+      [
+        sourcePlan.nombre_plan,
+        sourcePlan.descripcion ?? null,
+        sourcePrice,
+        sourcePlan.periodo_membresia_codigo,
+        normalizePlanCategory(sourcePlan.categoria_nivel, DEFAULT_PLAN_CATEGORY),
+        sourcePlan.beneficios,
+      ]
+    )
+    : await client.query(
+      `
+        INSERT INTO public.membership_plans (
+          nombre_plan,
+          descripcion,
+          precio_hnl,
+          periodo_membresia_codigo,
+          beneficios,
+          activo,
+          updated_at
+        )
+        VALUES ($1, $2, $3::numeric, $4, $5::jsonb, TRUE, NOW())
+        RETURNING id_plan
+      `,
+      [
+        sourcePlan.nombre_plan,
+        sourcePlan.descripcion ?? null,
+        sourcePrice,
+        sourcePlan.periodo_membresia_codigo,
+        sourcePlan.beneficios,
+      ]
+    );
   const clonedPlanId = cloneResult.rows[0].id_plan;
 
   // AM: Reasigna la oferta de la sucursal al clon para aislar metadata y beneficios.
@@ -672,6 +851,37 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     return sendError(reply, 500, "Falta aplicar migracion de PLANES multi-sucursal en la base de datos", {
       code: "CATALOG_PLAN_MIGRATION_REQUIRED",
       details: error.message,
+      requestId: request.id,
+    });
+  }
+
+  if (error?.code === "42703" && String(error?.message || "").includes("categoria_nivel")) {
+    return sendError(reply, 500, "Falta aplicar migracion de categoria de planes en la base de datos", {
+      code: "CATALOG_PLAN_CATEGORY_MIGRATION_REQUIRED",
+      details: error.message,
+      requestId: request.id,
+    });
+  }
+
+  if (error?.code === "23505") {
+    const constraint = String(error?.constraint || "").trim();
+    if (constraint === "uq_membership_plans_nombre_ci") {
+      return sendError(reply, 409, "Ya existe un plan con ese nombre", {
+        code: "CATALOG_PLAN_DUPLICATE",
+        details: error.detail || error.message,
+        requestId: request.id,
+      });
+    }
+    if (constraint === "uq_mps_scope") {
+      return sendError(reply, 409, "Ya existe una oferta para ese plan en la sucursal seleccionada", {
+        code: "CATALOG_PLAN_SCOPE_DUPLICATE",
+        details: error.detail || error.message,
+        requestId: request.id,
+      });
+    }
+    return sendError(reply, 409, "Conflicto de unicidad al guardar el plan", {
+      code: "CATALOG_PLAN_CONFLICT",
+      details: error.detail || error.message,
       requestId: request.id,
     });
   }
@@ -721,8 +931,10 @@ export default async function adminPlansRoutes(app) {
       const client = await app.db.connect();
 
       try {
+        const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
         const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
-        const { rows } = await client.query(LIST_PLANS_SQL, [branchId]);
+        const listSql = supportsPlanCategoryColumn ? LIST_PLANS_SQL : LIST_PLANS_SQL_LEGACY;
+        const { rows } = await client.query(listSql, [branchId]);
 
         return sendOk(reply, {
           id_sucursal: branchId,
@@ -771,11 +983,13 @@ export default async function adminPlansRoutes(app) {
       const client = await app.db.connect();
 
       try {
+        const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const nombrePlan = normalizeRequiredText(request.body.nombre_plan);
         const descripcion = normalizeOptionalText(request.body.descripcion);
         const precioHnl = Number(request.body.precio_hnl);
         const periodCode = normalizePeriodCode(request.body.periodo_membresia_codigo, "mensual");
+        const categoriaNivel = normalizePlanCategory(request.body.categoria_nivel, DEFAULT_PLAN_CATEGORY);
         const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
         const normalizedBenefits = normalizePlanBenefits(request.body.beneficios);
@@ -792,22 +1006,40 @@ export default async function adminPlansRoutes(app) {
         await client.query("BEGIN");
 
         const canonicalBenefits = await ensurePlanServiceBenefitsAccessible(client, normalizedBenefits, branchId);
-        const insertResult = await client.query(
-          `
-            INSERT INTO public.membership_plans (
-              nombre_plan,
-              descripcion,
-              precio_hnl,
-              periodo_membresia_codigo,
-              beneficios,
-              activo,
-              updated_at
-            )
-            VALUES ($1, $2, $3::numeric, $4, $5::jsonb, TRUE, NOW())
-            RETURNING id_plan
-          `,
-          [nombrePlan, descripcion ?? null, precioHnl, periodCode, serializePlanBenefits(canonicalBenefits)]
-        );
+        const insertResult = supportsPlanCategoryColumn
+          ? await client.query(
+            `
+              INSERT INTO public.membership_plans (
+                nombre_plan,
+                descripcion,
+                precio_hnl,
+                periodo_membresia_codigo,
+                categoria_nivel,
+                beneficios,
+                activo,
+                updated_at
+              )
+              VALUES ($1, $2, $3::numeric, $4, $5::smallint, $6::jsonb, TRUE, NOW())
+              RETURNING id_plan
+            `,
+            [nombrePlan, descripcion ?? null, precioHnl, periodCode, categoriaNivel, serializePlanBenefits(canonicalBenefits)]
+          )
+          : await client.query(
+            `
+              INSERT INTO public.membership_plans (
+                nombre_plan,
+                descripcion,
+                precio_hnl,
+                periodo_membresia_codigo,
+                beneficios,
+                activo,
+                updated_at
+              )
+              VALUES ($1, $2, $3::numeric, $4, $5::jsonb, TRUE, NOW())
+              RETURNING id_plan
+            `,
+            [nombrePlan, descripcion ?? null, precioHnl, periodCode, serializePlanBenefits(canonicalBenefits)]
+          );
 
         const idPlan = insertResult.rows[0].id_plan;
         await upsertPlanBranchOffer(client, idPlan, branchId, {
@@ -817,7 +1049,10 @@ export default async function adminPlansRoutes(app) {
           ordenVisual,
         });
 
-        const finalResult = await client.query(GET_PLAN_SCOPED_SQL, [idPlan, branchId]);
+        const finalResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
+          [idPlan, branchId]
+        );
         await client.query("COMMIT");
 
         return sendOk(reply, mapPlanRow(finalResult.rows[0]), {
@@ -877,10 +1112,14 @@ export default async function adminPlansRoutes(app) {
       const client = await app.db.connect();
 
       try {
+        const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
-        const baseResult = await client.query(GET_PLAN_BASE_SQL, [request.params.id]);
+        const baseResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_BASE_SQL : GET_PLAN_BASE_SQL_LEGACY,
+          [request.params.id]
+        );
         const basePlan = baseResult.rows[0];
         if (!basePlan) {
           throw new AppError(404, "El plan solicitado no existe", {
@@ -888,24 +1127,31 @@ export default async function adminPlansRoutes(app) {
           });
         }
 
-        const scopedResult = await client.query(GET_PLAN_SCOPED_SQL, [request.params.id, branchId]);
+        const scopedResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
+          [request.params.id, branchId]
+        );
         const scopedPlan = scopedResult.rows[0] ?? null;
 
         const shouldMutatePlanBase =
           request.body.nombre_plan !== undefined ||
           request.body.descripcion !== undefined ||
           request.body.periodo_membresia_codigo !== undefined ||
+          (supportsPlanCategoryColumn && request.body.categoria_nivel !== undefined) ||
           request.body.beneficios !== undefined;
         let targetPlanId = request.params.id;
 
         if (shouldMutatePlanBase) {
           const planSharedAcrossBranches = await hasPlanOffersInOtherBranches(client, request.params.id, branchId);
           if (planSharedAcrossBranches) {
-            targetPlanId = await clonePlanForBranch(client, basePlan, branchId);
+            targetPlanId = await clonePlanForBranch(client, basePlan, branchId, supportsPlanCategoryColumn);
           }
         }
 
-        const targetBaseResult = await client.query(GET_PLAN_BASE_SQL, [targetPlanId]);
+        const targetBaseResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_BASE_SQL : GET_PLAN_BASE_SQL_LEGACY,
+          [targetPlanId]
+        );
         const targetBasePlan = targetBaseResult.rows[0];
         if (!targetBasePlan) {
           throw new AppError(404, "El plan solicitado no existe", {
@@ -931,6 +1177,13 @@ export default async function adminPlansRoutes(app) {
           request.body.periodo_membresia_codigo !== undefined
             ? normalizePeriodCode(request.body.periodo_membresia_codigo)
             : normalizePeriodCode(targetBasePlan.periodo_membresia_codigo);
+        const categoriaNivel = supportsPlanCategoryColumn
+          ? (
+            request.body.categoria_nivel !== undefined
+              ? normalizePlanCategory(request.body.categoria_nivel, DEFAULT_PLAN_CATEGORY)
+              : normalizePlanCategory(targetBasePlan.categoria_nivel, DEFAULT_PLAN_CATEGORY)
+          )
+          : DEFAULT_PLAN_CATEGORY;
         const visiblePublico =
           request.body.visible_publico !== undefined
             ? normalizeBoolean(request.body.visible_publico, true)
@@ -956,26 +1209,51 @@ export default async function adminPlansRoutes(app) {
         const canonicalBenefits = await ensurePlanServiceBenefitsAccessible(client, sourceBenefits, branchId);
 
         if (shouldMutatePlanBase) {
-          await client.query(
-            `
-              UPDATE public.membership_plans
-              SET
-                nombre_plan = $2,
-                descripcion = $3,
-                periodo_membresia_codigo = $4,
-                beneficios = $5::jsonb,
-                activo = TRUE,
-                updated_at = NOW()
-              WHERE id_plan = $1::uuid
-            `,
-            [
-              targetPlanId,
-              nombrePlan,
-              descripcion ?? null,
-              periodCode,
-              serializePlanBenefits(canonicalBenefits),
-            ]
-          );
+          if (supportsPlanCategoryColumn) {
+            await client.query(
+              `
+                UPDATE public.membership_plans
+                SET
+                  nombre_plan = $2,
+                  descripcion = $3,
+                  periodo_membresia_codigo = $4,
+                  categoria_nivel = $5::smallint,
+                  beneficios = $6::jsonb,
+                  activo = TRUE,
+                  updated_at = NOW()
+                WHERE id_plan = $1::uuid
+              `,
+              [
+                targetPlanId,
+                nombrePlan,
+                descripcion ?? null,
+                periodCode,
+                categoriaNivel,
+                serializePlanBenefits(canonicalBenefits),
+              ]
+            );
+          } else {
+            await client.query(
+              `
+                UPDATE public.membership_plans
+                SET
+                  nombre_plan = $2,
+                  descripcion = $3,
+                  periodo_membresia_codigo = $4,
+                  beneficios = $5::jsonb,
+                  activo = TRUE,
+                  updated_at = NOW()
+                WHERE id_plan = $1::uuid
+              `,
+              [
+                targetPlanId,
+                nombrePlan,
+                descripcion ?? null,
+                periodCode,
+                serializePlanBenefits(canonicalBenefits),
+              ]
+            );
+          }
         }
 
         await upsertPlanBranchOffer(client, targetPlanId, branchId, {
@@ -985,7 +1263,10 @@ export default async function adminPlansRoutes(app) {
           ordenVisual,
         });
 
-        const finalResult = await client.query(GET_PLAN_SCOPED_SQL, [targetPlanId, branchId]);
+        const finalResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
+          [targetPlanId, branchId]
+        );
         await client.query("COMMIT");
 
         return sendOk(reply, mapPlanRow(finalResult.rows[0]), { requestId: request.id });
@@ -1042,10 +1323,14 @@ export default async function adminPlansRoutes(app) {
       const client = await app.db.connect();
 
       try {
+        const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
-        const baseResult = await client.query(GET_PLAN_BASE_SQL, [request.params.id]);
+        const baseResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_BASE_SQL : GET_PLAN_BASE_SQL_LEGACY,
+          [request.params.id]
+        );
         const basePlan = baseResult.rows[0];
         if (!basePlan) {
           throw new AppError(404, "El plan solicitado no existe", {
@@ -1053,7 +1338,10 @@ export default async function adminPlansRoutes(app) {
           });
         }
 
-        const scopedResult = await client.query(GET_PLAN_SCOPED_SQL, [request.params.id, branchId]);
+        const scopedResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
+          [request.params.id, branchId]
+        );
         const scopedPlan = scopedResult.rows[0] ?? null;
         const nextActivo = Boolean(request.body.activo);
         const baseBenefits = parseStoredBenefits(basePlan.beneficios);
@@ -1081,7 +1369,10 @@ export default async function adminPlansRoutes(app) {
           [request.params.id]
         );
 
-        const finalResult = await client.query(GET_PLAN_SCOPED_SQL, [request.params.id, branchId]);
+        const finalResult = await client.query(
+          supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
+          [request.params.id, branchId]
+        );
         await client.query("COMMIT");
 
         return sendOk(reply, mapPlanRow(finalResult.rows[0]), { requestId: request.id });

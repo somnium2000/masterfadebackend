@@ -43,7 +43,9 @@ const serviceBodySchema = {
     duracion_min: { type: "integer", minimum: 1 },
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
+    grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
     orden_visual: { type: "integer", minimum: 0 },
+    visible_publico: { type: "boolean" },
     servicio_informativo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
@@ -59,7 +61,9 @@ const servicePatchSchema = {
     duracion_min: { type: "integer", minimum: 1 },
     buffer_min: { type: "integer", minimum: 0 },
     precio_hnl: { type: "number", minimum: 0 },
+    grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
     orden_visual: { type: "integer", minimum: 0 },
+    visible_publico: { type: "boolean" },
     servicio_informativo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
@@ -275,7 +279,6 @@ const LIST_SERVICES_SQL = `
     FROM public.servicios_tarifas st
     WHERE ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
       AND st.id_empleado IS NULL
-      AND st.deleted_at IS NULL
   )
   SELECT
     s.id_servicio,
@@ -356,7 +359,6 @@ const GET_SERVICE_SQL = `
     FROM public.servicios_tarifas st
     WHERE ($2::uuid IS NULL OR st.id_sucursal = $2::uuid)
       AND st.id_empleado IS NULL
-      AND st.deleted_at IS NULL
   )
   SELECT
     s.id_servicio,
@@ -613,12 +615,34 @@ const LIST_PACKAGES_SQL = `
   LEFT JOIN public.servicios s
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
-   AND s.activo IS TRUE
   WHERE p.deleted_at IS NULL
   GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico, po.orden_visual
   HAVING COUNT(pd.id_servicio) > 0
-     AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
   ORDER BY COALESCE(po.orden_visual, 100) ASC, p.nombre_paquete ASC, po.id_sucursal ASC
+`;
+
+const SERVICE_LINKED_MEMBERSHIP_PLAN_SQL = `
+  -- AM: Bloquea inactivacion si el servicio esta ligado a beneficios de algun plan de membresia.
+  SELECT
+    mp.id_plan,
+    mp.nombre_plan
+  FROM public.membership_plans mp
+  WHERE EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(
+      CASE
+        WHEN mp.beneficios IS NULL THEN '[]'::jsonb
+        WHEN jsonb_typeof(mp.beneficios) = 'array' THEN mp.beneficios
+        -- AM: Compatibilidad con formato { version, items } usado por planes operativos.
+        WHEN jsonb_typeof(mp.beneficios) = 'object' AND jsonb_typeof(mp.beneficios->'items') = 'array' THEN mp.beneficios->'items'
+        WHEN jsonb_typeof(mp.beneficios) = 'object' THEN jsonb_build_array(mp.beneficios)
+        ELSE '[]'::jsonb
+      END
+    ) AS beneficio
+    WHERE LOWER(COALESCE(beneficio->>'tipo', 'servicio')) = 'servicio'
+      AND (beneficio->>'id_servicio') = $1::text
+  )
+  LIMIT 1
 `;
 
 const GET_PACKAGE_BASE_SQL = `
@@ -1367,12 +1391,24 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
 }
 
 async function inactivateServiceByBranch(client, idServicio, idSucursal) {
+  const linkedPlanResult = await client.query(SERVICE_LINKED_MEMBERSHIP_PLAN_SQL, [idServicio]);
+  const linkedPlan = linkedPlanResult.rows[0] ?? null;
+  if (linkedPlan) {
+    // AM: Regla solicitada por negocio: no permitir inactivar servicios asociados a planes.
+    throw new AppError(409, "No se puede inactivar este servicio porque está ligado a un plan de membresía.", {
+      code: "CATALOG_SERVICE_LINKED_MEMBERSHIP_PLAN",
+      details: {
+        id_plan: linkedPlan.id_plan,
+        nombre_plan: linkedPlan.nombre_plan ?? null,
+      },
+    });
+  }
+
   const tariffUpdate = await client.query(
     `
       UPDATE public.servicios_tarifas
       SET
         activo = FALSE,
-        deleted_at = COALESCE(deleted_at, NOW()),
         updated_at = NOW()
       WHERE id_servicio = $1::uuid
         AND id_sucursal = $2::uuid
@@ -1726,6 +1762,8 @@ export default async function adminCatalogRoutes(app) {
         const bufferMin = LEGACY_SERVICE_BUFFER_FALLBACK;
         const precioHnl = Number(request.body.precio_hnl);
         const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
+        const grupoCatalogo = normalizeServiceGroup(request.body.grupo_catalogo, "barberia");
+        const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const servicioInformativo = normalizeBoolean(request.body.servicio_informativo, false);
 
         await client.query("BEGIN");
@@ -1740,13 +1778,15 @@ export default async function adminCatalogRoutes(app) {
                 nombre_servicio,
                 descripcion,
                 duracion_min,
+                grupo_catalogo,
                 orden_visual,
+                visible_publico,
                 activo
               )
-              VALUES ($1, $2, $3::int, $4::int, TRUE)
+              VALUES ($1, $2, $3::int, $4, $5::int, $6::boolean, TRUE)
               RETURNING id_servicio
             `,
-            [nombreServicio, descripcion ?? null, duracionMin, ordenVisual]
+            [nombreServicio, descripcion ?? null, duracionMin, grupoCatalogo, ordenVisual, visiblePublico]
           );
           idServicio = insertResult.rows[0].id_servicio;
         } catch (insertError) {
@@ -1848,13 +1888,25 @@ export default async function adminCatalogRoutes(app) {
           request.body.orden_visual !== undefined
             ? normalizeOrderVisual(request.body.orden_visual, 100)
             : undefined;
+        const requestedGrupoCatalogo =
+          request.body.grupo_catalogo !== undefined
+            ? normalizeServiceGroup(request.body.grupo_catalogo, "barberia")
+            : undefined;
+        const requestedVisiblePublico =
+          request.body.visible_publico !== undefined
+            ? normalizeBoolean(request.body.visible_publico, true)
+            : undefined;
         const currentNombreServicio = normalizeRequiredText(current.nombre_servicio);
         const currentDescripcion = normalizeOptionalText(current.descripcion);
         const currentOrdenVisual = normalizeOrderVisual(current.orden_visual, 100);
+        const currentGrupoCatalogo = normalizeServiceGroup(current.grupo_catalogo, "barberia");
+        const currentVisiblePublico = normalizeBoolean(current.visible_publico, true);
         const shouldMutateServiceBase =
           (requestedNombreServicio !== undefined && requestedNombreServicio !== currentNombreServicio) ||
           (requestedDescripcion !== undefined && requestedDescripcion !== currentDescripcion) ||
-          (requestedOrdenVisual !== undefined && requestedOrdenVisual !== currentOrdenVisual);
+          (requestedOrdenVisual !== undefined && requestedOrdenVisual !== currentOrdenVisual) ||
+          (requestedGrupoCatalogo !== undefined && requestedGrupoCatalogo !== currentGrupoCatalogo) ||
+          (requestedVisiblePublico !== undefined && requestedVisiblePublico !== currentVisiblePublico);
         let targetServiceId = request.params.id;
 
         if (shouldMutateServiceBase) {
@@ -1888,6 +1940,14 @@ export default async function adminCatalogRoutes(app) {
           requestedOrdenVisual !== undefined
             ? requestedOrdenVisual
             : normalizeOrderVisual(targetBase.orden_visual, 100);
+        const grupoCatalogo =
+          requestedGrupoCatalogo !== undefined
+            ? requestedGrupoCatalogo
+            : normalizeServiceGroup(targetBase.grupo_catalogo, "barberia");
+        const visiblePublico =
+          requestedVisiblePublico !== undefined
+            ? requestedVisiblePublico
+            : normalizeBoolean(targetBase.visible_publico, true);
         await ensureUniqueServiceNameByBranch(client, targetServiceId, branchId, nombreServicio);
 
         const duracionMin =
@@ -1912,13 +1972,15 @@ export default async function adminCatalogRoutes(app) {
               SET
                 nombre_servicio = $2,
                 descripcion = $3,
-                orden_visual = $4::int,
+                grupo_catalogo = $4,
+                orden_visual = $5::int,
+                visible_publico = $6::boolean,
                 activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
             `,
-            [targetServiceId, nombreServicio, descripcion ?? null, ordenVisual]
+            [targetServiceId, nombreServicio, descripcion ?? null, grupoCatalogo, ordenVisual, visiblePublico]
           );
         } else {
           await client.query(
