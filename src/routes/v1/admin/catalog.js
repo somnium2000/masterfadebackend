@@ -2,6 +2,7 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const SUPER_ADMIN_ONLY = ["super_admin"];
 const requestIdSchema = { type: "string" };
 const SERVICE_GROUPS = ["barberia", "otros"];
 const LEGACY_SERVICE_BUFFER_FALLBACK = 5;
@@ -144,6 +145,19 @@ const serviceResponseSchema = {
     servicio_informativo: { type: "boolean" },
     orden_visual: { type: "integer" },
     agendable_barbero: { type: "boolean" },
+    barberos_ofrecen_total: { type: "integer" },
+    barberos_ofrecen: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id_empleado: { type: "string", format: "uuid" },
+          nombre_completo: { type: "string" },
+        },
+        required: ["id_empleado", "nombre_completo"],
+        additionalProperties: false,
+      },
+    },
   },
   required: [
     "id_servicio",
@@ -161,7 +175,46 @@ const serviceResponseSchema = {
     "servicio_informativo",
     "orden_visual",
     "agendable_barbero",
+    "barberos_ofrecen_total",
+    "barberos_ofrecen",
   ],
+  additionalProperties: false,
+};
+
+const serviceBarberAssignmentsBodySchema = {
+  type: "object",
+  properties: {
+    id_sucursal: { type: "string", format: "uuid" },
+    id_empleados: {
+      type: "array",
+      items: { type: "string", format: "uuid" },
+    },
+  },
+  required: ["id_sucursal", "id_empleados"],
+  additionalProperties: false,
+};
+
+const serviceBarberAssignmentItemSchema = {
+  type: "object",
+  properties: {
+    id_empleado: { type: "string", format: "uuid" },
+    nombre_completo: { type: "string" },
+    telefono_principal: { type: ["string", "null"] },
+    ofrece_servicio: { type: "boolean" },
+    tarifa_activa: { type: "boolean" },
+  },
+  required: ["id_empleado", "nombre_completo", "telefono_principal", "ofrece_servicio", "tarifa_activa"],
+  additionalProperties: false,
+};
+
+const serviceBarberAssignmentsResponseSchema = {
+  type: "object",
+  properties: {
+    id_servicio: { type: "string", format: "uuid" },
+    id_sucursal: { type: "string", format: "uuid" },
+    barberos: { type: "array", items: serviceBarberAssignmentItemSchema },
+  },
+  required: ["id_servicio", "id_sucursal", "barberos"],
   additionalProperties: false,
 };
 
@@ -242,7 +295,49 @@ const LIST_SERVICES_SQL = `
     st.id_sucursal,
     st.precio_hnl,
     COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
-    COALESCE(st.activo, FALSE) AS tarifa_activa
+    COALESCE(st.activo, FALSE) AS tarifa_activa,
+    COALESCE((
+      SELECT COUNT(DISTINCT stb.id_empleado)::int
+      FROM public.servicios_tarifas stb
+      JOIN public.empleados eb
+        ON eb.id_empleado = stb.id_empleado
+      WHERE stb.id_servicio = s.id_servicio
+        AND stb.id_sucursal = st.id_sucursal
+        AND stb.id_empleado IS NOT NULL
+        AND stb.deleted_at IS NULL
+        AND stb.activo IS TRUE
+        AND eb.deleted_at IS NULL
+        AND COALESCE(eb.estado, TRUE) IS TRUE
+        AND eb.es_barbero IS TRUE
+    ), 0) AS barberos_ofrecen_total,
+    COALESCE((
+      SELECT json_agg(
+        json_build_object(
+          'id_empleado', assigned.id_empleado,
+          'nombre_completo', assigned.nombre_completo
+        )
+        ORDER BY assigned.nombre_completo ASC
+      )
+      FROM (
+        SELECT DISTINCT ON (stb.id_empleado)
+          stb.id_empleado,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pb.nombres, pb.apellidos)), ''), 'Barbero') AS nombre_completo
+        FROM public.servicios_tarifas stb
+        JOIN public.empleados eb
+          ON eb.id_empleado = stb.id_empleado
+        JOIN public.personas pb
+          ON pb.id_persona = eb.id_persona
+        WHERE stb.id_servicio = s.id_servicio
+          AND stb.id_sucursal = st.id_sucursal
+          AND stb.id_empleado IS NOT NULL
+          AND stb.deleted_at IS NULL
+          AND stb.activo IS TRUE
+          AND eb.deleted_at IS NULL
+          AND COALESCE(eb.estado, TRUE) IS TRUE
+          AND eb.es_barbero IS TRUE
+        ORDER BY stb.id_empleado, stb.vigente_desde DESC, stb.updated_at DESC, stb.id_tarifa DESC
+      ) assigned
+    ), '[]'::json) AS barberos_ofrecen
   FROM public.servicios s
   LEFT JOIN scoped_tariffs st
     ON st.id_servicio = s.id_servicio
@@ -280,7 +375,49 @@ const GET_SERVICE_SQL = `
     st.id_sucursal,
     st.precio_hnl,
     COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
-    COALESCE(st.activo, FALSE) AS tarifa_activa
+    COALESCE(st.activo, FALSE) AS tarifa_activa,
+    COALESCE((
+      SELECT COUNT(DISTINCT stb.id_empleado)::int
+      FROM public.servicios_tarifas stb
+      JOIN public.empleados eb
+        ON eb.id_empleado = stb.id_empleado
+      WHERE stb.id_servicio = s.id_servicio
+        AND stb.id_sucursal = st.id_sucursal
+        AND stb.id_empleado IS NOT NULL
+        AND stb.deleted_at IS NULL
+        AND stb.activo IS TRUE
+        AND eb.deleted_at IS NULL
+        AND COALESCE(eb.estado, TRUE) IS TRUE
+        AND eb.es_barbero IS TRUE
+    ), 0) AS barberos_ofrecen_total,
+    COALESCE((
+      SELECT json_agg(
+        json_build_object(
+          'id_empleado', assigned.id_empleado,
+          'nombre_completo', assigned.nombre_completo
+        )
+        ORDER BY assigned.nombre_completo ASC
+      )
+      FROM (
+        SELECT DISTINCT ON (stb.id_empleado)
+          stb.id_empleado,
+          COALESCE(NULLIF(TRIM(CONCAT_WS(' ', pb.nombres, pb.apellidos)), ''), 'Barbero') AS nombre_completo
+        FROM public.servicios_tarifas stb
+        JOIN public.empleados eb
+          ON eb.id_empleado = stb.id_empleado
+        JOIN public.personas pb
+          ON pb.id_persona = eb.id_persona
+        WHERE stb.id_servicio = s.id_servicio
+          AND stb.id_sucursal = st.id_sucursal
+          AND stb.id_empleado IS NOT NULL
+          AND stb.deleted_at IS NULL
+          AND stb.activo IS TRUE
+          AND eb.deleted_at IS NULL
+          AND COALESCE(eb.estado, TRUE) IS TRUE
+          AND eb.es_barbero IS TRUE
+        ORDER BY stb.id_empleado, stb.vigente_desde DESC, stb.updated_at DESC, stb.id_tarifa DESC
+      ) assigned
+    ), '[]'::json) AS barberos_ofrecen
   FROM public.servicios s
   LEFT JOIN scoped_tariffs st
     ON st.id_servicio = s.id_servicio
@@ -357,6 +494,69 @@ const ACTIVE_BRANCHES_SQL = `
   WHERE s.deleted_at IS NULL
     AND s.estado IS TRUE
   ORDER BY s.nombre_sucursal ASC
+`;
+
+const LIST_BRANCH_BARBERS_SQL = `
+  SELECT
+    e.id_empleado,
+    COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombres, p.apellidos)), ''), 'Barbero') AS nombre_completo,
+    NULLIF(TRIM(p.telefono_principal), '') AS telefono_principal
+  FROM public.empleados e
+  JOIN public.personas p
+    ON p.id_persona = e.id_persona
+  WHERE e.id_sucursal = $1::uuid
+    AND e.deleted_at IS NULL
+    AND COALESCE(e.estado, TRUE) IS TRUE
+    AND e.es_barbero IS TRUE
+  ORDER BY p.nombres ASC, p.apellidos ASC, e.id_empleado ASC
+`;
+
+const LIST_SERVICE_BARBER_ASSIGNMENTS_SQL = `
+  SELECT
+    e.id_empleado,
+    COALESCE(NULLIF(TRIM(CONCAT_WS(' ', p.nombres, p.apellidos)), ''), 'Barbero') AS nombre_completo,
+    NULLIF(TRIM(p.telefono_principal), '') AS telefono_principal,
+    COALESCE(st_active.id_tarifa IS NOT NULL, FALSE) AS ofrece_servicio,
+    COALESCE(st_active.activo, FALSE) AS tarifa_activa
+  FROM public.empleados e
+  JOIN public.personas p
+    ON p.id_persona = e.id_persona
+  LEFT JOIN LATERAL (
+    SELECT
+      st.id_tarifa,
+      st.activo
+    FROM public.servicios_tarifas st
+    WHERE st.id_servicio = $1::uuid
+      AND st.id_sucursal = $2::uuid
+      AND st.id_empleado = e.id_empleado
+      AND st.deleted_at IS NULL
+      AND st.activo IS TRUE
+    ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
+    LIMIT 1
+  ) st_active ON TRUE
+  WHERE e.id_sucursal = $2::uuid
+    AND e.deleted_at IS NULL
+    AND COALESCE(e.estado, TRUE) IS TRUE
+    AND e.es_barbero IS TRUE
+  ORDER BY p.nombres ASC, p.apellidos ASC, e.id_empleado ASC
+`;
+
+const GET_LATEST_EMPLOYEE_SERVICE_TARIFF_SQL = `
+  SELECT
+    st.id_tarifa,
+    st.precio_hnl,
+    st.duracion_min,
+    st.buffer_min,
+    COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
+    st.activo,
+    st.deleted_at
+  FROM public.servicios_tarifas st
+  WHERE st.id_servicio = $1::uuid
+    AND st.id_sucursal = $2::uuid
+    AND st.id_empleado = $3::uuid
+  ORDER BY st.updated_at DESC, st.vigente_desde DESC, st.id_tarifa DESC
+  LIMIT 1
+  FOR UPDATE
 `;
 
 const LIST_PACKAGES_SQL = `
@@ -603,6 +803,23 @@ function mapAdminServiceRow(row) {
     orden_visual: ordenVisual,
     // AM: Campo legado conservado para compatibilidad de clientes frontend antiguos.
     agendable_barbero: agendable,
+    barberos_ofrecen_total: Number(row.barberos_ofrecen_total ?? 0),
+    barberos_ofrecen: Array.isArray(row.barberos_ofrecen)
+      ? row.barberos_ofrecen.map((barber) => ({
+        id_empleado: barber.id_empleado,
+        nombre_completo: barber.nombre_completo,
+      }))
+      : [],
+  };
+}
+
+function mapServiceBarberAssignmentRow(row) {
+  return {
+    id_empleado: row.id_empleado,
+    nombre_completo: row.nombre_completo,
+    telefono_principal: row.telefono_principal ?? null,
+    ofrece_servicio: Boolean(row.ofrece_servicio),
+    tarifa_activa: Boolean(row.tarifa_activa),
   };
 }
 
@@ -887,12 +1104,198 @@ async function cloneServiceForBranch(client, sourceService, branchId) {
         updated_at = NOW()
       WHERE id_servicio = $2::uuid
         AND id_sucursal = $3::uuid
-        AND id_empleado IS NULL
     `,
     [clonedServiceId, sourceService.id_servicio, branchId]
   );
 
   return clonedServiceId;
+}
+
+async function syncActiveEmployeeServiceTariffs(client, idServicio, idSucursal, options = {}) {
+  const parsedPrecio = options?.precioHnl === undefined || options?.precioHnl === null ? null : Number(options.precioHnl);
+  const parsedDuration =
+    options?.duracionMin === undefined || options?.duracionMin === null ? null : Number(options.duracionMin);
+  const parsedBuffer =
+    options?.bufferMin === undefined || options?.bufferMin === null ? null : Number(options.bufferMin);
+  const servicioInformativo =
+    options?.servicioInformativo === undefined || options?.servicioInformativo === null
+      ? null
+      : Boolean(options.servicioInformativo);
+
+  await client.query(
+    `
+      UPDATE public.servicios_tarifas
+      SET
+        precio_hnl = COALESCE($3::numeric, precio_hnl),
+        duracion_min = COALESCE($4::int, duracion_min),
+        buffer_min = COALESCE($5::int, buffer_min),
+        servicio_informativo = COALESCE($6::boolean, servicio_informativo),
+        updated_at = NOW()
+      WHERE id_servicio = $1::uuid
+        AND id_sucursal = $2::uuid
+        AND id_empleado IS NOT NULL
+        AND deleted_at IS NULL
+        AND activo IS TRUE
+    `,
+    [
+      idServicio,
+      idSucursal,
+      Number.isFinite(parsedPrecio) ? parsedPrecio : null,
+      Number.isFinite(parsedDuration) ? Math.max(1, Math.floor(parsedDuration)) : null,
+      Number.isFinite(parsedBuffer) ? Math.max(0, Math.floor(parsedBuffer)) : null,
+      servicioInformativo,
+    ]
+  );
+}
+
+async function upsertEmployeeServiceTariff(client, idServicio, idSucursal, idEmpleado, options = {}) {
+  const parsedPrecio = Number(options.precioHnl);
+  const parsedDuration = Number(options.duracionMin);
+  const parsedBuffer = Number(options.bufferMin ?? 0);
+  const servicioInformativo = Boolean(options.servicioInformativo);
+
+  const { rows } = await client.query(GET_LATEST_EMPLOYEE_SERVICE_TARIFF_SQL, [idServicio, idSucursal, idEmpleado]);
+  const currentTariff = rows[0];
+
+  if (currentTariff?.id_tarifa) {
+    await client.query(
+      `
+        UPDATE public.servicios_tarifas
+        SET
+          precio_hnl = $2::numeric,
+          duracion_min = $3::int,
+          buffer_min = $4::int,
+          servicio_informativo = $5::boolean,
+          activo = TRUE,
+          vigente_hasta = NULL,
+          deleted_at = NULL,
+          updated_at = NOW()
+        WHERE id_tarifa = $1::uuid
+      `,
+      [
+        currentTariff.id_tarifa,
+        parsedPrecio,
+        Math.max(1, Math.floor(parsedDuration)),
+        Math.max(0, Math.floor(parsedBuffer)),
+        servicioInformativo,
+      ]
+    );
+    return;
+  }
+
+  try {
+    await client.query(
+      `
+        INSERT INTO public.servicios_tarifas (
+          id_servicio,
+          id_sucursal,
+          id_empleado,
+          precio_hnl,
+          duracion_min,
+          buffer_min,
+          servicio_informativo,
+          vigente_desde,
+          activo
+        )
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::numeric, $5::int, $6::int, $7::boolean, CURRENT_DATE, TRUE)
+      `,
+      [
+        idServicio,
+        idSucursal,
+        idEmpleado,
+        parsedPrecio,
+        Math.max(1, Math.floor(parsedDuration)),
+        Math.max(0, Math.floor(parsedBuffer)),
+        servicioInformativo,
+      ]
+    );
+  } catch (error) {
+    if (error?.code !== "23505") {
+      throw error;
+    }
+
+    const fallback = await client.query(GET_LATEST_EMPLOYEE_SERVICE_TARIFF_SQL, [idServicio, idSucursal, idEmpleado]);
+    const candidate = fallback.rows[0];
+    if (!candidate?.id_tarifa) {
+      throw error;
+    }
+
+    await client.query(
+      `
+        UPDATE public.servicios_tarifas
+        SET
+          precio_hnl = $2::numeric,
+          duracion_min = $3::int,
+          buffer_min = $4::int,
+          servicio_informativo = $5::boolean,
+          activo = TRUE,
+          vigente_hasta = NULL,
+          deleted_at = NULL,
+          updated_at = NOW()
+        WHERE id_tarifa = $1::uuid
+      `,
+      [
+        candidate.id_tarifa,
+        parsedPrecio,
+        Math.max(1, Math.floor(parsedDuration)),
+        Math.max(0, Math.floor(parsedBuffer)),
+        servicioInformativo,
+      ]
+    );
+  }
+}
+
+async function syncServiceBarberAssignments(client, idServicio, idSucursal, idEmpleadoList = []) {
+  const requestedIds = [...new Set((Array.isArray(idEmpleadoList) ? idEmpleadoList : []).filter(Boolean))];
+  const serviceResult = await client.query(GET_SERVICE_SQL, [idServicio, idSucursal]);
+  const service = serviceResult.rows[0];
+
+  if (!service) {
+    throw new AppError(404, "El servicio solicitado no existe en la sucursal indicada", {
+      code: "CATALOG_SERVICE_NOT_FOUND",
+    });
+  }
+
+  const availableBarbersResult = await client.query(LIST_BRANCH_BARBERS_SQL, [idSucursal]);
+  const availableBarbers = availableBarbersResult.rows;
+  const availableIds = new Set(availableBarbers.map((row) => row.id_empleado));
+
+  const invalidBarberIds = requestedIds.filter((idEmpleado) => !availableIds.has(idEmpleado));
+  if (invalidBarberIds.length > 0) {
+    throw new AppError(422, "Uno o mas barberos no pertenecen a la sucursal indicada o no estan activos", {
+      code: "CATALOG_SERVICE_BARBER_OUT_OF_SCOPE",
+      details: { id_empleados: invalidBarberIds },
+    });
+  }
+
+  for (const idEmpleado of requestedIds) {
+    await upsertEmployeeServiceTariff(client, idServicio, idSucursal, idEmpleado, {
+      precioHnl: service.precio_hnl,
+      duracionMin: service.duracion_min,
+      bufferMin: service.buffer_min,
+      servicioInformativo: service.servicio_informativo,
+    });
+  }
+
+  await client.query(
+    `
+      UPDATE public.servicios_tarifas
+      SET
+        activo = FALSE,
+        deleted_at = COALESCE(deleted_at, NOW()),
+        vigente_hasta = COALESCE(vigente_hasta, CURRENT_DATE),
+        updated_at = NOW()
+      WHERE id_servicio = $1::uuid
+        AND id_sucursal = $2::uuid
+        AND id_empleado IS NOT NULL
+        AND deleted_at IS NULL
+        AND NOT (id_empleado = ANY($3::uuid[]))
+    `,
+    [idServicio, idSucursal, requestedIds]
+  );
+
+  const assignmentRows = await client.query(LIST_SERVICE_BARBER_ASSIGNMENTS_SQL, [idServicio, idSucursal]);
+  return assignmentRows.rows.map(mapServiceBarberAssignmentRow);
 }
 
 async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, options = {}) {
@@ -928,57 +1331,63 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
       `,
       [currentTariff.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
     );
-    return;
+  } else {
+    try {
+      await client.query(
+        `
+          INSERT INTO public.servicios_tarifas (
+            id_servicio,
+            id_sucursal,
+            id_empleado,
+            precio_hnl,
+            duracion_min,
+            buffer_min,
+            servicio_informativo,
+            vigente_desde,
+            activo
+          )
+          VALUES ($1::uuid, $2::uuid, NULL, $3::numeric, $4::int, $5::int, $6::boolean, CURRENT_DATE, TRUE)
+        `,
+        [idServicio, idSucursal, precioHnl, duracionMin, bufferMin, servicioInformativo ?? false]
+      );
+    } catch (error) {
+      if (error?.code !== "23505") {
+        throw error;
+      }
+
+      // AM: Fallback defensivo ante restricciones unicas legacy en servicios_tarifas.
+      const fallback = await client.query(GET_LATEST_ANY_SERVICE_TARIFF_SQL, [idServicio, idSucursal]);
+      const candidate = fallback.rows[0];
+
+      if (!candidate?.id_tarifa) {
+        throw error;
+      }
+
+      await client.query(
+        `
+          UPDATE public.servicios_tarifas
+          SET
+            precio_hnl = $2::numeric,
+            duracion_min = COALESCE($3::int, duracion_min),
+            buffer_min = COALESCE($4::int, buffer_min),
+            servicio_informativo = COALESCE($5::boolean, servicio_informativo),
+            activo = TRUE,
+            vigente_hasta = NULL,
+            deleted_at = NULL,
+            updated_at = NOW()
+          WHERE id_tarifa = $1::uuid
+        `,
+        [candidate.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
+      );
+    }
   }
 
-  try {
-    await client.query(
-      `
-        INSERT INTO public.servicios_tarifas (
-          id_servicio,
-          id_sucursal,
-          id_empleado,
-          precio_hnl,
-          duracion_min,
-          buffer_min,
-          servicio_informativo,
-          vigente_desde,
-          activo
-        )
-        VALUES ($1::uuid, $2::uuid, NULL, $3::numeric, $4::int, $5::int, $6::boolean, CURRENT_DATE, TRUE)
-      `,
-      [idServicio, idSucursal, precioHnl, duracionMin, bufferMin, servicioInformativo ?? false]
-    );
-  } catch (error) {
-    if (error?.code !== "23505") {
-      throw error;
-    }
-
-    // AM: Fallback defensivo ante restricciones unicas legacy en servicios_tarifas.
-    const fallback = await client.query(GET_LATEST_ANY_SERVICE_TARIFF_SQL, [idServicio, idSucursal]);
-    const candidate = fallback.rows[0];
-
-    if (!candidate?.id_tarifa) {
-      throw error;
-    }
-
-    await client.query(
-      `
-        UPDATE public.servicios_tarifas
-        SET
-          precio_hnl = $2::numeric,
-          duracion_min = COALESCE($3::int, duracion_min),
-          buffer_min = COALESCE($4::int, buffer_min),
-          servicio_informativo = COALESCE($5::boolean, servicio_informativo),
-          activo = TRUE,
-          vigente_hasta = NULL,
-          deleted_at = NULL,
-          updated_at = NOW()
-        WHERE id_tarifa = $1::uuid
-      `,
-      [candidate.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
-    );
-  }
+  await syncActiveEmployeeServiceTariffs(client, idServicio, idSucursal, {
+    precioHnl,
+    duracionMin,
+    bufferMin,
+    servicioInformativo,
+  });
 }
 
 async function inactivateServiceByBranch(client, idServicio, idSucursal) {
@@ -1004,6 +1413,21 @@ async function inactivateServiceByBranch(client, idServicio, idSucursal) {
       WHERE id_servicio = $1::uuid
         AND id_sucursal = $2::uuid
         AND id_empleado IS NULL
+        AND deleted_at IS NULL
+        AND activo IS TRUE
+    `,
+    [idServicio, idSucursal]
+  );
+
+  await client.query(
+    `
+      UPDATE public.servicios_tarifas
+      SET
+        activo = FALSE,
+        updated_at = NOW()
+      WHERE id_servicio = $1::uuid
+        AND id_sucursal = $2::uuid
+        AND id_empleado IS NOT NULL
         AND deleted_at IS NULL
         AND activo IS TRUE
     `,
@@ -1050,16 +1474,28 @@ async function activateServiceByBranch(client, idServicio, idSucursal, precioHnl
 
   if (precioHnl != null) {
     await upsertServiceTariff(client, idServicio, idSucursal, Number(precioHnl));
-    return;
-  }
+  } else {
+    const latestAnyTariffResult = await client.query(GET_LATEST_ANY_SERVICE_TARIFF_SQL, [idServicio, idSucursal]);
+    const latestAnyTariff = latestAnyTariffResult.rows[0];
 
-  const latestAnyTariffResult = await client.query(GET_LATEST_ANY_SERVICE_TARIFF_SQL, [idServicio, idSucursal]);
-  const latestAnyTariff = latestAnyTariffResult.rows[0];
+    if (!latestAnyTariff) {
+      throw new AppError(400, "No existe una tarifa previa para reactivar. Debes enviar precio_hnl.", {
+        code: "CATALOG_SERVICE_PRICE_REQUIRED",
+      });
+    }
 
-  if (!latestAnyTariff) {
-    throw new AppError(400, "No existe una tarifa previa para reactivar. Debes enviar precio_hnl.", {
-      code: "CATALOG_SERVICE_PRICE_REQUIRED",
-    });
+    await client.query(
+      `
+        UPDATE public.servicios_tarifas
+        SET
+          activo = TRUE,
+          deleted_at = NULL,
+          vigente_hasta = NULL,
+          updated_at = NOW()
+        WHERE id_tarifa = $1::uuid
+      `,
+      [latestAnyTariff.id_tarifa]
+    );
   }
 
   await client.query(
@@ -1067,12 +1503,15 @@ async function activateServiceByBranch(client, idServicio, idSucursal, precioHnl
       UPDATE public.servicios_tarifas
       SET
         activo = TRUE,
-        deleted_at = NULL,
         vigente_hasta = NULL,
         updated_at = NOW()
-      WHERE id_tarifa = $1::uuid
+      WHERE id_servicio = $1::uuid
+        AND id_sucursal = $2::uuid
+        AND id_empleado IS NOT NULL
+        AND deleted_at IS NULL
+        AND activo IS FALSE
     `,
-    [latestAnyTariff.id_tarifa]
+    [idServicio, idSucursal]
   );
 }
 
@@ -1672,6 +2111,140 @@ export default async function adminCatalogRoutes(app) {
           error,
           "No se pudo actualizar el estado del servicio del catalogo",
           "ADMIN_CATALOG_SERVICE_STATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.get(
+    "/servicios/:id/barberos",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ONLY),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        querystring: queryBranchSchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: serviceBarberAssignmentsResponseSchema,
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
+        const serviceResult = await client.query(GET_SERVICE_SQL, [request.params.id, branchId]);
+        if (!serviceResult.rows[0]) {
+          throw new AppError(404, "El servicio solicitado no existe en la sucursal indicada", {
+            code: "CATALOG_SERVICE_NOT_FOUND",
+          });
+        }
+
+        const assignmentsResult = await client.query(LIST_SERVICE_BARBER_ASSIGNMENTS_SQL, [request.params.id, branchId]);
+        return sendOk(reply, {
+          id_servicio: request.params.id,
+          id_sucursal: branchId,
+          barberos: assignmentsResult.rows.map(mapServiceBarberAssignmentRow),
+        });
+      } catch (error) {
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo consultar la asignacion de barberos del servicio",
+          "ADMIN_CATALOG_SERVICE_BARBERS_GET_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.put(
+    "/servicios/:id/barberos",
+    {
+      preHandler: app.requireRoles(SUPER_ADMIN_ONLY),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        body: serviceBarberAssignmentsBodySchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: serviceBarberAssignmentsResponseSchema,
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          422: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        await client.query("BEGIN");
+
+        const assignments = await syncServiceBarberAssignments(
+          client,
+          request.params.id,
+          branchId,
+          request.body?.id_empleados ?? []
+        );
+
+        await client.query("COMMIT");
+        return sendOk(reply, {
+          id_servicio: request.params.id,
+          id_sucursal: branchId,
+          barberos: assignments,
+        });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => { });
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo guardar la asignacion de barberos del servicio",
+          "ADMIN_CATALOG_SERVICE_BARBERS_SAVE_ERROR"
         );
       } finally {
         client.release();

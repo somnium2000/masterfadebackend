@@ -6,6 +6,7 @@ import {
   expireStaleAppointmentReservations,
   getHoldDurationMinutes,
   getSystemParameters,
+  insertAppointmentNotification,
   parseDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
@@ -13,12 +14,6 @@ import {
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
-const PUBLIC_TECHNICAL_CLIENT = {
-  nombre: "Cliente Publico",
-  telefono: "00000000",
-  email: "publico.booking@masterfade.local",
-};
-
 const errorResponseSchema = {
   type: "object",
   properties: {
@@ -58,6 +53,7 @@ const contextSchema = {
       properties: {
         hold_duracion_min: { type: "number" },
         no_show_min: { type: "number" },
+        agenda_buffer_global_min: { type: "number" },
         permitir_acompanantes: { type: "boolean" },
         pago_total_obligatorio: { type: "boolean" },
         simulacion_sin_pago: { type: "boolean" },
@@ -65,6 +61,7 @@ const contextSchema = {
       required: [
         "hold_duracion_min",
         "no_show_min",
+        "agenda_buffer_global_min",
         "permitir_acompanantes",
         "pago_total_obligatorio",
         "simulacion_sin_pago",
@@ -112,6 +109,7 @@ const holdBlockSchema = {
 function normalizePublicParams(paramsMap) {
   const hold = paramsMap?.hold_duracion_min?.valor_numero;
   const noShow = paramsMap?.no_show_min?.valor_numero;
+  const globalBuffer = paramsMap?.agenda_buffer_global_min?.valor_numero;
   const companions = paramsMap?.permitir_acompanantes?.valor_booleano;
   const fullPayment = paramsMap?.pago_total_obligatorio?.valor_booleano;
   const simulationNoPayment = paramsMap?.simulacion_sin_pago?.valor_booleano;
@@ -119,6 +117,7 @@ function normalizePublicParams(paramsMap) {
   return {
     hold_duracion_min: Number.isFinite(Number(hold)) ? Number(hold) : 5,
     no_show_min: Number.isFinite(Number(noShow)) ? Number(noShow) : 10,
+    agenda_buffer_global_min: Number.isFinite(Number(globalBuffer)) ? Number(globalBuffer) : 0,
     permitir_acompanantes: typeof companions === "boolean" ? companions : false,
     pago_total_obligatorio: typeof fullPayment === "boolean" ? fullPayment : true,
     simulacion_sin_pago: typeof simulationNoPayment === "boolean" ? simulationNoPayment : true,
@@ -254,39 +253,66 @@ function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
   return parsed;
 }
 
-function validateClientPayload(cliente) {
-  if (cliente == null) {
-    return { ...PUBLIC_TECHNICAL_CLIENT };
-  }
-
-  const nombre = String(cliente?.nombre || "").trim();
-  const telefono = normalizePhone(cliente?.telefono);
-  const email = normalizeEmail(cliente?.email);
+function validateClientPayload(titular) {
+  const nombre = String(titular?.nombre || "").trim();
+  const telefono = normalizePhone(titular?.telefono);
+  const email = normalizeEmail(titular?.email);
 
   if (!nombre) {
-    throw new AppError(400, "cliente.nombre es obligatorio", {
+    throw new AppError(400, "titular.nombre es obligatorio", {
       code: "PUBLIC_CITAS_CLIENT_NAME_REQUIRED",
     });
   }
-  if (telefono.length < 8) {
-    throw new AppError(400, "cliente.telefono es obligatorio y debe ser valido", {
-      code: "PUBLIC_CITAS_CLIENT_PHONE_REQUIRED",
+  if (!EMAIL_PATTERN.test(email)) {
+    throw new AppError(400, "titular.email es obligatorio y debe ser valido", {
+      code: "PUBLIC_CITAS_CLIENT_EMAIL_REQUIRED",
     });
   }
-  if (!EMAIL_PATTERN.test(email)) {
-    throw new AppError(400, "cliente.email es obligatorio y debe ser valido", {
-      code: "PUBLIC_CITAS_CLIENT_EMAIL_REQUIRED",
+  if (telefono && telefono.length < 8) {
+    throw new AppError(400, "titular.telefono debe ser valido", {
+      code: "PUBLIC_CITAS_CLIENT_PHONE_INVALID",
     });
   }
 
   return {
     nombre,
-    telefono,
+    telefono: telefono || null,
     email,
   };
 }
 
-function normalizeBlocksPayload(body) {
+function validateCompanionContactPayload(contacto, { alias, index }) {
+  const nombre = String(contacto?.nombre || "").trim();
+  const email = normalizeEmail(contacto?.email);
+  const telefono = normalizePhone(contacto?.telefono);
+
+  if (!nombre) {
+    throw new AppError(400, "El nombre del acompañante es obligatorio", {
+      code: "PUBLIC_CITAS_COMPANION_NAME_REQUIRED",
+      details: { alias, index },
+    });
+  }
+  if (email && !EMAIL_PATTERN.test(email)) {
+    throw new AppError(400, "El correo del acompañante debe ser valido", {
+      code: "PUBLIC_CITAS_COMPANION_EMAIL_INVALID",
+      details: { alias, index },
+    });
+  }
+  if (telefono && telefono.length < 8) {
+    throw new AppError(400, "El telefono del acompañante debe ser valido", {
+      code: "PUBLIC_CITAS_COMPANION_PHONE_INVALID",
+      details: { alias, index },
+    });
+  }
+
+  return {
+    nombre,
+    email: email || null,
+    telefono: telefono || null,
+  };
+}
+
+function normalizeBlocksPayload(body, titularPayload) {
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
   const legacyPayload = body?.fecha_inicio && Array.isArray(body?.servicios)
     ? [{
@@ -329,6 +355,13 @@ function normalizeBlocksPayload(body) {
       id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
       fecha_inicio: fechaInicio,
       serviceIds,
+      contacto: index === 0
+        ? {
+            nombre: titularPayload.nombre,
+            email: titularPayload.email,
+            telefono: titularPayload.telefono || null,
+          }
+        : validateCompanionContactPayload(item?.contacto, { alias, index }),
     };
   });
 }
@@ -363,7 +396,7 @@ async function resolveOrCreatePublicClient(client, payload) {
             updated_at = now()
         WHERE id_persona = $1::uuid
       `,
-      [existingResult.rows[0].id_persona, telefono]
+      [existingResult.rows[0].id_persona, telefono || ""]
     );
 
     return {
@@ -380,7 +413,7 @@ async function resolveOrCreatePublicClient(client, payload) {
       VALUES ($1, $2, $3)
       RETURNING id_persona
     `,
-    [nombres, apellidos, telefono]
+    [nombres, apellidos, telefono || null]
   );
 
   const idPersona = personaInsert.rows[0].id_persona;
@@ -475,9 +508,19 @@ export default async function publicCitasRoutes(app) {
       schema: {
         body: {
           type: "object",
-          required: ["id_sucursal"],
+          required: ["id_sucursal", "titular"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
+            titular: {
+              type: "object",
+              required: ["nombre", "email"],
+              properties: {
+                nombre: { type: "string", minLength: 1, maxLength: 120 },
+                email: { type: "string", format: "email", maxLength: 160 },
+                telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 20 }, { type: "null" }] },
+              },
+              additionalProperties: false,
+            },
             integrantes: {
               type: "array",
               minItems: 1,
@@ -488,6 +531,15 @@ export default async function publicCitasRoutes(app) {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  contacto: {
+                    type: "object",
+                    properties: {
+                      nombre: { type: "string", minLength: 1, maxLength: 120 },
+                      email: { anyOf: [{ type: "string", format: "email", maxLength: 160 }, { type: "null" }] },
+                      telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 20 }, { type: "null" }] },
+                    },
+                    additionalProperties: false,
+                  },
                   fecha_inicio: { type: "string", format: "date-time" },
                   servicios: {
                     type: "array",
@@ -517,16 +569,6 @@ export default async function publicCitasRoutes(app) {
                 },
                 additionalProperties: false,
               },
-            },
-            cliente: {
-              type: "object",
-              required: ["nombre", "telefono", "email"],
-              properties: {
-                nombre: { type: "string", minLength: 1, maxLength: 120 },
-                telefono: { type: "string", minLength: 8, maxLength: 20 },
-                email: { type: "string", format: "email", maxLength: 160 },
-              },
-              additionalProperties: false,
             },
             notas: { anyOf: [{ type: "string", maxLength: 500 }, { type: "null" }] },
           },
@@ -572,8 +614,8 @@ export default async function publicCitasRoutes(app) {
       try {
         await expireStaleAppointmentReservations(dbClient, { logger: request.log });
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
-        const clientePayload = validateClientPayload(request.body?.cliente);
-        const integrantes = normalizeBlocksPayload(request.body);
+        const titularPayload = validateClientPayload(request.body?.titular);
+        const integrantes = normalizeBlocksPayload(request.body, titularPayload);
         const publicParams = normalizePublicParams(await getSystemParameters(dbClient));
         const simulationNoPayment = Boolean(publicParams.simulacion_sin_pago);
 
@@ -582,7 +624,7 @@ export default async function publicCitasRoutes(app) {
         await dbClient.query("BEGIN");
 
         const clientProfile = await resolveOrCreatePublicClient(dbClient, {
-          ...clientePayload,
+          ...titularPayload,
           idSucursal: branch.id_sucursal,
         });
 
@@ -613,6 +655,7 @@ export default async function publicCitasRoutes(app) {
 
         const groupRecord = groupInsert.rows[0];
         const bloquesResponse = [];
+        const notificationTargets = new Map();
         let totalGrupo = 0;
 
         for (let index = 0; index < integrantes.length; index += 1) {
@@ -645,11 +688,14 @@ export default async function publicCitasRoutes(app) {
                 duracion_total_min,
                 buffer_total_min,
                 subtotal_servicios_hnl,
-                descuento_hnl,
-                total_pagar_hnl,
-                notas
-              )
-              VALUES (
+              descuento_hnl,
+              total_pagar_hnl,
+              contacto_nombre,
+              contacto_email,
+              contacto_telefono,
+              notas
+            )
+            VALUES (
                 $1::uuid,
                 $2::int,
                 $3,
@@ -667,7 +713,10 @@ export default async function publicCitasRoutes(app) {
                 $14::numeric,
                 0,
                 $15::numeric,
-                $16
+                $16,
+                $17,
+                $18,
+                $19
               )
               RETURNING id_cita
             `,
@@ -687,6 +736,9 @@ export default async function publicCitasRoutes(app) {
               selection.serviceSelection.buffer_total_min,
               selection.serviceSelection.monto_total_hnl,
               selection.serviceSelection.monto_total_hnl,
+              integrante.contacto?.nombre || integrante.alias,
+              integrante.contacto?.email || null,
+              integrante.contacto?.telefono || null,
               request.body?.notas ?? null,
             ]
           );
@@ -733,6 +785,14 @@ export default async function publicCitasRoutes(app) {
 
           totalGrupo += Number(selection.serviceSelection.monto_total_hnl || 0);
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
+          const targetEmail = normalizeEmail(integrante.contacto?.email);
+          if (targetEmail && EMAIL_PATTERN.test(targetEmail)) {
+            notificationTargets.set(targetEmail, {
+              email: targetEmail,
+              nombre: integrante.contacto?.nombre || integrante.alias || "Cliente",
+              id_cita: citaId,
+            });
+          }
 
           bloquesResponse.push({
             id_cita: citaId,
@@ -748,6 +808,43 @@ export default async function publicCitasRoutes(app) {
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
           });
+        }
+
+        const titularEmail = normalizeEmail(titularPayload.email);
+        if (titularEmail && EMAIL_PATTERN.test(titularEmail)) {
+          const firstCitaId = bloquesResponse[0]?.id_cita ?? null;
+          notificationTargets.set(titularEmail, {
+            email: titularEmail,
+            nombre: titularPayload.nombre,
+            id_cita: firstCitaId,
+          });
+        }
+
+        if (notificationTargets.size > 0) {
+          const resumenLineas = bloquesResponse.map(
+            (block) => `- ${block.alias}: ${block.fecha} ${block.hora} con ${block.nombre_barbero}`
+          );
+          const asunto = `Reserva confirmada #${groupRecord.id_grupo_cita}`;
+          for (const target of notificationTargets.values()) {
+            const cuerpo = [
+              `Hola ${target.nombre},`,
+              "",
+              "Tu cita fue registrada correctamente.",
+              `Grupo: ${groupRecord.id_grupo_cita}`,
+              `Total: HNL ${Number(totalGrupo || 0).toFixed(2)}`,
+              "",
+              "Detalle de bloques:",
+              ...resumenLineas,
+            ].join("\n");
+            await insertAppointmentNotification(dbClient, {
+              correo_destino: target.email,
+              asunto,
+              cuerpo,
+              evento: "cita_confirmada_publica",
+              id_cita: target.id_cita,
+              estado_notificacion_codigo: "pendiente",
+            });
+          }
         }
 
         await dbClient.query("COMMIT");
