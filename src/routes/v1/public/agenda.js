@@ -201,7 +201,12 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
         const fechaHasta = parseDateOnly(request.query?.fecha_hasta, "fecha_hasta");
-        const serviceSelection = await getServiceSelectionDetails(app.db, idSucursal, request.query?.servicios);
+        const serviceSelection = await getServiceSelectionDetails(
+          app.db,
+          idSucursal,
+          request.query?.servicios,
+          idBarbero
+        );
         const disponibilidad = await listAvailabilityByDateRange(
           app.db,
           idSucursal,
@@ -289,7 +294,12 @@ export default async function publicAgendaRoutes(app) {
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const fecha = parseDateOnly(request.query?.fecha, "fecha");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
-        const serviceSelection = await getServiceSelectionDetails(app.db, idSucursal, request.query?.servicios);
+        const serviceSelection = await getServiceSelectionDetails(
+          app.db,
+          idSucursal,
+          request.query?.servicios,
+          idBarbero
+        );
         const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
         if (idBarbero) {
