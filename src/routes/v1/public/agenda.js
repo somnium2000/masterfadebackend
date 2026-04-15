@@ -9,7 +9,7 @@ import {
   expireStaleAppointmentReservations,
   findFirstAvailableBarber,
   getBarberScheduleBounds,
-  getServiceSelectionDetails,
+  getBookingSelectionDetails,
   listAvailabilityByDateRange,
   listBarbersForBranch,
   mapBarbersForResponse,
@@ -157,10 +157,12 @@ export default async function publicAgendaRoutes(app) {
       schema: {
         querystring: {
           type: "object",
-          required: ["id_sucursal", "servicios", "fecha_desde", "fecha_hasta"],
+          required: ["id_sucursal", "fecha_desde", "fecha_hasta"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            servicios: { type: "string", minLength: 1 },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            servicios: { type: "string" },
+            id_paquete: { type: "string", format: "uuid" },
             fecha_desde: { type: "string", format: "date" },
             fecha_hasta: { type: "string", format: "date" },
             id_barbero: { type: "string", format: "uuid" },
@@ -201,12 +203,13 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
         const fechaHasta = parseDateOnly(request.query?.fecha_hasta, "fecha_hasta");
-        const serviceSelection = await getServiceSelectionDetails(
-          app.db,
-          idSucursal,
-          request.query?.servicios,
-          idBarbero
-        );
+        const serviceSelection = await getBookingSelectionDetails(app.db, {
+          id_sucursal: idSucursal,
+          selection_type: request.query?.selection_type,
+          servicios: request.query?.servicios,
+          id_paquete: request.query?.id_paquete ?? null,
+          id_barbero: idBarbero,
+        });
         const disponibilidad = await listAvailabilityByDateRange(
           app.db,
           idSucursal,
@@ -233,10 +236,12 @@ export default async function publicAgendaRoutes(app) {
       schema: {
         querystring: {
           type: "object",
-          required: ["id_sucursal", "servicios", "fecha"],
+          required: ["id_sucursal", "fecha"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            servicios: { type: "string", minLength: 1 },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            servicios: { type: "string" },
+            id_paquete: { type: "string", format: "uuid" },
             fecha: { type: "string", format: "date" },
             id_barbero: { type: "string", format: "uuid" },
           },
@@ -294,12 +299,13 @@ export default async function publicAgendaRoutes(app) {
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const fecha = parseDateOnly(request.query?.fecha, "fecha");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
-        const serviceSelection = await getServiceSelectionDetails(
-          app.db,
-          idSucursal,
-          request.query?.servicios,
-          idBarbero
-        );
+        const serviceSelection = await getBookingSelectionDetails(app.db, {
+          id_sucursal: idSucursal,
+          selection_type: request.query?.selection_type,
+          servicios: request.query?.servicios,
+          id_paquete: request.query?.id_paquete ?? null,
+          id_barbero: idBarbero,
+        });
         const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
         if (idBarbero) {

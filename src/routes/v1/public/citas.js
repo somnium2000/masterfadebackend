@@ -10,6 +10,7 @@ import {
   parseDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
+import { confirmAppointmentsWithoutPayment } from "../../../services/appointmentConfirmationService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -314,11 +315,16 @@ function validateCompanionContactPayload(contacto, { alias, index }) {
 
 function normalizeBlocksPayload(body, titularPayload) {
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
-  const legacyPayload = body?.fecha_inicio && Array.isArray(body?.servicios)
+  const hasLegacySelection = body?.selection_type === "package"
+    ? Boolean(body?.fecha_inicio && body?.id_paquete)
+    : Boolean(body?.fecha_inicio && Array.isArray(body?.servicios));
+  const legacyPayload = hasLegacySelection
     ? [{
       orden_integrante: 1,
       alias: "Titular",
       id_barbero: body?.id_barbero ?? null,
+      selection_type: body?.selection_type ?? "services",
+      id_paquete: body?.id_paquete ?? null,
       fecha_inicio: body.fecha_inicio,
       servicios: body.servicios,
     }]
@@ -335,16 +341,34 @@ function normalizeBlocksPayload(body, titularPayload) {
     const aliasFallback = index === 0 ? "Titular" : `Acompanante ${index}`;
     const alias = String(item?.alias || aliasFallback).trim().slice(0, 80) || aliasFallback;
     const ordenIntegrante = Number(item?.orden_integrante);
+    const selectionType = String(item?.selection_type || "services").trim().toLowerCase();
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
+    const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
 
-    if (!servicios.length) {
+    if (!["services", "package"].includes(selectionType)) {
+      throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
+        code: "PUBLIC_CITAS_BLOCK_SELECTION_TYPE_INVALID",
+        details: { alias, index, selection_type: item?.selection_type ?? null },
+      });
+    }
+
+    if (selectionType === "services" && !servicios.length) {
       throw new AppError(400, `El integrante ${alias} no tiene servicios seleccionados`, {
         code: "PUBLIC_CITAS_BLOCK_SERVICES_REQUIRED",
         details: { alias, index },
       });
     }
 
-    const serviceIds = servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"));
+    if (selectionType === "package" && !packageId) {
+      throw new AppError(400, `El integrante ${alias} no tiene paquete seleccionado`, {
+        code: "PUBLIC_CITAS_BLOCK_PACKAGE_REQUIRED",
+        details: { alias, index },
+      });
+    }
+
+    const serviceIds = selectionType === "services"
+      ? servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"))
+      : [];
 
     const fechaInicio = String(item?.fecha_inicio || "").trim();
     assertDateTimeNotPastInHonduras(fechaInicio, "fecha_inicio");
@@ -353,6 +377,8 @@ function normalizeBlocksPayload(body, titularPayload) {
       orden_integrante: Number.isFinite(ordenIntegrante) && ordenIntegrante > 0 ? Math.trunc(ordenIntegrante) : index + 1,
       alias,
       id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
+      selection_type: selectionType,
+      id_paquete: packageId,
       fecha_inicio: fechaInicio,
       serviceIds,
       contacto: index === 0
@@ -526,11 +552,13 @@ export default async function publicCitasRoutes(app) {
               minItems: 1,
               items: {
                 type: "object",
-                required: ["fecha_inicio", "servicios"],
+                required: ["fecha_inicio"],
                 properties: {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  selection_type: { type: "string", enum: ["services", "package"] },
+                  id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   contacto: {
                     type: "object",
                     properties: {
@@ -543,7 +571,6 @@ export default async function publicCitasRoutes(app) {
                   fecha_inicio: { type: "string", format: "date-time" },
                   servicios: {
                     type: "array",
-                    minItems: 1,
                     items: {
                       type: "object",
                       required: ["id_servicio"],
@@ -559,6 +586,8 @@ export default async function publicCitasRoutes(app) {
             },
             id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             fecha_inicio: { type: "string", format: "date-time" },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             servicios: {
               type: "array",
               items: {
@@ -584,7 +613,7 @@ export default async function publicCitasRoutes(app) {
                 properties: {
                   id_grupo_cita: { type: "string", format: "uuid" },
                   estado_grupo_codigo: { type: "string" },
-                  expires_at: { type: "string", format: "date-time" },
+                  expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
                   monto_total_hnl: { type: "number" },
                   bloques: { type: "array", items: holdBlockSchema },
                 },
@@ -630,8 +659,8 @@ export default async function publicCitasRoutes(app) {
 
         const holdDurationMin = await getHoldDurationMinutes(dbClient);
         const expiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
-        const targetAppointmentState = simulationNoPayment ? "confirmada" : "en_espera";
-        const holdState = simulationNoPayment ? "consumido" : "activo";
+        const targetAppointmentState = "en_espera";
+        const holdState = "activo";
 
         const groupInsert = await dbClient.query(
           `
@@ -657,18 +686,20 @@ export default async function publicCitasRoutes(app) {
         const bloquesResponse = [];
         const notificationTargets = new Map();
         let totalGrupo = 0;
+        const createdAppointmentIds = [];
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
           const selection = await resolveBookingSelection(dbClient, {
             id_sucursal: branch.id_sucursal,
+            selection_type: integrante.selection_type,
             servicios: integrante.serviceIds,
+            id_paquete: integrante.id_paquete,
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
           });
 
-          const totalDuration = selection.serviceSelection.duracion_total_min + selection.serviceSelection.buffer_total_min;
-          const finAt = new Date(selection.startDateTime.getTime() + totalDuration * 60 * 1000);
+          const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
 
           const citaInsert = await dbClient.query(
             `
@@ -690,6 +721,8 @@ export default async function publicCitasRoutes(app) {
                 subtotal_servicios_hnl,
               descuento_hnl,
               total_pagar_hnl,
+              selection_type,
+              id_paquete,
               contacto_nombre,
               contacto_email,
               contacto_telefono,
@@ -713,10 +746,12 @@ export default async function publicCitasRoutes(app) {
                 $14::numeric,
                 0,
                 $15::numeric,
-                $16,
-                $17,
+                $16::text,
+                $17::uuid,
                 $18,
-                $19
+                $19,
+                $20,
+                $21
               )
               RETURNING id_cita
             `,
@@ -736,6 +771,8 @@ export default async function publicCitasRoutes(app) {
               selection.serviceSelection.buffer_total_min,
               selection.serviceSelection.monto_total_hnl,
               selection.serviceSelection.monto_total_hnl,
+              selection.serviceSelection.selection_type || integrante.selection_type || "services",
+              selection.serviceSelection.id_paquete || integrante.id_paquete || null,
               integrante.contacto?.nombre || integrante.alias,
               integrante.contacto?.email || null,
               integrante.contacto?.telefono || null,
@@ -744,6 +781,7 @@ export default async function publicCitasRoutes(app) {
           );
 
           const citaId = citaInsert.rows[0].id_cita;
+          createdAppointmentIds.push(citaId);
 
           for (const serviceItem of selection.serviceSelection.items) {
             await dbClient.query(
@@ -803,10 +841,17 @@ export default async function publicCitasRoutes(app) {
             fecha: fecha || "",
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: targetAppointmentState,
+            estado_cita_codigo: simulationNoPayment ? "confirmada" : targetAppointmentState,
             monto_total_hnl: Number(selection.serviceSelection.monto_total_hnl || 0),
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
+          });
+        }
+
+        if (simulationNoPayment && createdAppointmentIds.length > 0) {
+          await confirmAppointmentsWithoutPayment(dbClient, {
+            citas: createdAppointmentIds,
+            motivo_confirmacion: "simulacion_sin_pago_publica",
           });
         }
 
@@ -854,7 +899,7 @@ export default async function publicCitasRoutes(app) {
           {
             id_grupo_cita: groupRecord.id_grupo_cita,
             estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
-            expires_at: expiresAt.toISOString(),
+            expires_at: simulationNoPayment ? null : expiresAt.toISOString(),
             monto_total_hnl: totalGrupo,
             bloques: bloquesResponse,
           },

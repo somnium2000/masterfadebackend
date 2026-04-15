@@ -5,9 +5,11 @@ import {
   expireStaleAppointmentReservations,
   OCCUPIED_APPOINTMENT_STATES,
   assertUuid,
+  getSystemParameters,
   parseDateOnly,
   resolveBookingSelection,
 } from "../../services/agendaService.js";
+import { confirmAppointmentsWithoutPayment, confirmAppointmentWithoutPayment } from "../../services/appointmentConfirmationService.js";
 import {
   createCoverageTracker,
   consumeCoverageForServices,
@@ -311,11 +313,16 @@ function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
 
 function normalizeHoldBlocksPayload(body) {
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
-  const legacyPayload = body?.fecha_inicio && Array.isArray(body?.servicios)
+  const hasLegacySelection = body?.selection_type === "package"
+    ? Boolean(body?.fecha_inicio && body?.id_paquete)
+    : Boolean(body?.fecha_inicio && Array.isArray(body?.servicios));
+  const legacyPayload = hasLegacySelection
     ? [{
       orden_integrante: 1,
       alias: "Titular",
       id_barbero: body?.id_barbero ?? null,
+      selection_type: body?.selection_type ?? "services",
+      id_paquete: body?.id_paquete ?? null,
       fecha_inicio: body.fecha_inicio,
       servicios: body.servicios,
     }]
@@ -332,16 +339,34 @@ function normalizeHoldBlocksPayload(body) {
     const aliasFallback = index === 0 ? "Titular" : `Acompanante ${index}`;
     const alias = String(item?.alias || aliasFallback).trim().slice(0, 80) || aliasFallback;
     const ordenIntegrante = Number(item?.orden_integrante);
+    const selectionType = String(item?.selection_type || "services").trim().toLowerCase();
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
+    const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
 
-    if (!servicios.length) {
+    if (!["services", "package"].includes(selectionType)) {
+      throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
+        code: "CITAS_HOLD_BLOCK_SELECTION_TYPE_INVALID",
+        details: { alias, index, selection_type: item?.selection_type ?? null },
+      });
+    }
+
+    if (selectionType === "services" && !servicios.length) {
       throw new AppError(400, `El integrante ${alias} no tiene servicios seleccionados`, {
         code: "CITAS_HOLD_BLOCK_SERVICES_REQUIRED",
         details: { alias, index },
       });
     }
 
-    const serviceIds = servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"));
+    if (selectionType === "package" && !packageId) {
+      throw new AppError(400, `El integrante ${alias} no tiene paquete seleccionado`, {
+        code: "CITAS_HOLD_BLOCK_PACKAGE_REQUIRED",
+        details: { alias, index },
+      });
+    }
+
+    const serviceIds = selectionType === "services"
+      ? servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"))
+      : [];
     const fechaInicio = String(item?.fecha_inicio || "").trim();
     assertDateTimeNotPastInHonduras(fechaInicio, "fecha_inicio");
 
@@ -349,10 +374,16 @@ function normalizeHoldBlocksPayload(body) {
       orden_integrante: Number.isFinite(ordenIntegrante) && ordenIntegrante > 0 ? Math.trunc(ordenIntegrante) : index + 1,
       alias,
       id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
+      selection_type: selectionType,
+      id_paquete: packageId,
       fecha_inicio: fechaInicio,
       serviceIds,
     };
   });
+}
+
+function isSimulationNoPaymentEnabled(paramsMap) {
+  return Boolean(paramsMap?.simulacion_sin_pago?.valor_booleano ?? true);
 }
 
 export default async function citasRoutes(app) {
@@ -363,14 +394,15 @@ export default async function citasRoutes(app) {
       schema: {
         body: {
           type: "object",
-          required: ["id_sucursal", "fecha_inicio", "servicios"],
+          required: ["id_sucursal", "fecha_inicio"],
           properties: {
             id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             id_sucursal: { type: "string", format: "uuid" },
             fecha_inicio: { type: "string", format: "date-time" },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             servicios: {
               type: "array",
-              minItems: 1,
               items: {
                 type: "object",
                 required: ["id_servicio"],
@@ -397,7 +429,7 @@ export default async function citasRoutes(app) {
                   id_barbero: { type: "string", format: "uuid" },
                   nombre_barbero: { type: "string" },
                   asignada_automaticamente: { type: "boolean" },
-                  expires_at: { type: "string", format: "date-time" },
+                  expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
                   duracion_total_min: { type: "integer" },
                   buffer_total_min: { type: "integer" },
                   monto_total_hnl: { type: "number" },
@@ -433,10 +465,16 @@ export default async function citasRoutes(app) {
       const dbClient = await app.db.connect();
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
-        const serviceIds = request.body.servicios.map((item) => item.id_servicio);
+        const selectionType = String(request.body?.selection_type || "services").trim().toLowerCase();
+        const serviceIds = Array.isArray(request.body?.servicios)
+          ? request.body.servicios.map((item) => item.id_servicio)
+          : [];
+        const simulationNoPayment = isSimulationNoPaymentEnabled(await getSystemParameters(dbClient));
         const selection = await resolveBookingSelection(dbClient, {
           id_sucursal: request.body.id_sucursal,
+          selection_type: selectionType,
           servicios: serviceIds,
+          id_paquete: request.body?.id_paquete ?? null,
           fecha_inicio: request.body.fecha_inicio,
           id_barbero: request.body.id_barbero ?? null,
         });
@@ -460,6 +498,8 @@ export default async function citasRoutes(app) {
               subtotal_servicios_hnl,
               descuento_hnl,
               total_pagar_hnl,
+              selection_type,
+              id_paquete,
               notas
             )
             VALUES (
@@ -477,7 +517,9 @@ export default async function citasRoutes(app) {
               $11::numeric,
               0,
               $12::numeric,
-              $13
+              $13::text,
+              $14::uuid,
+              $15
             )
             RETURNING id_cita
           `,
@@ -489,11 +531,13 @@ export default async function citasRoutes(app) {
             usuarioId,
             !request.body.id_barbero,
             selection.startDateTime.toISOString(),
-            new Date(selection.startDateTime.getTime() + (selection.serviceSelection.duracion_total_min + selection.serviceSelection.buffer_total_min) * 60 * 1000).toISOString(),
+            new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000).toISOString(),
             selection.serviceSelection.duracion_total_min,
             selection.serviceSelection.buffer_total_min,
             selection.serviceSelection.monto_total_hnl,
             selection.serviceSelection.monto_total_hnl,
+            selection.serviceSelection.selection_type || selectionType,
+            selection.serviceSelection.id_paquete || request.body?.id_paquete || null,
             request.body?.notas ?? null,
           ]
         );
@@ -539,17 +583,24 @@ export default async function citasRoutes(app) {
           [citaId, usuarioId, selection.expiresAt.toISOString()]
         );
 
+        if (simulationNoPayment) {
+          await confirmAppointmentWithoutPayment(dbClient, {
+            id_cita: citaId,
+            motivo_confirmacion: "simulacion_sin_pago_cliente_simple",
+          });
+        }
+
         await dbClient.query("COMMIT");
 
         return sendOk(
           reply,
           {
             id_cita: citaId,
-            estado_cita_codigo: "en_espera",
+            estado_cita_codigo: simulationNoPayment ? "confirmada" : "en_espera",
             id_barbero: selection.barber.id_empleado,
             nombre_barbero: selection.barber.nombre_completo,
             asignada_automaticamente: !request.body.id_barbero,
-            expires_at: new Date(holdInsert.rows[0].expires_at).toISOString(),
+            expires_at: simulationNoPayment ? null : new Date(holdInsert.rows[0].expires_at).toISOString(),
             duracion_total_min: selection.serviceSelection.duracion_total_min,
             buffer_total_min: selection.serviceSelection.buffer_total_min,
             monto_total_hnl: selection.serviceSelection.monto_total_hnl,
@@ -593,15 +644,16 @@ export default async function citasRoutes(app) {
               minItems: 1,
               items: {
                 type: "object",
-                required: ["fecha_inicio", "servicios"],
+                required: ["fecha_inicio"],
                 properties: {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  selection_type: { type: "string", enum: ["services", "package"] },
+                  id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   fecha_inicio: { type: "string", format: "date-time" },
                   servicios: {
                     type: "array",
-                    minItems: 1,
                     items: {
                       type: "object",
                       required: ["id_servicio"],
@@ -617,6 +669,8 @@ export default async function citasRoutes(app) {
             },
             id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             fecha_inicio: { type: "string", format: "date-time" },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             servicios: {
               type: "array",
               items: {
@@ -664,6 +718,7 @@ export default async function citasRoutes(app) {
 
         await dbClient.query("BEGIN");
         txStarted = true;
+        const simulationNoPayment = isSimulationNoPaymentEnabled(await getSystemParameters(dbClient));
 
         const activeMembership = await ensureSubscriptionLifecycle(dbClient, clienteId, { forUpdate: true });
         const coverageTracker = createCoverageTracker(activeMembership);
@@ -699,12 +754,15 @@ export default async function citasRoutes(app) {
         let extrasPendientesGrupo = 0;
         let coveredItemsCount = 0;
         let extraItemsCount = 0;
+        const createdAppointmentIds = [];
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
           const selection = await resolveBookingSelection(dbClient, {
             id_sucursal: branch.id_sucursal,
+            selection_type: integrante.selection_type,
             servicios: integrante.serviceIds,
+            id_paquete: integrante.id_paquete,
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
           });
@@ -715,8 +773,7 @@ export default async function citasRoutes(app) {
           const descuento = Number(coverage.coveredTotalHnl || 0);
           const totalPagar = Number(coverage.extraTotalHnl || 0);
 
-          const totalDuration = selection.serviceSelection.duracion_total_min + selection.serviceSelection.buffer_total_min;
-          const finAt = new Date(selection.startDateTime.getTime() + totalDuration * 60 * 1000);
+          const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
 
           const citaInsert = await dbClient.query(
             `
@@ -738,6 +795,8 @@ export default async function citasRoutes(app) {
                 subtotal_servicios_hnl,
                 descuento_hnl,
                 total_pagar_hnl,
+                selection_type,
+                id_paquete,
                 notas
               )
               VALUES (
@@ -758,7 +817,9 @@ export default async function citasRoutes(app) {
                 $14::numeric,
                 $15::numeric,
                 $16::numeric,
-                $17
+                $17::text,
+                $18::uuid,
+                $19
               )
               RETURNING id_cita
             `,
@@ -779,11 +840,14 @@ export default async function citasRoutes(app) {
               subtotalServicios,
               descuento,
               totalPagar,
+              selection.serviceSelection.selection_type || integrante.selection_type || "services",
+              selection.serviceSelection.id_paquete || integrante.id_paquete || null,
               request.body?.notas ?? null,
             ]
           );
 
           const citaId = citaInsert.rows[0].id_cita;
+          createdAppointmentIds.push(citaId);
 
           for (const serviceItem of selection.serviceSelection.items) {
             await dbClient.query(
@@ -852,7 +916,7 @@ export default async function citasRoutes(app) {
             fecha: fecha || "",
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: "en_espera",
+            estado_cita_codigo: simulationNoPayment ? "confirmada" : "en_espera",
             monto_total_hnl: subtotalServicios,
             descuento_hnl: descuento,
             total_pagar_hnl: totalPagar,
@@ -865,6 +929,13 @@ export default async function citasRoutes(app) {
           });
         }
 
+        if (simulationNoPayment && createdAppointmentIds.length > 0) {
+          await confirmAppointmentsWithoutPayment(dbClient, {
+            citas: createdAppointmentIds,
+            motivo_confirmacion: "simulacion_sin_pago_cliente_hold",
+          });
+        }
+
         const membershipState = await getClienteMembershipState(dbClient, clienteId);
         await dbClient.query("COMMIT");
         txStarted = false;
@@ -872,7 +943,7 @@ export default async function citasRoutes(app) {
         return sendOk(reply, {
           id_grupo_cita: groupRecord.id_grupo_cita,
           estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
-          expires_at: holdExpiresAt.toISOString(),
+          expires_at: simulationNoPayment ? null : holdExpiresAt.toISOString(),
           monto_total_hnl: subtotalGrupo,
           descuento_total_hnl: descuentoGrupo,
           total_pagar_hnl: totalGrupo,
