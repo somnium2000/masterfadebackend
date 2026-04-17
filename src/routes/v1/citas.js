@@ -13,7 +13,6 @@ import {
   consumeCoverageForServices,
   ensureSubscriptionLifecycle,
   getClienteMembershipState,
-  insertSubscriptionConsumptionRows,
 } from "../../services/membershipService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
@@ -822,16 +821,6 @@ export default async function citasRoutes(app) {
             `,
             [citaId, holdUserId, holdExpiresAt.toISOString()]
           );
-
-          if (hasMembership && coverage.items.length > 0) {
-            await insertSubscriptionConsumptionRows(dbClient, {
-              idSuscripcion: coverageTracker.idSuscripcion,
-              idCliente: clienteId,
-              idCita: citaId,
-              ordenIntegrante: integrante.orden_integrante,
-              entries: coverage.items,
-            });
-          }
 
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
           const coveredCount = coverage.items.filter((entry) => entry.coverage_status === "cubierto_plan").length;

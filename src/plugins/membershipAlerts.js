@@ -3,6 +3,7 @@ import {
   classifyExpiryAlert,
   listActiveSubscriptionsForAlerts,
   registerSubscriptionAlertEvent,
+  resolveMembershipVisibleState,
   summarizeCriticalBalance,
 } from "../services/membershipService.js";
 
@@ -20,17 +21,37 @@ function parseInterval(value, fallback = 60 * 60 * 1000) {
 
 async function getConsumptionRows(client, idSuscripcion) {
   try {
+    const capabilityColumns = await client.query(
+      `
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'subscription_consumptions'
+          AND column_name IN ('id_cortesia', 'source_kind', 'invalidado')
+      `
+    );
+    const columnSet = new Set((capabilityColumns?.rows || []).map((row) => String(row.column_name || "").trim()));
+    const selectIdCortesia = columnSet.has("id_cortesia")
+      ? "id_cortesia"
+      : "NULL::uuid AS id_cortesia";
+    const operationalWhere = [
+      columnSet.has("source_kind") ? "source_kind = 'appointment_completed'" : "TRUE",
+      columnSet.has("invalidado") ? "COALESCE(invalidado, FALSE) IS FALSE" : "TRUE",
+    ].join(" AND ");
+
     const { rows } = await client.query(
       `
         SELECT
           item_tipo,
           id_servicio,
+          ${selectIdCortesia},
           item_codigo,
           item_nombre,
           cantidad,
           coverage_status
         FROM public.subscription_consumptions
         WHERE id_suscripcion = $1::uuid
+          AND ${operationalWhere}
       `,
       [idSuscripcion]
     );
@@ -60,7 +81,19 @@ async function processMembershipAlertsTick(app) {
 
       try {
         const expiryInfo = classifyExpiryAlert(row, { thresholdDays: 3 });
-        if (expiryInfo.should_notify) {
+        const consumptionRows = await getConsumptionRows(client, subscriptionId);
+        const balanceSummary = summarizeCriticalBalance(row.beneficios_snapshot, consumptionRows);
+        const visibleState = resolveMembershipVisibleState(row, {
+          summary: balanceSummary,
+          timeRemaining: {
+            dias: expiryInfo.dias_restantes,
+            horas: expiryInfo.horas_restantes,
+            minutos: expiryInfo.minutos_restantes,
+            vencido: false,
+          },
+        });
+
+        if (visibleState === "pendiente_renovacion" && expiryInfo.should_notify) {
           const canSendExpiry = await registerSubscriptionAlertEvent(client, {
             idSuscripcion: subscriptionId,
             alertType: "vencimiento_3_dias",
@@ -82,10 +115,7 @@ async function processMembershipAlertsTick(app) {
           }
         }
 
-        const consumptionRows = await getConsumptionRows(client, subscriptionId);
-        const balanceSummary = summarizeCriticalBalance(row.beneficios_snapshot, consumptionRows);
-
-        if (balanceSummary.is_critical_1_1) {
+        if (visibleState === "pendiente_renovacion" && balanceSummary.is_critical_1_1) {
           const canSendCritical = await registerSubscriptionAlertEvent(client, {
             idSuscripcion: subscriptionId,
             alertType: "saldo_1_1",

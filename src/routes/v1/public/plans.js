@@ -43,11 +43,12 @@ const planBenefitSchema = {
   properties: {
     tipo: { type: "string", enum: PLAN_BENEFIT_TYPES },
     id_servicio: { type: ["string", "null"], format: "uuid" },
+    id_cortesia: { type: ["string", "null"], format: "uuid" },
     codigo: { type: ["string", "null"] },
     nombre: { type: "string" },
     cantidad: { type: "integer" },
   },
-  required: ["tipo", "id_servicio", "codigo", "nombre", "cantidad"],
+  required: ["tipo", "id_servicio", "id_cortesia", "codigo", "nombre", "cantidad"],
   additionalProperties: false,
 };
 
@@ -224,6 +225,7 @@ function parseStoredBenefits(rawBenefits) {
     !Array.isArray(data) &&
     (data.tipo !== undefined ||
       data.id_servicio !== undefined ||
+      data.id_cortesia !== undefined ||
       data.nombre !== undefined ||
       data.codigo !== undefined ||
       data.cantidad !== undefined);
@@ -238,22 +240,41 @@ function parseStoredBenefits(rawBenefits) {
   return items
     .map((beneficio) => {
       const normalizedServiceId = String(beneficio?.id_servicio || "").trim();
+      const normalizedCourtesyId = String(beneficio?.id_cortesia || "").trim();
+      const normalizedNombre = String(beneficio?.nombre || "").trim();
+      const normalizedCodigo = beneficio?.codigo ? String(beneficio.codigo).trim() : "";
       const rawType = String(beneficio?.tipo || "").trim().toLowerCase();
-      // AM: Compatibilidad con payloads legacy de beneficios sin tipo pero con id_servicio.
-      const tipo = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId) ? "servicio" : "cortesia";
+      // AM: Compatibilidad legacy de solo lectura:
+      // 1) servicio requiere id_servicio;
+      // 2) cortesia moderna requiere id_cortesia;
+      // 3) solo para visualizar datos viejos se acepta cortesia sin id_cortesia si tipo=cortesia y trae nombre/codigo.
+      const isService = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId);
+      const isCourtesy = rawType === "cortesia" || (!rawType && !normalizedServiceId && normalizedCourtesyId);
+      const allowsLegacyCourtesyRead = rawType === "cortesia" && !normalizedCourtesyId && Boolean(normalizedNombre || normalizedCodigo);
+      if (!isService && !isCourtesy && !allowsLegacyCourtesyRead) {
+        return null;
+      }
+
+      const tipo = isService ? "servicio" : "cortesia";
       return {
         tipo,
         id_servicio: normalizedServiceId || null,
-        codigo: beneficio?.codigo ? String(beneficio.codigo) : null,
-        nombre: String(beneficio?.nombre || "").trim(),
+        id_cortesia: normalizedCourtesyId || null,
+        codigo: normalizedCodigo || null,
+        nombre: normalizedNombre,
         cantidad: Number(beneficio?.cantidad ?? 0),
       };
     })
+    .filter(Boolean)
     .filter((beneficio) => Number.isInteger(beneficio.cantidad) && beneficio.cantidad > 0)
-    .filter((beneficio) => (beneficio.tipo === "servicio" ? Boolean(beneficio.id_servicio) : Boolean(beneficio.nombre || beneficio.codigo)))
+    .filter((beneficio) => (
+      beneficio.tipo === "servicio"
+        ? Boolean(beneficio.id_servicio)
+        : Boolean(beneficio.id_cortesia || beneficio.nombre || beneficio.codigo)
+    ))
     .map((beneficio) => ({
       ...beneficio,
-      nombre: beneficio.nombre || (beneficio.tipo === "servicio" ? "Servicio incluido" : (beneficio.codigo || "Cortesia")),
+      nombre: beneficio.nombre || (beneficio.tipo === "servicio" ? "Servicio incluido" : (beneficio.codigo || "Cortesia incluida")),
     }));
 }
 

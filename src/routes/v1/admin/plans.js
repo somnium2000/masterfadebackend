@@ -4,6 +4,7 @@ import { sendOk } from "../../../utils/response.js";
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
 // AM: Se permite cortesia para exhibicion comercial; el motor operativo sigue en servicios.
 const PLAN_BENEFIT_TYPES = ["servicio", "cortesia"];
+const PLAN_BENEFIT_MAX_CANTIDAD = 999;
 const PLAN_CATEGORY_MIN = 1;
 const PLAN_CATEGORY_MAX = 5;
 const DEFAULT_PLAN_CATEGORY = 1;
@@ -42,9 +43,10 @@ const planBenefitBodySchema = {
   properties: {
     tipo: { type: "string", enum: PLAN_BENEFIT_TYPES },
     id_servicio: { type: ["string", "null"], format: "uuid" },
+    id_cortesia: { type: ["string", "null"], format: "uuid" },
     codigo: { type: ["string", "null"], minLength: 1, maxLength: 120 },
     nombre: { type: ["string", "null"], minLength: 1, maxLength: 160 },
-    cantidad: { type: "integer", minimum: 1 },
+    cantidad: { type: "integer", minimum: 1, maximum: PLAN_BENEFIT_MAX_CANTIDAD },
   },
   required: ["tipo", "cantidad"],
   additionalProperties: false,
@@ -107,11 +109,12 @@ const planBenefitResponseSchema = {
   properties: {
     tipo: { type: "string", enum: PLAN_BENEFIT_TYPES },
     id_servicio: { type: ["string", "null"], format: "uuid" },
+    id_cortesia: { type: ["string", "null"], format: "uuid" },
     codigo: { type: ["string", "null"] },
     nombre: { type: "string" },
     cantidad: { type: "integer" },
   },
-  required: ["tipo", "id_servicio", "codigo", "nombre", "cantidad"],
+  required: ["tipo", "id_servicio", "id_cortesia", "codigo", "nombre", "cantidad"],
   additionalProperties: false,
 };
 
@@ -379,6 +382,18 @@ const GET_ACTIVE_SERVICES_IN_BRANCH_SQL = `
     AND s.activo IS TRUE
 `;
 
+const GET_COURTESIES_IN_BRANCH_SQL = `
+  SELECT
+    c.id AS id_cortesia,
+    c.nombre,
+    cs.activa
+  FROM public.cortesias c
+  JOIN public.cortesias_sucursales cs
+    ON cs.cortesia_id = c.id
+   AND cs.id_sucursal = $2::uuid
+  WHERE c.id = ANY($1::uuid[])
+`;
+
 function normalizeRequiredText(value) {
   return String(value || "").normalize("NFC").trim();
 }
@@ -437,12 +452,11 @@ function normalizePlanBenefits(beneficios) {
   }
 
   const seenServiceIds = new Set();
-  const seenCourtesyKeys = new Set();
+  const seenCourtesyIds = new Set();
   return beneficios.map((beneficio) => {
     const tipo = String(beneficio?.tipo || "").trim().toLowerCase();
     const cantidad = Number(beneficio?.cantidad);
     const nombre = normalizeOptionalText(beneficio?.nombre) ?? "";
-    const codigo = normalizeOptionalText(beneficio?.codigo);
 
     if (!PLAN_BENEFIT_TYPES.includes(tipo)) {
       throw new AppError(400, "Cada beneficio debe indicar un tipo valido (servicio o cortesia)", {
@@ -450,8 +464,8 @@ function normalizePlanBenefits(beneficios) {
       });
     }
 
-    if (!Number.isInteger(cantidad) || cantidad < 1) {
-      throw new AppError(400, "La cantidad de cada beneficio debe ser un entero mayor o igual a 1", {
+    if (!Number.isInteger(cantidad) || cantidad < 1 || cantidad > PLAN_BENEFIT_MAX_CANTIDAD) {
+      throw new AppError(400, `La cantidad de cada beneficio debe ser un entero entre 1 y ${PLAN_BENEFIT_MAX_CANTIDAD}`, {
         code: "CATALOG_PLAN_BENEFIT_INVALID",
       });
     }
@@ -473,28 +487,30 @@ function normalizePlanBenefits(beneficios) {
       return {
         tipo: "servicio",
         id_servicio: idServicio,
+        id_cortesia: null,
         codigo: null,
         nombre,
         cantidad,
       };
     }
 
-    if (!nombre) {
-      throw new AppError(400, "Los beneficios tipo cortesia requieren nombre", {
+    const idCortesia = String(beneficio?.id_cortesia || "").trim();
+    if (!idCortesia) {
+      throw new AppError(400, "Los beneficios tipo cortesia requieren id_cortesia", {
         code: "CATALOG_PLAN_BENEFIT_INVALID",
       });
     }
-    const courtesyKey = String((codigo || nombre)).trim().toLowerCase();
-    if (seenCourtesyKeys.has(courtesyKey)) {
+    if (seenCourtesyIds.has(idCortesia)) {
       throw new AppError(400, "No se permite repetir la misma cortesia dentro del plan", {
         code: "CATALOG_PLAN_BENEFIT_DUPLICATE",
       });
     }
-    seenCourtesyKeys.add(courtesyKey);
+    seenCourtesyIds.add(idCortesia);
     return {
       tipo: "cortesia",
       id_servicio: null,
-      codigo: codigo || null,
+      id_cortesia: idCortesia,
+      codigo: null,
       nombre,
       cantidad,
     };
@@ -510,6 +526,7 @@ function parseStoredBenefits(rawBenefits) {
     !Array.isArray(data) &&
     (data.tipo !== undefined ||
       data.id_servicio !== undefined ||
+      data.id_cortesia !== undefined ||
       data.nombre !== undefined ||
       data.codigo !== undefined ||
       data.cantidad !== undefined);
@@ -524,26 +541,45 @@ function parseStoredBenefits(rawBenefits) {
   return items
     .map((beneficio) => {
       const normalizedServiceId = String(beneficio?.id_servicio || "").trim();
+      const normalizedCourtesyId = String(beneficio?.id_cortesia || "").trim();
+      const normalizedNombre = String(beneficio?.nombre || "").trim();
+      const normalizedCodigo = beneficio?.codigo ? String(beneficio.codigo).trim() : "";
       const rawType = String(beneficio?.tipo || "").trim().toLowerCase();
-      // AM: Compatibilidad con beneficios legacy sin tipo explicito pero con id_servicio.
-      const tipo = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId) ? "servicio" : "cortesia";
+      // AM: Compatibilidad legacy estricta:
+      // 1) id_servicio fuerza tipo servicio aun sin tipo explicito.
+      // 2) id_cortesia fuerza tipo cortesia.
+      // 3) solo para lectura se permite cortesia legacy sin id_cortesia cuando tipo=cortesia y existe nombre/codigo.
+      const isService = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId);
+      const isCourtesy = rawType === "cortesia" || (!rawType && !normalizedServiceId && normalizedCourtesyId);
+      const allowsLegacyCourtesyRead = rawType === "cortesia" && !normalizedCourtesyId && Boolean(normalizedNombre || normalizedCodigo);
+      if (!isService && !isCourtesy && !allowsLegacyCourtesyRead) {
+        return null;
+      }
+
+      const tipo = isService ? "servicio" : "cortesia";
       return {
         tipo,
         id_servicio: normalizedServiceId || null,
-        codigo: beneficio?.codigo ? String(beneficio.codigo) : null,
-        nombre: String(beneficio?.nombre || "").trim(),
+        id_cortesia: normalizedCourtesyId || null,
+        codigo: normalizedCodigo || null,
+        nombre: normalizedNombre,
         cantidad: Number(beneficio?.cantidad ?? 0),
       };
     })
+    .filter(Boolean)
     .filter((beneficio) => Number.isInteger(beneficio.cantidad) && beneficio.cantidad > 0)
-    .filter((beneficio) => (beneficio.tipo === "servicio" ? Boolean(beneficio.id_servicio) : Boolean(beneficio.nombre || beneficio.codigo)))
+    .filter((beneficio) => (
+      beneficio.tipo === "servicio"
+        ? Boolean(beneficio.id_servicio)
+        : Boolean(beneficio.id_cortesia || beneficio.nombre || beneficio.codigo)
+    ))
     .map((beneficio) => ({
       ...beneficio,
       nombre:
         beneficio.nombre ||
         (beneficio.tipo === "servicio"
           ? "Servicio del catalogo"
-          : (beneficio.codigo || "Cortesia")),
+          : (beneficio.codigo || "Cortesia incluida")),
     }));
 }
 
@@ -704,6 +740,56 @@ async function ensurePlanServiceBenefitsAccessible(client, benefits, branchId) {
       nombre: serviceNameById.get(benefit.id_servicio) || benefit.nombre || "Servicio del catalogo",
     };
   });
+}
+
+async function ensurePlanCourtesyBenefitsAccessible(client, benefits, branchId, existingBenefits = []) {
+  const courtesyBenefitIds = [...new Set(
+    benefits
+      .filter((benefit) => benefit.tipo === "cortesia" && benefit.id_cortesia)
+      .map((benefit) => benefit.id_cortesia)
+  )];
+
+  if (!courtesyBenefitIds.length) {
+    return benefits;
+  }
+
+  const { rows } = await client.query(GET_COURTESIES_IN_BRANCH_SQL, [courtesyBenefitIds, branchId]);
+  if (rows.length !== courtesyBenefitIds.length) {
+    throw new AppError(400, "Una o mas cortesias de beneficios no existen en la sucursal seleccionada", {
+      code: "CATALOG_PLAN_COURTESY_NOT_FOUND",
+    });
+  }
+
+  const existingCourtesyIds = new Set(
+    (Array.isArray(existingBenefits) ? existingBenefits : [])
+      .filter((benefit) => benefit?.tipo === "cortesia" && benefit?.id_cortesia)
+      .map((benefit) => benefit.id_cortesia)
+  );
+  const courtesyById = new Map(rows.map((row) => [row.id_cortesia, row]));
+
+  return benefits.map((benefit) => {
+    if (benefit.tipo !== "cortesia") return benefit;
+
+    const currentCourtesy = courtesyById.get(benefit.id_cortesia);
+    if (!currentCourtesy) return benefit;
+
+    if (!currentCourtesy.activa && !existingCourtesyIds.has(benefit.id_cortesia)) {
+      throw new AppError(409, "No puedes agregar cortesias inactivas al plan", {
+        code: "CATALOG_PLAN_COURTESY_INACTIVE",
+      });
+    }
+
+    return {
+      ...benefit,
+      // AM: Se guarda nombre snapshot para lectura admin/public aunque el catalogo cambie despues.
+      nombre: String(currentCourtesy.nombre || "").trim() || benefit.nombre || "Cortesia del catalogo",
+    };
+  });
+}
+
+async function ensurePlanBenefitsAccessible(client, benefits, branchId, existingBenefits = []) {
+  const withServices = await ensurePlanServiceBenefitsAccessible(client, benefits, branchId);
+  return ensurePlanCourtesyBenefitsAccessible(client, withServices, branchId, existingBenefits);
 }
 
 async function upsertPlanBranchOffer(client, idPlan, idSucursal, payload = {}) {
@@ -1005,7 +1091,7 @@ export default async function adminPlansRoutes(app) {
 
         await client.query("BEGIN");
 
-        const canonicalBenefits = await ensurePlanServiceBenefitsAccessible(client, normalizedBenefits, branchId);
+        const canonicalBenefits = await ensurePlanBenefitsAccessible(client, normalizedBenefits, branchId, []);
         const insertResult = supportsPlanCategoryColumn
           ? await client.query(
             `
@@ -1193,10 +1279,10 @@ export default async function adminPlansRoutes(app) {
             ? normalizeOrderVisual(request.body.orden_visual, 100)
             : normalizeOrderVisual(scopedPlan?.orden_visual, 100);
         const nextActive = normalizeBoolean(scopedPlan?.activo, true);
-        const sourceBenefits =
-          request.body.beneficios !== undefined
-            ? normalizePlanBenefits(request.body.beneficios)
-            : parseStoredBenefits(targetBasePlan.beneficios);
+        const shouldUpdateBenefits = request.body.beneficios !== undefined;
+        const sourceBenefits = shouldUpdateBenefits
+          ? normalizePlanBenefits(request.body.beneficios)
+          : null;
 
         if (!Number.isFinite(precioHnl) || precioHnl < 0) {
           throw new AppError(400, "El precio del plan debe ser mayor o igual a 0", {
@@ -1206,53 +1292,99 @@ export default async function adminPlansRoutes(app) {
 
         await ensurePeriodExists(client, periodCode);
         await ensureUniquePlanNameByBranch(client, targetPlanId, branchId, nombrePlan);
-        const canonicalBenefits = await ensurePlanServiceBenefitsAccessible(client, sourceBenefits, branchId);
+        const canonicalBenefits = shouldUpdateBenefits
+          ? await ensurePlanBenefitsAccessible(client, sourceBenefits, branchId, [])
+          : null;
 
         if (shouldMutatePlanBase) {
           if (supportsPlanCategoryColumn) {
-            await client.query(
-              `
-                UPDATE public.membership_plans
-                SET
-                  nombre_plan = $2,
-                  descripcion = $3,
-                  periodo_membresia_codigo = $4,
-                  categoria_nivel = $5::smallint,
-                  beneficios = $6::jsonb,
-                  activo = TRUE,
-                  updated_at = NOW()
-                WHERE id_plan = $1::uuid
-              `,
-              [
-                targetPlanId,
-                nombrePlan,
-                descripcion ?? null,
-                periodCode,
-                categoriaNivel,
-                serializePlanBenefits(canonicalBenefits),
-              ]
-            );
+            if (shouldUpdateBenefits) {
+              await client.query(
+                `
+                  UPDATE public.membership_plans
+                  SET
+                    nombre_plan = $2,
+                    descripcion = $3,
+                    periodo_membresia_codigo = $4,
+                    categoria_nivel = $5::smallint,
+                    beneficios = $6::jsonb,
+                    activo = TRUE,
+                    updated_at = NOW()
+                  WHERE id_plan = $1::uuid
+                `,
+                [
+                  targetPlanId,
+                  nombrePlan,
+                  descripcion ?? null,
+                  periodCode,
+                  categoriaNivel,
+                  serializePlanBenefits(canonicalBenefits),
+                ]
+              );
+            } else {
+              await client.query(
+                `
+                  UPDATE public.membership_plans
+                  SET
+                    nombre_plan = $2,
+                    descripcion = $3,
+                    periodo_membresia_codigo = $4,
+                    categoria_nivel = $5::smallint,
+                    activo = TRUE,
+                    updated_at = NOW()
+                  WHERE id_plan = $1::uuid
+                `,
+                [
+                  targetPlanId,
+                  nombrePlan,
+                  descripcion ?? null,
+                  periodCode,
+                  categoriaNivel,
+                ]
+              );
+            }
           } else {
-            await client.query(
-              `
-                UPDATE public.membership_plans
-                SET
-                  nombre_plan = $2,
-                  descripcion = $3,
-                  periodo_membresia_codigo = $4,
-                  beneficios = $5::jsonb,
-                  activo = TRUE,
-                  updated_at = NOW()
-                WHERE id_plan = $1::uuid
-              `,
-              [
-                targetPlanId,
-                nombrePlan,
-                descripcion ?? null,
-                periodCode,
-                serializePlanBenefits(canonicalBenefits),
-              ]
-            );
+            if (shouldUpdateBenefits) {
+              await client.query(
+                `
+                  UPDATE public.membership_plans
+                  SET
+                    nombre_plan = $2,
+                    descripcion = $3,
+                    periodo_membresia_codigo = $4,
+                    beneficios = $5::jsonb,
+                    activo = TRUE,
+                    updated_at = NOW()
+                  WHERE id_plan = $1::uuid
+                `,
+                [
+                  targetPlanId,
+                  nombrePlan,
+                  descripcion ?? null,
+                  periodCode,
+                  serializePlanBenefits(canonicalBenefits),
+                ]
+              );
+            } else {
+              await client.query(
+                `
+                  UPDATE public.membership_plans
+                  SET
+                    nombre_plan = $2,
+                    descripcion = $3,
+                    periodo_membresia_codigo = $4,
+                    activo = TRUE,
+                    updated_at = NOW()
+                  WHERE id_plan = $1::uuid
+                `,
+                [
+                  targetPlanId,
+                  nombrePlan,
+                  descripcion ?? null,
+                  periodCode,
+                ]
+              );
+            }
           }
         }
 
