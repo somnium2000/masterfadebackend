@@ -12,6 +12,7 @@ import {
   resolveBookingSelection,
   resolveBranchIdsForClaims,
 } from "../../../services/agendaService.js";
+import { consumeMembershipForCompletedAppointment } from "../../../services/membershipService.js";
 
 const CONFIG_ALLOWED_ROLES = ["admin", "super_admin"];
 const OPERATIONAL_ALLOWED_ROLES = ["admin", "super_admin", "barbero"];
@@ -940,6 +941,17 @@ export default async function adminCitasRoutes(app) {
         }
       }
 
+      let consumoMembresia = null;
+      if (estadoDestino === "completada") {
+        consumoMembresia = await consumeMembershipForCompletedAppointment(dbClient, {
+          idCita,
+          idCliente: cita.id_cliente ?? null,
+          idSucursal: cita.id_sucursal,
+          ordenIntegrante: cita.orden_integrante ?? null,
+          usuarioEjecutorId: roleScope.actor_usuario_id ?? null,
+        });
+      }
+
       await dbClient.query(
         `
           UPDATE public.citas
@@ -998,6 +1010,7 @@ export default async function adminCitasRoutes(app) {
           estado_origen: estadoOrigen,
           estado_destino: estadoDestino,
         },
+        consumo_membresia: consumoMembresia,
       });
     } catch (error) {
       try {

@@ -9,6 +9,7 @@ import {
 } from "../../services/storage/storageService.js";
 import {
   acquireMembershipPlan,
+  cancelMembership,
   getClienteMembershipState,
   registerSubscriptionAlertEvent,
 } from "../../services/membershipService.js";
@@ -798,6 +799,7 @@ export default async function clienteRoutes(app) {
               precio_hnl: acquisition.plan.precio_hnl,
               inicio_at: acquisition.subscription.inicio_at,
               fin_at: acquisition.subscription.fin_at,
+              transicion: acquisition.transition || null,
             },
             estado_plan: estado,
           },
@@ -813,6 +815,73 @@ export default async function clienteRoutes(app) {
           error,
           "No se pudo adquirir el plan de membresía",
           "CLIENTE_MEMBERSHIP_ACQUIRE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/cancelar",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          properties: {
+            motivo_fin_codigo: { type: "string", minLength: 3, maxLength: 40 },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+        const cancelled = await cancelMembership(client, {
+          clienteId: context.clienteId,
+          motivoFinCodigo: request.body?.motivo_fin_codigo || "cancelacion",
+        });
+        await client.query("COMMIT");
+        txStarted = false;
+
+        const estado = await getClienteMembershipState(client, context.clienteId);
+        return sendOk(
+          reply,
+          {
+            cancelacion: cancelled,
+            estado_plan: estado,
+          },
+          { requestId: request.id }
+        );
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo cancelar la membresía",
+          "CLIENTE_MEMBERSHIP_CANCEL_ERROR"
         );
       } finally {
         client.release();
