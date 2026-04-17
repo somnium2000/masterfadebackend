@@ -25,6 +25,10 @@ export class PaymentProviderFactory {
         }
 
         const provider = String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase().trim();
+        const nodeEnv = String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase();
+        if ((nodeEnv === "production" || nodeEnv === "prod") && provider === "mock") {
+            throw new Error("PAYMENT_PROVIDER=mock no esta permitido en produccion.");
+        }
 
         switch (provider) {
             case "mock":

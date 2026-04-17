@@ -145,6 +145,30 @@ function getProviderAdapter(providerCode) {
   return null;
 }
 
+function validateWebhookFreshness(request) {
+  const timestampHeader = String(request.headers?.["x-webhook-timestamp"] || "").trim();
+  if (!timestampHeader) {
+    throw new AppError(400, "Cabecera de tiempo de webhook requerida", {
+      code: "PAGOS_WEBHOOK_TIMESTAMP_REQUIRED",
+    });
+  }
+
+  const parsedTs = Number(timestampHeader);
+  if (!Number.isFinite(parsedTs)) {
+    throw new AppError(400, "Cabecera de tiempo de webhook invalida", {
+      code: "PAGOS_WEBHOOK_TIMESTAMP_INVALID",
+    });
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const diff = Math.abs(nowSeconds - parsedTs);
+  if (diff > Number(process.env.WEBHOOK_REPLAY_WINDOW_SECONDS || 300)) {
+    throw new AppError(401, "Webhook fuera de ventana permitida", {
+      code: "PAGOS_WEBHOOK_REPLAY_DETECTED",
+    });
+  }
+}
+
 async function loadOwnedAppointment(client, { citaId, clienteId, personaId }) {
   const { rows } = await client.query(
     `
@@ -217,6 +241,12 @@ export default async function pagosRoutes(app) {
   app.post(
     "/crear-intent",
     {
+      config: {
+        rateLimit: {
+          max: Number(process.env.PAGOS_CREAR_INTENT_RATE_LIMIT_MAX || 20),
+          timeWindow: process.env.PAGOS_CREAR_INTENT_RATE_LIMIT_WINDOW || "1 minute",
+        },
+      },
       preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
       schema: {
         body: {
@@ -288,7 +318,12 @@ export default async function pagosRoutes(app) {
         await expireStaleAppointmentReservations(dbClient, { logger: request.log });
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
         const citaId = assertUuid(request.body?.id_cita, "id_cita");
-        const configuredProvider = safeText(process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+        const configuredProvider = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+        if (app.config?.isProduction && configuredProvider === "mock") {
+          throw new AppError(500, "Proveedor de pago no permitido en produccion", {
+            code: "PAGOS_PROVIDER_MOCK_FORBIDDEN",
+          });
+        }
         const providerAdapter = PaymentProviderFactory.create();
 
         await dbClient.query("BEGIN");
@@ -458,6 +493,14 @@ export default async function pagosRoutes(app) {
   app.post(
     "/webhook/:proveedor",
     {
+      config: {
+        rawBody: true,
+        rateLimit: {
+          max: Number(process.env.PAGOS_WEBHOOK_RATE_LIMIT_MAX || 120),
+          timeWindow: process.env.PAGOS_WEBHOOK_RATE_LIMIT_WINDOW || "1 minute",
+          allowList: (request) => request.ip === "127.0.0.1" || request.ip === "::1",
+        },
+      },
       schema: {
         params: {
           type: "object",
@@ -506,6 +549,8 @@ export default async function pagosRoutes(app) {
       const dbClient = await app.db.connect();
 
       try {
+        validateWebhookFreshness(request);
+
         const providerCode = String(request.params?.proveedor || "").trim().toLowerCase();
         const body = request.body && typeof request.body === "object" ? request.body : {};
         const providerIntentId = safeText(body.provider_intent_id ?? body.providerIntentId ?? body.referencia_externa);
@@ -540,7 +585,26 @@ export default async function pagosRoutes(app) {
 
         const providerAdapter = getProviderAdapter(providerCode);
         const signature = safeText(request.headers?.["x-signature"] ?? request.headers?.["x-webhook-signature"]);
-        const rawBody = JSON.stringify(body);
+        const rawBody = String(request.rawBody || "");
+
+        if (providerCode === "mock") {
+          const expectedMockSecret = safeText(process.env.MOCK_WEBHOOK_SECRET);
+          if (expectedMockSecret && signature !== expectedMockSecret) {
+            throw new AppError(401, "Firma de webhook invalida", {
+              code: "PAGOS_WEBHOOK_SIGNATURE_INVALID",
+            });
+          }
+        } else if (!providerAdapter) {
+          throw new AppError(400, "Proveedor de webhook no soportado", {
+            code: "PAGOS_WEBHOOK_PROVIDER_UNSUPPORTED",
+          });
+        }
+
+        if (!rawBody) {
+          throw new AppError(400, "Cuerpo de webhook invalido", {
+            code: "PAGOS_WEBHOOK_RAW_BODY_REQUIRED",
+          });
+        }
 
         if (providerAdapter && !providerAdapter.verifyWebhookSignature(rawBody, signature)) {
           throw new AppError(401, "Firma de webhook invalida", {

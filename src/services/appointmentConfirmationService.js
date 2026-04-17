@@ -53,22 +53,29 @@ export async function confirmAppointmentWithoutPayment(client, {
     [appointmentId]
   );
 
-  await client.query(
-    `
-      INSERT INTO public.audit_logs (accion, metadata, created_at)
-      VALUES (
-        'cita_confirmada_sin_pago',
-        jsonb_build_object(
-          'id_cita', $1::uuid,
-          'motivo_confirmacion', $2::text
-        ),
-        now()
-      )
-    `,
-    [appointmentId, String(motivo_confirmacion || "simulacion_sin_pago")]
-  ).catch(() => {
-    // Compatibilidad: algunos entornos no tienen audit_logs.
-  });
+  // Evita dejar la transaccion abortada cuando un entorno no tiene audit_logs.
+  // Usamos savepoint para encapsular este write opcional sin romper el flujo principal.
+  await client.query("SAVEPOINT sp_confirm_without_payment_audit");
+  try {
+    await client.query(
+      `
+        INSERT INTO public.audit_logs (accion, metadata, created_at)
+        VALUES (
+          'cita_confirmada_sin_pago',
+          jsonb_build_object(
+            'id_cita', $1::uuid,
+            'motivo_confirmacion', $2::text
+          ),
+          now()
+        )
+      `,
+      [appointmentId, String(motivo_confirmacion || "simulacion_sin_pago")]
+    );
+    await client.query("RELEASE SAVEPOINT sp_confirm_without_payment_audit");
+  } catch {
+    await client.query("ROLLBACK TO SAVEPOINT sp_confirm_without_payment_audit");
+    await client.query("RELEASE SAVEPOINT sp_confirm_without_payment_audit");
+  }
 
   return appointmentUpdate.rows[0];
 }

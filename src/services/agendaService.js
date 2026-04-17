@@ -5,8 +5,8 @@ import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export const OCCUPIED_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
-export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
+export const OCCUPIED_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
+export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
 export const BOOKING_SELECTION_TYPES = ["services", "package"];
 export const HOLD_EXPIRABLE_APPOINTMENT_STATES = ["en_espera", "pendiente_pago"];
 export const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
@@ -15,7 +15,8 @@ export const APPOINTMENT_STATE_TRANSITIONS = {
   en_espera: ["confirmada", "cancelada", "expirada"],
   pendiente_pago: ["confirmada", "cancelada", "expirada"],
   confirmada: ["en_salon", "cancelada", "no_show"],
-  en_salon: ["completada", "no_show"],
+  en_salon: ["en_atencion", "no_show"],
+  en_atencion: ["completada"],
 };
 export const SYSTEM_PARAMETER_KEYS = [
   "hold_duracion_min",
@@ -26,7 +27,7 @@ export const SYSTEM_PARAMETER_KEYS = [
   "simulacion_sin_pago",
   "masterpuntos_migracion_manual_habilitada",
 ];
-export const SLOT_INTERVAL_MINUTES = 30;
+export const SLOT_INTERVAL_MINUTES = 5;
 
 function createProviderAdapterByCode(providerCode) {
   const normalized = String(providerCode || "").trim().toLowerCase();
@@ -1382,12 +1383,43 @@ export async function insertAppointmentNotification(client, payload) {
   return rows[0] ?? null;
 }
 
-export function mapSlotsForResponse(slots) {
-  return (Array.isArray(slots) ? slots : []).map((slot) => ({
-    hora: slot.hora,
-    inicio_at: slot.inicio_at.toISOString(),
-    fin_at: slot.fin_at.toISOString(),
-  }));
+function getPeriodKeyFromTimeLabel(timeLabel) {
+  const normalized = String(timeLabel || "").trim();
+  const match = normalized.match(/^(\d{2}):(\d{2})/);
+  if (!match) return "noche";
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return "noche";
+  const totalMinutes = (hour * 60) + minute;
+  if (totalMinutes >= 6 * 60 && totalMinutes < 12 * 60) return "manana";
+  if (totalMinutes >= 12 * 60 && totalMinutes < 18 * 60) return "tarde";
+  return "noche";
+}
+
+export function mapSlotsForResponse(slots, { duracion_visible_min = 0 } = {}) {
+  const safeVisibleDuration = Math.max(0, Number(duracion_visible_min || 0));
+  return (Array.isArray(slots) ? slots : []).map((slot) => {
+    const startAt = slot?.inicio_at instanceof Date ? slot.inicio_at : new Date(slot?.inicio_at || "");
+    const safeStart = Number.isNaN(startAt.getTime()) ? null : startAt;
+    const endAtRaw = slot?.fin_at instanceof Date ? slot.fin_at : new Date(slot?.fin_at || "");
+    const safeEnd = Number.isNaN(endAtRaw.getTime()) ? null : endAtRaw;
+    const visibleEndAt = safeStart
+      ? new Date(safeStart.getTime() + safeVisibleDuration * 60 * 1000)
+      : null;
+    const horaInicio = String(slot?.hora || "").trim() || (safeStart ? toTimeLabel(safeStart) : "");
+    const horaFinVisible = visibleEndAt ? toTimeLabel(visibleEndAt) : horaInicio;
+    const periodKey = getPeriodKeyFromTimeLabel(horaInicio);
+    return {
+      hora: horaInicio,
+      inicio_at: safeStart ? safeStart.toISOString() : null,
+      fin_at: safeEnd ? safeEnd.toISOString() : null,
+      disponible: true,
+      duracion_visible_min: safeVisibleDuration,
+      hora_fin_visible: horaFinVisible,
+      period_key: periodKey,
+      range_label: `${horaInicio} - ${horaFinVisible}`,
+    };
+  }).filter((slot) => Boolean(slot.hora && slot.inicio_at && slot.fin_at));
 }
 
 export function mapDayAvailabilityForResponse(entries) {

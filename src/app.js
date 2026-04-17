@@ -9,8 +9,19 @@ import membershipAlerts from "./plugins/membershipAlerts.js";
 import routes from "./routes/v1/index.js";
 import { globalErrorHandler } from "./utils/errors.js";
 
+function parseTrustProxy(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return false;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return false;
+}
+
 export async function buildApp() {
-  const app = Fastify({ logger: true });
+  const app = Fastify({
+    logger: true,
+    trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+  });
 
   // AM: Registrar el error handler global antes de cargar rutas para unificar el contrato de errores.
   app.setErrorHandler(globalErrorHandler);

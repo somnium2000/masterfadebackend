@@ -296,6 +296,23 @@ const PUBLIC_PACKAGES_SQL = `
   GROUP BY p.id_paquete, eo.precio_hnl, eo.orden_visual, eo.id_sucursal
   HAVING COUNT(pd.id_servicio) > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
+     AND BOOL_AND(
+      s.id_servicio IS NOT NULL
+      AND s.activo IS TRUE
+      AND s.agendable IS TRUE
+      AND s.visible_publico IS TRUE
+      AND EXISTS (
+        SELECT 1
+        FROM public.servicios_tarifas st
+        WHERE st.id_servicio = pd.id_servicio
+          AND st.id_sucursal = eo.id_sucursal
+          AND st.deleted_at IS NULL
+          AND st.activo IS TRUE
+          AND st.vigente_desde <= CURRENT_DATE
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+          AND st.precio_hnl IS NOT NULL
+      )
+    )
   ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
 `;
 

@@ -116,7 +116,7 @@ const DEPENDENCY_SUMMARY_SQL = `
      FROM public.citas ci
      WHERE ci.id_sucursal = $1::uuid
        AND ci.deleted_at IS NULL
-       AND ci.estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada', 'en_salon')
+      AND ci.estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada', 'en_salon', 'en_atencion')
        AND ci.inicio_at >= NOW()) AS citas_futuras_activas
 `;
 

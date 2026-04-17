@@ -47,7 +47,7 @@ export const STORAGE_SCOPE_REGISTRY = Object.freeze({
     requiresBranchId: false,
     requiresEntityId: false,
     allowedRoles: ["super_admin"],
-    allowedMimeTypes: ["image/jpeg", "image/png", "image/webp", "image/svg+xml"],
+    allowedMimeTypes: ["image/jpeg", "image/png", "image/webp"],
     maxBytes: 5 * MB,
   },
   private_client_profile: {

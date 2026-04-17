@@ -4,7 +4,7 @@ import { buildAssetReadUrl } from "../../services/storage/storageService.js";
 
 const BARBER_ALLOWED_ROLES = ["barbero", "admin", "super_admin"];
 const OPERATIONAL_TIMEZONE = "America/Tegucigalpa";
-const PENDING_APPOINTMENT_STATES = ["confirmada", "en_espera", "pendiente_pago"];
+const PENDING_APPOINTMENT_STATES = ["confirmada", "en_salon", "en_atencion", "en_espera", "pendiente_pago"];
 
 const BARBER_PROFILE_SQL = `
   SELECT

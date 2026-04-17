@@ -22,6 +22,7 @@ const STATUS_CHANGE_WINDOW_MINUTES = 10;
 const OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES = 5;
 const FINISH_ALERT_THRESHOLD_MINUTES = 7;
 const OPERATIONAL_TIMEZONE = "America/Tegucigalpa";
+const OPERATIONAL_DELAY_AFFECTED_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
 let appointmentContactColumnsSupportCache = null;
 
 function sendHandled(reply, request, error, message, code) {
@@ -30,6 +31,9 @@ function sendHandled(reply, request, error, message, code) {
       ADMIN_CITAS_STATUS_WINDOW_NOT_OPEN: "La cita aún no está disponible para ese cambio de estado.",
       ADMIN_CITAS_STATUS_TRANSITION_INVALID: "El cambio de estado solicitado no está disponible para esta cita.",
       ADMIN_CITAS_STATUS_START_INVALID: "La cita no se puede actualizar en este momento.",
+      ADMIN_CITAS_ARRIVAL_STATE_INVALID: "La cita no se puede marcar en salon en su estado actual.",
+      ADMIN_CITAS_START_ATTENTION_STATE_INVALID: "La cita debe estar en salon antes de iniciar atencion.",
+      ADMIN_CITAS_FINISH_ATTENTION_STATE_INVALID: "La cita debe estar en atencion antes de finalizarla.",
     };
     const safeCodes = new Set(Object.keys(safeMessageByCode));
     return sendError(reply, error.statusCode, safeMessageByCode[error.code] || error.message, {
@@ -831,7 +835,7 @@ async function propagateOperationalDelay(client, {
     [
       citaCausante.id_empleado_barbero,
       citaCausante.id_cita,
-      ["en_espera", "pendiente_pago", "confirmada"],
+      OPERATIONAL_DELAY_AFFECTED_STATES,
       citaCausante.inicio_at,
     ]
   );
@@ -1476,6 +1480,69 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
+  app.post("/:id_cita/registrar-llegada", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idCita = assertUuid(request.params?.id_cita, "id_cita");
+
+      await dbClient.query("BEGIN");
+      const cita = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        forUpdate: true,
+      });
+
+      const estadoActual = String(cita.estado_cita_codigo || "");
+      if (estadoActual !== "confirmada") {
+        throw new AppError(409, "La cita no se puede marcar en salon en su estado actual", {
+          code: "ADMIN_CITAS_ARRIVAL_STATE_INVALID",
+          details: { id_cita: idCita, estado_cita_codigo: estadoActual },
+        });
+      }
+
+      const now = new Date();
+      await dbClient.query(
+        `
+          UPDATE public.citas
+          SET estado_cita_codigo = 'en_salon',
+              llegada_real_at = COALESCE(llegada_real_at, $2::timestamptz),
+              updated_at = now()
+          WHERE id_cita = $1::uuid
+        `,
+        [idCita, now.toISOString()]
+      );
+
+      const citaActualizada = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+      });
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, {
+        cita: mapOperationalAppointment(citaActualizada),
+        llegada: {
+          registrada_at: citaActualizada.llegada_real_at
+            ? new Date(citaActualizada.llegada_real_at).toISOString()
+            : now.toISOString(),
+        },
+      });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(reply, request, error, "No se pudo registrar la llegada de la cita", "ADMIN_CITAS_REGISTER_ARRIVAL_ERROR");
+    } finally {
+      dbClient.release();
+    }
+  });
+
   app.post("/:id_cita/iniciar-atencion", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
     const dbClient = await app.db.connect();
     try {
@@ -1493,9 +1560,9 @@ export default async function adminCitasRoutes(app) {
       });
 
       const estadoActual = String(cita.estado_cita_codigo || "");
-      if (!["confirmada", "en_espera", "pendiente_pago"].includes(estadoActual)) {
-        throw new AppError(409, "La cita no se puede iniciar en su estado actual", {
-          code: "ADMIN_CITAS_START_STATE_INVALID",
+      if (estadoActual !== "en_salon") {
+        throw new AppError(409, "La cita debe estar en salon para iniciar atencion", {
+          code: "ADMIN_CITAS_START_ATTENTION_STATE_INVALID",
           details: { id_cita: idCita, estado_cita_codigo: estadoActual },
         });
       }
@@ -1509,7 +1576,7 @@ export default async function adminCitasRoutes(app) {
       await dbClient.query(
         `
           UPDATE public.citas
-          SET estado_cita_codigo = 'en_salon',
+          SET estado_cita_codigo = 'en_atencion',
               atencion_iniciada_at = COALESCE(atencion_iniciada_at, $2::timestamptz),
               retraso_inicio_min = $3::int,
               updated_at = now()
@@ -1570,9 +1637,9 @@ export default async function adminCitasRoutes(app) {
         forUpdate: true,
       });
 
-      if (String(cita.estado_cita_codigo || "") !== "en_salon") {
+      if (String(cita.estado_cita_codigo || "") !== "en_atencion") {
         throw new AppError(409, "Solo puedes finalizar citas en atencion", {
-          code: "ADMIN_CITAS_FINISH_STATE_INVALID",
+          code: "ADMIN_CITAS_FINISH_ATTENTION_STATE_INVALID",
           details: { id_cita: idCita, estado_cita_codigo: cita.estado_cita_codigo },
         });
       }

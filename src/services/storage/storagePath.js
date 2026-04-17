@@ -4,7 +4,6 @@ const MIME_EXTENSION_MAP = Object.freeze({
   "image/jpeg": "jpg",
   "image/png": "png",
   "image/webp": "webp",
-  "image/svg+xml": "svg",
 });
 
 function normalizeSlug(value) {

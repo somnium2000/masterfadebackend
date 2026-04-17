@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log*
+*.log
+*.zip
+.env
+.env.*
+.git
+.gitignore
+db
+docs
+coverage
+dist
+build
+tmp
+.cache
