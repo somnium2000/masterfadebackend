@@ -1,5 +1,5 @@
 import { AppError } from "../utils/errors.js";
-import { assertUuid, resolveBranchIdsForClaims } from "./agendaService.js";
+import { assertUuid, getSystemParameters, resolveBranchIdsForClaims } from "./agendaService.js";
 
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_RULE = {
@@ -13,6 +13,7 @@ const DEFAULT_RULE = {
   activo: true,
   servicios_redimibles: [],
 };
+let legacyMigrationSchemaSupportCache = null;
 
 function normalizeText(value) {
   return String(value || "").trim();
@@ -117,6 +118,26 @@ function assertBranchInScope(branchIds, branchId) {
 
 async function materializeExpiredCycles(client, idCliente = null) {
   await client.query("SELECT public.fn_points_materialize_expired_cycles($1::uuid)", [idCliente]);
+}
+
+async function getLegacyMigrationConfig(client) {
+  const params = await getSystemParameters(client);
+  return {
+    migracion_manual_habilitada: Boolean(params?.masterpuntos_migracion_manual_habilitada?.valor_booleano ?? false),
+  };
+}
+
+async function getLegacyMigrationSchemaSupport(client) {
+  if (legacyMigrationSchemaSupportCache) return legacyMigrationSchemaSupportCache;
+  const { rows } = await client.query(
+    `
+      SELECT to_regclass('public.points_legacy_migrations') IS NOT NULL AS has_points_legacy_migrations
+    `
+  );
+  legacyMigrationSchemaSupportCache = {
+    has_points_legacy_migrations: Boolean(rows?.[0]?.has_points_legacy_migrations),
+  };
+  return legacyMigrationSchemaSupportCache;
 }
 
 async function ensureServicesEligible(client, serviceIds, { idSucursal = null } = {}) {
@@ -336,6 +357,16 @@ async function getRuleById(client, idRule) {
 }
 
 async function getClientCardById(client, idCliente, branchIds) {
+  const legacySupport = await getLegacyMigrationSchemaSupport(client);
+  const legacySelectSql = legacySupport.has_points_legacy_migrations
+    ? "plm.id_migracion IS NOT NULL AS legacy_migracion_aplicada,"
+    : "FALSE AS legacy_migracion_aplicada,";
+  const legacyJoinSql = legacySupport.has_points_legacy_migrations
+    ? `
+      LEFT JOIN public.points_legacy_migrations plm
+        ON plm.id_cliente = c.id_cliente
+    `
+    : "";
   const { rows } = await client.query(
     `
       WITH rule_by_branch AS (
@@ -381,6 +412,7 @@ async function getClientCardById(client, idCliente, branchIds) {
         cp.email AS correo_principal,
         COALESCE(vpb.balance_puntos, 0)::int AS balance_puntos,
         COALESCE(rbb.puntos_para_premio, (SELECT puntos_para_premio FROM global_rule), 10)::int AS puntos_para_premio,
+        ${legacySelectSql}
         cycle.primer_acumulado_at,
         cycle.vence_at
       FROM public.clientes c
@@ -394,6 +426,7 @@ async function getClientCardById(client, idCliente, branchIds) {
         ON rbb.id_sucursal = c.id_sucursal_origen
       LEFT JOIN cycle
         ON cycle.id_cliente = c.id_cliente
+      ${legacyJoinSql}
       LEFT JOIN LATERAL (
         SELECT c2.direccion_correo::text AS email
         FROM public.correos c2
@@ -437,6 +470,7 @@ async function getClientCardById(client, idCliente, branchIds) {
     progreso_actual: progress,
     puntos_para_premio: required,
     premio_disponible: balance >= required,
+    legacy_migracion_aplicada: Boolean(row.legacy_migracion_aplicada),
   };
 }
 
@@ -474,7 +508,7 @@ export async function getMasterPuntosContext(app, claims) {
   const { branchIds } = await getScope(app, claims);
   const client = await app.db.connect();
   try {
-    const [branchesResult, servicesResult, rules] = await Promise.all([
+    const [branchesResult, servicesResult, rules, config] = await Promise.all([
       client.query(
         `
           SELECT id_sucursal, nombre_sucursal
@@ -496,6 +530,7 @@ export async function getMasterPuntosContext(app, claims) {
         `
       ),
       listRulesByScope(client, branchIds),
+      getLegacyMigrationConfig(client),
     ]);
 
     return {
@@ -503,6 +538,7 @@ export async function getMasterPuntosContext(app, claims) {
       servicios_catalogo: servicesResult.rows.map(mapServiceRow),
       regla_global: rules.regla_global,
       reglas_sucursal: rules.reglas_sucursal,
+      parametros: config,
     };
   } finally {
     client.release();
@@ -513,6 +549,19 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
   const { branchIds } = await getScope(app, claims);
   const client = await app.db.connect();
   try {
+    const [config, legacySupport] = await Promise.all([
+      getLegacyMigrationConfig(client),
+      getLegacyMigrationSchemaSupport(client),
+    ]);
+    const legacySelectSql = legacySupport.has_points_legacy_migrations
+      ? "plm.id_migracion IS NOT NULL AS legacy_migracion_aplicada,"
+      : "FALSE AS legacy_migracion_aplicada,";
+    const legacyJoinSql = legacySupport.has_points_legacy_migrations
+      ? `
+        LEFT JOIN public.points_legacy_migrations plm
+          ON plm.id_cliente = c.id_cliente
+      `
+      : "";
     const params = [branchIds, NIL_UUID];
     const where = [
       "c.deleted_at IS NULL",
@@ -557,7 +606,7 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
             ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
             LIMIT 1
           ) cp ON TRUE
-          WHERE ${where.join(" AND ")}
+      WHERE ${where.join(" AND ")}
         ),
         rules_by_branch AS (
           SELECT DISTINCT ON (COALESCE(pr.id_sucursal, $2::uuid))
@@ -602,6 +651,7 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
           cp.email AS correo_principal,
           COALESCE(vpb.balance_puntos, 0)::int AS balance_puntos,
           COALESCE(rbb.puntos_para_premio, (SELECT puntos_para_premio FROM global_rule), 10)::int AS puntos_para_premio,
+          ${legacySelectSql}
           lc.primer_acumulado_at,
           lc.vence_at
         FROM scoped_clients c
@@ -615,6 +665,7 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
           ON rbb.id_sucursal = c.id_sucursal_origen
         LEFT JOIN latest_cycle lc
           ON lc.id_cliente = c.id_cliente
+        ${legacyJoinSql}
         LEFT JOIN LATERAL (
           SELECT c2.direccion_correo::text AS email
           FROM public.correos c2
@@ -655,8 +706,11 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
           progreso_actual: progress,
           puntos_para_premio: required,
           premio_disponible: balance >= required,
+          legacy_migracion_aplicada: Boolean(row.legacy_migracion_aplicada),
+          can_add_legacy_points: Boolean(config.migracion_manual_habilitada && !row.legacy_migracion_aplicada),
         };
       }),
+      parametros: config,
     };
   } finally {
     client.release();
@@ -974,6 +1028,139 @@ export async function createMasterPuntosCanje(app, claims, payload = {}) {
         puntos_ajustados: -Math.abs(Number(inserted.rows[0].puntos ?? pointsRequired)),
       },
       cliente: refreshedCard,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function createMasterPuntosLegacyMigration(app, claims, payload = {}) {
+  const { branchIds } = await getScope(app, claims);
+  const idCliente = assertUuid(payload.id_cliente, "id_cliente");
+  const puntos = normalizePositiveInt(payload.puntos, "puntos");
+  const motivo = normalizeOptionalText(payload.motivo) || "Migracion manual de sellos";
+
+  const client = await app.db.connect();
+  try {
+    await client.query("BEGIN");
+    const config = await getLegacyMigrationConfig(client);
+    const legacySupport = await getLegacyMigrationSchemaSupport(client);
+    if (!config.migracion_manual_habilitada) {
+      throw new AppError(409, "La migracion manual legacy de puntos esta deshabilitada", {
+        code: "MASTERPUNTOS_LEGACY_DISABLED",
+      });
+    }
+    if (!legacySupport.has_points_legacy_migrations) {
+      throw new AppError(409, "Falta aplicar la migracion de base de datos para migracion legacy de puntos", {
+        code: "MASTERPUNTOS_LEGACY_MIGRATION_REQUIRED",
+      });
+    }
+
+    const cliente = await ensureClientInScope(client, idCliente, branchIds);
+    const existsResult = await client.query(
+      `
+        SELECT id_migracion
+        FROM public.points_legacy_migrations
+        WHERE id_cliente = $1::uuid
+        LIMIT 1
+      `,
+      [idCliente]
+    );
+    if (existsResult.rows[0]) {
+      throw new AppError(409, "Este cliente ya tiene migracion legacy aplicada", {
+        code: "MASTERPUNTOS_LEGACY_ALREADY_MIGRATED",
+        details: { id_cliente: idCliente },
+      });
+    }
+
+    await materializeExpiredCycles(client, idCliente);
+    const branchTarget = cliente.id_sucursal_origen ?? null;
+    const effectiveRuleResult = await client.query(
+      `
+        SELECT *
+        FROM public.fn_points_get_effective_rule($1::uuid)
+        LIMIT 1
+      `,
+      [branchTarget]
+    );
+    const effectiveRule = effectiveRuleResult.rows[0] ?? null;
+    const expiracionMeses = Number(effectiveRule?.expiracion_meses ?? 12);
+    const cycleResult = await client.query(
+      `
+        SELECT id_cycle, primer_acumulado_at, vence_at
+        FROM public.fn_points_get_or_create_active_cycle($1::uuid, $2::int, now())
+        LIMIT 1
+      `,
+      [idCliente, expiracionMeses]
+    );
+    const cycle = cycleResult.rows[0] ?? null;
+    if (!cycle?.id_cycle) {
+      throw new AppError(409, "No se pudo crear/obtener ciclo activo de puntos", {
+        code: "MASTERPUNTOS_LEGACY_CYCLE_ERROR",
+      });
+    }
+
+    const txResult = await client.query(
+      `
+        INSERT INTO public.points_transactions (
+          id_cliente,
+          id_cycle,
+          id_sucursal_origen,
+          tipo_puntos_codigo,
+          puntos,
+          vence_at,
+          motivo,
+          creado_por_usuario_id
+        )
+        VALUES ($1::uuid, $2::uuid, $3::uuid, 'acumular', $4::int, $5::timestamptz, $6::text, $7::uuid)
+        RETURNING id_points_tx, created_at
+      `,
+      [
+        idCliente,
+        cycle.id_cycle,
+        branchTarget,
+        puntos,
+        cycle.vence_at,
+        motivo,
+        claims?.user?.id_usuario ?? null,
+      ]
+    );
+    const tx = txResult.rows[0];
+
+    await client.query(
+      `
+        INSERT INTO public.points_legacy_migrations (
+          id_cliente,
+          id_points_tx,
+          puntos_migrados,
+          motivo,
+          creado_por_usuario_id
+        )
+        VALUES ($1::uuid, $2::uuid, $3::int, $4::text, $5::uuid)
+      `,
+      [
+        idCliente,
+        tx.id_points_tx,
+        puntos,
+        motivo,
+        claims?.user?.id_usuario ?? null,
+      ]
+    );
+
+    const refreshedCard = await getClientCardById(client, idCliente, branchIds);
+    await client.query("COMMIT");
+    return {
+      migracion: {
+        id_cliente: idCliente,
+        puntos_migrados: puntos,
+        id_points_tx: tx.id_points_tx,
+        created_at: tx.created_at,
+      },
+      cliente: refreshedCard,
+      parametros: config,
     };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
