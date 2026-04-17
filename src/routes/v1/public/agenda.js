@@ -9,13 +9,14 @@ import {
   expireStaleAppointmentReservations,
   findFirstAvailableBarber,
   getBarberScheduleBounds,
-  getServiceSelectionDetails,
+  getBookingSelectionDetails,
   listAvailabilityByDateRange,
   listBarbersForBranch,
   mapBarbersForResponse,
   mapDayAvailabilityForResponse,
   mapSlotsForResponse,
   parseDateOnly,
+  SLOT_INTERVAL_MINUTES,
 } from "../../../services/agendaService.js";
 
 const requestIdSchema = { type: "string" };
@@ -78,8 +79,13 @@ const slotSchema = {
     hora: { type: "string" },
     inicio_at: { type: "string", format: "date-time" },
     fin_at: { type: "string", format: "date-time" },
+    disponible: { type: "boolean" },
+    duracion_visible_min: { type: "integer" },
+    hora_fin_visible: { type: "string" },
+    period_key: { type: "string", enum: ["manana", "tarde", "noche"] },
+    range_label: { type: "string" },
   },
-  required: ["hora", "inicio_at", "fin_at"],
+  required: ["hora", "inicio_at", "fin_at", "disponible", "duracion_visible_min", "hora_fin_visible", "period_key", "range_label"],
   additionalProperties: false,
 };
 
@@ -157,10 +163,12 @@ export default async function publicAgendaRoutes(app) {
       schema: {
         querystring: {
           type: "object",
-          required: ["id_sucursal", "servicios", "fecha_desde", "fecha_hasta"],
+          required: ["id_sucursal", "fecha_desde", "fecha_hasta"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            servicios: { type: "string", minLength: 1 },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            servicios: { type: "string" },
+            id_paquete: { type: "string", format: "uuid" },
             fecha_desde: { type: "string", format: "date" },
             fecha_hasta: { type: "string", format: "date" },
             id_barbero: { type: "string", format: "uuid" },
@@ -201,12 +209,13 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
         const fechaHasta = parseDateOnly(request.query?.fecha_hasta, "fecha_hasta");
-        const serviceSelection = await getServiceSelectionDetails(
-          app.db,
-          idSucursal,
-          request.query?.servicios,
-          idBarbero
-        );
+        const serviceSelection = await getBookingSelectionDetails(app.db, {
+          id_sucursal: idSucursal,
+          selection_type: request.query?.selection_type,
+          servicios: request.query?.servicios,
+          id_paquete: request.query?.id_paquete ?? null,
+          id_barbero: idBarbero,
+        });
         const disponibilidad = await listAvailabilityByDateRange(
           app.db,
           idSucursal,
@@ -233,10 +242,12 @@ export default async function publicAgendaRoutes(app) {
       schema: {
         querystring: {
           type: "object",
-          required: ["id_sucursal", "servicios", "fecha"],
+          required: ["id_sucursal", "fecha"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            servicios: { type: "string", minLength: 1 },
+            selection_type: { type: "string", enum: ["services", "package"] },
+            servicios: { type: "string" },
+            id_paquete: { type: "string", format: "uuid" },
             fecha: { type: "string", format: "date" },
             id_barbero: { type: "string", format: "uuid" },
           },
@@ -263,6 +274,7 @@ export default async function publicAgendaRoutes(app) {
                   hora_fin: { type: ["string", "null"] },
                   duracion_total_min: { type: "integer" },
                   buffer_total_min: { type: "integer" },
+                  slot_step_min: { type: "integer" },
                 },
                 required: [
                   "fecha",
@@ -273,6 +285,7 @@ export default async function publicAgendaRoutes(app) {
                   "hora_fin",
                   "duracion_total_min",
                   "buffer_total_min",
+                  "slot_step_min",
                 ],
                 additionalProperties: false,
               },
@@ -294,12 +307,13 @@ export default async function publicAgendaRoutes(app) {
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const fecha = parseDateOnly(request.query?.fecha, "fecha");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
-        const serviceSelection = await getServiceSelectionDetails(
-          app.db,
-          idSucursal,
-          request.query?.servicios,
-          idBarbero
-        );
+        const serviceSelection = await getBookingSelectionDetails(app.db, {
+          id_sucursal: idSucursal,
+          selection_type: request.query?.selection_type,
+          servicios: request.query?.servicios,
+          id_paquete: request.query?.id_paquete ?? null,
+          id_barbero: idBarbero,
+        });
         const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
         if (idBarbero) {
@@ -308,11 +322,14 @@ export default async function publicAgendaRoutes(app) {
             fecha,
             id_barbero: idBarbero,
             barbero: availability.barbero_autoasignado,
-            horarios: mapSlotsForResponse(availability.slots),
+            horarios: mapSlotsForResponse(availability.slots, {
+              duracion_visible_min: serviceSelection.duracion_total_min,
+            }),
             hora_inicio: availability.hora_inicio ?? null,
             hora_fin: availability.hora_fin ?? null,
             duracion_total_min: serviceSelection.duracion_total_min,
             buffer_total_min: serviceSelection.buffer_total_min,
+            slot_step_min: SLOT_INTERVAL_MINUTES,
           });
         }
 
@@ -324,11 +341,14 @@ export default async function publicAgendaRoutes(app) {
           fecha,
           id_barbero: result?.barber?.id_empleado ?? null,
           barbero: result?.barber ?? null,
-          horarios: mapSlotsForResponse(result?.slots ?? []),
+          horarios: mapSlotsForResponse(result?.slots ?? [], {
+            duracion_visible_min: serviceSelection.duracion_total_min,
+          }),
           hora_inicio: bounds.hora_inicio ?? null,
           hora_fin: bounds.hora_fin ?? null,
           duracion_total_min: serviceSelection.duracion_total_min,
           buffer_total_min: serviceSelection.buffer_total_min,
+          slot_step_min: SLOT_INTERVAL_MINUTES,
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudieron consultar los horarios del dia", "PUBLIC_AGENDA_SLOTS_ERROR");

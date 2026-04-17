@@ -6,12 +6,10 @@ import { sendError } from "../utils/errors.js";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function getBearerToken(headerValue) {
-  const rawValue = String(headerValue || "").trim();
-  if (!rawValue) return null;
-
-  const match = rawValue.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || null;
+function getSessionTokenFromRequest(request) {
+  const cookieToken = String(request.cookies?.mf_session || "").trim();
+  if (cookieToken) return cookieToken;
+  return null;
 }
 
 export default fp(async function authPlugin(app) {
@@ -19,10 +17,10 @@ export default fp(async function authPlugin(app) {
   app.decorateRequest("claims", null);
 
   app.decorate("authenticate", async function authenticate(request, reply) {
-    const token = getBearerToken(request.headers.authorization);
+    const token = getSessionTokenFromRequest(request);
 
     if (!token) {
-      return sendError(reply, 401, "Token de acceso requerido", {
+      return sendError(reply, 401, "Sesion requerida", {
         code: "AUTH_TOKEN_REQUIRED",
       });
     }

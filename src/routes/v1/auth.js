@@ -1,8 +1,12 @@
+import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import { getAuthClaims } from "../../utils/authClaims.js";
 import { sendOk } from "../../utils/response.js";
 import { sendError } from "../../utils/errors.js";
 import { generateRecoveryActionLink } from "../../services/authRecovery.js";
+
+const AUTH_SESSION_COOKIE = "mf_session";
+const AUTH_CSRF_COOKIE = "mf_csrf";
 
 const loginBodySchema = {
   type: "object",
@@ -13,6 +17,7 @@ const loginBodySchema = {
     email: { type: "string", minLength: 1 },
     contrasena: { type: "string", minLength: 1 },
     password: { type: "string", minLength: 1 },
+    remember: { type: "boolean" },
   },
   anyOf: [
     { required: ["identifier"] },
@@ -94,10 +99,18 @@ const loginResponseSchema = {
       data: {
         type: "object",
         properties: {
-          token: { type: "string" },
           user: { type: "object", additionalProperties: true },
+          csrf_token: { type: "string" },
+          session: {
+            type: "object",
+            properties: {
+              authenticated: { type: "boolean" },
+            },
+            required: ["authenticated"],
+            additionalProperties: false,
+          },
         },
-        required: ["token", "user"],
+        required: ["user", "csrf_token", "session"],
         additionalProperties: true,
       },
       requestId: requestIdSchema,
@@ -577,6 +590,57 @@ function signAppToken(payload, jwtSecret) {
   });
 }
 
+function getCookieSecureFlag(app) {
+  if (typeof app.config?.cookieSecure === "boolean") {
+    return app.config.cookieSecure;
+  }
+  const raw = String(process.env.AUTH_COOKIE_SECURE ?? "").trim().toLowerCase();
+  if (raw) return ["1", "true", "yes", "on"].includes(raw);
+  return String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase() === "production";
+}
+
+function buildCookieOptions(app, { remember = false } = {}) {
+  const sameSite = app.config?.cookieSameSite || "lax";
+  const secure = getCookieSecureFlag(app);
+  const domain = String(process.env.AUTH_COOKIE_DOMAIN || "").trim() || undefined;
+  const ttlSeconds = Math.max(900, Number(app.config?.sessionTtlSeconds || process.env.AUTH_SESSION_TTL_SECONDS || 43200));
+
+  return {
+    path: "/",
+    httpOnly: true,
+    secure,
+    sameSite,
+    ...(domain ? { domain } : {}),
+    ...(remember ? { maxAge: ttlSeconds } : {}),
+  };
+}
+
+function buildCsrfCookieOptions(app, { remember = false } = {}) {
+  const base = buildCookieOptions(app, { remember });
+  return {
+    ...base,
+    httpOnly: false,
+  };
+}
+
+function issueSessionCookies(app, reply, token, { remember = false } = {}) {
+  const csrfToken = jwt.sign(
+    { type: "csrf", nonce: crypto.randomUUID() },
+    app.config?.csrfSecret || process.env.CSRF_SECRET,
+    { expiresIn: "12h" }
+  );
+
+  reply.setCookie(AUTH_SESSION_COOKIE, token, buildCookieOptions(app, { remember }));
+  reply.setCookie(AUTH_CSRF_COOKIE, csrfToken, buildCsrfCookieOptions(app, { remember }));
+  return csrfToken;
+}
+
+function clearSessionCookies(app, reply) {
+  const options = buildCookieOptions(app, { remember: false });
+  reply.clearCookie(AUTH_SESSION_COOKIE, options);
+  reply.clearCookie(AUTH_CSRF_COOKIE, { ...options, httpOnly: false });
+}
+
 function signSocialConfirmToken(payload, jwtSecret) {
   return jwt.sign(payload, jwtSecret, {
     expiresIn: process.env.AUTH_SOCIAL_CONFIRM_EXPIRES_IN?.trim() || "30m",
@@ -623,20 +687,13 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
 
-function getBearerToken(headerValue) {
-  const raw = String(headerValue || "").trim();
-  if (!raw) return null;
-  const match = raw.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || null;
-}
-
 function extractSupabaseToken(request) {
   const body = request.body || {};
   const bodyToken = String(
     body.supabase_token ?? body.access_token ?? body.token ?? ""
   ).trim();
   if (bodyToken) return bodyToken;
-  return getBearerToken(request.headers.authorization);
+  return null;
 }
 
 function extractEmailFromSupabaseUser(user) {
@@ -1032,12 +1089,6 @@ export default async function authRoutes(app) {
     {
       preHandler: app.authenticate,
       schema: {
-        headers: {
-          type: "object",
-          properties: {
-            authorization: { type: "string" },
-          },
-        },
         response: meResponseSchema,
       },
     },
@@ -1071,6 +1122,12 @@ export default async function authRoutes(app) {
   app.post(
     "/exchange",
     {
+      config: {
+        rateLimit: {
+          max: Number(process.env.AUTH_EXCHANGE_RATE_LIMIT_MAX || 20),
+          timeWindow: process.env.AUTH_EXCHANGE_RATE_LIMIT_WINDOW || "1 minute",
+        },
+      },
       schema: {
         body: exchangeBodySchema,
         response: exchangeResponseSchema,
@@ -1241,7 +1298,8 @@ export default async function authRoutes(app) {
           jwtSecret
         );
 
-        return sendOk(reply, { token, user });
+        const csrfToken = issueSessionCookies(app, reply, token, { remember: true });
+        return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
         if (error?.statusCode && error?.code) {
           return sendError(reply, error.statusCode, error.message, {
@@ -1262,6 +1320,12 @@ export default async function authRoutes(app) {
   app.post(
     "/social/confirm",
     {
+      config: {
+        rateLimit: {
+          max: Number(process.env.AUTH_SOCIAL_CONFIRM_RATE_LIMIT_MAX || 15),
+          timeWindow: process.env.AUTH_SOCIAL_CONFIRM_RATE_LIMIT_WINDOW || "1 minute",
+        },
+      },
       schema: {
         body: socialConfirmBodySchema,
         response: socialConfirmResponseSchema,
@@ -1404,7 +1468,8 @@ export default async function authRoutes(app) {
           jwtSecret
         );
 
-        return sendOk(reply, { token, user });
+        const csrfToken = issueSessionCookies(app, reply, token, { remember: true });
+        return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
         if (error?.statusCode && error?.code) {
           return sendError(reply, error.statusCode, error.message, {
@@ -1658,7 +1723,14 @@ export default async function authRoutes(app) {
     }
   );
 
-  app.post("/forgot-password", async (request, reply) => {
+  app.post("/forgot-password", {
+    config: {
+      rateLimit: {
+        max: Number(process.env.AUTH_FORGOT_RATE_LIMIT_MAX || 10),
+        timeWindow: process.env.AUTH_FORGOT_RATE_LIMIT_WINDOW || "1 minute",
+      },
+    },
+  }, async (request, reply) => {
     const email = normalizeEmail(request.body?.email);
 
     if (!email || !email.includes("@")) {
@@ -1671,6 +1743,7 @@ export default async function authRoutes(app) {
 
     if (rateLimitState.blocked) {
       reply.header("Retry-After", String(rateLimitState.retryAfterSeconds));
+      request.log.warn({ event: "auth_forgot_password_rate_limited", email }, "Forgot-password rate limited");
 
       return sendError(reply, 429, "Demasiados intentos para este correo. Intenta mas tarde.", {
         code: "AUTH_RESET_RATE_LIMIT",
@@ -1732,6 +1805,12 @@ export default async function authRoutes(app) {
   app.post(
     "/login",
     {
+      config: {
+        rateLimit: {
+          max: Number(process.env.AUTH_LOGIN_RATE_LIMIT_MAX || 10),
+          timeWindow: process.env.AUTH_LOGIN_RATE_LIMIT_WINDOW || "1 minute",
+        },
+      },
       schema: {
         body: loginBodySchema,
         response: loginResponseSchema,
@@ -1744,6 +1823,7 @@ export default async function authRoutes(app) {
         body.identifier ?? body.email ?? body.nombre_usuario ?? body.username ?? ""
       );
       const contrasena = String(body.contrasena ?? body.password ?? "");
+      const remember = body.remember === true;
 
       if (!identifier || !contrasena) {
         return sendError(reply, 400, "Faltan credenciales: se requiere correo y contrasena", {
@@ -1784,6 +1864,7 @@ export default async function authRoutes(app) {
         });
 
         if (error || !data?.user?.id) {
+          request.log.warn({ event: "auth_login_failed", identifier }, "Login failed");
           return sendError(reply, 401, error?.message || "Credenciales invalidas", {
             code: "AUTH_INVALID_CREDENTIALS",
           });
@@ -1833,7 +1914,9 @@ export default async function authRoutes(app) {
           jwtSecret
         );
 
-        return sendOk(reply, { token, user });
+        const csrfToken = issueSessionCookies(app, reply, token, { remember });
+        request.log.info({ event: "auth_login_success", userId: claims.user.id_usuario }, "Login success");
+        return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown login error";
         request.log.error({ err: error }, "Login error");
@@ -1845,4 +1928,39 @@ export default async function authRoutes(app) {
       }
     }
   );
+
+  app.post(
+    "/logout",
+    {
+      preHandler: app.authenticate,
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  logged_out: { type: "boolean" },
+                },
+                required: ["logged_out"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      clearSessionCookies(app, reply);
+      request.log.info({ event: "auth_logout", userId: request.auth?.sub || null }, "Logout success");
+      return sendOk(reply, { logged_out: true }, { requestId: request.id });
+    }
+  );
 }
+

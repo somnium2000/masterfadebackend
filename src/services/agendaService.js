@@ -5,8 +5,9 @@ import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export const OCCUPIED_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
-export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
+export const OCCUPIED_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
+export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
+export const BOOKING_SELECTION_TYPES = ["services", "package"];
 export const HOLD_EXPIRABLE_APPOINTMENT_STATES = ["en_espera", "pendiente_pago"];
 export const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 export const AUTO_NO_SHOW_GRACE_MINUTES = 5;
@@ -14,7 +15,8 @@ export const APPOINTMENT_STATE_TRANSITIONS = {
   en_espera: ["confirmada", "cancelada", "expirada"],
   pendiente_pago: ["confirmada", "cancelada", "expirada"],
   confirmada: ["en_salon", "cancelada", "no_show"],
-  en_salon: ["completada", "no_show"],
+  en_salon: ["en_atencion", "no_show"],
+  en_atencion: ["completada"],
 };
 export const SYSTEM_PARAMETER_KEYS = [
   "hold_duracion_min",
@@ -25,7 +27,7 @@ export const SYSTEM_PARAMETER_KEYS = [
   "simulacion_sin_pago",
   "masterpuntos_migracion_manual_habilitada",
 ];
-export const SLOT_INTERVAL_MINUTES = 30;
+export const SLOT_INTERVAL_MINUTES = 5;
 
 function createProviderAdapterByCode(providerCode) {
   const normalized = String(providerCode || "").trim().toLowerCase();
@@ -587,6 +589,30 @@ function mapBarberRow(row) {
   };
 }
 
+function normalizeBookingSelectionType(rawValue, { required = false } = {}) {
+  const normalized = String(rawValue || "").trim().toLowerCase();
+  if (!normalized) {
+    if (required) {
+      throw new AppError(400, "selection_type es obligatorio", {
+        code: "AGENDA_SELECTION_TYPE_REQUIRED",
+      });
+    }
+    return "services";
+  }
+
+  if (!BOOKING_SELECTION_TYPES.includes(normalized)) {
+    throw new AppError(400, "selection_type no es valido", {
+      code: "AGENDA_SELECTION_TYPE_INVALID",
+      details: {
+        selection_type: rawValue,
+        permitidos: BOOKING_SELECTION_TYPES,
+      },
+    });
+  }
+
+  return normalized;
+}
+
 export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
@@ -672,6 +698,130 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
     // El buffer se configura globalmente y se aplica una sola vez por cita.
     buffer_total_min: details.length > 0 ? Number(globalBufferMin || 0) : 0,
     monto_total_hnl: details.reduce((total, item) => total + item.precio_hnl, 0),
+  };
+}
+
+export async function getPackageSelectionDetails(client, branchId, packageId, barberId = null) {
+  const safeBranchId = assertUuid(branchId, "id_sucursal");
+  const safePackageId = assertUuid(packageId, "id_paquete");
+  const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
+
+  const packageResult = await client.query(
+    `
+      WITH picked_offer AS (
+        SELECT
+          ps.id_paquete,
+          ps.id_sucursal,
+          ps.precio_hnl
+        FROM public.paquetes_sucursal ps
+        JOIN public.sucursales su
+          ON su.id_sucursal = ps.id_sucursal
+        WHERE ps.id_paquete = $2::uuid
+          AND ps.id_sucursal = $1::uuid
+          AND ps.activo IS TRUE
+          AND ps.visible_publico IS TRUE
+          AND su.deleted_at IS NULL
+          AND su.estado IS TRUE
+        ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
+        LIMIT 1
+      )
+      SELECT
+        p.id_paquete,
+        p.nombre_paquete,
+        p.descripcion,
+        po.precio_hnl
+      FROM public.paquetes p
+      JOIN picked_offer po
+        ON po.id_paquete = p.id_paquete
+      WHERE p.deleted_at IS NULL
+        AND p.activo IS TRUE
+      LIMIT 1
+    `,
+    [safeBranchId, safePackageId]
+  );
+
+  const packageRow = packageResult.rows[0];
+  if (!packageRow) {
+    throw new AppError(404, "El paquete solicitado no existe o no esta disponible para reserva publica", {
+      code: "AGENDA_PACKAGE_NOT_FOUND",
+      details: { id_paquete: safePackageId, id_sucursal: safeBranchId },
+    });
+  }
+
+  const detailResult = await client.query(
+    `
+      SELECT
+        pd.id_servicio,
+        pd.cantidad,
+        s.nombre_servicio
+      FROM public.paquetes_detalles pd
+      JOIN public.servicios s
+        ON s.id_servicio = pd.id_servicio
+      WHERE pd.id_paquete = $1::uuid
+        AND s.deleted_at IS NULL
+      ORDER BY s.nombre_servicio ASC, pd.id_servicio ASC
+    `,
+    [safePackageId]
+  );
+
+  if (!detailResult.rows.length) {
+    throw new AppError(409, "El paquete no contiene servicios configurados", {
+      code: "AGENDA_PACKAGE_SERVICES_EMPTY",
+      details: { id_paquete: safePackageId },
+    });
+  }
+
+  const expandedServiceIds = [];
+  for (const row of detailResult.rows) {
+    const qty = Math.max(1, Number(row.cantidad || 1));
+    for (let index = 0; index < qty; index += 1) {
+      expandedServiceIds.push(row.id_servicio);
+    }
+  }
+
+  const serviceSelection = await getServiceSelectionDetails(client, safeBranchId, expandedServiceIds, safeBarberId);
+  const packagePrice = packageRow.precio_hnl == null
+    ? Number(serviceSelection.monto_total_hnl || 0)
+    : Number(packageRow.precio_hnl);
+
+  return {
+    ...serviceSelection,
+    selection_type: "package",
+    id_paquete: safePackageId,
+    paquete: {
+      id_paquete: packageRow.id_paquete,
+      nombre_paquete: packageRow.nombre_paquete,
+      descripcion: packageRow.descripcion ?? null,
+      precio_hnl: packagePrice,
+    },
+    monto_total_hnl: packagePrice,
+  };
+}
+
+export async function getBookingSelectionDetails(client, {
+  id_sucursal,
+  selection_type = "services",
+  servicios = null,
+  id_paquete = null,
+  id_barbero = null,
+} = {}) {
+  const normalizedSelectionType = normalizeBookingSelectionType(selection_type, { required: true });
+
+  if (normalizedSelectionType === "package") {
+    if (!id_paquete) {
+      throw new AppError(400, "id_paquete es obligatorio para selection_type=package", {
+        code: "AGENDA_PACKAGE_ID_REQUIRED",
+      });
+    }
+    return getPackageSelectionDetails(client, id_sucursal, id_paquete, id_barbero);
+  }
+
+  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero);
+  return {
+    ...servicesSelection,
+    selection_type: "services",
+    id_paquete: null,
+    paquete: null,
   };
 }
 
@@ -777,7 +927,9 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString) {
     ),
     client.query(
       `
-        SELECT inicio_at, fin_at
+        SELECT
+          inicio_at,
+          inicio_at + make_interval(mins => (COALESCE(duracion_total_min, 0) + COALESCE(buffer_total_min, 0))) AS fin_at
         FROM public.citas
         WHERE id_empleado_barbero = $1::uuid
           AND deleted_at IS NULL
@@ -814,7 +966,9 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
     ),
     client.query(
       `
-        SELECT inicio_at, fin_at
+        SELECT
+          inicio_at,
+          inicio_at + make_interval(mins => (COALESCE(duracion_total_min, 0) + COALESCE(buffer_total_min, 0))) AS fin_at
         FROM public.citas
         WHERE id_empleado_barbero = $1::uuid
           AND deleted_at IS NULL
@@ -1114,9 +1268,22 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
   );
 }
 
-export async function resolveBookingSelection(client, { id_sucursal, servicios, fecha_inicio, id_barbero = null }) {
+export async function resolveBookingSelection(client, {
+  id_sucursal,
+  servicios,
+  fecha_inicio,
+  id_barbero = null,
+  selection_type = "services",
+  id_paquete = null,
+}) {
   const branch = await ensureActiveBranch(client, id_sucursal);
-  const serviceSelection = await getServiceSelectionDetails(client, branch.id_sucursal, servicios, id_barbero);
+  const serviceSelection = await getBookingSelectionDetails(client, {
+    id_sucursal: branch.id_sucursal,
+    selection_type,
+    servicios,
+    id_paquete,
+    id_barbero,
+  });
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
   const dateKey = formatDateOnly(startDateTime);
   const timeKey = toTimeLabel(startDateTime);
@@ -1216,12 +1383,43 @@ export async function insertAppointmentNotification(client, payload) {
   return rows[0] ?? null;
 }
 
-export function mapSlotsForResponse(slots) {
-  return (Array.isArray(slots) ? slots : []).map((slot) => ({
-    hora: slot.hora,
-    inicio_at: slot.inicio_at.toISOString(),
-    fin_at: slot.fin_at.toISOString(),
-  }));
+function getPeriodKeyFromTimeLabel(timeLabel) {
+  const normalized = String(timeLabel || "").trim();
+  const match = normalized.match(/^(\d{2}):(\d{2})/);
+  if (!match) return "noche";
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return "noche";
+  const totalMinutes = (hour * 60) + minute;
+  if (totalMinutes >= 6 * 60 && totalMinutes < 12 * 60) return "manana";
+  if (totalMinutes >= 12 * 60 && totalMinutes < 18 * 60) return "tarde";
+  return "noche";
+}
+
+export function mapSlotsForResponse(slots, { duracion_visible_min = 0 } = {}) {
+  const safeVisibleDuration = Math.max(0, Number(duracion_visible_min || 0));
+  return (Array.isArray(slots) ? slots : []).map((slot) => {
+    const startAt = slot?.inicio_at instanceof Date ? slot.inicio_at : new Date(slot?.inicio_at || "");
+    const safeStart = Number.isNaN(startAt.getTime()) ? null : startAt;
+    const endAtRaw = slot?.fin_at instanceof Date ? slot.fin_at : new Date(slot?.fin_at || "");
+    const safeEnd = Number.isNaN(endAtRaw.getTime()) ? null : endAtRaw;
+    const visibleEndAt = safeStart
+      ? new Date(safeStart.getTime() + safeVisibleDuration * 60 * 1000)
+      : null;
+    const horaInicio = String(slot?.hora || "").trim() || (safeStart ? toTimeLabel(safeStart) : "");
+    const horaFinVisible = visibleEndAt ? toTimeLabel(visibleEndAt) : horaInicio;
+    const periodKey = getPeriodKeyFromTimeLabel(horaInicio);
+    return {
+      hora: horaInicio,
+      inicio_at: safeStart ? safeStart.toISOString() : null,
+      fin_at: safeEnd ? safeEnd.toISOString() : null,
+      disponible: true,
+      duracion_visible_min: safeVisibleDuration,
+      hora_fin_visible: horaFinVisible,
+      period_key: periodKey,
+      range_label: `${horaInicio} - ${horaFinVisible}`,
+    };
+  }).filter((slot) => Boolean(slot.hora && slot.inicio_at && slot.fin_at));
 }
 
 export function mapDayAvailabilityForResponse(entries) {

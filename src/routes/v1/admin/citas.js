@@ -20,7 +20,10 @@ const HISTORY_ALLOWED_ROLES = ["admin", "super_admin"];
 const EMERGENCY_ALLOWED_ROLES = ["admin", "super_admin"];
 const HISTORICAL_DEFAULT_STATES = ["cancelada", "expirada", "completada", "no_show", "anulada"];
 const STATUS_CHANGE_WINDOW_MINUTES = 10;
+const OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES = 5;
+const FINISH_ALERT_THRESHOLD_MINUTES = 7;
 const OPERATIONAL_TIMEZONE = "America/Tegucigalpa";
+const OPERATIONAL_DELAY_AFFECTED_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
 let appointmentContactColumnsSupportCache = null;
 
 function sendHandled(reply, request, error, message, code) {
@@ -29,6 +32,9 @@ function sendHandled(reply, request, error, message, code) {
       ADMIN_CITAS_STATUS_WINDOW_NOT_OPEN: "La cita aún no está disponible para ese cambio de estado.",
       ADMIN_CITAS_STATUS_TRANSITION_INVALID: "El cambio de estado solicitado no está disponible para esta cita.",
       ADMIN_CITAS_STATUS_START_INVALID: "La cita no se puede actualizar en este momento.",
+      ADMIN_CITAS_ARRIVAL_STATE_INVALID: "La cita no se puede marcar en salon en su estado actual.",
+      ADMIN_CITAS_START_ATTENTION_STATE_INVALID: "La cita debe estar en salon antes de iniciar atencion.",
+      ADMIN_CITAS_FINISH_ATTENTION_STATE_INVALID: "La cita debe estar en atencion antes de finalizarla.",
     };
     const safeCodes = new Set(Object.keys(safeMessageByCode));
     return sendError(reply, error.statusCode, safeMessageByCode[error.code] || error.message, {
@@ -209,8 +215,16 @@ function mapOperationalAppointment(row) {
     estado_cita_codigo: row.estado_cita_codigo,
     inicio_at: new Date(row.inicio_at).toISOString(),
     fin_at: new Date(row.fin_at).toISOString(),
+    atencion_iniciada_at: row.atencion_iniciada_at ? new Date(row.atencion_iniciada_at).toISOString() : null,
+    atencion_finalizada_at: row.atencion_finalizada_at ? new Date(row.atencion_finalizada_at).toISOString() : null,
+    retraso_inicio_min: Number(row.retraso_inicio_min ?? 0),
     duracion_total_min: Number(row.duracion_total_min ?? 0),
     buffer_total_min: Number(row.buffer_total_min ?? 0),
+    selection_type: row.selection_type ?? "services",
+    id_paquete: row.id_paquete ?? null,
+    id_lote_reagendacion: row.id_lote_reagendacion ?? null,
+    id_cita_causante_retraso: row.id_cita_causante_retraso ?? null,
+    retraso_propagado_min: row.retraso_propagado_min == null ? null : Number(row.retraso_propagado_min),
     total_pagar_hnl: Number(row.total_pagar_hnl ?? 0),
     moneda_codigo: row.moneda_codigo ?? "HNL",
     asignada_automaticamente: Boolean(row.asignada_automaticamente),
@@ -368,8 +382,13 @@ async function listOperationalAppointments(client, {
         c.estado_cita_codigo,
         c.inicio_at,
         c.fin_at,
+        c.atencion_iniciada_at,
+        c.atencion_finalizada_at,
+        c.retraso_inicio_min,
         c.duracion_total_min,
         c.buffer_total_min,
+        c.selection_type,
+        c.id_paquete,
         c.total_pagar_hnl,
         c.moneda_codigo,
         c.asignada_automaticamente,
@@ -383,7 +402,10 @@ async function listOperationalAppointments(client, {
         hold.estado_hold_codigo AS hold_estado,
         hold.expires_at AS hold_expires_at,
         intent.estado_intent_codigo AS intent_estado,
-        intent.expires_at AS intent_expires_at
+        intent.expires_at AS intent_expires_at,
+        delay_reag.id_lote_reagendacion,
+        delay_reag.id_cita_causante AS id_cita_causante_retraso,
+        delay_reag.retraso_min AS retraso_propagado_min
       FROM public.citas c
       JOIN public.sucursales s
         ON s.id_sucursal = c.id_sucursal
@@ -435,6 +457,17 @@ async function listOperationalAppointments(client, {
         ORDER BY pi.created_at DESC
         LIMIT 1
       ) intent ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT
+          cr.id_lote_reagendacion,
+          cr.id_cita_causante,
+          cr.retraso_min
+        FROM public.citas_reagendaciones cr
+        WHERE cr.id_cita = c.id_cita
+          AND cr.tipo_reagendacion_codigo = 'retraso_operativo'
+        ORDER BY cr.created_at DESC, cr.id_reagendacion DESC
+        LIMIT 1
+      ) delay_reag ON TRUE
       WHERE ${where.join(" AND ")}
       ORDER BY c.inicio_at ${normalizedSortDirection}, c.id_cita ${normalizedSortDirection}
       LIMIT $${limitIdx}::int
@@ -479,8 +512,13 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
         c.estado_cita_codigo,
         c.inicio_at,
         c.fin_at,
+        c.atencion_iniciada_at,
+        c.atencion_finalizada_at,
+        c.retraso_inicio_min,
         c.duracion_total_min,
         c.buffer_total_min,
+        c.selection_type,
+        c.id_paquete,
         c.total_pagar_hnl,
         c.moneda_codigo,
         c.asignada_automaticamente,
@@ -609,8 +647,7 @@ async function performEmergencyReschedule(client, {
     id_barbero: idBarberoNuevo,
   });
 
-  const totalMinutes = Number(selection.serviceSelection.duracion_total_min || 0)
-    + Number(selection.serviceSelection.buffer_total_min || 0);
+  const totalMinutes = Number(selection.serviceSelection.duracion_total_min || 0);
   const finAtNuevo = new Date(selection.startDateTime.getTime() + totalMinutes * 60 * 1000);
   const estadoActual = String(appointment.estado_cita_codigo || "");
   const estadoDestino = estadoActual === "en_salon" ? "confirmada" : estadoActual;
@@ -625,7 +662,6 @@ async function performEmergencyReschedule(client, {
           duracion_total_min = $6::int,
           buffer_total_min = $7::int,
           estado_cita_codigo = $8::text,
-          llegada_real_at = CASE WHEN $8::text = 'confirmada' THEN NULL ELSE llegada_real_at END,
           no_show_at = NULL,
           updated_at = now()
       WHERE id_cita = $1::uuid
@@ -667,6 +703,252 @@ async function performEmergencyReschedule(client, {
     fin_at_nuevo: finAtNuevo.toISOString(),
     estado_cita_codigo: estadoDestino,
     reasignada_automaticamente: !idBarberoNuevo,
+  };
+}
+
+function calculateDelayMinutes({ plannedStart, actualStart }) {
+  const planned = new Date(plannedStart);
+  const actual = new Date(actualStart);
+  if (Number.isNaN(planned.getTime()) || Number.isNaN(actual.getTime())) return 0;
+  return Math.max(0, Math.round((actual.getTime() - planned.getTime()) / 60000));
+}
+
+function formatDateTimeInHonduras(isoDateTime) {
+  const parsed = new Date(isoDateTime);
+  if (Number.isNaN(parsed.getTime())) return "N/D";
+  return parsed.toLocaleString("es-HN", {
+    timeZone: OPERATIONAL_TIMEZONE,
+    hour12: true,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+async function queueOperationalDelayNotifications(client, {
+  affectedAppointments = [],
+  retrasoMin = 0,
+} = {}) {
+  const targets = Array.isArray(affectedAppointments) ? affectedAppointments : [];
+  for (const item of targets) {
+    const targetEmail = String(item?.correo_cliente || "").trim().toLowerCase();
+    if (!targetEmail) continue;
+    const oldStart = formatDateTimeInHonduras(item.inicio_at_anterior);
+    const newStart = formatDateTimeInHonduras(item.inicio_at_nuevo);
+    const subject = `Actualizacion de cita - ${item.nombre_sucursal || "MasterFade"}`;
+    const body = [
+      `Hola ${item.nombre_cliente || "Cliente"},`,
+      "",
+      "Te informamos un ajuste operativo en tu cita.",
+      `Hora original: ${oldStart}`,
+      `Nueva hora: ${newStart}`,
+      `Sucursal: ${item.nombre_sucursal || "N/D"}`,
+      `Barbero: ${item.nombre_barbero || "N/D"}`,
+      `Ajuste aplicado: +${Number(retrasoMin || 0)} minutos por retraso operativo.`,
+      "",
+      "Gracias por tu comprension.",
+      "Equipo MasterFade",
+    ].join("\n");
+
+    await client.query(
+      `
+        INSERT INTO public.notificaciones_email (
+          evento,
+          correo_destino,
+          asunto,
+          cuerpo,
+          estado_notificacion_codigo,
+          id_cita
+        )
+        VALUES (
+          'cita_retraso_operativo',
+          $1::text,
+          $2::text,
+          $3::text,
+          'pendiente',
+          $4::uuid
+        )
+      `,
+      [targetEmail, subject, body, item.id_cita]
+    );
+  }
+}
+
+async function propagateOperationalDelay(client, {
+  citaCausante,
+  retrasoMin = 0,
+  actorUsuarioId = null,
+} = {}) {
+  const safeDelay = Math.max(0, Number(retrasoMin || 0));
+  if (!citaCausante?.id_cita || safeDelay < OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES) {
+    return {
+      propagated: false,
+      threshold_min: OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES,
+      retraso_min: safeDelay,
+      affected: [],
+      id_lote_reagendacion: null,
+      notifications_enqueued: 0,
+    };
+  }
+
+  const affectedResult = await client.query(
+    `
+      SELECT
+        c.id_cita,
+        c.id_sucursal,
+        c.id_empleado_barbero,
+        c.inicio_at,
+        c.fin_at,
+        c.duracion_total_min,
+        c.buffer_total_min,
+        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Cliente') AS nombre_cliente,
+        COALESCE(c.contacto_email, cp.email) AS correo_cliente,
+        COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Barbero') AS nombre_barbero,
+        s.nombre_sucursal
+      FROM public.citas c
+      JOIN public.sucursales s
+        ON s.id_sucursal = c.id_sucursal
+      JOIN public.personas pc
+        ON pc.id_persona = c.id_persona_cliente
+      JOIN public.empleados eb
+        ON eb.id_empleado = c.id_empleado_barbero
+      JOIN public.personas pb
+        ON pb.id_persona = eb.id_persona
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona_cliente
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      WHERE c.deleted_at IS NULL
+        AND c.id_empleado_barbero = $1::uuid
+        AND c.id_cita <> $2::uuid
+        AND c.estado_cita_codigo = ANY($3::text[])
+        AND c.inicio_at > $4::timestamptz
+        AND (c.inicio_at AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date = ($4::timestamptz AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date
+      ORDER BY c.inicio_at ASC, c.id_cita ASC
+      FOR UPDATE
+    `,
+    [
+      citaCausante.id_empleado_barbero,
+      citaCausante.id_cita,
+      OPERATIONAL_DELAY_AFFECTED_STATES,
+      citaCausante.inicio_at,
+    ]
+  );
+
+  if (!affectedResult.rows.length) {
+    return {
+      propagated: false,
+      threshold_min: OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES,
+      retraso_min: safeDelay,
+      affected: [],
+      id_lote_reagendacion: null,
+      notifications_enqueued: 0,
+    };
+  }
+
+  const { rows: loteRows } = await client.query(`SELECT gen_random_uuid() AS id_lote_reagendacion`);
+  const loteId = loteRows[0]?.id_lote_reagendacion ?? null;
+  const affected = [];
+
+  for (const row of affectedResult.rows) {
+    const inicioAnterior = new Date(row.inicio_at);
+    const finAnterior = new Date(row.fin_at);
+    const inicioNuevo = new Date(inicioAnterior.getTime() + safeDelay * 60 * 1000);
+    const finNuevo = new Date(finAnterior.getTime() + safeDelay * 60 * 1000);
+
+    await client.query(
+      `
+        UPDATE public.citas
+        SET inicio_at = $2::timestamptz,
+            fin_at = $3::timestamptz,
+            updated_at = now()
+        WHERE id_cita = $1::uuid
+      `,
+      [row.id_cita, inicioNuevo.toISOString(), finNuevo.toISOString()]
+    );
+
+    await client.query(
+      `
+        INSERT INTO public.citas_reagendaciones (
+          id_cita,
+          id_sucursal,
+          id_empleado_barbero_anterior,
+          id_empleado_barbero_nuevo,
+          inicio_at_anterior,
+          fin_at_anterior,
+          inicio_at_nuevo,
+          fin_at_nuevo,
+          motivo,
+          tipo_reagendacion_codigo,
+          id_usuario_accion,
+          id_cita_causante,
+          id_lote_reagendacion,
+          retraso_min
+        )
+        VALUES (
+          $1::uuid,
+          $2::uuid,
+          $3::uuid,
+          $3::uuid,
+          $4::timestamptz,
+          $5::timestamptz,
+          $6::timestamptz,
+          $7::timestamptz,
+          $8::text,
+          'retraso_operativo',
+          $9::uuid,
+          $10::uuid,
+          $11::uuid,
+          $12::int
+        )
+      `,
+      [
+        row.id_cita,
+        row.id_sucursal,
+        row.id_empleado_barbero,
+        inicioAnterior.toISOString(),
+        finAnterior.toISOString(),
+        inicioNuevo.toISOString(),
+        finNuevo.toISOString(),
+        `Reprogramacion automatica por retraso operativo de ${safeDelay} min`,
+        actorUsuarioId,
+        citaCausante.id_cita,
+        loteId,
+        safeDelay,
+      ]
+    );
+
+    affected.push({
+      id_cita: row.id_cita,
+      nombre_cliente: row.nombre_cliente,
+      correo_cliente: row.correo_cliente,
+      nombre_barbero: row.nombre_barbero,
+      nombre_sucursal: row.nombre_sucursal,
+      inicio_at_anterior: inicioAnterior.toISOString(),
+      inicio_at_nuevo: inicioNuevo.toISOString(),
+      fin_at_anterior: finAnterior.toISOString(),
+      fin_at_nuevo: finNuevo.toISOString(),
+    });
+  }
+
+  await queueOperationalDelayNotifications(client, {
+    affectedAppointments: affected,
+    retrasoMin: safeDelay,
+  });
+
+  return {
+    propagated: true,
+    threshold_min: OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES,
+    retraso_min: safeDelay,
+    affected,
+    id_lote_reagendacion: loteId,
+    notifications_enqueued: affected.length,
   };
 }
 
@@ -864,7 +1146,8 @@ export default async function adminCitasRoutes(app) {
       const branchIds = await getScopeBranches(app, request.claims);
       const roleScope = getRoleScope(request.claims);
 
-      const [sucursalesResult, barberosResult, estadosResult] = await Promise.all([
+      const operationalDate = getCurrentDateInTimeZone() || new Date().toISOString().slice(0, 10);
+      const [sucursalesResult, barberosResult, estadosResult, retrasoResumenResult] = await Promise.all([
         app.db.query(
           `
             SELECT id_sucursal, nombre_sucursal
@@ -899,6 +1182,29 @@ export default async function adminCitasRoutes(app) {
             ORDER BY estado_cita_codigo ASC
           `
         ),
+        app.db.query(
+          `
+            SELECT
+              COUNT(*) FILTER (
+                WHERE cr.tipo_reagendacion_codigo = 'retraso_operativo'
+              )::int AS citas_reagendadas_hoy,
+              COUNT(*) FILTER (
+                WHERE ne.evento = 'cita_retraso_operativo'
+                  AND ne.estado_notificacion_codigo = 'pendiente'
+              )::int AS notificaciones_pendientes_hoy
+            FROM public.citas_reagendaciones cr
+            LEFT JOIN public.notificaciones_email ne
+              ON ne.id_cita = cr.id_cita
+            LEFT JOIN public.citas cc
+              ON cc.id_cita = cr.id_cita
+            WHERE (cr.created_at AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date = $1::date
+              AND cc.id_sucursal = ANY($2::uuid[])
+              ${roleScope.barber_empleado_id ? "AND cc.id_empleado_barbero = $3::uuid" : ""}
+          `,
+          roleScope.barber_empleado_id
+            ? [operationalDate, branchIds, roleScope.barber_empleado_id]
+            : [operationalDate, branchIds]
+        ),
       ]);
 
       return sendOk(reply, {
@@ -906,6 +1212,13 @@ export default async function adminCitasRoutes(app) {
         barberos: barberosResult.rows,
         estados: estadosResult.rows,
         estados_operativos_default: OPERATIONAL_APPOINTMENT_STATES,
+        retraso_operativo: {
+          fecha_operativa: operationalDate,
+          umbral_propagacion_min: OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES,
+          umbral_alerta_fin_min: FINISH_ALERT_THRESHOLD_MINUTES,
+          citas_reagendadas_hoy: Number(retrasoResumenResult.rows[0]?.citas_reagendadas_hoy || 0),
+          notificaciones_pendientes_hoy: Number(retrasoResumenResult.rows[0]?.notificaciones_pendientes_hoy || 0),
+        },
       });
     } catch (error) {
       return sendHandled(
@@ -1115,7 +1428,6 @@ export default async function adminCitasRoutes(app) {
           SET estado_cita_codigo = $2::text,
               llegada_real_at = CASE
                 WHEN $2::text = 'en_salon' AND llegada_real_at IS NULL THEN now()
-                WHEN $2::text <> 'en_salon' THEN NULL
                 ELSE llegada_real_at
               END,
               no_show_at = CASE
@@ -1176,6 +1488,213 @@ export default async function adminCitasRoutes(app) {
         // no-op
       }
       return sendHandled(reply, request, error, "No se pudo actualizar el estado de la cita", "ADMIN_CITAS_STATUS_PATCH_ERROR");
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.post("/:id_cita/registrar-llegada", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idCita = assertUuid(request.params?.id_cita, "id_cita");
+
+      await dbClient.query("BEGIN");
+      const cita = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        forUpdate: true,
+      });
+
+      const estadoActual = String(cita.estado_cita_codigo || "");
+      if (estadoActual !== "confirmada") {
+        throw new AppError(409, "La cita no se puede marcar en salon en su estado actual", {
+          code: "ADMIN_CITAS_ARRIVAL_STATE_INVALID",
+          details: { id_cita: idCita, estado_cita_codigo: estadoActual },
+        });
+      }
+
+      const now = new Date();
+      await dbClient.query(
+        `
+          UPDATE public.citas
+          SET estado_cita_codigo = 'en_salon',
+              llegada_real_at = COALESCE(llegada_real_at, $2::timestamptz),
+              updated_at = now()
+          WHERE id_cita = $1::uuid
+        `,
+        [idCita, now.toISOString()]
+      );
+
+      const citaActualizada = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+      });
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, {
+        cita: mapOperationalAppointment(citaActualizada),
+        llegada: {
+          registrada_at: citaActualizada.llegada_real_at
+            ? new Date(citaActualizada.llegada_real_at).toISOString()
+            : now.toISOString(),
+        },
+      });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(reply, request, error, "No se pudo registrar la llegada de la cita", "ADMIN_CITAS_REGISTER_ARRIVAL_ERROR");
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.post("/:id_cita/iniciar-atencion", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idCita = assertUuid(request.params?.id_cita, "id_cita");
+
+      await dbClient.query("BEGIN");
+      const cita = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        forUpdate: true,
+      });
+
+      const estadoActual = String(cita.estado_cita_codigo || "");
+      if (estadoActual !== "en_salon") {
+        throw new AppError(409, "La cita debe estar en salon para iniciar atencion", {
+          code: "ADMIN_CITAS_START_ATTENTION_STATE_INVALID",
+          details: { id_cita: idCita, estado_cita_codigo: estadoActual },
+        });
+      }
+
+      const now = new Date();
+      const retrasoMin = calculateDelayMinutes({
+        plannedStart: cita.inicio_at,
+        actualStart: now.toISOString(),
+      });
+
+      await dbClient.query(
+        `
+          UPDATE public.citas
+          SET estado_cita_codigo = 'en_atencion',
+              atencion_iniciada_at = COALESCE(atencion_iniciada_at, $2::timestamptz),
+              retraso_inicio_min = $3::int,
+              updated_at = now()
+          WHERE id_cita = $1::uuid
+        `,
+        [idCita, now.toISOString(), retrasoMin]
+      );
+
+      const citaActualizada = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+      });
+
+      const propagation = await propagateOperationalDelay(dbClient, {
+        citaCausante: citaActualizada,
+        retrasoMin,
+        actorUsuarioId: roleScope.actor_usuario_id,
+      });
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, {
+        cita: mapOperationalAppointment(citaActualizada),
+        atencion: {
+          iniciada_at: citaActualizada.atencion_iniciada_at
+            ? new Date(citaActualizada.atencion_iniciada_at).toISOString()
+            : now.toISOString(),
+          retraso_inicio_min: retrasoMin,
+          umbral_propagacion_min: OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES,
+        },
+        propagacion_retraso: propagation,
+      });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(reply, request, error, "No se pudo iniciar la atencion", "ADMIN_CITAS_START_ATTENTION_ERROR");
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.post("/:id_cita/finalizar-atencion", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const idCita = assertUuid(request.params?.id_cita, "id_cita");
+
+      await dbClient.query("BEGIN");
+      const cita = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        forUpdate: true,
+      });
+
+      if (String(cita.estado_cita_codigo || "") !== "en_atencion") {
+        throw new AppError(409, "Solo puedes finalizar citas en atencion", {
+          code: "ADMIN_CITAS_FINISH_ATTENTION_STATE_INVALID",
+          details: { id_cita: idCita, estado_cita_codigo: cita.estado_cita_codigo },
+        });
+      }
+
+      const now = new Date();
+      await dbClient.query(
+        `
+          UPDATE public.citas
+          SET estado_cita_codigo = 'completada',
+              atencion_finalizada_at = COALESCE(atencion_finalizada_at, $2::timestamptz),
+              updated_at = now()
+          WHERE id_cita = $1::uuid
+        `,
+        [idCita, now.toISOString()]
+      );
+
+      const citaActualizada = await getScopedAppointment(dbClient, {
+        idCita,
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+      });
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, {
+        cita: mapOperationalAppointment(citaActualizada),
+        atencion: {
+          iniciada_at: citaActualizada.atencion_iniciada_at
+            ? new Date(citaActualizada.atencion_iniciada_at).toISOString()
+            : null,
+          finalizada_at: citaActualizada.atencion_finalizada_at
+            ? new Date(citaActualizada.atencion_finalizada_at).toISOString()
+            : now.toISOString(),
+          retraso_inicio_min: Number(citaActualizada.retraso_inicio_min || 0),
+        },
+      });
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(reply, request, error, "No se pudo finalizar la atencion", "ADMIN_CITAS_FINISH_ATTENTION_ERROR");
     } finally {
       dbClient.release();
     }
