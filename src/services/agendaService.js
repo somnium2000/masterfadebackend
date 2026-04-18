@@ -753,20 +753,33 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
       SELECT
         pd.id_servicio,
         pd.cantidad,
-        s.nombre_servicio
+        s.nombre_servicio,
+        COALESCE(s.activo, FALSE) AS servicio_activo,
+        s.deleted_at
       FROM public.paquetes_detalles pd
-      JOIN public.servicios s
+      LEFT JOIN public.servicios s
         ON s.id_servicio = pd.id_servicio
       WHERE pd.id_paquete = $1::uuid
-        AND s.deleted_at IS NULL
-      ORDER BY s.nombre_servicio ASC, pd.id_servicio ASC
+      ORDER BY COALESCE(s.nombre_servicio, '') ASC, pd.id_servicio ASC
     `,
     [safePackageId]
   );
 
-  if (!detailResult.rows.length) {
-    throw new AppError(409, "El paquete no contiene servicios configurados", {
-      code: "AGENDA_PACKAGE_SERVICES_EMPTY",
+  if (detailResult.rows.length < 2) {
+    throw new AppError(409, "El paquete requiere al menos 2 servicios configurados", {
+      code: "AGENDA_PACKAGE_SERVICES_MIN_REQUIRED",
+      details: { id_paquete: safePackageId },
+    });
+  }
+
+  const containsInactiveServices = detailResult.rows.some((row) => (
+    !row?.nombre_servicio
+    || row?.deleted_at
+    || !row?.servicio_activo
+  ));
+  if (containsInactiveServices) {
+    throw new AppError(409, "El paquete incluye servicios inactivos o no disponibles.", {
+      code: "AGENDA_PACKAGE_SERVICES_INACTIVE",
       details: { id_paquete: safePackageId },
     });
   }

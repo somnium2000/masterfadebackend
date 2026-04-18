@@ -81,6 +81,49 @@ const paqueteSchema = {
   additionalProperties: false,
 };
 
+const planBenefitSchema = {
+  type: "object",
+  properties: {
+    tipo: { type: "string", enum: ["servicio", "cortesia"] },
+    id_servicio: { type: ["string", "null"], format: "uuid" },
+    id_cortesia: { type: ["string", "null"], format: "uuid" },
+    codigo: { type: ["string", "null"] },
+    nombre: { type: "string" },
+    cantidad: { type: "integer" },
+  },
+  required: ["tipo", "id_servicio", "id_cortesia", "codigo", "nombre", "cantidad"],
+  additionalProperties: false,
+};
+
+const planSchema = {
+  type: "object",
+  properties: {
+    id_plan: { type: "string", format: "uuid" },
+    id_sucursal: { type: ["string", "null"], format: "uuid" },
+    nombre_plan: { type: "string" },
+    descripcion: { type: ["string", "null"] },
+    periodo_membresia_codigo: { type: "string" },
+    periodo_membresia_label: { type: "string" },
+    categoria_nivel: { type: "integer", minimum: 1, maximum: 5 },
+    precio_hnl: { type: ["number", "null"] },
+    orden_visual: { type: "integer" },
+    beneficios: { type: "array", items: planBenefitSchema },
+  },
+  required: [
+    "id_plan",
+    "id_sucursal",
+    "nombre_plan",
+    "descripcion",
+    "periodo_membresia_codigo",
+    "periodo_membresia_label",
+    "categoria_nivel",
+    "precio_hnl",
+    "orden_visual",
+    "beneficios",
+  ],
+  additionalProperties: false,
+};
+
 const sucursalSchema = {
   type: "object",
   properties: {
@@ -159,7 +202,7 @@ const PUBLIC_SERVICES_SQL = `
       )
       AND st.vigente_desde <= CURRENT_DATE
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-      AND st.precio_hnl IS NOT NULL
+      AND st.precio_hnl > 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -214,6 +257,8 @@ const PUBLIC_SERVICES_SQL = `
   WHERE s.deleted_at IS NULL
     AND s.activo IS TRUE
     AND s.visible_publico IS TRUE
+    AND COALESCE(ss.duracion_min, s.duracion_min) > 0
+    AND ss.precio_hnl > 0
   ORDER BY s.orden_visual ASC, s.nombre_servicio ASC
 `;
 
@@ -234,6 +279,7 @@ const PUBLIC_PACKAGES_SQL = `
       ON su.id_sucursal = ps.id_sucursal
     WHERE ps.activo IS TRUE
       AND ps.visible_publico IS TRUE
+      AND ps.precio_hnl > 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR ps.id_sucursal = $1::uuid)
@@ -270,7 +316,7 @@ const PUBLIC_PACKAGES_SQL = `
     p.id_paquete,
     p.nombre_paquete,
     p.descripcion,
-    COALESCE(eo.precio_hnl, NULLIF(to_jsonb(p)->>'precio_hnl', '')::numeric) AS precio_hnl,
+    eo.precio_hnl AS precio_hnl,
     COALESCE(eo.orden_visual, 100) AS orden_visual,
     COALESCE(
       json_agg(
@@ -294,7 +340,8 @@ const PUBLIC_PACKAGES_SQL = `
   WHERE p.deleted_at IS NULL
     AND p.activo IS TRUE
   GROUP BY p.id_paquete, eo.precio_hnl, eo.orden_visual, eo.id_sucursal
-  HAVING COUNT(pd.id_servicio) > 0
+  HAVING COUNT(pd.id_servicio) >= 2
+     AND eo.precio_hnl > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
      AND BOOL_AND(
       s.id_servicio IS NOT NULL
@@ -310,10 +357,256 @@ const PUBLIC_PACKAGES_SQL = `
           AND st.activo IS TRUE
           AND st.vigente_desde <= CURRENT_DATE
           AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-          AND st.precio_hnl IS NOT NULL
+          AND st.precio_hnl > 0
       )
     )
   ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
+`;
+
+const PUBLIC_SERVICES_SEARCH_SQL = `
+  WITH active_tariffs AS (
+    SELECT
+      st.id_servicio,
+      st.id_sucursal,
+      st.precio_hnl,
+      st.duracion_min,
+      st.buffer_min,
+      COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
+      ROW_NUMBER() OVER (
+        PARTITION BY st.id_servicio, st.id_sucursal
+        ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
+      ) AS rn
+    FROM public.servicios_tarifas st
+    JOIN public.sucursales su
+      ON su.id_sucursal = st.id_sucursal
+    WHERE st.deleted_at IS NULL
+      AND st.activo IS TRUE
+      AND (($2::uuid IS NULL AND st.id_empleado IS NULL) OR ($2::uuid IS NOT NULL AND st.id_empleado = $2::uuid))
+      AND st.vigente_desde <= CURRENT_DATE
+      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+      AND st.precio_hnl > 0
+      AND su.deleted_at IS NULL
+      AND su.estado IS TRUE
+      AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
+  ),
+  picked_tariffs AS (
+    SELECT id_servicio, id_sucursal, precio_hnl, duracion_min, buffer_min, servicio_informativo
+    FROM active_tariffs
+    WHERE rn = 1
+  ),
+  service_scope AS (
+    SELECT
+      ranked.id_servicio,
+      ranked.precio_hnl,
+      ranked.duracion_min,
+      ranked.buffer_min,
+      ranked.servicio_informativo
+    FROM (
+      SELECT
+        pt.id_servicio,
+        pt.precio_hnl,
+        pt.duracion_min,
+        pt.buffer_min,
+        pt.servicio_informativo,
+        ROW_NUMBER() OVER (
+          PARTITION BY pt.id_servicio
+          ORDER BY pt.precio_hnl ASC NULLS LAST, pt.duracion_min ASC NULLS LAST, pt.buffer_min ASC NULLS LAST, pt.id_sucursal::text ASC
+        ) AS rn
+      FROM picked_tariffs pt
+    ) ranked
+    WHERE ranked.rn = 1
+  )
+  SELECT
+    s.id_servicio,
+    s.nombre_servicio,
+    s.descripcion,
+    COALESCE(ss.duracion_min, s.duracion_min) AS duracion_min,
+    COALESCE(ss.buffer_min, s.buffer_min) AS buffer_min,
+    s.grupo_catalogo,
+    s.activo,
+    COALESCE(ss.servicio_informativo, FALSE) AS servicio_informativo,
+    s.orden_visual,
+    s.agendable,
+    ss.precio_hnl
+  FROM public.servicios s
+  JOIN service_scope ss
+    ON ss.id_servicio = s.id_servicio
+  WHERE s.deleted_at IS NULL
+    AND s.activo IS TRUE
+    AND s.visible_publico IS TRUE
+    AND COALESCE(ss.duracion_min, s.duracion_min) > 0
+    AND ss.precio_hnl > 0
+    AND (
+      LOWER(s.nombre_servicio) LIKE $3::text
+      OR LOWER(COALESCE(s.descripcion, '')) LIKE $3::text
+    )
+  ORDER BY s.orden_visual ASC, s.nombre_servicio ASC
+  LIMIT 50
+`;
+
+const PUBLIC_PACKAGES_SEARCH_SQL = `
+  WITH scoped_offers AS (
+    SELECT
+      ps.id_paquete,
+      ps.id_sucursal,
+      ps.precio_hnl,
+      ps.orden_visual,
+      ROW_NUMBER() OVER (
+        PARTITION BY ps.id_paquete, ps.id_sucursal
+        ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
+      ) AS rn
+    FROM public.paquetes_sucursal ps
+    JOIN public.sucursales su
+      ON su.id_sucursal = ps.id_sucursal
+    WHERE ps.activo IS TRUE
+      AND ps.visible_publico IS TRUE
+      AND ps.precio_hnl > 0
+      AND su.deleted_at IS NULL
+      AND su.estado IS TRUE
+      AND ($1::uuid IS NULL OR ps.id_sucursal = $1::uuid)
+  ),
+  picked_offers AS (
+    SELECT
+      so.id_paquete,
+      so.id_sucursal,
+      so.precio_hnl,
+      so.orden_visual
+    FROM scoped_offers so
+    WHERE so.rn = 1
+  ),
+  effective_offers AS (
+    SELECT
+      po.id_paquete,
+      CASE WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl) ELSE MAX(po.precio_hnl) END AS precio_hnl,
+      CASE WHEN $1::uuid IS NULL THEN MIN(po.orden_visual) ELSE MAX(po.orden_visual) END AS orden_visual,
+      CASE WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid ELSE MAX(po.id_sucursal::text)::uuid END AS id_sucursal
+    FROM picked_offers po
+    GROUP BY po.id_paquete
+  )
+  SELECT
+    p.id_paquete,
+    p.nombre_paquete,
+    p.descripcion,
+    eo.precio_hnl AS precio_hnl,
+    COALESCE(eo.orden_visual, 100) AS orden_visual,
+    COALESCE(
+      json_agg(
+        json_build_object('id_servicio', s.id_servicio, 'nombre_servicio', s.nombre_servicio, 'cantidad', pd.cantidad)
+        ORDER BY s.nombre_servicio
+      ) FILTER (WHERE s.id_servicio IS NOT NULL),
+      '[]'::json
+    ) AS items
+  FROM public.paquetes p
+  JOIN effective_offers eo
+    ON eo.id_paquete = p.id_paquete
+  LEFT JOIN public.paquetes_detalles pd
+    ON pd.id_paquete = p.id_paquete
+  LEFT JOIN public.servicios s
+    ON s.id_servicio = pd.id_servicio
+   AND s.deleted_at IS NULL
+  WHERE p.deleted_at IS NULL
+    AND p.activo IS TRUE
+    AND (
+      LOWER(p.nombre_paquete) LIKE $2::text
+      OR LOWER(COALESCE(p.descripcion, '')) LIKE $2::text
+    )
+  GROUP BY p.id_paquete, eo.precio_hnl, eo.orden_visual, eo.id_sucursal
+  HAVING COUNT(pd.id_servicio) >= 2
+     AND eo.precio_hnl > 0
+     AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
+     AND BOOL_AND(
+      s.id_servicio IS NOT NULL
+      AND s.activo IS TRUE
+      AND s.agendable IS TRUE
+      AND s.visible_publico IS TRUE
+      AND EXISTS (
+        SELECT 1
+        FROM public.servicios_tarifas st
+        WHERE st.id_servicio = pd.id_servicio
+          AND st.id_sucursal = eo.id_sucursal
+          AND st.deleted_at IS NULL
+          AND st.activo IS TRUE
+          AND st.vigente_desde <= CURRENT_DATE
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+          AND st.precio_hnl > 0
+      )
+    )
+  ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
+  LIMIT 50
+`;
+
+const PUBLIC_PLANS_SEARCH_SQL = `
+  WITH scoped_offers AS (
+    SELECT
+      mps.id_plan,
+      mps.id_sucursal,
+      mps.precio_hnl,
+      mps.orden_visual,
+      ROW_NUMBER() OVER (
+        PARTITION BY mps.id_plan, mps.id_sucursal
+        ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
+      ) AS rn
+    FROM public.membership_plans_sucursal mps
+    JOIN public.sucursales su
+      ON su.id_sucursal = mps.id_sucursal
+    WHERE mps.activo IS TRUE
+      AND mps.visible_publico IS TRUE
+      AND mps.precio_hnl > 0
+      AND su.deleted_at IS NULL
+      AND su.estado IS TRUE
+      AND ($1::uuid IS NULL OR mps.id_sucursal = $1::uuid)
+  ),
+  picked_offers AS (
+    SELECT
+      so.id_plan,
+      so.id_sucursal,
+      so.precio_hnl,
+      so.orden_visual
+    FROM scoped_offers so
+    WHERE so.rn = 1
+  ),
+  effective_offers AS (
+    SELECT
+      po.id_plan,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
+        ELSE MAX(po.precio_hnl)
+      END AS precio_hnl,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
+        ELSE MAX(po.id_sucursal::text)::uuid
+      END AS id_sucursal,
+      CASE
+        WHEN $1::uuid IS NULL THEN MIN(po.orden_visual)
+        ELSE MAX(po.orden_visual)
+      END AS orden_visual
+    FROM picked_offers po
+    GROUP BY po.id_plan
+  )
+  SELECT
+    mp.id_plan,
+    eo.id_sucursal,
+    mp.nombre_plan,
+    mp.descripcion,
+    mp.periodo_membresia_codigo,
+    COALESCE(NULLIF(to_jsonb(mp)->>'categoria_nivel', '')::int, 1) AS categoria_nivel,
+    pm.descripcion AS periodo_membresia_label,
+    eo.precio_hnl AS precio_hnl,
+    mp.beneficios,
+    eo.orden_visual
+  FROM public.membership_plans mp
+  JOIN effective_offers eo
+    ON eo.id_plan = mp.id_plan
+  JOIN public.periodos_membresia pm
+    ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
+  WHERE mp.activo IS TRUE
+    AND eo.precio_hnl > 0
+    AND ($2::text IS NULL OR (
+      LOWER(mp.nombre_plan) LIKE $2::text
+      OR LOWER(COALESCE(mp.descripcion, '')) LIKE $2::text
+    ))
+  ORDER BY eo.orden_visual ASC, mp.nombre_plan ASC
+  LIMIT 50
 `;
 
 const PUBLIC_BRANCHES_SQL = `
@@ -436,6 +729,83 @@ function mapPackageRow(row) {
   };
 }
 
+function parseStoredBenefits(rawBenefits) {
+  if (!rawBenefits) return [];
+
+  const data = rawBenefits && typeof rawBenefits === "object" ? rawBenefits : {};
+  const looksLikeSingleBenefit =
+    data &&
+    !Array.isArray(data) &&
+    (data.tipo !== undefined ||
+      data.id_servicio !== undefined ||
+      data.id_cortesia !== undefined ||
+      data.nombre !== undefined ||
+      data.codigo !== undefined ||
+      data.cantidad !== undefined);
+  const items = Array.isArray(data?.items)
+    ? data.items
+    : Array.isArray(rawBenefits)
+      ? rawBenefits
+      : looksLikeSingleBenefit
+        ? [data]
+        : [];
+
+  return items
+    .map((beneficio) => {
+      const normalizedServiceId = String(beneficio?.id_servicio || "").trim();
+      const normalizedCourtesyId = String(beneficio?.id_cortesia || "").trim();
+      const normalizedNombre = String(beneficio?.nombre || "").trim();
+      const normalizedCodigo = beneficio?.codigo ? String(beneficio.codigo).trim() : "";
+      const rawType = String(beneficio?.tipo || "").trim().toLowerCase();
+      const isService = rawType === "servicio" || (rawType !== "cortesia" && normalizedServiceId);
+      const isCourtesy = rawType === "cortesia" || (!rawType && !normalizedServiceId && normalizedCourtesyId);
+      const allowsLegacyCourtesyRead = rawType === "cortesia" && !normalizedCourtesyId && Boolean(normalizedNombre || normalizedCodigo);
+      if (!isService && !isCourtesy && !allowsLegacyCourtesyRead) return null;
+      const tipo = isService ? "servicio" : "cortesia";
+      return {
+        tipo,
+        id_servicio: normalizedServiceId || null,
+        id_cortesia: normalizedCourtesyId || null,
+        codigo: normalizedCodigo || null,
+        nombre: normalizedNombre,
+        cantidad: Number(beneficio?.cantidad ?? 0),
+      };
+    })
+    .filter(Boolean)
+    .filter((beneficio) => Number.isInteger(beneficio.cantidad) && beneficio.cantidad > 0)
+    .filter((beneficio) => (
+      beneficio.tipo === "servicio"
+        ? Boolean(beneficio.id_servicio)
+        : Boolean(beneficio.id_cortesia || beneficio.nombre || beneficio.codigo)
+    ))
+    .map((beneficio) => ({
+      ...beneficio,
+      nombre: beneficio.nombre || (beneficio.tipo === "servicio" ? "Servicio incluido" : (beneficio.codigo || "Cortesia incluida")),
+    }));
+}
+
+function mapPlanRow(row) {
+  return {
+    id_plan: row.id_plan,
+    id_sucursal: row.id_sucursal ?? null,
+    nombre_plan: row.nombre_plan,
+    descripcion: row.descripcion ?? null,
+    periodo_membresia_codigo: row.periodo_membresia_codigo,
+    periodo_membresia_label: row.periodo_membresia_label || row.periodo_membresia_codigo,
+    categoria_nivel: Number(row.categoria_nivel ?? 1),
+    precio_hnl: row.precio_hnl == null ? null : Number(row.precio_hnl),
+    orden_visual: Number(row.orden_visual ?? 100),
+    beneficios: parseStoredBenefits(row.beneficios),
+  };
+}
+
+function isValidPublicPlan(plan) {
+  const price = Number(plan?.precio_hnl);
+  if (!Number.isFinite(price) || price <= 0) return false;
+  const benefits = Array.isArray(plan?.beneficios) ? plan.beneficios : [];
+  return benefits.some((benefit) => String(benefit?.tipo || "").toLowerCase() === "servicio" && benefit?.id_servicio);
+}
+
 function mapBranchRow(row) {
   return {
     id_sucursal: row.id_sucursal,
@@ -486,6 +856,13 @@ function mapPromotionRow(row) {
   };
 }
 
+function sendPublicCatalogError(reply, requestId, statusCode, message, code) {
+  return sendError(reply, statusCode, message, {
+    code,
+    requestId,
+  });
+}
+
 export default async function publicCatalogRoutes(app) {
   app.get(
     "/sucursales",
@@ -515,9 +892,7 @@ export default async function publicCatalogRoutes(app) {
     },
     async (request, reply) => {
       if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "Base de datos no configurada", "DB_NOT_CONFIGURED");
       }
 
       try {
@@ -527,10 +902,7 @@ export default async function publicCatalogRoutes(app) {
         });
       } catch (error) {
         request.log.error({ err: error }, "Public catalog sucursales error");
-        return sendError(reply, 500, "No se pudo consultar sucursales publicas del catalogo", {
-          code: "PUBLIC_CATALOG_BRANCHES_ERROR",
-          details: error instanceof Error ? error.message : "Unknown public catalog branches error",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "No se pudo consultar sucursales publicas del catalogo", "PUBLIC_CATALOG_BRANCHES_ERROR");
       }
     }
   );
@@ -571,9 +943,7 @@ export default async function publicCatalogRoutes(app) {
     },
     async (request, reply) => {
       if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "Base de datos no configurada", "DB_NOT_CONFIGURED");
       }
 
       try {
@@ -586,10 +956,7 @@ export default async function publicCatalogRoutes(app) {
         });
       } catch (error) {
         request.log.error({ err: error }, "Public catalog servicios error");
-        return sendError(reply, 500, "No se pudo consultar el catalogo de servicios", {
-          code: "PUBLIC_CATALOG_SERVICES_ERROR",
-          details: error instanceof Error ? error.message : "Unknown public catalog services error",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "No se pudo consultar el catalogo de servicios", "PUBLIC_CATALOG_SERVICES_ERROR");
       }
     }
   );
@@ -629,9 +996,7 @@ export default async function publicCatalogRoutes(app) {
     },
     async (request, reply) => {
       if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "Base de datos no configurada", "DB_NOT_CONFIGURED");
       }
 
       try {
@@ -641,10 +1006,77 @@ export default async function publicCatalogRoutes(app) {
         });
       } catch (error) {
         request.log.error({ err: error }, "Public catalog paquetes error");
-        return sendError(reply, 500, "No se pudo consultar el catalogo de paquetes", {
-          code: "PUBLIC_CATALOG_PACKAGES_ERROR",
-          details: error instanceof Error ? error.message : "Unknown public catalog packages error",
+        return sendPublicCatalogError(reply, request.id, 500, "No se pudo consultar el catalogo de paquetes", "PUBLIC_CATALOG_PACKAGES_ERROR");
+      }
+    }
+  );
+
+  app.get(
+    "/busqueda",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+            q: { type: "string", minLength: 1, maxLength: 80 },
+          },
+          required: ["q"],
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  servicios: { type: "array", items: servicioSchema },
+                  paquetes: { type: "array", items: paqueteSchema },
+                  planes: { type: "array", items: planSchema },
+                },
+                required: ["servicios", "paquetes", "planes"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!app.db) {
+        return sendPublicCatalogError(reply, request.id, 500, "Base de datos no configurada", "DB_NOT_CONFIGURED");
+      }
+
+      const branchId = request.query?.id_sucursal ?? null;
+      const queryText = String(request.query?.q || "").trim().toLowerCase();
+      if (!queryText) {
+        return sendPublicCatalogError(reply, request.id, 400, "Debes indicar un termino de busqueda", "PUBLIC_CATALOG_SEARCH_QUERY_REQUIRED");
+      }
+      const likeSearch = `%${queryText}%`;
+
+      try {
+        const [serviceResult, packageResult, planResult] = await Promise.all([
+          app.db.query(PUBLIC_SERVICES_SEARCH_SQL, [branchId, null, likeSearch]),
+          app.db.query(PUBLIC_PACKAGES_SEARCH_SQL, [branchId, likeSearch]),
+          app.db.query(PUBLIC_PLANS_SEARCH_SQL, [branchId, likeSearch]),
+        ]);
+        const mappedPlans = planResult.rows.map(mapPlanRow).filter(isValidPublicPlan);
+
+        return sendOk(reply, {
+          servicios: serviceResult.rows.map(mapServiceRow),
+          paquetes: packageResult.rows.map(mapPackageRow),
+          planes: mappedPlans,
         });
+      } catch (error) {
+        request.log.error({ err: error }, "Public catalog busqueda error");
+        return sendPublicCatalogError(reply, request.id, 500, "No se pudo consultar la busqueda del catalogo", "PUBLIC_CATALOG_SEARCH_ERROR");
       }
     }
   );
@@ -684,9 +1116,7 @@ export default async function publicCatalogRoutes(app) {
     },
     async (request, reply) => {
       if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "Base de datos no configurada", "DB_NOT_CONFIGURED");
       }
 
       try {
@@ -702,13 +1132,10 @@ export default async function publicCatalogRoutes(app) {
         ) {
           return sendError(reply, 500, "Falta aplicar migracion de PROMOCIONES multi-sucursal en la base de datos", {
             code: "PUBLIC_PROMOTIONS_MIGRATION_REQUIRED",
-            details: error.message,
+            requestId: request.id,
           });
         }
-        return sendError(reply, 500, "No se pudo consultar el catalogo de promociones", {
-          code: "PUBLIC_CATALOG_PROMOTIONS_ERROR",
-          details: error instanceof Error ? error.message : "Unknown public catalog promotions error",
-        });
+        return sendPublicCatalogError(reply, request.id, 500, "No se pudo consultar el catalogo de promociones", "PUBLIC_CATALOG_PROMOTIONS_ERROR");
       }
     }
   );

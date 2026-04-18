@@ -57,7 +57,7 @@ const planBodySchema = {
   properties: {
     nombre_plan: { type: "string", minLength: 1, maxLength: 140 },
     descripcion: { type: ["string", "null"], maxLength: 500 },
-    precio_hnl: { type: "number", minimum: 0 },
+    precio_hnl: { type: "number", exclusiveMinimum: 0 },
     periodo_membresia_codigo: { type: "string", minLength: 1, maxLength: 40 },
     categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     beneficios: {
@@ -78,7 +78,7 @@ const planPatchSchema = {
   properties: {
     nombre_plan: { type: "string", minLength: 1, maxLength: 140 },
     descripcion: { type: ["string", "null"], maxLength: 500 },
-    precio_hnl: { type: "number", minimum: 0 },
+    precio_hnl: { type: "number", exclusiveMinimum: 0 },
     periodo_membresia_codigo: { type: "string", minLength: 1, maxLength: 40 },
     categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     beneficios: {
@@ -99,6 +99,7 @@ const planStateBodySchema = {
   properties: {
     activo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
+    confirmar_clientes_activos: { type: "boolean" },
   },
   required: ["activo"],
   additionalProperties: false,
@@ -166,6 +167,16 @@ const PLAN_CATEGORY_COLUMN_EXISTS_SQL = `
     WHERE table_schema = 'public'
       AND table_name = 'membership_plans'
       AND column_name = 'categoria_nivel'
+  ) AS exists
+`;
+
+const SUBSCRIPTIONS_BRANCH_COLUMN_EXISTS_SQL = `
+  SELECT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'subscriptions'
+      AND column_name = 'id_sucursal_contratada'
   ) AS exists
 `;
 
@@ -453,7 +464,7 @@ function normalizePlanBenefits(beneficios) {
 
   const seenServiceIds = new Set();
   const seenCourtesyIds = new Set();
-  return beneficios.map((beneficio) => {
+  const normalizedBenefits = beneficios.map((beneficio) => {
     const tipo = String(beneficio?.tipo || "").trim().toLowerCase();
     const cantidad = Number(beneficio?.cantidad);
     const nombre = normalizeOptionalText(beneficio?.nombre) ?? "";
@@ -515,6 +526,14 @@ function normalizePlanBenefits(beneficios) {
       cantidad,
     };
   });
+
+  if (!normalizedBenefits.some((benefit) => benefit.tipo === "servicio")) {
+    throw new AppError(400, "El plan debe incluir al menos un servicio", {
+      code: "CATALOG_PLAN_SERVICE_REQUIRED",
+    });
+  }
+
+  return normalizedBenefits;
 }
 
 function parseStoredBenefits(rawBenefits) {
@@ -682,6 +701,33 @@ async function ensurePeriodExists(client, periodCode) {
 async function hasPlanCategoryColumn(client) {
   const { rows } = await client.query(PLAN_CATEGORY_COLUMN_EXISTS_SQL);
   return Boolean(rows[0]?.exists);
+}
+
+async function hasSubscriptionsBranchColumn(client) {
+  const { rows } = await client.query(SUBSCRIPTIONS_BRANCH_COLUMN_EXISTS_SQL);
+  return Boolean(rows[0]?.exists);
+}
+
+async function countActiveSubscriptionsForPlan(client, idPlan, idSucursal) {
+  const supportsBranchScope = await hasSubscriptionsBranchColumn(client);
+  const sql = supportsBranchScope
+    ? `
+      SELECT COUNT(*)::int AS total
+      FROM public.subscriptions s
+      WHERE s.id_plan = $1::uuid
+        AND s.estado_suscripcion_codigo IN ('activa', 'pendiente_renovacion')
+        AND s.id_sucursal_contratada = $2::uuid
+    `
+    : `
+      SELECT COUNT(*)::int AS total
+      FROM public.subscriptions s
+      WHERE s.id_plan = $1::uuid
+        AND s.estado_suscripcion_codigo IN ('activa', 'pendiente_renovacion')
+    `;
+
+  const params = supportsBranchScope ? [idPlan, idSucursal] : [idPlan];
+  const { rows } = await client.query(sql, params);
+  return Number(rows[0]?.total || 0);
 }
 
 async function ensureUniquePlanNameByBranch(client, planId, branchId, nombrePlan) {
@@ -972,6 +1018,46 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     });
   }
 
+  if (error?.code === "23514") {
+    const constraint = String(error?.constraint || "").trim();
+    if (constraint.includes("precio") || String(error?.message || "").toLowerCase().includes("precio")) {
+      return sendError(reply, 409, "El precio del plan no es valido para guardar la oferta.", {
+        code: "CATALOG_PLAN_INVALID_PRICE",
+        requestId: request.id,
+      });
+    }
+    if (constraint.includes("categoria") || String(error?.message || "").toLowerCase().includes("categoria")) {
+      return sendError(reply, 409, "La categoria del plan no cumple las reglas definidas.", {
+        code: "CATALOG_PLAN_INVALID_CATEGORY",
+        requestId: request.id,
+      });
+    }
+    return sendError(reply, 409, "La informacion del plan no cumple las reglas de integridad.", {
+      code: "CATALOG_PLAN_INVALID_DATA",
+      requestId: request.id,
+    });
+  }
+
+  if (error?.code === "P0001") {
+    const message = String(error?.message || "").toLowerCase();
+    if (message.includes("precio")) {
+      return sendError(reply, 409, "El precio del plan no es valido para activar u ofrecer.", {
+        code: "CATALOG_PLAN_INVALID_PRICE",
+        requestId: request.id,
+      });
+    }
+    if (message.includes("servicio") || message.includes("beneficio")) {
+      return sendError(reply, 409, "La composicion del plan no es valida para operar.", {
+        code: "CATALOG_PLAN_INVALID_COMPOSITION",
+        requestId: request.id,
+      });
+    }
+    return sendError(reply, 409, "No se pudo completar la operacion del plan por una regla de negocio.", {
+      code: "CATALOG_PLAN_BUSINESS_RULE",
+      requestId: request.id,
+    });
+  }
+
   request.log.error({ err: error }, fallbackMessage);
   return sendError(reply, 500, fallbackMessage, {
     code: fallbackCode,
@@ -1080,8 +1166,8 @@ export default async function adminPlansRoutes(app) {
         const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
         const normalizedBenefits = normalizePlanBenefits(request.body.beneficios);
 
-        if (!Number.isFinite(precioHnl) || precioHnl < 0) {
-          throw new AppError(400, "El precio del plan debe ser mayor o igual a 0", {
+        if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
+          throw new AppError(400, "El precio del plan debe ser mayor a 0", {
             code: "CATALOG_PLAN_PRICE_INVALID",
           });
         }
@@ -1284,8 +1370,8 @@ export default async function adminPlansRoutes(app) {
           ? normalizePlanBenefits(request.body.beneficios)
           : null;
 
-        if (!Number.isFinite(precioHnl) || precioHnl < 0) {
-          throw new AppError(400, "El precio del plan debe ser mayor o igual a 0", {
+        if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
+          throw new AppError(400, "El precio del plan debe ser mayor a 0", {
             code: "CATALOG_PLAN_PRICE_INVALID",
           });
         }
@@ -1477,6 +1563,19 @@ export default async function adminPlansRoutes(app) {
         const scopedPlan = scopedResult.rows[0] ?? null;
         const nextActivo = Boolean(request.body.activo);
         const baseBenefits = parseStoredBenefits(basePlan.beneficios);
+        const requiresActiveSubscriptionsConfirmation = !nextActivo && request.body?.confirmar_clientes_activos !== true;
+
+        if (requiresActiveSubscriptionsConfirmation) {
+          const totalClientesActivos = await countActiveSubscriptionsForPlan(client, request.params.id, branchId);
+          if (totalClientesActivos > 0) {
+            throw new AppError(409, "Este plan tiene clientes con suscripcion vigente en la sucursal seleccionada.", {
+              code: "CATALOG_PLAN_ACTIVE_SUBSCRIPTIONS_CONFIRM_REQUIRED",
+              details: {
+                total_clientes_activos: totalClientesActivos,
+              },
+            });
+          }
+        }
 
         if (nextActivo) {
           // AM: No se reactiva un plan si sus servicios-beneficio no estan operativos en la sucursal.

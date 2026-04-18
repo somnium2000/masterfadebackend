@@ -35,6 +35,15 @@ const queryBranchSchema = {
   additionalProperties: false,
 };
 
+const packageDeleteQuerySchema = {
+  type: "object",
+  properties: {
+    id_sucursal: { type: "string", format: "uuid" },
+    confirmar_citas_pendientes: { type: "string", enum: ["true", "false"] },
+  },
+  additionalProperties: false,
+};
+
 const serviceBodySchema = {
   type: "object",
   properties: {
@@ -83,7 +92,7 @@ const packageBodySchema = {
     visible_publico: { type: "boolean" },
     items: {
       type: "array",
-      minItems: 1,
+      minItems: 2,
       items: {
         type: "object",
         properties: {
@@ -111,7 +120,7 @@ const packagePatchSchema = {
     visible_publico: { type: "boolean" },
     items: {
       type: "array",
-      minItems: 1,
+      minItems: 2,
       items: {
         type: "object",
         properties: {
@@ -224,6 +233,7 @@ const serviceStateBodySchema = {
     activo: { type: "boolean" },
     precio_hnl: { type: ["number", "null"], minimum: 0 },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
+    confirmar_citas_pendientes: { type: "boolean" },
   },
   required: ["activo"],
   additionalProperties: false,
@@ -235,6 +245,7 @@ const packageStateBodySchema = {
     activo: { type: "boolean" },
     // AM: Cambio de estado por sucursal para evitar inactivaciones globales accidentales.
     id_sucursal: { type: ["string", "null"], format: "uuid" },
+    confirmar_citas_pendientes: { type: "boolean" },
   },
   required: ["activo"],
   additionalProperties: false,
@@ -615,9 +626,10 @@ const LIST_PACKAGES_SQL = `
   LEFT JOIN public.servicios s
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
+   AND s.activo IS TRUE
   WHERE p.deleted_at IS NULL
   GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico, po.orden_visual
-  HAVING COUNT(pd.id_servicio) > 0
+  HAVING COUNT(pd.id_servicio) >= 2
   ORDER BY COALESCE(po.orden_visual, 100) ASC, p.nombre_paquete ASC, po.id_sucursal ASC
 `;
 
@@ -645,6 +657,52 @@ const SERVICE_LINKED_MEMBERSHIP_PLAN_SQL = `
   LIMIT 1
 `;
 
+const SERVICE_FUTURE_APPOINTMENTS_COUNT_SQL = `
+  SELECT COUNT(*)::int AS total_citas_futuras
+  FROM public.citas_detalles cd
+  JOIN public.citas c
+    ON c.id_cita = cd.id_cita
+  WHERE cd.id_servicio = $1::uuid
+    AND c.id_sucursal = $2::uuid
+    AND c.deleted_at IS NULL
+    AND c.inicio_at >= NOW()
+`;
+
+const PACKAGE_FUTURE_APPOINTMENTS_COUNT_SQL = `
+  SELECT COUNT(*)::int AS total_citas_futuras
+  FROM public.citas c
+  WHERE c.id_paquete = $1::uuid
+    AND c.id_sucursal = $2::uuid
+    AND c.deleted_at IS NULL
+    AND c.inicio_at >= NOW()
+`;
+
+const SERVICE_LINKED_ACTIVE_PACKAGES_SQL = `
+  WITH picked_offers AS (
+    SELECT DISTINCT ON (ps.id_paquete)
+      ps.id_paquete,
+      ps.id_sucursal,
+      ps.activo
+    FROM public.paquetes_sucursal ps
+    WHERE ps.id_sucursal = $2::uuid
+    ORDER BY ps.id_paquete, ps.updated_at DESC, ps.id_paquete_sucursal DESC
+  )
+  SELECT
+    p.id_paquete,
+    p.nombre_paquete
+  FROM public.paquetes_detalles pd
+  JOIN public.paquetes p
+    ON p.id_paquete = pd.id_paquete
+  JOIN picked_offers po
+    ON po.id_paquete = p.id_paquete
+  WHERE pd.id_servicio = $1::uuid
+    AND p.deleted_at IS NULL
+    AND p.activo IS TRUE
+    AND po.activo IS TRUE
+  ORDER BY p.nombre_paquete ASC
+  LIMIT 5
+`;
+
 const GET_PACKAGE_BASE_SQL = `
   SELECT
     p.id_paquete,
@@ -669,6 +727,7 @@ const GET_PACKAGE_BASE_SQL = `
   LEFT JOIN public.servicios s
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
+   AND s.activo IS TRUE
   WHERE p.id_paquete = $1::uuid
     AND p.deleted_at IS NULL
   GROUP BY p.id_paquete
@@ -718,6 +777,7 @@ const GET_PACKAGE_SCOPED_SQL = `
   LEFT JOIN public.servicios s
     ON s.id_servicio = pd.id_servicio
    AND s.deleted_at IS NULL
+   AND s.activo IS TRUE
   WHERE p.id_paquete = $1::uuid
     AND p.deleted_at IS NULL
   GROUP BY p.id_paquete, po.id_sucursal, po.precio_hnl, po.activo, po.visible_publico, po.orden_visual
@@ -935,8 +995,8 @@ async function ensureUniquePackageNameByBranch(client, packageId, branchId, nomb
 
 function normalizePackageItems(items) {
   // AM: Normaliza y valida el detalle para evitar paquetes vacios o con servicios duplicados.
-  if (!Array.isArray(items) || items.length === 0) {
-    throw new AppError(400, "Agrega al menos un servicio al paquete", {
+  if (!Array.isArray(items) || items.length < 2) {
+    throw new AppError(400, "Agrega al menos 2 servicios al paquete", {
       code: "CATALOG_PACKAGE_ITEMS_REQUIRED",
     });
   }
@@ -1298,7 +1358,40 @@ async function syncServiceBarberAssignments(client, idServicio, idSucursal, idEm
   return assignmentRows.rows.map(mapServiceBarberAssignmentRow);
 }
 
+async function lockServiceTariffScope(client, idServicio, idSucursal) {
+  // AM: Serializa mutaciones de tarifa por servicio+sucursal sin depender de cambios en BD.
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))",
+    [String(idServicio || ""), String(idSucursal || "")]
+  );
+}
+
+async function deactivateSiblingBaseTariffs(client, idServicio, idSucursal, keepTariffId) {
+  if (!keepTariffId) return;
+
+  // AM: Regla operativa de produccion:
+  // mantener exactamente una tarifa base activa por servicio+sucursal.
+  await client.query(
+    `
+      UPDATE public.servicios_tarifas
+      SET
+        activo = FALSE,
+        vigente_hasta = COALESCE(vigente_hasta, CURRENT_DATE),
+        updated_at = NOW()
+      WHERE id_servicio = $1::uuid
+        AND id_sucursal = $2::uuid
+        AND id_empleado IS NULL
+        AND deleted_at IS NULL
+        AND activo IS TRUE
+        AND id_tarifa <> $3::uuid
+    `,
+    [idServicio, idSucursal, keepTariffId]
+  );
+}
+
 async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, options = {}) {
+  await lockServiceTariffScope(client, idServicio, idSucursal);
+
   const parsedDuration =
     options?.duracionMin === undefined || options?.duracionMin === null ? null : Number(options.duracionMin);
   const parsedBuffer =
@@ -1312,6 +1405,7 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
 
   const { rows } = await client.query(GET_LATEST_SERVICE_TARIFF_SQL, [idServicio, idSucursal]);
   const currentTariff = rows[0];
+  let activeTariffId;
 
   if (currentTariff) {
     // AM: Reactiva la misma tarifa historica cuando existe, evitando colisiones de unicidad al reactivar.
@@ -1331,9 +1425,10 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
       `,
       [currentTariff.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
     );
+    activeTariffId = currentTariff.id_tarifa;
   } else {
     try {
-      await client.query(
+      const insertTariffResult = await client.query(
         `
           INSERT INTO public.servicios_tarifas (
             id_servicio,
@@ -1347,9 +1442,11 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
             activo
           )
           VALUES ($1::uuid, $2::uuid, NULL, $3::numeric, $4::int, $5::int, $6::boolean, CURRENT_DATE, TRUE)
+          RETURNING id_tarifa
         `,
         [idServicio, idSucursal, precioHnl, duracionMin, bufferMin, servicioInformativo ?? false]
       );
+      activeTariffId = insertTariffResult.rows[0]?.id_tarifa ?? null;
     } catch (error) {
       if (error?.code !== "23505") {
         throw error;
@@ -1379,8 +1476,11 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
         `,
         [candidate.id_tarifa, precioHnl, duracionMin, bufferMin, servicioInformativo]
       );
+      activeTariffId = candidate.id_tarifa;
     }
   }
+
+  await deactivateSiblingBaseTariffs(client, idServicio, idSucursal, activeTariffId);
 
   await syncActiveEmployeeServiceTariffs(client, idServicio, idSucursal, {
     precioHnl,
@@ -1390,7 +1490,11 @@ async function upsertServiceTariff(client, idServicio, idSucursal, precioHnl, op
   });
 }
 
-async function inactivateServiceByBranch(client, idServicio, idSucursal) {
+async function inactivateServiceByBranch(client, idServicio, idSucursal, options = {}) {
+  await lockServiceTariffScope(client, idServicio, idSucursal);
+
+  const confirmPendingAppointments = Boolean(options?.confirmPendingAppointments);
+
   const linkedPlanResult = await client.query(SERVICE_LINKED_MEMBERSHIP_PLAN_SQL, [idServicio]);
   const linkedPlan = linkedPlanResult.rows[0] ?? null;
   if (linkedPlan) {
@@ -1402,6 +1506,35 @@ async function inactivateServiceByBranch(client, idServicio, idSucursal) {
         nombre_plan: linkedPlan.nombre_plan ?? null,
       },
     });
+  }
+
+  const linkedActivePackagesResult = await client.query(SERVICE_LINKED_ACTIVE_PACKAGES_SQL, [idServicio, idSucursal]);
+  if (linkedActivePackagesResult.rows.length > 0) {
+    throw new AppError(409, "No se puede inactivar este servicio porque forma parte de paquetes activos.", {
+      code: "CATALOG_SERVICE_LINKED_ACTIVE_PACKAGE",
+      details: {
+        paquetes: linkedActivePackagesResult.rows.map((row) => ({
+          id_paquete: row.id_paquete,
+          nombre_paquete: row.nombre_paquete ?? null,
+        })),
+      },
+    });
+  }
+
+  const futureAppointmentsResult = await client.query(SERVICE_FUTURE_APPOINTMENTS_COUNT_SQL, [idServicio, idSucursal]);
+  const totalFutureAppointments = Number(futureAppointmentsResult.rows[0]?.total_citas_futuras ?? 0);
+  if (totalFutureAppointments > 0 && !confirmPendingAppointments) {
+    throw new AppError(
+      409,
+      "Este servicio tiene citas futuras asociadas. Confirma nuevamente para inactivarlo y conservarlo solo en esas citas ya creadas.",
+      {
+        code: "CATALOG_SERVICE_PENDING_APPOINTMENTS_CONFIRMATION_REQUIRED",
+        details: {
+          total_citas_futuras: totalFutureAppointments,
+          id_sucursal: idSucursal,
+        },
+      }
+    );
   }
 
   const tariffUpdate = await client.query(
@@ -1459,7 +1592,76 @@ async function inactivateServiceByBranch(client, idServicio, idSucursal) {
   }
 }
 
+async function inactivatePackageByBranch(client, idPaquete, idSucursal, options = {}) {
+  const confirmPendingAppointments = Boolean(options?.confirmPendingAppointments);
+  const futureAppointmentsResult = await client.query(PACKAGE_FUTURE_APPOINTMENTS_COUNT_SQL, [idPaquete, idSucursal]);
+  const totalFutureAppointments = Number(futureAppointmentsResult.rows[0]?.total_citas_futuras ?? 0);
+
+  if (totalFutureAppointments > 0 && !confirmPendingAppointments) {
+    throw new AppError(
+      409,
+      "Este paquete tiene citas futuras asociadas. Confirma nuevamente para inactivarlo y conservarlo solo en esas citas ya creadas.",
+      {
+        code: "CATALOG_PACKAGE_PENDING_APPOINTMENTS_CONFIRMATION_REQUIRED",
+        details: {
+          total_citas_futuras: totalFutureAppointments,
+          id_sucursal: idSucursal,
+        },
+      }
+    );
+  }
+
+  await upsertPackageBranchOffer(client, idPaquete, idSucursal, {
+    activo: false,
+  });
+}
+
+function mapPostgresCatalogError(error) {
+  if (!error || typeof error !== "object") return null;
+  const pgCode = String(error?.code || "").trim();
+  const rawMessage = String(error?.message || "");
+  const message = rawMessage.toLowerCase();
+  const constraint = String(error?.constraint || "").toLowerCase();
+
+  const looksLikeBusinessDbError = ["23502", "23514", "23503", "23P01", "P0001"].includes(pgCode);
+  if (!looksLikeBusinessDbError) return null;
+
+  const compositionByCount =
+    (message.includes("paquete") && message.includes("servicio") && (message.includes("minimo") || message.includes("mínimo")))
+    || message.includes("al menos 2 servicios")
+    || message.includes("2 servicios activos");
+  if (compositionByCount) {
+    return new AppError(409, "El paquete activo debe incluir al menos 2 servicios activos.", {
+      code: "PACKAGE_INVALID_COMPOSITION",
+    });
+  }
+
+  const compositionByInactiveServices =
+    message.includes("paquete")
+    && message.includes("servicio")
+    && message.includes("inactiv");
+  if (compositionByInactiveServices) {
+    return new AppError(409, "El paquete activo no puede contener servicios inactivos.", {
+      code: "PACKAGE_INVALID_COMPOSITION",
+    });
+  }
+
+  const invalidPrice =
+    constraint.includes("precio")
+    || message.includes("precio_hnl")
+    || (message.includes("precio") && (message.includes("mayor a 0") || message.includes("> 0") || message.includes("positivo")));
+  if (invalidPrice) {
+    return new AppError(409, "El precio del paquete debe ser mayor a 0.", {
+      code: "PACKAGE_INVALID_PRICE",
+    });
+  }
+
+  return null;
+}
+
 async function activateServiceByBranch(client, idServicio, idSucursal, precioHnl = null) {
+  await lockServiceTariffScope(client, idServicio, idSucursal);
+
   await client.query(
     `
       UPDATE public.servicios
@@ -1496,6 +1698,8 @@ async function activateServiceByBranch(client, idServicio, idSucursal, precioHnl
       `,
       [latestAnyTariff.id_tarifa]
     );
+
+    await deactivateSiblingBaseTariffs(client, idServicio, idSucursal, latestAnyTariff.id_tarifa);
   }
 
   await client.query(
@@ -1651,6 +1855,15 @@ async function clonePackageForBranch(client, sourcePackage, branchId) {
 }
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
+  const mappedDbError = mapPostgresCatalogError(error);
+  if (mappedDbError) {
+    return sendError(reply, mappedDbError.statusCode, mappedDbError.message, {
+      code: mappedDbError.code,
+      details: mappedDbError.details,
+      requestId: request.id,
+    });
+  }
+
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
@@ -1662,7 +1875,6 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
   request.log.error({ err: error }, fallbackMessage);
   return sendError(reply, 500, fallbackMessage, {
     code: fallbackCode,
-    details: error instanceof Error ? error.message : fallbackMessage,
     requestId: request.id,
   });
 }
@@ -2063,6 +2275,7 @@ export default async function adminCatalogRoutes(app) {
           401: errorResponseSchema,
           403: errorResponseSchema,
           404: errorResponseSchema,
+          409: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
@@ -2091,7 +2304,9 @@ export default async function adminCatalogRoutes(app) {
         if (requestedState) {
           await activateServiceByBranch(client, request.params.id, branchId, precioHnl);
         } else {
-          await inactivateServiceByBranch(client, request.params.id, branchId);
+          await inactivateServiceByBranch(client, request.params.id, branchId, {
+            confirmPendingAppointments: request.body?.confirmar_citas_pendientes === true,
+          });
         }
 
         const finalResult = await client.query(GET_SERVICE_SQL, [request.params.id, branchId]);
@@ -2147,6 +2362,7 @@ export default async function adminCatalogRoutes(app) {
           401: errorResponseSchema,
           403: errorResponseSchema,
           404: errorResponseSchema,
+          409: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
@@ -2281,6 +2497,7 @@ export default async function adminCatalogRoutes(app) {
           401: errorResponseSchema,
           403: errorResponseSchema,
           404: errorResponseSchema,
+          409: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
@@ -2305,11 +2522,14 @@ export default async function adminCatalogRoutes(app) {
           // AM: Solo se reactiva una oferta de sucursal si su composicion sigue disponible en esa sucursal.
           const currentItems = normalizePackageItems(basePackage.items || []);
           await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
+          await upsertPackageBranchOffer(client, request.params.id, branchId, {
+            activo: true,
+          });
+        } else {
+          await inactivatePackageByBranch(client, request.params.id, branchId, {
+            confirmPendingAppointments: request.body?.confirmar_citas_pendientes === true,
+          });
         }
-
-        await upsertPackageBranchOffer(client, request.params.id, branchId, {
-          activo: nextActivo,
-        });
 
         // AM: Conserva el paquete base operativo; el estado comercial se controla por sucursal.
         await client.query(
@@ -2518,6 +2738,11 @@ export default async function adminCatalogRoutes(app) {
         const nombrePaquete = normalizeRequiredText(request.body.nombre_paquete);
         const descripcion = normalizeOptionalText(request.body.descripcion);
         const precioHnl = Number(request.body.precio_hnl);
+        if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
+          throw new AppError(400, "El precio del paquete debe ser mayor a 0", {
+            code: "CATALOG_PACKAGE_PRICE_INVALID",
+          });
+        }
         const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
         const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const items = normalizePackageItems(request.body.items);
@@ -2652,6 +2877,11 @@ export default async function adminCatalogRoutes(app) {
                 ? 0
                 : Number(basePackage.precio_hnl)
               : Number(scopedPackage.precio_hnl);
+        if (request.body.precio_hnl !== undefined && (!Number.isFinite(precioHnl) || precioHnl <= 0)) {
+          throw new AppError(400, "El precio del paquete debe ser mayor a 0", {
+            code: "CATALOG_PACKAGE_PRICE_INVALID",
+          });
+        }
         const ordenVisual =
           request.body.orden_visual !== undefined
             ? normalizeOrderVisual(request.body.orden_visual, 100)
@@ -2729,7 +2959,7 @@ export default async function adminCatalogRoutes(app) {
           required: ["id"],
           additionalProperties: false,
         },
-        querystring: queryBranchSchema,
+        querystring: packageDeleteQuerySchema,
         response: {
           200: {
             type: "object",
@@ -2773,8 +3003,8 @@ export default async function adminCatalogRoutes(app) {
         }
 
         // AM: Delete legacy se mantiene como inactivacion por sucursal para no afectar otras sedes.
-        await upsertPackageBranchOffer(client, request.params.id, branchId, {
-          activo: false,
+        await inactivatePackageByBranch(client, request.params.id, branchId, {
+          confirmPendingAppointments: request.query?.confirmar_citas_pendientes === "true",
         });
 
         await client.query("COMMIT");

@@ -1657,6 +1657,14 @@ export default async function adminCitasRoutes(app) {
         });
       }
 
+      const consumoMembresia = await consumeMembershipForCompletedAppointment(dbClient, {
+        idCita,
+        idCliente: cita.id_cliente ?? null,
+        idSucursal: cita.id_sucursal,
+        ordenIntegrante: cita.orden_integrante ?? null,
+        usuarioEjecutorId: roleScope.actor_usuario_id ?? null,
+      });
+
       const now = new Date();
       await dbClient.query(
         `
@@ -1687,6 +1695,7 @@ export default async function adminCitasRoutes(app) {
             : now.toISOString(),
           retraso_inicio_min: Number(citaActualizada.retraso_inicio_min || 0),
         },
+        consumo_membresia: consumoMembresia,
       });
     } catch (error) {
       try {
