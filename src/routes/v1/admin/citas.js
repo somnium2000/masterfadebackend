@@ -122,7 +122,7 @@ function selectParams(values) {
     agenda_buffer_global_min: Number(values.agenda_buffer_global_min?.valor_numero ?? 0),
     permitir_acompanantes: Boolean(values.permitir_acompanantes?.valor_booleano ?? false),
     pago_total_obligatorio: Boolean(values.pago_total_obligatorio?.valor_booleano ?? true),
-    simulacion_sin_pago: Boolean(values.simulacion_sin_pago?.valor_booleano ?? true),
+    simulacion_sin_pago: Boolean(values.simulacion_sin_pago?.valor_booleano),
     masterpuntos_migracion_manual_habilitada: Boolean(
       values.masterpuntos_migracion_manual_habilitada?.valor_booleano ?? false
     ),

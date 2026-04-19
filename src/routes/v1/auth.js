@@ -1311,7 +1311,6 @@ export default async function authRoutes(app) {
         request.log.error({ err: error }, "Auth exchange error");
         return sendError(reply, 500, "No se pudo completar el exchange de autenticacion", {
           code: "AUTH_EXCHANGE_ERROR",
-          details: error instanceof Error ? error.message : "Unknown auth exchange error",
         });
       }
     }
@@ -1387,7 +1386,6 @@ export default async function authRoutes(app) {
         if (authLookup?.error || !supabaseUser?.id) {
           return sendError(reply, 401, "No se pudo validar la identidad social para confirmar.", {
             code: "AUTH_SOCIAL_CONFIRM_USER_NOT_FOUND",
-            details: authLookup?.error?.message || "SUPABASE_USER_NOT_FOUND",
           });
         }
 
@@ -1481,7 +1479,6 @@ export default async function authRoutes(app) {
         request.log.error({ err: error }, "Auth social confirm error");
         return sendError(reply, 500, "No se pudo confirmar el acceso social.", {
           code: "AUTH_SOCIAL_CONFIRM_ERROR",
-          details: error instanceof Error ? error.message : "Unknown auth social confirm error",
         });
       }
     }
