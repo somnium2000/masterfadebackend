@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
   if (["production", "prod"].includes(value)) return "production";
+  if (["staging", "preprod"].includes(value)) return "staging";
   if (["test", "testing"].includes(value)) return "test";
   return "development";
 }
@@ -24,18 +25,18 @@ function readRequired(name, { minLength = 1 } = {}) {
 }
 
 function assertSecureProductionConfig(config) {
-  if (config.nodeEnv !== "production") return;
+  if (config.nodeEnv !== "production" && config.nodeEnv !== "staging") return;
 
   if (!config.frontendUrl.startsWith("https://")) {
-    throw new Error("FRONTEND_URL debe usar HTTPS en produccion.");
+    throw new Error("FRONTEND_URL debe usar HTTPS en produccion/staging.");
   }
 
   if (config.paymentProvider === "mock") {
-    throw new Error("PAYMENT_PROVIDER=mock esta prohibido en produccion.");
+    throw new Error("PAYMENT_PROVIDER=mock esta prohibido en produccion/staging.");
   }
 
   if (!config.cookieSecure) {
-    throw new Error("AUTH_COOKIE_SECURE debe estar activo en produccion.");
+    throw new Error("AUTH_COOKIE_SECURE debe estar activo en produccion/staging.");
   }
 }
 
@@ -48,17 +49,19 @@ export default async function envPlugin(app) {
   const jwtSecret = readRequired("JWT_SECRET", { minLength: 24 });
   const cookieSecret = readRequired("COOKIE_SECRET", { minLength: 24 });
   const csrfSecret = readRequired("CSRF_SECRET", { minLength: 24 });
+  
+  const isProdOrStaging = nodeEnv === "production" || nodeEnv === "staging";
 
   const config = {
     nodeEnv,
-    isProduction: nodeEnv === "production",
+    isProduction: isProdOrStaging,
     frontendUrl,
     jwtSecret,
     cookieSecret,
     csrfSecret,
     paymentProvider,
-    trustProxy: parseBoolean(process.env.TRUST_PROXY, nodeEnv === "production"),
-    cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, nodeEnv === "production"),
+    trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
+    cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),
     cookieSameSite: String(process.env.AUTH_COOKIE_SAMESITE || "lax").trim().toLowerCase() || "lax",
     sessionTtlSeconds: Math.max(900, Number(process.env.AUTH_SESSION_TTL_SECONDS || 43200)),
   };

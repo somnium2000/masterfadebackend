@@ -382,7 +382,7 @@ function normalizeHoldBlocksPayload(body) {
 }
 
 function isSimulationNoPaymentEnabled(paramsMap) {
-  return Boolean(paramsMap?.simulacion_sin_pago?.valor_booleano ?? true);
+  return Boolean(paramsMap?.simulacion_sin_pago?.valor_booleano);
 }
 
 export default async function citasRoutes(app) {

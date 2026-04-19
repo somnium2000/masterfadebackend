@@ -562,31 +562,103 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
           ON plm.id_cliente = c.id_cliente
       `
       : "";
-    const params = [branchIds, NIL_UUID];
-    const where = [
+
+    const page = Math.max(1, Number(query.page) || 1);
+    const limit = Math.max(1, Math.min(100, Number(query.limit) || 50));
+    const offset = (page - 1) * limit;
+    const search = normalizeOptionalText(query.search ?? query.q);
+    const soloPremio = String(query.solo_premio || '').toLowerCase() === 'true';
+
+    // 1) COUNT QUERY Y PARAMETROS INDEPENDIENTES
+    const countParams = [branchIds, NIL_UUID];
+    const countWhere = [
       "c.deleted_at IS NULL",
-      "c.id_sucursal_origen = ANY($1::uuid[])",
+      "c.id_sucursal_origen = ANY($1::uuid[])"
     ];
 
-    const search = normalizeOptionalText(query.search ?? query.q);
     if (search) {
-      params.push(`%${search}%`);
-      const i = params.length;
-      where.push(`(
-        CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')) ILIKE $${i}
-        OR COALESCE(cp.email, '') ILIKE $${i}
-        OR COALESCE(p.telefono_principal, '') ILIKE $${i}
+      countParams.push(`%${search}%`);
+      const idx = countParams.length;
+      countWhere.push(`(
+        CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')) ILIKE ${idx}
+        OR COALESCE(cp.email, '') ILIKE ${idx}
+        OR COALESCE(p.telefono_principal, '') ILIKE ${idx}
       )`);
     }
 
     if (query.id_sucursal) {
       const idSucursal = assertUuid(query.id_sucursal, "id_sucursal");
       assertBranchInScope(branchIds, idSucursal);
-      params.push(idSucursal);
-      where.push(`c.id_sucursal_origen = $${params.length}::uuid`);
+      countParams.push(idSucursal);
+      const idx = countParams.length;
+      countWhere.push(`c.id_sucursal_origen = ${idx}::uuid`);
     }
 
     await materializeExpiredCycles(client, null);
+
+    const countQuerySql = `
+      WITH rules_by_branch AS (
+        SELECT DISTINCT ON (COALESCE(pr.id_sucursal, $2::uuid))
+          pr.id_sucursal,
+          pr.puntos_para_premio
+        FROM public.points_rules pr
+        WHERE pr.activo IS TRUE
+          AND (pr.id_sucursal IS NULL OR pr.id_sucursal = ANY($1::uuid[]))
+        ORDER BY
+          COALESCE(pr.id_sucursal, $2::uuid),
+          pr.updated_at DESC,
+          pr.created_at DESC,
+          pr.id_rule DESC
+      ),
+      global_rule AS (
+        SELECT puntos_para_premio
+        FROM rules_by_branch
+        WHERE id_sucursal IS NULL
+        LIMIT 1
+      )
+      SELECT COUNT(*) AS total
+      FROM public.clientes c
+      JOIN public.personas p ON p.id_persona = c.id_persona
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      LEFT JOIN public.vw_points_balance vpb ON vpb.id_cliente = c.id_cliente
+      LEFT JOIN rules_by_branch rbb ON rbb.id_sucursal = c.id_sucursal_origen
+      WHERE ${countWhere.join(" AND ")}
+        AND COALESCE(vpb.balance_puntos, 0) > 0
+        ${soloPremio ? "AND COALESCE(vpb.balance_puntos, 0) >= COALESCE(rbb.puntos_para_premio, (SELECT puntos_para_premio FROM global_rule), 10)" : ""}
+    `;
+    const countResult = await client.query(countQuerySql, countParams);
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    // 2) MAIN QUERY Y PARAMETROS INDEPENDIENTES
+    const params = [branchIds, NIL_UUID];
+    const mainWhere = [
+      "c.deleted_at IS NULL",
+      "c.id_sucursal_origen = ANY($1::uuid[])"
+    ];
+
+    if (search) {
+      params.push(`%${search}%`);
+      const idx = params.length;
+      mainWhere.push(`(
+        CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')) ILIKE ${idx}
+        OR COALESCE(cp.email, '') ILIKE ${idx}
+        OR COALESCE(p.telefono_principal, '') ILIKE ${idx}
+      )`);
+    }
+
+    if (query.id_sucursal) {
+      const idSucursal = assertUuid(query.id_sucursal, "id_sucursal");
+      params.push(idSucursal);
+      const idx = params.length;
+      mainWhere.push(`c.id_sucursal_origen = ${idx}::uuid`);
+    }
 
     const { rows } = await client.query(
       `
@@ -606,7 +678,23 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
             ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
             LIMIT 1
           ) cp ON TRUE
-      WHERE ${where.join(" AND ")}
+          LEFT JOIN public.vw_points_balance vpb ON vpb.id_cliente = c.id_cliente
+          LEFT JOIN (
+            SELECT DISTINCT ON (COALESCE(pr.id_sucursal, $2::uuid))
+              pr.id_sucursal,
+              pr.puntos_para_premio
+            FROM public.points_rules pr
+            WHERE pr.activo IS TRUE
+              AND (pr.id_sucursal IS NULL OR pr.id_sucursal = ANY($1::uuid[]))
+            ORDER BY
+              COALESCE(pr.id_sucursal, $2::uuid),
+              pr.updated_at DESC,
+              pr.created_at DESC,
+              pr.id_rule DESC
+          ) rbb ON rbb.id_sucursal = c.id_sucursal_origen
+          WHERE ${mainWhere.join(" AND ")}
+            AND COALESCE(vpb.balance_puntos, 0) > 0
+            ${soloPremio ? "AND COALESCE(vpb.balance_puntos, 0) >= COALESCE(rbb.puntos_para_premio, 10)" : ""}
         ),
         rules_by_branch AS (
           SELECT DISTINCT ON (COALESCE(pr.id_sucursal, $2::uuid))
@@ -674,8 +762,9 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
           ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
           LIMIT 1
         ) cp ON TRUE
-        WHERE COALESCE(vpb.balance_puntos, 0) > 0
         ORDER BY p.nombres ASC, p.apellidos ASC, c.id_cliente ASC
+        LIMIT ${limit}
+        OFFSET ${offset}
       `,
       params
     );
@@ -707,17 +796,28 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
           puntos_para_premio: required,
           premio_disponible: balance >= required,
           legacy_migracion_aplicada: Boolean(row.legacy_migracion_aplicada),
-          can_add_legacy_points: Boolean(config.migracion_manual_habilitada && !row.legacy_migracion_aplicada),
         };
       }),
-      parametros: config,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
     };
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    app.log.error(err);
+    throw new AppError(500, "Error al listar clientes de MasterPuntos", {
+      code: "MASTERPUNTOS_LIST_CLIENTS_ERROR",
+      details: err.message,
+    });
   } finally {
     client.release();
   }
 }
 
-export async function getMasterPuntosClienteMovimientos(app, claims, idCliente) {
+export async function getMasterPuntosClienteMovimientos(app, claims, idCliente, query = {}) {
   const { branchIds } = await getScope(app, claims);
   const safeId = assertUuid(idCliente, "id_cliente");
   const client = await app.db.connect();
@@ -725,63 +825,60 @@ export async function getMasterPuntosClienteMovimientos(app, claims, idCliente) 
     await ensureClientInScope(client, safeId, branchIds);
     await materializeExpiredCycles(client, safeId);
 
-    const [card, txResult] = await Promise.all([
-      getClientCardById(client, safeId, branchIds),
-      client.query(
-        `
-          SELECT
-            pt.id_points_tx,
-            pt.id_cita,
-            pt.id_cycle,
-            pt.id_sucursal_origen,
-            pt.id_servicio_canje,
-            s.nombre_servicio AS nombre_servicio_canje,
-            pt.tipo_puntos_codigo,
-            tp.descripcion AS tipo_descripcion,
-            tp.signo,
-            pt.puntos,
-            (pt.puntos * tp.signo)::int AS puntos_ajustados,
-            pt.vence_at,
-            pt.motivo,
-            pt.creado_por_usuario_id,
-            pt.created_at
-          FROM public.points_transactions pt
-          JOIN public.tipos_puntos tp
-            ON tp.tipo_puntos_codigo = pt.tipo_puntos_codigo
-          LEFT JOIN public.servicios s
-            ON s.id_servicio = pt.id_servicio_canje
-          WHERE pt.id_cliente = $1::uuid
-          ORDER BY pt.created_at DESC, pt.id_points_tx DESC
-        `,
-        [safeId]
-      ),
-    ]);
+    const page = Math.max(1, Number(query.page) || 1);
+    const limit = Math.max(1, Math.min(100, Number(query.limit) || 50));
+    const offset = (page - 1) * limit;
+
+    const countResult = await client.query(
+      `SELECT COUNT(*) AS total FROM public.points_ledger WHERE id_cliente = $1::uuid`,
+      [safeId]
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    const { rows } = await client.query(
+      `
+        SELECT
+          l.id_ledger,
+          l.tipo_movimiento,
+          l.puntos,
+          l.motivo,
+          l.id_referencia_origen,
+          l.created_at,
+          u.username AS usuario_registra,
+          l.id_sucursal
+        FROM public.points_ledger l
+        LEFT JOIN public.usuarios u
+          ON u.id_usuario = l.created_by_usuario_id
+        WHERE l.id_cliente = $1::uuid
+        ORDER BY l.created_at DESC, l.id_ledger DESC
+        LIMIT ${limit}
+        OFFSET ${offset}
+      `,
+      [safeId]
+    );
 
     return {
-      cliente: card,
-      movimientos: txResult.rows.map((row) => ({
-        id_points_tx: row.id_points_tx,
-        id_cita: row.id_cita ?? null,
-        id_cycle: row.id_cycle ?? null,
-        id_sucursal_origen: row.id_sucursal_origen ?? null,
-        id_servicio_canje: row.id_servicio_canje ?? null,
-        nombre_servicio_canje: row.nombre_servicio_canje ?? null,
-        tipo_puntos_codigo: row.tipo_puntos_codigo,
-        tipo_descripcion: row.tipo_descripcion ?? row.tipo_puntos_codigo,
-        signo: Number(row.signo ?? 1),
-        puntos: Number(row.puntos ?? 0),
-        puntos_ajustados: Number(row.puntos_ajustados ?? 0),
-        vence_at: row.vence_at ?? null,
+      movimientos: rows.map((row) => ({
+        id_ledger: row.id_ledger,
+        tipo_movimiento: row.tipo_movimiento,
+        puntos: Number(row.puntos || 0),
         motivo: row.motivo ?? null,
-        creado_por_usuario_id: row.creado_por_usuario_id ?? null,
-        created_at: row.created_at ?? null,
+        id_referencia_origen: row.id_referencia_origen ?? null,
+        created_at: row.created_at ? new Date(row.created_at).toISOString() : null,
+        usuario_registra: row.usuario_registra ?? "Sistema",
+        id_sucursal: row.id_sucursal ?? null,
       })),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      }
     };
   } finally {
     client.release();
   }
 }
-
 export async function updateMasterPuntosRegla(app, claims, payload = {}) {
   const scope = await getScope(app, claims);
   const normalized = normalizeRulePayload(payload, scope);
@@ -901,6 +998,7 @@ export async function createMasterPuntosCanje(app, claims, payload = {}) {
   const client = await app.db.connect();
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [idCliente]);
     const cliente = await ensureClientInScope(client, idCliente, branchIds);
     if (!cliente.id_usuario) {
       throw new AppError(409, "No se puede canjear: el cliente no tiene usuario activo", {
@@ -1046,6 +1144,7 @@ export async function createMasterPuntosLegacyMigration(app, claims, payload = {
   const client = await app.db.connect();
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [idCliente]);
     const config = await getLegacyMigrationConfig(client);
     const legacySupport = await getLegacyMigrationSchemaSupport(client);
     if (!config.migracion_manual_habilitada) {

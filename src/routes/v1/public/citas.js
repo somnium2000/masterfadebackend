@@ -121,7 +121,7 @@ function normalizePublicParams(paramsMap) {
     agenda_buffer_global_min: Number.isFinite(Number(globalBuffer)) ? Number(globalBuffer) : 0,
     permitir_acompanantes: typeof companions === "boolean" ? companions : false,
     pago_total_obligatorio: typeof fullPayment === "boolean" ? fullPayment : true,
-    simulacion_sin_pago: typeof simulationNoPayment === "boolean" ? simulationNoPayment : true,
+    simulacion_sin_pago: typeof simulationNoPayment === "boolean" ? simulationNoPayment : false,
   };
 }
 
@@ -415,20 +415,10 @@ async function resolveOrCreatePublicClient(client, payload) {
   );
 
   if (existingResult.rows[0]) {
-    await client.query(
-      `
-        UPDATE public.personas
-        SET telefono_principal = COALESCE(NULLIF($2, ''), telefono_principal),
-            updated_at = now()
-        WHERE id_persona = $1::uuid
-      `,
-      [existingResult.rows[0].id_persona, telefono || ""]
-    );
-
-    return {
-      id_cliente: existingResult.rows[0].id_cliente,
-      id_persona: existingResult.rows[0].id_persona,
-    };
+    throw new AppError(409, "Este correo ya esta asociado a una cuenta. Por favor inicia sesion para agendar.", {
+      code: "PUBLIC_CITAS_EMAIL_IN_USE",
+      details: { email },
+    });
   }
 
   const { nombres, apellidos } = splitFullName(nombre);
@@ -531,6 +521,12 @@ export default async function publicCitasRoutes(app) {
   app.post(
     "/hold",
     {
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "15 minutes",
+        },
+      },
       schema: {
         body: {
           type: "object",

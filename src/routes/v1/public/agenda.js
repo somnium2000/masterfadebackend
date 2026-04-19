@@ -209,6 +209,16 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
         const fechaHasta = parseDateOnly(request.query?.fecha_hasta, "fecha_hasta");
+        const dateDesde = new Date(fechaDesde);
+        const dateHasta = new Date(fechaHasta);
+        if (dateHasta < dateDesde) {
+          throw new AppError(400, "fecha_hasta no puede ser menor a fecha_desde", { code: "PUBLIC_AGENDA_DATES_INVALID" });
+        }
+        const diffTime = Math.abs(dateHasta - dateDesde);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        if (diffDays > 60) {
+          throw new AppError(400, "El rango de fechas no puede superar los 60 dias", { code: "PUBLIC_AGENDA_DATE_RANGE_TOO_LARGE" });
+        }
         const serviceSelection = await getBookingSelectionDetails(app.db, {
           id_sucursal: idSucursal,
           selection_type: request.query?.selection_type,

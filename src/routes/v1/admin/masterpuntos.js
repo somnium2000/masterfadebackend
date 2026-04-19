@@ -11,6 +11,16 @@ import {
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
 
+const movimientosQuerySchema = {
+  type: "object",
+  properties: {
+    page: { type: "integer", minimum: 1 },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+  },
+  additionalProperties: false,
+};
+
+
 const idClienteParamSchema = {
   type: "object",
   required: ["id_cliente"],
@@ -23,9 +33,12 @@ const idClienteParamSchema = {
 const clientesQuerySchema = {
   type: "object",
   properties: {
+    page: { type: "integer", minimum: 1 },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
     q: { type: "string", minLength: 1, maxLength: 120 },
     search: { type: "string", minLength: 1, maxLength: 120 },
     id_sucursal: { type: "string", format: "uuid" },
+    solo_premio: { type: "boolean" },
   },
   additionalProperties: false,
 };
@@ -92,7 +105,7 @@ function sendHandled(reply, request, error, message, code) {
   request.log.error({ err: error }, message);
   return sendError(reply, 500, message, {
     code,
-    details: error instanceof Error ? error.message : message,
+    
     requestId: request.id,
   });
 }
@@ -127,11 +140,11 @@ export default async function adminMasterPuntosRoutes(app) {
     "/clientes/:id_cliente/movimientos",
     {
       preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
-      schema: { params: idClienteParamSchema },
+      schema: { params: idClienteParamSchema, querystring: movimientosQuerySchema },
     },
     async (request, reply) => {
       try {
-        const data = await getMasterPuntosClienteMovimientos(app, request.claims, request.params.id_cliente);
+        const data = await getMasterPuntosClienteMovimientos(app, request.claims, request.params.id_cliente, request.query || {});
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo listar movimientos del cliente", "MASTERPUNTOS_CLIENT_MOVEMENTS_ERROR");
