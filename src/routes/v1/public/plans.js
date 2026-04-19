@@ -97,6 +97,7 @@ const PUBLIC_PLANS_SQL = `
       ON su.id_sucursal = mps.id_sucursal
     WHERE mps.activo IS TRUE
       AND mps.visible_publico IS TRUE
+      AND mps.precio_hnl > 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR mps.id_sucursal = $1::uuid)
@@ -146,6 +147,7 @@ const PUBLIC_PLANS_SQL = `
   JOIN public.periodos_membresia pm
     ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
   WHERE mp.activo IS TRUE
+    AND COALESCE(eo.precio_hnl, mp.precio_hnl) > 0
   ORDER BY eo.orden_visual ASC, mp.nombre_plan ASC
 `;
 
@@ -165,6 +167,7 @@ const PUBLIC_PLANS_SQL_LEGACY = `
       ON su.id_sucursal = mps.id_sucursal
     WHERE mps.activo IS TRUE
       AND mps.visible_publico IS TRUE
+      AND mps.precio_hnl > 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR mps.id_sucursal = $1::uuid)
@@ -213,6 +216,7 @@ const PUBLIC_PLANS_SQL_LEGACY = `
   JOIN public.periodos_membresia pm
     ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
   WHERE mp.activo IS TRUE
+    AND COALESCE(eo.precio_hnl, mp.precio_hnl) > 0
   ORDER BY eo.orden_visual ASC, mp.nombre_plan ASC
 `;
 
@@ -304,6 +308,20 @@ function mapPlanRow(row) {
   };
 }
 
+function isValidPublicPlan(plan) {
+  const price = Number(plan?.precio_hnl);
+  if (!Number.isFinite(price) || price <= 0) return false;
+  const benefits = Array.isArray(plan?.beneficios) ? plan.beneficios : [];
+  return benefits.some((benefit) => String(benefit?.tipo || "").toLowerCase() === "servicio" && benefit?.id_servicio);
+}
+
+function sendPublicPlansError(reply, requestId, statusCode, message, code) {
+  return sendError(reply, statusCode, message, {
+    code,
+    requestId,
+  });
+}
+
 export default async function publicPlansRoutes(app) {
   app.get(
     "/",
@@ -340,36 +358,24 @@ export default async function publicPlansRoutes(app) {
     },
     async (request, reply) => {
       if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
+        return sendPublicPlansError(reply, request.id, 500, "Base de datos no configurada", "DB_NOT_CONFIGURED");
       }
 
       try {
         const supportsPlanCategoryColumn = await hasPlanCategoryColumn(app);
         const querySql = supportsPlanCategoryColumn ? PUBLIC_PLANS_SQL : PUBLIC_PLANS_SQL_LEGACY;
         const { rows } = await app.db.query(querySql, [request.query?.id_sucursal ?? null]);
-        return sendOk(reply, {
-          planes: rows.map(mapPlanRow),
-        });
+        const planes = rows.map(mapPlanRow).filter(isValidPublicPlan);
+        return sendOk(reply, { planes });
       } catch (error) {
         request.log.error({ err: error }, "Public catalog planes error");
         if (error?.code === "42P01" && String(error?.message || "").includes("membership_plans_sucursal")) {
-          return sendError(reply, 500, "Falta aplicar migracion de PLANES multi-sucursal en la base de datos", {
-            code: "PUBLIC_PLAN_MIGRATION_REQUIRED",
-            details: error.message,
-          });
+          return sendPublicPlansError(reply, request.id, 500, "Falta aplicar migracion de PLANES multi-sucursal en la base de datos", "PUBLIC_PLAN_MIGRATION_REQUIRED");
         }
         if (error?.code === "42703" && String(error?.message || "").includes("categoria_nivel")) {
-          return sendError(reply, 500, "Falta aplicar migracion de categoria de planes en la base de datos", {
-            code: "PUBLIC_PLAN_CATEGORY_MIGRATION_REQUIRED",
-            details: error.message,
-          });
+          return sendPublicPlansError(reply, request.id, 500, "Falta aplicar migracion de categoria de planes en la base de datos", "PUBLIC_PLAN_CATEGORY_MIGRATION_REQUIRED");
         }
-        return sendError(reply, 500, "No se pudo consultar el catalogo de planes", {
-          code: "PUBLIC_CATALOG_PLANS_ERROR",
-          details: error instanceof Error ? error.message : "Unknown public catalog plans error",
-        });
+        return sendPublicPlansError(reply, request.id, 500, "No se pudo consultar el catalogo de planes", "PUBLIC_CATALOG_PLANS_ERROR");
       }
     }
   );

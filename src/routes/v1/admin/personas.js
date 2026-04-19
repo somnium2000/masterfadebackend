@@ -10,6 +10,9 @@ import {
 } from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
+const USER_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const EMPLOYEE_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const CLIENT_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
 const ACCESS_STATUS = {
   PENDING_PASSWORD: "pendiente_password",
   ACTIVE: "activo",
@@ -245,6 +248,29 @@ const LIST_USUARIOS_SQL = `
   LEFT JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario AND ru.activo IS TRUE
   LEFT JOIN public.roles r ON r.id_rol = ru.id_rol
   WHERE u.deleted_at IS NULL
+    AND (
+      EXISTS (
+        SELECT 1
+        FROM public.empleados e
+        WHERE e.id_persona = u.id_persona
+          AND e.deleted_at IS NULL
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM public.clientes c
+        WHERE c.id_usuario = u.id_usuario
+          AND c.deleted_at IS NULL
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM public.roles_usuarios ru_sa
+        JOIN public.roles r_sa
+          ON r_sa.id_rol = ru_sa.id_rol
+        WHERE ru_sa.id_usuario = u.id_usuario
+          AND ru_sa.activo IS TRUE
+          AND r_sa.nombre = 'super_admin'
+      )
+    )
   GROUP BY u.id_usuario, u.id_persona, p.nombres, p.apellidos, p.telefono_principal, cp.email, au.email, u.estado, u.estado_acceso, u.credenciales_completadas_at, u.ultimo_login_at
   ORDER BY p.nombres ASC, p.apellidos ASC, u.id_usuario ASC
 `;
@@ -583,9 +609,13 @@ async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
 
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
+    const safeDetails =
+      error.statusCode >= 500
+        ? undefined
+        : error.details;
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
-      details: error.details,
+      ...(safeDetails !== undefined ? { details: safeDetails } : {}),
       requestId: request.id,
     });
   }
@@ -645,7 +675,6 @@ function sendHandled(reply, request, error, message, code) {
   request.log.error({ err: error }, message);
   return sendError(reply, 500, message, {
     code,
-    details: error instanceof Error ? error.message : message,
     requestId: request.id,
   });
 }
@@ -1093,25 +1122,74 @@ function parseEmployeeRoleNames(rawRoles, esBarbero) {
     }
   }
 
-  if (esBarbero && !uniqueRoles.includes("barbero")) {
-    throw new AppError(400, "Si empleado.es_barbero=true debes asignar rol barbero", {
-      code: "PERSONAS_BARBER_ROLE_REQUIRED",
-    });
-  }
-
-  if (!esBarbero && uniqueRoles.includes("barbero")) {
-    throw new AppError(400, "Si asignas rol barbero debes marcar empleado.es_barbero=true", {
-      code: "PERSONAS_BARBER_FLAG_REQUIRED",
-    });
-  }
-
-  if (uniqueRoles.includes("super_admin") && uniqueRoles.length > 1) {
-    throw new AppError(400, "super_admin debe ser un rol exclusivo en esta fase", {
-      code: "PERSONAS_SUPER_ADMIN_ROLE_EXCLUSIVE",
-    });
-  }
+  if (esBarbero && !uniqueRoles.includes("barbero")) uniqueRoles.push("barbero");
 
   return uniqueRoles;
+}
+
+function assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles }) {
+  if (!normalizeOptional(persona?.dni)) {
+    throw new AppError(400, "persona.dni es obligatorio para empleados", {
+      code: "PERSONAS_EMPLOYEE_DNI_REQUIRED",
+    });
+  }
+  if (!normalizeOptional(persona?.telefono_principal)) {
+    throw new AppError(400, "persona.telefono_principal es obligatorio para empleados", {
+      code: "PERSONAS_EMPLOYEE_PHONE_REQUIRED",
+    });
+  }
+  if (!normalizeOptional(correoPrincipal)) {
+    throw new AppError(400, "acceso.correo_principal es obligatorio para empleados", {
+      code: "PERSONAS_EMPLOYEE_EMAIL_REQUIRED",
+    });
+  }
+  if (!normalizeOptional(idSucursal)) {
+    throw new AppError(400, "empleado.id_sucursal es obligatorio", {
+      code: "PERSONAS_EMPLOYEE_BRANCH_REQUIRED",
+    });
+  }
+  if (!Array.isArray(roles) || !roles.length) {
+    throw new AppError(400, "Debes asignar al menos un rol para el empleado", {
+      code: "PERSONAS_ROLE_REQUIRED",
+    });
+  }
+}
+
+function assertRequiredClientBusinessFields({ persona, correoPrincipal }) {
+  if (!normalizeOptional(persona?.dni)) {
+    throw new AppError(400, "persona.dni es obligatorio para clientes", {
+      code: "PERSONAS_CLIENT_DNI_REQUIRED",
+    });
+  }
+  if (!normalizeOptional(persona?.telefono_principal)) {
+    throw new AppError(400, "persona.telefono_principal es obligatorio para clientes", {
+      code: "PERSONAS_CLIENT_PHONE_REQUIRED",
+    });
+  }
+  if (!normalizeOptional(correoPrincipal)) {
+    throw new AppError(400, "acceso.correo_principal es obligatorio para clientes", {
+      code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
+    });
+  }
+}
+
+async function assertPersonaNotEmpleado(client, personaId) {
+  if (!personaId) return;
+  const { rowCount } = await client.query(
+    `
+      SELECT 1
+      FROM public.empleados
+      WHERE id_persona = $1::uuid
+        AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [personaId]
+  );
+  if (rowCount > 0) {
+    throw new AppError(409, "La persona ya pertenece a Empleados y no puede registrarse como Cliente", {
+      code: "PERSONAS_CLIENT_EMPLOYEE_CONFLICT",
+    });
+  }
 }
 
 async function setEmployeeRoleAssignments(client, { roleIdsByName, roleNames, userId, branchId, assignedBy }) {
@@ -1217,7 +1295,6 @@ async function createAuthIdentity(app, { email, nombres, apellidos }) {
   if (createAuth.error || !createAuth.data?.user?.id) {
     throw new AppError(500, "No se pudo crear la identidad en Supabase Auth", {
       code: "PERSONAS_AUTH_CREATE_ERROR",
-      details: createAuth.error?.message || "AUTH_CREATE_FAILED",
     });
   }
 
@@ -1243,14 +1320,14 @@ async function sendPasswordSetupEmail(app, email, fullName = null) {
   if (!app.supabaseAdmin) {
     return {
       sent: false,
-      message: "Supabase Admin no configurado para generar enlace de configuracion",
+      message: "No se pudo preparar el correo de configuración de contraseña",
     };
   }
 
   if (!app.mailer?.configured) {
     return {
       sent: false,
-      message: "Servicio SMTP no configurado para enviar correo de configuracion",
+      message: "No se pudo enviar el correo de configuración de contraseña",
     };
   }
 
@@ -1260,7 +1337,7 @@ async function sendPasswordSetupEmail(app, email, fullName = null) {
     if (!recovery.found || !recovery.action_link) {
       return {
         sent: false,
-        message: "No se encontro identidad en Auth para enviar configuracion",
+        message: "No se pudo preparar el enlace de configuración de contraseña",
       };
     }
 
@@ -1274,15 +1351,16 @@ async function sendPasswordSetupEmail(app, email, fullName = null) {
     if (!delivery.sent) {
       return {
         sent: false,
-        message: delivery.message || "No se pudo enviar el correo de configuracion",
+        message: "No se pudo enviar el correo de configuración de contraseña",
       };
     }
 
     return { sent: true, message: "Correo de configuracion enviado por SMTP" };
   } catch (error) {
+    app.log.error({ err: error, email }, "sendPasswordSetupEmail error");
     return {
       sent: false,
-      message: error instanceof Error ? error.message : "No se pudo enviar el correo de configuracion",
+      message: "No se pudo enviar el correo de configuración de contraseña",
     };
   }
 }
@@ -1331,9 +1409,10 @@ async function createEmpleado(app, request, payload) {
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
     const empleadoRaw = payload?.empleado || {};
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
-    const esBarbero = Boolean(empleadoRaw.es_barbero);
-    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, esBarbero);
+    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
+    const esBarbero = roles.includes("barbero");
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
+    assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles });
 
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
@@ -1478,6 +1557,9 @@ async function createEmpleado(app, request, payload) {
 async function updateEmpleado(app, request, idEmpleado, payload) {
   const client = await app.db.connect();
   let transactionStarted = false;
+  let authEmailUpdated = false;
+  let authEmailPrevious = null;
+  let authUserIdForCompensation = null;
 
   try {
     const current = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
@@ -1498,10 +1580,13 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
     const empleadoRaw = payload?.empleado || {};
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
-    const esBarbero = Boolean(empleadoRaw.es_barbero);
-    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, esBarbero);
+    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
+    const esBarbero = roles.includes("barbero");
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
     const previousEmail = normalizeEmail(currentRow.correo_principal ?? "");
+    authEmailPrevious = previousEmail || null;
+    authUserIdForCompensation = currentRow.id_usuario;
+    assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles });
 
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
@@ -1551,6 +1636,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     await upsertPrimaryEmail(client, currentRow.id_persona, correoPrincipal);
     if (previousEmail !== correoPrincipal) {
       await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
+      authEmailUpdated = true;
     }
 
     await client.query(
@@ -1592,6 +1678,16 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     if (transactionStarted) {
       await client.query("ROLLBACK").catch(() => {});
     }
+    if (authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
+      try {
+        await syncAuthUserEmail(app, authUserIdForCompensation, authEmailPrevious);
+      } catch (compensationError) {
+        request.log.error(
+          { err: compensationError, id_usuario: authUserIdForCompensation },
+          "No se pudo revertir correo de auth tras rollback en actualizacion de empleado"
+        );
+      }
+    }
     throw error;
   } finally {
     client.release();
@@ -1607,7 +1703,7 @@ async function createCliente(app, request, payload) {
     const persona = buildPersonaPayload(payload?.persona || {});
     const acceso = payload?.acceso || {};
     const cliente = payload?.cliente || {};
-    const habilitarAcceso = Boolean(acceso.habilitar_acceso);
+    const habilitarAcceso = acceso.habilitar_acceso === false ? false : true;
     const correoPrincipal = normalizeEmail(acceso.correo_principal);
     const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
@@ -1618,30 +1714,23 @@ async function createCliente(app, request, payload) {
     const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
+    assertRequiredClientBusinessFields({ persona, correoPrincipal });
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
       rtn: persona.rtn,
     });
-    if (!correoPrincipal) {
-      throw new AppError(400, "Cliente requiere correo_principal obligatorio", {
-        code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
-      });
-    }
     assertValidEmail(correoPrincipal);
     await ensureEmailAvailability(client, correoPrincipal);
-
-    if (habilitarAcceso) {
-      if (!idSucursalOrigen) {
-        throw new AppError(400, "Cliente con acceso requiere id_sucursal_origen activo", {
-          code: "PERSONAS_CLIENT_BRANCH_REQUIRED",
-        });
-      }
-      authUserId = await createAuthIdentity(app, {
-        email: correoPrincipal,
-        nombres: persona.nombres,
-        apellidos: persona.apellidos,
+    if (!habilitarAcceso) {
+      throw new AppError(400, "Los clientes deben crearse con acceso habilitado", {
+        code: "PERSONAS_CLIENT_ACCESS_REQUIRED",
       });
     }
+    authUserId = await createAuthIdentity(app, {
+      email: correoPrincipal,
+      nombres: persona.nombres,
+      apellidos: persona.apellidos,
+    });
 
     const roleIdsByName = await loadRoleIdByName(client);
 
@@ -1678,35 +1767,34 @@ async function createCliente(app, request, payload) {
     );
 
     const idPersona = personaInsert.rows[0].id_persona;
+    await assertPersonaNotEmpleado(client, idPersona);
 
     if (correoPrincipal) {
       await upsertPrimaryEmail(client, idPersona, correoPrincipal);
     }
 
-    if (habilitarAcceso) {
-      await client.query(
-        `
-          INSERT INTO public.usuarios (
-            id_usuario,
-            id_persona,
-            estado,
-            estado_acceso,
-            credenciales_completadas_at,
-            ultimo_login_at
-          )
-          VALUES ($1::uuid, $2::uuid, TRUE, $3, NULL, NULL)
-        `,
-        [authUserId, idPersona, ACCESS_STATUS.PENDING_PASSWORD]
-      );
+    await client.query(
+      `
+        INSERT INTO public.usuarios (
+          id_usuario,
+          id_persona,
+          estado,
+          estado_acceso,
+          credenciales_completadas_at,
+          ultimo_login_at
+        )
+        VALUES ($1::uuid, $2::uuid, TRUE, $3, NULL, NULL)
+      `,
+      [authUserId, idPersona, ACCESS_STATUS.PENDING_PASSWORD]
+    );
 
-      await ensureClienteRoleAssignment(
-        client,
-        roleIdsByName,
-        authUserId,
-        idSucursalOrigen,
-        request.claims?.user?.id_usuario ?? null
-      );
-    }
+    await ensureClienteRoleAssignment(
+      client,
+      roleIdsByName,
+      authUserId,
+      idSucursalOrigen,
+      request.claims?.user?.id_usuario ?? null
+    );
 
     const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
     const clienteInsert = hasConsentTimestampColumns
@@ -1821,23 +1909,20 @@ async function createCliente(app, request, payload) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    let setupPassword = null;
-    if (habilitarAcceso) {
-      const setupResult = await sendPasswordSetupEmail(
-        app,
-        correoPrincipal,
-        buildFullName(persona.nombres, persona.apellidos)
-      );
-      setupPassword = {
-        requerido: true,
-        enviado: setupResult.sent,
-        mensaje: setupResult.message,
-      };
-    }
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      correoPrincipal,
+      buildFullName(persona.nombres, persona.apellidos)
+    );
+    const setupPassword = {
+      requerido: true,
+      enviado: setupResult.sent,
+      mensaje: setupResult.message,
+    };
 
     return {
       cliente: await enrichClienteProfilePhotoSignedUrl(app, request.claims, mapCliente(detail.rows[0])),
-      ...(setupPassword ? { setup_password: setupPassword } : {}),
+      setup_password: setupPassword,
     };
   } catch (error) {
     if (transactionStarted) {
@@ -1861,6 +1946,7 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
       `
         SELECT
           u.id_usuario,
+          u.id_persona,
           u.estado_acceso,
           p.nombres,
           p.apellidos,
@@ -1888,6 +1974,40 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     }
 
     const userRow = userResult.rows[0];
+    const relationshipGuard = await client.query(
+      `
+        SELECT
+          EXISTS (
+            SELECT 1
+            FROM public.empleados e
+            WHERE e.id_persona = $1::uuid
+              AND e.deleted_at IS NULL
+          ) AS has_empleado,
+          EXISTS (
+            SELECT 1
+            FROM public.clientes c
+            WHERE c.id_usuario = $2::uuid
+              AND c.deleted_at IS NULL
+          ) AS has_cliente,
+          EXISTS (
+            SELECT 1
+            FROM public.roles_usuarios ru
+            JOIN public.roles r
+              ON r.id_rol = ru.id_rol
+            WHERE ru.id_usuario = $2::uuid
+              AND ru.activo IS TRUE
+              AND r.nombre = 'super_admin'
+          ) AS has_super_admin
+      `,
+      [userRow.id_persona, userId]
+    );
+    const relation = relationshipGuard.rows?.[0] || {};
+    if (!relation.has_empleado && !relation.has_cliente && !relation.has_super_admin) {
+      throw new AppError(409, "Usuario sin relacion valida de dominio", {
+        code: "PERSONAS_USER_DOMAIN_RELATION_REQUIRED",
+      });
+    }
+
     const email = normalizeEmail(userRow.email);
     if (!email) {
       throw new AppError(409, "El usuario no tiene correo principal", { code: "PERSONAS_USER_EMAIL_MISSING" });
@@ -1917,16 +2037,6 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
       email,
       buildFullName(userRow.nombres, userRow.apellidos)
     );
-    if (!setupResult.sent) {
-      // AM: En reenvio manual se exige entrega real para evitar falso positivo en UI.
-      throw new AppError(502, "No se pudo enviar el correo de configuracion", {
-        code: "PERSONAS_USER_SETUP_DELIVERY_FAILED",
-        details: {
-          email,
-          reason: setupResult.message || "DELIVERY_FAILED",
-        },
-      });
-    }
 
     return {
       id_usuario: userId,
@@ -1969,7 +2079,6 @@ async function syncAuthUserEmail(app, userId, email) {
   if (updateAuth.error) {
     throw new AppError(500, "No se pudo sincronizar correo en Supabase Auth", {
       code: "PERSONAS_AUTH_EMAIL_SYNC_ERROR",
-      details: updateAuth.error.message || "AUTH_EMAIL_UPDATE_FAILED",
     });
   }
 }
@@ -2000,7 +2109,8 @@ async function blockUserAccessByLifecycle(client, userId) {
   await client.query(
     `
       UPDATE public.usuarios
-      SET estado_acceso = $2,
+      SET estado = FALSE,
+          estado_acceso = $2,
           updated_at = NOW()
       WHERE id_usuario = $1::uuid
         AND deleted_at IS NULL
@@ -2048,15 +2158,11 @@ async function restoreEmployeeRolesByLifecycle(client, { userId, branchId, assig
     .filter((value) => EMPLOYEE_ALLOWED_ROLES.has(value));
 
   let candidateRoles = [...new Set(historicalRoleNames)];
-  if (candidateRoles.includes("super_admin")) {
-    candidateRoles = ["super_admin"];
-  } else {
-    if (!esBarbero) {
-      candidateRoles = candidateRoles.filter((role) => role !== "barbero");
-    }
-    if (esBarbero && !candidateRoles.includes("barbero")) {
-      candidateRoles.push("barbero");
-    }
+  if (!esBarbero) {
+    candidateRoles = candidateRoles.filter((role) => role !== "barbero");
+  }
+  if (esBarbero && !candidateRoles.includes("barbero")) {
+    candidateRoles.push("barbero");
   }
 
   if (!candidateRoles.length) {
@@ -2064,9 +2170,7 @@ async function restoreEmployeeRolesByLifecycle(client, { userId, branchId, assig
     candidateRoles = esBarbero ? ["barbero"] : ["admin"];
   }
 
-  const normalizedRoles = candidateRoles.includes("super_admin")
-    ? ["super_admin"]
-    : parseEmployeeRoleNames(candidateRoles, esBarbero);
+  const normalizedRoles = parseEmployeeRoleNames(candidateRoles, esBarbero);
   if (normalizedRoles.some((role) => BRANCH_REQUIRED_ROLES.has(role)) && !branchId) {
     throw new AppError(409, "No se puede activar empleado sin sucursal valida para sus roles internos", {
       code: "PERSONAS_EMPLOYEE_ACTIVATE_BRANCH_REQUIRED",
@@ -2100,6 +2204,11 @@ async function updateUsuario(app, request, userId, payload) {
     if (!hasPersonaPatch && !hasAccessPatch) {
       throw new AppError(400, "Debes enviar al menos un cambio en persona o acceso", {
         code: "PERSONAS_USER_UPDATE_EMPTY",
+      });
+    }
+    if (hasAccessPatch) {
+      throw new AppError(400, "Desde este submodulo no se permite cambiar correo, rol o sucursal del usuario", {
+        code: "PERSONAS_USER_ACCESS_PATCH_NOT_ALLOWED",
       });
     }
 
@@ -2305,6 +2414,41 @@ async function updateUsuarioAccessStatus(app, userId, status) {
 
   try {
     await getUsuarioOrThrow(client, userId);
+    const relationshipGuard = await client.query(
+      `
+        SELECT
+          EXISTS (
+            SELECT 1
+            FROM public.usuarios u
+            JOIN public.empleados e
+              ON e.id_persona = u.id_persona
+            WHERE u.id_usuario = $1::uuid
+              AND e.deleted_at IS NULL
+          ) AS has_empleado,
+          EXISTS (
+            SELECT 1
+            FROM public.clientes c
+            WHERE c.id_usuario = $1::uuid
+              AND c.deleted_at IS NULL
+          ) AS has_cliente,
+          EXISTS (
+            SELECT 1
+            FROM public.roles_usuarios ru
+            JOIN public.roles r
+              ON r.id_rol = ru.id_rol
+            WHERE ru.id_usuario = $1::uuid
+              AND ru.activo IS TRUE
+              AND r.nombre = 'super_admin'
+          ) AS has_super_admin
+      `,
+      [userId]
+    );
+    const relation = relationshipGuard.rows?.[0] || {};
+    if (!relation.has_empleado && !relation.has_cliente && !relation.has_super_admin) {
+      throw new AppError(409, "Usuario sin relacion valida de dominio", {
+        code: "PERSONAS_USER_DOMAIN_RELATION_REQUIRED",
+      });
+    }
 
     if (status === ACCESS_STATUS.ACTIVE) {
       const activationGuard = await client.query(
@@ -2415,6 +2559,12 @@ async function inactivateEmpleado(app, idEmpleado) {
     }
 
     const row = current.rows[0];
+    if (!row.id_usuario) {
+      throw new AppError(409, "Empleado inconsistente: no tiene usuario vinculado", {
+        code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
+      });
+    }
+
     await client.query("BEGIN");
     transactionStarted = true;
 
@@ -2428,10 +2578,8 @@ async function inactivateEmpleado(app, idEmpleado) {
       [idEmpleado]
     );
 
-    if (row.id_usuario) {
-      await deactivateUserRolesByNames(client, row.id_usuario, [...EMPLOYEE_ALLOWED_ROLES]);
-      await blockUserAccessByLifecycle(client, row.id_usuario);
-    }
+    await deactivateUserRolesByNames(client, row.id_usuario, [...EMPLOYEE_ALLOWED_ROLES]);
+    await blockUserAccessByLifecycle(client, row.id_usuario);
 
     const detail = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
 
@@ -2462,6 +2610,12 @@ async function activateEmpleado(app, request, idEmpleado) {
     }
 
     const row = current.rows[0];
+    if (!row.id_usuario) {
+      throw new AppError(409, "Empleado inconsistente: no tiene usuario vinculado", {
+        code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
+      });
+    }
+
     await client.query("BEGIN");
     transactionStarted = true;
 
@@ -2475,15 +2629,13 @@ async function activateEmpleado(app, request, idEmpleado) {
       [idEmpleado]
     );
 
-    if (row.id_usuario) {
-      await restoreEmployeeRolesByLifecycle(client, {
-        userId: row.id_usuario,
-        branchId: row.id_sucursal,
-        assignedBy: request.claims?.user?.id_usuario ?? null,
-        esBarbero: Boolean(row.es_barbero),
-      });
-      await restoreUserAccessByLifecycle(client, row.id_usuario);
-    }
+    await restoreEmployeeRolesByLifecycle(client, {
+      userId: row.id_usuario,
+      branchId: row.id_sucursal,
+      assignedBy: request.claims?.user?.id_usuario ?? null,
+      esBarbero: Boolean(row.es_barbero),
+    });
+    await restoreUserAccessByLifecycle(client, row.id_usuario);
 
     const detail = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
 
@@ -2505,6 +2657,9 @@ async function updateCliente(app, request, idCliente, payload) {
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
+  let authEmailUpdated = false;
+  let authEmailPrevious = null;
+  let authUserIdForCompensation = null;
 
   try {
     const current = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
@@ -2530,40 +2685,32 @@ async function updateCliente(app, request, idCliente, payload) {
     }
     const currentHabilitarAcceso =
       currentRow?.tiene_acceso !== undefined ? Boolean(currentRow.tiene_acceso) : Boolean(currentRow?.id_usuario);
-    const habilitarAcceso = hasHabilitarAccesoPatch ? Boolean(acceso.habilitar_acceso) : currentHabilitarAcceso;
+    const requestedHabilitarAcceso = hasHabilitarAccesoPatch ? Boolean(acceso.habilitar_acceso) : currentHabilitarAcceso;
+    const habilitarAcceso = requestedHabilitarAcceso;
     const correoPrincipal = normalizeEmail(acceso.correo_principal ?? currentRow.correo_principal ?? "");
-    const idSucursalOrigen = await ensureActiveBranch(client, cliente.id_sucursal_origen ?? currentRow.id_sucursal_origen ?? null);
+    const hasSucursalOrigenPatch = Object.prototype.hasOwnProperty.call(cliente, "id_sucursal_origen");
+    const idSucursalOrigen = hasSucursalOrigenPatch
+      ? await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null)
+      : normalizeOptional(currentRow.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
     const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(cliente, "foto_perfil_asset_id");
     const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
       ? normalizeOptional(cliente.foto_perfil_asset_id ?? null)
       : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
 
-    if (currentRow.id_usuario && !habilitarAcceso) {
-      throw new AppError(400, "El cliente ya tiene acceso. Usa accion de inactivar para restringirlo.", {
-        code: "PERSONAS_CLIENT_ACCESS_DISABLE_NOT_ALLOWED",
+    if (!habilitarAcceso) {
+      throw new AppError(400, "Los clientes deben conservar acceso habilitado", {
+        code: "PERSONAS_CLIENT_ACCESS_REQUIRED",
       });
     }
-
-    if (!correoPrincipal) {
-      throw new AppError(400, "Cliente requiere correo_principal obligatorio", {
-        code: "PERSONAS_CLIENT_EMAIL_REQUIRED",
-      });
-    }
+    assertRequiredClientBusinessFields({ persona, correoPrincipal });
+    await assertPersonaNotEmpleado(client, currentRow.id_persona);
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
       rtn: persona.rtn,
       excludePersonaId: currentRow.id_persona,
     });
     assertValidEmail(correoPrincipal);
-    if (habilitarAcceso) {
-      if (!idSucursalOrigen) {
-        throw new AppError(400, "Cliente con acceso requiere id_sucursal_origen activo", {
-          code: "PERSONAS_CLIENT_BRANCH_REQUIRED",
-        });
-      }
-    }
-
     await ensureEmailAvailability(client, correoPrincipal, {
       excludePersonaId: currentRow.id_persona,
       excludeUserId: currentRow.id_usuario ?? null,
@@ -2728,6 +2875,9 @@ async function updateCliente(app, request, idCliente, payload) {
     if (correoPrincipal && nextUserId) {
       const previousEmail = normalizeEmail(currentRow.correo_principal ?? "");
       if (previousEmail !== correoPrincipal) {
+        authEmailUpdated = true;
+        authEmailPrevious = previousEmail || null;
+        authUserIdForCompensation = nextUserId;
         await syncAuthUserEmail(app, nextUserId, correoPrincipal);
       }
     }
@@ -2853,6 +3003,16 @@ async function updateCliente(app, request, idCliente, payload) {
     if (transactionStarted) {
       await client.query("ROLLBACK").catch(() => {});
     }
+    if (authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
+      try {
+        await syncAuthUserEmail(app, authUserIdForCompensation, authEmailPrevious);
+      } catch (compensationError) {
+        request.log.error(
+          { err: compensationError, id_usuario: authUserIdForCompensation },
+          "No se pudo revertir correo de auth tras rollback en actualizacion de cliente"
+        );
+      }
+    }
     await deleteAuthIdentity(app, request, authUserId);
     throw error;
   } finally {
@@ -2873,6 +3033,11 @@ async function inactivateCliente(app, idCliente) {
     }
 
     const row = current.rows[0];
+    if (!row.id_usuario) {
+      throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
+        code: "PERSONAS_CLIENT_WITHOUT_USER",
+      });
+    }
     await client.query("BEGIN");
     transactionStarted = true;
 
@@ -2886,10 +3051,8 @@ async function inactivateCliente(app, idCliente) {
       [idCliente]
     );
 
-    if (row.id_usuario) {
-      await deactivateUserRolesByNames(client, row.id_usuario, ["cliente"]);
-      await blockUserAccessByLifecycle(client, row.id_usuario);
-    }
+    await deactivateUserRolesByNames(client, row.id_usuario, ["cliente"]);
+    await blockUserAccessByLifecycle(client, row.id_usuario);
 
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 
@@ -2920,6 +3083,11 @@ async function activateCliente(app, request, idCliente) {
     }
 
     const row = current.rows[0];
+    if (!row.id_usuario) {
+      throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
+        code: "PERSONAS_CLIENT_WITHOUT_USER",
+      });
+    }
     await client.query("BEGIN");
     transactionStarted = true;
 
@@ -2933,23 +3101,16 @@ async function activateCliente(app, request, idCliente) {
       [idCliente]
     );
 
-    if (row.id_usuario) {
-      const activeBranchId = await ensureActiveBranch(client, row.id_sucursal_origen ?? null);
-      if (!activeBranchId) {
-        throw new AppError(409, "No se puede activar cliente sin sucursal de origen activa", {
-          code: "PERSONAS_CLIENT_ACTIVATE_BRANCH_REQUIRED",
-        });
-      }
-      const roleIdsByName = await loadRoleIdByName(client);
-      await ensureClienteRoleAssignment(
-        client,
-        roleIdsByName,
-        row.id_usuario,
-        activeBranchId,
-        request.claims?.user?.id_usuario ?? null
-      );
-      await restoreUserAccessByLifecycle(client, row.id_usuario);
-    }
+    const activeBranchId = normalizeOptional(row.id_sucursal_origen ?? null);
+    const roleIdsByName = await loadRoleIdByName(client);
+    await ensureClienteRoleAssignment(
+      client,
+      roleIdsByName,
+      row.id_usuario,
+      activeBranchId,
+      request.claims?.user?.id_usuario ?? null
+    );
+    await restoreUserAccessByLifecycle(client, row.id_usuario);
 
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 
@@ -2971,6 +3132,7 @@ function uniqueUuidList(values) {
   return [...new Set((Array.isArray(values) ? values : []).filter(Boolean))];
 }
 
+// eslint-disable-next-line no-unused-vars
 async function loadPersonaDeletionBundle(client, { personaId = null, userId = null } = {}) {
   let resolvedPersonaId = personaId;
   if (!resolvedPersonaId && userId) {
@@ -3098,6 +3260,7 @@ async function deleteAuthUsersStrict(client, userIds) {
   }
 }
 
+// eslint-disable-next-line no-unused-vars
 async function deletePersonaBundlePermanently(app, client, bundle) {
   const usuarioIds = uniqueUuidList(bundle?.usuarioIds);
   const empleadoIds = uniqueUuidList(bundle?.empleadoIds);
@@ -3195,148 +3358,6 @@ async function deletePersonaBundlePermanently(app, client, bundle) {
   }
 }
 
-async function deleteEmpleadoPermanently(app, idEmpleado) {
-  const client = await app.db.connect();
-  try {
-    const current = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
-    if (!current.rowCount) {
-      throw new AppError(404, "Empleado no encontrado", {
-        code: "PERSONAS_EMPLOYEE_NOT_FOUND",
-      });
-    }
-
-    const row = current.rows[0];
-    const bundle = await loadPersonaDeletionBundle(client, {
-      personaId: row.id_persona,
-      userId: row.id_usuario ?? null,
-    });
-    return deletePersonaBundlePermanently(app, client, bundle);
-  } finally {
-    client.release();
-  }
-}
-
-async function deleteClientePermanently(app, idCliente) {
-  const client = await app.db.connect();
-  try {
-    const current = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
-    if (!current.rowCount) {
-      throw new AppError(404, "Cliente no encontrado", {
-        code: "PERSONAS_CLIENT_NOT_FOUND",
-      });
-    }
-
-    const row = current.rows[0];
-    const bundle = await loadPersonaDeletionBundle(client, {
-      personaId: row.id_persona,
-      userId: row.id_usuario ?? null,
-    });
-    return deletePersonaBundlePermanently(app, client, bundle);
-  } finally {
-    client.release();
-  }
-}
-
-async function deleteUsuarioPermanently(app, idUsuario) {
-  const client = await app.db.connect();
-  try {
-    const current = await client.query(
-      `
-        SELECT id_usuario, id_persona
-        FROM public.usuarios
-        WHERE id_usuario = $1::uuid
-          AND deleted_at IS NULL
-        LIMIT 1
-      `,
-      [idUsuario]
-    );
-    if (!current.rowCount) {
-      throw new AppError(404, "Usuario no encontrado", {
-        code: "PERSONAS_USER_NOT_FOUND",
-      });
-    }
-
-    const row = current.rows[0];
-    const bundle = await loadPersonaDeletionBundle(client, {
-      personaId: row.id_persona ?? null,
-      userId: row.id_usuario,
-    });
-    return deletePersonaBundlePermanently(app, client, bundle);
-  } finally {
-    client.release();
-  }
-}
-
-function normalizeLegacyInternalPayload(payload) {
-  return {
-    persona: payload?.persona || {},
-    acceso: {
-      correo_principal: payload?.correo_principal,
-      roles: Array.isArray(payload?.roles) ? payload.roles.map((entry) => entry?.rol).filter(Boolean) : [],
-    },
-    empleado: {
-      id_sucursal: payload?.empleado?.id_sucursal ?? null,
-      fecha_ingreso: payload?.empleado?.fecha_ingreso ?? null,
-      salario_base: payload?.empleado?.salario_base ?? null,
-      estado: true,
-      es_barbero: Boolean(payload?.empleado?.es_barbero),
-    },
-    cliente: {
-      id_sucursal_origen: payload?.cliente?.id_sucursal_origen ?? null,
-      consentimiento_marketing: Boolean(payload?.cliente?.consentimiento_marketing),
-      acepta_terminos: Boolean(payload?.cliente?.acepta_terminos),
-      estado: true,
-    },
-    createEmployee: Boolean(payload?.crear_empleado),
-    createClient: Boolean(payload?.crear_cliente),
-  };
-}
-
-async function createLegacyInternalUser(app, request, payload) {
-  const normalized = normalizeLegacyInternalPayload(payload);
-
-  if (normalized.createEmployee && normalized.createClient) {
-    throw new AppError(400, "Usa alta por modulo (empleados o clientes), no ambos", {
-      code: "PERSONAS_LEGACY_CREATE_CONFLICT",
-    });
-  }
-
-  if (normalized.createEmployee) {
-    const result = await createEmpleado(app, request, {
-      persona: normalized.persona,
-      acceso: normalized.acceso,
-      empleado: normalized.empleado,
-    });
-    return {
-      usuario: result.empleado,
-      setup_password: result.setup_password,
-      legado: true,
-      mensaje: "Endpoint legado redirigido al flujo de empleados",
-    };
-  }
-
-  if (normalized.createClient) {
-    const result = await createCliente(app, request, {
-      persona: normalized.persona,
-      acceso: {
-        habilitar_acceso: true,
-        correo_principal: normalized.acceso.correo_principal,
-      },
-      cliente: normalized.cliente,
-    });
-    return {
-      usuario: result.cliente,
-      setup_password: result.setup_password,
-      legado: true,
-      mensaje: "Endpoint legado redirigido al flujo de clientes con acceso",
-    };
-  }
-
-  throw new AppError(400, "El endpoint legado requiere crear_empleado=true o crear_cliente=true", {
-    code: "PERSONAS_LEGACY_CREATE_REQUIRED_PROFILE",
-  });
-}
-
 export default async function adminPersonasRoutes(app) {
   app.get("/", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
     try {
@@ -3347,7 +3368,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/catalogos", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/catalogos", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const [rolesResult, sucursalesResult] = await Promise.all([
         app.db.query("SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"),
@@ -3430,7 +3451,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.get("/usuarios", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/usuarios", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(LIST_USUARIOS_SQL);
       return sendOk(reply, { usuarios: rows.map(mapUsuario) });
@@ -3441,7 +3462,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/usuarios/:id_usuario",
-    { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: usuarioUpdateBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioUpdateBodySchema } },
     async (request, reply) => {
       try {
         const updated = await updateUsuario(app, request, request.params.id_usuario, request.body || {});
@@ -3454,7 +3475,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/usuarios/:id_usuario/estado-acceso",
-    { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: usuarioAccessStatusBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioAccessStatusBodySchema } },
     async (request, reply) => {
       try {
         const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, request.body?.estado_acceso);
@@ -3465,7 +3486,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.BLOCKED);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3474,7 +3495,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.ACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3483,7 +3504,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.INACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3492,18 +3513,17 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.delete("/usuarios/:id_usuario/permanente", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
-    try {
-      const deleted = await deleteUsuarioPermanently(app, request.params.id_usuario);
-      return sendOk(reply, deleted, { requestId: request.id });
-    } catch (error) {
-      return sendHandled(reply, request, error, "No se pudo eliminar usuario permanentemente", "PERSONAS_USER_DELETE_PERMANENT_ERROR");
-    }
-  });
+  // AM: Endpoint legacy bloqueado por regla de negocio: usuarios se gestionan por ciclo de vida, sin borrado permanente.
+  app.delete("/usuarios/:id_usuario/permanente", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => (
+    sendError(reply, 410, "La eliminacion permanente de usuarios esta deshabilitada por politica de negocio", {
+      code: "PERSONAS_USER_PERMANENT_DELETE_DISABLED",
+      requestId: request.id,
+    })
+  ));
 
   app.post(
     "/usuarios/:id_usuario/enviar-configuracion-password",
-    { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: usuarioSetupBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioSetupBodySchema } },
     async (request, reply) => {
       try {
         const result = await sendUsuarioPasswordSetup(app, request.params.id_usuario, request.body || {});
@@ -3514,7 +3534,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.get("/empleados", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/empleados", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(LIST_EMPLEADOS_SQL);
       return sendOk(reply, { empleados: rows.map(mapEmpleado) });
@@ -3523,7 +3543,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/empleados/:id_empleado", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/empleados/:id_empleado", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(EMPLEADO_BY_ID_SQL, [request.params.id_empleado]);
       if (!rows.length) {
@@ -3538,7 +3558,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.post("/empleados", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: empleadoCreateBodySchema } }, async (request, reply) => {
+  app.post("/empleados", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { body: empleadoCreateBodySchema } }, async (request, reply) => {
     try {
       const created = await createEmpleado(app, request, request.body || {});
       return sendOk(reply, created, { statusCode: 201, requestId: request.id });
@@ -3549,7 +3569,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/empleados/:id_empleado",
-    { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: empleadoCreateBodySchema } },
+    { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { body: empleadoCreateBodySchema } },
     async (request, reply) => {
       try {
         const updated = await updateEmpleado(app, request, request.params.id_empleado, request.body || {});
@@ -3560,7 +3580,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await inactivateEmpleado(app, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3569,7 +3589,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/empleados/:id_empleado/activar", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/empleados/:id_empleado/activar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await activateEmpleado(app, request, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3578,16 +3598,15 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.delete("/empleados/:id_empleado/permanente", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
-    try {
-      const deleted = await deleteEmpleadoPermanently(app, request.params.id_empleado);
-      return sendOk(reply, deleted, { requestId: request.id });
-    } catch (error) {
-      return sendHandled(reply, request, error, "No se pudo eliminar empleado permanentemente", "PERSONAS_EMPLOYEE_DELETE_PERMANENT_ERROR");
-    }
-  });
+  // AM: Endpoint legacy bloqueado por regla de negocio: empleados no se eliminan permanentemente.
+  app.delete("/empleados/:id_empleado/permanente", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => (
+    sendError(reply, 410, "La eliminación permanente de empleados está deshabilitada por política de negocio", {
+      code: "PERSONAS_EMPLOYEE_PERMANENT_DELETE_DISABLED",
+      requestId: request.id,
+    })
+  ));
 
-  app.get("/clientes", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/clientes", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(LIST_CLIENTES_SQL);
       return sendOk(reply, { clientes: rows.map(mapCliente) });
@@ -3596,7 +3615,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(CLIENTE_BY_ID_SQL, [request.params.id_cliente]);
       if (!rows.length) {
@@ -3612,7 +3631,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.post("/clientes", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: clienteCreateBodySchema } }, async (request, reply) => {
+  app.post("/clientes", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { body: clienteCreateBodySchema } }, async (request, reply) => {
     try {
       const created = await createCliente(app, request, request.body || {});
       return sendOk(reply, created, { statusCode: 201, requestId: request.id });
@@ -3623,7 +3642,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/clientes/:id_cliente",
-    { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { body: clienteUpdateBodySchema } },
+    { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { body: clienteUpdateBodySchema } },
     async (request, reply) => {
       try {
         const updated = await updateCliente(app, request, request.params.id_cliente, request.body || {});
@@ -3634,7 +3653,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/clientes/:id_cliente/inactivar", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/clientes/:id_cliente/inactivar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await inactivateCliente(app, request.params.id_cliente);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3643,7 +3662,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/clientes/:id_cliente/activar", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
+  app.patch("/clientes/:id_cliente/activar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const updated = await activateCliente(app, request, request.params.id_cliente);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3652,16 +3671,15 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.delete("/clientes/:id_cliente/permanente", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY) }, async (request, reply) => {
-    try {
-      const deleted = await deleteClientePermanently(app, request.params.id_cliente);
-      return sendOk(reply, deleted, { requestId: request.id });
-    } catch (error) {
-      return sendHandled(reply, request, error, "No se pudo eliminar cliente permanentemente", "PERSONAS_CLIENT_DELETE_PERMANENT_ERROR");
-    }
-  });
+  // AM: Endpoint legacy bloqueado por regla de negocio: clientes no se eliminan permanentemente.
+  app.delete("/clientes/:id_cliente/permanente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => (
+    sendError(reply, 410, "La eliminación permanente de clientes está deshabilitada por política de negocio", {
+      code: "PERSONAS_CLIENT_PERMANENT_DELETE_DISABLED",
+      requestId: request.id,
+    })
+  ));
 
-  // AM: Endpoint legado conservado por compatibilidad temporal, ahora sin exponer passwords.
+  // AM: Endpoint legacy bloqueado: este submodulo no crea usuarios desde cero.
   app.post(
     "/usuarios-internos",
     {
@@ -3696,12 +3714,10 @@ export default async function adminPersonasRoutes(app) {
       },
     },
     async (request, reply) => {
-      try {
-        const created = await createLegacyInternalUser(app, request, request.body || {});
-        return sendOk(reply, created, { statusCode: 201, requestId: request.id });
-      } catch (error) {
-        return sendHandled(reply, request, error, "No se pudo crear usuario interno", "PERSONAS_CREATE_INTERNAL_USER_ERROR");
-      }
+      return sendError(reply, 410, "La creacion directa de usuarios internos esta deshabilitada. Usa los modulos de Empleados o Clientes.", {
+        code: "PERSONAS_INTERNAL_USERS_CREATE_DISABLED",
+        requestId: request.id,
+      });
     }
   );
 }
