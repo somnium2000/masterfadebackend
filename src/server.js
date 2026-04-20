@@ -9,7 +9,7 @@ const port = Number(process.env.PORT || 3002);
 const host = process.env.HOST || "127.0.0.1";
 
 // NUEVO:
-// PORQUE: Evitar doble cierre por múltiples señales/errores.
+// PORQUE: Evitar doble cierre por múltiples señales/errores y evitar problemas.
 // IMPACTO: Previene errores de "close called twice" y ayuda a liberar el puerto correctamente.
 let isShuttingDown = false;
 
