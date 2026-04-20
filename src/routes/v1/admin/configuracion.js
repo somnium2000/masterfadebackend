@@ -6,7 +6,7 @@ import {
   resolveAssetForBinding,
 } from "../../../services/storage/storageService.js";
 
-const SUPER_ADMIN_ALLOWED_ROLES = ["super_admin"];
+const CONFIG_COMMUNICATION_ALLOWED_ROLES = ["super_admin", "admin"];
 const requestIdSchema = { type: "string" };
 
 const errorResponseSchema = {
@@ -38,78 +38,9 @@ const optionalQuerySchema = {
   additionalProperties: false,
 };
 
-const NOTIFICATION_PARAM_DEFS = {
-  email_habilitado: {
-    clave: "notificaciones_email_habilitadas",
-    type: "boolean",
-    defaultValue: true,
-    descripcion: "Habilita o deshabilita el envio general de notificaciones por email",
-  },
-  reintentos_max: {
-    clave: "notificaciones_email_reintentos_max",
-    type: "number",
-    defaultValue: 3,
-    descripcion: "Cantidad maxima de reintentos para notificaciones fallidas por email",
-  },
-  reintento_delay_min: {
-    clave: "notificaciones_email_reintento_delay_min",
-    type: "number",
-    defaultValue: 10,
-    descripcion: "Minutos de espera antes de reintentar una notificacion por email",
-  },
-};
-
-const COMMUNICATION_PARAM_DEFS = {
-  marketing_habilitado: {
-    clave: "comunicaciones_marketing_habilitadas",
-    type: "boolean",
-    defaultValue: true,
-    descripcion: "Permite comunicaciones promocionales para clientes con consentimiento",
-  },
-  requiere_consentimiento: {
-    clave: "comunicaciones_requiere_consentimiento",
-    type: "boolean",
-    defaultValue: true,
-    descripcion: "Requiere consentimiento explicito para enviar comunicaciones promocionales",
-  },
-  max_promos_semana: {
-    clave: "comunicaciones_max_promos_semana",
-    type: "number",
-    defaultValue: 3,
-    descripcion: "Cantidad maxima de comunicaciones promocionales por semana",
-  },
-};
-
-const BASE_PARAMETER_DEFS = {
-  moneda_default: {
-    clave: "moneda_default",
-    type: "text",
-    defaultValue: "HNL",
-    descripcion: "Codigo de moneda predeterminada del sistema",
-  },
-  hold_minutos: {
-    clave: "hold_minutos",
-    type: "number",
-    defaultValue: 5,
-    descripcion: "Minutos de vigencia de hold temporal",
-  },
-  buffer_servicio_minutos: {
-    clave: "buffer_servicio_minutos",
-    type: "number",
-    defaultValue: 5,
-    descripcion: "Buffer base en minutos entre servicios",
-  },
-  no_show_min: {
-    clave: "no_show_min",
-    type: "number",
-    defaultValue: 10,
-    descripcion: "Minutos de tolerancia para marcar no show",
-  },
-};
-
 const PROMOTION_STATES = ["borrador", "publicada", "archivada"];
-const PROMOTION_CTA_TYPES = ["interno", "externo", "none"];
 const COMMUNICATION_CAMPAIGN_TYPES = ["informativa", "promocional"];
+const COMMUNICATION_FIXED_TYPE = "informativa";
 const COMMUNICATION_CAMPAIGN_CHANNEL = "email";
 const COMMUNICATION_CAMPAIGN_DRAFT_STATE = "borrador";
 const COMMUNICATION_CAMPAIGN_SCHEDULED_STATE = "programada";
@@ -163,9 +94,6 @@ const promotionBodySchema = {
     imagen_mobile_url: { type: ["string", "null"], maxLength: 500 },
     imagen_mobile_asset_id: { type: ["string", "null"], format: "uuid" },
     imagen_alt: { type: ["string", "null"], maxLength: 180 },
-    cta_texto: { type: ["string", "null"], maxLength: 80 },
-    cta_url: { type: ["string", "null"], maxLength: 500 },
-    cta_tipo: { type: "string", enum: PROMOTION_CTA_TYPES },
     estado: { type: "string", enum: PROMOTION_STATES },
     visible_publico: { type: "boolean" },
     vigencia_desde: { type: ["string", "null"], format: "date" },
@@ -190,9 +118,6 @@ const promotionPatchSchema = {
     imagen_mobile_url: { type: ["string", "null"], maxLength: 500 },
     imagen_mobile_asset_id: { type: ["string", "null"], format: "uuid" },
     imagen_alt: { type: ["string", "null"], maxLength: 180 },
-    cta_texto: { type: ["string", "null"], maxLength: 80 },
-    cta_url: { type: ["string", "null"], maxLength: 500 },
-    cta_tipo: { type: "string", enum: PROMOTION_CTA_TYPES },
     estado: { type: "string", enum: PROMOTION_STATES },
     visible_publico: { type: "boolean" },
     vigencia_desde: { type: ["string", "null"], format: "date" },
@@ -208,7 +133,7 @@ const promotionPatchSchema = {
 const communicationCampaignCreateSchema = {
   type: "object",
   properties: {
-    tipo_campania: { type: "string", enum: COMMUNICATION_CAMPAIGN_TYPES },
+    tipo_campania: { type: "string", enum: [COMMUNICATION_FIXED_TYPE] },
     nombre_interno: { type: "string", minLength: 1, maxLength: COMMUNICATION_INTERNAL_NAME_MAX_LENGTH },
     asunto: { type: "string", minLength: 1, maxLength: COMMUNICATION_SUBJECT_MAX_LENGTH },
     contenido_texto: { type: "string", minLength: 1, maxLength: COMMUNICATION_CONTENT_TEXT_MAX_LENGTH },
@@ -221,7 +146,7 @@ const communicationCampaignCreateSchema = {
 const communicationCampaignPatchSchema = {
   type: "object",
   properties: {
-    tipo_campania: { type: "string", enum: COMMUNICATION_CAMPAIGN_TYPES },
+    tipo_campania: { type: "string", enum: [COMMUNICATION_FIXED_TYPE] },
     nombre_interno: { type: "string", minLength: 1, maxLength: COMMUNICATION_INTERNAL_NAME_MAX_LENGTH },
     asunto: { type: "string", minLength: 1, maxLength: COMMUNICATION_SUBJECT_MAX_LENGTH },
     contenido_texto: { type: "string", minLength: 1, maxLength: COMMUNICATION_CONTENT_TEXT_MAX_LENGTH },
@@ -278,7 +203,7 @@ const communicationCampaignsQuerySchema = {
   type: "object",
   properties: {
     q: { type: "string", maxLength: 180 },
-    tipo_campania: { type: "string", enum: COMMUNICATION_CAMPAIGN_TYPES },
+    tipo_campania: { type: "string", enum: [COMMUNICATION_FIXED_TYPE] },
     estado: { type: "string", enum: COMMUNICATION_CAMPAIGN_DB_STATES },
     estado_operativo: { type: "string", enum: COMMUNICATION_CAMPAIGN_OPERATIONAL_STATES },
     incluir_canceladas: { type: "boolean" },
@@ -307,6 +232,15 @@ function normalizeOptionalText(value) {
   return trimmed || null;
 }
 
+function maskEmailAddress(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || !raw.includes("@")) return null;
+  const [local, domain] = raw.split("@");
+  if (!local || !domain) return null;
+  const prefix = local.length <= 2 ? local.slice(0, 1) : local.slice(0, 2);
+  return `${prefix}***@${domain}`;
+}
+
 function parseBooleanQueryValue(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
   if (typeof value === "boolean") return value;
@@ -314,145 +248,6 @@ function parseBooleanQueryValue(value, fallback = false) {
   if (["1", "true", "yes", "on", "si"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return fallback;
-}
-
-function mapRowsByKey(rows = []) {
-  return new Map(rows.map((row) => [row.clave, row]));
-}
-
-function resolveParamValue(row, descriptor) {
-  if (!row) return descriptor.defaultValue;
-  if (descriptor.type === "boolean") {
-    if (row.valor_booleano === null || row.valor_booleano === undefined) return descriptor.defaultValue;
-    return Boolean(row.valor_booleano);
-  }
-  if (descriptor.type === "number") {
-    if (row.valor_numero === null || row.valor_numero === undefined) return descriptor.defaultValue;
-    const parsed = Number(row.valor_numero);
-    return Number.isFinite(parsed) ? parsed : descriptor.defaultValue;
-  }
-  if (descriptor.type === "text") {
-    const text = String(row.valor_texto || "").trim();
-    return text || descriptor.defaultValue;
-  }
-  return descriptor.defaultValue;
-}
-
-function buildParamPayload(descriptor, value) {
-  if (descriptor.type === "boolean") {
-    return { valor_texto: null, valor_numero: null, valor_booleano: Boolean(value) };
-  }
-  if (descriptor.type === "number") {
-    const parsed = Number(value);
-    if (!Number.isFinite(parsed)) {
-      throw new AppError(400, "El valor numerico del parametro no es valido", {
-        code: "CONFIG_PARAMETER_NUMBER_INVALID",
-      });
-    }
-    return { valor_texto: null, valor_numero: parsed, valor_booleano: null };
-  }
-  const text = String(value || "").normalize("NFC").trim();
-  if (!text) {
-    throw new AppError(400, "El valor de texto del parametro es requerido", {
-      code: "CONFIG_PARAMETER_TEXT_REQUIRED",
-    });
-  }
-  return { valor_texto: text, valor_numero: null, valor_booleano: null };
-}
-
-function descriptorKeys(defs) {
-  return Object.values(defs).map((entry) => entry.clave);
-}
-
-async function readSystemParameters(client, definitions) {
-  const keys = descriptorKeys(definitions);
-  const { rows } = await client.query(
-    `
-      SELECT clave, valor_texto, valor_numero, valor_booleano
-      FROM public.parametros_sistema
-      WHERE clave = ANY($1::text[])
-    `,
-    [keys]
-  );
-
-  const rowsByKey = mapRowsByKey(rows);
-  const payload = {};
-  for (const [field, descriptor] of Object.entries(definitions)) {
-    payload[field] = resolveParamValue(rowsByKey.get(descriptor.clave), descriptor);
-  }
-  return payload;
-}
-
-async function readBranchParameters(client, idSucursal, definitions) {
-  if (!idSucursal) return null;
-  const keys = descriptorKeys(definitions);
-  const { rows } = await client.query(
-    `
-      SELECT clave, valor_texto, valor_numero, valor_booleano
-      FROM public.parametros_sucursal
-      WHERE id_sucursal = $1::uuid
-        AND clave = ANY($2::text[])
-    `,
-    [idSucursal, keys]
-  );
-
-  const rowsByKey = mapRowsByKey(rows);
-  const payload = {};
-  for (const [field, descriptor] of Object.entries(definitions)) {
-    payload[field] = resolveParamValue(rowsByKey.get(descriptor.clave), descriptor);
-  }
-  return payload;
-}
-
-async function upsertSystemParameter(client, descriptor, value) {
-  const mapped = buildParamPayload(descriptor, value);
-  await client.query(
-    `
-      INSERT INTO public.parametros_sistema (
-        clave,
-        valor_texto,
-        valor_numero,
-        valor_booleano,
-        descripcion,
-        updated_at
-      )
-      VALUES ($1, $2, $3::numeric, $4::boolean, $5, NOW())
-      ON CONFLICT (clave)
-      DO UPDATE SET
-        valor_texto = EXCLUDED.valor_texto,
-        valor_numero = EXCLUDED.valor_numero,
-        valor_booleano = EXCLUDED.valor_booleano,
-        descripcion = COALESCE(EXCLUDED.descripcion, public.parametros_sistema.descripcion),
-        updated_at = NOW()
-    `,
-    [descriptor.clave, mapped.valor_texto, mapped.valor_numero, mapped.valor_booleano, descriptor.descripcion || null]
-  );
-}
-
-async function upsertBranchParameter(client, idSucursal, descriptor, value) {
-  const mapped = buildParamPayload(descriptor, value);
-  await client.query(
-    `
-      INSERT INTO public.parametros_sucursal (
-        id_sucursal,
-        clave,
-        valor_texto,
-        valor_numero,
-        valor_booleano,
-        descripcion,
-        updated_at
-      )
-      VALUES ($1::uuid, $2, $3, $4::numeric, $5::boolean, $6, NOW())
-      ON CONFLICT (id_sucursal, clave)
-      DO UPDATE SET
-        valor_texto = EXCLUDED.valor_texto,
-        valor_numero = EXCLUDED.valor_numero,
-        valor_booleano = EXCLUDED.valor_booleano,
-        descripcion = COALESCE(EXCLUDED.descripcion, public.parametros_sucursal.descripcion),
-        updated_at = NOW()
-    `,
-    [idSucursal, descriptor.clave, mapped.valor_texto, mapped.valor_numero, mapped.valor_booleano, descriptor.descripcion || null]
-  );
 }
 
 async function ensureBranchExists(client, idSucursal) {
@@ -475,174 +270,20 @@ async function ensureBranchExists(client, idSucursal) {
   return idSucursal;
 }
 
-async function getProfileRow(client, userId) {
-  const { rows } = await client.query(
-    `
-      SELECT
-        u.id_usuario,
-        u.id_persona,
-        u.estado_acceso,
-        u.ultimo_login_at,
-        p.nombres,
-        p.apellidos,
-        p.telefono_principal,
-        p.direccion_texto,
-        p.observaciones,
-        COALESCE(correo_principal.direccion_correo::text, auth_user.email::text, '') AS email
-      FROM public.usuarios u
-      LEFT JOIN public.personas p ON p.id_persona = u.id_persona
-      LEFT JOIN auth.users auth_user ON auth_user.id = u.id_usuario
-      LEFT JOIN LATERAL (
-        SELECT c.direccion_correo
-        FROM public.correos c
-        WHERE c.id_persona = u.id_persona
-          AND c.deleted_at IS NULL
-        ORDER BY c.es_principal DESC NULLS LAST, c.verificado DESC NULLS LAST, c.id_correo ASC
-        LIMIT 1
-      ) correo_principal ON TRUE
-      WHERE u.id_usuario = $1::uuid
-        AND u.deleted_at IS NULL
-      LIMIT 1
-    `,
-    [userId]
-  );
-  return rows[0] ?? null;
-}
-
-function mapProfileRow(row) {
-  return {
-    id_usuario: row.id_usuario,
-    id_persona: row.id_persona ?? null,
-    email: String(row.email || "").trim() || null,
-    nombres: row.nombres ?? "",
-    apellidos: row.apellidos ?? "",
-    telefono_principal: row.telefono_principal ?? null,
-    direccion_texto: row.direccion_texto ?? null,
-    observaciones: row.observaciones ?? null,
-    estado_acceso: row.estado_acceso ?? null,
-    ultimo_login_at: row.ultimo_login_at ?? null,
-  };
-}
-
-async function buildNotificationsPayload(client, limit = 20) {
-  const configuracion = await readSystemParameters(client, NOTIFICATION_PARAM_DEFS);
-
-  const statsResult = await client.query(
-    `
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (WHERE enviado_en IS NOT NULL)::int AS enviadas,
-        COUNT(*) FILTER (
-          WHERE enviado_en IS NULL
-            AND (COALESCE(estado_notificacion_codigo, '') NOT IN ('error', 'fallido', 'failed'))
-        )::int AS pendientes,
-        COUNT(*) FILTER (
-          WHERE COALESCE(estado_notificacion_codigo, '') IN ('error', 'fallido', 'failed')
-            OR ultimo_error IS NOT NULL
-        )::int AS fallidas
-      FROM public.notificaciones_email
-    `
-  );
-
-  const estadosResult = await client.query(
-    `
-      SELECT
-        COALESCE(estado_notificacion_codigo, 'sin_estado') AS estado,
-        COUNT(*)::int AS total
-      FROM public.notificaciones_email
-      GROUP BY 1
-      ORDER BY total DESC, estado ASC
-    `
-  );
-
-  const recentResult = await client.query(
-    `
-      SELECT
-        id_notificacion,
-        evento,
-        correo_destino::text AS correo_destino,
-        asunto,
-        estado_notificacion_codigo,
-        enviar_en,
-        enviado_en,
-        ultimo_error,
-        created_at
-      FROM public.notificaciones_email
-      ORDER BY created_at DESC
-      LIMIT $1::int
-    `,
-    [limit]
-  );
-
-  return {
-    configuracion,
-    resumen: statsResult.rows[0] || { total: 0, enviadas: 0, pendientes: 0, fallidas: 0 },
-    estados: estadosResult.rows.map((row) => ({ estado: row.estado, total: Number(row.total || 0) })),
-    recientes: recentResult.rows.map((row) => ({
-      id_notificacion: row.id_notificacion,
-      evento: row.evento ?? "sin_evento",
-      correo_destino: row.correo_destino ?? null,
-      asunto: row.asunto ?? null,
-      estado_notificacion_codigo: row.estado_notificacion_codigo ?? null,
-      enviar_en: row.enviar_en ?? null,
-      enviado_en: row.enviado_en ?? null,
-      ultimo_error: row.ultimo_error ?? null,
-      created_at: row.created_at ?? null,
-    })),
-  };
-}
-
-async function buildCommunicationPayload(client, idSucursal) {
-  const branchId = idSucursal ? await ensureBranchExists(client, idSucursal) : null;
-  const reglasSistema = await readSystemParameters(client, COMMUNICATION_PARAM_DEFS);
-  const reglasSucursal = await readBranchParameters(client, branchId, COMMUNICATION_PARAM_DEFS);
-
-  const statsResult = await client.query(
-    `
-      SELECT
-        COUNT(*)::int AS total_clientes,
-        COUNT(*) FILTER (WHERE COALESCE(estado, TRUE) IS TRUE)::int AS clientes_activos,
-        COUNT(*) FILTER (WHERE COALESCE(consentimiento_marketing, FALSE) IS TRUE)::int AS consentimiento_marketing_si,
-        COUNT(*) FILTER (WHERE COALESCE(consentimiento_marketing, FALSE) IS FALSE)::int AS consentimiento_marketing_no,
-        COUNT(*) FILTER (WHERE COALESCE(acepta_terminos, FALSE) IS TRUE)::int AS acepta_terminos_si,
-        COUNT(*) FILTER (WHERE COALESCE(acepta_terminos, FALSE) IS FALSE)::int AS acepta_terminos_no
-      FROM public.clientes
-      WHERE deleted_at IS NULL
-    `
-  );
-
-  return {
-    id_sucursal: branchId,
-    reglas_sistema: reglasSistema,
-    reglas_sucursal: reglasSucursal,
-    consentimientos: statsResult.rows[0] || {
-      total_clientes: 0,
-      clientes_activos: 0,
-      consentimiento_marketing_si: 0,
-      consentimiento_marketing_no: 0,
-      acepta_terminos_si: 0,
-      acepta_terminos_no: 0,
-    },
-  };
-}
-
-async function buildBaseParametersPayload(client, idSucursal) {
-  const branchId = idSucursal ? await ensureBranchExists(client, idSucursal) : null;
-  return {
-    id_sucursal: branchId,
-    sistema: await readSystemParameters(client, BASE_PARAMETER_DEFS),
-    sucursal: await readBranchParameters(client, branchId, BASE_PARAMETER_DEFS),
-  };
-}
-
 function normalizeCommunicationCampaignType(value) {
   const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return COMMUNICATION_FIXED_TYPE;
   if (!COMMUNICATION_CAMPAIGN_TYPES.includes(normalized)) {
-    throw new AppError(400, "tipo_campania invalido. Valores permitidos: informativa, promocional", {
+    throw new AppError(400, "tipo_campania invalido. Valor permitido: informativa", {
       code: "CONFIG_COMM_CAMPAIGN_TYPE_INVALID",
     });
   }
-  return normalized;
+  if (normalized !== COMMUNICATION_FIXED_TYPE) {
+    throw new AppError(400, "Este submodulo solo admite campanias informativas", {
+      code: "CONFIG_COMM_CAMPAIGN_TYPE_FORBIDDEN",
+    });
+  }
+  return COMMUNICATION_FIXED_TYPE;
 }
 
 function normalizeCommunicationRequiredText(value, fieldName, maxLength) {
@@ -694,10 +335,16 @@ function normalizeCommunicationExclusionsSnapshot(rawValue) {
   if (typeof rawValue !== "object") return null;
   const exclusions = Array.isArray(rawValue.excluidos) ? rawValue.excluidos : [];
   const summary = Array.isArray(rawValue.resumen_por_motivo) ? rawValue.resumen_por_motivo : [];
+  const sanitizedExclusions = exclusions.map((row) => ({
+    nombre_cliente: row?.nombre_cliente ?? null,
+    correo_destino: maskEmailAddress(row?.correo_destino ?? null),
+    motivo_exclusion: row?.motivo_exclusion ?? null,
+    origen_exclusion: row?.origen_exclusion ?? null,
+  }));
   return {
     generado_at: rawValue.generado_at ?? null,
     tipo_campania: rawValue.tipo_campania ?? null,
-    excluidos: exclusions,
+    excluidos: sanitizedExclusions,
     resumen_por_motivo: summary,
   };
 }
@@ -750,7 +397,6 @@ function resolveCommunicationCampaignsSort(sort) {
 
 function buildCommunicationCampaignsFilters(rawQuery = {}) {
   const q = String(rawQuery.q || "").trim();
-  const tipoCampania = rawQuery.tipo_campania ? String(rawQuery.tipo_campania).trim().toLowerCase() : null;
   const estado = rawQuery.estado ? String(rawQuery.estado).trim().toLowerCase() : null;
   const estadoOperativo = rawQuery.estado_operativo ? String(rawQuery.estado_operativo).trim().toLowerCase() : null;
   const incluirCanceladas = parseBooleanQueryValue(rawQuery.incluir_canceladas, false);
@@ -760,7 +406,7 @@ function buildCommunicationCampaignsFilters(rawQuery = {}) {
 
   return {
     q: q || null,
-    tipo_campania: tipoCampania && COMMUNICATION_CAMPAIGN_TYPES.includes(tipoCampania) ? tipoCampania : null,
+    tipo_campania: COMMUNICATION_FIXED_TYPE,
     estado: estado && COMMUNICATION_CAMPAIGN_DB_STATES.includes(estado) ? estado : null,
     estado_operativo: estadoOperativo && COMMUNICATION_CAMPAIGN_OPERATIONAL_STATES.includes(estadoOperativo) ? estadoOperativo : null,
     incluir_canceladas: incluirCanceladas,
@@ -949,9 +595,18 @@ async function getCommunicationCampaignByIdForUpdate(client, idCampania) {
   return rows[0] ?? null;
 }
 
+function assertCommunicationCampaignAllowed(campaign) {
+  const rawType = String(campaign?.tipo_campania || "").trim().toLowerCase();
+  if (rawType && rawType !== COMMUNICATION_FIXED_TYPE) {
+    throw new AppError(404, "La campania indicada no existe o fue eliminada", {
+      code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
+    });
+  }
+}
+
 function buildCommunicationCampaignCreateValues(body) {
   return {
-    tipo_campania: normalizeCommunicationCampaignType(body.tipo_campania),
+    tipo_campania: normalizeCommunicationCampaignType(body.tipo_campania ?? COMMUNICATION_FIXED_TYPE),
     nombre_interno: normalizeCommunicationRequiredText(body.nombre_interno, "nombre_interno", COMMUNICATION_INTERNAL_NAME_MAX_LENGTH),
     asunto: normalizeCommunicationRequiredText(body.asunto, "asunto", COMMUNICATION_SUBJECT_MAX_LENGTH),
     contenido_texto: normalizeCommunicationRequiredText(body.contenido_texto, "contenido_texto", COMMUNICATION_CONTENT_TEXT_MAX_LENGTH),
@@ -961,7 +616,7 @@ function buildCommunicationCampaignCreateValues(body) {
 
 function buildCommunicationCampaignPatchValues(body = {}, currentRow) {
   const next = {
-    tipo_campania: currentRow.tipo_campania,
+    tipo_campania: normalizeCommunicationCampaignType(currentRow.tipo_campania ?? COMMUNICATION_FIXED_TYPE),
     nombre_interno: currentRow.nombre_interno,
     asunto: currentRow.asunto,
     contenido_texto: currentRow.contenido_texto,
@@ -978,14 +633,7 @@ function buildCommunicationCampaignPatchValues(body = {}, currentRow) {
 }
 
 function resolveCampaignTypeForEligibility(rawType) {
-  const normalized = String(rawType || "").trim().toLowerCase();
-  if (!COMMUNICATION_CAMPAIGN_TYPES.includes(normalized)) {
-    throw new AppError(409, "La campania tiene tipo_campania invalido para calcular elegibilidad", {
-      code: "CONFIG_COMM_CAMPAIGN_TYPE_INCONSISTENT",
-      details: { tipo_campania: rawType ?? null },
-    });
-  }
-  return normalized;
+  return normalizeCommunicationCampaignType(rawType ?? COMMUNICATION_FIXED_TYPE);
 }
 
 function buildEligibilityEvaluationCte() {
@@ -1022,7 +670,7 @@ function buildEligibilityEvaluationCte() {
         bc.*,
         COALESCE(bc.cliente_activo, FALSE) IS TRUE AS ok_activo,
         (COALESCE(bc.acepta_terminos, FALSE) IS TRUE OR bc.acepta_terminos_at IS NOT NULL) AS ok_terminos,
-        (COALESCE(bc.consentimiento_marketing, FALSE) IS TRUE OR bc.consentimiento_marketing_at IS NOT NULL) AS ok_marketing,
+        (COALESCE(bc.consentimiento_marketing, FALSE) IS TRUE) AS ok_marketing,
         (
           bc.correo_destino IS NOT NULL
           AND btrim(bc.correo_destino) <> ''
@@ -1037,7 +685,7 @@ function buildEligibilityEvaluationCte() {
           WHEN NOT e.ok_activo THEN 'inactivo'
           WHEN NOT e.ok_correo THEN 'sin_correo'
           WHEN NOT e.ok_terminos THEN 'sin_aceptacion_terminos'
-          WHEN $1::text = 'promocional' AND NOT e.ok_marketing THEN 'sin_consentimiento_marketing'
+          WHEN NOT e.ok_marketing THEN 'sin_consentimiento_marketing'
           ELSE 'elegible'
         END AS estado_elegibilidad
       FROM evaluados e
@@ -1088,7 +736,6 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
       ${buildEligibilityEvaluationCte()}
       SELECT
         id_cliente,
-        id_persona,
         concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
         btrim(correo_destino) AS correo_destino
       FROM resultado
@@ -1104,7 +751,6 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
       ${buildEligibilityEvaluationCte()}
       SELECT
         id_cliente,
-        id_persona,
         concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
         CASE WHEN correo_destino IS NULL THEN NULL ELSE btrim(correo_destino) END AS correo_destino,
         estado_elegibilidad AS motivo_exclusion
@@ -1133,15 +779,13 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
     })),
     elegibles_preview: elegiblesPreviewResult.rows.map((row) => ({
       id_cliente: row.id_cliente,
-      id_persona: row.id_persona,
       nombre_cliente: row.nombre_cliente || null,
-      correo_destino: row.correo_destino || null,
+      correo_destino: maskEmailAddress(row.correo_destino),
     })),
     excluidos_preview: excluidosPreviewResult.rows.map((row) => ({
       id_cliente: row.id_cliente,
-      id_persona: row.id_persona,
       nombre_cliente: row.nombre_cliente || null,
-      correo_destino: row.correo_destino || null,
+      correo_destino: maskEmailAddress(row.correo_destino),
       motivo_exclusion: row.motivo_exclusion,
     })),
   };
@@ -1174,7 +818,6 @@ async function listCommunicationEligibilityRecipients(client, campaignType, opti
       ${buildEligibilityEvaluationCte()}
       SELECT
         id_cliente,
-        id_persona,
         concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
         CASE WHEN correo_destino IS NULL THEN NULL ELSE btrim(correo_destino) END AS correo_destino,
         estado_elegibilidad AS motivo_exclusion
@@ -1213,9 +856,8 @@ async function listCommunicationEligibilityRecipients(client, campaignType, opti
     total: Number(totalResult.rows?.[0]?.total || 0),
     destinatarios: listResult.rows.map((row) => ({
       id_cliente: row.id_cliente,
-      id_persona: row.id_persona,
       nombre_cliente: row.nombre_cliente || null,
-      correo_destino: row.correo_destino || null,
+      correo_destino: maskEmailAddress(row.correo_destino),
       motivo_exclusion: row.motivo_exclusion === "elegible" ? null : row.motivo_exclusion,
     })),
   };
@@ -1312,10 +954,8 @@ function buildCommunicationExclusionsSnapshot({ campaignType, excludedByRules = 
     generado_at: new Date().toISOString(),
     tipo_campania: campaignType,
     excluidos: allExclusions.map((row) => ({
-      id_cliente: row.id_cliente,
-      id_persona: row.id_persona ?? null,
       nombre_cliente: row.nombre_cliente ?? null,
-      correo_destino: row.correo_destino ?? null,
+      correo_destino: maskEmailAddress(row.correo_destino),
       motivo_exclusion: row.motivo_exclusion ?? null,
       origen_exclusion: row.origen_exclusion ?? null,
     })),
@@ -1334,14 +974,11 @@ async function listCampaignShipments(client, idCampania, options = {}) {
     `
       SELECT
         ce.id_envio,
-        ce.id_cliente,
-        ce.id_persona,
         ce.correo_destino::text AS correo_destino,
         ce.estado_envio,
         ce.enviar_en,
         ce.enviado_at,
         ce.ultimo_error,
-        ce.provider_message_id,
         ce.intentos,
         ce.created_at,
         concat_ws(' ', NULLIF(btrim(p.nombres), ''), NULLIF(btrim(p.apellidos), '')) AS nombre_cliente
@@ -1371,15 +1008,12 @@ async function listCampaignShipments(client, idCampania, options = {}) {
     total: Number(totalResult.rows?.[0]?.total || 0),
     envios: rowsResult.rows.map((row) => ({
       id_envio: row.id_envio,
-      id_cliente: row.id_cliente,
-      id_persona: row.id_persona,
       nombre_cliente: row.nombre_cliente || null,
-      correo_destino: row.correo_destino || null,
+      correo_destino: maskEmailAddress(row.correo_destino),
       estado_envio: row.estado_envio,
       enviar_en: row.enviar_en ?? null,
       enviado_at: row.enviado_at ?? null,
       ultimo_error: row.ultimo_error ?? null,
-      provider_message_id: row.provider_message_id ?? null,
       intentos: Number(row.intentos ?? 0),
       created_at: row.created_at ?? null,
     })),
@@ -1726,16 +1360,6 @@ function normalizePromotionState(value, fallback = "borrador") {
   return normalized;
 }
 
-function normalizePromotionCtaType(value, fallback = "none") {
-  const normalized = String(value || fallback).trim().toLowerCase();
-  if (!PROMOTION_CTA_TYPES.includes(normalized)) {
-    throw new AppError(400, "cta_tipo invalido", {
-      code: "CONFIG_PROMOTION_CTA_TYPE_INVALID",
-    });
-  }
-  return normalized;
-}
-
 function normalizeDateOnly(value) {
   if (value === undefined) return undefined;
   if (value === null || value === "") return null;
@@ -1763,9 +1387,6 @@ function mapPromotionRow(row) {
     imagen_mobile_path: row.imagen_mobile_path ?? null,
     imagen_mobile_url: row.imagen_mobile_url ?? null,
     imagen_alt: row.imagen_alt ?? null,
-    cta_texto: row.cta_texto ?? null,
-    cta_url: row.cta_url ?? null,
-    cta_tipo: row.cta_tipo ?? "none",
     estado: row.estado,
     visible_publico: Boolean(row.visible_publico),
     vigencia_desde: row.vigencia_desde ?? null,
@@ -1873,23 +1494,10 @@ function validatePromotionPublication(values) {
     });
   }
 
-  if (values.cta_tipo === "none") {
-    if (String(values.cta_texto || "").trim() || String(values.cta_url || "").trim()) {
-      throw new AppError(400, "Si cta_tipo es none, cta_texto y cta_url deben ir vacios", {
-        code: "CONFIG_PROMOTION_CTA_NONE_INVALID",
-      });
-    }
-  } else {
-    if (!String(values.cta_texto || "").trim()) {
-      throw new AppError(400, "cta_texto es requerido cuando cta_tipo es interno o externo", {
-        code: "CONFIG_PROMOTION_CTA_TEXT_REQUIRED",
-      });
-    }
-    if (!String(values.cta_url || "").trim()) {
-      throw new AppError(400, "cta_url es requerido cuando cta_tipo es interno o externo", {
-        code: "CONFIG_PROMOTION_CTA_URL_REQUIRED",
-      });
-    }
+  if (!Array.isArray(values.parrafos) || values.parrafos.length === 0) {
+    throw new AppError(400, "La descripcion es requerida", {
+      code: "CONFIG_PROMOTION_DESCRIPTION_REQUIRED",
+    });
   }
 
   if (values.estado === "archivada" && values.visible_publico) {
@@ -1907,11 +1515,6 @@ function validatePromotionPublication(values) {
     if (!String(values.titulo || "").trim()) {
       throw new AppError(400, "Una promocion publicada requiere titulo", {
         code: "CONFIG_PROMOTION_TITLE_REQUIRED",
-      });
-    }
-    if (!Array.isArray(values.parrafos) || values.parrafos.length === 0) {
-      throw new AppError(400, "Una promocion publicada requiere al menos un parrafo", {
-        code: "CONFIG_PROMOTION_PARAGRAPHS_REQUIRED",
       });
     }
     if (!String(values.imagen_principal_url || "").trim()) {
@@ -1972,9 +1575,9 @@ async function ensureFeaturedPromotionConflict(client, { idSucursal, idPromocion
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
+    request.log.warn({ err: error, code: error.code }, "Operacion de configuracion controlada con error de negocio");
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
-      details: error.details,
       requestId: request.id,
     });
   }
@@ -1983,9 +1586,9 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     error?.code === "42P01" &&
     (String(error?.message || "").includes("promociones_sucursal") || String(error?.message || "").includes("promociones"))
   ) {
+    request.log.error({ err: error }, "Migracion de promociones faltante en modulo configuracion");
     return sendError(reply, 500, "Falta aplicar migracion de PROMOCIONES multi-sucursal en la base de datos", {
       code: "CONFIG_PROMOTIONS_MIGRATION_REQUIRED",
-      details: error.message,
       requestId: request.id,
     });
   }
@@ -1994,9 +1597,9 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     error?.code === "42P01" &&
     (String(error?.message || "").includes("comunicaciones_campanias") || String(error?.message || "").includes("comunicaciones_envios"))
   ) {
+    request.log.error({ err: error }, "Migracion de comunicacion faltante");
     return sendError(reply, 500, "Falta aplicar la estructura de COMUNICACION en la base de datos", {
       code: "CONFIG_COMMUNICATION_MIGRATION_REQUIRED",
-      details: error.message,
       requestId: request.id,
     });
   }
@@ -2011,9 +1614,9 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
       || String(error?.message || "").includes("imagen_mobile_path")
     )
   ) {
+    request.log.error({ err: error }, "Migracion de storage faltante para promociones");
     return sendError(reply, 500, "Falta aplicar migracion de STORAGE para promociones", {
       code: "CONFIG_STORAGE_MIGRATION_REQUIRED",
-      details: error.message,
       requestId: request.id,
     });
   }
@@ -2023,9 +1626,9 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     (String(error?.constraint || "").includes("uq_comunicaciones_envios_campania_cliente_correo") ||
       String(error?.message || "").includes("uq_comunicaciones_envios_campania_cliente_correo"))
   ) {
+    request.log.warn({ err: error }, "Campania ya programada detectada por constraint");
     return sendError(reply, 409, "La campania ya tiene destinatarios programados y no puede duplicarse", {
       code: "CONFIG_COMM_CAMPAIGN_ALREADY_SCHEDULED",
-      details: error.message,
       requestId: request.id,
     });
   }
@@ -2033,7 +1636,6 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
   request.log.error({ err: error }, fallbackMessage);
   return sendError(reply, 500, fallbackMessage, {
     code: fallbackCode,
-    details: error instanceof Error ? error.message : fallbackMessage,
     requestId: request.id,
   });
 }
@@ -2055,228 +1657,9 @@ export default async function adminConfiguracionRoutes(app) {
   }
 
   app.get(
-    "/perfil",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const idUsuario = request.claims?.user?.id_usuario || request.auth?.sub;
-        const row = await getProfileRow(client, idUsuario);
-        if (!row) {
-          throw new AppError(404, "No se encontro perfil interno para el usuario autenticado", {
-            code: "CONFIG_PROFILE_NOT_FOUND",
-          });
-        }
-        return sendOk(reply, { perfil: mapProfileRow(row) }, { requestId: request.id });
-      } catch (error) {
-        return sendHandledError(reply, request, error, "No se pudo consultar el perfil de configuracion", "CONFIG_PROFILE_GET_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.patch(
-    "/perfil",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        body: {
-          type: "object",
-          properties: {
-            nombres: { type: "string", minLength: 1, maxLength: 120 },
-            apellidos: { type: "string", minLength: 1, maxLength: 120 },
-            telefono_principal: { type: ["string", "null"], maxLength: 30 },
-            direccion_texto: { type: ["string", "null"], maxLength: 300 },
-            observaciones: { type: ["string", "null"], maxLength: 500 },
-          },
-          minProperties: 1,
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          400: errorResponseSchema,
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          409: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const idUsuario = request.claims?.user?.id_usuario || request.auth?.sub;
-        const current = await getProfileRow(client, idUsuario);
-        if (!current) {
-          throw new AppError(404, "No se encontro perfil interno para el usuario autenticado", {
-            code: "CONFIG_PROFILE_NOT_FOUND",
-          });
-        }
-        if (!current.id_persona) {
-          throw new AppError(409, "El usuario no tiene una persona asociada para editar perfil", {
-            code: "CONFIG_PROFILE_PERSON_MISSING",
-          });
-        }
-
-        // AM: Edicion de perfil acotada: correo/login se mantiene en solo lectura para no romper auth.
-        const nombres = request.body.nombres !== undefined ? normalizeRequiredText(request.body.nombres, "nombres") : current.nombres;
-        const apellidos = request.body.apellidos !== undefined ? normalizeRequiredText(request.body.apellidos, "apellidos") : current.apellidos;
-        const telefonoPrincipal = request.body.telefono_principal !== undefined ? normalizeOptionalText(request.body.telefono_principal) : current.telefono_principal;
-        const direccionTexto = request.body.direccion_texto !== undefined ? normalizeOptionalText(request.body.direccion_texto) : current.direccion_texto;
-        const observaciones = request.body.observaciones !== undefined ? normalizeOptionalText(request.body.observaciones) : current.observaciones;
-
-        await client.query(
-          `
-            UPDATE public.personas
-            SET
-              nombres = $2,
-              apellidos = $3,
-              telefono_principal = $4,
-              direccion_texto = $5,
-              observaciones = $6,
-              updated_at = NOW()
-            WHERE id_persona = $1::uuid
-          `,
-          [current.id_persona, nombres, apellidos, telefonoPrincipal, direccionTexto, observaciones]
-        );
-
-        const updated = await getProfileRow(client, idUsuario);
-        return sendOk(reply, { perfil: mapProfileRow(updated) }, { requestId: request.id });
-      } catch (error) {
-        return sendHandledError(reply, request, error, "No se pudo actualizar el perfil de configuracion", "CONFIG_PROFILE_PATCH_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.get(
-    "/notificaciones",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        querystring: optionalQuerySchema,
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const limit = Number(request.query?.limit || 20);
-        const payload = await buildNotificationsPayload(client, limit);
-        return sendOk(reply, payload, { requestId: request.id });
-      } catch (error) {
-        return sendHandledError(reply, request, error, "No se pudo consultar configuracion de notificaciones", "CONFIG_NOTIFICATIONS_GET_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.patch(
-    "/notificaciones",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        body: {
-          type: "object",
-          properties: {
-            email_habilitado: { type: "boolean" },
-            reintentos_max: { type: "integer", minimum: 0, maximum: 10 },
-            reintento_delay_min: { type: "integer", minimum: 0, maximum: 120 },
-          },
-          minProperties: 1,
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          400: errorResponseSchema,
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        await client.query("BEGIN");
-        for (const [field, value] of Object.entries(request.body || {})) {
-          const descriptor = NOTIFICATION_PARAM_DEFS[field];
-          if (!descriptor) continue;
-          await upsertSystemParameter(client, descriptor, value);
-        }
-        await client.query("COMMIT");
-
-        const payload = await buildNotificationsPayload(client, 20);
-        return sendOk(reply, payload, { requestId: request.id });
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
-        return sendHandledError(reply, request, error, "No se pudo actualizar configuracion de notificaciones", "CONFIG_NOTIFICATIONS_PATCH_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.get(
     "/comunicacion/campanias",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         querystring: communicationCampaignsQuerySchema,
         response: {
@@ -2312,7 +1695,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.post(
     "/comunicacion/campanias",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         body: communicationCampaignCreateSchema,
         response: {
@@ -2406,7 +1789,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.get(
     "/comunicacion/campanias/:id",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -2443,6 +1826,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(row);
         return sendOk(reply, { campania: mapCommunicationCampaignRow(row) }, { requestId: request.id });
       } catch (error) {
         return sendHandledError(reply, request, error, "No se pudo consultar la campania de comunicacion", "CONFIG_COMM_CAMPAIGN_DETAIL_ERROR");
@@ -2455,7 +1839,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.patch(
     "/comunicacion/campanias/:id",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -2503,6 +1887,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(currentRow);
 
         if (String(currentRow.estado || "").trim().toLowerCase() !== COMMUNICATION_CAMPAIGN_DRAFT_STATE) {
           throw new AppError(409, "Solo se pueden editar campanias en estado borrador en esta etapa", {
@@ -2571,7 +1956,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.get(
     "/comunicacion/campanias/:id/elegibilidad",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -2611,6 +1996,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const campaignType = resolveCampaignTypeForEligibility(campaign.tipo_campania);
         const payload = await getCommunicationEligibilitySummaryPayload(client, campaignType, request.query || {});
@@ -2634,7 +2020,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.get(
     "/comunicacion/campanias/:id/elegibilidad/destinatarios",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -2674,6 +2060,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const campaignType = resolveCampaignTypeForEligibility(campaign.tipo_campania);
         const payload = await listCommunicationEligibilityRecipients(client, campaignType, request.query || {});
@@ -2695,7 +2082,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.post(
     "/comunicacion/campanias/:id/programar",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -2747,6 +2134,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const existingShipmentsResult = await client.query(
           `
@@ -2933,7 +2321,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.post(
     "/comunicacion/campanias/:id/enviar",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -2996,6 +2384,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const campaignState = String(campaign.estado || "").trim().toLowerCase();
         if (campaignState !== COMMUNICATION_CAMPAIGN_SCHEDULED_STATE) {
@@ -3046,7 +2435,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.post(
     "/comunicacion/campanias/:id/reintentar-fallidos",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -3109,6 +2498,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const campaignState = String(campaign.estado || "").trim().toLowerCase();
         if (campaignState !== COMMUNICATION_CAMPAIGN_SCHEDULED_STATE) {
@@ -3160,7 +2550,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.post(
     "/comunicacion/campanias/:id/cancelar",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -3216,6 +2606,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const campaignState = String(campaign.estado || "").trim().toLowerCase();
         const allowedStates = [COMMUNICATION_CAMPAIGN_DRAFT_STATE, COMMUNICATION_CAMPAIGN_SCHEDULED_STATE, "procesando", "error"];
@@ -3320,7 +2711,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.get(
     "/comunicacion/campanias/:id/envios",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -3359,6 +2750,7 @@ export default async function adminConfiguracionRoutes(app) {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
           });
         }
+        assertCommunicationCampaignAllowed(campaign);
 
         const payload = await listCampaignShipments(client, campaign.id_campania, request.query || {});
         return sendOk(reply, {
@@ -3375,273 +2767,9 @@ export default async function adminConfiguracionRoutes(app) {
   );
 
   app.get(
-    "/comunicacion",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        querystring: optionalQuerySchema,
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const payload = await buildCommunicationPayload(client, request.query?.id_sucursal ?? null);
-        return sendOk(reply, payload, { requestId: request.id });
-      } catch (error) {
-        return sendHandledError(reply, request, error, "No se pudo consultar configuracion de comunicacion", "CONFIG_COMMUNICATION_GET_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.patch(
-    "/comunicacion",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        body: {
-          type: "object",
-          properties: {
-            id_sucursal: { type: ["string", "null"], format: "uuid" },
-            reglas_sistema: {
-              type: "object",
-              properties: {
-                marketing_habilitado: { type: "boolean" },
-                requiere_consentimiento: { type: "boolean" },
-                max_promos_semana: { type: "integer", minimum: 0, maximum: 30 },
-              },
-              additionalProperties: false,
-            },
-            reglas_sucursal: {
-              type: "object",
-              properties: {
-                marketing_habilitado: { type: "boolean" },
-                requiere_consentimiento: { type: "boolean" },
-                max_promos_semana: { type: "integer", minimum: 0, maximum: 30 },
-              },
-              additionalProperties: false,
-            },
-          },
-          minProperties: 1,
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          400: errorResponseSchema,
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const hasSystemRules = request.body?.reglas_sistema && Object.keys(request.body.reglas_sistema).length > 0;
-        const hasBranchRules = request.body?.reglas_sucursal && Object.keys(request.body.reglas_sucursal).length > 0;
-
-        if (!hasSystemRules && !hasBranchRules) {
-          throw new AppError(400, "No se enviaron reglas para actualizar", {
-            code: "CONFIG_COMMUNICATION_EMPTY",
-          });
-        }
-
-        const branchId = request.body?.id_sucursal ? await ensureBranchExists(client, request.body.id_sucursal) : null;
-        if (hasBranchRules && !branchId) {
-          throw new AppError(400, "Debes indicar id_sucursal para actualizar reglas por sucursal", {
-            code: "CONFIG_COMMUNICATION_BRANCH_REQUIRED",
-          });
-        }
-
-        await client.query("BEGIN");
-
-        if (hasSystemRules) {
-          for (const [field, value] of Object.entries(request.body.reglas_sistema)) {
-            const descriptor = COMMUNICATION_PARAM_DEFS[field];
-            if (!descriptor) continue;
-            await upsertSystemParameter(client, descriptor, value);
-          }
-        }
-
-        if (hasBranchRules && branchId) {
-          for (const [field, value] of Object.entries(request.body.reglas_sucursal)) {
-            const descriptor = COMMUNICATION_PARAM_DEFS[field];
-            if (!descriptor) continue;
-            await upsertBranchParameter(client, branchId, descriptor, value);
-          }
-        }
-
-        await client.query("COMMIT");
-        const payload = await buildCommunicationPayload(client, branchId);
-        return sendOk(reply, payload, { requestId: request.id });
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
-        return sendHandledError(reply, request, error, "No se pudo actualizar configuracion de comunicacion", "CONFIG_COMMUNICATION_PATCH_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.get(
-    "/parametros",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        querystring: optionalQuerySchema,
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const payload = await buildBaseParametersPayload(client, request.query?.id_sucursal ?? null);
-        return sendOk(reply, payload, { requestId: request.id });
-      } catch (error) {
-        return sendHandledError(reply, request, error, "No se pudo consultar parametros base de configuracion", "CONFIG_PARAMETERS_GET_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.patch(
-    "/parametros",
-    {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
-      schema: {
-        body: {
-          type: "object",
-          required: ["scope", "valores"],
-          properties: {
-            scope: { type: "string", enum: ["sistema", "sucursal"] },
-            id_sucursal: { type: ["string", "null"], format: "uuid" },
-            valores: {
-              type: "object",
-              properties: {
-                moneda_default: { type: "string", minLength: 3, maxLength: 3 },
-                hold_minutos: { type: "integer", minimum: 0, maximum: 240 },
-                buffer_servicio_minutos: { type: "integer", minimum: 0, maximum: 240 },
-                no_show_min: { type: "integer", minimum: 0, maximum: 240 },
-              },
-              minProperties: 1,
-              additionalProperties: false,
-            },
-          },
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: { type: "object", additionalProperties: true },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          400: errorResponseSchema,
-          401: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const client = await app.db.connect();
-      try {
-        const scope = String(request.body.scope || "").trim().toLowerCase();
-        const branchId = request.body?.id_sucursal ? await ensureBranchExists(client, request.body.id_sucursal) : null;
-
-        if (scope === "sucursal" && !branchId) {
-          throw new AppError(400, "Debes indicar id_sucursal para actualizar parametros por sucursal", {
-            code: "CONFIG_PARAMETERS_BRANCH_REQUIRED",
-          });
-        }
-
-        const values = { ...(request.body.valores || {}) };
-        if (values.moneda_default !== undefined) {
-          // AM: Curaduria para evitar codigos de moneda invalidos en parametros base.
-          const currency = String(values.moneda_default || "").trim().toUpperCase();
-          if (!/^[A-Z]{3}$/.test(currency)) {
-            throw new AppError(400, "moneda_default debe tener formato ISO de 3 letras, por ejemplo HNL", {
-              code: "CONFIG_PARAMETERS_CURRENCY_INVALID",
-            });
-          }
-          values.moneda_default = currency;
-        }
-
-        await client.query("BEGIN");
-        for (const [field, value] of Object.entries(values)) {
-          const descriptor = BASE_PARAMETER_DEFS[field];
-          if (!descriptor) continue;
-          if (scope === "sucursal") {
-            await upsertBranchParameter(client, branchId, descriptor, value);
-          } else {
-            await upsertSystemParameter(client, descriptor, value);
-          }
-        }
-        await client.query("COMMIT");
-
-        const payload = await buildBaseParametersPayload(client, branchId);
-        return sendOk(reply, payload, { requestId: request.id });
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
-        return sendHandledError(reply, request, error, "No se pudieron actualizar parametros base de configuracion", "CONFIG_PARAMETERS_PATCH_ERROR");
-      } finally {
-        client.release();
-      }
-    }
-  );
-
-  app.get(
     "/promociones",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         querystring: optionalQuerySchema,
         response: {
@@ -3681,7 +2809,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.get(
     "/promociones/:id",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -3739,7 +2867,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.post(
     "/promociones",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         body: promotionBodySchema,
         response: {
@@ -3815,11 +2943,6 @@ export default async function adminConfiguracionRoutes(app) {
         const imagenPrincipalPath = imagenPrincipalAsset?.object_path ?? null;
         const imagenMobilePath = imagenMobileAsset?.object_path ?? null;
         const imagenAlt = normalizeOptionalText(request.body.imagen_alt) ?? null;
-        const ctaTexto = normalizeOptionalText(request.body.cta_texto) ?? null;
-        const ctaUrl = normalizeOptionalText(request.body.cta_url) ?? null;
-        const ctaTipo = normalizePromotionCtaType(request.body.cta_tipo, "none");
-        const normalizedCtaTexto = ctaTipo === "none" ? null : ctaTexto;
-        const normalizedCtaUrl = ctaTipo === "none" ? null : ctaUrl;
         const estado = normalizePromotionState(request.body.estado, "borrador");
         const visiblePublico = Boolean(request.body.visible_publico ?? false);
         const vigenciaDesde = normalizeDateOnly(request.body.vigencia_desde) ?? null;
@@ -3831,9 +2954,6 @@ export default async function adminConfiguracionRoutes(app) {
           titulo,
           parrafos,
           imagen_principal_url: imagenPrincipalUrl,
-          cta_texto: normalizedCtaTexto,
-          cta_url: normalizedCtaUrl,
-          cta_tipo: ctaTipo,
           estado,
           visible_publico: visiblePublico,
           vigencia_desde: vigenciaDesde,
@@ -3873,7 +2993,7 @@ export default async function adminConfiguracionRoutes(app) {
               estado,
               updated_at
             )
-            VALUES ($1, $2, $3, $4::jsonb, $5::uuid, $6, $7, $8::uuid, $9, $10, $11, $12, $13, $14, $15, NOW())
+            VALUES ($1, $2, $3, $4::jsonb, $5::uuid, $6, $7, $8::uuid, $9, $10, $11, NULL, NULL, 'none', $12, NOW())
             RETURNING id_promocion
           `,
           [
@@ -3888,9 +3008,6 @@ export default async function adminConfiguracionRoutes(app) {
             imagenMobilePath,
             imagenMobileUrl,
             imagenAlt,
-            normalizedCtaTexto,
-            normalizedCtaUrl,
-            ctaTipo,
             estado,
           ]
         );
@@ -3958,7 +3075,7 @@ export default async function adminConfiguracionRoutes(app) {
   app.patch(
     "/promociones/:id",
     {
-      preHandler: app.requireRoles(SUPER_ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(CONFIG_COMMUNICATION_ALLOWED_ROLES),
       schema: {
         params: {
           type: "object",
@@ -4091,20 +3208,6 @@ export default async function adminConfiguracionRoutes(app) {
           request.body.imagen_alt !== undefined
             ? normalizeOptionalText(request.body.imagen_alt) ?? null
             : currentPromotion.imagen_alt;
-        const ctaTexto =
-          request.body.cta_texto !== undefined
-            ? normalizeOptionalText(request.body.cta_texto) ?? null
-            : currentPromotion.cta_texto;
-        const ctaUrl =
-          request.body.cta_url !== undefined
-            ? normalizeOptionalText(request.body.cta_url) ?? null
-            : currentPromotion.cta_url;
-        const ctaTipo =
-          request.body.cta_tipo !== undefined
-            ? normalizePromotionCtaType(request.body.cta_tipo)
-            : normalizePromotionCtaType(currentPromotion.cta_tipo, "none");
-        const normalizedCtaTexto = ctaTipo === "none" ? null : ctaTexto;
-        const normalizedCtaUrl = ctaTipo === "none" ? null : ctaUrl;
         const estado =
           request.body.estado !== undefined
             ? normalizePromotionState(request.body.estado)
@@ -4134,9 +3237,6 @@ export default async function adminConfiguracionRoutes(app) {
           titulo,
           parrafos,
           imagen_principal_url: imagenPrincipalUrl,
-          cta_texto: normalizedCtaTexto,
-          cta_url: normalizedCtaUrl,
-          cta_tipo: ctaTipo,
           estado,
           visible_publico: visiblePublico,
           vigencia_desde: vigenciaDesde,
@@ -4196,10 +3296,10 @@ export default async function adminConfiguracionRoutes(app) {
               imagen_mobile_path = $10,
               imagen_mobile_url = $11,
               imagen_alt = $12,
-              cta_texto = $13,
-              cta_url = $14,
-              cta_tipo = $15,
-              estado = $16,
+              cta_texto = NULL,
+              cta_url = NULL,
+              cta_tipo = 'none',
+              estado = $13,
               updated_at = NOW()
             WHERE id_promocion = $1::uuid
           `,
@@ -4216,9 +3316,6 @@ export default async function adminConfiguracionRoutes(app) {
             imagenMobilePath,
             imagenMobileUrl,
             imagenAlt,
-            normalizedCtaTexto,
-            normalizedCtaUrl,
-            ctaTipo,
             estado,
           ]
         );

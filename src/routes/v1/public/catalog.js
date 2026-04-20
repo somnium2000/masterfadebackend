@@ -146,9 +146,6 @@ const promocionSchema = {
     imagen_principal_url: { type: ["string", "null"] },
     imagen_mobile_url: { type: ["string", "null"] },
     imagen_alt: { type: ["string", "null"] },
-    cta_texto: { type: ["string", "null"] },
-    cta_url: { type: ["string", "null"] },
-    cta_tipo: { type: "string", enum: ["interno", "externo", "none"] },
     estado: { type: "string", enum: ["publicada"] },
     vigencia_desde: { type: ["string", "null"], format: "date" },
     vigencia_hasta: { type: ["string", "null"], format: "date" },
@@ -165,9 +162,6 @@ const promocionSchema = {
     "imagen_principal_url",
     "imagen_mobile_url",
     "imagen_alt",
-    "cta_texto",
-    "cta_url",
-    "cta_tipo",
     "estado",
     "vigencia_desde",
     "vigencia_hasta",
@@ -632,9 +626,6 @@ const PUBLIC_PROMOTIONS_SQL = `
       p.imagen_principal_url,
       p.imagen_mobile_url,
       p.imagen_alt,
-      p.cta_texto,
-      p.cta_url,
-      p.cta_tipo,
       p.estado,
       ps.vigencia_desde,
       ps.vigencia_hasta,
@@ -676,9 +667,6 @@ const PUBLIC_PROMOTIONS_SQL = `
     imagen_principal_url,
     imagen_mobile_url,
     imagen_alt,
-    cta_texto,
-    cta_url,
-    cta_tipo,
     estado,
     vigencia_desde,
     vigencia_hasta,
@@ -827,14 +815,6 @@ function normalizePromotionParagraphs(value) {
 }
 
 function mapPromotionRow(row) {
-  const ctaTipoRaw = String(row.cta_tipo || "none").trim().toLowerCase();
-  const ctaTexto = row.cta_texto == null ? null : String(row.cta_texto).trim() || null;
-  const ctaUrl = row.cta_url == null ? null : String(row.cta_url).trim() || null;
-  const ctaTipo =
-    (ctaTipoRaw === "interno" || ctaTipoRaw === "externo") && ctaUrl
-      ? ctaTipoRaw
-      : "none";
-
   return {
     id_promocion: row.id_promocion,
     id_sucursal: row.id_sucursal ?? null,
@@ -845,9 +825,6 @@ function mapPromotionRow(row) {
     imagen_principal_url: row.imagen_principal_url ?? null,
     imagen_mobile_url: row.imagen_mobile_url ?? null,
     imagen_alt: row.imagen_alt ?? null,
-    cta_texto: ctaTipo === "none" ? null : (ctaTexto || "Ver mas"),
-    cta_url: ctaTipo === "none" ? null : ctaUrl,
-    cta_tipo: ctaTipo,
     estado: "publicada",
     vigencia_desde: row.vigencia_desde ?? null,
     vigencia_hasta: row.vigencia_hasta ?? null,
