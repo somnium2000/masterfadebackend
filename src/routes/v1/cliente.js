@@ -350,8 +350,6 @@ async function buildClienteMePayload(app, claims, { expiresIn = 300 } = {}) {
 
     const profile = {
       id_cliente: row.id_cliente,
-      id_persona: row.id_persona,
-      id_usuario: row.id_usuario,
       id_sucursal_origen: row.id_sucursal_origen ?? null,
       nombre_sucursal: row.nombre_sucursal ?? null,
       estado_cliente: Boolean(row.estado_cliente),
@@ -364,7 +362,6 @@ async function buildClienteMePayload(app, claims, { expiresIn = 300 } = {}) {
       genero_codigo: row.genero_codigo ?? null,
       genero_descripcion: row.genero_descripcion ?? null,
       direccion_texto: row.direccion_texto ?? null,
-      observaciones: row.observaciones ?? null,
       preferencias_corte: normalizeOptionalText(
         row.preferencias_corte ?? row.observaciones ?? null
       ),
@@ -374,7 +371,6 @@ async function buildClienteMePayload(app, claims, { expiresIn = 300 } = {}) {
       acepta_terminos_at: row.acepta_terminos_at ?? null,
       consentimiento_marketing_at: row.consentimiento_marketing_at ?? null,
       foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
-      foto_perfil_path: row.foto_perfil_path ?? null,
       foto_perfil_signed_url: fotoPerfilSignedUrl,
     };
 
@@ -427,7 +423,6 @@ function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   request.log.error({ err: error }, fallbackMessage);
   return sendError(reply, 500, fallbackMessage, {
     code: fallbackCode,
-    details: error instanceof Error ? error.message : fallbackMessage,
     requestId: request.id,
   });
 }
@@ -482,7 +477,6 @@ export default async function clienteRoutes(app) {
             fecha_nacimiento: { type: ["string", "null"], format: "date" },
             genero_codigo: { type: ["string", "null"], maxLength: 40 },
             direccion_texto: { type: ["string", "null"], maxLength: 300 },
-            observaciones: { type: ["string", "null"], maxLength: 1000 },
             preferencias_corte: { type: ["string", "null"], maxLength: 1000 },
             foto_perfil_asset_id: { type: ["string", "null"], format: "uuid" },
           },
@@ -517,7 +511,6 @@ export default async function clienteRoutes(app) {
           "fecha_nacimiento",
           "genero_codigo",
           "direccion_texto",
-          "observaciones",
           "preferencias_corte",
           "foto_perfil_asset_id",
         ].some((key) => Object.prototype.hasOwnProperty.call(body, key));
@@ -540,15 +533,14 @@ export default async function clienteRoutes(app) {
         const nextDireccion = Object.prototype.hasOwnProperty.call(body, "direccion_texto")
           ? normalizeOptionalText(body.direccion_texto)
           : current.direccion_texto;
-        const nextObservaciones = Object.prototype.hasOwnProperty.call(body, "observaciones")
-          ? normalizeOptionalText(body.observaciones)
-          : current.observaciones;
-
         const nextPreferencias = Object.prototype.hasOwnProperty.call(body, "preferencias_corte")
           ? normalizeOptionalText(body.preferencias_corte)
           : (capabilities.hasPreferencias
             ? normalizeOptionalText(current.preferencias_corte)
             : normalizeOptionalText(current.observaciones));
+        const nextObservaciones = capabilities.hasPreferencias
+          ? current.observaciones
+          : nextPreferencias;
         const serializedPreferencias = serializePreferenciasForDb(nextPreferencias, capabilities);
 
         await client.query("BEGIN");
