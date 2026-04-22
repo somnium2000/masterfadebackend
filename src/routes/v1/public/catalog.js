@@ -192,7 +192,7 @@ const PUBLIC_SERVICES_SQL = `
       AND st.activo IS TRUE
       AND (
         ($2::uuid IS NULL AND st.id_empleado IS NULL)
-        OR ($2::uuid IS NOT NULL AND st.id_empleado = $2::uuid)
+        OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
       )
       AND st.vigente_desde <= CURRENT_DATE
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
@@ -337,7 +337,7 @@ const PUBLIC_PACKAGES_SQL = `
   HAVING COUNT(pd.id_servicio) >= 2
      AND eo.precio_hnl > 0
      AND COUNT(s.id_servicio) = COUNT(pd.id_servicio)
-     AND BOOL_AND(
+      AND BOOL_AND(
       s.id_servicio IS NOT NULL
       AND s.activo IS TRUE
       AND s.agendable IS TRUE
@@ -349,6 +349,10 @@ const PUBLIC_PACKAGES_SQL = `
           AND st.id_sucursal = eo.id_sucursal
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
+          AND (
+            ($2::uuid IS NULL AND st.id_empleado IS NULL)
+            OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
+          )
           AND st.vigente_desde <= CURRENT_DATE
           AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
           AND st.precio_hnl > 0
@@ -375,7 +379,10 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
       ON su.id_sucursal = st.id_sucursal
     WHERE st.deleted_at IS NULL
       AND st.activo IS TRUE
-      AND (($2::uuid IS NULL AND st.id_empleado IS NULL) OR ($2::uuid IS NOT NULL AND st.id_empleado = $2::uuid))
+      AND (
+        ($2::uuid IS NULL AND st.id_empleado IS NULL)
+        OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
+      )
       AND st.vigente_desde <= CURRENT_DATE
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
       AND st.precio_hnl > 0
@@ -520,6 +527,10 @@ const PUBLIC_PACKAGES_SEARCH_SQL = `
           AND st.id_sucursal = eo.id_sucursal
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
+          AND (
+            ($3::uuid IS NULL AND st.id_empleado IS NULL)
+            OR ($3::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $3::uuid))
+          )
           AND st.vigente_desde <= CURRENT_DATE
           AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
           AND st.precio_hnl > 0
@@ -946,6 +957,7 @@ export default async function publicCatalogRoutes(app) {
           type: "object",
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
+            id_barbero: { type: "string", format: "uuid" },
           },
           additionalProperties: false,
         },
@@ -977,7 +989,10 @@ export default async function publicCatalogRoutes(app) {
       }
 
       try {
-        const { rows } = await app.db.query(PUBLIC_PACKAGES_SQL, [request.query?.id_sucursal ?? null]);
+        const { rows } = await app.db.query(PUBLIC_PACKAGES_SQL, [
+          request.query?.id_sucursal ?? null,
+          request.query?.id_barbero ?? null,
+        ]);
         return sendOk(reply, {
           paquetes: rows.map(mapPackageRow),
         });
@@ -1041,7 +1056,7 @@ export default async function publicCatalogRoutes(app) {
       try {
         const [serviceResult, packageResult, planResult] = await Promise.all([
           app.db.query(PUBLIC_SERVICES_SEARCH_SQL, [branchId, null, likeSearch]),
-          app.db.query(PUBLIC_PACKAGES_SEARCH_SQL, [branchId, likeSearch]),
+          app.db.query(PUBLIC_PACKAGES_SEARCH_SQL, [branchId, likeSearch, null]),
           app.db.query(PUBLIC_PLANS_SEARCH_SQL, [branchId, likeSearch]),
         ]);
         const mappedPlans = planResult.rows.map(mapPlanRow).filter(isValidPublicPlan);

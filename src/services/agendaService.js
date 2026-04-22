@@ -7,7 +7,7 @@ const UUID_PATTERN =
 
 export const OCCUPIED_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
 export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
-export const BOOKING_SELECTION_TYPES = ["services", "package"];
+export const BOOKING_SELECTION_TYPES = ["services", "package", "mixed"];
 export const HOLD_EXPIRABLE_APPOINTMENT_STATES = ["en_espera", "pendiente_pago"];
 export const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 export const AUTO_NO_SHOW_GRACE_MINUTES = 5;
@@ -173,6 +173,37 @@ export function parseDateTime(value, field = "fecha_inicio") {
     });
   }
   return parsed;
+}
+
+function extractDateAndTimeKeyFromDateTime(value, field = "fecha_inicio") {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new AppError(400, `${field} debe ser una fecha-hora valida`, {
+        code: "AGENDA_DATETIME_INVALID",
+        details: { field, value: null },
+      });
+    }
+    return {
+      dateKey: formatDateOnly(value),
+      timeKey: toTimeLabel(value),
+    };
+  }
+
+  const raw = String(value || "").trim();
+  const match = raw.match(
+    /^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/
+  );
+  if (!match) {
+    throw new AppError(400, `${field} debe ser una fecha-hora valida`, {
+      code: "AGENDA_DATETIME_INVALID",
+      details: { field, value: raw || null },
+    });
+  }
+
+  return {
+    dateKey: parseDateOnly(match[1], field),
+    timeKey: match[2],
+  };
 }
 
 function addMinutes(date, minutes) {
@@ -630,7 +661,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
           ROW_NUMBER() OVER (
             PARTITION BY st.id_servicio
             ORDER BY 
-              (CASE WHEN st.id_empleado IS NOT NULL THEN 1 ELSE 2 END) ASC,
+              (CASE WHEN st.id_empleado IS NULL THEN 1 ELSE 2 END) ASC,
               st.vigente_desde DESC, 
               st.updated_at DESC, 
               st.id_tarifa DESC
@@ -830,6 +861,59 @@ export async function getBookingSelectionDetails(client, {
       });
     }
     return getPackageSelectionDetails(client, id_sucursal, id_paquete, id_barbero);
+  }
+
+  if (normalizedSelectionType === "mixed") {
+    if (!id_paquete) {
+      throw new AppError(400, "id_paquete es obligatorio para selection_type=mixed", {
+        code: "AGENDA_MIXED_PACKAGE_REQUIRED",
+      });
+    }
+
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, id_paquete, id_barbero);
+    const extraServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: true });
+    if (!extraServiceIds.length) {
+      return {
+        ...packageSelection,
+        selection_type: "mixed",
+        servicios_extra: [],
+        monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
+      };
+    }
+
+    const packageServiceIds = new Set(
+      (Array.isArray(packageSelection.items) ? packageSelection.items : [])
+        .map((item) => item?.id_servicio)
+        .filter(Boolean)
+    );
+    const filteredExtraIds = extraServiceIds.filter((idServicio) => !packageServiceIds.has(idServicio));
+    if (!filteredExtraIds.length) {
+      return {
+        ...packageSelection,
+        selection_type: "mixed",
+        servicios_extra: [],
+        monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
+      };
+    }
+
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, filteredExtraIds, id_barbero);
+    const mergedItems = [
+      ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
+      ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
+    ];
+    const totalDuracion = Number(packageSelection.duracion_total_min || 0) + Number(extraSelection.duracion_total_min || 0);
+    const totalMonto = Number(packageSelection.monto_total_hnl || 0) + Number(extraSelection.monto_total_hnl || 0);
+    const globalBuffer = Number(extraSelection.buffer_total_min || packageSelection.buffer_total_min || 0);
+
+    return {
+      ...packageSelection,
+      selection_type: "mixed",
+      items: mergedItems,
+      servicios_extra: extraSelection.items,
+      duracion_total_min: totalDuracion,
+      buffer_total_min: mergedItems.length > 0 ? globalBuffer : 0,
+      monto_total_hnl: totalMonto,
+    };
   }
 
   const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero);
@@ -1301,8 +1385,7 @@ export async function resolveBookingSelection(client, {
     id_barbero,
   });
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
-  const dateKey = formatDateOnly(startDateTime);
-  const timeKey = toTimeLabel(startDateTime);
+  const { dateKey, timeKey } = extractDateAndTimeKeyFromDateTime(fecha_inicio, "fecha_inicio");
   const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
   let selectedBarber;

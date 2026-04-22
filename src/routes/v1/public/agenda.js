@@ -101,7 +101,6 @@ function sendHandled(reply, request, error, message, code) {
   request.log.error({ err: error }, message);
   return sendError(reply, 500, message, {
     code,
-    details: error instanceof Error ? error.message : "Unknown public agenda error",
     requestId: request.id,
   });
 }
@@ -166,7 +165,7 @@ export default async function publicAgendaRoutes(app) {
           required: ["id_sucursal", "fecha_desde", "fecha_hasta"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            selection_type: { type: "string", enum: ["services", "package"] },
+            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
             servicios: { type: "string" },
             id_paquete: { type: "string", format: "uuid" },
             fecha_desde: { type: "string", format: "date" },
@@ -255,7 +254,7 @@ export default async function publicAgendaRoutes(app) {
           required: ["id_sucursal", "fecha"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            selection_type: { type: "string", enum: ["services", "package"] },
+            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
             servicios: { type: "string" },
             id_paquete: { type: "string", format: "uuid" },
             fecha: { type: "string", format: "date" },
