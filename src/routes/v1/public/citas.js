@@ -6,11 +6,9 @@ import {
   expireStaleAppointmentReservations,
   getHoldDurationMinutes,
   getSystemParameters,
-  insertAppointmentNotification,
   parseDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
-import { confirmAppointmentsWithoutPayment } from "../../../services/appointmentConfirmationService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -137,13 +135,30 @@ function sendHandled(reply, request, error, message, code) {
   request.log.error({ err: error }, message);
   return sendError(reply, 500, message, {
     code,
-    details: error instanceof Error ? error.message : "Unknown public citas error",
     requestId: request.id,
   });
 }
 
 function isConflictError(error) {
   return error?.code === "23P01" || /YA_EXISTE_HOLD_ACTIVO_PARA_USUARIO/i.test(String(error?.message || ""));
+}
+
+function isAvailabilityConflictError(error) {
+  if (isConflictError(error)) return true;
+  if (!(error instanceof AppError)) return false;
+  if (error.statusCode !== 409) return false;
+  const safeCode = String(error.code || "").trim().toUpperCase();
+  return safeCode.startsWith("AGENDA_")
+    || safeCode === "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER";
+}
+
+function resolveSafeConflictReason(error) {
+  if (isConflictError(error)) return "DB_CONFLICT";
+  if (!(error instanceof AppError)) return "UNKNOWN_CONFLICT";
+  const safeCode = String(error.code || "").trim().toUpperCase();
+  if (safeCode.startsWith("AGENDA_")) return safeCode;
+  if (safeCode === "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER") return safeCode;
+  return "UNKNOWN_CONFLICT";
 }
 
 function splitFullName(rawName) {
@@ -165,6 +180,14 @@ function splitFullName(rawName) {
 
 function normalizePhone(rawValue) {
   return String(rawValue || "").replace(/[^\d+]/g, "").slice(0, 20);
+}
+
+function hasPhoneLetters(rawValue) {
+  return /[A-Za-z]/.test(String(rawValue || ""));
+}
+
+function hasUnsafeText(rawValue) {
+  return /[<>]/.test(String(rawValue || ""));
 }
 
 function normalizeEmail(rawEmail) {
@@ -256,28 +279,44 @@ function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
 
 function validateClientPayload(titular) {
   const nombre = String(titular?.nombre || "").trim();
-  const telefono = normalizePhone(titular?.telefono);
+  const rawTelefono = String(titular?.telefono || "").trim();
+  const telefono = normalizePhone(rawTelefono);
   const email = normalizeEmail(titular?.email);
 
-  if (!nombre) {
+  if (!nombre || hasUnsafeText(nombre) || nombre.length < 2 || nombre.length > 120) {
     throw new AppError(400, "titular.nombre es obligatorio", {
       code: "PUBLIC_CITAS_CLIENT_NAME_REQUIRED",
+      details: { field: "titular.nombre" },
     });
   }
   if (!EMAIL_PATTERN.test(email)) {
     throw new AppError(400, "titular.email es obligatorio y debe ser valido", {
       code: "PUBLIC_CITAS_CLIENT_EMAIL_REQUIRED",
+      details: { field: "titular.email" },
     });
   }
-  if (telefono && telefono.length < 8) {
+  if (!rawTelefono) {
+    throw new AppError(400, "titular.telefono es obligatorio", {
+      code: "PUBLIC_CITAS_CLIENT_PHONE_REQUIRED",
+      details: { field: "titular.telefono" },
+    });
+  }
+  if (hasPhoneLetters(rawTelefono)) {
+    throw new AppError(400, "titular.telefono no admite letras", {
+      code: "PUBLIC_CITAS_CLIENT_PHONE_INVALID",
+      details: { field: "titular.telefono" },
+    });
+  }
+  if (!telefono || telefono.length < 8) {
     throw new AppError(400, "titular.telefono debe ser valido", {
       code: "PUBLIC_CITAS_CLIENT_PHONE_INVALID",
+      details: { field: "titular.telefono" },
     });
   }
 
   return {
     nombre,
-    telefono: telefono || null,
+    telefono,
     email,
   };
 }
@@ -285,37 +324,45 @@ function validateClientPayload(titular) {
 function validateCompanionContactPayload(contacto, { alias, index }) {
   const nombre = String(contacto?.nombre || "").trim();
   const email = normalizeEmail(contacto?.email);
-  const telefono = normalizePhone(contacto?.telefono);
+  const rawTelefono = String(contacto?.telefono || "").trim();
+  const telefono = normalizePhone(rawTelefono);
+  const blockIndex = index;
 
-  if (!nombre) {
-    throw new AppError(400, "El nombre del acompañante es obligatorio", {
+  if (!nombre || hasUnsafeText(nombre) || nombre.length < 2 || nombre.length > 120) {
+    throw new AppError(400, "El nombre del acompanante es obligatorio", {
       code: "PUBLIC_CITAS_COMPANION_NAME_REQUIRED",
-      details: { alias, index },
+      details: { field: "contacto.nombre", alias, blockIndex },
     });
   }
-  if (email && !EMAIL_PATTERN.test(email)) {
-    throw new AppError(400, "El correo del acompañante debe ser valido", {
+  if (!EMAIL_PATTERN.test(email)) {
+    throw new AppError(400, "El correo del acompanante es obligatorio y debe ser valido", {
       code: "PUBLIC_CITAS_COMPANION_EMAIL_INVALID",
-      details: { alias, index },
+      details: { field: "contacto.email", alias, blockIndex },
+    });
+  }
+  if (rawTelefono && hasPhoneLetters(rawTelefono)) {
+    throw new AppError(400, "El telefono del acompanante no admite letras", {
+      code: "PUBLIC_CITAS_COMPANION_PHONE_INVALID",
+      details: { field: "contacto.telefono", alias, blockIndex },
     });
   }
   if (telefono && telefono.length < 8) {
-    throw new AppError(400, "El telefono del acompañante debe ser valido", {
+    throw new AppError(400, "El telefono del acompanante debe ser valido", {
       code: "PUBLIC_CITAS_COMPANION_PHONE_INVALID",
-      details: { alias, index },
+      details: { field: "contacto.telefono", alias, blockIndex },
     });
   }
 
   return {
     nombre,
-    email: email || null,
+    email,
     telefono: telefono || null,
   };
 }
 
 function normalizeBlocksPayload(body, titularPayload) {
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
-  const hasLegacySelection = body?.selection_type === "package"
+  const hasLegacySelection = body?.selection_type === "package" || body?.selection_type === "mixed"
     ? Boolean(body?.fecha_inicio && body?.id_paquete)
     : Boolean(body?.fecha_inicio && Array.isArray(body?.servicios));
   const legacyPayload = hasLegacySelection
@@ -334,6 +381,7 @@ function normalizeBlocksPayload(body, titularPayload) {
   if (!rawBlocks.length) {
     throw new AppError(400, "Debes enviar al menos un integrante para crear la reserva", {
       code: "PUBLIC_CITAS_BLOCKS_REQUIRED",
+      details: { field: "integrantes" },
     });
   }
 
@@ -345,28 +393,28 @@ function normalizeBlocksPayload(body, titularPayload) {
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
     const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
 
-    if (!["services", "package"].includes(selectionType)) {
+    if (!["services", "package", "mixed"].includes(selectionType)) {
       throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
         code: "PUBLIC_CITAS_BLOCK_SELECTION_TYPE_INVALID",
-        details: { alias, index, selection_type: item?.selection_type ?? null },
+        details: { field: "selection_type", alias, blockIndex: index, selection_type: item?.selection_type ?? null },
       });
     }
 
-    if (selectionType === "services" && !servicios.length) {
+    if ((selectionType === "services" || selectionType === "mixed") && !servicios.length && !packageId) {
       throw new AppError(400, `El integrante ${alias} no tiene servicios seleccionados`, {
         code: "PUBLIC_CITAS_BLOCK_SERVICES_REQUIRED",
-        details: { alias, index },
+        details: { field: "servicios", alias, blockIndex: index },
       });
     }
 
-    if (selectionType === "package" && !packageId) {
+    if ((selectionType === "package" || selectionType === "mixed") && !packageId && !servicios.length) {
       throw new AppError(400, `El integrante ${alias} no tiene paquete seleccionado`, {
         code: "PUBLIC_CITAS_BLOCK_PACKAGE_REQUIRED",
-        details: { alias, index },
+        details: { field: "id_paquete", alias, blockIndex: index },
       });
     }
 
-    const serviceIds = selectionType === "services"
+    const serviceIds = (selectionType === "services" || selectionType === "mixed")
       ? servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"))
       : [];
 
@@ -395,7 +443,34 @@ function normalizeBlocksPayload(body, titularPayload) {
 async function resolveOrCreatePublicClient(client, payload) {
   const { nombre, telefono, email, idSucursal } = payload;
 
-  const existingResult = await client.query(
+  const existingActiveUserByEmailResult = await client.query(
+    `
+      SELECT u.id_usuario
+      FROM public.usuarios u
+      JOIN public.personas p
+        ON p.id_persona = u.id_persona
+       AND p.deleted_at IS NULL
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE u.deleted_at IS NULL
+        AND COALESCE(u.estado, TRUE) IS TRUE
+        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
+        AND lower(co.direccion_correo::text) = lower($1)
+      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+      LIMIT 1
+    `,
+    [email]
+  );
+
+  if (existingActiveUserByEmailResult.rows[0]) {
+    throw new AppError(409, "Este correo ya esta asociado a una cuenta activa. Inicia sesion para agendar.", {
+      code: "PUBLIC_CITAS_EMAIL_IN_USE",
+      details: { email },
+    });
+  }
+
+  const existingUserClientResult = await client.query(
     `
       SELECT c.id_cliente, c.id_persona
       FROM public.clientes c
@@ -414,34 +489,55 @@ async function resolveOrCreatePublicClient(client, payload) {
     [email]
   );
 
-  if (existingResult.rows[0]) {
+  if (existingUserClientResult.rows[0]) {
     throw new AppError(409, "Este correo ya esta asociado a una cuenta. Por favor inicia sesion para agendar.", {
       code: "PUBLIC_CITAS_EMAIL_IN_USE",
       details: { email },
     });
   }
 
-  const { nombres, apellidos } = splitFullName(nombre);
-
-  const personaInsert = await client.query(
+  const existingPersonaResult = await client.query(
     `
-      INSERT INTO public.personas (nombres, apellidos, telefono_principal)
-      VALUES ($1, $2, $3)
-      RETURNING id_persona
+      SELECT p.id_persona
+      FROM public.personas p
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE p.deleted_at IS NULL
+        AND lower(co.direccion_correo::text) = lower($1)
+      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+      LIMIT 1
     `,
-    [nombres, apellidos, telefono || null]
+    [email]
   );
 
-  const idPersona = personaInsert.rows[0].id_persona;
+  let idPersona = existingPersonaResult.rows[0]?.id_persona || null;
 
-  const clienteInsert = await client.query(
-    `
-      INSERT INTO public.clientes (id_persona, id_usuario, acepta_terminos, id_sucursal_origen)
-      VALUES ($1::uuid, NULL, TRUE, $2::uuid)
-      RETURNING id_cliente
-    `,
-    [idPersona, idSucursal]
-  );
+  if (!idPersona) {
+    const { nombres, apellidos } = splitFullName(nombre);
+
+    const personaInsert = await client.query(
+      `
+        INSERT INTO public.personas (nombres, apellidos, telefono_principal)
+        VALUES ($1, $2, $3)
+        RETURNING id_persona
+      `,
+      [nombres, apellidos, telefono || null]
+    );
+    idPersona = personaInsert.rows[0].id_persona;
+  } else if (telefono) {
+    await client.query(
+      `
+        UPDATE public.personas
+        SET telefono_principal = COALESCE(NULLIF(telefono_principal, ''), $2),
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+      `,
+      [idPersona, telefono]
+    );
+  }
+
+  void idSucursal;
 
   await client.query(
     `
@@ -453,7 +549,7 @@ async function resolveOrCreatePublicClient(client, payload) {
   );
 
   return {
-    id_cliente: clienteInsert.rows[0].id_cliente,
+    id_cliente: null,
     id_persona: idPersona,
   };
 }
@@ -535,7 +631,7 @@ export default async function publicCitasRoutes(app) {
             id_sucursal: { type: "string", format: "uuid" },
             titular: {
               type: "object",
-              required: ["nombre", "email"],
+              required: ["nombre", "email", "telefono"],
               properties: {
                 nombre: { type: "string", minLength: 1, maxLength: 120 },
                 email: { type: "string", format: "email", maxLength: 160 },
@@ -553,7 +649,7 @@ export default async function publicCitasRoutes(app) {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
-                  selection_type: { type: "string", enum: ["services", "package"] },
+                  selection_type: { type: "string", enum: ["services", "package", "mixed"] },
                   id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   contacto: {
                     type: "object",
@@ -582,7 +678,7 @@ export default async function publicCitasRoutes(app) {
             },
             id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             fecha_inicio: { type: "string", format: "date-time" },
-            selection_type: { type: "string", enum: ["services", "package"] },
+            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
             id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             servicios: {
               type: "array",
@@ -641,9 +737,13 @@ export default async function publicCitasRoutes(app) {
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const titularPayload = validateClientPayload(request.body?.titular);
         const integrantes = normalizeBlocksPayload(request.body, titularPayload);
-        const publicParams = normalizePublicParams(await getSystemParameters(dbClient));
-        const simulationNoPayment = Boolean(publicParams.simulacion_sin_pago);
-
+        if (integrantes.length > 5) {
+          throw new AppError(400, "Solo se permiten hasta 4 acompañantes por reserva", {
+            code: "PUBLIC_CITAS_MAX_COMPANIONS",
+            details: { field: "integrantes", maxCompanions: 4 },
+          });
+        }
+        const titularDateTime = parseIsoDateAndTime(integrantes[0]?.fecha_inicio || "");
         const branch = await ensureActiveBranch(dbClient, idSucursal);
 
         await dbClient.query("BEGIN");
@@ -680,12 +780,18 @@ export default async function publicCitasRoutes(app) {
 
         const groupRecord = groupInsert.rows[0];
         const bloquesResponse = [];
-        const notificationTargets = new Map();
         let totalGrupo = 0;
-        const createdAppointmentIds = [];
+        let titularResolved = null;
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
+          const splitDateTime = parseIsoDateAndTime(integrante.fecha_inicio);
+          if (index > 0 && splitDateTime.fecha !== titularDateTime.fecha) {
+            throw new AppError(409, "Los acompañantes deben agendarse en la misma fecha del titular", {
+              code: "PUBLIC_CITAS_COMPANION_DATE_MISMATCH",
+              details: { field: "fecha_inicio", alias: integrante.alias, blockIndex: index },
+            });
+          }
           const selection = await resolveBookingSelection(dbClient, {
             id_sucursal: branch.id_sucursal,
             selection_type: integrante.selection_type,
@@ -694,6 +800,24 @@ export default async function publicCitasRoutes(app) {
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
           });
+          if (
+            index > 0
+            && titularResolved
+            && splitDateTime.hora
+            && splitDateTime.hora === titularResolved.hora
+            && selection.barber.id_empleado === titularResolved.id_barbero
+          ) {
+            throw new AppError(409, "Un acompañante no puede tomar la misma hora del titular con el mismo barbero", {
+              code: "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER",
+              details: { field: "fecha_inicio", alias: integrante.alias, blockIndex: index },
+            });
+          }
+          if (index === 0) {
+            titularResolved = {
+              hora: splitDateTime.hora,
+              id_barbero: selection.barber.id_empleado,
+            };
+          }
 
           const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
 
@@ -777,8 +901,6 @@ export default async function publicCitasRoutes(app) {
           );
 
           const citaId = citaInsert.rows[0].id_cita;
-          createdAppointmentIds.push(citaId);
-
           for (const serviceItem of selection.serviceSelection.items) {
             await dbClient.query(
               `
@@ -819,14 +941,6 @@ export default async function publicCitasRoutes(app) {
 
           totalGrupo += Number(selection.serviceSelection.monto_total_hnl || 0);
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
-          const targetEmail = normalizeEmail(integrante.contacto?.email);
-          if (targetEmail && EMAIL_PATTERN.test(targetEmail)) {
-            notificationTargets.set(targetEmail, {
-              email: targetEmail,
-              nombre: integrante.contacto?.nombre || integrante.alias || "Cliente",
-              id_cita: citaId,
-            });
-          }
 
           bloquesResponse.push({
             id_cita: citaId,
@@ -837,55 +951,11 @@ export default async function publicCitasRoutes(app) {
             fecha: fecha || "",
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: simulationNoPayment ? "confirmada" : targetAppointmentState,
+            estado_cita_codigo: targetAppointmentState,
             monto_total_hnl: Number(selection.serviceSelection.monto_total_hnl || 0),
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
           });
-        }
-
-        if (simulationNoPayment && createdAppointmentIds.length > 0) {
-          await confirmAppointmentsWithoutPayment(dbClient, {
-            citas: createdAppointmentIds,
-            motivo_confirmacion: "simulacion_sin_pago_publica",
-          });
-        }
-
-        const titularEmail = normalizeEmail(titularPayload.email);
-        if (titularEmail && EMAIL_PATTERN.test(titularEmail)) {
-          const firstCitaId = bloquesResponse[0]?.id_cita ?? null;
-          notificationTargets.set(titularEmail, {
-            email: titularEmail,
-            nombre: titularPayload.nombre,
-            id_cita: firstCitaId,
-          });
-        }
-
-        if (notificationTargets.size > 0) {
-          const resumenLineas = bloquesResponse.map(
-            (block) => `- ${block.alias}: ${block.fecha} ${block.hora} con ${block.nombre_barbero}`
-          );
-          const asunto = `Reserva confirmada #${groupRecord.id_grupo_cita}`;
-          for (const target of notificationTargets.values()) {
-            const cuerpo = [
-              `Hola ${target.nombre},`,
-              "",
-              "Tu cita fue registrada correctamente.",
-              `Grupo: ${groupRecord.id_grupo_cita}`,
-              `Total: HNL ${Number(totalGrupo || 0).toFixed(2)}`,
-              "",
-              "Detalle de bloques:",
-              ...resumenLineas,
-            ].join("\n");
-            await insertAppointmentNotification(dbClient, {
-              correo_destino: target.email,
-              asunto,
-              cuerpo,
-              evento: "cita_confirmada_publica",
-              id_cita: target.id_cita,
-              estado_notificacion_codigo: "pendiente",
-            });
-          }
         }
 
         await dbClient.query("COMMIT");
@@ -895,7 +965,7 @@ export default async function publicCitasRoutes(app) {
           {
             id_grupo_cita: groupRecord.id_grupo_cita,
             estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
-            expires_at: simulationNoPayment ? null : expiresAt.toISOString(),
+            expires_at: expiresAt.toISOString(),
             monto_total_hnl: totalGrupo,
             bloques: bloquesResponse,
           },
@@ -908,10 +978,19 @@ export default async function publicCitasRoutes(app) {
           // no-op
         }
 
-        if (isConflictError(error)) {
-          return sendError(reply, 409, "Ya existe un conflicto de disponibilidad para uno de los bloques", {
+        if (isAvailabilityConflictError(error)) {
+          const reason = resolveSafeConflictReason(error);
+          request.log.warn(
+            {
+              requestId: request.id,
+              reason,
+              sourceCode: error instanceof AppError ? String(error.code || "") : null,
+            },
+            "Public hold rejected by agenda conflict"
+          );
+          return sendError(reply, 409, "La hora seleccionada ya no está disponible.", {
             code: "PUBLIC_CITAS_HOLD_CONFLICT",
-            details: error instanceof Error ? error.message : "Public hold conflict",
+            reason,
             requestId: request.id,
           });
         }
@@ -923,3 +1002,4 @@ export default async function publicCitasRoutes(app) {
     }
   );
 }
+
