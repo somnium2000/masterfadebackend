@@ -1043,6 +1043,7 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
     `
       SELECT
         s.id_servicio,
+        s.agendable,
         EXISTS (
           SELECT 1
           FROM public.servicios_tarifas st
@@ -1050,6 +1051,7 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
             AND st.id_empleado IS NULL
             AND st.deleted_at IS NULL
             AND st.activo IS TRUE
+            AND COALESCE(st.servicio_informativo, FALSE) IS FALSE
             AND st.vigente_desde <= CURRENT_DATE
             AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
             AND ($1::uuid[] IS NULL OR st.id_sucursal = ANY($1::uuid[]))
@@ -1065,6 +1067,12 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
   if (rows.length !== uniqueServiceIds.length) {
     throw new AppError(400, "Uno o mas servicios del paquete no existen o no estan activos", {
       code: "CATALOG_PACKAGE_SERVICE_NOT_FOUND",
+    });
+  }
+
+  if (rows.some((row) => !normalizeBoolean(row.agendable, false))) {
+    throw new AppError(409, "Un paquete no puede incluir servicios no agendables o informativos", {
+      code: "CATALOG_PACKAGE_SERVICE_NOT_BOOKABLE",
     });
   }
 
@@ -1181,6 +1189,25 @@ async function syncActiveEmployeeServiceTariffs(client, idServicio, idSucursal, 
     options?.servicioInformativo === undefined || options?.servicioInformativo === null
       ? null
       : Boolean(options.servicioInformativo);
+
+  if (servicioInformativo === false) {
+    await client.query(
+      `
+        UPDATE public.servicios_tarifas
+        SET
+          activo = FALSE,
+          deleted_at = COALESCE(deleted_at, NOW()),
+          vigente_hasta = COALESCE(vigente_hasta, CURRENT_DATE),
+          updated_at = NOW()
+        WHERE id_servicio = $1::uuid
+          AND id_sucursal = $2::uuid
+          AND id_empleado IS NOT NULL
+          AND deleted_at IS NULL
+      `,
+      [idServicio, idSucursal]
+    );
+    return;
+  }
 
   await client.query(
     `
@@ -1307,8 +1334,7 @@ async function upsertEmployeeServiceTariff(client, idServicio, idSucursal, idEmp
 
 async function syncServiceBarberAssignments(client, idServicio, idSucursal, idEmpleadoList = []) {
   const requestedIds = [...new Set((Array.isArray(idEmpleadoList) ? idEmpleadoList : []).filter(Boolean))];
-  const serviceResult = await client.query(GET_SERVICE_SQL, [idServicio, idSucursal]);
-  const service = serviceResult.rows[0];
+  const service = await ensureInformativeServiceForBarberAssignments(client, idServicio, idSucursal);
 
   if (!service) {
     throw new AppError(404, "El servicio solicitado no existe en la sucursal indicada", {
@@ -1356,6 +1382,30 @@ async function syncServiceBarberAssignments(client, idServicio, idSucursal, idEm
 
   const assignmentRows = await client.query(LIST_SERVICE_BARBER_ASSIGNMENTS_SQL, [idServicio, idSucursal]);
   return assignmentRows.rows.map(mapServiceBarberAssignmentRow);
+}
+
+async function ensureInformativeServiceForBarberAssignments(client, idServicio, idSucursal) {
+  const serviceResult = await client.query(GET_SERVICE_SQL, [idServicio, idSucursal]);
+  const service = serviceResult.rows[0];
+
+  if (!service) {
+    throw new AppError(404, "El servicio solicitado no existe en la sucursal indicada", {
+      code: "CATALOG_SERVICE_NOT_FOUND",
+    });
+  }
+
+  const isInformative = normalizeBoolean(service.servicio_informativo, false);
+  if (!isInformative) {
+    throw new AppError(
+      409,
+      "Solo los servicios informativos pueden asignarse manualmente a barberos.",
+      {
+        code: "CATALOG_SERVICE_BARBER_ASSIGNMENTS_ONLY_INFORMATIVE",
+      }
+    );
+  }
+
+  return service;
 }
 
 async function lockServiceTariffScope(client, idServicio, idSucursal) {
@@ -1977,6 +2027,7 @@ export default async function adminCatalogRoutes(app) {
         const grupoCatalogo = normalizeServiceGroup(request.body.grupo_catalogo, "barberia");
         const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const servicioInformativo = normalizeBoolean(request.body.servicio_informativo, false);
+        const agendable = !servicioInformativo;
 
         await client.query("BEGIN");
 
@@ -1993,12 +2044,13 @@ export default async function adminCatalogRoutes(app) {
                 grupo_catalogo,
                 orden_visual,
                 visible_publico,
+                agendable,
                 activo
               )
-              VALUES ($1, $2, $3::int, $4, $5::int, $6::boolean, TRUE)
+              VALUES ($1, $2, $3::int, $4, $5::int, $6::boolean, $7::boolean, TRUE)
               RETURNING id_servicio
             `,
-            [nombreServicio, descripcion ?? null, duracionMin, grupoCatalogo, ordenVisual, visiblePublico]
+            [nombreServicio, descripcion ?? null, duracionMin, grupoCatalogo, ordenVisual, visiblePublico, agendable]
           );
           idServicio = insertResult.rows[0].id_servicio;
         } catch (insertError) {
@@ -2176,6 +2228,7 @@ export default async function adminCatalogRoutes(app) {
           request.body.servicio_informativo !== undefined
             ? normalizeBoolean(request.body.servicio_informativo, false)
             : normalizeBoolean(current.servicio_informativo, false);
+        const agendable = !servicioInformativo;
 
         if (shouldMutateServiceBase) {
           await client.query(
@@ -2187,24 +2240,26 @@ export default async function adminCatalogRoutes(app) {
                 grupo_catalogo = $4,
                 orden_visual = $5::int,
                 visible_publico = $6::boolean,
+                agendable = $7::boolean,
                 activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
             `,
-            [targetServiceId, nombreServicio, descripcion ?? null, grupoCatalogo, ordenVisual, visiblePublico]
+            [targetServiceId, nombreServicio, descripcion ?? null, grupoCatalogo, ordenVisual, visiblePublico, agendable]
           );
         } else {
           await client.query(
             `
               UPDATE public.servicios
               SET
+                agendable = $2::boolean,
                 activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
             `,
-            [targetServiceId]
+            [targetServiceId, agendable]
           );
         }
 
@@ -2372,12 +2427,7 @@ export default async function adminCatalogRoutes(app) {
 
       try {
         const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
-        const serviceResult = await client.query(GET_SERVICE_SQL, [request.params.id, branchId]);
-        if (!serviceResult.rows[0]) {
-          throw new AppError(404, "El servicio solicitado no existe en la sucursal indicada", {
-            code: "CATALOG_SERVICE_NOT_FOUND",
-          });
-        }
+        await ensureInformativeServiceForBarberAssignments(client, request.params.id, branchId);
 
         const assignmentsResult = await client.query(LIST_SERVICE_BARBER_ASSIGNMENTS_SQL, [request.params.id, branchId]);
         return sendOk(reply, {
@@ -2428,6 +2478,7 @@ export default async function adminCatalogRoutes(app) {
           401: errorResponseSchema,
           403: errorResponseSchema,
           404: errorResponseSchema,
+          409: errorResponseSchema,
           422: errorResponseSchema,
           500: errorResponseSchema,
         },

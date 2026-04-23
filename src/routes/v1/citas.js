@@ -312,7 +312,7 @@ function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
 
 function normalizeHoldBlocksPayload(body) {
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
-  const hasLegacySelection = body?.selection_type === "package"
+  const hasLegacySelection = body?.selection_type === "package" || body?.selection_type === "mixed"
     ? Boolean(body?.fecha_inicio && body?.id_paquete)
     : Boolean(body?.fecha_inicio && Array.isArray(body?.servicios));
   const legacyPayload = hasLegacySelection
@@ -342,28 +342,28 @@ function normalizeHoldBlocksPayload(body) {
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
     const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
 
-    if (!["services", "package"].includes(selectionType)) {
+    if (!["services", "package", "mixed"].includes(selectionType)) {
       throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
         code: "CITAS_HOLD_BLOCK_SELECTION_TYPE_INVALID",
         details: { alias, index, selection_type: item?.selection_type ?? null },
       });
     }
 
-    if (selectionType === "services" && !servicios.length) {
+    if ((selectionType === "services" || selectionType === "mixed") && !servicios.length && !packageId) {
       throw new AppError(400, `El integrante ${alias} no tiene servicios seleccionados`, {
         code: "CITAS_HOLD_BLOCK_SERVICES_REQUIRED",
         details: { alias, index },
       });
     }
 
-    if (selectionType === "package" && !packageId) {
+    if ((selectionType === "package" || selectionType === "mixed") && !packageId && !servicios.length) {
       throw new AppError(400, `El integrante ${alias} no tiene paquete seleccionado`, {
         code: "CITAS_HOLD_BLOCK_PACKAGE_REQUIRED",
         details: { alias, index },
       });
     }
 
-    const serviceIds = selectionType === "services"
+    const serviceIds = (selectionType === "services" || selectionType === "mixed")
       ? servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"))
       : [];
     const fechaInicio = String(item?.fecha_inicio || "").trim();
@@ -398,7 +398,7 @@ export default async function citasRoutes(app) {
             id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             id_sucursal: { type: "string", format: "uuid" },
             fecha_inicio: { type: "string", format: "date-time" },
-            selection_type: { type: "string", enum: ["services", "package"] },
+            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
             id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             servicios: {
               type: "array",
@@ -648,7 +648,7 @@ export default async function citasRoutes(app) {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
-                  selection_type: { type: "string", enum: ["services", "package"] },
+                  selection_type: { type: "string", enum: ["services", "package", "mixed"] },
                   id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   fecha_inicio: { type: "string", format: "date-time" },
                   servicios: {
@@ -668,7 +668,7 @@ export default async function citasRoutes(app) {
             },
             id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             fecha_inicio: { type: "string", format: "date-time" },
-            selection_type: { type: "string", enum: ["services", "package"] },
+            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
             id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             servicios: {
               type: "array",
