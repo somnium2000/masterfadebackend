@@ -26,6 +26,10 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DNI_PATTERN = /^\d{13}$/;
 const RTN_PATTERN = /^\d{14}$/;
 const STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE = "private_client_profile";
+const STORAGE_SCOPE_PUBLIC_BARBER_PROFILE = "public_barber_profile";
+const BARBER_PUBLIC_ALIAS_MAX = 80;
+const BARBER_PUBLIC_SUMMARY_MAX = 500;
+const BARBER_PUBLIC_CERT_MAX = 120;
 
 const personaInputSchema = {
   type: "object",
@@ -41,6 +45,20 @@ const personaInputSchema = {
     observaciones: { type: ["string", "null"], maxLength: 500 },
   },
   required: ["nombres", "apellidos"],
+  additionalProperties: false,
+};
+
+const barberPublicProfileInputSchema = {
+  type: "object",
+  properties: {
+    alias_publico: { type: ["string", "null"], maxLength: BARBER_PUBLIC_ALIAS_MAX },
+    resumen_publico: { type: ["string", "null"], maxLength: BARBER_PUBLIC_SUMMARY_MAX },
+    certificaciones_titulos: {
+      type: ["array", "null"],
+      items: { type: "string", maxLength: BARBER_PUBLIC_CERT_MAX },
+    },
+    visible_en_landing: { type: ["boolean", "null"] },
+  },
   additionalProperties: false,
 };
 
@@ -67,12 +85,14 @@ const empleadoCreateBodySchema = {
         id_sucursal: { type: "string", format: "uuid" },
         fecha_ingreso: { type: ["string", "null"], format: "date-time" },
         salario_base: { type: ["number", "null"], minimum: 0 },
+        foto_perfil_asset_id: { type: ["string", "null"], format: "uuid" },
         estado: { type: "boolean" },
         es_barbero: { type: "boolean" },
       },
       required: ["id_sucursal", "es_barbero"],
       additionalProperties: false,
     },
+    perfil_publico: barberPublicProfileInputSchema,
   },
   required: ["persona", "acceso", "empleado"],
   additionalProperties: false,
@@ -298,6 +318,14 @@ const EMPLEADO_BASE_SQL = `
     e.salario_base,
     COALESCE(e.estado, TRUE) AS estado_laboral,
     COALESCE(e.es_barbero, FALSE) AS es_barbero,
+    bpp.alias_publico,
+    bpp.resumen_publico,
+    COALESCE(bpp.certificaciones_titulos, ARRAY[]::text[]) AS certificaciones_titulos,
+    COALESCE(bpp.visible_en_landing, FALSE) AS visible_en_landing,
+    CASE
+      WHEN sa.visibility = 'public' THEN COALESCE(sa.public_url, NULL)
+      ELSE NULL
+    END AS foto_perfil_url,
     COALESCE(u.estado, TRUE) AS estado_usuario,
     COALESCE(u.estado_acceso, 'pendiente_password') AS estado_acceso,
     u.credenciales_completadas_at,
@@ -314,6 +342,12 @@ const EMPLEADO_BASE_SQL = `
   LEFT JOIN public.usuarios u ON u.id_persona = e.id_persona AND u.deleted_at IS NULL
   LEFT JOIN auth.users au ON au.id = u.id_usuario
   LEFT JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal
+  LEFT JOIN public.barberos_perfiles_publicos bpp
+    ON bpp.id_empleado = e.id_empleado
+    AND bpp.deleted_at IS NULL
+  LEFT JOIN public.storage_assets sa
+    ON sa.id_asset = p.foto_perfil_asset_id
+    AND sa.deleted_at IS NULL
   LEFT JOIN LATERAL (
     SELECT c.direccion_correo::text AS email
     FROM public.correos c
@@ -410,6 +444,58 @@ function normalizeOptional(value) {
   if (value === undefined) return undefined;
   const trimmed = String(value ?? "").normalize("NFC").trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizeOptionalBoundedText(value, { field, maxLength }) {
+  const normalized = normalizeOptional(value);
+  if (normalized == null) return null;
+  if (normalized.length > maxLength) {
+    throw new AppError(400, `${field} excede la longitud permitida`, {
+      code: "PERSONAS_BARBER_PUBLIC_PROFILE_INVALID",
+      details: { field, max_length: maxLength },
+    });
+  }
+  return normalized;
+}
+
+function normalizePublicCertifications(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "certificaciones_titulos debe ser una lista", {
+      code: "PERSONAS_BARBER_PUBLIC_PROFILE_INVALID",
+      details: { field: "certificaciones_titulos" },
+    });
+  }
+
+  const unique = new Set();
+  const normalized = [];
+  for (const rawItem of value) {
+    const text = normalizeOptionalBoundedText(rawItem, {
+      field: "certificaciones_titulos",
+      maxLength: BARBER_PUBLIC_CERT_MAX,
+    });
+    if (!text) continue;
+    const dedupeKey = text.toLowerCase();
+    if (unique.has(dedupeKey)) continue;
+    unique.add(dedupeKey);
+    normalized.push(text);
+  }
+  return normalized;
+}
+
+function normalizeBarberPublicProfile(rawProfile = {}) {
+  return {
+    alias_publico: normalizeOptionalBoundedText(rawProfile?.alias_publico, {
+      field: "alias_publico",
+      maxLength: BARBER_PUBLIC_ALIAS_MAX,
+    }),
+    resumen_publico: normalizeOptionalBoundedText(rawProfile?.resumen_publico, {
+      field: "resumen_publico",
+      maxLength: BARBER_PUBLIC_SUMMARY_MAX,
+    }),
+    certificaciones_titulos: normalizePublicCertifications(rawProfile?.certificaciones_titulos),
+    visible_en_landing: rawProfile?.visible_en_landing == null ? false : Boolean(rawProfile.visible_en_landing),
+  };
 }
 
 function normalizeEmail(value) {
@@ -534,6 +620,7 @@ function mapEmpleado(row) {
     foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
     foto_perfil_path: row.foto_perfil_path ?? null,
     foto_perfil_signed_url: null,
+    foto_perfil_url: row.foto_perfil_url ?? null,
     correo_principal: row.correo_principal ?? null,
     id_sucursal: row.id_sucursal,
     nombre_sucursal: row.nombre_sucursal ?? null,
@@ -541,6 +628,10 @@ function mapEmpleado(row) {
     salario_base: row.salario_base ?? null,
     estado_laboral: Boolean(row.estado_laboral),
     es_barbero: Boolean(row.es_barbero),
+    alias_publico: row.alias_publico ?? null,
+    resumen_publico: row.resumen_publico ?? null,
+    certificaciones_titulos: Array.isArray(row.certificaciones_titulos) ? row.certificaciones_titulos : [],
+    visible_en_landing: Boolean(row.visible_en_landing),
     estado_usuario: Boolean(row.estado_usuario),
     estado_acceso: row.estado_acceso ?? ACCESS_STATUS.PENDING_PASSWORD,
     credenciales_completadas_at: row.credenciales_completadas_at ?? null,
@@ -1101,6 +1192,64 @@ async function loadRoleIdByName(client) {
   return new Map(roleRows.rows.map((row) => [String(row.nombre), row.id_rol]));
 }
 
+async function upsertBarberPublicProfile(client, { idEmpleado, profile }) {
+  if (!idEmpleado || !profile) return;
+
+  const { rows } = await client.query(
+    `
+      SELECT id_perfil_publico
+      FROM public.barberos_perfiles_publicos
+      WHERE id_empleado = $1::uuid
+      ORDER BY (deleted_at IS NULL) DESC, updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+      LIMIT 1
+    `,
+    [idEmpleado]
+  );
+
+  if (rows.length) {
+    await client.query(
+      `
+        UPDATE public.barberos_perfiles_publicos
+        SET alias_publico = $2,
+            resumen_publico = $3,
+            certificaciones_titulos = $4::text[],
+            visible_en_landing = $5::boolean,
+            deleted_at = NULL,
+            updated_at = NOW()
+        WHERE id_perfil_publico = $1::uuid
+      `,
+      [
+        rows[0].id_perfil_publico,
+        profile.alias_publico,
+        profile.resumen_publico,
+        profile.certificaciones_titulos,
+        profile.visible_en_landing,
+      ]
+    );
+    return;
+  }
+
+  await client.query(
+    `
+      INSERT INTO public.barberos_perfiles_publicos (
+        id_empleado,
+        alias_publico,
+        resumen_publico,
+        certificaciones_titulos,
+        visible_en_landing
+      )
+      VALUES ($1::uuid, $2, $3, $4::text[], $5::boolean)
+    `,
+    [
+      idEmpleado,
+      profile.alias_publico,
+      profile.resumen_publico,
+      profile.certificaciones_titulos,
+      profile.visible_en_landing,
+    ]
+  );
+}
+
 function parseEmployeeRoleNames(rawRoles, esBarbero) {
   const normalizedRoles = Array.isArray(rawRoles)
     ? rawRoles.map((value) => normalizeRequired(value).toLowerCase()).filter(Boolean)
@@ -1411,6 +1560,8 @@ async function createEmpleado(app, request, payload) {
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
     const esBarbero = roles.includes("barbero");
+    const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
+    const fotoPerfilAssetIdRaw = normalizeOptional(empleadoRaw.foto_perfil_asset_id ?? null);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
     assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles });
 
@@ -1501,7 +1652,7 @@ async function createEmpleado(app, request, payload) {
     });
 
     const fechaIngreso = normalizeOptional(empleadoRaw.fecha_ingreso ?? null);
-    await client.query(
+    const empleadoInsert = await client.query(
       `
         INSERT INTO public.empleados (
           id_persona,
@@ -1519,9 +1670,51 @@ async function createEmpleado(app, request, payload) {
           COALESCE($5::boolean, TRUE),
           $6::boolean
         )
+        RETURNING id_empleado
       `,
       [idPersona, idSucursal, fechaIngreso, salarioBase, empleadoRaw.estado ?? true, esBarbero]
     );
+    const idEmpleado = empleadoInsert.rows[0]?.id_empleado ?? null;
+
+    if (esBarbero && idEmpleado) {
+      await upsertBarberPublicProfile(client, {
+        idEmpleado,
+        profile: perfilPublico,
+      });
+
+      if (fotoPerfilAssetIdRaw) {
+        const fotoAsset = await resolveAssetForBinding(client, {
+          assetId: fotoPerfilAssetIdRaw,
+          scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+          entityType: "barbero",
+          entityId: idEmpleado,
+          idSucursal,
+          claims: request.claims,
+          allowUnboundEntity: true,
+          allowedStatuses: ["temporal", "activo"],
+        });
+        const activatedPhoto = await activateAssetForEntity(app, client, {
+          assetId: fotoAsset.id_asset,
+          scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+          entityType: "barbero",
+          entityId: idEmpleado,
+          idSucursal,
+          claims: request.claims,
+          replaceCurrent: false,
+        });
+        await client.query(
+          `
+            UPDATE public.personas
+            SET
+              foto_perfil_asset_id = $2::uuid,
+              foto_perfil_path = $3,
+              updated_at = NOW()
+            WHERE id_persona = $1::uuid
+          `,
+          [idPersona, activatedPhoto.asset.id_asset, activatedPhoto.asset.object_path]
+        );
+      }
+    }
 
     const detail = await client.query(EMPLEADO_BY_USER_SQL, [authUserId]);
 
@@ -1582,6 +1775,13 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
     const esBarbero = roles.includes("barbero");
+    const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
+    const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(empleadoRaw, "foto_perfil_asset_id");
+    const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
+      ? normalizeOptional(empleadoRaw.foto_perfil_asset_id ?? null)
+      : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
+    const fotoPerfilChanged = hasFotoPerfilPatch
+      && nextFotoPerfilAssetIdRaw !== normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
     const previousEmail = normalizeEmail(currentRow.correo_principal ?? "");
     authEmailPrevious = previousEmail || null;
@@ -1600,6 +1800,18 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     });
 
     const roleIdsByName = await loadRoleIdByName(client);
+    const nextFotoPerfilAsset = fotoPerfilChanged && esBarbero && nextFotoPerfilAssetIdRaw
+      ? await resolveAssetForBinding(client, {
+        assetId: nextFotoPerfilAssetIdRaw,
+        scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+        entityType: "barbero",
+        entityId: idEmpleado,
+        idSucursal,
+        claims: request.claims,
+        allowUnboundEntity: true,
+        allowedStatuses: ["temporal", "activo"],
+      })
+      : null;
 
     await client.query("BEGIN");
     transactionStarted = true;
@@ -1668,10 +1880,57 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
       assignedBy: request.claims?.user?.id_usuario ?? null,
     });
 
+    let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
+    let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
+    if (fotoPerfilChanged && esBarbero) {
+      if (!nextFotoPerfilAsset) {
+        nextFotoPerfilAssetId = null;
+        nextFotoPerfilPath = null;
+      } else {
+        const activatedPhoto = await activateAssetForEntity(app, client, {
+          assetId: nextFotoPerfilAsset.id_asset,
+          scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+          entityType: "barbero",
+          entityId: idEmpleado,
+          idSucursal,
+          claims: request.claims,
+          replaceCurrent: false,
+        });
+        nextFotoPerfilAssetId = activatedPhoto.asset.id_asset;
+        nextFotoPerfilPath = activatedPhoto.asset.object_path;
+      }
+      await client.query(
+        `
+          UPDATE public.personas
+          SET
+            foto_perfil_asset_id = $2::uuid,
+            foto_perfil_path = $3,
+            updated_at = NOW()
+          WHERE id_persona = $1::uuid
+        `,
+        [currentRow.id_persona, nextFotoPerfilAssetId, nextFotoPerfilPath]
+      );
+    }
+
+    if (esBarbero) {
+      await upsertBarberPublicProfile(client, {
+        idEmpleado,
+        profile: perfilPublico,
+      });
+    }
+
     const detail = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
 
     await client.query("COMMIT");
     transactionStarted = false;
+
+    if (fotoPerfilChanged && esBarbero) {
+      await replaceAssetIfNeeded(app, client, {
+        previousAssetId: currentRow.foto_perfil_asset_id,
+        nextAssetId: nextFotoPerfilAssetIdRaw,
+        claims: request.claims,
+      });
+    }
 
     return { empleado: mapEmpleado(detail.rows[0]) };
   } catch (error) {
