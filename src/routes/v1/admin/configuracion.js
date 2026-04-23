@@ -68,6 +68,16 @@ const COMMUNICATION_ELIGIBILITY_REASONS = [
   "sin_aceptacion_terminos",
   "sin_consentimiento_marketing",
 ];
+const COMMUNICATION_SCHEMA_CAPS_DEFAULT = Object.freeze({
+  hasCampaignExclusionsSnapshot: false,
+  hasClientAceptaTerminosAt: false,
+  hasClientConsentimientoMarketingAt: false,
+});
+const COMMUNICATION_SCHEMA_CAPS_CACHE_MS = 30000;
+let communicationSchemaCapsCache = {
+  loadedAt: 0,
+  value: COMMUNICATION_SCHEMA_CAPS_DEFAULT,
+};
 const COMMUNICATION_EMAIL_FROM_ADDRESS =
   String(process.env.SMTP_FROM_PROMOTIONS || process.env.SMTP_FROM_COMMUNICATIONS || "promociones@masterfadeapp.com")
     .trim();
@@ -349,6 +359,64 @@ function normalizeCommunicationExclusionsSnapshot(rawValue) {
   };
 }
 
+async function getCommunicationSchemaCapabilities(client) {
+  const now = Date.now();
+  if (now - communicationSchemaCapsCache.loadedAt < COMMUNICATION_SCHEMA_CAPS_CACHE_MS) {
+    return communicationSchemaCapsCache.value;
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT table_name, column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND (
+          (table_name = 'comunicaciones_campanias' AND column_name IN ('exclusiones_snapshot'))
+          OR (table_name = 'clientes' AND column_name IN ('acepta_terminos_at', 'consentimiento_marketing_at'))
+        )
+    `
+  );
+
+  const found = new Set(rows.map((row) => `${row.table_name}.${row.column_name}`));
+  const capabilities = {
+    hasCampaignExclusionsSnapshot: found.has("comunicaciones_campanias.exclusiones_snapshot"),
+    hasClientAceptaTerminosAt: found.has("clientes.acepta_terminos_at"),
+    hasClientConsentimientoMarketingAt: found.has("clientes.consentimiento_marketing_at"),
+  };
+
+  communicationSchemaCapsCache = {
+    loadedAt: now,
+    value: capabilities,
+  };
+  return capabilities;
+}
+
+function buildCommunicationCampaignSelectColumns(schemaCaps = COMMUNICATION_SCHEMA_CAPS_DEFAULT) {
+  return [
+    "id_campania",
+    "tipo_campania",
+    "canal",
+    "nombre_interno",
+    "asunto",
+    "contenido_texto",
+    "observaciones",
+    "estado",
+    "programada_para",
+    "enviada_at",
+    "finalizada_at",
+    "total_destinatarios",
+    "total_pendientes",
+    "total_enviados",
+    "total_fallidos",
+    "total_omitidos",
+    schemaCaps.hasCampaignExclusionsSnapshot ? "exclusiones_snapshot" : "NULL::jsonb AS exclusiones_snapshot",
+    "creada_por",
+    "actualizada_por",
+    "created_at",
+    "updated_at",
+  ].join(",\n        ");
+}
+
 function mapCommunicationCampaignRow(row) {
   return {
     id_campania: row.id_campania,
@@ -524,31 +592,12 @@ async function listCommunicationCampaigns(client, rawQuery = {}) {
   };
 }
 
-async function getCommunicationCampaignById(client, idCampania) {
+async function getCommunicationCampaignById(client, idCampania, schemaCaps = null) {
+  const capabilities = schemaCaps || await getCommunicationSchemaCapabilities(client);
   const { rows } = await client.query(
     `
       SELECT
-        id_campania,
-        tipo_campania,
-        canal,
-        nombre_interno,
-        asunto,
-        contenido_texto,
-        observaciones,
-        estado,
-        programada_para,
-        enviada_at,
-        finalizada_at,
-        total_destinatarios,
-        total_pendientes,
-        total_enviados,
-        total_fallidos,
-        total_omitidos,
-        exclusiones_snapshot,
-        creada_por,
-        actualizada_por,
-        created_at,
-        updated_at
+        ${buildCommunicationCampaignSelectColumns(capabilities)}
       FROM public.comunicaciones_campanias
       WHERE id_campania = $1::uuid
         AND deleted_at IS NULL
@@ -560,30 +609,11 @@ async function getCommunicationCampaignById(client, idCampania) {
 }
 
 async function getCommunicationCampaignByIdForUpdate(client, idCampania) {
+  const capabilities = await getCommunicationSchemaCapabilities(client);
   const { rows } = await client.query(
     `
       SELECT
-        id_campania,
-        tipo_campania,
-        canal,
-        nombre_interno,
-        asunto,
-        contenido_texto,
-        observaciones,
-        estado,
-        programada_para,
-        enviada_at,
-        finalizada_at,
-        total_destinatarios,
-        total_pendientes,
-        total_enviados,
-        total_fallidos,
-        total_omitidos,
-        exclusiones_snapshot,
-        creada_por,
-        actualizada_por,
-        created_at,
-        updated_at
+        ${buildCommunicationCampaignSelectColumns(capabilities)}
       FROM public.comunicaciones_campanias
       WHERE id_campania = $1::uuid
         AND deleted_at IS NULL
@@ -636,7 +666,13 @@ function resolveCampaignTypeForEligibility(rawType) {
   return normalizeCommunicationCampaignType(rawType ?? COMMUNICATION_FIXED_TYPE);
 }
 
-function buildEligibilityEvaluationCte() {
+function buildEligibilityEvaluationCte(schemaCaps = COMMUNICATION_SCHEMA_CAPS_DEFAULT) {
+  const aceptaTerminosAtSelect = schemaCaps.hasClientAceptaTerminosAt
+    ? "c.acepta_terminos_at,"
+    : "NULL::timestamptz AS acepta_terminos_at,";
+  const consentimientoMarketingAtSelect = schemaCaps.hasClientConsentimientoMarketingAt
+    ? "c.consentimiento_marketing_at,"
+    : "NULL::timestamptz AS consentimiento_marketing_at,";
   return `
     WITH base_clientes AS (
       SELECT
@@ -645,9 +681,9 @@ function buildEligibilityEvaluationCte() {
         c.id_usuario,
         c.estado AS cliente_activo,
         c.acepta_terminos,
-        c.acepta_terminos_at,
+        ${aceptaTerminosAtSelect}
         c.consentimiento_marketing,
-        c.consentimiento_marketing_at,
+        ${consentimientoMarketingAtSelect}
         p.nombres,
         p.apellidos,
         correo_principal.direccion_correo::text AS correo_destino
@@ -694,6 +730,8 @@ function buildEligibilityEvaluationCte() {
 }
 
 async function getCommunicationEligibilitySummaryPayload(client, campaignType, options = {}) {
+  void campaignType;
+  const schemaCaps = await getCommunicationSchemaCapabilities(client);
   const limitElegibles = Number.isFinite(Number(options.limit_elegibles))
     ? Math.max(1, Math.min(100, Number(options.limit_elegibles)))
     : 20;
@@ -703,7 +741,7 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
 
   const summaryResult = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         COUNT(*)::int AS total_clientes_evaluados,
         COUNT(*) FILTER (WHERE estado_elegibilidad = 'elegible')::int AS total_elegibles,
@@ -713,13 +751,12 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
         COUNT(*) FILTER (WHERE estado_elegibilidad = 'sin_aceptacion_terminos')::int AS excluidos_sin_aceptacion_terminos,
         COUNT(*) FILTER (WHERE estado_elegibilidad = 'sin_consentimiento_marketing')::int AS excluidos_sin_consentimiento_marketing
       FROM resultado
-    `,
-    [campaignType]
+    `
   );
 
   const reasonsResult = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         estado_elegibilidad AS motivo,
         COUNT(*)::int AS total
@@ -727,13 +764,12 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
       WHERE estado_elegibilidad <> 'elegible'
       GROUP BY estado_elegibilidad
       ORDER BY total DESC, estado_elegibilidad ASC
-    `,
-    [campaignType]
+    `
   );
 
   const elegiblesPreviewResult = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         id_cliente,
         concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
@@ -741,14 +777,14 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
       FROM resultado
       WHERE estado_elegibilidad = 'elegible'
       ORDER BY nombre_cliente ASC NULLS LAST, id_cliente ASC
-      LIMIT $2::int
+      LIMIT $1::int
     `,
-    [campaignType, limitElegibles]
+    [limitElegibles]
   );
 
   const excluidosPreviewResult = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         id_cliente,
         concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
@@ -757,9 +793,9 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
       FROM resultado
       WHERE estado_elegibilidad <> 'elegible'
       ORDER BY motivo_exclusion ASC, nombre_cliente ASC NULLS LAST, id_cliente ASC
-      LIMIT $2::int
+      LIMIT $1::int
     `,
-    [campaignType, limitExcluidos]
+    [limitExcluidos]
   );
 
   const summary = summaryResult.rows[0] || {};
@@ -792,6 +828,8 @@ async function getCommunicationEligibilitySummaryPayload(client, campaignType, o
 }
 
 async function listCommunicationEligibilityRecipients(client, campaignType, options = {}) {
+  void campaignType;
+  const schemaCaps = await getCommunicationSchemaCapabilities(client);
   const estado = String(options.estado || "elegible").trim().toLowerCase();
   if (!COMMUNICATION_ELIGIBILITY_STATES.includes(estado)) {
     throw new AppError(400, "estado de elegibilidad invalido", {
@@ -815,7 +853,7 @@ async function listCommunicationEligibilityRecipients(client, campaignType, opti
 
   const listResult = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         id_cliente,
         concat_ws(' ', NULLIF(btrim(nombres), ''), NULLIF(btrim(apellidos), '')) AS nombre_cliente,
@@ -823,29 +861,29 @@ async function listCommunicationEligibilityRecipients(client, campaignType, opti
         estado_elegibilidad AS motivo_exclusion
       FROM resultado
       WHERE (
-        ($2::text = 'elegible' AND estado_elegibilidad = 'elegible')
-        OR ($2::text = 'excluido' AND estado_elegibilidad <> 'elegible')
+        ($1::text = 'elegible' AND estado_elegibilidad = 'elegible')
+        OR ($1::text = 'excluido' AND estado_elegibilidad <> 'elegible')
       )
-        AND ($3::text IS NULL OR estado_elegibilidad = $3::text)
+        AND ($2::text IS NULL OR estado_elegibilidad = $2::text)
       ORDER BY nombre_cliente ASC NULLS LAST, id_cliente ASC
-      LIMIT $4::int
-      OFFSET $5::int
+      LIMIT $3::int
+      OFFSET $4::int
     `,
-    [campaignType, estado, reasonFilter, limit, offset]
+    [estado, reasonFilter, limit, offset]
   );
 
   const totalResult = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT COUNT(*)::int AS total
       FROM resultado
       WHERE (
-        ($2::text = 'elegible' AND estado_elegibilidad = 'elegible')
-        OR ($2::text = 'excluido' AND estado_elegibilidad <> 'elegible')
+        ($1::text = 'elegible' AND estado_elegibilidad = 'elegible')
+        OR ($1::text = 'excluido' AND estado_elegibilidad <> 'elegible')
       )
-        AND ($3::text IS NULL OR estado_elegibilidad = $3::text)
+        AND ($2::text IS NULL OR estado_elegibilidad = $2::text)
     `,
-    [campaignType, estado, reasonFilter]
+    [estado, reasonFilter]
   );
 
   return {
@@ -891,9 +929,11 @@ function parseExcludedClientIds(value) {
 }
 
 async function listEligibleRecipientsForScheduling(client, campaignType) {
+  void campaignType;
+  const schemaCaps = await getCommunicationSchemaCapabilities(client);
   const { rows } = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         id_cliente,
         id_persona,
@@ -903,8 +943,7 @@ async function listEligibleRecipientsForScheduling(client, campaignType) {
       FROM resultado
       WHERE estado_elegibilidad = 'elegible'
       ORDER BY id_cliente ASC
-    `,
-    [campaignType]
+    `
   );
   return rows.map((row) => ({
     id_cliente: row.id_cliente,
@@ -916,9 +955,11 @@ async function listEligibleRecipientsForScheduling(client, campaignType) {
 }
 
 async function listExcludedRecipientsForSnapshot(client, campaignType) {
+  void campaignType;
+  const schemaCaps = await getCommunicationSchemaCapabilities(client);
   const { rows } = await client.query(
     `
-      ${buildEligibilityEvaluationCte()}
+      ${buildEligibilityEvaluationCte(schemaCaps)}
       SELECT
         id_cliente,
         id_persona,
@@ -928,8 +969,7 @@ async function listExcludedRecipientsForSnapshot(client, campaignType) {
       FROM resultado
       WHERE estado_elegibilidad <> 'elegible'
       ORDER BY estado_elegibilidad ASC, nombre_cliente ASC NULLS LAST, id_cliente ASC
-    `,
-    [campaignType]
+    `
   );
 
   return rows.map((row) => ({
@@ -1719,6 +1759,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
+        const schemaCaps = await getCommunicationSchemaCapabilities(client);
         const actorUserId = request.claims?.user?.id_usuario || request.auth?.sub;
         if (!actorUserId) {
           throw new AppError(401, "No se pudo resolver el usuario autenticado para crear la campania", {
@@ -1743,27 +1784,7 @@ export default async function adminConfiguracionRoutes(app) {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $8::uuid, NOW())
             RETURNING
-              id_campania,
-              tipo_campania,
-              canal,
-              nombre_interno,
-              asunto,
-              contenido_texto,
-              observaciones,
-              estado,
-              programada_para,
-              enviada_at,
-              finalizada_at,
-              total_destinatarios,
-              total_pendientes,
-              total_enviados,
-              total_fallidos,
-              total_omitidos,
-              exclusiones_snapshot,
-              creada_por,
-              actualizada_por,
-              created_at,
-              updated_at
+              ${buildCommunicationCampaignSelectColumns(schemaCaps)}
           `,
           [
             values.tipo_campania,
@@ -1820,7 +1841,8 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
-        const row = await getCommunicationCampaignById(client, request.params.id);
+        const schemaCaps = await getCommunicationSchemaCapabilities(client);
+        const row = await getCommunicationCampaignById(client, request.params.id, schemaCaps);
         if (!row) {
           throw new AppError(404, "La campania indicada no existe o fue eliminada", {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
@@ -1873,6 +1895,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
+        const schemaCaps = await getCommunicationSchemaCapabilities(client);
         const actorUserId = request.claims?.user?.id_usuario || request.auth?.sub;
         if (!actorUserId) {
           throw new AppError(401, "No se pudo resolver el usuario autenticado para editar la campania", {
@@ -1881,7 +1904,7 @@ export default async function adminConfiguracionRoutes(app) {
         }
 
         await client.query("BEGIN");
-        const currentRow = await getCommunicationCampaignById(client, request.params.id);
+        const currentRow = await getCommunicationCampaignById(client, request.params.id, schemaCaps);
         if (!currentRow) {
           throw new AppError(404, "La campania indicada no existe o fue eliminada", {
             code: "CONFIG_COMM_CAMPAIGN_NOT_FOUND",
@@ -1911,27 +1934,7 @@ export default async function adminConfiguracionRoutes(app) {
             WHERE id_campania = $1::uuid
               AND deleted_at IS NULL
             RETURNING
-              id_campania,
-              tipo_campania,
-              canal,
-              nombre_interno,
-              asunto,
-              contenido_texto,
-              observaciones,
-              estado,
-              programada_para,
-              enviada_at,
-              finalizada_at,
-              total_destinatarios,
-              total_pendientes,
-              total_enviados,
-              total_fallidos,
-              total_omitidos,
-              exclusiones_snapshot,
-              creada_por,
-              actualizada_por,
-              created_at,
-              updated_at
+              ${buildCommunicationCampaignSelectColumns(schemaCaps)}
           `,
           [request.params.id, values.tipo_campania, values.nombre_interno, values.asunto, values.contenido_texto, values.observaciones, actorUserId]
         );
@@ -2116,6 +2119,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
+        const schemaCaps = await getCommunicationSchemaCapabilities(client);
         const actorUserId = request.claims?.user?.id_usuario || request.auth?.sub;
         if (!actorUserId) {
           throw new AppError(401, "No se pudo resolver el usuario autenticado para programar la campania", {
@@ -2270,7 +2274,7 @@ export default async function adminConfiguracionRoutes(app) {
               total_enviados = 0,
               total_fallidos = 0,
               total_omitidos = $4::int,
-              exclusiones_snapshot = $5::jsonb,
+              ${schemaCaps.hasCampaignExclusionsSnapshot ? "exclusiones_snapshot = $5::jsonb," : ""}
               actualizada_por = $6::uuid,
               updated_at = NOW()
             WHERE id_campania = $1::uuid
@@ -2284,7 +2288,7 @@ export default async function adminConfiguracionRoutes(app) {
               total_enviados,
               total_fallidos,
               total_omitidos,
-              exclusiones_snapshot
+              ${schemaCaps.hasCampaignExclusionsSnapshot ? "exclusiones_snapshot" : "NULL::jsonb AS exclusiones_snapshot"}
           `,
           [
             campaign.id_campania,

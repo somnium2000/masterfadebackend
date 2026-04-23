@@ -552,12 +552,28 @@ export async function getBarberById(client, empleadoId) {
         e.id_sucursal,
         s.nombre_sucursal,
         p.nombres,
-        p.apellidos
+        p.apellidos,
+        bpp.alias_publico,
+        bpp.resumen_publico,
+        COALESCE(bpp.certificaciones_titulos, ARRAY[]::text[]) AS certificaciones_titulos,
+        COALESCE(bpp.visible_en_landing, FALSE) AS visible_en_landing,
+        p.foto_perfil_path,
+        sa.updated_at AS foto_perfil_updated_at,
+        CASE
+          WHEN sa.visibility = 'public' THEN COALESCE(sa.public_url, NULL)
+          ELSE NULL
+        END AS foto_perfil_public_url
       FROM public.empleados e
       JOIN public.personas p
         ON p.id_persona = e.id_persona
       JOIN public.sucursales s
         ON s.id_sucursal = e.id_sucursal
+      LEFT JOIN public.barberos_perfiles_publicos bpp
+        ON bpp.id_empleado = e.id_empleado
+        AND bpp.deleted_at IS NULL
+      LEFT JOIN public.storage_assets sa
+        ON sa.id_asset = p.foto_perfil_asset_id
+        AND sa.deleted_at IS NULL
       WHERE e.id_empleado = $1::uuid
         AND e.deleted_at IS NULL
         AND e.estado IS TRUE
@@ -587,12 +603,28 @@ export async function listBarbersForBranch(client, branchId) {
         e.id_sucursal,
         s.nombre_sucursal,
         p.nombres,
-        p.apellidos
+        p.apellidos,
+        bpp.alias_publico,
+        bpp.resumen_publico,
+        COALESCE(bpp.certificaciones_titulos, ARRAY[]::text[]) AS certificaciones_titulos,
+        COALESCE(bpp.visible_en_landing, FALSE) AS visible_en_landing,
+        p.foto_perfil_path,
+        sa.updated_at AS foto_perfil_updated_at,
+        CASE
+          WHEN sa.visibility = 'public' THEN COALESCE(sa.public_url, NULL)
+          ELSE NULL
+        END AS foto_perfil_public_url
       FROM public.empleados e
       JOIN public.personas p
         ON p.id_persona = e.id_persona
       JOIN public.sucursales s
         ON s.id_sucursal = e.id_sucursal
+      LEFT JOIN public.barberos_perfiles_publicos bpp
+        ON bpp.id_empleado = e.id_empleado
+        AND bpp.deleted_at IS NULL
+      LEFT JOIN public.storage_assets sa
+        ON sa.id_asset = p.foto_perfil_asset_id
+        AND sa.deleted_at IS NULL
       WHERE e.id_sucursal = $1::uuid
         AND e.deleted_at IS NULL
         AND e.estado IS TRUE
@@ -610,6 +642,13 @@ export async function listBarbersForBranch(client, branchId) {
 function mapBarberRow(row) {
   const nombres = String(row.nombres || "").trim();
   const apellidos = String(row.apellidos || "").trim();
+  const aliasPublico = String(row.alias_publico || "").trim() || null;
+  const resumenPublico = String(row.resumen_publico || "").trim() || null;
+  const certificaciones = Array.isArray(row.certificaciones_titulos)
+    ? row.certificaciones_titulos
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+    : [];
   return {
     id_empleado: row.id_empleado,
     id_sucursal: row.id_sucursal,
@@ -617,6 +656,13 @@ function mapBarberRow(row) {
     nombres,
     apellidos,
     nombre_completo: `${nombres} ${apellidos}`.trim() || "Sin nombre",
+    alias_publico: aliasPublico,
+    resumen_publico: resumenPublico,
+    certificaciones_titulos: certificaciones,
+    visible_en_landing: Boolean(row.visible_en_landing),
+    foto_perfil_url: row.foto_perfil_public_url ?? null,
+    foto_perfil_updated_at: row.foto_perfil_updated_at ?? null,
+    foto_perfil_path: row.foto_perfil_path ?? null,
   };
 }
 
@@ -1535,6 +1581,14 @@ export function mapDayAvailabilityForResponse(entries) {
           apellidos: entry.barbero_autoasignado.apellidos,
           id_sucursal: entry.barbero_autoasignado.id_sucursal,
           nombre_sucursal: entry.barbero_autoasignado.nombre_sucursal,
+          alias_publico: entry.barbero_autoasignado.alias_publico ?? null,
+          resumen_publico: entry.barbero_autoasignado.resumen_publico ?? null,
+          certificaciones_titulos: Array.isArray(entry.barbero_autoasignado.certificaciones_titulos)
+            ? entry.barbero_autoasignado.certificaciones_titulos
+            : [],
+          visible_en_landing: Boolean(entry.barbero_autoasignado.visible_en_landing),
+          foto_perfil_url: entry.barbero_autoasignado.foto_perfil_url ?? null,
+          foto_perfil_updated_at: entry.barbero_autoasignado.foto_perfil_updated_at ?? null,
         }
       : null,
   }));
@@ -1548,6 +1602,12 @@ export function mapBarbersForResponse(barbers) {
     nombre_completo: barber.nombre_completo,
     nombres: barber.nombres,
     apellidos: barber.apellidos,
+    alias_publico: barber.alias_publico ?? null,
+    resumen_publico: barber.resumen_publico ?? null,
+    certificaciones_titulos: Array.isArray(barber.certificaciones_titulos) ? barber.certificaciones_titulos : [],
+    visible_en_landing: Boolean(barber.visible_en_landing),
+    foto_perfil_url: barber.foto_perfil_url ?? null,
+    foto_perfil_updated_at: barber.foto_perfil_updated_at ?? null,
   }));
 }
 

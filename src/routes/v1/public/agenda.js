@@ -50,8 +50,27 @@ const barberSchema = {
     nombre_completo: { type: "string" },
     nombres: { type: "string" },
     apellidos: { type: "string" },
+    alias_publico: { type: ["string", "null"] },
+    resumen_publico: { type: ["string", "null"] },
+    certificaciones_titulos: { type: "array", items: { type: "string" } },
+    visible_en_landing: { type: "boolean" },
+    foto_perfil_url: { type: ["string", "null"] },
+    foto_perfil_updated_at: { type: ["string", "null"], format: "date-time" },
   },
-  required: ["id_empleado", "id_sucursal", "nombre_sucursal", "nombre_completo", "nombres", "apellidos"],
+  required: [
+    "id_empleado",
+    "id_sucursal",
+    "nombre_sucursal",
+    "nombre_completo",
+    "nombres",
+    "apellidos",
+    "alias_publico",
+    "resumen_publico",
+    "certificaciones_titulos",
+    "visible_en_landing",
+    "foto_perfil_url",
+    "foto_perfil_updated_at",
+  ],
   additionalProperties: false,
 };
 
@@ -330,7 +349,9 @@ export default async function publicAgendaRoutes(app) {
           return sendOk(reply, {
             fecha,
             id_barbero: idBarbero,
-            barbero: availability.barbero_autoasignado,
+            barbero: availability.barbero_autoasignado
+              ? mapBarbersForResponse([availability.barbero_autoasignado])[0]
+              : null,
             horarios: mapSlotsForResponse(availability.slots, {
               duracion_visible_min: serviceSelection.duracion_total_min,
             }),
@@ -349,7 +370,7 @@ export default async function publicAgendaRoutes(app) {
         return sendOk(reply, {
           fecha,
           id_barbero: result?.barber?.id_empleado ?? null,
-          barbero: result?.barber ?? null,
+          barbero: result?.barber ? mapBarbersForResponse([result.barber])[0] : null,
           horarios: mapSlotsForResponse(result?.slots ?? [], {
             duracion_visible_min: serviceSelection.duracion_total_min,
           }),

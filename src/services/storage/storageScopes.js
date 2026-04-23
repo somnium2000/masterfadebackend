@@ -73,7 +73,7 @@ export const STORAGE_SCOPE_REGISTRY = Object.freeze({
     entityType: "barbero",
     variant: "perfil",
     requiresBranchId: true,
-    requiresEntityId: true,
+    requiresEntityId: false,
     allowedRoles: ["super_admin", "admin"],
     allowedMimeTypes: ["image/jpeg", "image/png", "image/webp"],
     maxBytes: 5 * MB,

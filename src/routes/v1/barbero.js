@@ -22,6 +22,11 @@ const BARBER_PROFILE_SQL = `
     p.observaciones,
     p.foto_perfil_asset_id,
     p.foto_perfil_path,
+    sa.updated_at AS foto_perfil_updated_at,
+    CASE
+      WHEN sa.visibility = 'public' THEN COALESCE(sa.public_url, NULL)
+      ELSE NULL
+    END AS foto_perfil_url,
     COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo_principal,
     e.id_sucursal,
     s.nombre_sucursal,
@@ -29,6 +34,10 @@ const BARBER_PROFILE_SQL = `
     e.salario_base,
     COALESCE(e.estado, TRUE) AS estado_laboral,
     COALESCE(e.es_barbero, FALSE) AS es_barbero,
+    bpp.alias_publico,
+    bpp.resumen_publico,
+    COALESCE(bpp.certificaciones_titulos, ARRAY[]::text[]) AS certificaciones_titulos,
+    COALESCE(bpp.visible_en_landing, FALSE) AS visible_en_landing,
     COALESCE(u.estado, TRUE) AS estado_usuario,
     COALESCE(u.estado_acceso, 'pendiente_password') AS estado_acceso,
     u.credenciales_completadas_at,
@@ -50,6 +59,12 @@ const BARBER_PROFILE_SQL = `
     ON au.id = u.id_usuario
   LEFT JOIN public.sucursales s
     ON s.id_sucursal = e.id_sucursal
+  LEFT JOIN public.barberos_perfiles_publicos bpp
+    ON bpp.id_empleado = e.id_empleado
+    AND bpp.deleted_at IS NULL
+  LEFT JOIN public.storage_assets sa
+    ON sa.id_asset = p.foto_perfil_asset_id
+    AND sa.deleted_at IS NULL
   LEFT JOIN LATERAL (
     SELECT c.direccion_correo::text AS email
     FROM public.correos c
@@ -251,6 +266,8 @@ function mapBarberProfile(row, fotoPerfilSignedUrl) {
     observaciones: row.observaciones ?? null,
     foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
     foto_perfil_path: row.foto_perfil_path ?? null,
+    foto_perfil_updated_at: row.foto_perfil_updated_at ?? null,
+    foto_perfil_url: row.foto_perfil_url ?? null,
     foto_perfil_signed_url: fotoPerfilSignedUrl ?? null,
     correo_principal: row.correo_principal ?? null,
     id_sucursal: row.id_sucursal ?? null,
@@ -259,6 +276,10 @@ function mapBarberProfile(row, fotoPerfilSignedUrl) {
     salario_base: row.salario_base == null ? null : Number(row.salario_base),
     estado_laboral: Boolean(row.estado_laboral),
     es_barbero: Boolean(row.es_barbero),
+    alias_publico: row.alias_publico ?? null,
+    resumen_publico: row.resumen_publico ?? null,
+    certificaciones_titulos: Array.isArray(row.certificaciones_titulos) ? row.certificaciones_titulos : [],
+    visible_en_landing: Boolean(row.visible_en_landing),
     estado_usuario: Boolean(row.estado_usuario),
     estado_acceso: row.estado_acceso ?? "pendiente_password",
     credenciales_completadas_at: row.credenciales_completadas_at ?? null,
@@ -304,22 +325,15 @@ async function buildBarberProfilePayload(app, request, userId) {
   ]);
 
   let fotoPerfilSignedUrl = null;
-  if (baseProfile.foto_perfil_asset_id) {
+  if (!baseProfile.foto_perfil_url && baseProfile.foto_perfil_asset_id) {
     try {
       const readUrl = await buildAssetReadUrl(app, {
         claims: request.claims,
         assetId: baseProfile.foto_perfil_asset_id,
       });
       fotoPerfilSignedUrl = readUrl?.url ?? null;
-    } catch (error) {
-      request.log.warn(
-        {
-          err: error,
-          id_empleado: baseProfile.id_empleado,
-          id_asset: baseProfile.foto_perfil_asset_id,
-        },
-        "No se pudo generar la signed URL de la foto del barbero"
-      );
+    } catch {
+      fotoPerfilSignedUrl = null;
     }
   }
 
