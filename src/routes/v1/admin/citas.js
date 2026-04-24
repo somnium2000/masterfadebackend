@@ -121,6 +121,7 @@ function selectParams(values) {
     hold_duracion_min: Number(values.hold_duracion_min?.valor_numero ?? 5),
     no_show_min: Number(values.no_show_min?.valor_numero ?? 10),
     agenda_buffer_global_min: Number(values.agenda_buffer_global_min?.valor_numero ?? 0),
+    agenda_min_servicio_vendible_min: Number(values.agenda_min_servicio_vendible_min?.valor_numero ?? 10),
     permitir_acompanantes: Boolean(values.permitir_acompanantes?.valor_booleano ?? false),
     pago_total_obligatorio: Boolean(values.pago_total_obligatorio?.valor_booleano ?? true),
     simulacion_sin_pago: Boolean(values.simulacion_sin_pago?.valor_booleano),
@@ -2351,6 +2352,13 @@ export default async function adminCitasRoutes(app) {
           "Buffer global en minutos entre citas",
         ]);
       }
+      if (request.body?.agenda_min_servicio_vendible_min !== undefined) {
+        numericUpdates.push([
+          "agenda_min_servicio_vendible_min",
+          Number(request.body.agenda_min_servicio_vendible_min),
+          "Duracion minima vendible en minutos para evitar huecos huerfanos",
+        ]);
+      }
       if (request.body?.permitir_acompanantes !== undefined) {
         booleanUpdates.push([
           "permitir_acompanantes",
@@ -2396,10 +2404,23 @@ export default async function adminCitasRoutes(app) {
       }
 
       await dbClient.query("BEGIN");
+      const numericValidationRules = {
+        hold_duracion_min: { min: 1, max: 120 },
+        no_show_min: { min: 1, max: 240 },
+        agenda_buffer_global_min: { min: 0, max: 120 },
+        agenda_min_servicio_vendible_min: { min: 1, max: 240 },
+      };
       for (const [clave, valor, descripcion] of numericUpdates) {
-        if (!Number.isFinite(valor) || valor <= 0) {
-          throw new AppError(400, `${clave} debe ser un numero positivo`, {
+        const rule = numericValidationRules[clave] || { min: 1, max: 9999 };
+        if (
+          !Number.isFinite(valor)
+          || !Number.isInteger(valor)
+          || valor < rule.min
+          || valor > rule.max
+        ) {
+          throw new AppError(400, `${clave} debe estar entre ${rule.min} y ${rule.max}`, {
             code: "ADMIN_CITAS_PARAMS_INVALID",
+            details: { clave, min: rule.min, max: rule.max },
           });
         }
 

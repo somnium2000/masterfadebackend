@@ -22,6 +22,18 @@ function assertUuid(value, field = "id") {
   return normalized;
 }
 
+const PUBLIC_PAGOS_SAFE_DETAIL_KEYS = new Set(["field"]);
+
+function sanitizePublicPagosErrorDetails(rawDetails) {
+  if (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails)) return undefined;
+  const safeDetails = {};
+  for (const [key, value] of Object.entries(rawDetails)) {
+    if (!PUBLIC_PAGOS_SAFE_DETAIL_KEYS.has(key) || value == null) continue;
+    safeDetails[key] = String(value).trim().slice(0, 120);
+  }
+  return Object.keys(safeDetails).length ? safeDetails : undefined;
+}
+
 function escapeHtml(input) {
   return String(input || "")
     .replace(/&/g, "&amp;")
@@ -712,7 +724,16 @@ export default async function publicPagosRoutes(app) {
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
       if (error instanceof AppError) {
-        return sendError(reply, error.statusCode, error.message, { code: error.code, details: error.details, requestId: request.id });
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          "Public pagos create intent handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
       }
       request.log.error({ err: error }, "No se pudo crear intent publico");
       return sendError(reply, 500, "No se pudo iniciar el pago", { code: "PUBLIC_PAGOS_CREATE_INTENT_ERROR", requestId: request.id });
@@ -778,7 +799,16 @@ export default async function publicPagosRoutes(app) {
       });
     } catch (error) {
       if (error instanceof AppError) {
-        return sendError(reply, error.statusCode, error.message, { code: error.code, details: error.details, requestId: request.id });
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          "Public pagos status handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
       }
       request.log.error({ err: error }, "No se pudo consultar estado de pago publico");
       return sendError(reply, 500, "No se pudo consultar el estado del pago", { code: "PUBLIC_PAGOS_STATUS_ERROR", requestId: request.id });
@@ -901,7 +931,16 @@ export default async function publicPagosRoutes(app) {
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
       if (error instanceof AppError) {
-        return sendError(reply, error.statusCode, error.message, { code: error.code, details: error.details, requestId: request.id });
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          "Public pagos mock complete handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
       }
       request.log.error({ err: error }, "No se pudo completar pago mock");
       return sendError(reply, 500, "No se pudo completar el pago", { code: "PUBLIC_PAGOS_MOCK_COMPLETE_ERROR", requestId: request.id });

@@ -5,6 +5,7 @@ export const AUTH_CLAIMS_SQL = `
       u.id_persona,
       p.nombres,
       p.apellidos,
+      p.telefono_principal,
       COALESCE(NULLIF(c.direccion_correo::text, ''), NULLIF(au.email::text, '')) AS email
     FROM public.usuarios u
     LEFT JOIN public.personas p
@@ -76,6 +77,7 @@ export const AUTH_CLAIMS_SQL = `
     bu.email,
     bu.nombres,
     bu.apellidos,
+    bu.telefono_principal,
     rs.roles,
     rs.branch_ids,
     es.empresa_id,
@@ -107,6 +109,7 @@ export async function getAuthClaims(app, userId) {
       email: row.email ?? null,
       nombres: row.nombres ?? null,
       apellidos: row.apellidos ?? null,
+      telefono_principal: row.telefono_principal ?? null,
     },
     roles: Array.isArray(row.roles) ? row.roles : [],
     branch_ids: Array.isArray(row.branch_ids) ? row.branch_ids : [],

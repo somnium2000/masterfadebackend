@@ -5,11 +5,14 @@ import {
 import { sendOk } from "../../../utils/response.js";
 import {
   assertUuid,
+  buildCuratedSlotExposure,
+  buildCuratedSlotExposureDebug,
   buildDayAvailability,
   expireStaleAppointmentReservations,
   findFirstAvailableBarber,
   getBarberScheduleBounds,
   getBookingSelectionDetails,
+  getMinSellableServiceMinutes,
   listAvailabilityByDateRange,
   listBarbersForBranch,
   mapBarbersForResponse,
@@ -108,11 +111,34 @@ const slotSchema = {
   additionalProperties: false,
 };
 
+const curatedPeriodSchema = {
+  type: "object",
+  properties: {
+    recommended: {
+      anyOf: [slotSchema, { type: "null" }],
+    },
+    alternatives: { type: "array", items: slotSchema },
+    overflow: { type: "array", items: slotSchema },
+    has_more: { type: "boolean" },
+    total: { type: "integer" },
+  },
+  required: ["recommended", "alternatives", "overflow", "has_more", "total"],
+  additionalProperties: false,
+};
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
+    request.log.warn(
+      {
+        requestId: request.id,
+        statusCode: error.statusCode,
+        code: error.code,
+        details: error.details,
+      },
+      "Public agenda handled AppError"
+    );
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
-      details: error.details,
       requestId: request.id,
     });
   }
@@ -122,6 +148,23 @@ function sendHandled(reply, request, error, message, code) {
     code,
     requestId: request.id,
   });
+}
+
+function canExposeSlotDebug(request) {
+  const askDebug = String(request.query?.debug || "").trim().toLowerCase();
+  if (!["1", "true", "yes"].includes(askDebug)) return false;
+  const roles = Array.isArray(request.claims?.roles) ? request.claims.roles : [];
+  return roles.includes("admin") || roles.includes("super_admin") || roles.includes("barbero");
+}
+
+function mapDiscardedReasonSummary(discarded) {
+  const counts = new Map();
+  (Array.isArray(discarded) ? discarded : []).forEach((entry) => {
+    const code = String(entry?.reason || "").trim();
+    if (!code) return;
+    counts.set(code, (counts.get(code) || 0) + 1);
+  });
+  return Array.from(counts.entries()).map(([code, count]) => ({ code, count }));
 }
 
 export default async function publicAgendaRoutes(app) {
@@ -278,6 +321,7 @@ export default async function publicAgendaRoutes(app) {
             id_paquete: { type: "string", format: "uuid" },
             fecha: { type: "string", format: "date" },
             id_barbero: { type: "string", format: "uuid" },
+            debug: { type: "boolean" },
           },
           additionalProperties: false,
         },
@@ -298,22 +342,35 @@ export default async function publicAgendaRoutes(app) {
                     ],
                   },
                   horarios: { type: "array", items: slotSchema },
+                  horarios_curados: {
+                    type: "object",
+                    properties: {
+                      manana: curatedPeriodSchema,
+                      tarde: curatedPeriodSchema,
+                      noche: curatedPeriodSchema,
+                    },
+                    required: ["manana", "tarde", "noche"],
+                    additionalProperties: false,
+                  },
                   hora_inicio: { type: ["string", "null"] },
                   hora_fin: { type: ["string", "null"] },
                   duracion_total_min: { type: "integer" },
                   buffer_total_min: { type: "integer" },
                   slot_step_min: { type: "integer" },
+                  debug: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
                 },
                 required: [
                   "fecha",
                   "id_barbero",
                   "barbero",
                   "horarios",
+                  "horarios_curados",
                   "hora_inicio",
                   "hora_fin",
                   "duracion_total_min",
                   "buffer_total_min",
                   "slot_step_min",
+                  "debug",
                 ],
                 additionalProperties: false,
               },
@@ -335,6 +392,8 @@ export default async function publicAgendaRoutes(app) {
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const fecha = parseDateOnly(request.query?.fecha, "fecha");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
+        const minSellableDurationMin = await getMinSellableServiceMinutes(app.db);
+        const includeDebug = canExposeSlotDebug(request);
         const serviceSelection = await getBookingSelectionDetails(app.db, {
           id_sucursal: idSucursal,
           selection_type: request.query?.selection_type,
@@ -345,40 +404,75 @@ export default async function publicAgendaRoutes(app) {
         const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
         if (idBarbero) {
-          const availability = await buildDayAvailability(app.db, idSucursal, serviceSelection, fecha, idBarbero);
+          const availability = await buildDayAvailability(app.db, idSucursal, serviceSelection, fecha, idBarbero, {
+            minSellableDurationMin,
+            includeDiscardReasons: includeDebug,
+          });
+          const horarios = mapSlotsForResponse(availability.slots, {
+            duracion_visible_min: serviceSelection.duracion_total_min,
+          });
+          const horariosCurados = buildCuratedSlotExposure(horarios, {
+            minSellableDurationMin,
+          });
+          const debugPayload = includeDebug
+            ? {
+                discarded_reason_codes: mapDiscardedReasonSummary(availability?.discarded_slots),
+                discarded_slots: Array.isArray(availability?.discarded_slots)
+                  ? availability.discarded_slots.slice(0, 120)
+                  : [],
+                curated_ranking: buildCuratedSlotExposureDebug(horarios, {
+                  minSellableDurationMin,
+                }),
+              }
+            : null;
           return sendOk(reply, {
             fecha,
             id_barbero: idBarbero,
             barbero: availability.barbero_autoasignado
               ? mapBarbersForResponse([availability.barbero_autoasignado])[0]
               : null,
-            horarios: mapSlotsForResponse(availability.slots, {
-              duracion_visible_min: serviceSelection.duracion_total_min,
-            }),
+            horarios,
+            horarios_curados: horariosCurados,
             hora_inicio: availability.hora_inicio ?? null,
             hora_fin: availability.hora_fin ?? null,
             duracion_total_min: serviceSelection.duracion_total_min,
             buffer_total_min: serviceSelection.buffer_total_min,
             slot_step_min: SLOT_INTERVAL_MINUTES,
+            debug: debugPayload,
           });
         }
 
-        const result = await findFirstAvailableBarber(app.db, idSucursal, fecha, serviceTotalMinutes);
+        const result = await findFirstAvailableBarber(app.db, idSucursal, fecha, serviceTotalMinutes, {
+          minSellableDurationMin,
+        });
         const bounds = result?.barber
           ? await getBarberScheduleBounds(app.db, result.barber.id_empleado, fecha)
           : { hora_inicio: null, hora_fin: null };
+        const horarios = mapSlotsForResponse(result?.slots ?? [], {
+          duracion_visible_min: serviceSelection.duracion_total_min,
+        });
+        const horariosCurados = buildCuratedSlotExposure(horarios, {
+          minSellableDurationMin,
+        });
+        const debugPayload = includeDebug
+          ? {
+              curated_ranking: buildCuratedSlotExposureDebug(horarios, {
+                minSellableDurationMin,
+              }),
+            }
+          : null;
         return sendOk(reply, {
           fecha,
           id_barbero: result?.barber?.id_empleado ?? null,
           barbero: result?.barber ? mapBarbersForResponse([result.barber])[0] : null,
-          horarios: mapSlotsForResponse(result?.slots ?? [], {
-            duracion_visible_min: serviceSelection.duracion_total_min,
-          }),
+          horarios,
+          horarios_curados: horariosCurados,
           hora_inicio: bounds.hora_inicio ?? null,
           hora_fin: bounds.hora_fin ?? null,
           duracion_total_min: serviceSelection.duracion_total_min,
           buffer_total_min: serviceSelection.buffer_total_min,
           slot_step_min: SLOT_INTERVAL_MINUTES,
+          debug: debugPayload,
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudieron consultar los horarios del dia", "PUBLIC_AGENDA_SLOTS_ERROR");
