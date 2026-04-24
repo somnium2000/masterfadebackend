@@ -6,6 +6,7 @@ import {
   expireStaleAppointmentReservations,
   getHoldDurationMinutes,
   getSystemParameters,
+  parseSinglePackageId,
   parseDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
@@ -123,11 +124,45 @@ function normalizePublicParams(paramsMap) {
   };
 }
 
+const PUBLIC_CITAS_SAFE_DETAIL_KEYS = new Set([
+  "field",
+  "blockIndex",
+  "maxCompanions",
+  "selection_type",
+  "alias",
+]);
+
+function sanitizePublicCitasErrorDetails(rawDetails) {
+  if (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails)) return undefined;
+  const safeDetails = {};
+  for (const [key, value] of Object.entries(rawDetails)) {
+    if (!PUBLIC_CITAS_SAFE_DETAIL_KEYS.has(key)) continue;
+    if (key === "blockIndex" || key === "maxCompanions") {
+      const parsed = Number(value);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeDetails[key] = parsed;
+      continue;
+    }
+    if (value == null) continue;
+    safeDetails[key] = String(value).trim().slice(0, 160);
+  }
+  return Object.keys(safeDetails).length ? safeDetails : undefined;
+}
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
+    request.log.warn(
+      {
+        requestId: request.id,
+        statusCode: error.statusCode,
+        code: error.code,
+        details: error.details,
+      },
+      "Public citas handled AppError"
+    );
+    const safeDetails = sanitizePublicCitasErrorDetails(error.details);
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
-      details: error.details,
+      ...(safeDetails ? { details: safeDetails } : {}),
       requestId: request.id,
     });
   }
@@ -176,6 +211,31 @@ function splitFullName(rawName) {
     nombres: parts.slice(0, -1).join(" "),
     apellidos: parts[parts.length - 1],
   };
+}
+
+function normalizePersonName(rawValue) {
+  return String(rawValue || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((token) => token
+      .split(/([-'])/)
+      .map((part, index) => {
+        if (index % 2 === 1) return part;
+        const lower = String(part || "").toLocaleLowerCase("es-HN");
+        if (!lower) return "";
+        return `${lower.charAt(0).toLocaleUpperCase("es-HN")}${lower.slice(1)}`;
+      })
+      .join(""))
+    .join(" ");
+}
+
+function buildFullName(nombres, apellidos) {
+  return [normalizePersonName(nombres), normalizePersonName(apellidos)]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
 }
 
 function normalizePhone(rawValue) {
@@ -278,7 +338,9 @@ function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
 }
 
 function validateClientPayload(titular) {
-  const nombre = String(titular?.nombre || "").trim();
+  const nombres = normalizePersonName(titular?.nombres || "");
+  const apellidos = normalizePersonName(titular?.apellidos || "");
+  const nombre = buildFullName(nombres, apellidos) || normalizePersonName(titular?.nombre || "");
   const rawTelefono = String(titular?.telefono || "").trim();
   const telefono = normalizePhone(rawTelefono);
   const email = normalizeEmail(titular?.email);
@@ -316,26 +378,48 @@ function validateClientPayload(titular) {
 
   return {
     nombre,
+    nombres,
+    apellidos,
     telefono,
     email,
   };
 }
 
 function validateCompanionContactPayload(contacto, { alias, index }) {
-  const nombre = String(contacto?.nombre || "").trim();
+  const nombres = normalizePersonName(contacto?.nombres || "");
+  const apellidos = normalizePersonName(contacto?.apellidos || "");
+  const nombreLegacy = normalizePersonName(contacto?.nombre || "");
+  const legacyTokens = nombreLegacy.split(" ").filter(Boolean);
+  const effectiveNombres = nombres || (
+    legacyTokens.length > 1
+      ? normalizePersonName(legacyTokens.slice(0, -1).join(" "))
+      : normalizePersonName(legacyTokens[0] || "")
+  );
+  const effectiveApellidos = apellidos || (
+    legacyTokens.length > 1
+      ? normalizePersonName(legacyTokens[legacyTokens.length - 1])
+      : ""
+  );
+  const nombre = buildFullName(effectiveNombres, effectiveApellidos);
   const email = normalizeEmail(contacto?.email);
   const rawTelefono = String(contacto?.telefono || "").trim();
   const telefono = normalizePhone(rawTelefono);
   const blockIndex = index;
 
-  if (!nombre || hasUnsafeText(nombre) || nombre.length < 2 || nombre.length > 120) {
+  if (!effectiveNombres || hasUnsafeText(effectiveNombres) || effectiveNombres.length < 2 || effectiveNombres.length > 120) {
     throw new AppError(400, "El nombre del acompanante es obligatorio", {
       code: "PUBLIC_CITAS_COMPANION_NAME_REQUIRED",
-      details: { field: "contacto.nombre", alias, blockIndex },
+      details: { field: "contacto.nombres", alias, blockIndex },
     });
   }
-  if (!EMAIL_PATTERN.test(email)) {
-    throw new AppError(400, "El correo del acompanante es obligatorio y debe ser valido", {
+  if (!effectiveApellidos || hasUnsafeText(effectiveApellidos) || effectiveApellidos.length < 2 || effectiveApellidos.length > 120) {
+    throw new AppError(400, "El apellido del acompanante es obligatorio", {
+      code: "PUBLIC_CITAS_COMPANION_LAST_NAME_REQUIRED",
+      details: { field: "contacto.apellidos", alias, blockIndex },
+    });
+  }
+  if (email && !EMAIL_PATTERN.test(email)) {
+    throw new AppError(400, "El correo del acompanante debe ser valido", {
       code: "PUBLIC_CITAS_COMPANION_EMAIL_INVALID",
       details: { field: "contacto.email", alias, blockIndex },
     });
@@ -355,7 +439,9 @@ function validateCompanionContactPayload(contacto, { alias, index }) {
 
   return {
     nombre,
-    email,
+    nombres: effectiveNombres,
+    apellidos: effectiveApellidos,
+    email: email || null,
     telefono: telefono || null,
   };
 }
@@ -391,7 +477,7 @@ function normalizeBlocksPayload(body, titularPayload) {
     const ordenIntegrante = Number(item?.orden_integrante);
     const selectionType = String(item?.selection_type || "services").trim().toLowerCase();
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
-    const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
+    const packageId = parseSinglePackageId(item?.id_paquete, { required: false, field: "id_paquete" });
 
     if (!["services", "package", "mixed"].includes(selectionType)) {
       throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
@@ -432,6 +518,8 @@ function normalizeBlocksPayload(body, titularPayload) {
       contacto: index === 0
         ? {
             nombre: titularPayload.nombre,
+            nombres: titularPayload.nombres || splitFullName(titularPayload.nombre).nombres,
+            apellidos: titularPayload.apellidos || splitFullName(titularPayload.nombre).apellidos,
             email: titularPayload.email,
             telefono: titularPayload.telefono || null,
           }
@@ -441,7 +529,7 @@ function normalizeBlocksPayload(body, titularPayload) {
 }
 
 async function resolveOrCreatePublicClient(client, payload) {
-  const { nombre, telefono, email, idSucursal } = payload;
+  const { nombre, nombres, apellidos, telefono, email, idSucursal } = payload;
 
   const existingActiveUserByEmailResult = await client.query(
     `
@@ -464,9 +552,9 @@ async function resolveOrCreatePublicClient(client, payload) {
   );
 
   if (existingActiveUserByEmailResult.rows[0]) {
-    throw new AppError(409, "Este correo ya esta asociado a una cuenta activa. Inicia sesion para agendar.", {
-      code: "PUBLIC_CITAS_EMAIL_IN_USE",
-      details: { email },
+    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesión para continuar.", {
+      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+      details: { field: "titular.email" },
     });
   }
 
@@ -490,9 +578,9 @@ async function resolveOrCreatePublicClient(client, payload) {
   );
 
   if (existingUserClientResult.rows[0]) {
-    throw new AppError(409, "Este correo ya esta asociado a una cuenta. Por favor inicia sesion para agendar.", {
-      code: "PUBLIC_CITAS_EMAIL_IN_USE",
-      details: { email },
+    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesión para continuar.", {
+      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+      details: { field: "titular.email" },
     });
   }
 
@@ -514,7 +602,8 @@ async function resolveOrCreatePublicClient(client, payload) {
   let idPersona = existingPersonaResult.rows[0]?.id_persona || null;
 
   if (!idPersona) {
-    const { nombres, apellidos } = splitFullName(nombre);
+    const resolvedName = buildFullName(nombres, apellidos) || nombre;
+    const splitName = splitFullName(resolvedName);
 
     const personaInsert = await client.query(
       `
@@ -522,7 +611,7 @@ async function resolveOrCreatePublicClient(client, payload) {
         VALUES ($1, $2, $3)
         RETURNING id_persona
       `,
-      [nombres, apellidos, telefono || null]
+      [splitName.nombres, splitName.apellidos, telefono || null]
     );
     idPersona = personaInsert.rows[0].id_persona;
   } else if (telefono) {
@@ -607,7 +696,6 @@ export default async function publicCitasRoutes(app) {
         request.log.error({ err: error }, "Public citas contexto error");
         return sendError(reply, 500, "No se pudo consultar el contexto de citas publicas", {
           code: "PUBLIC_CITAS_CONTEXT_ERROR",
-          details: error instanceof Error ? error.message : "Unknown public citas context error",
           requestId: request.id,
         });
       }
@@ -634,6 +722,8 @@ export default async function publicCitasRoutes(app) {
               required: ["nombre", "email", "telefono"],
               properties: {
                 nombre: { type: "string", minLength: 1, maxLength: 120 },
+                nombres: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+                apellidos: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
                 email: { type: "string", format: "email", maxLength: 160 },
                 telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 20 }, { type: "null" }] },
               },
@@ -655,6 +745,8 @@ export default async function publicCitasRoutes(app) {
                     type: "object",
                     properties: {
                       nombre: { type: "string", minLength: 1, maxLength: 120 },
+                      nombres: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+                      apellidos: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
                       email: { anyOf: [{ type: "string", format: "email", maxLength: 160 }, { type: "null" }] },
                       telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 20 }, { type: "null" }] },
                     },

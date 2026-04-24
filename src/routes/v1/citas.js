@@ -5,7 +5,9 @@ import {
   expireStaleAppointmentReservations,
   OCCUPIED_APPOINTMENT_STATES,
   assertUuid,
+  getHoldDurationMinutes,
   getSystemParameters,
+  parseSinglePackageId,
   parseDateOnly,
   resolveBookingSelection,
 } from "../../services/agendaService.js";
@@ -20,6 +22,7 @@ import {
 const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const errorResponseSchema = {
   type: "object",
@@ -109,7 +112,6 @@ function sendHandled(reply, request, error, message, code) {
   request.log.error({ err: error }, message);
   return sendError(reply, 500, message, {
     code,
-    details: error instanceof Error ? error.message : "Unknown citas error",
     requestId: request.id,
   });
 }
@@ -244,6 +246,43 @@ function parseIsoDateAndTime(rawDateTime) {
   return { fecha: match[1], hora: match[2] };
 }
 
+function normalizePersonName(rawValue) {
+  return String(rawValue || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((token) => token
+      .split(/([-'])/)
+      .map((part, index) => {
+        if (index % 2 === 1) return part;
+        const lower = String(part || "").toLocaleLowerCase("es-HN");
+        if (!lower) return "";
+        return `${lower.charAt(0).toLocaleUpperCase("es-HN")}${lower.slice(1)}`;
+      })
+      .join(""))
+    .join(" ");
+}
+
+function buildFullName(nombres, apellidos) {
+  return [normalizePersonName(nombres), normalizePersonName(apellidos)]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+function normalizePhone(rawValue) {
+  return String(rawValue || "").replace(/[^\d+]/g, "").slice(0, 20);
+}
+
+function hasPhoneLetters(rawValue) {
+  return /[A-Za-z]/.test(String(rawValue || ""));
+}
+
+function normalizeEmail(rawEmail) {
+  return String(rawEmail || "").trim().toLowerCase();
+}
+
 function getDateTimePartsInTimeZone(dateValue, timeZone = HONDURAS_TIME_ZONE) {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -340,7 +379,7 @@ function normalizeHoldBlocksPayload(body) {
     const ordenIntegrante = Number(item?.orden_integrante);
     const selectionType = String(item?.selection_type || "services").trim().toLowerCase();
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
-    const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
+    const packageId = parseSinglePackageId(item?.id_paquete, { required: false, field: "id_paquete" });
 
     if (!["services", "package", "mixed"].includes(selectionType)) {
       throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
@@ -379,6 +418,144 @@ function normalizeHoldBlocksPayload(body) {
       serviceIds,
     };
   });
+}
+
+async function resolveAuthenticatedTitularContact(client, { personaId, claimsUser, titularPayload }) {
+  const profileResult = await client.query(
+    `
+      SELECT
+        p.nombres,
+        p.apellidos,
+        p.telefono_principal,
+        COALESCE(
+          NULLIF((
+            SELECT c.direccion_correo
+            FROM public.correos c
+            WHERE c.id_persona = p.id_persona
+              AND c.deleted_at IS NULL
+            ORDER BY c.es_principal DESC NULLS LAST, c.verificado DESC NULLS LAST, c.id_correo ASC
+            LIMIT 1
+          )::text, ''),
+          NULLIF($2::text, '')
+        ) AS email
+      FROM public.personas p
+      WHERE p.id_persona = $1::uuid
+        AND p.deleted_at IS NULL
+      LIMIT 1
+    `,
+    [personaId, claimsUser?.email ?? null]
+  );
+
+  const profileRow = profileResult.rows[0];
+  if (!profileRow) {
+    throw new AppError(409, "No se pudo resolver el perfil autenticado del titular", {
+      code: "CITAS_HOLD_TITULAR_PROFILE_NOT_FOUND",
+    });
+  }
+
+  const profileNombres = normalizePersonName(profileRow.nombres || "");
+  const profileApellidos = normalizePersonName(profileRow.apellidos || "");
+  const profilePhone = normalizePhone(profileRow.telefono_principal || "");
+  const profileEmail = normalizeEmail(profileRow.email || "");
+
+  if (!EMAIL_PATTERN.test(profileEmail)) {
+    throw new AppError(409, "No se pudo validar el correo de la cuenta autenticada", {
+      code: "CITAS_HOLD_ACCOUNT_EMAIL_INVALID",
+    });
+  }
+
+  const payload = titularPayload && typeof titularPayload === "object"
+    ? titularPayload
+    : {};
+  const inputNombres = normalizePersonName(payload.nombres || "");
+  const inputApellidos = normalizePersonName(payload.apellidos || "");
+  const inputPhoneRaw = String(payload.telefono || "").trim();
+  const inputPhone = normalizePhone(inputPhoneRaw);
+  const guardarNombresApellidos = Boolean(payload.guardar_nombres_apellidos);
+  const guardarTelefono = Boolean(payload.guardar_telefono);
+
+  if (inputPhoneRaw && hasPhoneLetters(inputPhoneRaw)) {
+    throw new AppError(400, "El telefono del titular no admite letras", {
+      code: "CITAS_HOLD_TITULAR_PHONE_INVALID",
+      details: { field: "titular.telefono" },
+    });
+  }
+  if (inputPhoneRaw && inputPhone.length < 8) {
+    throw new AppError(400, "El telefono del titular debe ser valido", {
+      code: "CITAS_HOLD_TITULAR_PHONE_INVALID",
+      details: { field: "titular.telefono" },
+    });
+  }
+
+  const missingNombres = !profileNombres;
+  const missingApellidos = !profileApellidos;
+  const missingTelefono = profilePhone.length < 8;
+
+  const effectiveNombres = profileNombres || (missingNombres ? inputNombres : "");
+  const effectiveApellidos = profileApellidos || (missingApellidos ? inputApellidos : "");
+  const effectivePhone = profilePhone || (missingTelefono ? inputPhone : "");
+  const fullName = buildFullName(effectiveNombres, effectiveApellidos);
+
+  if (!effectiveNombres) {
+    throw new AppError(400, "El nombre del titular es obligatorio", {
+      code: "CITAS_HOLD_TITULAR_NAME_REQUIRED",
+      details: { field: "titular.nombres" },
+    });
+  }
+  if (!effectiveApellidos) {
+    throw new AppError(400, "El apellido del titular es obligatorio", {
+      code: "CITAS_HOLD_TITULAR_LAST_NAME_REQUIRED",
+      details: { field: "titular.apellidos" },
+    });
+  }
+  if (!effectivePhone || effectivePhone.length < 8) {
+    throw new AppError(400, "El telefono del titular es obligatorio", {
+      code: "CITAS_HOLD_TITULAR_PHONE_REQUIRED",
+      details: { field: "titular.telefono" },
+    });
+  }
+
+  if (guardarNombresApellidos && (missingNombres || missingApellidos)) {
+    await client.query(
+      `
+        UPDATE public.personas
+        SET nombres = CASE
+              WHEN (nombres IS NULL OR btrim(nombres) = '') AND $2::text <> '' THEN $2
+              ELSE nombres
+            END,
+            apellidos = CASE
+              WHEN (apellidos IS NULL OR btrim(apellidos) = '') AND $3::text <> '' THEN $3
+              ELSE apellidos
+            END,
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+      `,
+      [personaId, inputNombres, inputApellidos]
+    );
+  }
+
+  if (guardarTelefono && missingTelefono && inputPhone.length >= 8) {
+    await client.query(
+      `
+        UPDATE public.personas
+        SET telefono_principal = CASE
+              WHEN telefono_principal IS NULL OR btrim(telefono_principal) = '' THEN $2
+              ELSE telefono_principal
+            END,
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+      `,
+      [personaId, inputPhone]
+    );
+  }
+
+  return {
+    fullName,
+    nombres: effectiveNombres,
+    apellidos: effectiveApellidos,
+    email: profileEmail,
+    telefono: effectivePhone,
+  };
 }
 
 function isSimulationNoPaymentEnabled(paramsMap) {
@@ -616,7 +793,6 @@ export default async function citasRoutes(app) {
         if (isConflictError(error)) {
           return sendError(reply, 409, "Ya existe un hold activo o el horario solicitado no esta disponible", {
             code: "CITA_HOLD_CONFLICTO",
-            details: error instanceof Error ? error.message : "Cita conflict",
             requestId: request.id,
           });
         }
@@ -638,6 +814,17 @@ export default async function citasRoutes(app) {
           required: ["id_sucursal"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
+            titular: {
+              type: "object",
+              properties: {
+                nombres: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+                apellidos: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+                telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 20 }, { type: "null" }] },
+                guardar_nombres_apellidos: { type: "boolean" },
+                guardar_telefono: { type: "boolean" },
+              },
+              additionalProperties: false,
+            },
             integrantes: {
               type: "array",
               minItems: 1,
@@ -718,6 +905,11 @@ export default async function citasRoutes(app) {
         await dbClient.query("BEGIN");
         txStarted = true;
         const simulationNoPayment = isSimulationNoPaymentEnabled(await getSystemParameters(dbClient));
+        const titularContact = await resolveAuthenticatedTitularContact(dbClient, {
+          personaId,
+          claimsUser: request.claims?.user,
+          titularPayload: request.body?.titular,
+        });
 
         const activeMembership = await ensureSubscriptionLifecycle(dbClient, clienteId, { forUpdate: true });
         const coverageTracker = createCoverageTracker(activeMembership);
@@ -744,7 +936,8 @@ export default async function citasRoutes(app) {
         );
 
         const groupRecord = groupInsert.rows[0];
-        const holdExpiresAt = new Date(Date.now() + (5 * 60 * 1000));
+        const holdDurationMin = await getHoldDurationMinutes(dbClient);
+        const holdExpiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
         const holdUserId = integrantes.length > 1 ? null : usuarioId;
         const bloquesResponse = [];
         let subtotalGrupo = 0;
@@ -754,6 +947,12 @@ export default async function citasRoutes(app) {
         let coveredItemsCount = 0;
         let extraItemsCount = 0;
         const createdAppointmentIds = [];
+        if (integrantes[0]) {
+          integrantes[0] = {
+            ...integrantes[0],
+            alias: titularContact.fullName || integrantes[0].alias || "Titular",
+          };
+        }
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
@@ -971,7 +1170,6 @@ export default async function citasRoutes(app) {
         if (isConflictError(error)) {
           return sendError(reply, 409, "Ya existe un conflicto de disponibilidad para uno de los bloques", {
             code: "CITAS_HOLD_CONFLICT",
-            details: error instanceof Error ? error.message : "Hold conflict",
             requestId: request.id,
           });
         }
