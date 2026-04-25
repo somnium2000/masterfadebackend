@@ -55,6 +55,7 @@ const planBenefitSchema = {
 const planSchema = {
   type: "object",
   properties: {
+    id_plan_sucursal: { type: "string", format: "uuid" },
     id_plan: { type: "string", format: "uuid" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     nombre_plan: { type: "string" },
@@ -67,6 +68,7 @@ const planSchema = {
     beneficios: { type: "array", items: planBenefitSchema },
   },
   required: [
+    "id_plan_sucursal",
     "id_plan",
     "id_sucursal",
     "nombre_plan",
@@ -84,14 +86,16 @@ const planSchema = {
 const PUBLIC_PLANS_SQL = `
   WITH scoped_offers AS (
     SELECT
+      mps.id_plan_sucursal,
       mps.id_plan,
       mps.id_sucursal,
       mps.precio_hnl,
       mps.orden_visual,
+      mps.updated_at,
       ROW_NUMBER() OVER (
         PARTITION BY mps.id_plan, mps.id_sucursal
         ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
-      ) AS rn
+      ) AS rn_branch
     FROM public.membership_plans_sucursal mps
     JOIN public.sucursales su
       ON su.id_sucursal = mps.id_sucursal
@@ -104,33 +108,40 @@ const PUBLIC_PLANS_SQL = `
   ),
   picked_offers AS (
     SELECT
+      so.id_plan_sucursal,
       so.id_plan,
       so.id_sucursal,
       so.precio_hnl,
-      so.orden_visual
+      so.orden_visual,
+      so.updated_at
     FROM scoped_offers so
-    WHERE so.rn = 1
+    WHERE so.rn_branch = 1
   ),
   effective_offers AS (
     SELECT
-      po.id_plan,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
-        ELSE MAX(po.precio_hnl)
-      END AS precio_hnl,
-      CASE
-        -- AM: Seleccion determinista de sucursal efectiva sin depender de operadores min/max uuid.
-        WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
-        ELSE MAX(po.id_sucursal::text)::uuid
-      END AS id_sucursal,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.orden_visual)
-        ELSE MAX(po.orden_visual)
-      END AS orden_visual
-    FROM picked_offers po
-    GROUP BY po.id_plan
+      ranked.id_plan_sucursal,
+      ranked.id_plan,
+      ranked.id_sucursal,
+      ranked.precio_hnl,
+      ranked.orden_visual
+    FROM (
+      SELECT
+        po.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY po.id_plan
+          ORDER BY
+            CASE WHEN $1::uuid IS NULL THEN po.precio_hnl ELSE 0 END ASC,
+            CASE WHEN $1::uuid IS NULL THEN po.id_sucursal::text ELSE '' END ASC,
+            po.orden_visual ASC,
+            po.updated_at DESC,
+            po.id_plan_sucursal DESC
+        ) AS rn_plan
+      FROM picked_offers po
+    ) ranked
+    WHERE ranked.rn_plan = 1
   )
   SELECT
+    eo.id_plan_sucursal,
     mp.id_plan,
     eo.id_sucursal,
     mp.nombre_plan,
@@ -138,7 +149,7 @@ const PUBLIC_PLANS_SQL = `
     mp.periodo_membresia_codigo,
     mp.categoria_nivel,
     pm.descripcion AS periodo_membresia_label,
-    COALESCE(eo.precio_hnl, mp.precio_hnl) AS precio_hnl,
+    eo.precio_hnl AS precio_hnl,
     mp.beneficios,
     eo.orden_visual
   FROM public.membership_plans mp
@@ -147,21 +158,23 @@ const PUBLIC_PLANS_SQL = `
   JOIN public.periodos_membresia pm
     ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
   WHERE mp.activo IS TRUE
-    AND COALESCE(eo.precio_hnl, mp.precio_hnl) > 0
+    AND eo.precio_hnl > 0
   ORDER BY eo.orden_visual ASC, mp.nombre_plan ASC
 `;
 
 const PUBLIC_PLANS_SQL_LEGACY = `
   WITH scoped_offers AS (
     SELECT
+      mps.id_plan_sucursal,
       mps.id_plan,
       mps.id_sucursal,
       mps.precio_hnl,
       mps.orden_visual,
+      mps.updated_at,
       ROW_NUMBER() OVER (
         PARTITION BY mps.id_plan, mps.id_sucursal
         ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
-      ) AS rn
+      ) AS rn_branch
     FROM public.membership_plans_sucursal mps
     JOIN public.sucursales su
       ON su.id_sucursal = mps.id_sucursal
@@ -174,32 +187,40 @@ const PUBLIC_PLANS_SQL_LEGACY = `
   ),
   picked_offers AS (
     SELECT
+      so.id_plan_sucursal,
       so.id_plan,
       so.id_sucursal,
       so.precio_hnl,
-      so.orden_visual
+      so.orden_visual,
+      so.updated_at
     FROM scoped_offers so
-    WHERE so.rn = 1
+    WHERE so.rn_branch = 1
   ),
   effective_offers AS (
     SELECT
-      po.id_plan,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
-        ELSE MAX(po.precio_hnl)
-      END AS precio_hnl,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
-        ELSE MAX(po.id_sucursal::text)::uuid
-      END AS id_sucursal,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.orden_visual)
-        ELSE MAX(po.orden_visual)
-      END AS orden_visual
-    FROM picked_offers po
-    GROUP BY po.id_plan
+      ranked.id_plan_sucursal,
+      ranked.id_plan,
+      ranked.id_sucursal,
+      ranked.precio_hnl,
+      ranked.orden_visual
+    FROM (
+      SELECT
+        po.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY po.id_plan
+          ORDER BY
+            CASE WHEN $1::uuid IS NULL THEN po.precio_hnl ELSE 0 END ASC,
+            CASE WHEN $1::uuid IS NULL THEN po.id_sucursal::text ELSE '' END ASC,
+            po.orden_visual ASC,
+            po.updated_at DESC,
+            po.id_plan_sucursal DESC
+        ) AS rn_plan
+      FROM picked_offers po
+    ) ranked
+    WHERE ranked.rn_plan = 1
   )
   SELECT
+    eo.id_plan_sucursal,
     mp.id_plan,
     eo.id_sucursal,
     mp.nombre_plan,
@@ -207,7 +228,7 @@ const PUBLIC_PLANS_SQL_LEGACY = `
     mp.periodo_membresia_codigo,
     1::smallint AS categoria_nivel,
     pm.descripcion AS periodo_membresia_label,
-    COALESCE(eo.precio_hnl, mp.precio_hnl) AS precio_hnl,
+    eo.precio_hnl AS precio_hnl,
     mp.beneficios,
     eo.orden_visual
   FROM public.membership_plans mp
@@ -216,7 +237,7 @@ const PUBLIC_PLANS_SQL_LEGACY = `
   JOIN public.periodos_membresia pm
     ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
   WHERE mp.activo IS TRUE
-    AND COALESCE(eo.precio_hnl, mp.precio_hnl) > 0
+    AND eo.precio_hnl > 0
   ORDER BY eo.orden_visual ASC, mp.nombre_plan ASC
 `;
 
@@ -295,6 +316,7 @@ async function hasPlanCategoryColumn(app) {
 
 function mapPlanRow(row) {
   return {
+    id_plan_sucursal: row.id_plan_sucursal,
     id_plan: row.id_plan,
     id_sucursal: row.id_sucursal ?? null,
     nombre_plan: row.nombre_plan,

@@ -8,6 +8,9 @@ import {
   replaceAssetIfNeeded,
 } from "../../services/storage/storageService.js";
 import {
+  createMembershipPurchaseOrder,
+  createMembershipOrderPaymentIntent,
+  confirmMembershipPaymentAndActivateSubscription,
   acquireMembershipPlan,
   cancelMembership,
   getClienteMembershipState,
@@ -689,6 +692,236 @@ export default async function clienteRoutes(app) {
           error,
           "No se pudo consultar el estado de la membresía del cliente",
           "CLIENTE_MEMBERSHIP_STATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/orden",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_plan_sucursal"],
+          properties: {
+            id_plan_sucursal: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              success: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_order: { type: "string", format: "uuid" },
+                  estado_orden_codigo: { type: "string" },
+                  plan: { type: "object", additionalProperties: true },
+                  totales: { type: "object", additionalProperties: true },
+                  cliente: { type: "object", additionalProperties: true },
+                },
+                required: ["id_order", "estado_orden_codigo", "plan", "totales", "cliente"],
+                additionalProperties: true,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["success", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const order = await createMembershipPurchaseOrder(client, {
+          clienteId: context.clienteId,
+          usuarioId: context.userId ?? null,
+          idPlanSucursal: request.body.id_plan_sucursal,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return reply.code(201).send({
+          success: true,
+          data: order,
+          requestId: request.id,
+        });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear la orden de compra del plan",
+          "CLIENTE_MEMBERSHIP_ORDER_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/pago-intent",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_order"],
+          properties: {
+            id_order: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_payment_intent: { type: "string", format: "uuid" },
+                  id_order: { type: "string", format: "uuid" },
+                  origen_pago_codigo: { type: "string" },
+                  monto: { type: "number" },
+                  moneda_codigo: { type: "string" },
+                  client_secret: { type: "string" },
+                },
+                required: [
+                  "id_payment_intent",
+                  "id_order",
+                  "origen_pago_codigo",
+                  "monto",
+                  "moneda_codigo",
+                  "client_secret",
+                ],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const intent = await createMembershipOrderPaymentIntent(client, {
+          idOrder: request.body.id_order,
+          clienteId: context.clienteId,
+          usuarioId: context.userId ?? null,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, intent, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear el intent de pago para la orden de plan",
+          "CLIENTE_MEMBERSHIP_PAYMENT_INTENT_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/confirmar-pago",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_payment_intent"],
+          properties: {
+            id_payment_intent: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_suscripcion: { type: "string", format: "uuid" },
+                  estado: { type: "string" },
+                },
+                required: ["id_suscripcion", "estado"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const confirmation = await confirmMembershipPaymentAndActivateSubscription(client, {
+          idPaymentIntent: request.body.id_payment_intent,
+          clienteId: context.clienteId,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, confirmation, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar el pago del plan",
+          "CLIENTE_MEMBERSHIP_PAYMENT_CONFIRM_ERROR"
         );
       } finally {
         client.release();
