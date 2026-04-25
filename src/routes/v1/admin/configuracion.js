@@ -39,6 +39,25 @@ const optionalQuerySchema = {
 };
 
 const PROMOTION_STATES = ["borrador", "publicada", "archivada"];
+const PROMOTION_TYPES = ["descuento_servicio", "descuento_paquete", "dos_por_uno_servicio"];
+const PROMOTION_TARGETS = ["servicio", "paquete"];
+const PROMOTION_MECHANICS = ["porcentaje", "monto_fijo", "dos_por_uno"];
+// JK: Patron reutilizable para validar hora en formato HH:mm o HH:mm:ss.
+const PROMOTION_TIME_PATTERN = "^([01]\\d|2[0-3]):[0-5]\\d(:[0-5]\\d)?$";
+const PROMOTION_TYPE_RULES = Object.freeze({
+  descuento_servicio: {
+    aplicaA: "servicio",
+    mecanicasPermitidas: ["porcentaje", "monto_fijo"],
+  },
+  descuento_paquete: {
+    aplicaA: "paquete",
+    mecanicasPermitidas: ["porcentaje", "monto_fijo"],
+  },
+  dos_por_uno_servicio: {
+    aplicaA: "servicio",
+    mecanicasPermitidas: ["dos_por_uno"],
+  },
+});
 const COMMUNICATION_CAMPAIGN_TYPES = ["informativa", "promocional"];
 const COMMUNICATION_FIXED_TYPE = "informativa";
 const COMMUNICATION_CAMPAIGN_CHANNEL = "email";
@@ -108,10 +127,21 @@ const promotionBodySchema = {
     visible_publico: { type: "boolean" },
     vigencia_desde: { type: ["string", "null"], format: "date" },
     vigencia_hasta: { type: ["string", "null"], format: "date" },
+    // JK: Ventana horaria opcional sobre el mismo rango de vigencia por fecha.
+    vigencia_hora_desde: { type: ["string", "null"], pattern: PROMOTION_TIME_PATTERN },
+    vigencia_hora_hasta: { type: ["string", "null"], pattern: PROMOTION_TIME_PATTERN },
     orden_visual: { type: "integer", minimum: 0 },
     destacada: { type: "boolean" },
+    tipo_promocion: { type: "string", enum: PROMOTION_TYPES },
+    aplica_a: { type: "string", enum: PROMOTION_TARGETS },
+    mecanica: { type: "string", enum: PROMOTION_MECHANICS },
+    id_servicio_objetivo: { type: ["string", "null"], format: "uuid" },
+    id_paquete_objetivo: { type: ["string", "null"], format: "uuid" },
+    valor_descuento: { type: ["number", "null"], exclusiveMinimum: 0 },
+    cantidad_requerida: { type: ["integer", "null"], minimum: 1 },
+    cantidad_bonificada: { type: ["integer", "null"], minimum: 1 },
   },
-  required: ["id_sucursal", "titulo"],
+  required: ["id_sucursal", "titulo", "tipo_promocion", "aplica_a", "mecanica"],
   additionalProperties: false,
 };
 
@@ -132,8 +162,19 @@ const promotionPatchSchema = {
     visible_publico: { type: "boolean" },
     vigencia_desde: { type: ["string", "null"], format: "date" },
     vigencia_hasta: { type: ["string", "null"], format: "date" },
+    // JK: Ventana horaria opcional sobre el mismo rango de vigencia por fecha.
+    vigencia_hora_desde: { type: ["string", "null"], pattern: PROMOTION_TIME_PATTERN },
+    vigencia_hora_hasta: { type: ["string", "null"], pattern: PROMOTION_TIME_PATTERN },
     orden_visual: { type: "integer", minimum: 0 },
     destacada: { type: "boolean" },
+    tipo_promocion: { type: "string", enum: PROMOTION_TYPES },
+    aplica_a: { type: "string", enum: PROMOTION_TARGETS },
+    mecanica: { type: "string", enum: PROMOTION_MECHANICS },
+    id_servicio_objetivo: { type: ["string", "null"], format: "uuid" },
+    id_paquete_objetivo: { type: ["string", "null"], format: "uuid" },
+    valor_descuento: { type: ["number", "null"], exclusiveMinimum: 0 },
+    cantidad_requerida: { type: ["integer", "null"], minimum: 1 },
+    cantidad_bonificada: { type: ["integer", "null"], minimum: 1 },
   },
   required: ["id_sucursal"],
   minProperties: 2,
@@ -1412,6 +1453,326 @@ function normalizeDateOnly(value) {
   return raw;
 }
 
+function normalizeTimeOnly(value, fieldName = "hora") {
+  // JK: Soporta hora opcional en promociones aceptando HH:mm y HH:mm:ss.
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const raw = String(value).trim();
+  const match = raw.match(/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
+  if (!match) {
+    throw new AppError(400, `Formato de ${fieldName} invalido; usa HH:mm o HH:mm:ss`, {
+      code: "CONFIG_PROMOTION_TIME_INVALID",
+      details: { field: fieldName },
+    });
+  }
+  const seconds = match[3] || "00";
+  return `${match[1]}:${match[2]}:${seconds}`;
+}
+
+function promotionTimeToSeconds(value) {
+  // JK: Convierte hora textual a segundos para comparar rangos en validaciones.
+  if (value === undefined || value === null || value === "") return null;
+  const raw = String(value).trim();
+  const match = raw.match(/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3] || "0");
+  return (hours * 3600) + (minutes * 60) + seconds;
+}
+
+function normalizePromotionType(value, fallback = null) {
+  const raw = value === undefined ? fallback : value;
+  const normalized = String(raw || "").trim().toLowerCase();
+  if (!PROMOTION_TYPES.includes(normalized)) {
+    throw new AppError(400, "tipo_promocion invalido", {
+      code: "CONFIG_PROMOTION_TYPE_INVALID",
+    });
+  }
+  return normalized;
+}
+
+function normalizePromotionTarget(value, fallback = null) {
+  const raw = value === undefined ? fallback : value;
+  const normalized = String(raw || "").trim().toLowerCase();
+  if (!PROMOTION_TARGETS.includes(normalized)) {
+    throw new AppError(400, "aplica_a invalido", {
+      code: "CONFIG_PROMOTION_TARGET_INVALID",
+    });
+  }
+  return normalized;
+}
+
+function normalizePromotionMechanic(value, fallback = null) {
+  const raw = value === undefined ? fallback : value;
+  const normalized = String(raw || "").trim().toLowerCase();
+  if (!PROMOTION_MECHANICS.includes(normalized)) {
+    throw new AppError(400, "mecanica invalida", {
+      code: "CONFIG_PROMOTION_MECHANIC_INVALID",
+    });
+  }
+  return normalized;
+}
+
+function normalizePromotionOptionalUuid(value) {
+  const normalized = normalizeOptionalText(value);
+  return normalized ?? null;
+}
+
+function normalizePromotionOptionalNumber(value, fieldName) {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new AppError(400, `${fieldName} debe ser numerico`, {
+      code: "CONFIG_PROMOTION_VALUE_INVALID",
+      details: { field: fieldName },
+    });
+  }
+  return parsed;
+}
+
+function normalizePromotionOptionalInteger(value, fieldName) {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) {
+    throw new AppError(400, `${fieldName} debe ser un entero`, {
+      code: "CONFIG_PROMOTION_VALUE_INVALID",
+      details: { field: fieldName },
+    });
+  }
+  return parsed;
+}
+
+function formatPromotionNumber(value, fractionDigits = 2) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const fixed = parsed.toFixed(fractionDigits);
+  return fixed.includes(".")
+    ? fixed.replace(/\.?0+$/, "")
+    : fixed;
+}
+
+function construirResumenPromocion(row) {
+  // JK: Resumen operativo calculado en runtime para evitar duplicar estado derivado en base de datos.
+  const aplicaA = String(row?.aplica_a || "").toLowerCase();
+  const scopeLabel = aplicaA === "paquete" ? "Paquete" : "Servicio";
+  const mecanica = String(row?.mecanica || "").toLowerCase();
+  const hasServiceTarget = Boolean(String(row?.id_servicio_objetivo || "").trim());
+  const hasPackageTarget = Boolean(String(row?.id_paquete_objetivo || "").trim());
+  const valorDescuento = Number(row?.valor_descuento);
+  const hasValidDiscount = Number.isFinite(valorDescuento) && valorDescuento > 0;
+
+  // JK: Evita mostrar resumenes engañosos cuando faltan datos operativos obligatorios.
+  const missingOperationalData = (
+    (aplicaA === "servicio" && !hasServiceTarget)
+    || (aplicaA === "paquete" && !hasPackageTarget)
+    || (mecanica === "porcentaje" && !hasValidDiscount)
+    || (mecanica === "monto_fijo" && !hasValidDiscount)
+    || (mecanica === "dos_por_uno" && !hasServiceTarget)
+  );
+  if (missingOperationalData) {
+    return "Sin aplicación configurada";
+  }
+
+  if (mecanica === "porcentaje") {
+    const value = formatPromotionNumber(row?.valor_descuento);
+    return value ? `${scopeLabel} · ${value}%` : "Sin aplicación configurada";
+  }
+
+  if (mecanica === "monto_fijo") {
+    const value = formatPromotionNumber(row?.valor_descuento);
+    return value ? `${scopeLabel} · L ${value}` : "Sin aplicación configurada";
+  }
+
+  if (mecanica === "dos_por_uno") {
+    const requerida = Number(row?.cantidad_requerida ?? 1);
+    const bonificada = Number(row?.cantidad_bonificada ?? 1);
+    const safeRequerida = Number.isInteger(requerida) && requerida > 0 ? requerida : 1;
+    const safeBonificada = Number.isInteger(bonificada) && bonificada > 0 ? bonificada : 1;
+    return `${scopeLabel} · ${safeRequerida + safeBonificada}x${safeRequerida}`;
+  }
+
+  return scopeLabel;
+}
+
+function validatePromotionBusinessConsistency(values) {
+  const typeRule = PROMOTION_TYPE_RULES[values.tipo_promocion];
+  if (!typeRule) {
+    throw new AppError(400, "tipo_promocion invalido", {
+      code: "CONFIG_PROMOTION_TYPE_INVALID",
+    });
+  }
+
+  if (values.aplica_a !== typeRule.aplicaA) {
+    throw new AppError(400, "La combinacion tipo_promocion/aplica_a no es valida", {
+      code: "CONFIG_PROMOTION_TYPE_TARGET_MISMATCH",
+    });
+  }
+
+  if (!typeRule.mecanicasPermitidas.includes(values.mecanica)) {
+    throw new AppError(400, "La mecanica no es compatible con el tipo de promocion", {
+      code: "CONFIG_PROMOTION_TYPE_MECHANIC_MISMATCH",
+    });
+  }
+
+  if (values.aplica_a === "servicio") {
+    if (!values.id_servicio_objetivo) {
+      throw new AppError(400, "Debes indicar id_servicio_objetivo cuando aplica_a=servicio", {
+        code: "CONFIG_PROMOTION_SERVICE_TARGET_REQUIRED",
+      });
+    }
+    if (values.id_paquete_objetivo) {
+      throw new AppError(400, "id_paquete_objetivo debe ser null cuando aplica_a=servicio", {
+        code: "CONFIG_PROMOTION_PACKAGE_TARGET_FORBIDDEN",
+      });
+    }
+  }
+
+  if (values.aplica_a === "paquete") {
+    if (!values.id_paquete_objetivo) {
+      throw new AppError(400, "Debes indicar id_paquete_objetivo cuando aplica_a=paquete", {
+        code: "CONFIG_PROMOTION_PACKAGE_TARGET_REQUIRED",
+      });
+    }
+    if (values.id_servicio_objetivo) {
+      throw new AppError(400, "id_servicio_objetivo debe ser null cuando aplica_a=paquete", {
+        code: "CONFIG_PROMOTION_SERVICE_TARGET_FORBIDDEN",
+      });
+    }
+  }
+
+  if (values.mecanica === "porcentaje") {
+    const value = Number(values.valor_descuento);
+    if (!Number.isFinite(value) || value <= 0 || value > 100) {
+      throw new AppError(400, "valor_descuento debe ser mayor que 0 y menor o igual a 100 para mecanica=porcentaje", {
+        code: "CONFIG_PROMOTION_PERCENTAGE_VALUE_INVALID",
+      });
+    }
+  }
+
+  if (values.mecanica === "monto_fijo") {
+    const value = Number(values.valor_descuento);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new AppError(400, "valor_descuento debe ser mayor que 0 para mecanica=monto_fijo", {
+        code: "CONFIG_PROMOTION_FIXED_VALUE_INVALID",
+      });
+    }
+  }
+
+  if (values.mecanica === "dos_por_uno") {
+    if (values.valor_descuento !== null && values.valor_descuento !== undefined) {
+      throw new AppError(400, "valor_descuento debe ser null para mecanica=dos_por_uno", {
+        code: "CONFIG_PROMOTION_2X1_VALUE_INVALID",
+      });
+    }
+    const requerida = Number(values.cantidad_requerida);
+    const bonificada = Number(values.cantidad_bonificada);
+    if (!Number.isInteger(requerida) || requerida <= 0) {
+      throw new AppError(400, "cantidad_requerida debe ser un entero mayor que 0 para mecanica=dos_por_uno", {
+        code: "CONFIG_PROMOTION_2X1_REQUIRED_QTY_INVALID",
+      });
+    }
+    if (!Number.isInteger(bonificada) || bonificada <= 0) {
+      throw new AppError(400, "cantidad_bonificada debe ser un entero mayor que 0 para mecanica=dos_por_uno", {
+        code: "CONFIG_PROMOTION_2X1_BONUS_QTY_INVALID",
+      });
+    }
+  } else {
+    if (values.cantidad_requerida !== null && values.cantidad_requerida !== undefined) {
+      throw new AppError(400, "cantidad_requerida solo aplica para mecanica=dos_por_uno", {
+        code: "CONFIG_PROMOTION_REQUIRED_QTY_FORBIDDEN",
+      });
+    }
+    if (values.cantidad_bonificada !== null && values.cantidad_bonificada !== undefined) {
+      throw new AppError(400, "cantidad_bonificada solo aplica para mecanica=dos_por_uno", {
+        code: "CONFIG_PROMOTION_BONUS_QTY_FORBIDDEN",
+      });
+    }
+  }
+}
+
+async function ensurePromotionServiceTargetAvailable(client, idServicio, idSucursal) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_servicio,
+        EXISTS (
+          SELECT 1
+          FROM public.servicios_tarifas st
+          WHERE st.id_servicio = s.id_servicio
+            AND st.id_sucursal = $2::uuid
+            AND st.id_empleado IS NULL
+            AND st.deleted_at IS NULL
+            AND st.activo IS TRUE
+        ) AS disponible_en_sucursal
+      FROM public.servicios s
+      WHERE s.id_servicio = $1::uuid
+        AND s.deleted_at IS NULL
+        AND COALESCE(s.activo, TRUE) IS TRUE
+      LIMIT 1
+    `,
+    [idServicio, idSucursal]
+  );
+
+  if (!rows[0]) {
+    throw new AppError(404, "El servicio objetivo no existe o no esta activo", {
+      code: "CONFIG_PROMOTION_SERVICE_NOT_FOUND",
+    });
+  }
+
+  if (!rows[0].disponible_en_sucursal) {
+    throw new AppError(409, "El servicio objetivo no esta disponible en la sucursal indicada", {
+      code: "CONFIG_PROMOTION_SERVICE_NOT_AVAILABLE_IN_BRANCH",
+    });
+  }
+}
+
+async function ensurePromotionPackageTargetAvailable(client, idPaquete, idSucursal) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        p.id_paquete,
+        EXISTS (
+          SELECT 1
+          FROM public.paquetes_sucursal ps
+          WHERE ps.id_paquete = p.id_paquete
+            AND ps.id_sucursal = $2::uuid
+            AND ps.activo IS TRUE
+        ) AS disponible_en_sucursal
+      FROM public.paquetes p
+      WHERE p.id_paquete = $1::uuid
+        AND p.deleted_at IS NULL
+        AND COALESCE(p.activo, TRUE) IS TRUE
+      LIMIT 1
+    `,
+    [idPaquete, idSucursal]
+  );
+
+  if (!rows[0]) {
+    throw new AppError(404, "El paquete objetivo no existe o no esta activo", {
+      code: "CONFIG_PROMOTION_PACKAGE_NOT_FOUND",
+    });
+  }
+
+  if (!rows[0].disponible_en_sucursal) {
+    throw new AppError(409, "El paquete objetivo no esta disponible en la sucursal indicada", {
+      code: "CONFIG_PROMOTION_PACKAGE_NOT_AVAILABLE_IN_BRANCH",
+    });
+  }
+}
+
+async function validatePromotionBusinessRules(client, values) {
+  // JK: Valida coherencia funcional y disponibilidad real del objetivo antes de persistir.
+  validatePromotionBusinessConsistency(values);
+  if (values.aplica_a === "servicio") {
+    await ensurePromotionServiceTargetAvailable(client, values.id_servicio_objetivo, values.id_sucursal);
+    return;
+  }
+  await ensurePromotionPackageTargetAvailable(client, values.id_paquete_objetivo, values.id_sucursal);
+}
+
 function mapPromotionRow(row) {
   return {
     id_promocion: row.id_promocion,
@@ -1427,10 +1788,22 @@ function mapPromotionRow(row) {
     imagen_mobile_path: row.imagen_mobile_path ?? null,
     imagen_mobile_url: row.imagen_mobile_url ?? null,
     imagen_alt: row.imagen_alt ?? null,
+    tipo_promocion: row.tipo_promocion,
+    aplica_a: row.aplica_a,
+    mecanica: row.mecanica,
+    id_servicio_objetivo: row.id_servicio_objetivo ?? null,
+    id_paquete_objetivo: row.id_paquete_objetivo ?? null,
+    valor_descuento: row.valor_descuento == null ? null : Number(row.valor_descuento),
+    cantidad_requerida: row.cantidad_requerida == null ? null : Number(row.cantidad_requerida),
+    cantidad_bonificada: row.cantidad_bonificada == null ? null : Number(row.cantidad_bonificada),
+    resumen_promocion: row.resumen_promocion || construirResumenPromocion(row),
     estado: row.estado,
     visible_publico: Boolean(row.visible_publico),
     vigencia_desde: row.vigencia_desde ?? null,
     vigencia_hasta: row.vigencia_hasta ?? null,
+    // JK: Devuelve horas de vigencia para que frontend pueda editar sin perder datos.
+    vigencia_hora_desde: row.vigencia_hora_desde ?? null,
+    vigencia_hora_hasta: row.vigencia_hora_hasta ?? null,
     orden_visual: Number(row.orden_visual ?? 100),
     destacada: Boolean(row.destacada),
     created_at: row.created_at ?? null,
@@ -1458,10 +1831,21 @@ async function getPromotionScoped(client, idPromocion, idSucursal) {
         p.cta_texto,
         p.cta_url,
         p.cta_tipo,
+        p.tipo_promocion,
+        p.aplica_a,
+        p.mecanica,
+        p.id_servicio_objetivo,
+        p.id_paquete_objetivo,
+        p.valor_descuento,
+        p.cantidad_requerida,
+        p.cantidad_bonificada,
         p.estado,
         ps.visible_publico,
         ps.vigencia_desde,
         ps.vigencia_hasta,
+        /* // JK: Se incluye vigencia por hora para soportar ventana horaria desde backend. */
+        ps.vigencia_hora_desde,
+        ps.vigencia_hora_hasta,
         ps.orden_visual,
         ps.destacada,
         p.created_at,
@@ -1475,7 +1859,8 @@ async function getPromotionScoped(client, idPromocion, idSucursal) {
     `,
     [idPromocion, idSucursal]
   );
-  return rows[0] ?? null;
+  const row = rows[0] ?? null;
+  return row ? { ...row, resumen_promocion: construirResumenPromocion(row) } : null;
 }
 
 async function listPromotions(client, idSucursal = null) {
@@ -1498,10 +1883,21 @@ async function listPromotions(client, idSucursal = null) {
         p.cta_texto,
         p.cta_url,
         p.cta_tipo,
+        p.tipo_promocion,
+        p.aplica_a,
+        p.mecanica,
+        p.id_servicio_objetivo,
+        p.id_paquete_objetivo,
+        p.valor_descuento,
+        p.cantidad_requerida,
+        p.cantidad_bonificada,
         p.estado,
         ps.visible_publico,
         ps.vigencia_desde,
         ps.vigencia_hasta,
+        /* // JK: Se incluye vigencia por hora para soportar ventana horaria desde backend. */
+        ps.vigencia_hora_desde,
+        ps.vigencia_hora_hasta,
         ps.orden_visual,
         ps.destacada,
         p.created_at,
@@ -1518,7 +1914,7 @@ async function listPromotions(client, idSucursal = null) {
     `,
     [idSucursal]
   );
-  return rows.map(mapPromotionRow);
+  return rows.map((row) => mapPromotionRow({ ...row, resumen_promocion: construirResumenPromocion(row) }));
 }
 
 function validatePromotionPublication(values) {
@@ -1531,6 +1927,22 @@ function validatePromotionPublication(values) {
   if (values.vigencia_desde && values.vigencia_hasta && values.vigencia_hasta < values.vigencia_desde) {
     throw new AppError(400, "vigencia_hasta no puede ser menor que vigencia_desde", {
       code: "CONFIG_PROMOTION_VIGENCY_INVALID",
+    });
+  }
+
+  // JK: Si la promocion aplica el mismo dia y ambas horas existen, la hora final debe ser mayor.
+  const vigenciaHoraDesdeSeconds = promotionTimeToSeconds(values.vigencia_hora_desde);
+  const vigenciaHoraHastaSeconds = promotionTimeToSeconds(values.vigencia_hora_hasta);
+  if (
+    values.vigencia_desde
+    && values.vigencia_hasta
+    && values.vigencia_desde === values.vigencia_hasta
+    && vigenciaHoraDesdeSeconds !== null
+    && vigenciaHoraHastaSeconds !== null
+    && vigenciaHoraHastaSeconds <= vigenciaHoraDesdeSeconds
+  ) {
+    throw new AppError(400, "Cuando vigencia_desde y vigencia_hasta son iguales, vigencia_hora_hasta debe ser mayor que vigencia_hora_desde", {
+      code: "CONFIG_PROMOTION_VIGENCY_TIME_INVALID",
     });
   }
 
@@ -1629,6 +2041,41 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     request.log.error({ err: error }, "Migracion de promociones faltante en modulo configuracion");
     return sendError(reply, 500, "Falta aplicar migracion de PROMOCIONES multi-sucursal en la base de datos", {
       code: "CONFIG_PROMOTIONS_MIGRATION_REQUIRED",
+      requestId: request.id,
+    });
+  }
+
+  if (
+    error?.code === "42703" &&
+    (
+      String(error?.message || "").includes("vigencia_hora_desde")
+      || String(error?.message || "").includes("vigencia_hora_hasta")
+    )
+  ) {
+    // JK: Mensaje especifico para despliegues donde aun no se aplica la migracion de horas.
+    request.log.error({ err: error }, "Migracion de vigencia horaria faltante en promociones");
+    return sendError(reply, 500, "Falta aplicar migracion de vigencia por hora en promociones", {
+      code: "CONFIG_PROMOTION_TIME_MIGRATION_REQUIRED",
+      requestId: request.id,
+    });
+  }
+
+  if (
+    error?.code === "42703" &&
+    (
+      String(error?.message || "").includes("tipo_promocion")
+      || String(error?.message || "").includes("aplica_a")
+      || String(error?.message || "").includes("mecanica")
+      || String(error?.message || "").includes("id_servicio_objetivo")
+      || String(error?.message || "").includes("id_paquete_objetivo")
+      || String(error?.message || "").includes("valor_descuento")
+      || String(error?.message || "").includes("cantidad_requerida")
+      || String(error?.message || "").includes("cantidad_bonificada")
+    )
+  ) {
+    request.log.error({ err: error }, "Migracion operativa de promociones faltante");
+    return sendError(reply, 500, "Falta aplicar migracion de logica operativa en promociones", {
+      code: "CONFIG_PROMOTION_LOGIC_MIGRATION_REQUIRED",
       requestId: request.id,
     });
   }
@@ -2951,8 +3398,19 @@ export default async function adminConfiguracionRoutes(app) {
         const visiblePublico = Boolean(request.body.visible_publico ?? false);
         const vigenciaDesde = normalizeDateOnly(request.body.vigencia_desde) ?? null;
         const vigenciaHasta = normalizeDateOnly(request.body.vigencia_hasta) ?? null;
+        // JK: Normaliza horas de vigencia opcionales para guardar un formato consistente en DB.
+        const vigenciaHoraDesde = normalizeTimeOnly(request.body.vigencia_hora_desde, "vigencia_hora_desde") ?? null;
+        const vigenciaHoraHasta = normalizeTimeOnly(request.body.vigencia_hora_hasta, "vigencia_hora_hasta") ?? null;
         const ordenVisual = Number.isFinite(Number(request.body.orden_visual)) ? Number(request.body.orden_visual) : 100;
         const destacada = Boolean(request.body.destacada ?? false);
+        const tipoPromocion = normalizePromotionType(request.body.tipo_promocion);
+        const aplicaA = normalizePromotionTarget(request.body.aplica_a);
+        const mecanica = normalizePromotionMechanic(request.body.mecanica);
+        const idServicioObjetivo = normalizePromotionOptionalUuid(request.body.id_servicio_objetivo);
+        const idPaqueteObjetivo = normalizePromotionOptionalUuid(request.body.id_paquete_objetivo);
+        const valorDescuento = normalizePromotionOptionalNumber(request.body.valor_descuento, "valor_descuento");
+        const cantidadRequerida = normalizePromotionOptionalInteger(request.body.cantidad_requerida, "cantidad_requerida");
+        const cantidadBonificada = normalizePromotionOptionalInteger(request.body.cantidad_bonificada, "cantidad_bonificada");
 
         const publicationSnapshot = {
           titulo,
@@ -2962,9 +3420,22 @@ export default async function adminConfiguracionRoutes(app) {
           visible_publico: visiblePublico,
           vigencia_desde: vigenciaDesde,
           vigencia_hasta: vigenciaHasta,
+          vigencia_hora_desde: vigenciaHoraDesde,
+          vigencia_hora_hasta: vigenciaHoraHasta,
           orden_visual: ordenVisual,
         };
         validatePromotionPublication(publicationSnapshot);
+        await validatePromotionBusinessRules(client, {
+          id_sucursal: branchId,
+          tipo_promocion: tipoPromocion,
+          aplica_a: aplicaA,
+          mecanica,
+          id_servicio_objetivo: idServicioObjetivo,
+          id_paquete_objetivo: idPaqueteObjetivo,
+          valor_descuento: valorDescuento,
+          cantidad_requerida: cantidadRequerida,
+          cantidad_bonificada: cantidadBonificada,
+        });
 
         await ensurePromotionSlugUnique(client, slug);
         await ensureFeaturedPromotionConflict(client, {
@@ -2994,10 +3465,18 @@ export default async function adminConfiguracionRoutes(app) {
               cta_texto,
               cta_url,
               cta_tipo,
+              tipo_promocion,
+              aplica_a,
+              mecanica,
+              id_servicio_objetivo,
+              id_paquete_objetivo,
+              valor_descuento,
+              cantidad_requerida,
+              cantidad_bonificada,
               estado,
               updated_at
             )
-            VALUES ($1, $2, $3, $4::jsonb, $5::uuid, $6, $7, $8::uuid, $9, $10, $11, NULL, NULL, 'none', $12, NOW())
+            VALUES ($1, $2, $3, $4::jsonb, $5::uuid, $6, $7, $8::uuid, $9, $10, $11, NULL, NULL, 'none', $12, $13, $14, $15::uuid, $16::uuid, $17, $18::int, $19::int, $20, NOW())
             RETURNING id_promocion
           `,
           [
@@ -3012,6 +3491,14 @@ export default async function adminConfiguracionRoutes(app) {
             imagenMobilePath,
             imagenMobileUrl,
             imagenAlt,
+            tipoPromocion,
+            aplicaA,
+            mecanica,
+            idServicioObjetivo,
+            idPaqueteObjetivo,
+            valorDescuento,
+            cantidadRequerida,
+            cantidadBonificada,
             estado,
           ]
         );
@@ -3049,13 +3536,16 @@ export default async function adminConfiguracionRoutes(app) {
               visible_publico,
               vigencia_desde,
               vigencia_hasta,
+              /* // JK: Persistencia de ventana horaria opcional de vigencia. */
+              vigencia_hora_desde,
+              vigencia_hora_hasta,
               orden_visual,
               destacada,
               updated_at
             )
-            VALUES ($1::uuid, $2::uuid, $3::boolean, $4::date, $5::date, $6::int, $7::boolean, NOW())
+            VALUES ($1::uuid, $2::uuid, $3::boolean, $4::date, $5::date, $6::time, $7::time, $8::int, $9::boolean, NOW())
           `,
-          [idPromocion, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, ordenVisual, destacada]
+          [idPromocion, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, vigenciaHoraDesde, vigenciaHoraHasta, ordenVisual, destacada]
         );
 
         const finalPromotion = await getPromotionScoped(client, idPromocion, branchId);
@@ -3228,6 +3718,15 @@ export default async function adminConfiguracionRoutes(app) {
           request.body.vigencia_hasta !== undefined
             ? normalizeDateOnly(request.body.vigencia_hasta)
             : currentPromotion.vigencia_hasta;
+        // JK: Mantiene/normaliza horas en edicion para no perder ventana horaria previa.
+        const vigenciaHoraDesde =
+          request.body.vigencia_hora_desde !== undefined
+            ? normalizeTimeOnly(request.body.vigencia_hora_desde, "vigencia_hora_desde")
+            : currentPromotion.vigencia_hora_desde;
+        const vigenciaHoraHasta =
+          request.body.vigencia_hora_hasta !== undefined
+            ? normalizeTimeOnly(request.body.vigencia_hora_hasta, "vigencia_hora_hasta")
+            : currentPromotion.vigencia_hora_hasta;
         const ordenVisual =
           request.body.orden_visual !== undefined
             ? Number(request.body.orden_visual)
@@ -3236,6 +3735,29 @@ export default async function adminConfiguracionRoutes(app) {
           request.body.destacada !== undefined
             ? Boolean(request.body.destacada)
             : Boolean(currentPromotion.destacada);
+        const tipoPromocion = normalizePromotionType(request.body.tipo_promocion, currentPromotion.tipo_promocion);
+        const aplicaA = normalizePromotionTarget(request.body.aplica_a, currentPromotion.aplica_a);
+        const mecanica = normalizePromotionMechanic(request.body.mecanica, currentPromotion.mecanica);
+        const idServicioObjetivo =
+          request.body.id_servicio_objetivo !== undefined
+            ? normalizePromotionOptionalUuid(request.body.id_servicio_objetivo)
+            : normalizePromotionOptionalUuid(currentPromotion.id_servicio_objetivo);
+        const idPaqueteObjetivo =
+          request.body.id_paquete_objetivo !== undefined
+            ? normalizePromotionOptionalUuid(request.body.id_paquete_objetivo)
+            : normalizePromotionOptionalUuid(currentPromotion.id_paquete_objetivo);
+        const valorDescuento =
+          request.body.valor_descuento !== undefined
+            ? normalizePromotionOptionalNumber(request.body.valor_descuento, "valor_descuento")
+            : normalizePromotionOptionalNumber(currentPromotion.valor_descuento, "valor_descuento");
+        const cantidadRequerida =
+          request.body.cantidad_requerida !== undefined
+            ? normalizePromotionOptionalInteger(request.body.cantidad_requerida, "cantidad_requerida")
+            : normalizePromotionOptionalInteger(currentPromotion.cantidad_requerida, "cantidad_requerida");
+        const cantidadBonificada =
+          request.body.cantidad_bonificada !== undefined
+            ? normalizePromotionOptionalInteger(request.body.cantidad_bonificada, "cantidad_bonificada")
+            : normalizePromotionOptionalInteger(currentPromotion.cantidad_bonificada, "cantidad_bonificada");
 
         const publicationSnapshot = {
           titulo,
@@ -3245,9 +3767,22 @@ export default async function adminConfiguracionRoutes(app) {
           visible_publico: visiblePublico,
           vigencia_desde: vigenciaDesde,
           vigencia_hasta: vigenciaHasta,
+          vigencia_hora_desde: vigenciaHoraDesde,
+          vigencia_hora_hasta: vigenciaHoraHasta,
           orden_visual: ordenVisual,
         };
         validatePromotionPublication(publicationSnapshot);
+        await validatePromotionBusinessRules(client, {
+          id_sucursal: branchId,
+          tipo_promocion: tipoPromocion,
+          aplica_a: aplicaA,
+          mecanica,
+          id_servicio_objetivo: idServicioObjetivo,
+          id_paquete_objetivo: idPaqueteObjetivo,
+          valor_descuento: valorDescuento,
+          cantidad_requerida: cantidadRequerida,
+          cantidad_bonificada: cantidadBonificada,
+        });
 
         await ensurePromotionSlugUnique(client, slug, request.params.id);
         await ensureFeaturedPromotionConflict(client, {
@@ -3304,6 +3839,14 @@ export default async function adminConfiguracionRoutes(app) {
               cta_url = NULL,
               cta_tipo = 'none',
               estado = $13,
+              tipo_promocion = $14,
+              aplica_a = $15,
+              mecanica = $16,
+              id_servicio_objetivo = $17::uuid,
+              id_paquete_objetivo = $18::uuid,
+              valor_descuento = $19,
+              cantidad_requerida = $20::int,
+              cantidad_bonificada = $21::int,
               updated_at = NOW()
             WHERE id_promocion = $1::uuid
           `,
@@ -3321,6 +3864,14 @@ export default async function adminConfiguracionRoutes(app) {
             imagenMobileUrl,
             imagenAlt,
             estado,
+            tipoPromocion,
+            aplicaA,
+            mecanica,
+            idServicioObjetivo,
+            idPaqueteObjetivo,
+            valorDescuento,
+            cantidadRequerida,
+            cantidadBonificada,
           ]
         );
 
@@ -3331,13 +3882,16 @@ export default async function adminConfiguracionRoutes(app) {
               visible_publico = $3::boolean,
               vigencia_desde = $4::date,
               vigencia_hasta = $5::date,
-              orden_visual = $6::int,
-              destacada = $7::boolean,
+              /* // JK: Persistencia de ventana horaria opcional de vigencia. */
+              vigencia_hora_desde = $6::time,
+              vigencia_hora_hasta = $7::time,
+              orden_visual = $8::int,
+              destacada = $9::boolean,
               updated_at = NOW()
             WHERE id_promocion = $1::uuid
               AND id_sucursal = $2::uuid
           `,
-          [request.params.id, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, ordenVisual, destacada]
+          [request.params.id, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, vigenciaHoraDesde, vigenciaHoraHasta, ordenVisual, destacada]
         );
 
         const finalPromotion = await getPromotionScoped(client, request.params.id, branchId);
