@@ -126,6 +126,16 @@ export function globalErrorHandler(error, request, reply) {
     });
   }
 
+  // AM: Fastify rate-limit puede propagar un payload estructurado sin statusCode
+  // al handler global. Si no lo normalizamos aqui, termina en 500.
+  if (error && typeof error === "object" && error.error?.code === "RATE_LIMIT_EXCEEDED") {
+    return sendError(reply, 429, "Demasiadas solicitudes. Intenta mas tarde.", {
+      code: "RATE_LIMIT_EXCEEDED",
+      requestId: request.id,
+      exposeDetails: false,
+    });
+  }
+
   const statusCode = error.statusCode || 500;
   request.log.error(error);
 
