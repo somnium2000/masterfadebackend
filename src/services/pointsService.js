@@ -5,6 +5,10 @@ import { assertUuid } from "./agendaService.js";
 const DEFAULT_PUNTOS_PARA_PREMIO = 10;
 const HISTORIAL_DEFAULT_LIMIT = 20;
 const HISTORIAL_MAX_LIMIT = 100;
+const CLIENT_SEARCH_MIN_LENGTH = 2;
+const CLIENT_SEARCH_MAX_LENGTH = 80;
+const CLIENT_SEARCH_DEFAULT_LIMIT = 10;
+const CLIENT_SEARCH_MAX_LIMIT = 20;
 const REWARD_SERVICE_NAMES_NO_PLAN = ["corte de cabello", "corte de barba"];
 const REWARD_SERVICE_NAMES_WITH_PLAN = ["facial express"];
 const REDEEM_CONTEXT_TOKEN_PREFIX = "mf_reward_ctx_v1";
@@ -122,6 +126,16 @@ function resolveHistoryLimit(limit) {
   const parsed = Number(limit);
   if (!Number.isFinite(parsed)) return HISTORIAL_DEFAULT_LIMIT;
   return Math.max(1, Math.min(Math.trunc(parsed), HISTORIAL_MAX_LIMIT));
+}
+
+function normalizeClientSearchQuery(value) {
+  return normalizeText(value).replace(/\s+/g, " ");
+}
+
+function resolveClientSearchLimit(limit) {
+  const parsed = Number(limit);
+  if (!Number.isFinite(parsed)) return CLIENT_SEARCH_DEFAULT_LIMIT;
+  return Math.max(1, Math.min(Math.trunc(parsed), CLIENT_SEARCH_MAX_LIMIT));
 }
 
 function sanitizeMovimientoRow(row) {
@@ -424,6 +438,87 @@ function assertMotivoObligatorio(motivo, field = "motivo") {
     });
   }
   return normalized;
+}
+
+export async function searchActiveClientesForAdminPoints(app, { q, limit } = {}) {
+  if (!app?.db) {
+    throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
+  }
+
+  const query = normalizeClientSearchQuery(q);
+  if (!query || query.length < CLIENT_SEARCH_MIN_LENGTH) {
+    return { clientes: [] };
+  }
+  if (query.length > CLIENT_SEARCH_MAX_LENGTH) {
+    throw new AppError(400, "La busqueda de cliente excede el maximo permitido", {
+      code: "POINTS_CLIENT_SEARCH_QUERY_TOO_LONG",
+      details: { max_length: CLIENT_SEARCH_MAX_LENGTH },
+    });
+  }
+
+  const safeLimit = resolveClientSearchLimit(limit);
+  const queryLower = query.toLowerCase();
+  const containsPattern = `%${queryLower}%`;
+  const startsWithPattern = `${queryLower}%`;
+
+  const { rows } = await app.db.query(
+    `
+      SELECT
+        c.id_cliente,
+        TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, ''))) AS nombre_cliente,
+        COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo,
+        NULLIF(p.telefono_principal, '') AS telefono,
+        c.id_usuario
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+      JOIN public.usuarios u
+        ON u.id_usuario = c.id_usuario
+        AND u.deleted_at IS NULL
+      LEFT JOIN auth.users au
+        ON au.id = c.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      WHERE c.deleted_at IS NULL
+        AND COALESCE(c.estado, TRUE) IS TRUE
+        AND c.id_usuario IS NOT NULL
+        AND COALESCE(u.estado, TRUE) IS TRUE
+        AND COALESCE(u.estado_acceso, 'pendiente_password') NOT IN ('bloqueado', 'inactivo')
+        AND (
+          LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $1::text
+          OR LOWER(COALESCE(p.telefono_principal, '')) LIKE $1::text
+          OR LOWER(COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, ''), '')) LIKE $1::text
+        )
+      ORDER BY
+        CASE
+          WHEN LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $2::text THEN 0
+          WHEN LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $1::text THEN 1
+          WHEN LOWER(COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, ''), '')) LIKE $1::text THEN 2
+          WHEN LOWER(COALESCE(p.telefono_principal, '')) LIKE $1::text THEN 3
+          ELSE 4
+        END,
+        LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) ASC,
+        c.id_cliente ASC
+      LIMIT $3::int
+    `,
+    [containsPattern, startsWithPattern, safeLimit]
+  );
+
+  return {
+    clientes: rows.map((row) => ({
+      id_cliente: row.id_cliente,
+      nombre_cliente: row.nombre_cliente || "Cliente",
+      correo: row.correo || null,
+      telefono: row.telefono || null,
+      id_usuario: row.id_usuario || null,
+    })),
+  };
 }
 
 function assertIntegerPoints(value) {

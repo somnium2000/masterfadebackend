@@ -3,6 +3,7 @@ import { sendOk } from "../../../utils/response.js";
 import {
   addManualPointsAdjustment,
   getClientePointsSummary,
+  searchActiveClientesForAdminPoints,
 } from "../../../services/pointsService.js";
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
@@ -27,6 +28,16 @@ const ajusteBodySchema = {
   additionalProperties: false,
 };
 
+const buscarClientesQuerySchema = {
+  type: "object",
+  properties: {
+    q: { type: "string", minLength: 0, maxLength: 80 },
+    limit: { type: ["integer", "string"] },
+  },
+  required: ["q"],
+  additionalProperties: false,
+};
+
 function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -44,6 +55,60 @@ function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
 }
 
 export default async function adminPointsRoutes(app) {
+  app.get(
+    "/clientes/buscar",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        querystring: buscarClientesQuerySchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  clientes: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        id_cliente: { type: "string", format: "uuid" },
+                        nombre_cliente: { type: "string" },
+                        correo: { type: ["string", "null"] },
+                        telefono: { type: ["string", "null"] },
+                        id_usuario: { type: ["string", "null"], format: "uuid" },
+                      },
+                      required: ["id_cliente", "nombre_cliente", "correo", "telefono", "id_usuario"],
+                      additionalProperties: false,
+                    },
+                  },
+                },
+                required: ["clientes"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await searchActiveClientesForAdminPoints(app, {
+          q: request.query?.q,
+          limit: request.query?.limit,
+        });
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo buscar clientes activos", "ADMIN_POINTS_CLIENT_SEARCH_ERROR");
+      }
+    }
+  );
+
   app.get(
     "/clientes/:id_cliente/resumen",
     {
