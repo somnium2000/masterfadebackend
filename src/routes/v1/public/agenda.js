@@ -127,6 +127,18 @@ const curatedPeriodSchema = {
 };
 
 function sendHandled(reply, request, error, message, code) {
+  const errorCode = String(error?.code || "").trim().toUpperCase();
+  const errorMessage = String(error?.message || "");
+  const isPoolSaturated = errorCode === "53300"
+    || errorMessage.includes("MAXCONNSESSION")
+    || /too many clients/i.test(errorMessage)
+    || /max clients reached/i.test(errorMessage);
+  if (isPoolSaturated) {
+    return sendError(reply, 503, "Servicio de agenda temporalmente saturado. Intenta nuevamente en unos minutos.", {
+      code: "PUBLIC_AGENDA_DB_POOL_SATURATED",
+      requestId: request.id,
+    });
+  }
   if (error instanceof AppError) {
     request.log.warn(
       {
@@ -167,6 +179,21 @@ function mapDiscardedReasonSummary(discarded) {
   return Array.from(counts.entries()).map(([code, count]) => ({ code, count }));
 }
 
+async function expireReservationsBestEffort(app, request, dbClient = null) {
+  try {
+    await expireStaleAppointmentReservations(dbClient || app.db, { logger: request.log });
+  } catch (error) {
+    request.log.warn(
+      {
+        requestId: request.id,
+        code: error?.code || null,
+        message: error?.message || null,
+      },
+      "No se pudieron expirar reservas vencidas en agenda publica; se continua con la consulta"
+    );
+  }
+}
+
 export default async function publicAgendaRoutes(app) {
   app.get(
     "/barberos",
@@ -200,20 +227,24 @@ export default async function publicAgendaRoutes(app) {
           },
           400: errorResponseSchema,
           404: errorResponseSchema,
+          503: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
+      const dbClient = await app.db.connect();
       try {
-        await expireStaleAppointmentReservations(app.db, { logger: request.log });
+        await expireReservationsBestEffort(app, request, dbClient);
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
-        const barberos = await listBarbersForBranch(app.db, idSucursal);
+        const barberos = await listBarbersForBranch(dbClient, idSucursal);
         return sendOk(reply, {
           barberos: mapBarbersForResponse(barberos),
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo consultar el catalogo de barberos", "PUBLIC_AGENDA_BARBERS_ERROR");
+      } finally {
+        dbClient.release();
       }
     }
   );
@@ -259,13 +290,15 @@ export default async function publicAgendaRoutes(app) {
           400: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          503: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
+      const dbClient = await app.db.connect();
       try {
-        await expireStaleAppointmentReservations(app.db, { logger: request.log });
+        await expireReservationsBestEffort(app, request, dbClient);
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
@@ -280,7 +313,7 @@ export default async function publicAgendaRoutes(app) {
         if (diffDays > 60) {
           throw new AppError(400, "El rango de fechas no puede superar los 60 dias", { code: "PUBLIC_AGENDA_DATE_RANGE_TOO_LARGE" });
         }
-        const serviceSelection = await getBookingSelectionDetails(app.db, {
+        const serviceSelection = await getBookingSelectionDetails(dbClient, {
           id_sucursal: idSucursal,
           selection_type: request.query?.selection_type,
           servicios: request.query?.servicios,
@@ -288,7 +321,7 @@ export default async function publicAgendaRoutes(app) {
           id_barbero: idBarbero,
         });
         const disponibilidad = await listAvailabilityByDateRange(
-          app.db,
+          dbClient,
           idSucursal,
           serviceSelection,
           fechaDesde,
@@ -303,6 +336,8 @@ export default async function publicAgendaRoutes(app) {
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo calcular disponibilidad", "PUBLIC_AGENDA_AVAILABILITY_ERROR");
+      } finally {
+        dbClient.release();
       }
     }
   );
@@ -382,19 +417,21 @@ export default async function publicAgendaRoutes(app) {
           400: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          503: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
+      const dbClient = await app.db.connect();
       try {
-        await expireStaleAppointmentReservations(app.db, { logger: request.log });
+        await expireReservationsBestEffort(app, request, dbClient);
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
         const fecha = parseDateOnly(request.query?.fecha, "fecha");
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
-        const minSellableDurationMin = await getMinSellableServiceMinutes(app.db);
+        const minSellableDurationMin = await getMinSellableServiceMinutes(dbClient);
         const includeDebug = canExposeSlotDebug(request);
-        const serviceSelection = await getBookingSelectionDetails(app.db, {
+        const serviceSelection = await getBookingSelectionDetails(dbClient, {
           id_sucursal: idSucursal,
           selection_type: request.query?.selection_type,
           servicios: request.query?.servicios,
@@ -404,7 +441,7 @@ export default async function publicAgendaRoutes(app) {
         const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
         if (idBarbero) {
-          const availability = await buildDayAvailability(app.db, idSucursal, serviceSelection, fecha, idBarbero, {
+          const availability = await buildDayAvailability(dbClient, idSucursal, serviceSelection, fecha, idBarbero, {
             minSellableDurationMin,
             includeDiscardReasons: includeDebug,
           });
@@ -442,11 +479,11 @@ export default async function publicAgendaRoutes(app) {
           });
         }
 
-        const result = await findFirstAvailableBarber(app.db, idSucursal, fecha, serviceTotalMinutes, {
+        const result = await findFirstAvailableBarber(dbClient, idSucursal, fecha, serviceTotalMinutes, {
           minSellableDurationMin,
         });
         const bounds = result?.barber
-          ? await getBarberScheduleBounds(app.db, result.barber.id_empleado, fecha)
+          ? await getBarberScheduleBounds(dbClient, result.barber.id_empleado, fecha)
           : { hora_inicio: null, hora_fin: null };
         const horarios = mapSlotsForResponse(result?.slots ?? [], {
           duracion_visible_min: serviceSelection.duracion_total_min,
@@ -476,6 +513,8 @@ export default async function publicAgendaRoutes(app) {
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudieron consultar los horarios del dia", "PUBLIC_AGENDA_SLOTS_ERROR");
+      } finally {
+        dbClient.release();
       }
     }
   );

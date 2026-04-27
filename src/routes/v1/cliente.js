@@ -13,6 +13,7 @@ import {
   confirmMembershipPaymentAndActivateSubscription,
   acquireMembershipPlan,
   cancelMembership,
+  cancelMembershipBySubscription,
   getClienteMembershipState,
   registerSubscriptionAlertEvent,
 } from "../../services/membershipService.js";
@@ -409,6 +410,42 @@ async function getClienteMailContext(client, clienteId) {
       LIMIT 1
     `,
     [clienteId]
+  );
+
+  return rows?.[0] ?? null;
+}
+
+async function getMembershipSubscriptionMailSummary(client, {
+  clienteId,
+  idSuscripcion,
+} = {}) {
+  const safeClienteId = String(clienteId || "").trim();
+  const safeSubscriptionId = String(idSuscripcion || "").trim();
+  if (!safeClienteId || !safeSubscriptionId) return null;
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_suscripcion,
+        s.inicio_at,
+        s.fin_at,
+        mp.nombre_plan,
+        COALESCE(mpo.total_hnl, mpo.subtotal_hnl, 0)::numeric AS total_pagado_hnl
+      FROM public.subscriptions s
+      JOIN public.membership_plans mp
+        ON mp.id_plan = s.id_plan
+      LEFT JOIN LATERAL (
+        SELECT mo.total_hnl, mo.subtotal_hnl
+        FROM public.membership_purchase_orders mo
+        WHERE mo.id_suscripcion = s.id_suscripcion
+        ORDER BY mo.created_at DESC
+        LIMIT 1
+      ) mpo ON TRUE
+      WHERE s.id_suscripcion = $1::uuid
+        AND s.id_cliente = $2::uuid
+      LIMIT 1
+    `,
+    [safeSubscriptionId, safeClienteId]
   );
 
   return rows?.[0] ?? null;
@@ -882,8 +919,9 @@ export default async function clienteRoutes(app) {
                 properties: {
                   id_suscripcion: { type: "string", format: "uuid" },
                   estado: { type: "string" },
+                  email_enviado: { type: "boolean" },
                 },
-                required: ["id_suscripcion", "estado"],
+                required: ["id_suscripcion", "estado", "email_enviado"],
                 additionalProperties: false,
               },
               requestId: requestIdSchema,
@@ -911,7 +949,41 @@ export default async function clienteRoutes(app) {
         await client.query("COMMIT");
         txStarted = false;
 
-        return sendOk(reply, confirmation, { requestId: request.id });
+        let emailEnviado = false;
+        try {
+          if (app.mailer?.configured && confirmation?.id_suscripcion) {
+            const [mailContext, summary] = await Promise.all([
+              getClienteMailContext(client, context.clienteId),
+              getMembershipSubscriptionMailSummary(client, {
+                clienteId: context.clienteId,
+                idSuscripcion: confirmation.id_suscripcion,
+              }),
+            ]);
+
+            if (mailContext?.correo_principal && summary?.nombre_plan) {
+              const delivery = await app.mailer.sendMembershipPlanAcquiredEmail({
+                to: mailContext.correo_principal,
+                fullName: mailContext.nombre_completo,
+                planName: summary.nombre_plan,
+                startAt: summary.inicio_at,
+                endAt: summary.fin_at,
+                amountHnl: Number(summary.total_pagado_hnl || 0),
+              });
+              emailEnviado = Boolean(delivery?.sent);
+            }
+          }
+        } catch (mailError) {
+          request.log.warn(
+            { err: mailError, id_suscripcion: confirmation?.id_suscripcion, id_cliente: context.clienteId },
+            "No se pudo enviar correo de activacion de plan"
+          );
+          emailEnviado = false;
+        }
+
+        return sendOk(reply, {
+          ...confirmation,
+          email_enviado: emailEnviado,
+        }, { requestId: request.id });
       } catch (error) {
         if (txStarted) {
           await client.query("ROLLBACK").catch(() => {});
@@ -1107,6 +1179,75 @@ export default async function clienteRoutes(app) {
           error,
           "No se pudo cancelar la membresía",
           "CLIENTE_MEMBERSHIP_CANCEL_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.patch(
+    "/planes/:id_suscripcion/cancelar",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_suscripcion"],
+          properties: {
+            id_suscripcion: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_suscripcion: { type: "string", format: "uuid" },
+                  estado_suscripcion_codigo: { type: "string" },
+                },
+                required: ["id_suscripcion", "estado_suscripcion_codigo"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const cancelled = await cancelMembershipBySubscription(client, {
+          clienteId: context.clienteId,
+          idSuscripcion: request.params.id_suscripcion,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+        return sendOk(reply, cancelled, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo cancelar la suscripcion del plan",
+          "CLIENTE_MEMBERSHIP_CANCEL_BY_SUBSCRIPTION_ERROR"
         );
       } finally {
         client.release();
