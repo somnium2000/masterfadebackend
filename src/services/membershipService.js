@@ -577,7 +577,7 @@ async function getClienteConsumptionRows(client, idCliente, { limit = 40 } = {})
   }
 }
 
-async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false } = {}) {
+async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false, idSucursal = null } = {}) {
   const capabilities = await getMembershipCapabilities(client);
   if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans) return null;
 
@@ -596,6 +596,16 @@ async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false }
     : "1::smallint AS categoria_nivel";
 
   const lockClause = forUpdate ? "FOR UPDATE" : "";
+  const safeSucursalId = normalizeText(idSucursal);
+  const conditions = [
+    "s.id_cliente = $1::uuid",
+    "s.estado_suscripcion_codigo = $2",
+  ];
+  const params = [clienteId, ACTIVE_STATUS];
+  if (safeSucursalId && capabilities.hasSubsSucursalContratada) {
+    params.push(safeSucursalId);
+    conditions.push(`s.id_sucursal_contratada = $${params.length}::uuid`);
+  }
   try {
     const { rows } = await client.query(
       `
@@ -619,13 +629,12 @@ async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false }
         FROM public.subscriptions s
         JOIN public.membership_plans mp
           ON mp.id_plan = s.id_plan
-        WHERE s.id_cliente = $1::uuid
-          AND s.estado_suscripcion_codigo = $2
+        WHERE ${conditions.join("\n          AND ")}
         ORDER BY s.inicio_at DESC, s.created_at DESC
         LIMIT 1
         ${lockClause}
       `,
-      [clienteId, ACTIVE_STATUS]
+      params
     );
     return rows[0] ?? null;
   } catch (error) {
@@ -634,9 +643,9 @@ async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false }
   }
 }
 
-export async function ensureSubscriptionLifecycle(client, clienteId, { forUpdate = false } = {}) {
+export async function ensureSubscriptionLifecycle(client, clienteId, { forUpdate = false, idSucursal = null } = {}) {
   const capabilities = await getMembershipCapabilities(client);
-  const activeRow = await getActiveSubscriptionRow(client, clienteId, { forUpdate });
+  const activeRow = await getActiveSubscriptionRow(client, clienteId, { forUpdate, idSucursal });
   if (!activeRow) {
     return {
       active: null,
@@ -1426,6 +1435,10 @@ async function cancelActiveSubscriptionForSameBranch(client, {
   clienteId,
   sucursalId,
 } = {}) {
+  const safeClienteId = normalizeText(clienteId);
+  const safeSucursalId = normalizeText(sucursalId);
+  if (!safeClienteId || !safeSucursalId) return null;
+
   const capabilities = await getMembershipCapabilities(client);
   if (!capabilities.hasSubscriptions || !capabilities.hasSubsSucursalContratada) return null;
 
@@ -1446,7 +1459,7 @@ async function cancelActiveSubscriptionForSameBranch(client, {
         AND estado_suscripcion_codigo = 'activa'
       RETURNING id_suscripcion
     `,
-    [clienteId, sucursalId]
+    [safeClienteId, safeSucursalId]
   );
   return rows?.[0] ?? null;
 }
@@ -1597,6 +1610,14 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     });
   }
 
+  const orderBranchId = normalizeText(intent.id_sucursal);
+  if (!orderBranchId) {
+    throw new AppError(409, "La orden de membresia no tiene sucursal asociada", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_BRANCH_REQUIRED",
+      details: { id_order: intent.id_order },
+    });
+  }
+
   const intentState = normalizeText(intent.estado_intent_codigo).toLowerCase();
   if (intentState === "confirmado" || normalizeText(intent.estado_orden_codigo).toLowerCase() === "pagada") {
     throw new AppError(409, "El pago de esta orden ya fue procesado", {
@@ -1631,13 +1652,13 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
 
   await cancelActiveSubscriptionForSameBranch(client, {
     clienteId: intent.id_cliente,
-    sucursalId: intent.id_sucursal,
+    sucursalId: orderBranchId,
   });
 
   const createdSubscription = await createSubscriptionFromPaidMembershipOrder(client, {
     clienteId: intent.id_cliente,
     planId: intent.id_plan,
-    sucursalId: intent.id_sucursal,
+    sucursalId: orderBranchId,
     periodoMembresiaCodigo: intent.periodo_membresia_codigo,
     beneficiosRaw: intent.beneficios,
     usuarioCreadorId: safeText(intent.id_usuario) || safeText(intent.created_by_usuario_id) || null,
@@ -1804,6 +1825,113 @@ export async function cancelMembership(client, {
   };
 }
 
+export async function cancelMembershipBySubscription(client, {
+  clienteId,
+  idSuscripcion,
+} = {}) {
+  const safeClienteId = normalizeText(clienteId);
+  const safeIdSuscripcion = normalizeText(idSuscripcion);
+  if (!safeClienteId) {
+    throw new AppError(400, "cliente_id es obligatorio para cancelar la suscripcion", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_CLIENT_REQUIRED",
+    });
+  }
+  if (!safeIdSuscripcion) {
+    throw new AppError(400, "id_suscripcion es obligatorio para cancelar la suscripcion", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_ID_REQUIRED",
+    });
+  }
+
+  await lockClienteMembershipScope(client, safeClienteId);
+  const capabilities = await getMembershipCapabilities(client);
+  const selectSucursalContratada = capabilities.hasSubsSucursalContratada
+    ? "s.id_sucursal_contratada"
+    : "NULL::uuid AS id_sucursal_contratada";
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_suscripcion,
+        s.id_cliente,
+        s.estado_suscripcion_codigo,
+        ${selectSucursalContratada}
+      FROM public.subscriptions s
+      WHERE s.id_suscripcion = $1::uuid
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [safeIdSuscripcion]
+  );
+  const targetSubscription = rows[0] ?? null;
+
+  if (!targetSubscription) {
+    throw new AppError(404, "No se encontro la suscripcion indicada", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_NOT_FOUND",
+      details: { id_suscripcion: safeIdSuscripcion },
+    });
+  }
+
+  if (normalizeText(targetSubscription.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "No puedes cancelar una suscripcion de otro cliente", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_FORBIDDEN",
+    });
+  }
+
+  const currentStatus = normalizeText(targetSubscription.estado_suscripcion_codigo).toLowerCase();
+  if (currentStatus !== ACTIVE_STATUS) {
+    throw new AppError(409, "La suscripcion ya no esta activa", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_NOT_ACTIVE",
+      details: {
+        id_suscripcion: safeIdSuscripcion,
+        estado_suscripcion_codigo: targetSubscription.estado_suscripcion_codigo,
+      },
+    });
+  }
+
+  if (!targetSubscription.id_sucursal_contratada) {
+    throw new AppError(409, "La suscripcion no tiene una sucursal contratada valida", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_BRANCH_REQUIRED",
+      details: { id_suscripcion: safeIdSuscripcion },
+    });
+  }
+
+  const setParts = [
+    "estado_suscripcion_codigo = $2::text",
+    "cancelada_al_fin = TRUE",
+    "updated_at = now()",
+  ];
+  const params = [safeIdSuscripcion, CANCELLED_STATUS];
+  if (capabilities.hasSubsMotivoFin) {
+    setParts.push("motivo_fin_codigo = $3::text");
+    params.push("cancelacion");
+  }
+  const idClienteBindIndex = params.push(safeClienteId);
+
+  const { rows: updatedRows } = await client.query(
+    `
+      UPDATE public.subscriptions
+      SET ${setParts.join(", ")}
+      WHERE id_suscripcion = $1::uuid
+        AND id_cliente = $${idClienteBindIndex}::uuid
+      RETURNING id_suscripcion, estado_suscripcion_codigo
+    `,
+    params
+  );
+
+  const updatedSubscription = updatedRows[0] ?? null;
+  if (!updatedSubscription) {
+    throw new AppError(409, "No se pudo cancelar la suscripcion indicada", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_CONFLICT",
+      details: { id_suscripcion: safeIdSuscripcion },
+    });
+  }
+
+  return {
+    id_suscripcion: updatedSubscription.id_suscripcion,
+    estado_suscripcion_codigo: updatedSubscription.estado_suscripcion_codigo,
+  };
+}
+
 export async function acquireMembershipPlan(client, { clienteId, usuarioId, idPlan, idSucursal }) {
   // AM: Protege entornos con migraci�n parcial devolviendo error de negocio controlado.
   const capabilities = await getMembershipCapabilities(client);
@@ -1814,7 +1942,10 @@ export async function acquireMembershipPlan(client, { clienteId, usuarioId, idPl
   }
 
   await lockClienteMembershipScope(client, clienteId);
-  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, { forUpdate: true });
+  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, {
+    forUpdate: true,
+    idSucursal,
+  });
   const previousActive = lifecycle.active || null;
   let transitionType = "adquisicion";
   let closedPrevious = null;
@@ -2066,12 +2197,75 @@ async function getMembershipPointsSummary(client, clienteId) {
   }
 }
 
+async function listActiveSubscriptionRowsByCliente(client, clienteId, { limit = 20 } = {}) {
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans) return [];
+
+  const maxLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+  const selectMotivo = capabilities.hasSubsMotivoFin ? "s.motivo_fin_codigo" : "NULL::text AS motivo_fin_codigo";
+  const selectSucursalContratada = capabilities.hasSubsSucursalContratada
+    ? "s.id_sucursal_contratada"
+    : "NULL::uuid AS id_sucursal_contratada";
+  const selectBeneficiosSnapshot = capabilities.hasSubsBeneficiosSnapshot
+    ? "s.beneficios_snapshot"
+    : `${EMPTY_SNAPSHOT_SQL_LITERAL}::jsonb AS beneficios_snapshot`;
+  const selectCategoria = capabilities.hasPlanCategoriaNivel
+    ? "mp.categoria_nivel"
+    : "1::smallint AS categoria_nivel";
+  const joinSucursal = capabilities.hasSubsSucursalContratada
+    ? "LEFT JOIN public.sucursales suc ON suc.id_sucursal = s.id_sucursal_contratada"
+    : "";
+  const selectSucursalNombre = capabilities.hasSubsSucursalContratada
+    ? "suc.nombre_sucursal"
+    : "NULL::text AS nombre_sucursal";
+  const whereSucursal = capabilities.hasSubsSucursalContratada
+    ? "AND s.id_sucursal_contratada IS NOT NULL"
+    : "";
+
+  try {
+    const { rows } = await client.query(
+      `
+        SELECT
+          s.id_suscripcion,
+          s.id_cliente,
+          s.id_plan,
+          s.estado_suscripcion_codigo,
+          s.inicio_at,
+          s.fin_at,
+          ${selectSucursalContratada},
+          ${selectMotivo},
+          ${selectBeneficiosSnapshot},
+          s.created_at,
+          mp.nombre_plan,
+          mp.descripcion AS plan_descripcion,
+          mp.periodo_membresia_codigo,
+          ${selectCategoria},
+          ${selectSucursalNombre}
+        FROM public.subscriptions s
+        JOIN public.membership_plans mp
+          ON mp.id_plan = s.id_plan
+        ${joinSucursal}
+        WHERE s.id_cliente = $1::uuid
+          AND s.estado_suscripcion_codigo = $2
+          AND s.inicio_at <= NOW()
+          AND s.fin_at > NOW()
+          ${whereSucursal}
+        ORDER BY s.created_at DESC, s.inicio_at DESC
+        LIMIT $3::int
+      `,
+      [clienteId, ACTIVE_STATUS, maxLimit]
+    );
+    return rows;
+  } catch (error) {
+    if (isSchemaCompatibilityError(error)) return [];
+    throw error;
+  }
+}
+
 export async function getClienteMembershipState(client, clienteId) {
   // AM: Estado resiliente; nunca debe depender de columnas/tablas opcionales para responder.
-  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, { forUpdate: false });
   const hasSubscriptions = (await getAnySubscriptionCount(client, clienteId)) > 0;
   const puntos = await getMembershipPointsSummary(client, clienteId);
-
   const subscriptionsHistoryRows = await listSubscriptionHistoryRows(client, clienteId, { limit: 20 });
   const historialMembresias = subscriptionsHistoryRows.map((row) => ({
     id_suscripcion: row.id_suscripcion,
@@ -2086,8 +2280,9 @@ export async function getClienteMembershipState(client, clienteId) {
     id_sucursal_contratada: row.id_sucursal_contratada ?? null,
     created_at: toIsoDateTime(row.created_at),
   }));
+  const activeRows = await listActiveSubscriptionRowsByCliente(client, clienteId, { limit: 20 });
 
-  if (!lifecycle.active) {
+  if (!activeRows.length) {
     const latest = subscriptionsHistoryRows[0] ?? null;
     const historicConsumptionRows = await getClienteConsumptionRows(client, clienteId, { limit: 40 });
     const estadoVisible = resolveMembershipVisibleState(latest);
@@ -2095,6 +2290,7 @@ export async function getClienteMembershipState(client, clienteId) {
       estado_plan: estadoVisible,
       cta_recomendada: hasSubscriptions ? "actualizar" : "adquirir",
       tiene_historial: hasSubscriptions,
+      planes_activos: [],
       plan_activo: null,
       ultimo_plan: latest
         ? {
@@ -2116,40 +2312,68 @@ export async function getClienteMembershipState(client, clienteId) {
       historial_membresias: historialMembresias,
     };
   }
-
-  const active = lifecycle.active;
-  const summary = lifecycle.summary || summarizeBenefits(active.beneficios_snapshot, active.consumo_rows);
-  const planInfo = await getPlanDisplayInfo(client, active.id_plan, active.id_sucursal_contratada);
-  const estadoVisibleActivo = resolveMembershipVisibleState(active, {
-    summary,
-    timeRemaining: lifecycle.time_remaining,
-  });
+  const activePlans = [];
+  const activeConsumptionRows = [];
+  for (const row of activeRows) {
+    const snapshot = normalizeBenefitsSnapshot(row.beneficios_snapshot);
+    const consumptionRows = await getSubscriptionConsumptionRows(client, row.id_suscripcion);
+    const summary = summarizeBenefits(snapshot, consumptionRows);
+    const timeRemaining = computeTimeRemaining(row.fin_at);
+    const planInfo = await getPlanDisplayInfo(client, row.id_plan, row.id_sucursal_contratada);
+    const estadoVisible = resolveMembershipVisibleState(row, {
+      summary,
+      timeRemaining,
+    });
+    const planPayload = {
+      id_suscripcion: row.id_suscripcion,
+      id_plan: row.id_plan,
+      nombre_plan: planInfo?.nombre_plan || row.nombre_plan,
+      descripcion: planInfo?.descripcion ?? row.plan_descripcion ?? null,
+      categoria_nivel: toInt(planInfo?.categoria_nivel ?? row.categoria_nivel, 1),
+      periodo_membresia_codigo: planInfo?.periodo_membresia_codigo || row.periodo_membresia_codigo,
+      precio_hnl: toNumber(planInfo?.precio_hnl, 0),
+      estado_suscripcion_codigo: row.estado_suscripcion_codigo,
+      estado_visible: estadoVisible,
+      inicio_at: toIsoDateTime(row.inicio_at),
+      fin_at: toIsoDateTime(row.fin_at),
+      id_sucursal_contratada: row.id_sucursal_contratada ?? null,
+      sucursal_nombre: row.nombre_sucursal ?? null,
+      beneficios_snapshot: snapshot,
+      tiempo_restante: timeRemaining,
+      ultimo_servicio_restante: Number(summary?.totales?.servicios_restantes || 0) === 1,
+      remanentes: summary,
+    };
+    activePlans.push(planPayload);
+    activeConsumptionRows.push(...(Array.isArray(consumptionRows) ? consumptionRows : []));
+  }
+  const planActivoCompat = activePlans[0] ?? null;
+  const estadoVisibleActivo = planActivoCompat?.estado_visible || "activa";
+  const activeHistoryRows = activeConsumptionRows
+    .sort((left, right) => new Date(right?.created_at || 0).getTime() - new Date(left?.created_at || 0).getTime());
 
   return {
     estado_plan: estadoVisibleActivo,
     cta_recomendada: "actualizar",
     tiene_historial: true,
-    plan_activo: {
-      id_suscripcion: active.id_suscripcion,
-      id_plan: active.id_plan,
-      nombre_plan: planInfo?.nombre_plan || active.nombre_plan,
-      descripcion: planInfo?.descripcion ?? active.plan_descripcion ?? null,
-      categoria_nivel: toInt(planInfo?.categoria_nivel ?? active.categoria_nivel, 1),
-      periodo_membresia_codigo: planInfo?.periodo_membresia_codigo || active.periodo_membresia_codigo,
-      precio_hnl: toNumber(planInfo?.precio_hnl, 0),
-      estado_suscripcion_codigo: active.estado_suscripcion_codigo,
-      estado_visible: estadoVisibleActivo,
-      inicio_at: toIsoDateTime(active.inicio_at),
-      fin_at: toIsoDateTime(active.fin_at),
-      id_sucursal_contratada: active.id_sucursal_contratada ?? null,
-      tiempo_restante: lifecycle.time_remaining,
-      ultimo_servicio_restante: Number(summary?.totales?.servicios_restantes || 0) === 1,
-      remanentes: summary,
-    },
+    planes_activos: activePlans,
+    plan_activo: planActivoCompat,
     ultimo_plan: null,
-    bloqueo_actualizacion: buildUpgradeBlockedDetails(lifecycle),
+    bloqueo_actualizacion: planActivoCompat
+      ? {
+        motivo: "plan_activo_vigente",
+        tiempo_restante: {
+          dias: Number(planActivoCompat?.tiempo_restante?.dias || 0),
+          horas: Number(planActivoCompat?.tiempo_restante?.horas || 0),
+          minutos: Number(planActivoCompat?.tiempo_restante?.minutos || 0),
+        },
+        remanentes: {
+          servicios: Number(planActivoCompat?.remanentes?.totales?.servicios_restantes || 0),
+          cortesias: Number(planActivoCompat?.remanentes?.totales?.cortesias_restantes || 0),
+        },
+      }
+      : null,
     masterpuntos: puntos,
-    historial_consumos: mapConsumptionHistory(active.consumo_rows),
+    historial_consumos: mapConsumptionHistory(activeHistoryRows),
     historial_membresias: historialMembresias,
   };
 }
@@ -2411,20 +2635,70 @@ export async function consumeMembershipForCompletedAppointment(client, {
   };
 }
 
-export function createCoverageTracker(activeContext) {
+export function createCoverageTracker(activeContext, {
+  appointmentBranchId = null,
+  planBranchName = null,
+} = {}) {
   if (!activeContext?.active || !activeContext?.summary) {
     return {
       hasPlan: false,
       idSuscripcion: null,
       serviceRemaining: new Map(),
       planName: null,
+      idSucursalContratada: null,
+      sucursalPlanNombre: null,
+      branchMatch: false,
+      hasServiceBenefitsAvailable: false,
+      requiredServiceIds: [],
+      requiredServices: [],
+      coverageEnabled: false,
+      coverageDisabledReason: "sin_plan_activo",
+      coverageDisabledMessage: null,
     };
   }
 
   const serviceRemaining = new Map();
+  let availableServices = 0;
+  const requiredServices = [];
   for (const service of activeContext.summary.servicios || []) {
     if (!service?.id_servicio) continue;
-    serviceRemaining.set(service.id_servicio, toInt(service.restante, 0));
+    const remaining = toInt(service.restante, 0);
+    const idServicio = normalizeText(service.id_servicio);
+    if (!idServicio) continue;
+    serviceRemaining.set(idServicio, remaining);
+    if (remaining > 0) {
+      availableServices += 1;
+      requiredServices.push({
+        id_servicio: idServicio,
+        nombre: normalizeText(service.nombre) || "Servicio",
+        restante: remaining,
+        total: toInt(service.total, 0),
+      });
+    }
+  }
+  const requiredServiceIds = requiredServices.map((service) => service.id_servicio);
+
+  const contractedBranchId = normalizeText(activeContext.active.id_sucursal_contratada) || null;
+  const appointmentBranch = normalizeText(appointmentBranchId) || null;
+  const hasContractedBranch = Boolean(contractedBranchId);
+  const hasAppointmentBranch = Boolean(appointmentBranch);
+  const branchMatch = hasContractedBranch && hasAppointmentBranch && contractedBranchId === appointmentBranch;
+  const hasServiceBenefitsAvailable = availableServices > 0;
+
+  let coverageEnabled = branchMatch && hasServiceBenefitsAvailable;
+  let coverageDisabledReason = null;
+  if (!hasContractedBranch) {
+    coverageEnabled = false;
+    coverageDisabledReason = "missing_contracted_branch";
+  } else if (!hasAppointmentBranch) {
+    coverageEnabled = false;
+    coverageDisabledReason = "appointment_branch_missing";
+  } else if (!branchMatch) {
+    coverageEnabled = false;
+    coverageDisabledReason = "branch_mismatch";
+  } else if (!hasServiceBenefitsAvailable) {
+    coverageEnabled = false;
+    coverageDisabledReason = "insufficient_benefits";
   }
 
   return {
@@ -2432,25 +2706,82 @@ export function createCoverageTracker(activeContext) {
     idSuscripcion: activeContext.active.id_suscripcion,
     serviceRemaining,
     planName: activeContext.active.nombre_plan || null,
+    idSucursalContratada: contractedBranchId,
+    sucursalPlanNombre: normalizeText(planBranchName) || null,
+    branchMatch,
+    hasServiceBenefitsAvailable,
+    requiredServiceIds,
+    requiredServices,
+    coverageEnabled,
+    coverageDisabledReason,
+    coverageDisabledMessage: null,
   };
 }
 
-export function consumeCoverageForServices(tracker, serviceItems = [], { isTitular = true } = {}) {
+export function filterCoverageTrackerByTariffServices(tracker, availableServiceIds = []) {
+  if (!tracker?.hasPlan || tracker?.coverageEnabled === false) return tracker;
+
+  const availableSet = new Set(
+    (Array.isArray(availableServiceIds) ? availableServiceIds : [])
+      .map((serviceId) => normalizeText(serviceId))
+      .filter(Boolean)
+  );
+
+  const filteredRequiredServices = (Array.isArray(tracker.requiredServices) ? tracker.requiredServices : [])
+    .filter((service) => availableSet.has(normalizeText(service?.id_servicio)));
+  const filteredRequiredServiceIds = filteredRequiredServices
+    .map((service) => normalizeText(service?.id_servicio))
+    .filter(Boolean);
+
+  const previousRemaining = tracker.serviceRemaining instanceof Map ? tracker.serviceRemaining : new Map();
+  const nextRemaining = new Map();
+  for (const serviceId of filteredRequiredServiceIds) {
+    const current = toInt(previousRemaining.get(serviceId), 0);
+    if (current > 0) {
+      nextRemaining.set(serviceId, current);
+    }
+  }
+
+  tracker.requiredServices = filteredRequiredServices;
+  tracker.requiredServiceIds = filteredRequiredServiceIds;
+  tracker.serviceRemaining = nextRemaining;
+  tracker.hasServiceBenefitsAvailable = filteredRequiredServiceIds.length > 0;
+
+  if (!tracker.hasServiceBenefitsAvailable) {
+    tracker.coverageEnabled = false;
+    tracker.coverageDisabledReason = "services_without_active_tariff";
+  }
+
+  return tracker;
+}
+
+export function consumeCoverageForServices(tracker, serviceItems = [], { isTitular = true, forcedServiceIds = [] } = {}) {
   const result = {
     items: [],
     coveredTotalHnl: 0,
     extraTotalHnl: 0,
+    coveredServiceIds: [],
+    forcedCoveredServiceIds: [],
   };
 
   const list = Array.isArray(serviceItems) ? serviceItems : [];
+  const forcedSet = new Set(
+    (Array.isArray(forcedServiceIds) ? forcedServiceIds : [])
+      .map((serviceId) => normalizeText(serviceId))
+      .filter(Boolean)
+  );
+  const coveredServiceIdSet = new Set();
+  const forcedCoveredServiceIdSet = new Set();
+
   for (const item of list) {
     const idServicio = normalizeText(item?.id_servicio);
     const nombre = normalizeText(item?.nombre_servicio) || "Servicio";
     const price = toNumber(item?.precio_hnl, 0);
     const quantity = 1;
+    const forcedByMembership = Boolean(idServicio && forcedSet.has(idServicio));
 
     let status = COVERAGE_STATUS.EXTRA_PENDING;
-    if (tracker?.hasPlan && isTitular && idServicio) {
+    if (tracker?.hasPlan && tracker.coverageEnabled !== false && isTitular && idServicio) {
       const current = toInt(tracker.serviceRemaining.get(idServicio), 0);
       if (current > 0) {
         tracker.serviceRemaining.set(idServicio, current - 1);
@@ -2460,6 +2791,8 @@ export function consumeCoverageForServices(tracker, serviceItems = [], { isTitul
 
     if (status === COVERAGE_STATUS.COVERED) {
       result.coveredTotalHnl += price * quantity;
+      coveredServiceIdSet.add(idServicio);
+      if (forcedByMembership) forcedCoveredServiceIdSet.add(idServicio);
     } else {
       result.extraTotalHnl += price * quantity;
     }
@@ -2473,8 +2806,11 @@ export function consumeCoverageForServices(tracker, serviceItems = [], { isTitul
       precio_unitario_hnl: price,
       total_hnl: price * quantity,
       coverage_status: status,
+      forced_by_membership: forcedByMembership,
     });
   }
+  result.coveredServiceIds = [...coveredServiceIdSet];
+  result.forcedCoveredServiceIds = [...forcedCoveredServiceIdSet];
   return result;
 }
 

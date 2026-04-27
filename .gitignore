@@ -9,4 +9,7 @@ dist/
 build/
 tmp/
 .cache/
-
+tmp_*
+*.tmp
+debug_*
+repro_*

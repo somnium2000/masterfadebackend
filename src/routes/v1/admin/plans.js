@@ -52,6 +52,37 @@ const planBenefitBodySchema = {
   additionalProperties: false,
 };
 
+const planBenefitsObjectSchema = {
+  type: "object",
+  properties: {
+    version: { type: ["integer", "null"] },
+    items: {
+      type: "array",
+      items: planBenefitBodySchema,
+    },
+    servicios: {
+      type: "array",
+      items: planBenefitBodySchema,
+    },
+    cortesias: {
+      type: "array",
+      items: planBenefitBodySchema,
+    },
+  },
+  additionalProperties: true,
+};
+
+const planBenefitsInputSchema = {
+  anyOf: [
+    {
+      type: "array",
+      minItems: 1,
+      items: planBenefitBodySchema,
+    },
+    planBenefitsObjectSchema,
+  ],
+};
+
 const planBodySchema = {
   type: "object",
   properties: {
@@ -61,9 +92,7 @@ const planBodySchema = {
     periodo_membresia_codigo: { type: "string", minLength: 1, maxLength: 40 },
     categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     beneficios: {
-      type: "array",
-      minItems: 1,
-      items: planBenefitBodySchema,
+      ...planBenefitsInputSchema,
     },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     visible_publico: { type: "boolean" },
@@ -82,9 +111,7 @@ const planPatchSchema = {
     periodo_membresia_codigo: { type: "string", minLength: 1, maxLength: 40 },
     categoria_nivel: { type: "integer", minimum: PLAN_CATEGORY_MIN, maximum: PLAN_CATEGORY_MAX },
     beneficios: {
-      type: "array",
-      minItems: 1,
-      items: planBenefitBodySchema,
+      ...planBenefitsInputSchema,
     },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     visible_publico: { type: "boolean" },
@@ -456,7 +483,19 @@ function parsePlanCategoryFromRow(value) {
 }
 
 function normalizePlanBenefits(beneficios) {
-  if (!Array.isArray(beneficios) || beneficios.length === 0) {
+  const payload = beneficios && typeof beneficios === "object" ? beneficios : null;
+  const sourceItems = Array.isArray(beneficios)
+    ? beneficios
+    : (
+      Array.isArray(payload?.items)
+        ? payload.items
+        : [
+          ...(Array.isArray(payload?.servicios) ? payload.servicios : []),
+          ...(Array.isArray(payload?.cortesias) ? payload.cortesias : []),
+        ]
+    );
+
+  if (!Array.isArray(sourceItems) || sourceItems.length === 0) {
     throw new AppError(400, "Debes registrar al menos un beneficio para el plan", {
       code: "CATALOG_PLAN_BENEFITS_REQUIRED",
     });
@@ -464,7 +503,7 @@ function normalizePlanBenefits(beneficios) {
 
   const seenServiceIds = new Set();
   const seenCourtesyIds = new Set();
-  const normalizedBenefits = beneficios.map((beneficio) => {
+  const normalizedBenefits = sourceItems.map((beneficio) => {
     const tipo = String(beneficio?.tipo || "").trim().toLowerCase();
     const cantidad = Number(beneficio?.cantidad);
     const nombre = normalizeOptionalText(beneficio?.nombre) ?? "";
@@ -553,6 +592,11 @@ function parseStoredBenefits(rawBenefits) {
     ? data.items
     : Array.isArray(rawBenefits)
       ? rawBenefits
+      : Array.isArray(data?.servicios) || Array.isArray(data?.cortesias)
+        ? [
+          ...(Array.isArray(data?.servicios) ? data.servicios : []),
+          ...(Array.isArray(data?.cortesias) ? data.cortesias : []),
+        ]
       : looksLikeSingleBenefit
         ? [data]
         : [];
@@ -603,9 +647,14 @@ function parseStoredBenefits(rawBenefits) {
 }
 
 function serializePlanBenefits(beneficios = []) {
+  const normalizedItems = Array.isArray(beneficios) ? beneficios : [];
+  const servicios = normalizedItems.filter((beneficio) => String(beneficio?.tipo || "").toLowerCase() === "servicio");
+  const cortesias = normalizedItems.filter((beneficio) => String(beneficio?.tipo || "").toLowerCase() === "cortesia");
   return {
     version: 1,
-    items: beneficios,
+    items: normalizedItems,
+    servicios,
+    cortesias,
   };
 }
 
@@ -1046,9 +1095,15 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
         requestId: request.id,
       });
     }
-    if (message.includes("servicio") || message.includes("beneficio")) {
-      return sendError(reply, 409, "La composicion del plan no es valida para operar.", {
+    if (
+      message.includes("servicio")
+      || message.includes("beneficio")
+      || message.includes("plan_servicios_required")
+      || message.includes("plan_benef")
+    ) {
+      return sendError(reply, 400, "La composicion del plan no es valida. Debe incluir al menos un servicio con cantidad mayor a 0.", {
         code: "CATALOG_PLAN_INVALID_COMPOSITION",
+        details: error?.message || null,
         requestId: request.id,
       });
     }

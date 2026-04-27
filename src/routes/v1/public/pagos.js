@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
+import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 
@@ -82,13 +83,11 @@ function resolvePaymentsFromAlias() {
 function buildPostPaymentEmailTemplate({
   recipientName,
   bookingCode,
-  groupId,
   totalGrupo,
   detailLines,
 }) {
   const safeName = safeText(recipientName) || "Cliente";
   const safeCode = safeText(bookingCode) || "N/A";
-  const safeGroupId = safeText(groupId) || "N/D";
   const moneyLabel = `HNL ${Number(totalGrupo || 0).toFixed(2)}`;
   const detailList = Array.isArray(detailLines) ? detailLines : [];
   const detailHtml = detailList
@@ -540,10 +539,21 @@ async function grantCompanionPoints(client, { idGrupoCita }) {
 
 async function confirmGroupAfterPaid(client, { idCitaAnchor }) {
   const groupResult = await client.query(
-    `SELECT id_grupo_cita FROM public.citas WHERE id_cita = $1::uuid AND deleted_at IS NULL LIMIT 1`,
+    `
+      SELECT
+        c.id_grupo_cita,
+        cg.id_cliente_titular
+      FROM public.citas c
+      JOIN public.citas_grupos cg
+        ON cg.id_grupo_cita = c.id_grupo_cita
+      WHERE c.id_cita = $1::uuid
+        AND c.deleted_at IS NULL
+      LIMIT 1
+    `,
     [idCitaAnchor]
   );
   const idGrupoCita = groupResult.rows[0]?.id_grupo_cita ?? null;
+  const idClienteTitular = groupResult.rows[0]?.id_cliente_titular ?? null;
   if (!idGrupoCita) return null;
 
   const totalResult = await client.query(
@@ -576,9 +586,27 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor }) {
     [idGrupoCita]
   );
 
+  let rewardRedemption = {
+    aplicada: false,
+    ya_aplicada: false,
+    puntos_descontados: 0,
+    saldo_actual: null,
+  };
+  if (idClienteTitular) {
+    rewardRedemption = await applyRewardRedeemForConfirmedGroup(client, {
+      idGrupoCita,
+      idCliente: idClienteTitular,
+      motivo: "Canje de recompensa ruta a tu cortesia",
+    });
+  }
+
   await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
   await grantCompanionPoints(client, { idGrupoCita });
-  return { id_grupo_cita: idGrupoCita, total_hnl: totalGrupo };
+  return {
+    id_grupo_cita: idGrupoCita,
+    total_hnl: totalGrupo,
+    recompensa_utilizada: rewardRedemption,
+  };
 }
 
 export default async function publicPagosRoutes(app) {

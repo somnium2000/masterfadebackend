@@ -274,6 +274,15 @@ async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
+function isPoolLikeClient(client) {
+  return Boolean(
+    client
+    && typeof client.query === "function"
+    && typeof client.connect === "function"
+    && typeof client.release !== "function"
+  );
+}
+
 function startOfDay(dateString) {
   return new Date(`${dateString}T00:00:00`);
 }
@@ -1625,7 +1634,8 @@ export async function getBarberScheduleBounds(client, empleadoId, dateString) {
 
 export async function findFirstAvailableBarber(client, branchId, dateString, serviceTotalMinutes, options = {}) {
   const barbers = await listBarbersForBranch(client, branchId);
-  const withSlots = await mapWithConcurrency(barbers, 4, async (barber) => ({
+  const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
+  const withSlots = await mapWithConcurrency(barbers, barberConcurrency, async (barber) => ({
     barber,
     slots: await getAvailableSlotsForBarber(client, barber.id_empleado, dateString, serviceTotalMinutes, {
       minSellableDurationMin: options?.minSellableDurationMin,
@@ -1691,7 +1701,8 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
     };
   }
 
-  const withSlots = await mapWithConcurrency(barbers, 4, async (barber) => ({
+  const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
+  const withSlots = await mapWithConcurrency(barbers, barberConcurrency, async (barber) => ({
     barber,
     slots: await getAvailableSlotsForBarber(client, barber.id_empleado, safeDate, serviceTotalMinutes, {
       minSellableDurationMin,
@@ -1742,6 +1753,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
   for (let current = new Date(startDate); current.getTime() <= endDate.getTime(); current = addMinutes(current, 24 * 60)) {
     dateKeys.push(formatDateOnly(current));
   }
+  const rangeConcurrency = isPoolLikeClient(client) ? 1 : 4;
 
   if (barberId) {
     const barber = await getBarberById(client, barberId);
@@ -1761,12 +1773,10 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     }
 
     const schedulesByWeekday = new Map();
-    await Promise.all(
-      Array.from(sampleDateByWeekday.entries()).map(async ([weekday, sampleDate]) => {
-        const schedules = await getSchedulesForBarberOnDate(client, barber.id_empleado, sampleDate);
-        schedulesByWeekday.set(weekday, schedules);
-      })
-    );
+    for (const [weekday, sampleDate] of sampleDateByWeekday.entries()) {
+      const schedules = await getSchedulesForBarberOnDate(client, barber.id_empleado, sampleDate);
+      schedulesByWeekday.set(weekday, schedules);
+    }
 
     const busyIntervals = await getBusyIntervalsForBarberByRange(client, barber.id_empleado, safeFrom, safeTo);
     const availability = [];
@@ -1827,7 +1837,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     }));
   }
 
-  return mapWithConcurrency(dateKeys, 4, (dateKey) =>
+  return mapWithConcurrency(dateKeys, rangeConcurrency, (dateKey) =>
     buildDayAvailability(client, branchId, serviceSelection, dateKey, null, { barbers, minSellableDurationMin })
   );
 }
