@@ -18,6 +18,12 @@ The app fails at startup if any of these are missing.
 - CSRF token cookie: `mf_csrf` (non-HttpOnly) + `X-CSRF-Token` header.
 - Frontend sends requests with `credentials: include`.
 
+## Local development origin alignment
+- Preferred local frontend origin: `http://localhost:5173`.
+- Local backend API origin: `http://localhost:3002`.
+- Keep `CORS_ORIGENES` explicit (comma-separated), never use `*`.
+- Optional compatibility for local tooling: include `http://127.0.0.1:5173` in development.
+
 ## Health endpoints
 - Public: `GET /v1/health` and `GET /v1/health/live`.
 - Internal: `GET /v1/health/ready` requires `X-Internal-Health-Token`.

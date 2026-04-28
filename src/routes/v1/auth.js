@@ -1960,8 +1960,8 @@ export default async function authRoutes(app) {
             id_usuario: null,
             identifier,
             provider: "supabase_password",
-            resultado: "session_limit",
-            motivo_codigo: "LOGIN_SESSION_LIMIT",
+            resultado: "blocked",
+            motivo_codigo: "LOGIN_RATE_LIMITED",
             metadata: {
               auth_stage: "password_login",
             },
@@ -2019,8 +2019,8 @@ export default async function authRoutes(app) {
             id_usuario: claims.user.id_usuario,
             identifier,
             provider: "supabase_password",
-            resultado: "failed",
-            motivo_codigo: "LOGIN_INVALID_CREDENTIALS",
+            resultado: "blocked",
+            motivo_codigo: "LOGIN_TEMPORARILY_LOCKED",
             metadata: {
               auth_stage: "password_login",
             },

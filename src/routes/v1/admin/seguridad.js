@@ -1,6 +1,9 @@
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
+  getAdminSecurityAlertDetail,
+  getAdminSecurityLoginLogDetail,
+  getAdminSecuritySessionDetail,
   listAdminSecurityAlerts,
   listAdminSecurityLoginLogs,
   listAdminSecuritySessions,
@@ -12,6 +15,7 @@ import {
 
 const SECURITY_READ_ROLES = ["super_admin", "security_admin", "security_auditor"];
 const SECURITY_WRITE_ROLES = ["super_admin", "security_admin"];
+const SSE_HEARTBEAT_MS = 25_000;
 
 const listQuerySchemaBase = {
   page: { type: "integer", minimum: 1 },
@@ -40,6 +44,15 @@ const sesionesQuerySchema = {
     estado: { type: "string", enum: ["activa", "cerrada", "revocada", "expirada"] },
     id_usuario: { type: "string", format: "uuid" },
     sort_by: { type: "string", enum: ["inicio_at", "ultimo_uso_at", "expira_at", "estado"] },
+  },
+  additionalProperties: false,
+};
+
+const idLoginLogParamSchema = {
+  type: "object",
+  required: ["id_login_log"],
+  properties: {
+    id_login_log: { type: "string", format: "uuid" },
   },
   additionalProperties: false,
 };
@@ -110,7 +123,8 @@ const estadoAlertaBodySchema = {
   type: "object",
   required: ["estado"],
   properties: {
-    estado: { type: "string", enum: ["abierta", "en_revision", "resuelta", "descartada"] },
+    estado: { type: "string", enum: ["resuelta", "descartada"] },
+    comentario: { type: "string", minLength: 1, maxLength: 700 },
   },
   additionalProperties: false,
 };
@@ -131,7 +145,88 @@ function sendHandled(reply, request, error, message, code) {
   });
 }
 
+function parseAllowedCorsOrigins(app) {
+  const configured = Array.isArray(app?.config?.corsOrigins) ? app.config.corsOrigins : [];
+  if (configured.length > 0) return configured;
+  const raw =
+    process.env.CORS_ORIGENES ||
+    process.env.CORS_ORIGINS ||
+    process.env.CORS_ORIGIN ||
+    "http://localhost:5173";
+  return String(raw)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 export default async function adminSeguridadRoutes(app) {
+  app.get(
+    "/realtime/events",
+    {
+      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+    },
+    async (request, reply) => {
+      const originHeader = String(request.headers?.origin || "").trim();
+      const allowedOrigins = parseAllowedCorsOrigins(app);
+      if (originHeader && allowedOrigins.includes(originHeader)) {
+        reply.raw.setHeader("Access-Control-Allow-Origin", originHeader);
+        reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
+        reply.raw.setHeader("Vary", "Origin");
+      }
+
+      reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.setHeader("X-Accel-Buffering", "no");
+
+      if (typeof reply.hijack === "function") {
+        reply.hijack();
+      }
+
+      const writeEvent = (eventName, payload) => {
+        if (reply.raw.writableEnded || reply.raw.destroyed) return;
+        reply.raw.write(`event: ${eventName}\n`);
+        reply.raw.write(`data: ${JSON.stringify(payload)}\n\n`);
+      };
+
+      const unsubscribe = app.securityRealtime?.subscribe?.((signal) => {
+        const minimalSignal = {
+          event: signal?.event || null,
+          changed_at: signal?.changed_at || null,
+          seq: Number(signal?.seq || 0),
+        };
+        writeEvent(minimalSignal.event, minimalSignal);
+      }) || (() => {});
+
+      const heartbeat = setInterval(() => {
+        writeEvent("ping", {
+          event: "ping",
+          changed_at: new Date().toISOString(),
+          seq: 0,
+        });
+      }, SSE_HEARTBEAT_MS);
+
+      let closed = false;
+      const closeStream = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(heartbeat);
+        unsubscribe();
+        if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+          try {
+            reply.raw.end();
+          } catch {
+            // noop
+          }
+        }
+      };
+
+      reply.raw.on("error", closeStream);
+      request.raw.on("close", closeStream);
+      reply.raw.on("close", closeStream);
+    }
+  );
+
   app.get(
     "/login-logs",
     {
@@ -155,6 +250,44 @@ export default async function adminSeguridadRoutes(app) {
   );
 
   app.get(
+    "/login-logs/:id_login_log",
+    {
+      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      schema: { params: idLoginLogParamSchema },
+    },
+    async (request, reply) => {
+      try {
+        const detail = await getAdminSecurityLoginLogDetail(app, request, {
+          idLoginLog: request.params.id_login_log,
+        });
+
+        if (!detail.ok && detail.code === "SECURITY_LOGIN_LOG_NOT_FOUND") {
+          return sendError(reply, 404, "Login log no encontrado.", {
+            code: "SECURITY_LOGIN_LOG_NOT_FOUND",
+            requestId: request.id,
+          });
+        }
+        if (!detail.ok) {
+          return sendError(reply, 400, "No se pudo consultar el detalle del login log.", {
+            code: detail.code || "SECURITY_LOGIN_LOG_DETAIL_ERROR",
+            requestId: request.id,
+          });
+        }
+
+        return sendOk(reply, detail.item, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo consultar detalle de login log",
+          "SECURITY_ADMIN_LOGIN_LOG_DETAIL_ERROR"
+        );
+      }
+    }
+  );
+
+  app.get(
     "/sesiones",
     {
       preHandler: app.requireRoles(SECURITY_READ_ROLES),
@@ -162,7 +295,10 @@ export default async function adminSeguridadRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const data = await listAdminSecuritySessions(app, request.query || {});
+        const data = await listAdminSecuritySessions(app, {
+          ...(request.query || {}),
+          current_session_id: request.user?.sid || request.auth?.sid || null,
+        });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(
@@ -171,6 +307,44 @@ export default async function adminSeguridadRoutes(app) {
           error,
           "No se pudo consultar sesiones de seguridad",
           "SECURITY_ADMIN_SESSIONS_LIST_ERROR"
+        );
+      }
+    }
+  );
+
+  app.get(
+    "/sesiones/:id_sesion",
+    {
+      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      schema: { params: idSesionParamSchema },
+    },
+    async (request, reply) => {
+      try {
+        const detail = await getAdminSecuritySessionDetail(app, request, {
+          idSesion: request.params.id_sesion,
+        });
+
+        if (!detail.ok && detail.code === "SECURITY_SESSION_NOT_FOUND") {
+          return sendError(reply, 404, "Sesion no encontrada.", {
+            code: "SECURITY_SESSION_NOT_FOUND",
+            requestId: request.id,
+          });
+        }
+        if (!detail.ok) {
+          return sendError(reply, 400, "No se pudo consultar el detalle de la sesion.", {
+            code: detail.code || "SECURITY_SESSION_DETAIL_ERROR",
+            requestId: request.id,
+          });
+        }
+
+        return sendOk(reply, detail.item, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo consultar detalle de sesion",
+          "SECURITY_ADMIN_SESSION_DETAIL_ERROR"
         );
       }
     }
@@ -185,7 +359,7 @@ export default async function adminSeguridadRoutes(app) {
     async (request, reply) => {
       try {
         const actorUserId = request.claims?.user?.id_usuario || null;
-        const actorSessionId = request.auth?.sid || null;
+        const actorSessionId = request.user?.sid || request.auth?.sid || null;
         const action = await revokeAdminSecuritySession(app, request, {
           idSesion: request.params.id_sesion,
           actorUserId,
@@ -335,6 +509,44 @@ export default async function adminSeguridadRoutes(app) {
     }
   );
 
+  app.get(
+    "/alertas/:id_alerta",
+    {
+      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      schema: { params: idAlertaParamSchema },
+    },
+    async (request, reply) => {
+      try {
+        const detail = await getAdminSecurityAlertDetail(app, request, {
+          idAlerta: request.params.id_alerta,
+        });
+
+        if (!detail.ok && detail.code === "SECURITY_ALERT_NOT_FOUND") {
+          return sendError(reply, 404, "Alerta no encontrada.", {
+            code: "SECURITY_ALERT_NOT_FOUND",
+            requestId: request.id,
+          });
+        }
+        if (!detail.ok) {
+          return sendError(reply, 400, "No se pudo consultar el detalle de la alerta.", {
+            code: detail.code || "SECURITY_ALERT_DETAIL_ERROR",
+            requestId: request.id,
+          });
+        }
+
+        return sendOk(reply, detail.item, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo consultar detalle de alerta",
+          "SECURITY_ADMIN_ALERT_DETAIL_ERROR"
+        );
+      }
+    }
+  );
+
   app.patch(
     "/alertas/:id_alerta/estado",
     {
@@ -350,12 +562,25 @@ export default async function adminSeguridadRoutes(app) {
         const action = await updateAdminAlertState(app, request, {
           idAlerta: request.params.id_alerta,
           estado: request.body?.estado,
+          comentarioResolucion: request.body?.comentario,
           actorUserId,
         });
 
         if (!action.ok && action.code === "SECURITY_ALERT_NOT_FOUND") {
           return sendError(reply, 404, "Alerta no encontrada.", {
             code: "SECURITY_ALERT_NOT_FOUND",
+            requestId: request.id,
+          });
+        }
+        if (!action.ok && action.code === "SECURITY_ALERT_RESOLUTION_COMMENT_REQUIRED") {
+          return sendError(reply, 400, "Comentario obligatorio para resolver o descartar la alerta.", {
+            code: "SECURITY_ALERT_RESOLUTION_COMMENT_REQUIRED",
+            requestId: request.id,
+          });
+        }
+        if (!action.ok && action.code === "SECURITY_ALERT_STATE_NOT_ALLOWED") {
+          return sendError(reply, 400, "Solo se permite resolver o descartar desde este endpoint.", {
+            code: "SECURITY_ALERT_STATE_NOT_ALLOWED",
             requestId: request.id,
           });
         }
@@ -371,6 +596,7 @@ export default async function adminSeguridadRoutes(app) {
           {
             id_alerta: action.id_alerta,
             estado: action.estado,
+            comentario_resolucion: action.comentario_resolucion ?? null,
           },
           { requestId: request.id }
         );

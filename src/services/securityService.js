@@ -4,15 +4,18 @@ import {
   maskEmail,
   normalizeIdentifier,
 } from "../utils/securityHash.js";
-import { getRequestMeta, maskIpAddress, shortenUserAgent } from "../utils/requestMeta.js";
+import { getRequestMeta, maskIpAddress } from "../utils/requestMeta.js";
+import { buildDeviceSummary } from "../utils/deviceInfo.js";
 
-const RESULT_SET = new Set(["success", "failed", "error", "session_limit"]);
+const RESULT_SET = new Set(["success", "failed", "blocked", "error", "session_limit"]);
 const REASON_SET = new Set([
   "LOGIN_SUCCESS",
   "LOGIN_INVALID_CREDENTIALS",
   "LOGIN_PROVIDER_ERROR",
   "LOGIN_INTERNAL_ERROR",
   "LOGIN_SESSION_LIMIT",
+  "LOGIN_RATE_LIMITED",
+  "LOGIN_TEMPORARILY_LOCKED",
 ]);
 const PROVIDER_MAX_LENGTH = 48;
 const REASON_MAX_LENGTH = 64;
@@ -41,6 +44,15 @@ const DEFAULT_SESSION_POLICY = {
   collisionAction: "allow",
 };
 const ADMIN_PAGE_SIZE_MAX = 100;
+const SECURITY_PRIVILEGED_ROLES = new Set(["super_admin", "security_admin"]);
+const RESOLVED_ALERT_STATES = new Set(["resuelta", "descartada"]);
+const ALERT_STATE_UPDATE_SET = new Set(["resuelta", "descartada"]);
+const ALERT_RESOLUTION_COMMENT_MAX = 700;
+const SENSITIVE_KEY_PATTERN = /(token|jwt|cookie|refresh|jti|authorization|bearer|set-cookie)/i;
+
+function publishSecurityRealtimeSignal(app, eventName) {
+  app?.securityRealtime?.publish?.(eventName);
+}
 
 function normalizeLimitedText(value, maxLength) {
   const normalized = String(value || "").normalize("NFC").trim();
@@ -337,7 +349,7 @@ export async function createActiveSession(app, request, payload) {
       `,
       [userId, ALERT_DEDUP_MINUTES]
     );
-    if (existing.rowCount) return;
+    if (existing.rowCount) return false;
 
     await client.query(
       `
@@ -374,9 +386,11 @@ export async function createActiveSession(app, request, payload) {
         ),
       ]
     );
+    return true;
   }
 
   const client = await app.db.connect();
+  let shouldPublishAlertsChanged = false;
   try {
     await client.query("BEGIN");
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [userId]);
@@ -470,13 +484,17 @@ export async function createActiveSession(app, request, payload) {
         });
 
         if (requiresReplacement) {
-          await insertLimitAlertIfNeeded(client, {
+          const insertedLimitAlert = await insertLimitAlertIfNeeded(client, {
             activeSessions: activeCount,
             maxActiveSessions: policy.maxActiveSessions,
           });
+          shouldPublishAlertsChanged = shouldPublishAlertsChanged || Boolean(insertedLimitAlert);
         }
 
         await client.query("COMMIT");
+        if (shouldPublishAlertsChanged) {
+          publishSecurityRealtimeSignal(app, "security.alerts.changed");
+        }
         return {
           ok: false,
           code: "AUTH_SESSION_LIMIT_REACHED",
@@ -533,6 +551,10 @@ export async function createActiveSession(app, request, payload) {
       ]
     );
     await client.query("COMMIT");
+    publishSecurityRealtimeSignal(app, "security.sessions.changed");
+    if (shouldPublishAlertsChanged) {
+      publishSecurityRealtimeSignal(app, "security.alerts.changed");
+    }
     return { ok: true };
   } catch (_error) {
     await client.query("ROLLBACK").catch(() => {});
@@ -652,7 +674,7 @@ export async function closeActiveSession(app, request, payload) {
   const meta = getRequestMeta(request);
 
   try {
-    await app.db.query(
+    const result = await app.db.query(
       `
         UPDATE public.seguridad_sesiones
         SET
@@ -671,6 +693,9 @@ export async function closeActiveSession(app, request, payload) {
       `,
       [sid, userId, closedBy || null, motivo, meta.ip, meta.userAgent, meta.requestId]
     );
+    if (result.rowCount > 0) {
+      publishSecurityRealtimeSignal(app, "security.sessions.changed");
+    }
     return { ok: true };
   } catch (_error) {
     request?.log?.error(
@@ -789,7 +814,7 @@ export async function getLoginProtectionState(app, request, { identifier }) {
           FROM public.seguridad_login_logs
           WHERE created_at >= (NOW() - make_interval(mins => $2::int))
             AND identificador_hash = $1::text
-            AND resultado IN ('failed', 'error', 'session_limit')
+            AND resultado IN ('failed', 'blocked', 'error', 'session_limit')
         `,
         [identifierHash, LOGIN_WINDOW_MINUTES]
       );
@@ -817,7 +842,7 @@ export async function getLoginProtectionState(app, request, { identifier }) {
     if (blockedByIp && meta.ip) {
       const client = await app.db.connect();
       try {
-        await insertSecurityAlertDedup(client, {
+        const inserted = await insertSecurityAlertDedup(client, {
           tipo: "muchos_fallos_misma_ip",
           severidad: "media",
           ip: meta.ip,
@@ -827,6 +852,9 @@ export async function getLoginProtectionState(app, request, { identifier }) {
             login_window_minutes: LOGIN_WINDOW_MINUTES,
           },
         });
+        if (inserted) {
+          publishSecurityRealtimeSignal(app, "security.alerts.changed");
+        }
       } finally {
         client.release();
       }
@@ -951,6 +979,7 @@ export async function registerFailedLoginAttempt(app, request, payload) {
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [String(user.id_usuario)]);
+      let insertedAlerts = 0;
 
       const current = await client.query(
         `
@@ -1002,7 +1031,7 @@ export async function registerFailedLoginAttempt(app, request, payload) {
       );
 
       if (nextCount >= LOGIN_FAILED_LOCK_THRESHOLD) {
-        await insertSecurityAlertDedup(client, {
+        const inserted = await insertSecurityAlertDedup(client, {
           tipo: "muchos_fallos_mismo_usuario",
           severidad: "alta",
           idUsuario: user.id_usuario,
@@ -1013,10 +1042,11 @@ export async function registerFailedLoginAttempt(app, request, payload) {
             login_window_minutes: LOGIN_WINDOW_MINUTES,
           },
         });
+        if (inserted) insertedAlerts += 1;
       }
 
       if (shouldLock) {
-        await insertSecurityAlertDedup(client, {
+        const inserted = await insertSecurityAlertDedup(client, {
           tipo: "usuario_bloqueado",
           severidad: "alta",
           idUsuario: user.id_usuario,
@@ -1027,10 +1057,11 @@ export async function registerFailedLoginAttempt(app, request, payload) {
             failed_attempts: nextCount,
           },
         });
+        if (inserted) insertedAlerts += 1;
       }
 
       if (user.is_super_admin) {
-        await insertSecurityAlertDedup(client, {
+        const inserted = await insertSecurityAlertDedup(client, {
           tipo: "intentos_contra_super_admin",
           severidad: "critica",
           idUsuario: user.id_usuario,
@@ -1040,9 +1071,13 @@ export async function registerFailedLoginAttempt(app, request, payload) {
             failed_attempts: nextCount,
           },
         });
+        if (inserted) insertedAlerts += 1;
       }
 
       await client.query("COMMIT");
+      if (insertedAlerts > 0) {
+        publishSecurityRealtimeSignal(app, "security.alerts.changed");
+      }
       return { ok: true, blockedNow: shouldLock };
     } catch (_error) {
       await client.query("ROLLBACK").catch(() => {});
@@ -1122,6 +1157,64 @@ function buildPagination(total, page, limit) {
     total: safeTotal,
     total_pages: totalPages,
   };
+}
+
+function toIsoDateOrNull(value) {
+  return value ? new Date(value).toISOString() : null;
+}
+
+function getRequestRoles(request) {
+  if (!Array.isArray(request?.claims?.roles)) return [];
+  return request.claims.roles
+    .filter(Boolean)
+    .map((role) => String(role).trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function canSeeExpandedSecurityFields(request) {
+  return getRequestRoles(request).some((role) => SECURITY_PRIVILEGED_ROLES.has(role));
+}
+
+function canSeeFullSecurityIp(request) {
+  return canSeeExpandedSecurityFields(request);
+}
+
+function formatIpByRole(ip, request) {
+  return canSeeFullSecurityIp(request) ? (ip ?? null) : maskIpAddress(ip);
+}
+
+function sanitizeMetadataOutput(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeMetadataOutput(entry));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const clean = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (SENSITIVE_KEY_PATTERN.test(String(key || ""))) continue;
+    clean[key] = sanitizeMetadataOutput(raw);
+  }
+  return clean;
+}
+
+function normalizeResolutionComment(value) {
+  const normalized = String(value || "").normalize("NFC").trim();
+  if (!normalized) return null;
+  return normalized.slice(0, ALERT_RESOLUTION_COMMENT_MAX);
+}
+
+function inferAlertImpactLevel(row) {
+  const tipo = String(row?.tipo || "").toLowerCase();
+  const detalle = row?.detalle && typeof row.detalle === "object" ? row.detalle : {};
+  const hasSessionInDetail =
+    detalle.id_sesion || detalle.session_id || detalle.sesion_id || detalle.sid || detalle.idSesion;
+
+  if (hasSessionInDetail || /sesion|session/.test(tipo)) return "sesion";
+  if (row?.id_usuario) return "usuario";
+  if (row?.ip) return "ip";
+  return "sistema";
 }
 
 async function insertAdminAuditLog(app, {
@@ -1256,9 +1349,9 @@ export async function listAdminSecurityLoginLogs(app, options = {}) {
     resultado: row.resultado,
     motivo_codigo: row.motivo_codigo ?? null,
     ip: maskIpAddress(row.ip),
-    user_agent_hint: shortenUserAgent(row.user_agent, 56),
+    device_summary: buildDeviceSummary(row.user_agent),
     request_id: row.request_id ?? null,
-    created_at: row.created_at ? new Date(row.created_at).toISOString() : null,
+    created_at: toIsoDateOrNull(row.created_at),
   }));
 
   return {
@@ -1269,6 +1362,7 @@ export async function listAdminSecurityLoginLogs(app, options = {}) {
 
 export async function listAdminSecuritySessions(app, options = {}) {
   if (!app?.db) return { items: [], pagination: buildPagination(0, 1, 20) };
+  const currentSessionId = String(options.current_session_id || options.currentSessionId || "").trim();
 
   const page = toSafePage(options.page, 1);
   const limit = toSafeLimit(options.limit, 20);
@@ -1343,22 +1437,202 @@ export async function listAdminSecuritySessions(app, options = {}) {
     id_sesion: row.id_sesion,
     id_usuario: row.id_usuario,
     estado: row.estado,
-    inicio_at: row.inicio_at ? new Date(row.inicio_at).toISOString() : null,
-    ultimo_uso_at: row.ultimo_uso_at ? new Date(row.ultimo_uso_at).toISOString() : null,
-    expira_at: row.expira_at ? new Date(row.expira_at).toISOString() : null,
-    cierre_at: row.cierre_at ? new Date(row.cierre_at).toISOString() : null,
-    revocada_at: row.revocada_at ? new Date(row.revocada_at).toISOString() : null,
+    inicio_at: toIsoDateOrNull(row.inicio_at),
+    ultimo_uso_at: toIsoDateOrNull(row.ultimo_uso_at),
+    expira_at: toIsoDateOrNull(row.expira_at),
+    cierre_at: toIsoDateOrNull(row.cierre_at),
+    revocada_at: toIsoDateOrNull(row.revocada_at),
     motivo_cierre: row.motivo_cierre ?? null,
     ip_inicio: maskIpAddress(row.ip_inicio),
     ip_ultimo_uso: maskIpAddress(row.ip_ultimo_uso),
-    user_agent_hint: shortenUserAgent(row.user_agent, 56),
-    request_id: row.request_id ?? null,
+    device_summary: buildDeviceSummary(row.user_agent),
+    is_current_session: Boolean(currentSessionId && String(row.id_sesion) === currentSessionId),
   }));
 
   return {
     items,
     pagination: buildPagination(total, page, limit),
   };
+}
+
+export async function getAdminSecurityLoginLogDetail(app, request, { idLoginLog }) {
+  if (!app?.db || !isValidUuid(idLoginLog)) {
+    return { ok: false, code: "SECURITY_LOGIN_LOG_DETAIL_INVALID" };
+  }
+
+  const result = await app.db.query(
+    `
+      SELECT
+        ll.id_login_log,
+        ll.id_usuario,
+        ll.identificador_hash,
+        ll.email_masked,
+        ll.provider,
+        ll.resultado,
+        ll.motivo_codigo,
+        ll.ip,
+        ll.user_agent,
+        ll.request_id,
+        ll.metadata,
+        ll.created_at,
+        p.nombres,
+        p.apellidos,
+        COALESCE(NULLIF(c.direccion_correo::text, ''), NULLIF(au.email::text, '')) AS email_resolved
+      FROM public.seguridad_login_logs ll
+      LEFT JOIN public.usuarios u
+        ON u.id_usuario = ll.id_usuario
+      LEFT JOIN public.personas p
+        ON p.id_persona = u.id_persona
+      LEFT JOIN auth.users au
+        ON au.id = u.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo
+        FROM public.correos c2
+        WHERE c2.id_persona = u.id_persona
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) c ON TRUE
+      WHERE ll.id_login_log = $1::uuid
+      LIMIT 1
+    `,
+    [idLoginLog]
+  );
+
+  const row = result.rows?.[0];
+  if (!row) {
+    return { ok: false, code: "SECURITY_LOGIN_LOG_NOT_FOUND" };
+  }
+
+  const isPrivileged = canSeeExpandedSecurityFields(request);
+  const fullEmail = row.id_usuario ? normalizeIdentifier(row.email_resolved || "") : "";
+  const safeMetadata = sanitizeMetadataOutput(row.metadata || {});
+  const detail = {
+    id_login_log: row.id_login_log,
+    id_usuario: row.id_usuario ?? null,
+    provider: row.provider ?? null,
+    resultado: row.resultado,
+    motivo_codigo: row.motivo_codigo ?? null,
+    ip: formatIpByRole(row.ip, request),
+    device_summary: buildDeviceSummary(row.user_agent),
+    user_agent: row.user_agent ?? null,
+    created_at: toIsoDateOrNull(row.created_at),
+    usuario: row.id_usuario
+      ? {
+          nombres: row.nombres ?? null,
+          apellidos: row.apellidos ?? null,
+        }
+      : null,
+  };
+
+  if (fullEmail) {
+    detail.email = fullEmail;
+  } else {
+    detail.email_masked = row.email_masked ?? null;
+    detail.identificador_hash = row.identificador_hash ?? null;
+  }
+
+  if (isPrivileged) {
+    detail.request_id = row.request_id ?? null;
+    detail.metadata = safeMetadata;
+  }
+
+  return { ok: true, item: detail };
+}
+
+export async function getAdminSecuritySessionDetail(app, request, { idSesion }) {
+  if (!app?.db || !isValidUuid(idSesion)) {
+    return { ok: false, code: "SECURITY_SESSION_DETAIL_INVALID" };
+  }
+
+  const result = await app.db.query(
+    `
+      SELECT
+        s.id_sesion,
+        s.id_usuario,
+        s.estado,
+        s.inicio_at,
+        s.ultimo_uso_at,
+        s.expira_at,
+        s.cierre_at,
+        s.revocada_at,
+        s.cerrada_por,
+        s.motivo_cierre,
+        s.ip_inicio,
+        s.ip_ultimo_uso,
+        s.user_agent,
+        s.request_id,
+        s.metadata,
+        p.nombres,
+        p.apellidos,
+        COALESCE(NULLIF(c.direccion_correo::text, ''), NULLIF(au.email::text, '')) AS email_resolved,
+        (
+          SELECT COALESCE(
+            array_agg(DISTINCT r.nombre ORDER BY r.nombre) FILTER (WHERE r.nombre IS NOT NULL),
+            ARRAY[]::text[]
+          )
+          FROM public.roles_usuarios ru
+          JOIN public.roles r
+            ON r.id_rol = ru.id_rol
+          WHERE ru.id_usuario = s.id_usuario
+            AND ru.activo IS TRUE
+        ) AS roles_usuario
+      FROM public.seguridad_sesiones s
+      LEFT JOIN public.usuarios u
+        ON u.id_usuario = s.id_usuario
+      LEFT JOIN public.personas p
+        ON p.id_persona = u.id_persona
+      LEFT JOIN auth.users au
+        ON au.id = u.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo
+        FROM public.correos c2
+        WHERE c2.id_persona = u.id_persona
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) c ON TRUE
+      WHERE s.id_sesion = $1::uuid
+      LIMIT 1
+    `,
+    [idSesion]
+  );
+
+  const row = result.rows?.[0];
+  if (!row) {
+    return { ok: false, code: "SECURITY_SESSION_NOT_FOUND" };
+  }
+
+  const isPrivileged = canSeeExpandedSecurityFields(request);
+  const currentSessionId = String(request?.user?.sid || request?.auth?.sid || "").trim();
+  const detail = {
+    id_sesion: row.id_sesion,
+    id_usuario: row.id_usuario,
+    estado: row.estado,
+    inicio_at: toIsoDateOrNull(row.inicio_at),
+    ultimo_uso_at: toIsoDateOrNull(row.ultimo_uso_at),
+    expira_at: toIsoDateOrNull(row.expira_at),
+    cierre_at: toIsoDateOrNull(row.cierre_at),
+    revocada_at: toIsoDateOrNull(row.revocada_at),
+    cerrada_por: row.cerrada_por ?? null,
+    motivo_cierre: row.motivo_cierre ?? null,
+    ip_inicio: formatIpByRole(row.ip_inicio, request),
+    ip_ultimo_uso: formatIpByRole(row.ip_ultimo_uso, request),
+    device_summary: buildDeviceSummary(row.user_agent),
+    user_agent: row.user_agent ?? null,
+    usuario: {
+      email: normalizeIdentifier(row.email_resolved || "") || null,
+      nombres: row.nombres ?? null,
+      apellidos: row.apellidos ?? null,
+    },
+    is_current_session: Boolean(currentSessionId && String(row.id_sesion) === currentSessionId),
+  };
+
+  if (isPrivileged) {
+    detail.request_id = row.request_id ?? null;
+    detail.metadata = sanitizeMetadataOutput(row.metadata || {});
+    detail.usuario.roles = Array.isArray(row.roles_usuario) ? row.roles_usuario : [];
+  }
+
+  return { ok: true, item: detail };
 }
 
 export async function revokeAdminSecuritySession(app, request, {
@@ -1407,6 +1681,7 @@ export async function revokeAdminSecuritySession(app, request, {
     request,
     metadata: { id_usuario_objetivo: result.rows[0].id_usuario },
   });
+  publishSecurityRealtimeSignal(app, "security.sessions.changed");
 
   return {
     ok: true,
@@ -1476,6 +1751,7 @@ export async function listAdminSecurityUsers(app, options = {}) {
         sua.locked_until_at,
         sua.last_login_at,
         sua.last_login_ip,
+        sua.force_password_change,
         sua.updated_at,
         COALESCE(
           array_agg(DISTINCT r.nombre ORDER BY r.nombre) FILTER (WHERE r.nombre IS NOT NULL),
@@ -1506,6 +1782,7 @@ export async function listAdminSecurityUsers(app, options = {}) {
         sua.locked_until_at,
         sua.last_login_at,
         sua.last_login_ip,
+        sua.force_password_change,
         sua.updated_at
       ORDER BY ${sortBy} ${sortDirection}
       LIMIT $${dataParams.length - 1}::int
@@ -1527,6 +1804,7 @@ export async function listAdminSecurityUsers(app, options = {}) {
     locked_until_at: row.locked_until_at ? new Date(row.locked_until_at).toISOString() : null,
     last_login_at: row.last_login_at ? new Date(row.last_login_at).toISOString() : null,
     last_login_ip: maskIpAddress(row.last_login_ip),
+    force_password_change: row.force_password_change === null ? null : Boolean(row.force_password_change),
     updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
   }));
 
@@ -1757,6 +2035,7 @@ export async function listAdminSecurityAlerts(app, options = {}) {
         a.id_usuario,
         a.ip,
         a.resumen,
+        a.detalle,
         a.detectada_at,
         a.resuelta_at,
         a.resuelta_por
@@ -1774,11 +2053,12 @@ export async function listAdminSecurityAlerts(app, options = {}) {
     tipo: row.tipo,
     severidad: row.severidad,
     estado: row.estado,
+    nivel_afectacion: inferAlertImpactLevel(row),
     id_usuario: row.id_usuario ?? null,
     ip: maskIpAddress(row.ip),
     resumen: row.resumen ?? null,
-    detectada_at: row.detectada_at ? new Date(row.detectada_at).toISOString() : null,
-    resuelta_at: row.resuelta_at ? new Date(row.resuelta_at).toISOString() : null,
+    detectada_at: toIsoDateOrNull(row.detectada_at),
+    resuelta_at: toIsoDateOrNull(row.resuelta_at),
     resuelta_por: row.resuelta_por ?? null,
   }));
 
@@ -1788,30 +2068,103 @@ export async function listAdminSecurityAlerts(app, options = {}) {
   };
 }
 
+export async function getAdminSecurityAlertDetail(app, request, { idAlerta }) {
+  if (!app?.db || !isValidUuid(idAlerta)) {
+    return { ok: false, code: "SECURITY_ALERT_DETAIL_INVALID" };
+  }
+
+  const result = await app.db.query(
+    `
+      SELECT
+        a.id_alerta,
+        a.tipo,
+        a.severidad,
+        a.estado,
+        a.id_usuario,
+        a.ip,
+        a.resumen,
+        a.detalle,
+        a.detectada_at,
+        a.resuelta_at,
+        a.resuelta_por,
+        a.comentario_resolucion
+      FROM public.seguridad_alertas a
+      WHERE a.id_alerta = $1::uuid
+      LIMIT 1
+    `,
+    [idAlerta]
+  );
+
+  const row = result.rows?.[0];
+  if (!row) {
+    return { ok: false, code: "SECURITY_ALERT_NOT_FOUND" };
+  }
+
+  const isPrivileged = canSeeExpandedSecurityFields(request);
+  const detail = {
+    id_alerta: row.id_alerta,
+    tipo: row.tipo,
+    severidad: row.severidad,
+    estado: row.estado,
+    nivel_afectacion: inferAlertImpactLevel(row),
+    id_usuario: row.id_usuario ?? null,
+    ip: formatIpByRole(row.ip, request),
+    resumen: row.resumen ?? null,
+    detalle: sanitizeMetadataOutput(row.detalle || {}),
+    detectada_at: toIsoDateOrNull(row.detectada_at),
+    resuelta_at: toIsoDateOrNull(row.resuelta_at),
+    resuelta_por: row.resuelta_por ?? null,
+    comentario_resolucion: row.comentario_resolucion ?? null,
+  };
+
+  if (!isPrivileged) {
+    delete detail.detalle;
+  }
+
+  return { ok: true, item: detail };
+}
+
 export async function updateAdminAlertState(app, request, {
   idAlerta,
   estado,
+  comentarioResolucion = null,
   actorUserId,
 }) {
   if (!app?.db || !isValidUuid(idAlerta) || !isValidUuid(actorUserId)) {
     return { ok: false, code: "SECURITY_ALERT_STATE_INVALID" };
   }
 
-  const nextState = String(estado || "").trim();
-  const resolvedAt = nextState === "resuelta" || nextState === "descartada" ? "NOW()" : "NULL";
-  const resolvedBy = nextState === "resuelta" || nextState === "descartada" ? "$3::uuid" : "NULL";
+  const nextState = String(estado || "").trim().toLowerCase();
+  if (!ALERT_STATE_UPDATE_SET.has(nextState)) {
+    return { ok: false, code: "SECURITY_ALERT_STATE_NOT_ALLOWED" };
+  }
+  const nextComment = normalizeResolutionComment(comentarioResolucion);
+  const requiresComment = RESOLVED_ALERT_STATES.has(nextState);
+  if (requiresComment && !nextComment) {
+    return { ok: false, code: "SECURITY_ALERT_RESOLUTION_COMMENT_REQUIRED" };
+  }
 
   const result = await app.db.query(
     `
       UPDATE public.seguridad_alertas
       SET
         estado = $2::text,
-        resuelta_at = ${resolvedAt},
-        resuelta_por = ${resolvedBy}
+        resuelta_at = CASE
+          WHEN $2::text IN ('resuelta', 'descartada') THEN NOW()
+          ELSE NULL
+        END,
+        resuelta_por = CASE
+          WHEN $2::text IN ('resuelta', 'descartada') THEN $3::uuid
+          ELSE NULL
+        END,
+        comentario_resolucion = CASE
+          WHEN $2::text IN ('resuelta', 'descartada') THEN $4::text
+          ELSE NULL
+        END
       WHERE id_alerta = $1::uuid
-      RETURNING id_alerta, estado
+      RETURNING id_alerta, estado, comentario_resolucion
     `,
-    [idAlerta, nextState, actorUserId]
+    [idAlerta, nextState, actorUserId, nextComment]
   );
 
   if (!result.rowCount) {
@@ -1826,12 +2179,14 @@ export async function updateAdminAlertState(app, request, {
     resultado: "ok",
     motivoCodigo: "SECURITY_ALERT_UPDATED",
     request,
-    metadata: { estado: nextState },
+    metadata: { estado: nextState, comentario_resolucion: nextComment },
   });
+  publishSecurityRealtimeSignal(app, "security.alerts.changed");
 
   return {
     ok: true,
     id_alerta: result.rows[0].id_alerta,
     estado: result.rows[0].estado,
+    comentario_resolucion: result.rows[0].comentario_resolucion ?? null,
   };
 }
