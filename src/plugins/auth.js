@@ -2,6 +2,7 @@ import fp from "fastify-plugin";
 import jwt from "jsonwebtoken";
 import { getAuthClaims } from "../utils/authClaims.js";
 import { sendError } from "../utils/errors.js";
+import { validateActiveSession } from "../services/securityService.js";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -50,9 +51,32 @@ export default fp(async function authPlugin(app) {
         });
       }
 
+      if (!UUID_PATTERN.test(String(payload.sid || "")) || !UUID_PATTERN.test(String(payload.jti || ""))) {
+        return sendError(reply, 401, "Token de acceso invalido", {
+          code: "AUTH_TOKEN_INVALID",
+        });
+      }
+
+      const sessionValidation = await validateActiveSession(app, request, {
+        id_usuario: String(payload.sub || ""),
+        sid: String(payload.sid || ""),
+        jti: String(payload.jti || ""),
+      });
+
+      if (!sessionValidation.ok) {
+        if (sessionValidation.statusCode === 500) {
+          return sendError(reply, 500, "No se pudo validar la sesion", {
+            code: "AUTH_SESSION_VALIDATE_ERROR",
+          });
+        }
+        return sendError(reply, 401, "Token de acceso invalido", {
+          code: "AUTH_SESSION_INVALID",
+        });
+      }
+
       request.auth = payload;
     } catch (error) {
-      request.log.warn({ err: error }, "JWT verification failed");
+      request.log.warn({ event: "auth_jwt_verification_failed", code: "AUTH_TOKEN_INVALID" }, "JWT verification failed");
       return sendError(reply, 401, "Token de acceso invalido", {
         code: "AUTH_TOKEN_INVALID",
       });

@@ -4,6 +4,17 @@ import { getAuthClaims } from "../../utils/authClaims.js";
 import { sendOk } from "../../utils/response.js";
 import { sendError } from "../../utils/errors.js";
 import { generateRecoveryActionLink } from "../../services/authRecovery.js";
+import {
+  applyProgressiveLoginDelay,
+  checkUserTemporaryLock,
+  closeActiveSession,
+  createActiveSession,
+  getLoginProtectionState,
+  inferFailedLoginReason,
+  logLoginAttempt,
+  registerFailedLoginAttempt,
+  registerSuccessfulLogin,
+} from "../../services/securityService.js";
 
 const AUTH_SESSION_COOKIE = "mf_session";
 const AUTH_CSRF_COOKIE = "mf_csrf";
@@ -18,6 +29,7 @@ const loginBodySchema = {
     contrasena: { type: "string", minLength: 1 },
     password: { type: "string", minLength: 1 },
     remember: { type: "boolean" },
+    replace_active_session: { type: "boolean" },
   },
   anyOf: [
     { required: ["identifier"] },
@@ -116,6 +128,25 @@ const loginResponseSchema = {
       requestId: requestIdSchema,
     },
     required: ["ok", "data"],
+    additionalProperties: true,
+  },
+  409: {
+    type: "object",
+    properties: {
+      ok: { type: "boolean" },
+      error: {
+        type: "object",
+        properties: {
+          code: { type: "string" },
+          message: { type: "string" },
+        },
+        required: ["code", "message"],
+        additionalProperties: false,
+      },
+      requires_session_replacement: { type: "boolean" },
+      requestId: requestIdSchema,
+    },
+    required: ["ok", "error", "requires_session_replacement"],
     additionalProperties: true,
   },
 };
@@ -583,12 +614,89 @@ function registerResetAttempt(emailKey) {
   };
 }
 
-function signAppToken(payload, jwtSecret) {
+function signAppToken(payload, jwtSecret, { sid, jti } = {}) {
+  if (!UUID_REGEX.test(String(sid || "")) || !UUID_REGEX.test(String(jti || ""))) {
+    throw new Error("AUTH_TOKEN_SESSION_IDS_INVALID");
+  }
+
   return jwt.sign(payload, jwtSecret, {
     expiresIn: process.env.JWT_EXPIRES_IN?.trim() || "12h",
     issuer: process.env.APP_JWT_ISSUER || "masterfade-api",
     audience: process.env.APP_JWT_AUDIENCE || "masterfade-app",
+    jwtid: jti,
+    header: { typ: "JWT" },
+    mutatePayload: false,
+    noTimestamp: false,
+    algorithm: "HS256",
   });
+}
+
+function decodeJwtExpiryUnix(token) {
+  const decoded = jwt.decode(token);
+  const expUnix = Number(decoded?.exp || 0);
+  if (!Number.isFinite(expUnix) || expUnix <= 0) {
+    return null;
+  }
+  return expUnix;
+}
+
+async function issueManagedAppSession(app, request, { jwtSecret, claims, email, roles, branchIds, remember = false, replaceActiveSession = false, identifier = null, provider = "supabase_password" }) {
+  const sid = crypto.randomUUID();
+  const jti = crypto.randomUUID();
+  const token = signAppToken(
+    {
+      sub: String(claims.user.id_usuario),
+      sid,
+      email: email ?? null,
+      "mf:roles": Array.isArray(roles) ? roles : [],
+      "mf:branch_ids": Array.isArray(branchIds) ? branchIds : [],
+      token_type: "app",
+    },
+    jwtSecret,
+    { sid, jti }
+  );
+
+  const expUnix = decodeJwtExpiryUnix(token);
+  if (!expUnix) {
+    throw {
+      statusCode: 500,
+      message: "No se pudo crear la sesion de autenticacion",
+      code: "AUTH_SESSION_EXP_INVALID",
+    };
+  }
+
+  const persisted = await createActiveSession(app, request, {
+    id_usuario: String(claims.user.id_usuario),
+    sid,
+    jti,
+    exp_unix: expUnix,
+    roles,
+    replace_active_session: replaceActiveSession === true,
+    identifier,
+    provider,
+    metadata: {
+      auth_stage: "app_session",
+      remember: remember === true,
+    },
+  });
+
+  if (!persisted.ok) {
+    if (persisted.code === "AUTH_SESSION_LIMIT_REACHED") {
+      throw {
+        statusCode: 409,
+        message: "Ya existe una sesion activa para esta cuenta. Puedes cerrar la sesion anterior y continuar.",
+        code: "AUTH_SESSION_LIMIT_REACHED",
+        requires_session_replacement: persisted.requiresSessionReplacement === true,
+      };
+    }
+    throw {
+      statusCode: 500,
+      message: "No se pudo crear la sesion de autenticacion",
+      code: "AUTH_SESSION_CREATE_ERROR",
+    };
+  }
+
+  return { token, sid, jti };
 }
 
 function getCookieSecureFlag(app) {
@@ -1288,18 +1396,16 @@ export default async function authRoutes(app) {
           ultimo_login_at: accessSync.state?.ultimo_login_at ?? null,
         };
 
-        const token = signAppToken(
-          {
-            sub: String(claims.user.id_usuario),
-            email: user.email ?? extractEmailFromSupabaseUser(supabaseUser) ?? null,
-            "mf:roles": claims.roles || [],
-            "mf:branch_ids": claims.branch_ids || [],
-            token_type: "app",
-          },
-          jwtSecret
-        );
+        const session = await issueManagedAppSession(app, request, {
+          jwtSecret,
+          claims,
+          email: user.email ?? extractEmailFromSupabaseUser(supabaseUser) ?? null,
+          roles: claims.roles || [],
+          branchIds: claims.branch_ids || [],
+          remember: true,
+        });
 
-        const csrfToken = issueSessionCookies(app, reply, token, { remember: true });
+        const csrfToken = issueSessionCookies(app, reply, session.token, { remember: true });
         return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
         if (error?.statusCode && error?.code) {
@@ -1456,18 +1562,16 @@ export default async function authRoutes(app) {
           ultimo_login_at: accessSync.state?.ultimo_login_at ?? null,
         };
 
-        const token = signAppToken(
-          {
-            sub: String(claims.user.id_usuario),
-            email: user.email ?? socialEmail ?? null,
-            "mf:roles": claims.roles || [],
-            "mf:branch_ids": claims.branch_ids || [],
-            token_type: "app",
-          },
-          jwtSecret
-        );
+        const session = await issueManagedAppSession(app, request, {
+          jwtSecret,
+          claims,
+          email: user.email ?? socialEmail ?? null,
+          roles: claims.roles || [],
+          branchIds: claims.branch_ids || [],
+          remember: true,
+        });
 
-        const csrfToken = issueSessionCookies(app, reply, token, { remember: true });
+        const csrfToken = issueSessionCookies(app, reply, session.token, { remember: true });
         return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
         if (error?.statusCode && error?.code) {
@@ -1805,8 +1909,8 @@ export default async function authRoutes(app) {
     {
       config: {
         rateLimit: {
-          max: Number(process.env.AUTH_LOGIN_RATE_LIMIT_MAX || 10),
-          timeWindow: process.env.AUTH_LOGIN_RATE_LIMIT_WINDOW || "1 minute",
+          max: Number(process.env.AUTH_LOGIN_RATE_LIMIT_MAX || 20),
+          timeWindow: process.env.AUTH_LOGIN_RATE_LIMIT_WINDOW || "15 minutes",
         },
       },
       schema: {
@@ -1822,6 +1926,7 @@ export default async function authRoutes(app) {
       );
       const contrasena = String(body.contrasena ?? body.password ?? "");
       const remember = body.remember === true;
+      const replaceActiveSession = body.replace_active_session === true;
 
       if (!identifier || !contrasena) {
         return sendError(reply, 400, "Faltan credenciales: se requiere correo y contrasena", {
@@ -1849,6 +1954,25 @@ export default async function authRoutes(app) {
           });
         }
 
+        const protectionState = await getLoginProtectionState(app, request, { identifier });
+        if (protectionState.blocked) {
+          await logLoginAttempt(app, request, {
+            id_usuario: null,
+            identifier,
+            provider: "supabase_password",
+            resultado: "blocked",
+            motivo_codigo: "LOGIN_RATE_LIMITED",
+            metadata: {
+              auth_stage: "password_login",
+            },
+          });
+          return sendError(reply, 429, "No fue posible iniciar sesion en este momento. Intenta nuevamente mas tarde.", {
+            code: "AUTH_LOGIN_RATE_LIMITED",
+          });
+        }
+
+        await applyProgressiveLoginDelay(protectionState.delayMs || 0);
+
         if (!app.supabase) {
           return sendError(reply, 500, "Supabase Auth no esta configurado en el backend", {
             code: "SUPABASE_NOT_CONFIGURED",
@@ -1862,8 +1986,14 @@ export default async function authRoutes(app) {
         });
 
         if (error || !data?.user?.id) {
-          request.log.warn({ event: "auth_login_failed", identifier }, "Login failed");
-          return sendError(reply, 401, error?.message || "Credenciales invalidas", {
+          const reason = inferFailedLoginReason(error);
+          await registerFailedLoginAttempt(app, request, {
+            identifier,
+            provider: "supabase_password",
+            motivo_codigo: reason,
+          });
+          request.log.warn({ event: "auth_login_failed", reason }, "Login failed");
+          return sendError(reply, 401, "Credenciales invalidas o acceso no permitido.", {
             code: "AUTH_INVALID_CREDENTIALS",
           });
         }
@@ -1871,23 +2001,36 @@ export default async function authRoutes(app) {
         // AM: Validacion de autorizacion interna: no emitimos APP JWT si no existe usuario activo en public.usuarios.
         const claims = await getAuthClaims(app, data.user.id);
         if (!claims) {
-          return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
-            code: "AUTH_USER_NOT_ONBOARDED",
+          return sendError(reply, 401, "Credenciales invalidas o acceso no permitido.", {
+            code: "AUTH_INVALID_CREDENTIALS",
           });
         }
 
         const accessSync = await syncAccessStateAfterLogin(app, claims.user.id_usuario);
         if (!accessSync.ok) {
-          if (accessSync.code === "AUTH_ACCESS_BLOCKED") {
-            return sendError(reply, 403, "Tu acceso esta bloqueado o inactivo. Contacta al administrador.", {
-              code: "AUTH_ACCESS_BLOCKED",
-              details: { estado_acceso: accessSync.estado_acceso },
-            });
-          }
-          return sendError(reply, 403, "Usuario autenticado sin perfil interno activo en Masterfade", {
-            code: "AUTH_USER_NOT_ONBOARDED",
+          return sendError(reply, 401, "Credenciales invalidas o acceso no permitido.", {
+            code: "AUTH_INVALID_CREDENTIALS",
           });
         }
+
+        const tempLock = await checkUserTemporaryLock(app, { idUsuario: claims.user.id_usuario });
+        if (tempLock.ok && tempLock.blocked) {
+          await logLoginAttempt(app, request, {
+            id_usuario: claims.user.id_usuario,
+            identifier,
+            provider: "supabase_password",
+            resultado: "blocked",
+            motivo_codigo: "LOGIN_TEMPORARILY_LOCKED",
+            metadata: {
+              auth_stage: "password_login",
+            },
+          });
+          return sendError(reply, 429, "No fue posible iniciar sesion en este momento. Intenta nuevamente mas tarde.", {
+            code: "AUTH_USER_TEMPORARILY_LOCKED",
+          });
+        }
+
+        await registerSuccessfulLogin(app, request, { idUsuario: claims.user.id_usuario });
 
         const user = {
           ...claims.user,
@@ -1901,23 +2044,55 @@ export default async function authRoutes(app) {
           ultimo_login_at: accessSync.state?.ultimo_login_at ?? null,
         };
 
-        const token = signAppToken(
-          {
-            sub: String(claims.user.id_usuario),
-            email: user.email ?? data.user.email ?? null,
-            "mf:roles": claims.roles || [],
-            "mf:branch_ids": claims.branch_ids || [],
-            token_type: "app",
-          },
-          jwtSecret
-        );
+        const session = await issueManagedAppSession(app, request, {
+          jwtSecret,
+          claims,
+          email: user.email ?? data.user.email ?? null,
+          roles: claims.roles || [],
+          branchIds: claims.branch_ids || [],
+          remember,
+          replaceActiveSession,
+          identifier,
+          provider: "supabase_password",
+        });
 
-        const csrfToken = issueSessionCookies(app, reply, token, { remember });
+        const csrfToken = issueSessionCookies(app, reply, session.token, { remember });
+        await logLoginAttempt(app, request, {
+          id_usuario: claims.user.id_usuario,
+          identifier,
+          provider: "supabase_password",
+          resultado: "success",
+          motivo_codigo: "LOGIN_SUCCESS",
+          metadata: {
+            auth_stage: "password_login",
+          },
+        });
         request.log.info({ event: "auth_login_success", userId: claims.user.id_usuario }, "Login success");
         return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
+        if (error?.statusCode === 409 && error?.code === "AUTH_SESSION_LIMIT_REACHED") {
+          return reply.code(409).send({
+            ok: false,
+            error: {
+              code: "AUTH_SESSION_LIMIT_REACHED",
+              message: "Ya existe una sesion activa para esta cuenta. Puedes cerrar la sesion anterior y continuar.",
+            },
+            requires_session_replacement: error?.requires_session_replacement === true,
+            requestId: request.id,
+          });
+        }
         const message = error instanceof Error ? error.message : "Unknown login error";
-        request.log.error({ err: error }, "Login error");
+        await logLoginAttempt(app, request, {
+          id_usuario: null,
+          identifier,
+          provider: "supabase_password",
+          resultado: "error",
+          motivo_codigo: "LOGIN_INTERNAL_ERROR",
+          metadata: {
+            auth_stage: "password_login",
+          },
+        });
+        request.log.error({ event: "auth_login_error", code: "AUTH_LOGIN_ERROR" }, "Login error");
 
         return sendError(reply, 500, "Error al procesar login", {
           code: "AUTH_LOGIN_ERROR",
@@ -1956,6 +2131,18 @@ export default async function authRoutes(app) {
     },
     async (request, reply) => {
       clearSessionCookies(app, reply);
+      const closed = await closeActiveSession(app, request, {
+        sid: String(request.auth?.sid || ""),
+        id_usuario: String(request.auth?.sub || ""),
+        cerrada_por: String(request.auth?.sub || ""),
+        motivo_cierre: "logout_usuario",
+      });
+      if (!closed.ok) {
+        request.log.error(
+          { event: "auth_logout_session_close_failed", code: closed.code || "AUTH_SESSION_CLOSE_ERROR" },
+          "Logout session close failed"
+        );
+      }
       request.log.info({ event: "auth_logout", userId: request.auth?.sub || null }, "Logout success");
       return sendOk(reply, { logged_out: true }, { requestId: request.id });
     }

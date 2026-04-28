@@ -6,7 +6,7 @@ import { buildApp } from "./app.js";
 
 const app = await buildApp();
 const port = Number(process.env.PORT || 3002);
-const host = process.env.HOST || "127.0.0.1";
+const host = process.env.HOST || "localhost";
 
 // NUEVO:
 // PORQUE: Evitar doble cierre por múltiples señales/errores y evitar problemas.
