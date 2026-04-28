@@ -76,6 +76,10 @@ async function envPlugin(app) {
     corsOrigins: parseCorsOrigins(
       process.env.CORS_ORIGENES || process.env.CORS_ORIGINS || process.env.CORS_ORIGIN
     ),
+    serviceBarberAssignmentsEnabled: parseBoolean(
+      process.env.SERVICE_BARBER_ASSIGNMENTS_ENABLED,
+      false
+    ),
   };
 
   if (!["strict", "lax", "none"].includes(config.cookieSameSite)) {
