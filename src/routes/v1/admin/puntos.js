@@ -20,10 +20,11 @@ const idClienteParamSchema = {
 
 const ajusteBodySchema = {
   type: "object",
-  required: ["puntos", "motivo"],
+  required: ["accion", "puntos", "motivo"],
   properties: {
-    puntos: { type: "integer" },
-    motivo: { type: "string", minLength: 1, maxLength: 300 },
+    accion: { type: "string", enum: ["sumar", "restar"] },
+    puntos: { type: "integer", minimum: 1 },
+    motivo: { type: "string", minLength: 5, maxLength: 300 },
   },
   additionalProperties: false,
 };
@@ -164,6 +165,7 @@ export default async function adminPointsRoutes(app) {
       try {
         const data = await addManualPointsAdjustment(app, {
           idCliente: request.params.id_cliente,
+          accion: request.body?.accion,
           puntos: request.body?.puntos,
           motivo: request.body?.motivo,
           usuarioAdmin: request.claims?.user,
