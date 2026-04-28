@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import fp from "fastify-plugin";
 
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -40,7 +41,15 @@ function assertSecureProductionConfig(config) {
   }
 }
 
-export default async function envPlugin(app) {
+function parseCorsOrigins(rawValue, fallback = "http://localhost:5173") {
+  const raw = String(rawValue || fallback);
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+async function envPlugin(app) {
   dotenv.config();
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
@@ -64,6 +73,9 @@ export default async function envPlugin(app) {
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),
     cookieSameSite: String(process.env.AUTH_COOKIE_SAMESITE || "lax").trim().toLowerCase() || "lax",
     sessionTtlSeconds: Math.max(900, Number(process.env.AUTH_SESSION_TTL_SECONDS || 43200)),
+    corsOrigins: parseCorsOrigins(
+      process.env.CORS_ORIGENES || process.env.CORS_ORIGINS || process.env.CORS_ORIGIN
+    ),
   };
 
   if (!["strict", "lax", "none"].includes(config.cookieSameSite)) {
@@ -74,3 +86,5 @@ export default async function envPlugin(app) {
 
   app.decorate("config", config);
 }
+
+export default fp(envPlugin, { name: "env-plugin" });

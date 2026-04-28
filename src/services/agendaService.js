@@ -22,12 +22,27 @@ export const SYSTEM_PARAMETER_KEYS = [
   "hold_duracion_min",
   "no_show_min",
   "agenda_buffer_global_min",
+  "agenda_min_servicio_vendible_min",
   "permitir_acompanantes",
   "pago_total_obligatorio",
   "simulacion_sin_pago",
   "masterpuntos_migracion_manual_habilitada",
 ];
 export const SLOT_INTERVAL_MINUTES = 5;
+export const AGENDA_DEFAULT_TIME_ZONE = String(
+  process.env.AGENDA_TIME_ZONE
+  || process.env.APP_TIME_ZONE
+  || "America/Tegucigalpa"
+).trim();
+export const SLOT_DISCARD_REASONS = {
+  RESIDUAL_GAP_NOT_SELLABLE: "RESIDUAL_GAP_NOT_SELLABLE",
+  DURATION_INSUFFICIENT: "DURATION_INSUFFICIENT",
+  CONFLICT_WITH_APPOINTMENT: "CONFLICT_WITH_APPOINTMENT",
+  CONFLICT_WITH_HOLD: "CONFLICT_WITH_HOLD",
+  CONFLICT_WITH_BLOCK: "CONFLICT_WITH_BLOCK",
+  CROSS_BLOCK_BOUNDARY: "CROSS_BLOCK_BOUNDARY",
+  RESOURCE_UNAVAILABLE: "RESOURCE_UNAVAILABLE",
+};
 
 function createProviderAdapterByCode(providerCode) {
   const normalized = String(providerCode || "").trim().toLowerCase();
@@ -141,6 +156,35 @@ export function parseUuidList(rawValue, { required = false, field = "items", uni
   return values;
 }
 
+export function parseSinglePackageId(rawValue, { required = false, field = "id_paquete" } = {}) {
+  const normalizedValues = Array.isArray(rawValue)
+    ? rawValue
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean)
+    : String(rawValue || "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+  const uniqueValues = Array.from(new Set(normalizedValues));
+  if (!uniqueValues.length) {
+    if (!required) return null;
+    throw new AppError(400, `${field} es obligatorio`, {
+      code: "AGENDA_PACKAGE_ID_REQUIRED",
+      details: { field },
+    });
+  }
+
+  if (uniqueValues.length > 1) {
+    throw new AppError(400, "Solo puedes seleccionar un paquete por cita", {
+      code: "ONLY_ONE_PACKAGE_ALLOWED",
+      details: { field },
+    });
+  }
+
+  return assertUuid(uniqueValues[0], field);
+}
+
 export function assertUuid(value, field) {
   const raw = String(value || "").trim();
   if (!UUID_PATTERN.test(raw)) {
@@ -230,6 +274,15 @@ async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
+function isPoolLikeClient(client) {
+  return Boolean(
+    client
+    && typeof client.query === "function"
+    && typeof client.connect === "function"
+    && typeof client.release !== "function"
+  );
+}
+
 function startOfDay(dateString) {
   return new Date(`${dateString}T00:00:00`);
 }
@@ -243,6 +296,122 @@ function formatDateOnly(date) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function getDateTimePartsInTimeZone(dateValue, timeZone) {
+  const parsed = dateValue instanceof Date ? dateValue : new Date(dateValue || "");
+  if (Number.isNaN(parsed.getTime())) return null;
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const parts = formatter.formatToParts(parsed);
+  const byType = {};
+  for (const part of parts) {
+    if (part?.type) byType[part.type] = part.value;
+  }
+  const year = Number(byType.year);
+  const month = Number(byType.month);
+  const day = Number(byType.day);
+  const hour = Number(byType.hour);
+  const minute = Number(byType.minute);
+  const second = Number(byType.second);
+  if (![year, month, day, hour, minute, second].every((value) => Number.isFinite(value))) {
+    return null;
+  }
+  return {
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+  };
+}
+
+function formatDateOnlyInTimeZone(dateValue, timeZone) {
+  const parts = getDateTimePartsInTimeZone(dateValue, timeZone);
+  if (!parts) return null;
+  return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function getTimeZoneOffsetMs(dateValue, timeZone) {
+  const parts = getDateTimePartsInTimeZone(dateValue, timeZone);
+  if (!parts) return 0;
+  const utcFromParts = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second
+  );
+  return utcFromParts - dateValue.getTime();
+}
+
+function buildDateInTimeZone(dateString, hour, minute, second, timeZone) {
+  const [year, month, day] = String(dateString || "").split("-").map(Number);
+  if (![year, month, day, hour, minute, second].every((value) => Number.isFinite(value))) {
+    return null;
+  }
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second);
+  let candidate = new Date(utcGuess);
+  const firstOffset = getTimeZoneOffsetMs(candidate, timeZone);
+  candidate = new Date(utcGuess - firstOffset);
+  const secondOffset = getTimeZoneOffsetMs(candidate, timeZone);
+  if (secondOffset !== firstOffset) {
+    candidate = new Date(utcGuess - secondOffset);
+  }
+  return Number.isNaN(candidate.getTime()) ? null : candidate;
+}
+
+function resolveTodaySellableFloorStartAt(dateString, stepMinutes, { now = new Date(), timeZone = AGENDA_DEFAULT_TIME_ZONE } = {}) {
+  const safeDate = parseDateOnly(dateString, "fecha");
+  const referenceNow = now instanceof Date ? now : new Date(now);
+  if (Number.isNaN(referenceNow.getTime())) return null;
+
+  const todayInZone = formatDateOnlyInTimeZone(referenceNow, timeZone);
+  if (!todayInZone || todayInZone !== safeDate) return null;
+
+  const nowParts = getDateTimePartsInTimeZone(referenceNow, timeZone);
+  if (!nowParts) return null;
+  const safeStep = Math.max(1, Math.trunc(Number(stepMinutes || SLOT_INTERVAL_MINUTES)));
+  const minuteWithFractions = (nowParts.hour * 60) + nowParts.minute + (nowParts.second / 60);
+  const roundedMinutes = Math.ceil(minuteWithFractions / safeStep) * safeStep;
+  if (roundedMinutes >= 24 * 60) {
+    return buildDateInTimeZone(safeDate, 23, 59, 59, timeZone);
+  }
+
+  const floorHour = Math.floor(roundedMinutes / 60);
+  const floorMinute = roundedMinutes % 60;
+  return buildDateInTimeZone(safeDate, floorHour, floorMinute, 0, timeZone);
+}
+
+function trimIntervalsByMinimumStart(intervals, minimumStartAt) {
+  if (!(minimumStartAt instanceof Date) || Number.isNaN(minimumStartAt.getTime())) {
+    return Array.isArray(intervals) ? intervals : [];
+  }
+
+  const trimmed = [];
+  for (const interval of Array.isArray(intervals) ? intervals : []) {
+    const normalized = normalizeInterval(interval?.start, interval?.end);
+    if (!normalized) continue;
+    if (normalized.end.getTime() <= minimumStartAt.getTime()) continue;
+    trimmed.push({
+      start: normalized.start.getTime() < minimumStartAt.getTime()
+        ? new Date(minimumStartAt)
+        : normalized.start,
+      end: normalized.end,
+    });
+  }
+
+  return trimmed;
 }
 
 function combineDateAndTime(dateString, timeString) {
@@ -320,6 +489,30 @@ function toTimeLabel(date) {
   return `${hours}:${minutes}`;
 }
 
+const SLOT_OPERATIONAL_CONTEXT_KEY = "__slot_operational_context";
+
+function toSafeIsoString(value) {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) return null;
+  return value.toISOString();
+}
+
+function getSlotOperationalContext(slot) {
+  if (!slot || typeof slot !== "object") return null;
+  const context = slot[SLOT_OPERATIONAL_CONTEXT_KEY];
+  if (!context || typeof context !== "object") return null;
+  return context;
+}
+
+function setSlotOperationalContext(slot, context) {
+  if (!slot || typeof slot !== "object" || !context || typeof context !== "object") return;
+  Object.defineProperty(slot, SLOT_OPERATIONAL_CONTEXT_KEY, {
+    value: context,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  });
+}
+
 function toHourMinute(value) {
   if (value == null) return null;
   const normalized = String(value).trim();
@@ -344,7 +537,11 @@ export async function getHoldDurationMinutes(client) {
       LIMIT 1
     `
   );
-  return rows[0]?.hold_duracion_min ?? 5;
+  const rawValue = Number(rows[0]?.hold_duracion_min ?? 5);
+  if (!Number.isFinite(rawValue)) return 5;
+  const normalized = Math.trunc(rawValue);
+  if (normalized < 1 || normalized > 120) return 5;
+  return normalized;
 }
 
 export async function getGlobalBufferMinutes(client) {
@@ -358,6 +555,19 @@ export async function getGlobalBufferMinutes(client) {
   );
   const value = Number(rows[0]?.agenda_buffer_global_min ?? 0);
   return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+export async function getMinSellableServiceMinutes(client) {
+  const { rows } = await client.query(
+    `
+      SELECT COALESCE(valor_numero, 10)::int AS agenda_min_servicio_vendible_min
+      FROM public.parametros_sistema
+      WHERE clave = 'agenda_min_servicio_vendible_min'
+      LIMIT 1
+    `
+  );
+  const value = Number(rows[0]?.agenda_min_servicio_vendible_min ?? 10);
+  return Number.isFinite(value) && value >= 1 ? Math.trunc(value) : 10;
 }
 
 export async function getSystemParameters(client) {
@@ -783,7 +993,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
 
 export async function getPackageSelectionDetails(client, branchId, packageId, barberId = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
-  const safePackageId = assertUuid(packageId, "id_paquete");
+  const safePackageId = parseSinglePackageId(packageId, { required: true, field: "id_paquete" });
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
 
   const packageResult = await client.query(
@@ -901,22 +1111,13 @@ export async function getBookingSelectionDetails(client, {
   const normalizedSelectionType = normalizeBookingSelectionType(selection_type, { required: true });
 
   if (normalizedSelectionType === "package") {
-    if (!id_paquete) {
-      throw new AppError(400, "id_paquete es obligatorio para selection_type=package", {
-        code: "AGENDA_PACKAGE_ID_REQUIRED",
-      });
-    }
-    return getPackageSelectionDetails(client, id_sucursal, id_paquete, id_barbero);
+    const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
+    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
   }
 
   if (normalizedSelectionType === "mixed") {
-    if (!id_paquete) {
-      throw new AppError(400, "id_paquete es obligatorio para selection_type=mixed", {
-        code: "AGENDA_MIXED_PACKAGE_REQUIRED",
-      });
-    }
-
-    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, id_paquete, id_barbero);
+    const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
     const extraServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: true });
     if (!extraServiceIds.length) {
       return {
@@ -932,17 +1133,15 @@ export async function getBookingSelectionDetails(client, {
         .map((item) => item?.id_servicio)
         .filter(Boolean)
     );
-    const filteredExtraIds = extraServiceIds.filter((idServicio) => !packageServiceIds.has(idServicio));
-    if (!filteredExtraIds.length) {
-      return {
-        ...packageSelection,
-        selection_type: "mixed",
-        servicios_extra: [],
-        monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
-      };
+    const conflictingServiceIds = extraServiceIds.filter((idServicio) => packageServiceIds.has(idServicio));
+    if (conflictingServiceIds.length > 0) {
+      throw new AppError(409, "Ese servicio ya lo incluye el paquete seleccionado", {
+        code: "SERVICE_ALREADY_INCLUDED_IN_PACKAGE",
+        details: { field: "servicios" },
+      });
     }
 
-    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, filteredExtraIds, id_barbero);
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero);
     const mergedItems = [
       ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
       ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
@@ -1055,10 +1254,11 @@ async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
   ];
 }
 
-async function getBusyIntervalsForBarber(client, empleadoId, dateString) {
+async function getBusyIntervalsForBarber(client, empleadoId, dateString, options = {}) {
   const safeDate = parseDateOnly(dateString, "fecha");
   const dayStart = startOfDay(safeDate);
   const dayEnd = endOfDay(safeDate);
+  const includeSources = Boolean(options?.includeSources);
 
   const [bloqueosResult, citasResult] = await Promise.all([
     client.query(
@@ -1075,7 +1275,8 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString) {
       `
         SELECT
           inicio_at,
-          inicio_at + make_interval(mins => (COALESCE(duracion_total_min, 0) + COALESCE(buffer_total_min, 0))) AS fin_at
+          inicio_at + make_interval(mins => (COALESCE(duracion_total_min, 0) + COALESCE(buffer_total_min, 0))) AS fin_at,
+          estado_cita_codigo
         FROM public.citas
         WHERE id_empleado_barbero = $1::uuid
           AND deleted_at IS NULL
@@ -1087,13 +1288,33 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString) {
     ),
   ]);
 
-  return [
-    ...bloqueosResult.rows.map((row) => ({ start: row.inicio_at, end: row.fin_at })),
-    ...citasResult.rows.map((row) => ({ start: row.inicio_at, end: row.fin_at })),
-  ];
+  const blockedBySchedule = bloqueosResult.rows.map((row) => ({
+    start: row.inicio_at,
+    end: row.fin_at,
+    source: SLOT_DISCARD_REASONS.CONFLICT_WITH_BLOCK,
+  }));
+  const blockedByAppointments = citasResult.rows.map((row) => {
+    const rawState = String(row.estado_cita_codigo || "").trim().toLowerCase();
+    const source = (rawState === "en_espera" || rawState === "pendiente_pago")
+      ? SLOT_DISCARD_REASONS.CONFLICT_WITH_HOLD
+      : SLOT_DISCARD_REASONS.CONFLICT_WITH_APPOINTMENT;
+    return {
+      start: row.inicio_at,
+      end: row.fin_at,
+      source,
+    };
+  });
+
+  const merged = [...blockedBySchedule, ...blockedByAppointments];
+  if (!includeSources) {
+    return merged.map((entry) => ({ start: entry.start, end: entry.end }));
+  }
+
+  return merged;
 }
 
-async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateString, toDateString) {
+async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateString, toDateString, options = {}) {
+  const includeSources = Boolean(options?.includeSources);
   const safeFrom = parseDateOnly(fromDateString, "fecha_desde");
   const safeTo = parseDateOnly(toDateString, "fecha_hasta");
   const rangeStart = startOfDay(safeFrom);
@@ -1114,7 +1335,8 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
       `
         SELECT
           inicio_at,
-          inicio_at + make_interval(mins => (COALESCE(duracion_total_min, 0) + COALESCE(buffer_total_min, 0))) AS fin_at
+          inicio_at + make_interval(mins => (COALESCE(duracion_total_min, 0) + COALESCE(buffer_total_min, 0))) AS fin_at,
+          estado_cita_codigo
         FROM public.citas
         WHERE id_empleado_barbero = $1::uuid
           AND deleted_at IS NULL
@@ -1126,11 +1348,39 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
     ),
   ]);
 
+  const blockedBySchedule = bloqueosResult.rows.map((row) => ({
+    start: row.inicio_at,
+    end: row.fin_at,
+    source: SLOT_DISCARD_REASONS.CONFLICT_WITH_BLOCK,
+  }));
+  const blockedByAppointments = citasResult.rows.map((row) => {
+    const rawState = String(row.estado_cita_codigo || "").trim().toLowerCase();
+    const source = (rawState === "en_espera" || rawState === "pendiente_pago")
+      ? SLOT_DISCARD_REASONS.CONFLICT_WITH_HOLD
+      : SLOT_DISCARD_REASONS.CONFLICT_WITH_APPOINTMENT;
+    return {
+      start: row.inicio_at,
+      end: row.fin_at,
+      source,
+    };
+  });
+
   return [
-    ...bloqueosResult.rows.map((row) => ({ start: row.inicio_at, end: row.fin_at })),
-    ...citasResult.rows.map((row) => ({ start: row.inicio_at, end: row.fin_at })),
+    ...blockedBySchedule,
+    ...blockedByAppointments,
   ]
-    .map((entry) => normalizeInterval(entry.start, entry.end))
+    .map((entry) => ({
+      start: entry.start,
+      end: entry.end,
+      source: entry.source,
+    }))
+    .map((entry) => {
+      const normalized = normalizeInterval(entry.start, entry.end);
+      if (!normalized) return null;
+      return includeSources
+        ? { ...normalized, source: entry.source }
+        : normalized;
+    })
     .filter(Boolean);
 }
 
@@ -1159,8 +1409,44 @@ function buildBaseIntervalsFromSchedules(dateString, schedules) {
   return intervals;
 }
 
-function buildSlotsFromIntervals(intervals, serviceDurationMinutes, stepMinutes = SLOT_INTERVAL_MINUTES) {
+function resolveOperationalDayBoundsFromSchedules(dateString, schedules) {
+  let startAt = null;
+  let endAt = null;
+  for (const row of Array.isArray(schedules) ? schedules : []) {
+    const rowStart = normalizeInterval(
+      combineDateAndTime(dateString, row?.hora_inicio),
+      combineDateAndTime(dateString, row?.hora_fin)
+    );
+    if (!rowStart) continue;
+    if (!startAt || rowStart.start.getTime() < startAt.getTime()) {
+      startAt = rowStart.start;
+    }
+    if (!endAt || rowStart.end.getTime() > endAt.getTime()) {
+      endAt = rowStart.end;
+    }
+  }
+  return {
+    startAt: startAt ? new Date(startAt) : null,
+    endAt: endAt ? new Date(endAt) : null,
+  };
+}
+
+function buildSlotsFromIntervals(
+  intervals,
+  serviceDurationMinutes,
+  stepMinutes = SLOT_INTERVAL_MINUTES,
+  options = {}
+) {
   const slots = [];
+  const discarded = [];
+  const minSellableDurationMin = Math.max(0, Number(options?.minSellableDurationMin || 0));
+  const includeDiscarded = Boolean(options?.includeDiscarded);
+  const operationalDayStartAt = options?.operationalDayStartAt instanceof Date
+    ? new Date(options.operationalDayStartAt)
+    : null;
+  const operationalDayEndAt = options?.operationalDayEndAt instanceof Date
+    ? new Date(options.operationalDayEndAt)
+    : null;
 
   function alignIntervalStartToStep(dateValue) {
     const aligned = new Date(dateValue);
@@ -1173,37 +1459,153 @@ function buildSlotsFromIntervals(intervals, serviceDurationMinutes, stepMinutes 
     return aligned;
   }
 
+  function diffMinutes(fromDate, toDate) {
+    return Math.max(0, Math.round((toDate.getTime() - fromDate.getTime()) / 60000));
+  }
+
+  function pushDiscarded(interval, startAt, endAt, reason, details = {}) {
+    if (!includeDiscarded) return;
+    discarded.push({
+      reason,
+      inicio_at: new Date(startAt).toISOString(),
+      fin_at: new Date(endAt).toISOString(),
+      intervalo_inicio_at: new Date(interval.start).toISOString(),
+      intervalo_fin_at: new Date(interval.end).toISOString(),
+      details,
+    });
+  }
+
   for (const interval of intervals) {
+    const intervalDurationMin = diffMinutes(interval.start, interval.end);
+    if (intervalDurationMin < serviceDurationMinutes) {
+      pushDiscarded(
+        interval,
+        interval.start,
+        interval.end,
+        SLOT_DISCARD_REASONS.DURATION_INSUFFICIENT,
+        {
+          interval_duration_min: intervalDurationMin,
+          required_duration_min: serviceDurationMinutes,
+        }
+      );
+      continue;
+    }
+
     let cursor = alignIntervalStartToStep(interval.start);
     while (cursor.getTime() + serviceDurationMinutes * 60 * 1000 <= interval.end.getTime()) {
       const slotEnd = addMinutes(cursor, serviceDurationMinutes);
+      const residualBeforeMin = diffMinutes(interval.start, cursor);
+      const residualAfterMin = diffMinutes(slotEnd, interval.end);
+      const hasUnsellableGap = minSellableDurationMin > 0
+        && (
+          (residualBeforeMin > 0 && residualBeforeMin < minSellableDurationMin)
+          || (residualAfterMin > 0 && residualAfterMin < minSellableDurationMin)
+        );
+
+      if (hasUnsellableGap) {
+        pushDiscarded(
+          interval,
+          cursor,
+          slotEnd,
+          SLOT_DISCARD_REASONS.RESIDUAL_GAP_NOT_SELLABLE,
+          {
+            residual_before_min: residualBeforeMin,
+            residual_after_min: residualAfterMin,
+            min_sellable_min: minSellableDurationMin,
+          }
+        );
+        cursor = addMinutes(cursor, stepMinutes);
+        continue;
+      }
+
       slots.push({
         inicio_at: new Date(cursor),
         fin_at: slotEnd,
         hora: toTimeLabel(cursor),
       });
+      setSlotOperationalContext(slots[slots.length - 1], {
+        free_interval_start_at: toSafeIsoString(interval.start),
+        free_interval_end_at: toSafeIsoString(interval.end),
+        free_interval_duration_min: intervalDurationMin,
+        residual_before_min: residualBeforeMin,
+        residual_after_min: residualAfterMin,
+        operational_day_start_at: toSafeIsoString(operationalDayStartAt),
+        operational_day_end_at: toSafeIsoString(operationalDayEndAt),
+      });
       cursor = addMinutes(cursor, stepMinutes);
     }
   }
-  return slots;
+  return includeDiscarded ? { slots, discarded } : { slots, discarded: [] };
 }
 
-export async function getAvailableSlotsForBarber(client, empleadoId, dateString, serviceTotalMinutes) {
+export async function getAvailableSlotsForBarber(
+  client,
+  empleadoId,
+  dateString,
+  serviceTotalMinutes,
+  options = {}
+) {
   const safeBarberId = assertUuid(empleadoId, "id_barbero");
   const safeDate = parseDateOnly(dateString, "fecha");
+  const includeDiscardReasons = Boolean(options?.includeDiscardReasons);
+  const minSellableDurationMin = Number.isFinite(Number(options?.minSellableDurationMin))
+    ? Math.max(0, Math.trunc(Number(options.minSellableDurationMin)))
+    : await getMinSellableServiceMinutes(client);
   const schedules = await getSchedulesForBarberOnDate(client, safeBarberId, safeDate);
   if (!schedules.length) {
-    return [];
+    return includeDiscardReasons
+      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { schedule: "missing" } }] }
+      : [];
   }
 
   const baseIntervals = buildBaseIntervalsFromSchedules(safeDate, schedules);
+  const operationalDayBounds = resolveOperationalDayBoundsFromSchedules(safeDate, schedules);
   if (!baseIntervals.length) {
-    return [];
+    return includeDiscardReasons
+      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { interval: "empty" } }] }
+      : [];
   }
 
   const busyIntervals = await getBusyIntervalsForBarber(client, safeBarberId, safeDate);
   const freeIntervals = subtractIntervals(baseIntervals, busyIntervals);
-  return buildSlotsFromIntervals(freeIntervals, serviceTotalMinutes, SLOT_INTERVAL_MINUTES);
+  const todaySellableFloorStartAt = resolveTodaySellableFloorStartAt(safeDate, SLOT_INTERVAL_MINUTES, {
+    now: options?.now,
+    timeZone: options?.timeZone || AGENDA_DEFAULT_TIME_ZONE,
+  });
+  const sellableFreeIntervals = trimIntervalsByMinimumStart(freeIntervals, todaySellableFloorStartAt);
+  if (!sellableFreeIntervals.length) {
+    if (!includeDiscardReasons) return [];
+    const sourceSummary = await getBusyIntervalsForBarber(client, safeBarberId, safeDate, { includeSources: true });
+    return {
+      slots: [],
+      discarded: (Array.isArray(sourceSummary) ? sourceSummary : []).map((entry) => ({
+        reason: entry?.source || SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE,
+        inicio_at: entry?.start ? new Date(entry.start).toISOString() : null,
+        fin_at: entry?.end ? new Date(entry.end).toISOString() : null,
+      })),
+    };
+  }
+
+  const buildResult = buildSlotsFromIntervals(
+    sellableFreeIntervals,
+    serviceTotalMinutes,
+    SLOT_INTERVAL_MINUTES,
+    {
+      minSellableDurationMin,
+      includeDiscarded: includeDiscardReasons,
+      operationalDayStartAt: operationalDayBounds.startAt,
+      operationalDayEndAt: operationalDayBounds.endAt,
+    }
+  );
+
+  if (!includeDiscardReasons) {
+    return buildResult.slots;
+  }
+
+  return {
+    slots: buildResult.slots,
+    discarded: buildResult.discarded,
+  };
 }
 
 export async function getBarberScheduleBounds(client, empleadoId, dateString) {
@@ -1230,11 +1632,14 @@ export async function getBarberScheduleBounds(client, empleadoId, dateString) {
   };
 }
 
-export async function findFirstAvailableBarber(client, branchId, dateString, serviceTotalMinutes) {
+export async function findFirstAvailableBarber(client, branchId, dateString, serviceTotalMinutes, options = {}) {
   const barbers = await listBarbersForBranch(client, branchId);
-  const withSlots = await mapWithConcurrency(barbers, 4, async (barber) => ({
+  const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
+  const withSlots = await mapWithConcurrency(barbers, barberConcurrency, async (barber) => ({
     barber,
-    slots: await getAvailableSlotsForBarber(client, barber.id_empleado, dateString, serviceTotalMinutes),
+    slots: await getAvailableSlotsForBarber(client, barber.id_empleado, dateString, serviceTotalMinutes, {
+      minSellableDurationMin: options?.minSellableDurationMin,
+    }),
   }));
   const first = withSlots.find((entry) => entry.slots.length > 0) ?? null;
   return first;
@@ -1243,6 +1648,10 @@ export async function findFirstAvailableBarber(client, branchId, dateString, ser
 export async function buildDayAvailability(client, branchId, serviceSelection, dateString, barberId = null, options = {}) {
   const safeDate = parseDateOnly(dateString, "fecha");
   const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
+  const minSellableDurationMin = Number.isFinite(Number(options?.minSellableDurationMin))
+    ? Math.max(0, Math.trunc(Number(options.minSellableDurationMin)))
+    : await getMinSellableServiceMinutes(client);
+  const includeDiscardReasons = Boolean(options?.includeDiscardReasons);
 
   if (barberId) {
     const preloadedBarber = options?.barber;
@@ -1254,8 +1663,16 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
       });
     }
 
-    const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, safeDate, serviceTotalMinutes);
+    const slotsResult = await getAvailableSlotsForBarber(client, barber.id_empleado, safeDate, serviceTotalMinutes, {
+      minSellableDurationMin,
+      includeDiscardReasons,
+    });
+    const slots = Array.isArray(slotsResult) ? slotsResult : (slotsResult?.slots || []);
+    const discarded = Array.isArray(slotsResult?.discarded) ? slotsResult.discarded : [];
     const bounds = await getBarberScheduleBounds(client, barber.id_empleado, safeDate);
+    const discardedReasonCodes = includeDiscardReasons
+      ? Array.from(new Set(discarded.map((entry) => String(entry?.reason || "").trim()).filter(Boolean)))
+      : [];
     return {
       fecha: safeDate,
       disponible: slots.length > 0,
@@ -1265,6 +1682,8 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
       hora_inicio: bounds.hora_inicio,
       hora_fin: bounds.hora_fin,
       slots,
+      discarded_slots: includeDiscardReasons ? discarded : [],
+      discarded_reason_codes: discardedReasonCodes,
     };
   }
 
@@ -1282,9 +1701,12 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
     };
   }
 
-  const withSlots = await mapWithConcurrency(barbers, 4, async (barber) => ({
+  const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
+  const withSlots = await mapWithConcurrency(barbers, barberConcurrency, async (barber) => ({
     barber,
-    slots: await getAvailableSlotsForBarber(client, barber.id_empleado, safeDate, serviceTotalMinutes),
+    slots: await getAvailableSlotsForBarber(client, barber.id_empleado, safeDate, serviceTotalMinutes, {
+      minSellableDurationMin,
+    }),
   }));
 
   let availableCount = 0;
@@ -1318,6 +1740,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
   const safeTo = parseDateOnly(toDate, "fecha_hasta");
   const startDate = startOfDay(safeFrom);
   const endDate = startOfDay(safeTo);
+  const minSellableDurationMin = await getMinSellableServiceMinutes(client);
 
   if (endDate.getTime() < startDate.getTime()) {
     throw new AppError(400, "fecha_hasta no puede ser menor que fecha_desde", {
@@ -1330,6 +1753,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
   for (let current = new Date(startDate); current.getTime() <= endDate.getTime(); current = addMinutes(current, 24 * 60)) {
     dateKeys.push(formatDateOnly(current));
   }
+  const rangeConcurrency = isPoolLikeClient(client) ? 1 : 4;
 
   if (barberId) {
     const barber = await getBarberById(client, barberId);
@@ -1349,12 +1773,10 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     }
 
     const schedulesByWeekday = new Map();
-    await Promise.all(
-      Array.from(sampleDateByWeekday.entries()).map(async ([weekday, sampleDate]) => {
-        const schedules = await getSchedulesForBarberOnDate(client, barber.id_empleado, sampleDate);
-        schedulesByWeekday.set(weekday, schedules);
-      })
-    );
+    for (const [weekday, sampleDate] of sampleDateByWeekday.entries()) {
+      const schedules = await getSchedulesForBarberOnDate(client, barber.id_empleado, sampleDate);
+      schedulesByWeekday.set(weekday, schedules);
+    }
 
     const busyIntervals = await getBusyIntervalsForBarberByRange(client, barber.id_empleado, safeFrom, safeTo);
     const availability = [];
@@ -1382,7 +1804,13 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
         (entry) => entry.end.getTime() > dayStart.getTime() && entry.start.getTime() < dayEnd.getTime()
       );
       const freeIntervals = subtractIntervals(baseIntervals, dayBusyIntervals);
-      const slots = buildSlotsFromIntervals(freeIntervals, serviceTotalMinutes, SLOT_INTERVAL_MINUTES);
+      const slotsResult = buildSlotsFromIntervals(
+        freeIntervals,
+        serviceTotalMinutes,
+        SLOT_INTERVAL_MINUTES,
+        { minSellableDurationMin }
+      );
+      const slots = slotsResult.slots;
 
       availability.push({
         fecha: dateKey,
@@ -1409,8 +1837,8 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     }));
   }
 
-  return mapWithConcurrency(dateKeys, 4, (dateKey) =>
-    buildDayAvailability(client, branchId, serviceSelection, dateKey, null, { barbers })
+  return mapWithConcurrency(dateKeys, rangeConcurrency, (dateKey) =>
+    buildDayAvailability(client, branchId, serviceSelection, dateKey, null, { barbers, minSellableDurationMin })
   );
 }
 
@@ -1433,6 +1861,7 @@ export async function resolveBookingSelection(client, {
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
   const { dateKey, timeKey } = extractDateAndTimeKeyFromDateTime(fecha_inicio, "fecha_inicio");
   const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
+  const minSellableDurationMin = await getMinSellableServiceMinutes(client);
 
   let selectedBarber;
   if (id_barbero) {
@@ -1443,7 +1872,9 @@ export async function resolveBookingSelection(client, {
         details: { id_barbero, id_sucursal: branch.id_sucursal },
       });
     }
-    const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes);
+    const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes, {
+      minSellableDurationMin,
+    });
     const matchingSlot = slots.find((slot) => slot.hora === timeKey);
     if (!matchingSlot) {
       throw new AppError(409, "El horario solicitado no esta disponible", {
@@ -1456,7 +1887,9 @@ export async function resolveBookingSelection(client, {
     const barbers = await listBarbersForBranch(client, branch.id_sucursal);
     const candidates = [];
     for (const barber of barbers) {
-      const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes);
+      const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes, {
+        minSellableDurationMin,
+      });
       if (slots.some((slot) => slot.hora === timeKey)) {
         candidates.push(barber);
       }
@@ -1554,7 +1987,7 @@ export function mapSlotsForResponse(slots, { duracion_visible_min = 0 } = {}) {
     const horaInicio = String(slot?.hora || "").trim() || (safeStart ? toTimeLabel(safeStart) : "");
     const horaFinVisible = visibleEndAt ? toTimeLabel(visibleEndAt) : horaInicio;
     const periodKey = getPeriodKeyFromTimeLabel(horaInicio);
-    return {
+    const mappedSlot = {
       hora: horaInicio,
       inicio_at: safeStart ? safeStart.toISOString() : null,
       fin_at: safeEnd ? safeEnd.toISOString() : null,
@@ -1564,7 +1997,323 @@ export function mapSlotsForResponse(slots, { duracion_visible_min = 0 } = {}) {
       period_key: periodKey,
       range_label: `${horaInicio} - ${horaFinVisible}`,
     };
+    const context = getSlotOperationalContext(slot);
+    if (context) {
+      setSlotOperationalContext(mappedSlot, context);
+    }
+    return mappedSlot;
   }).filter((slot) => Boolean(slot.hora && slot.inicio_at && slot.fin_at));
+}
+
+function sortSlotsByHour(left, right) {
+  const leftKey = String(left?.hora || "").trim();
+  const rightKey = String(right?.hora || "").trim();
+  return leftKey.localeCompare(rightKey);
+}
+
+const CURATED_PERIOD_SEGMENTS = {
+  manana: [{ startMin: 6 * 60, endMin: 12 * 60 }],
+  tarde: [{ startMin: 12 * 60, endMin: 18 * 60 }],
+  noche: [
+    { startMin: 0, endMin: 6 * 60 },
+    { startMin: 18 * 60, endMin: 24 * 60 },
+  ],
+};
+
+function getMinutesFromDayStart(dateValue) {
+  if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return null;
+  return (dateValue.getHours() * 60) + dateValue.getMinutes();
+}
+
+function parseSlotDate(value) {
+  const dateValue = value instanceof Date ? value : new Date(value || "");
+  return Number.isNaN(dateValue.getTime()) ? null : dateValue;
+}
+
+function resolveOperationalPeriodMembership(slot) {
+  const startAt = parseSlotDate(slot?.inicio_at);
+  const endAt = parseSlotDate(slot?.fin_at);
+  if (!startAt || !endAt || endAt.getTime() <= startAt.getTime()) return null;
+
+  const startMin = getMinutesFromDayStart(startAt);
+  const endMin = getMinutesFromDayStart(endAt);
+  if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) return null;
+
+  for (const [periodKey, segments] of Object.entries(CURATED_PERIOD_SEGMENTS)) {
+    for (const segment of segments) {
+      if (startMin >= segment.startMin && endMin <= segment.endMin) {
+        return {
+          periodKey,
+          segment,
+          startMin,
+          endMin,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function scoreSlotForCuratedPeriod(slot, membership, minSellableDurationMin) {
+  const minSellable = Math.max(0, Math.trunc(Number(minSellableDurationMin || 0)));
+  const context = getSlotOperationalContext(slot);
+  const contextResidualBefore = Number(context?.residual_before_min);
+  const contextResidualAfter = Number(context?.residual_after_min);
+  const residualBeforeMin = Number.isFinite(contextResidualBefore) && contextResidualBefore >= 0
+    ? Math.trunc(contextResidualBefore)
+    : Math.max(0, membership.startMin - membership.segment.startMin);
+  const residualAfterMin = Number.isFinite(contextResidualAfter) && contextResidualAfter >= 0
+    ? Math.trunc(contextResidualAfter)
+    : Math.max(0, membership.segment.endMin - membership.endMin);
+  const freeIntervalStartAt = parseSlotDate(context?.free_interval_start_at);
+  const operationalDayStartAt = parseSlotDate(context?.operational_day_start_at);
+  const slotStartAt = parseSlotDate(slot?.inicio_at);
+
+  let score = 0;
+  const beforeUnsellable = minSellable > 0 && residualBeforeMin > 0 && residualBeforeMin < minSellable;
+  const afterUnsellable = minSellable > 0 && residualAfterMin > 0 && residualAfterMin < minSellable;
+
+  // Prioriza llenar el hueco de izquierda a derecha y evita residuos no vendibles.
+  if (beforeUnsellable) score -= 400;
+  if (afterUnsellable) score -= 400;
+
+  if (residualBeforeMin === 0) score += 500;
+  score -= residualBeforeMin * 6;
+
+  // Cierre limpio del hueco como desempate operativo (secundario frente al borde izquierdo).
+  if (residualAfterMin === 0) score += 30;
+  if (residualAfterMin >= minSellable && residualAfterMin > 0) {
+    score += Math.min(20, residualAfterMin / 10);
+  }
+
+  if (residualBeforeMin > 0 && residualAfterMin > 0) {
+    score -= 12;
+  }
+
+  // Si hay varios huecos, prioriza el que empieza antes en el día operativo real.
+  if (freeIntervalStartAt && operationalDayStartAt) {
+    const freeStartOffsetMin = Math.max(0, Math.round((freeIntervalStartAt.getTime() - operationalDayStartAt.getTime()) / 60000));
+    score -= freeStartOffsetMin * 1;
+  }
+
+  // Dentro del hueco real, favorece explícitamente el borde izquierdo.
+  if (slotStartAt && freeIntervalStartAt) {
+    const offsetWithinIntervalMin = Math.max(0, Math.round((slotStartAt.getTime() - freeIntervalStartAt.getTime()) / 60000));
+    score -= offsetWithinIntervalMin * 3;
+  }
+
+  return {
+    slot,
+    score,
+    residual_before_min: residualBeforeMin,
+    residual_after_min: residualAfterMin,
+    free_interval_start_at: context?.free_interval_start_at ?? null,
+    free_interval_end_at: context?.free_interval_end_at ?? null,
+    operational_day_start_at: context?.operational_day_start_at ?? null,
+  };
+}
+
+function createEmptyCuratedPeriod() {
+  return {
+    recommended: null,
+    alternatives: [],
+    overflow: [],
+    has_more: false,
+    total: 0,
+  };
+}
+
+function buildCuratedRankingByPeriod(slots, safeMinSellableDurationMin) {
+  const grouped = {
+    manana: [],
+    tarde: [],
+    noche: [],
+  };
+
+  for (const slot of Array.isArray(slots) ? slots : []) {
+    const membership = resolveOperationalPeriodMembership(slot);
+    if (!membership || !grouped[membership.periodKey]) continue;
+    grouped[membership.periodKey].push(
+      scoreSlotForCuratedPeriod(slot, membership, safeMinSellableDurationMin)
+    );
+  }
+
+  for (const periodKey of Object.keys(grouped)) {
+    grouped[periodKey] = grouped[periodKey]
+      .slice()
+      .sort((left, right) => {
+        if (right.score !== left.score) return right.score - left.score;
+        return sortSlotsByHour(left.slot, right.slot);
+      });
+  }
+
+  return grouped;
+}
+
+function isUnsellableResidual(residualMinutes, minSellableMinutes) {
+  return minSellableMinutes > 0
+    && residualMinutes > 0
+    && residualMinutes < minSellableMinutes;
+}
+
+function isScoredEntryEligibleForPublicExposure(entry, minSellableDurationMin) {
+  const minSellable = Math.max(0, Math.trunc(Number(minSellableDurationMin || 0)));
+  if (!entry?.slot) return false;
+
+  // Filtro defensivo: no exponer slots que impliquen residuos no vendibles.
+  const residualBefore = Number(entry?.residual_before_min);
+  const residualAfter = Number(entry?.residual_after_min);
+  const safeResidualBefore = Number.isFinite(residualBefore) ? Math.max(0, Math.trunc(residualBefore)) : 0;
+  const safeResidualAfter = Number.isFinite(residualAfter) ? Math.max(0, Math.trunc(residualAfter)) : 0;
+
+  return !(
+    isUnsellableResidual(safeResidualBefore, minSellable)
+    || isUnsellableResidual(safeResidualAfter, minSellable)
+  );
+}
+
+function getSlotStartTimestamp(slot) {
+  const startAt = parseSlotDate(slot?.inicio_at);
+  if (!startAt) return null;
+  return startAt.getTime();
+}
+
+function hasMinSpacingFromSelected(selectedStartTimes, candidateStartTime, spacingMinutes) {
+  if (!Number.isFinite(candidateStartTime)) return false;
+  const spacingMs = Math.max(0, Math.trunc(Number(spacingMinutes || 0))) * 60 * 1000;
+  if (spacingMs <= 0) return true;
+
+  for (const selectedStart of Array.isArray(selectedStartTimes) ? selectedStartTimes : []) {
+    if (!Number.isFinite(selectedStart)) continue;
+    if (Math.abs(candidateStartTime - selectedStart) < spacingMs) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function buildCuratedSlotExposure(
+  slots,
+  { alternativesLimit = 3, minSellableDurationMin = 0, alternativeSpacingMin = 30 } = {}
+) {
+  const safeAlternativesLimit = Math.max(2, Math.min(3, Math.trunc(Number(alternativesLimit || 3))));
+  const safeMinSellableDurationMin = Math.max(0, Math.trunc(Number(minSellableDurationMin || 0)));
+  const safeAlternativeSpacingMin = Math.max(0, Math.trunc(Number(alternativeSpacingMin || 0)));
+  const periods = {
+    manana: createEmptyCuratedPeriod(),
+    tarde: createEmptyCuratedPeriod(),
+    noche: createEmptyCuratedPeriod(),
+  };
+
+  const rankingByPeriod = buildCuratedRankingByPeriod(slots, safeMinSellableDurationMin);
+  for (const periodKey of Object.keys(rankingByPeriod)) {
+    const orderedByScore = rankingByPeriod[periodKey]
+      .filter((entry) => isScoredEntryEligibleForPublicExposure(entry, safeMinSellableDurationMin));
+    if (!orderedByScore.length) continue;
+
+    const recommendedEntry = orderedByScore[0] || null;
+    const recommended = recommendedEntry?.slot || null;
+    const alternatives = [];
+    const overflow = [];
+    const selectedStartTimes = [];
+    const recommendedStartTime = getSlotStartTimestamp(recommended);
+    if (Number.isFinite(recommendedStartTime)) {
+      selectedStartTimes.push(recommendedStartTime);
+    }
+
+    for (const candidate of orderedByScore.slice(1)) {
+      const candidateSlot = candidate?.slot;
+      if (!candidateSlot) continue;
+
+      const candidateStartTime = getSlotStartTimestamp(candidateSlot);
+      const hasSpacing = hasMinSpacingFromSelected(
+        selectedStartTimes,
+        candidateStartTime,
+        safeAlternativeSpacingMin
+      );
+      if (alternatives.length < safeAlternativesLimit && hasSpacing) {
+        alternatives.push(candidateSlot);
+        if (Number.isFinite(candidateStartTime)) {
+          selectedStartTimes.push(candidateStartTime);
+        }
+        continue;
+      }
+
+      overflow.push(candidateSlot);
+    }
+
+    periods[periodKey] = {
+      recommended,
+      alternatives,
+      overflow,
+      has_more: overflow.length > 0,
+      total: (recommended ? 1 : 0) + alternatives.length + overflow.length,
+    };
+  }
+
+  return periods;
+}
+
+function buildRankingReason(entry, minSellableDurationMin) {
+  const minSellable = Math.max(0, Math.trunc(Number(minSellableDurationMin || 0)));
+  const reasons = [];
+
+  if (entry?.residual_before_min === 0) {
+    reasons.push("touches_interval_left_edge");
+  } else {
+    reasons.push("offset_from_interval_left_edge");
+  }
+
+  if (minSellable > 0) {
+    const beforeUnsellable = entry?.residual_before_min > 0 && entry?.residual_before_min < minSellable;
+    const afterUnsellable = entry?.residual_after_min > 0 && entry?.residual_after_min < minSellable;
+    reasons.push(beforeUnsellable || afterUnsellable ? "penalized_unsellable_residual" : "sellable_residuals");
+  }
+
+  if (entry?.residual_after_min === 0) {
+    reasons.push("clean_interval_closure");
+  }
+
+  return reasons.join("|");
+}
+
+export function buildCuratedSlotExposureDebug(
+  slots,
+  { minSellableDurationMin = 0, maxEntriesPerPeriod = 16 } = {}
+) {
+  const safeMinSellableDurationMin = Math.max(0, Math.trunc(Number(minSellableDurationMin || 0)));
+  const safeMaxEntries = Math.max(1, Math.min(40, Math.trunc(Number(maxEntriesPerPeriod || 16))));
+  const rankingByPeriod = buildCuratedRankingByPeriod(slots, safeMinSellableDurationMin);
+
+  const response = {
+    manana: { candidates: [], considered_total: 0 },
+    tarde: { candidates: [], considered_total: 0 },
+    noche: { candidates: [], considered_total: 0 },
+  };
+
+  for (const periodKey of Object.keys(rankingByPeriod)) {
+    const scoredEntries = rankingByPeriod[periodKey];
+    const topCandidates = scoredEntries.slice(0, safeMaxEntries).map((entry, index) => ({
+      rank: index + 1,
+      hora: entry?.slot?.hora ?? null,
+      inicio_at: entry?.slot?.inicio_at ?? null,
+      fin_at: entry?.slot?.fin_at ?? null,
+      score: Number(entry?.score ?? 0),
+      origin_interval_start: entry?.free_interval_start_at ?? null,
+      origin_interval_end: entry?.free_interval_end_at ?? null,
+      residual_before_interval_min: Number(entry?.residual_before_min ?? 0),
+      residual_after_interval_min: Number(entry?.residual_after_min ?? 0),
+      ranking_reason: buildRankingReason(entry, safeMinSellableDurationMin),
+    }));
+
+    response[periodKey] = {
+      candidates: topCandidates,
+      considered_total: scoredEntries.length,
+    };
+  }
+
+  return response;
 }
 
 export function mapDayAvailabilityForResponse(entries) {

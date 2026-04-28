@@ -6,6 +6,7 @@ import db from "./plugins/db.js";
 import auth from "./plugins/auth.js";
 import mailer from "./plugins/mailer.js";
 import membershipAlerts from "./plugins/membershipAlerts.js";
+import securityRealtime from "./plugins/securityRealtime.js";
 import routes from "./routes/v1/index.js";
 import { globalErrorHandler } from "./utils/errors.js";
 
@@ -33,6 +34,7 @@ export async function buildApp() {
   await app.register(mailer);
   await app.register(membershipAlerts);
   await app.register(auth);
+  await app.register(securityRealtime);
   await app.register(routes);
 
   return app;

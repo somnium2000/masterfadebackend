@@ -1,4 +1,6 @@
-﻿import { AppError } from "../utils/errors.js";
+import crypto from "node:crypto";
+import { AppError } from "../utils/errors.js";
+import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
 
 const ACTIVE_STATUS = "activa";
 const EXPIRED_STATUS = "vencida";
@@ -14,11 +16,13 @@ const MEMBERSHIP_CONSUMPTION_TYPES = {
   SERVICE: "servicio",
   COURTESY: "cortesia",
 };
+const MEMBERSHIP_CONFIRMABLE_INTENT_STATES = new Set(["creado", "link_generado", "pendiente_confirmacion"]);
 // AM: Lista de errores SQL de compatibilidad de esquema (tabla/columna/tipo ausente).
 const SCHEMA_COMPATIBLE_ERROR_CODES = new Set(["42P01", "42703", "42704"]);
 // AM: Literal SQL seguro para fallback de beneficios cuando no existe la columna snapshot.
 const EMPTY_SNAPSHOT_SQL_LITERAL = `'{"version":1,"items":[]}'`;
 let membershipCapabilitiesCache = null;
+let membershipPurchaseOrderCapabilitiesCache = null;
 
 function toNumber(value, fallback = 0) {
   const parsed = Number(value);
@@ -32,6 +36,26 @@ function toInt(value, fallback = 0) {
 
 function normalizeText(value) {
   return String(value ?? "").trim();
+}
+
+function safeText(value) {
+  const normalized = normalizeText(value);
+  return normalized || null;
+}
+
+function addMonthsSafe(baseDate, monthsToAdd = 1) {
+  const date = new Date(baseDate);
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + Number(monthsToAdd || 1));
+  return next;
+}
+
+function resolveMembershipEndAtFromPeriod(periodCode, startAt) {
+  const normalized = normalizeText(periodCode).toLowerCase();
+  if (normalized === "anual") return addMonthsSafe(startAt, 12);
+  if (normalized === "semestral") return addMonthsSafe(startAt, 6);
+  if (normalized === "trimestral") return addMonthsSafe(startAt, 3);
+  return addMonthsSafe(startAt, 1);
 }
 
 function toIsoDateTime(value) {
@@ -72,7 +96,7 @@ export function isMembershipPendingRenewal({
   };
 }
 
-// AM: Fuente única de verdad para estado visible:
+// AM: Fuente �nica de verdad para estado visible:
 // - estado_suscripcion_codigo + motivo_fin_codigo = estado persistido/cierre
 // - estado_visible = lectura operativa/UI consistente del ciclo de vida.
 export function resolveMembershipVisibleState(row, { summary = null, timeRemaining = null } = {}) {
@@ -553,11 +577,11 @@ async function getClienteConsumptionRows(client, idCliente, { limit = 40 } = {})
   }
 }
 
-async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false } = {}) {
+async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false, idSucursal = null } = {}) {
   const capabilities = await getMembershipCapabilities(client);
   if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans) return null;
 
-  // AM: Fallback compatible cuando subscriptions.beneficios_snapshot no existe aún.
+  // AM: Fallback compatible cuando subscriptions.beneficios_snapshot no existe a�n.
   const selectBeneficiosSnapshot = capabilities.hasSubsBeneficiosSnapshot
     ? "s.beneficios_snapshot"
     : `${EMPTY_SNAPSHOT_SQL_LITERAL}::jsonb AS beneficios_snapshot`;
@@ -572,6 +596,16 @@ async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false }
     : "1::smallint AS categoria_nivel";
 
   const lockClause = forUpdate ? "FOR UPDATE" : "";
+  const safeSucursalId = normalizeText(idSucursal);
+  const conditions = [
+    "s.id_cliente = $1::uuid",
+    "s.estado_suscripcion_codigo = $2",
+  ];
+  const params = [clienteId, ACTIVE_STATUS];
+  if (safeSucursalId && capabilities.hasSubsSucursalContratada) {
+    params.push(safeSucursalId);
+    conditions.push(`s.id_sucursal_contratada = $${params.length}::uuid`);
+  }
   try {
     const { rows } = await client.query(
       `
@@ -595,13 +629,12 @@ async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false }
         FROM public.subscriptions s
         JOIN public.membership_plans mp
           ON mp.id_plan = s.id_plan
-        WHERE s.id_cliente = $1::uuid
-          AND s.estado_suscripcion_codigo = $2
+        WHERE ${conditions.join("\n          AND ")}
         ORDER BY s.inicio_at DESC, s.created_at DESC
         LIMIT 1
         ${lockClause}
       `,
-      [clienteId, ACTIVE_STATUS]
+      params
     );
     return rows[0] ?? null;
   } catch (error) {
@@ -610,9 +643,9 @@ async function getActiveSubscriptionRow(client, clienteId, { forUpdate = false }
   }
 }
 
-export async function ensureSubscriptionLifecycle(client, clienteId, { forUpdate = false } = {}) {
+export async function ensureSubscriptionLifecycle(client, clienteId, { forUpdate = false, idSucursal = null } = {}) {
   const capabilities = await getMembershipCapabilities(client);
-  const activeRow = await getActiveSubscriptionRow(client, clienteId, { forUpdate });
+  const activeRow = await getActiveSubscriptionRow(client, clienteId, { forUpdate, idSucursal });
   if (!activeRow) {
     return {
       active: null,
@@ -779,6 +812,892 @@ async function getSubscriptionPrice(client, { idPlan, idSucursal }) {
   }
 }
 
+async function getMembershipPurchaseOrderCapabilities(client) {
+  if (membershipPurchaseOrderCapabilitiesCache) return membershipPurchaseOrderCapabilitiesCache;
+
+  let hasTable = false;
+  let columnRows = [];
+  try {
+    const [tableResult, columnsResult] = await Promise.all([
+      client.query(
+        `
+          SELECT to_regclass('public.membership_purchase_orders') IS NOT NULL AS has_purchase_orders
+        `
+      ),
+      client.query(
+        `
+          SELECT column_name
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'membership_purchase_orders'
+        `
+      ),
+    ]);
+    hasTable = Boolean(tableResult?.rows?.[0]?.has_purchase_orders);
+    columnRows = Array.isArray(columnsResult?.rows) ? columnsResult.rows : [];
+  } catch (error) {
+    if (!isSchemaCompatibilityError(error)) throw error;
+  }
+
+  membershipPurchaseOrderCapabilitiesCache = {
+    hasTable,
+    columns: new Set(columnRows.map((row) => row.column_name)),
+  };
+  return membershipPurchaseOrderCapabilitiesCache;
+}
+
+async function getPlanOfferForPurchaseOrder(client, idPlanSucursal) {
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasMembershipPlans || !capabilities.hasMembershipPlansSucursal) return null;
+  const selectCategoria = capabilities.hasPlanCategoriaNivel ? "mp.categoria_nivel" : "1::smallint AS categoria_nivel";
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        mps.id_plan_sucursal,
+        mps.id_plan,
+        mps.id_sucursal,
+        mps.precio_hnl,
+        mps.activo AS oferta_activa,
+        mps.visible_publico,
+        mps.orden_visual,
+        mp.nombre_plan,
+        mp.descripcion AS plan_descripcion,
+        mp.periodo_membresia_codigo,
+        ${selectCategoria},
+        mp.beneficios,
+        mp.activo AS plan_activo,
+        pm.descripcion AS periodo_membresia_label,
+        s.nombre_sucursal
+      FROM public.membership_plans_sucursal mps
+      JOIN public.membership_plans mp
+        ON mp.id_plan = mps.id_plan
+      LEFT JOIN public.periodos_membresia pm
+        ON pm.periodo_membresia_codigo = mp.periodo_membresia_codigo
+      JOIN public.sucursales s
+        ON s.id_sucursal = mps.id_sucursal
+      WHERE mps.id_plan_sucursal = $1::uuid
+      LIMIT 1
+    `,
+    [idPlanSucursal]
+  );
+
+  return rows?.[0] ?? null;
+}
+
+async function getClienteSnapshotForPurchaseOrder(client, clienteId) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id_cliente,
+        c.id_usuario,
+        COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Cliente') AS nombre_completo,
+        cp.email AS correo_principal
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      WHERE c.id_cliente = $1::uuid
+        AND c.deleted_at IS NULL
+      LIMIT 1
+    `,
+    [clienteId]
+  );
+  return rows?.[0] ?? null;
+}
+
+export async function createMembershipPurchaseOrder(client, {
+  clienteId,
+  usuarioId = null,
+  idPlanSucursal,
+} = {}) {
+  const safeClienteId = normalizeText(clienteId);
+  const safePlanSucursalId = normalizeText(idPlanSucursal);
+  if (!safeClienteId || !safePlanSucursalId) {
+    throw new AppError(400, "id_plan_sucursal es obligatorio para crear la orden de plan", {
+      code: "MEMBERSHIP_PURCHASE_ORDER_INVALID_INPUT",
+    });
+  }
+
+  const orderCapabilities = await getMembershipPurchaseOrderCapabilities(client);
+  if (!orderCapabilities.hasTable) {
+    throw new AppError(503, "El m�dulo de ordenes de membres�a a�n no est� listo", {
+      code: "MEMBERSHIP_PURCHASE_ORDER_SCHEMA_NOT_READY",
+    });
+  }
+
+  const requiredColumns = [
+    "id_order",
+    "id_cliente",
+    "id_plan",
+    "id_plan_sucursal",
+    "id_sucursal",
+    "estado_orden_codigo",
+    "moneda_codigo",
+    "subtotal_hnl",
+    "descuento_hnl",
+    "total_hnl",
+  ];
+  const missingColumns = requiredColumns.filter((columnName) => !orderCapabilities.columns.has(columnName));
+  if (missingColumns.length > 0) {
+    throw new AppError(500, "La tabla de �rdenes de membres�a no tiene la estructura esperada", {
+      code: "MEMBERSHIP_PURCHASE_ORDER_SCHEMA_MISMATCH",
+      details: { missing_columns: missingColumns },
+    });
+  }
+
+  const planOffer = await getPlanOfferForPurchaseOrder(client, safePlanSucursalId);
+  if (!planOffer) {
+    throw new AppError(404, "No se encontr� la oferta del plan para la sucursal indicada", {
+      code: "MEMBERSHIP_PURCHASE_PLAN_NOT_FOUND",
+      details: { id_plan_sucursal: safePlanSucursalId },
+    });
+  }
+
+  if (!planOffer.plan_activo) {
+    throw new AppError(409, "El plan base est� inactivo y no puede comprarse", {
+      code: "MEMBERSHIP_PURCHASE_PLAN_INACTIVE",
+      details: { id_plan: planOffer.id_plan },
+    });
+  }
+  if (!planOffer.oferta_activa) {
+    throw new AppError(409, "La oferta del plan en esta sucursal est� inactiva", {
+      code: "MEMBERSHIP_PURCHASE_OFFER_INACTIVE",
+      details: { id_plan_sucursal: safePlanSucursalId },
+    });
+  }
+  if (!planOffer.visible_publico) {
+    throw new AppError(409, "La oferta del plan en esta sucursal no est� visible al p�blico", {
+      code: "MEMBERSHIP_PURCHASE_OFFER_NOT_VISIBLE",
+      details: { id_plan_sucursal: safePlanSucursalId },
+    });
+  }
+
+  const totalHnl = toNumber(planOffer.precio_hnl, 0);
+  if (!Number.isFinite(totalHnl) || totalHnl <= 0) {
+    throw new AppError(409, "La oferta del plan tiene un precio inv�lido para compra", {
+      code: "MEMBERSHIP_PURCHASE_PRICE_INVALID",
+      details: { id_plan_sucursal: safePlanSucursalId, precio_hnl: planOffer.precio_hnl },
+    });
+  }
+
+  const clienteSnapshotRow = await getClienteSnapshotForPurchaseOrder(client, safeClienteId);
+  if (!clienteSnapshotRow) {
+    throw new AppError(404, "No se encontr� el cliente autenticado para generar la orden", {
+      code: "MEMBERSHIP_PURCHASE_CLIENT_NOT_FOUND",
+      details: { id_cliente: safeClienteId },
+    });
+  }
+
+  const resolvedUsuarioId = normalizeText(usuarioId) || normalizeText(clienteSnapshotRow.id_usuario) || null;
+  const beneficios = normalizeBenefitsSnapshot(planOffer.beneficios);
+  const subtotalHnl = totalHnl;
+  const descuentoHnl = 0;
+  const monedaCodigo = "HNL";
+  const planSnapshot = {
+    id_plan: planOffer.id_plan,
+    id_plan_sucursal: planOffer.id_plan_sucursal,
+    nombre_plan: planOffer.nombre_plan,
+    id_sucursal: planOffer.id_sucursal,
+    sucursal_nombre: planOffer.nombre_sucursal || null,
+    precio_hnl: subtotalHnl,
+    beneficios,
+    periodo_membresia_codigo: planOffer.periodo_membresia_codigo || null,
+    periodo_membresia_label: planOffer.periodo_membresia_label || planOffer.periodo_membresia_codigo || null,
+    categoria_nivel: toInt(planOffer.categoria_nivel, 1),
+  };
+  const clienteSnapshot = {
+    id_cliente: clienteSnapshotRow.id_cliente,
+    id_usuario: resolvedUsuarioId,
+    nombre_completo: clienteSnapshotRow.nombre_completo || "Cliente",
+    email: clienteSnapshotRow.correo_principal || null,
+  };
+  const facturaSnapshot = {
+    moneda_codigo: monedaCodigo,
+    subtotal_hnl: subtotalHnl,
+    descuento_hnl: descuentoHnl,
+    total_hnl: subtotalHnl - descuentoHnl,
+    descripcion: `Compra de plan ${planOffer.nombre_plan} - ${planOffer.nombre_sucursal || "Sucursal"}`,
+  };
+
+  const insertColumns = [
+    "id_cliente",
+    "id_usuario",
+    "id_plan",
+    "id_plan_sucursal",
+    "id_sucursal",
+    "estado_orden_codigo",
+    "moneda_codigo",
+    "subtotal_hnl",
+    "descuento_hnl",
+    "total_hnl",
+    "plan_snapshot",
+    "cliente_snapshot",
+    "factura_snapshot",
+    "email_factura",
+    "expires_at",
+  ].filter((columnName) => orderCapabilities.columns.has(columnName));
+
+  const insertValues = [];
+  const params = [];
+  for (const columnName of insertColumns) {
+    params.push(
+      columnName === "id_cliente"
+        ? safeClienteId
+        : columnName === "id_usuario"
+          ? resolvedUsuarioId
+          : columnName === "id_plan"
+            ? planOffer.id_plan
+            : columnName === "id_plan_sucursal"
+              ? planOffer.id_plan_sucursal
+              : columnName === "id_sucursal"
+                ? planOffer.id_sucursal
+                : columnName === "estado_orden_codigo"
+                  ? "pendiente_pago"
+                  : columnName === "moneda_codigo"
+                    ? monedaCodigo
+                    : columnName === "subtotal_hnl"
+                      ? subtotalHnl
+                      : columnName === "descuento_hnl"
+                        ? descuentoHnl
+                        : columnName === "total_hnl"
+                          ? subtotalHnl - descuentoHnl
+                          : columnName === "plan_snapshot"
+                            ? JSON.stringify(planSnapshot)
+                            : columnName === "cliente_snapshot"
+                              ? JSON.stringify(clienteSnapshot)
+                              : columnName === "factura_snapshot"
+                                ? JSON.stringify(facturaSnapshot)
+                                : columnName === "email_factura"
+                                  ? clienteSnapshot.email
+                                  : null
+    );
+    const bindIndex = params.length;
+    if (["id_cliente", "id_usuario", "id_plan", "id_plan_sucursal", "id_sucursal"].includes(columnName)) {
+      insertValues.push(`$${bindIndex}::uuid`);
+    } else if (["subtotal_hnl", "descuento_hnl", "total_hnl"].includes(columnName)) {
+      insertValues.push(`$${bindIndex}::numeric`);
+    } else if (["plan_snapshot", "cliente_snapshot", "factura_snapshot"].includes(columnName)) {
+      insertValues.push(`$${bindIndex}::jsonb`);
+    } else if (columnName === "expires_at") {
+      insertValues.push("now() + interval '30 minutes'");
+      params.pop();
+    } else {
+      insertValues.push(`$${bindIndex}::text`);
+    }
+  }
+
+  const { rows } = await client.query(
+    `
+      INSERT INTO public.membership_purchase_orders (
+        ${insertColumns.join(", ")}
+      )
+      VALUES (
+        ${insertValues.join(", ")}
+      )
+      RETURNING id_order
+    `
+  , params);
+
+  const created = rows?.[0];
+  if (!created?.id_order) {
+    throw new AppError(500, "No se pudo crear la orden de compra del plan", {
+      code: "MEMBERSHIP_PURCHASE_ORDER_CREATE_FAILED",
+    });
+  }
+
+  return {
+    id_order: created.id_order,
+    estado_orden_codigo: "pendiente_pago",
+    plan: {
+      id_plan: planOffer.id_plan,
+      id_plan_sucursal: planOffer.id_plan_sucursal,
+      nombre_plan: planOffer.nombre_plan,
+      id_sucursal: planOffer.id_sucursal,
+      sucursal_nombre: planOffer.nombre_sucursal || null,
+      precio_hnl: subtotalHnl,
+      beneficios,
+    },
+    totales: {
+      subtotal_hnl: subtotalHnl,
+      descuento_hnl: descuentoHnl,
+      total_hnl: subtotalHnl - descuentoHnl,
+      moneda_codigo: monedaCodigo,
+    },
+    cliente: {
+      id_cliente: clienteSnapshotRow.id_cliente,
+      email: clienteSnapshot.email,
+    },
+  };
+}
+
+
+function buildMembershipPaymentCallbackUrl(idOrder) {
+  const explicit = safeText(process.env.PAYMENT_CALLBACK_URL);
+  if (explicit) return explicit;
+  const frontend = safeText(process.env.FRONTEND_URL) || "http://localhost:5173";
+  return `${frontend.replace(/\/+$/, "")}/planes/pagos/resultado?id_order=${encodeURIComponent(idOrder)}`;
+}
+
+async function ensureActivePaymentProvider(client, providerCode) {
+  const normalizedCode = normalizeText(providerCode).toLowerCase() || "mock";
+  const existing = await client.query(
+    `
+      SELECT id_provider, codigo, nombre, activo
+      FROM public.payment_providers
+      WHERE codigo = $1::text
+      LIMIT 1
+    `,
+    [normalizedCode]
+  );
+  if (existing.rows[0]) {
+    if (!existing.rows[0].activo) {
+      throw new AppError(409, "El proveedor de pago no esta activo", {
+        code: "MEMBERSHIP_PAYMENT_PROVIDER_INACTIVE",
+        details: { proveedor: normalizedCode },
+      });
+    }
+    return existing.rows[0];
+  }
+
+  if (normalizedCode !== "mock") {
+    throw new AppError(404, "El proveedor de pago solicitado no esta configurado", {
+      code: "MEMBERSHIP_PAYMENT_PROVIDER_NOT_FOUND",
+      details: { proveedor: normalizedCode },
+    });
+  }
+
+  const inserted = await client.query(
+    `
+      INSERT INTO public.payment_providers (codigo, nombre, activo, configuracion_publica)
+      VALUES ('mock', 'Proveedor Mock', TRUE, '{}'::jsonb)
+      ON CONFLICT (codigo)
+      DO UPDATE SET activo = TRUE, updated_at = now()
+      RETURNING id_provider, codigo, nombre, activo
+    `
+  );
+  return inserted.rows[0];
+}
+
+async function getMembershipOrderForPayment(client, idOrder) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        mpo.id_order,
+        mpo.id_cliente,
+        mpo.id_usuario,
+        mpo.estado_orden_codigo,
+        mpo.moneda_codigo,
+        mpo.total_hnl,
+        mpo.expires_at
+      FROM public.membership_purchase_orders mpo
+      WHERE mpo.id_order = $1::uuid
+      LIMIT 1
+    `,
+    [idOrder]
+  );
+  return rows?.[0] ?? null;
+}
+
+async function resolveMembershipIntentCreatorUserId(client, { clienteId, preferredUserId = null } = {}) {
+  const preferred = safeText(preferredUserId);
+  if (preferred) return preferred;
+
+  const ownerUser = await client.query(
+    `
+      SELECT id_usuario
+      FROM public.clientes
+      WHERE id_cliente = $1::uuid
+        AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [clienteId]
+  );
+  const ownerUserId = safeText(ownerUser.rows?.[0]?.id_usuario);
+  if (ownerUserId) return ownerUserId;
+
+  const fallback = await client.query(
+    `
+      SELECT id_usuario
+      FROM public.usuarios
+      WHERE deleted_at IS NULL
+        AND COALESCE(estado, TRUE) IS TRUE
+        AND COALESCE(estado_acceso, 'activo') = 'activo'
+      ORDER BY created_at ASC
+      LIMIT 1
+    `
+  );
+  const fallbackUserId = safeText(fallback.rows?.[0]?.id_usuario);
+  if (!fallbackUserId) {
+    throw new AppError(500, "No se pudo resolver el usuario creador del intent de pago", {
+      code: "MEMBERSHIP_PAYMENT_CREATOR_USER_NOT_FOUND",
+    });
+  }
+  return fallbackUserId;
+}
+
+export async function createMembershipOrderPaymentIntent(client, {
+  idOrder,
+  clienteId,
+  usuarioId = null,
+} = {}) {
+  const safeOrderId = normalizeText(idOrder);
+  const safeClienteId = normalizeText(clienteId);
+  if (!safeOrderId || !safeClienteId) {
+    throw new AppError(400, "id_order es obligatorio para crear el intent de pago", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_INVALID_INPUT",
+    });
+  }
+
+  const order = await getMembershipOrderForPayment(client, safeOrderId);
+  if (!order) {
+    throw new AppError(404, "La orden de plan no existe", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_NOT_FOUND",
+      details: { id_order: safeOrderId },
+    });
+  }
+
+  if (normalizeText(order.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "La orden no pertenece al cliente autenticado", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_FORBIDDEN",
+      details: { id_order: safeOrderId },
+    });
+  }
+
+  if (normalizeText(order.estado_orden_codigo).toLowerCase() !== "pendiente_pago") {
+    throw new AppError(409, "La orden no esta en estado pendiente de pago", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_STATE_INVALID",
+      details: {
+        id_order: safeOrderId,
+        estado_orden_codigo: order.estado_orden_codigo,
+      },
+    });
+  }
+
+  const expiresAt = order.expires_at ? new Date(order.expires_at) : null;
+  if (expiresAt && !Number.isNaN(expiresAt.getTime()) && expiresAt.getTime() <= Date.now()) {
+    throw new AppError(410, "La orden de plan esta expirada", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_EXPIRED",
+      details: { id_order: safeOrderId },
+    });
+  }
+
+  const amount = toNumber(order.total_hnl, 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new AppError(409, "La orden tiene un monto invalido para pago", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_AMOUNT_INVALID",
+      details: { id_order: safeOrderId, total_hnl: order.total_hnl },
+    });
+  }
+
+  const configuredProvider = safeText(process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+  const provider = await ensureActivePaymentProvider(client, configuredProvider);
+  const providerAdapter = PaymentProviderFactory.create();
+  const resolvedUsuarioId = await resolveMembershipIntentCreatorUserId(client, {
+    clienteId: safeClienteId,
+    preferredUserId: safeText(usuarioId) || safeText(order.id_usuario) || null,
+  });
+  const idempotencyKey = `mf_membership_${safeOrderId}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const callbackUrl = buildMembershipPaymentCallbackUrl(safeOrderId);
+  const currency = safeText(order.moneda_codigo) || "HNL";
+  const providerIntent = await providerAdapter.createIntent({
+    idempotencyKey,
+    montoHnl: amount,
+    moneda: currency,
+    descripcion: `Compra de plan ${safeOrderId}`,
+    callbackUrl,
+    metadata: {
+      id_order: safeOrderId,
+      id_cliente: safeClienteId,
+    },
+  });
+
+  const intentExpiry = (expiresAt && !Number.isNaN(expiresAt.getTime()))
+    ? expiresAt.toISOString()
+    : new Date(Date.now() + (30 * 60 * 1000)).toISOString();
+
+  const { rows } = await client.query(
+    `
+      INSERT INTO public.payment_intents (
+        id_provider,
+        id_cita,
+        id_hold,
+        id_membership_order,
+        origen_pago_codigo,
+        estado_intent_codigo,
+        monto_hnl,
+        moneda_codigo,
+        link_pago_url,
+        referencia_externa,
+        idempotency_key,
+        expires_at,
+        created_by_usuario_id
+      )
+      VALUES (
+        $1::uuid,
+        NULL,
+        NULL,
+        $2::uuid,
+        'membership',
+        'link_generado',
+        $3::numeric,
+        $4::text,
+        $5::text,
+        $6::text,
+        $7::text,
+        $8::timestamptz,
+        $9::uuid
+      )
+      RETURNING id_intent, id_membership_order, origen_pago_codigo, monto_hnl, moneda_codigo, referencia_externa
+    `,
+    [
+      provider.id_provider,
+      safeOrderId,
+      amount,
+      currency,
+      providerIntent?.paymentUrl ?? null,
+      providerIntent?.providerIntentId ?? null,
+      idempotencyKey,
+      intentExpiry,
+      resolvedUsuarioId,
+    ]
+  );
+
+  const created = rows?.[0];
+  if (!created?.id_intent) {
+    throw new AppError(500, "No se pudo crear el intent de pago para la orden de plan", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_CREATE_FAILED",
+    });
+  }
+
+  return {
+    id_payment_intent: created.id_intent,
+    id_order: created.id_membership_order,
+    origen_pago_codigo: created.origen_pago_codigo,
+    monto: toNumber(created.monto_hnl, amount),
+    moneda_codigo: created.moneda_codigo || currency,
+    client_secret: safeText(created.referencia_externa) || idempotencyKey,
+  };
+}
+
+async function getMembershipIntentForConfirmation(client, idPaymentIntent) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        pi.id_intent,
+        pi.id_provider,
+        pi.id_membership_order,
+        pi.origen_pago_codigo,
+        pi.estado_intent_codigo,
+        pi.monto_hnl,
+        pi.moneda_codigo,
+        pi.referencia_externa,
+        pi.created_by_usuario_id,
+        mpo.id_order,
+        mpo.id_cliente,
+        mpo.id_usuario,
+        mpo.id_plan,
+        mpo.id_plan_sucursal,
+        mpo.id_sucursal,
+        mpo.estado_orden_codigo,
+        mpo.total_hnl,
+        mpo.moneda_codigo AS order_moneda_codigo,
+        mpo.expires_at AS order_expires_at,
+        mpo.id_suscripcion,
+        mp.periodo_membresia_codigo,
+        mp.beneficios,
+        mp.nombre_plan,
+        s.nombre_sucursal
+      FROM public.payment_intents pi
+      JOIN public.membership_purchase_orders mpo
+        ON mpo.id_order = pi.id_membership_order
+      LEFT JOIN public.membership_plans mp
+        ON mp.id_plan = mpo.id_plan
+      LEFT JOIN public.sucursales s
+        ON s.id_sucursal = mpo.id_sucursal
+      WHERE pi.id_intent = $1::uuid
+      FOR UPDATE OF pi, mpo
+      LIMIT 1
+    `,
+    [idPaymentIntent]
+  );
+  return rows?.[0] ?? null;
+}
+
+async function cancelActiveSubscriptionForSameBranch(client, {
+  clienteId,
+  sucursalId,
+} = {}) {
+  const safeClienteId = normalizeText(clienteId);
+  const safeSucursalId = normalizeText(sucursalId);
+  if (!safeClienteId || !safeSucursalId) return null;
+
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasSubscriptions || !capabilities.hasSubsSucursalContratada) return null;
+
+  const setParts = [
+    "estado_suscripcion_codigo = 'cancelada'",
+    "updated_at = now()",
+  ];
+  if (capabilities.hasSubsMotivoFin) {
+    setParts.push("motivo_fin_codigo = 'reemplazo'");
+  }
+
+  const { rows } = await client.query(
+    `
+      UPDATE public.subscriptions
+      SET ${setParts.join(", ")}
+      WHERE id_cliente = $1::uuid
+        AND id_sucursal_contratada = $2::uuid
+        AND estado_suscripcion_codigo = 'activa'
+      RETURNING id_suscripcion
+    `,
+    [safeClienteId, safeSucursalId]
+  );
+  return rows?.[0] ?? null;
+}
+
+async function createSubscriptionFromPaidMembershipOrder(client, {
+  clienteId,
+  planId,
+  sucursalId,
+  periodoMembresiaCodigo,
+  beneficiosRaw,
+  usuarioCreadorId = null,
+} = {}) {
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasSubscriptions) {
+    throw new AppError(503, "El modulo de membresias no esta listo para activar suscripciones", {
+      code: "MEMBERSHIP_SUBSCRIPTION_SCHEMA_NOT_READY",
+    });
+  }
+
+  const now = new Date();
+  const endAt = resolveMembershipEndAtFromPeriod(periodoMembresiaCodigo, now);
+  const snapshot = normalizeBenefitsSnapshot(beneficiosRaw);
+  const insertColumns = [
+    "id_cliente",
+    "id_plan",
+    "estado_suscripcion_codigo",
+    "inicio_at",
+    "fin_at",
+    "renovacion_auto",
+    "cancelada_al_fin",
+    "created_by_usuario_id",
+  ];
+  const insertValues = [
+    "$1::uuid",
+    "$2::uuid",
+    "'activa'",
+    "$3::timestamptz",
+    "$4::timestamptz",
+    "FALSE",
+    "FALSE",
+    "$5::uuid",
+  ];
+  const params = [clienteId, planId, now.toISOString(), endAt.toISOString(), usuarioCreadorId];
+
+  if (capabilities.hasSubsSucursalContratada) {
+    const bindIndex = params.length + 1;
+    insertColumns.push("id_sucursal_contratada");
+    insertValues.push(`$${bindIndex}::uuid`);
+    params.push(sucursalId);
+  }
+  if (capabilities.hasSubsBeneficiosSnapshot) {
+    const bindIndex = params.length + 1;
+    insertColumns.push("beneficios_snapshot");
+    insertValues.push(`$${bindIndex}::jsonb`);
+    params.push(JSON.stringify(snapshot));
+  }
+
+  const { rows } = await client.query(
+    `
+      INSERT INTO public.subscriptions (
+        ${insertColumns.join(", ")}
+      )
+      VALUES (
+        ${insertValues.join(", ")}
+      )
+      RETURNING id_suscripcion, estado_suscripcion_codigo
+    `,
+    params
+  );
+  return rows?.[0] ?? null;
+}
+
+async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
+  const providerTxId = safeText(intentRow?.referencia_externa) || `membership_${intentRow?.id_intent}`;
+  const creatorUserId = safeText(intentRow?.created_by_usuario_id) || safeText(intentRow?.id_usuario) || null;
+  const amount = toNumber(intentRow?.monto_hnl, toNumber(intentRow?.total_hnl, 0));
+  const currency = safeText(intentRow?.moneda_codigo) || safeText(intentRow?.order_moneda_codigo) || "HNL";
+
+  await client.query(
+    `
+      INSERT INTO public.payments (
+        id_intent,
+        estado_pago_codigo,
+        provider_tx_id,
+        monto_hnl,
+        moneda_codigo,
+        paid_at,
+        pago_tardio,
+        registrado_manualmente,
+        registrado_por_usuario_id
+      )
+      VALUES (
+        $1::uuid,
+        'capturado',
+        $2::text,
+        $3::numeric,
+        $4::text,
+        now(),
+        FALSE,
+        FALSE,
+        $5::uuid
+      )
+      ON CONFLICT (provider_tx_id)
+      DO UPDATE SET updated_at = now()
+    `,
+    [intentRow.id_intent, providerTxId, amount, currency, creatorUserId]
+  );
+}
+
+export async function confirmMembershipPaymentAndActivateSubscription(client, {
+  idPaymentIntent,
+  clienteId,
+} = {}) {
+  const safeIntentId = normalizeText(idPaymentIntent);
+  const safeClienteId = normalizeText(clienteId);
+  if (!safeIntentId || !safeClienteId) {
+    throw new AppError(400, "id_payment_intent es obligatorio para confirmar pago de plan", {
+      code: "MEMBERSHIP_PAYMENT_CONFIRM_INVALID_INPUT",
+    });
+  }
+
+  const intent = await getMembershipIntentForConfirmation(client, safeIntentId);
+  if (!intent) {
+    throw new AppError(404, "Intent de pago no encontrado", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_NOT_FOUND",
+      details: { id_payment_intent: safeIntentId },
+    });
+  }
+
+  if (normalizeText(intent.origen_pago_codigo).toLowerCase() !== "membership") {
+    throw new AppError(400, "El intent no corresponde a un pago de membresia", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_ORIGIN_INVALID",
+      details: { origen_pago_codigo: intent.origen_pago_codigo },
+    });
+  }
+
+  if (!intent.id_order) {
+    throw new AppError(404, "No se encontro la orden asociada al intent de membresia", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_NOT_FOUND",
+      details: { id_payment_intent: safeIntentId },
+    });
+  }
+
+  if (normalizeText(intent.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "La orden de membresia no pertenece al cliente autenticado", {
+      code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+      details: { id_payment_intent: safeIntentId },
+    });
+  }
+
+  const orderBranchId = normalizeText(intent.id_sucursal);
+  if (!orderBranchId) {
+    throw new AppError(409, "La orden de membresia no tiene sucursal asociada", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_BRANCH_REQUIRED",
+      details: { id_order: intent.id_order },
+    });
+  }
+
+  const intentState = normalizeText(intent.estado_intent_codigo).toLowerCase();
+  if (intentState === "confirmado" || normalizeText(intent.estado_orden_codigo).toLowerCase() === "pagada") {
+    throw new AppError(409, "El pago de esta orden ya fue procesado", {
+      code: "MEMBERSHIP_PAYMENT_ALREADY_PROCESSED",
+      details: {
+        id_payment_intent: safeIntentId,
+        estado_intent_codigo: intent.estado_intent_codigo,
+        estado_orden_codigo: intent.estado_orden_codigo,
+      },
+    });
+  }
+  if (!MEMBERSHIP_CONFIRMABLE_INTENT_STATES.has(intentState)) {
+    throw new AppError(409, "El intent no esta en un estado valido para confirmar", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_STATE_INVALID",
+      details: {
+        id_payment_intent: safeIntentId,
+        estado_intent_codigo: intent.estado_intent_codigo,
+      },
+    });
+  }
+
+  await client.query(
+    `
+      UPDATE public.membership_purchase_orders
+      SET estado_orden_codigo = 'pagada',
+          paid_at = now(),
+          updated_at = now()
+      WHERE id_order = $1::uuid
+    `,
+    [intent.id_order]
+  );
+
+  await cancelActiveSubscriptionForSameBranch(client, {
+    clienteId: intent.id_cliente,
+    sucursalId: orderBranchId,
+  });
+
+  const createdSubscription = await createSubscriptionFromPaidMembershipOrder(client, {
+    clienteId: intent.id_cliente,
+    planId: intent.id_plan,
+    sucursalId: orderBranchId,
+    periodoMembresiaCodigo: intent.periodo_membresia_codigo,
+    beneficiosRaw: intent.beneficios,
+    usuarioCreadorId: safeText(intent.id_usuario) || safeText(intent.created_by_usuario_id) || null,
+  });
+
+  if (!createdSubscription?.id_suscripcion) {
+    throw new AppError(500, "No se pudo activar la suscripcion del plan pagado", {
+      code: "MEMBERSHIP_SUBSCRIPTION_CREATE_FAILED",
+    });
+  }
+
+  await client.query(
+    `
+      UPDATE public.membership_purchase_orders
+      SET id_suscripcion = $2::uuid,
+          updated_at = now()
+      WHERE id_order = $1::uuid
+    `,
+    [intent.id_order, createdSubscription.id_suscripcion]
+  );
+
+  await client.query(
+    `
+      UPDATE public.payment_intents
+      SET estado_intent_codigo = 'confirmado',
+          updated_at = now()
+      WHERE id_intent = $1::uuid
+    `,
+    [intent.id_intent]
+  );
+
+  await insertCapturedPaymentForMembershipIntent(client, intent);
+
+  return {
+    id_suscripcion: createdSubscription.id_suscripcion,
+    estado: createdSubscription.estado_suscripcion_codigo || "activa",
+  };
+}
+
 async function listSubscriptionHistoryRows(client, clienteId, { limit = 20 } = {}) {
   const capabilities = await getMembershipCapabilities(client);
   if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans) return [];
@@ -845,7 +1764,7 @@ async function closeSubscriptionById(client, idSuscripcion, {
   const normalizedStatus = normalizeText(statusCode) || EXPIRED_STATUS;
   const normalizedReason = normalizeText(motivoFinCodigo) || null;
   if (normalizedReason && !ALLOWED_MOTIVO_FIN.has(normalizedReason)) {
-    throw new AppError(400, "Motivo de cierre de membresía inválido", {
+    throw new AppError(400, "Motivo de cierre de membres�a inv�lido", {
       code: "MEMBERSHIP_CLOSE_REASON_INVALID",
       details: { motivo_fin_codigo: normalizedReason },
     });
@@ -879,7 +1798,7 @@ export async function cancelMembership(client, {
 } = {}) {
   const safeClienteId = normalizeText(clienteId);
   if (!safeClienteId) {
-    throw new AppError(400, "cliente_id es obligatorio para cancelar membresía", {
+    throw new AppError(400, "cliente_id es obligatorio para cancelar membres�a", {
       code: "MEMBERSHIP_CANCEL_CLIENT_REQUIRED",
     });
   }
@@ -906,24 +1825,134 @@ export async function cancelMembership(client, {
   };
 }
 
+export async function cancelMembershipBySubscription(client, {
+  clienteId,
+  idSuscripcion,
+} = {}) {
+  const safeClienteId = normalizeText(clienteId);
+  const safeIdSuscripcion = normalizeText(idSuscripcion);
+  if (!safeClienteId) {
+    throw new AppError(400, "cliente_id es obligatorio para cancelar la suscripcion", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_CLIENT_REQUIRED",
+    });
+  }
+  if (!safeIdSuscripcion) {
+    throw new AppError(400, "id_suscripcion es obligatorio para cancelar la suscripcion", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_ID_REQUIRED",
+    });
+  }
+
+  await lockClienteMembershipScope(client, safeClienteId);
+  const capabilities = await getMembershipCapabilities(client);
+  const selectSucursalContratada = capabilities.hasSubsSucursalContratada
+    ? "s.id_sucursal_contratada"
+    : "NULL::uuid AS id_sucursal_contratada";
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_suscripcion,
+        s.id_cliente,
+        s.estado_suscripcion_codigo,
+        ${selectSucursalContratada}
+      FROM public.subscriptions s
+      WHERE s.id_suscripcion = $1::uuid
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [safeIdSuscripcion]
+  );
+  const targetSubscription = rows[0] ?? null;
+
+  if (!targetSubscription) {
+    throw new AppError(404, "No se encontro la suscripcion indicada", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_NOT_FOUND",
+      details: { id_suscripcion: safeIdSuscripcion },
+    });
+  }
+
+  if (normalizeText(targetSubscription.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "No puedes cancelar una suscripcion de otro cliente", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_FORBIDDEN",
+    });
+  }
+
+  const currentStatus = normalizeText(targetSubscription.estado_suscripcion_codigo).toLowerCase();
+  if (currentStatus !== ACTIVE_STATUS) {
+    throw new AppError(409, "La suscripcion ya no esta activa", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_NOT_ACTIVE",
+      details: {
+        id_suscripcion: safeIdSuscripcion,
+        estado_suscripcion_codigo: targetSubscription.estado_suscripcion_codigo,
+      },
+    });
+  }
+
+  if (!targetSubscription.id_sucursal_contratada) {
+    throw new AppError(409, "La suscripcion no tiene una sucursal contratada valida", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_BRANCH_REQUIRED",
+      details: { id_suscripcion: safeIdSuscripcion },
+    });
+  }
+
+  const setParts = [
+    "estado_suscripcion_codigo = $2::text",
+    "cancelada_al_fin = TRUE",
+    "updated_at = now()",
+  ];
+  const params = [safeIdSuscripcion, CANCELLED_STATUS];
+  if (capabilities.hasSubsMotivoFin) {
+    setParts.push("motivo_fin_codigo = $3::text");
+    params.push("cancelacion");
+  }
+  const idClienteBindIndex = params.push(safeClienteId);
+
+  const { rows: updatedRows } = await client.query(
+    `
+      UPDATE public.subscriptions
+      SET ${setParts.join(", ")}
+      WHERE id_suscripcion = $1::uuid
+        AND id_cliente = $${idClienteBindIndex}::uuid
+      RETURNING id_suscripcion, estado_suscripcion_codigo
+    `,
+    params
+  );
+
+  const updatedSubscription = updatedRows[0] ?? null;
+  if (!updatedSubscription) {
+    throw new AppError(409, "No se pudo cancelar la suscripcion indicada", {
+      code: "MEMBERSHIP_CANCEL_SUBSCRIPTION_CONFLICT",
+      details: { id_suscripcion: safeIdSuscripcion },
+    });
+  }
+
+  return {
+    id_suscripcion: updatedSubscription.id_suscripcion,
+    estado_suscripcion_codigo: updatedSubscription.estado_suscripcion_codigo,
+  };
+}
+
 export async function acquireMembershipPlan(client, { clienteId, usuarioId, idPlan, idSucursal }) {
-  // AM: Protege entornos con migración parcial devolviendo error de negocio controlado.
+  // AM: Protege entornos con migraci�n parcial devolviendo error de negocio controlado.
   const capabilities = await getMembershipCapabilities(client);
   if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans || !capabilities.hasMembershipPlansSucursal) {
-    throw new AppError(503, "El módulo de membresías aún no está listo. Aplica la migración pendiente.", {
+    throw new AppError(503, "El m�dulo de membres�as a�n no est� listo. Aplica la migraci�n pendiente.", {
       code: "MEMBERSHIP_SCHEMA_NOT_READY",
     });
   }
 
   await lockClienteMembershipScope(client, clienteId);
-  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, { forUpdate: true });
+  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, {
+    forUpdate: true,
+    idSucursal,
+  });
   const previousActive = lifecycle.active || null;
   let transitionType = "adquisicion";
   let closedPrevious = null;
 
   const planOffer = await getSubscriptionPrice(client, { idPlan, idSucursal });
   if (!planOffer || !planOffer.plan_activo || !planOffer.oferta_activa || !planOffer.visible_publico) {
-    throw new AppError(404, "El plan seleccionado no está disponible para adquisición.", {
+    throw new AppError(404, "El plan seleccionado no est� disponible para adquisici�n.", {
       code: "MEMBERSHIP_PLAN_NOT_AVAILABLE",
       details: { id_plan: idPlan, id_sucursal: idSucursal },
     });
@@ -1168,12 +2197,75 @@ async function getMembershipPointsSummary(client, clienteId) {
   }
 }
 
+async function listActiveSubscriptionRowsByCliente(client, clienteId, { limit = 20 } = {}) {
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans) return [];
+
+  const maxLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+  const selectMotivo = capabilities.hasSubsMotivoFin ? "s.motivo_fin_codigo" : "NULL::text AS motivo_fin_codigo";
+  const selectSucursalContratada = capabilities.hasSubsSucursalContratada
+    ? "s.id_sucursal_contratada"
+    : "NULL::uuid AS id_sucursal_contratada";
+  const selectBeneficiosSnapshot = capabilities.hasSubsBeneficiosSnapshot
+    ? "s.beneficios_snapshot"
+    : `${EMPTY_SNAPSHOT_SQL_LITERAL}::jsonb AS beneficios_snapshot`;
+  const selectCategoria = capabilities.hasPlanCategoriaNivel
+    ? "mp.categoria_nivel"
+    : "1::smallint AS categoria_nivel";
+  const joinSucursal = capabilities.hasSubsSucursalContratada
+    ? "LEFT JOIN public.sucursales suc ON suc.id_sucursal = s.id_sucursal_contratada"
+    : "";
+  const selectSucursalNombre = capabilities.hasSubsSucursalContratada
+    ? "suc.nombre_sucursal"
+    : "NULL::text AS nombre_sucursal";
+  const whereSucursal = capabilities.hasSubsSucursalContratada
+    ? "AND s.id_sucursal_contratada IS NOT NULL"
+    : "";
+
+  try {
+    const { rows } = await client.query(
+      `
+        SELECT
+          s.id_suscripcion,
+          s.id_cliente,
+          s.id_plan,
+          s.estado_suscripcion_codigo,
+          s.inicio_at,
+          s.fin_at,
+          ${selectSucursalContratada},
+          ${selectMotivo},
+          ${selectBeneficiosSnapshot},
+          s.created_at,
+          mp.nombre_plan,
+          mp.descripcion AS plan_descripcion,
+          mp.periodo_membresia_codigo,
+          ${selectCategoria},
+          ${selectSucursalNombre}
+        FROM public.subscriptions s
+        JOIN public.membership_plans mp
+          ON mp.id_plan = s.id_plan
+        ${joinSucursal}
+        WHERE s.id_cliente = $1::uuid
+          AND s.estado_suscripcion_codigo = $2
+          AND s.inicio_at <= NOW()
+          AND s.fin_at > NOW()
+          ${whereSucursal}
+        ORDER BY s.created_at DESC, s.inicio_at DESC
+        LIMIT $3::int
+      `,
+      [clienteId, ACTIVE_STATUS, maxLimit]
+    );
+    return rows;
+  } catch (error) {
+    if (isSchemaCompatibilityError(error)) return [];
+    throw error;
+  }
+}
+
 export async function getClienteMembershipState(client, clienteId) {
   // AM: Estado resiliente; nunca debe depender de columnas/tablas opcionales para responder.
-  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, { forUpdate: false });
   const hasSubscriptions = (await getAnySubscriptionCount(client, clienteId)) > 0;
   const puntos = await getMembershipPointsSummary(client, clienteId);
-
   const subscriptionsHistoryRows = await listSubscriptionHistoryRows(client, clienteId, { limit: 20 });
   const historialMembresias = subscriptionsHistoryRows.map((row) => ({
     id_suscripcion: row.id_suscripcion,
@@ -1188,8 +2280,9 @@ export async function getClienteMembershipState(client, clienteId) {
     id_sucursal_contratada: row.id_sucursal_contratada ?? null,
     created_at: toIsoDateTime(row.created_at),
   }));
+  const activeRows = await listActiveSubscriptionRowsByCliente(client, clienteId, { limit: 20 });
 
-  if (!lifecycle.active) {
+  if (!activeRows.length) {
     const latest = subscriptionsHistoryRows[0] ?? null;
     const historicConsumptionRows = await getClienteConsumptionRows(client, clienteId, { limit: 40 });
     const estadoVisible = resolveMembershipVisibleState(latest);
@@ -1197,6 +2290,7 @@ export async function getClienteMembershipState(client, clienteId) {
       estado_plan: estadoVisible,
       cta_recomendada: hasSubscriptions ? "actualizar" : "adquirir",
       tiene_historial: hasSubscriptions,
+      planes_activos: [],
       plan_activo: null,
       ultimo_plan: latest
         ? {
@@ -1218,40 +2312,68 @@ export async function getClienteMembershipState(client, clienteId) {
       historial_membresias: historialMembresias,
     };
   }
-
-  const active = lifecycle.active;
-  const summary = lifecycle.summary || summarizeBenefits(active.beneficios_snapshot, active.consumo_rows);
-  const planInfo = await getPlanDisplayInfo(client, active.id_plan, active.id_sucursal_contratada);
-  const estadoVisibleActivo = resolveMembershipVisibleState(active, {
-    summary,
-    timeRemaining: lifecycle.time_remaining,
-  });
+  const activePlans = [];
+  const activeConsumptionRows = [];
+  for (const row of activeRows) {
+    const snapshot = normalizeBenefitsSnapshot(row.beneficios_snapshot);
+    const consumptionRows = await getSubscriptionConsumptionRows(client, row.id_suscripcion);
+    const summary = summarizeBenefits(snapshot, consumptionRows);
+    const timeRemaining = computeTimeRemaining(row.fin_at);
+    const planInfo = await getPlanDisplayInfo(client, row.id_plan, row.id_sucursal_contratada);
+    const estadoVisible = resolveMembershipVisibleState(row, {
+      summary,
+      timeRemaining,
+    });
+    const planPayload = {
+      id_suscripcion: row.id_suscripcion,
+      id_plan: row.id_plan,
+      nombre_plan: planInfo?.nombre_plan || row.nombre_plan,
+      descripcion: planInfo?.descripcion ?? row.plan_descripcion ?? null,
+      categoria_nivel: toInt(planInfo?.categoria_nivel ?? row.categoria_nivel, 1),
+      periodo_membresia_codigo: planInfo?.periodo_membresia_codigo || row.periodo_membresia_codigo,
+      precio_hnl: toNumber(planInfo?.precio_hnl, 0),
+      estado_suscripcion_codigo: row.estado_suscripcion_codigo,
+      estado_visible: estadoVisible,
+      inicio_at: toIsoDateTime(row.inicio_at),
+      fin_at: toIsoDateTime(row.fin_at),
+      id_sucursal_contratada: row.id_sucursal_contratada ?? null,
+      sucursal_nombre: row.nombre_sucursal ?? null,
+      beneficios_snapshot: snapshot,
+      tiempo_restante: timeRemaining,
+      ultimo_servicio_restante: Number(summary?.totales?.servicios_restantes || 0) === 1,
+      remanentes: summary,
+    };
+    activePlans.push(planPayload);
+    activeConsumptionRows.push(...(Array.isArray(consumptionRows) ? consumptionRows : []));
+  }
+  const planActivoCompat = activePlans[0] ?? null;
+  const estadoVisibleActivo = planActivoCompat?.estado_visible || "activa";
+  const activeHistoryRows = activeConsumptionRows
+    .sort((left, right) => new Date(right?.created_at || 0).getTime() - new Date(left?.created_at || 0).getTime());
 
   return {
     estado_plan: estadoVisibleActivo,
     cta_recomendada: "actualizar",
     tiene_historial: true,
-    plan_activo: {
-      id_suscripcion: active.id_suscripcion,
-      id_plan: active.id_plan,
-      nombre_plan: planInfo?.nombre_plan || active.nombre_plan,
-      descripcion: planInfo?.descripcion ?? active.plan_descripcion ?? null,
-      categoria_nivel: toInt(planInfo?.categoria_nivel ?? active.categoria_nivel, 1),
-      periodo_membresia_codigo: planInfo?.periodo_membresia_codigo || active.periodo_membresia_codigo,
-      precio_hnl: toNumber(planInfo?.precio_hnl, 0),
-      estado_suscripcion_codigo: active.estado_suscripcion_codigo,
-      estado_visible: estadoVisibleActivo,
-      inicio_at: toIsoDateTime(active.inicio_at),
-      fin_at: toIsoDateTime(active.fin_at),
-      id_sucursal_contratada: active.id_sucursal_contratada ?? null,
-      tiempo_restante: lifecycle.time_remaining,
-      ultimo_servicio_restante: Number(summary?.totales?.servicios_restantes || 0) === 1,
-      remanentes: summary,
-    },
+    planes_activos: activePlans,
+    plan_activo: planActivoCompat,
     ultimo_plan: null,
-    bloqueo_actualizacion: buildUpgradeBlockedDetails(lifecycle),
+    bloqueo_actualizacion: planActivoCompat
+      ? {
+        motivo: "plan_activo_vigente",
+        tiempo_restante: {
+          dias: Number(planActivoCompat?.tiempo_restante?.dias || 0),
+          horas: Number(planActivoCompat?.tiempo_restante?.horas || 0),
+          minutos: Number(planActivoCompat?.tiempo_restante?.minutos || 0),
+        },
+        remanentes: {
+          servicios: Number(planActivoCompat?.remanentes?.totales?.servicios_restantes || 0),
+          cortesias: Number(planActivoCompat?.remanentes?.totales?.cortesias_restantes || 0),
+        },
+      }
+      : null,
     masterpuntos: puntos,
-    historial_consumos: mapConsumptionHistory(active.consumo_rows),
+    historial_consumos: mapConsumptionHistory(activeHistoryRows),
     historial_membresias: historialMembresias,
   };
 }
@@ -1513,20 +2635,70 @@ export async function consumeMembershipForCompletedAppointment(client, {
   };
 }
 
-export function createCoverageTracker(activeContext) {
+export function createCoverageTracker(activeContext, {
+  appointmentBranchId = null,
+  planBranchName = null,
+} = {}) {
   if (!activeContext?.active || !activeContext?.summary) {
     return {
       hasPlan: false,
       idSuscripcion: null,
       serviceRemaining: new Map(),
       planName: null,
+      idSucursalContratada: null,
+      sucursalPlanNombre: null,
+      branchMatch: false,
+      hasServiceBenefitsAvailable: false,
+      requiredServiceIds: [],
+      requiredServices: [],
+      coverageEnabled: false,
+      coverageDisabledReason: "sin_plan_activo",
+      coverageDisabledMessage: null,
     };
   }
 
   const serviceRemaining = new Map();
+  let availableServices = 0;
+  const requiredServices = [];
   for (const service of activeContext.summary.servicios || []) {
     if (!service?.id_servicio) continue;
-    serviceRemaining.set(service.id_servicio, toInt(service.restante, 0));
+    const remaining = toInt(service.restante, 0);
+    const idServicio = normalizeText(service.id_servicio);
+    if (!idServicio) continue;
+    serviceRemaining.set(idServicio, remaining);
+    if (remaining > 0) {
+      availableServices += 1;
+      requiredServices.push({
+        id_servicio: idServicio,
+        nombre: normalizeText(service.nombre) || "Servicio",
+        restante: remaining,
+        total: toInt(service.total, 0),
+      });
+    }
+  }
+  const requiredServiceIds = requiredServices.map((service) => service.id_servicio);
+
+  const contractedBranchId = normalizeText(activeContext.active.id_sucursal_contratada) || null;
+  const appointmentBranch = normalizeText(appointmentBranchId) || null;
+  const hasContractedBranch = Boolean(contractedBranchId);
+  const hasAppointmentBranch = Boolean(appointmentBranch);
+  const branchMatch = hasContractedBranch && hasAppointmentBranch && contractedBranchId === appointmentBranch;
+  const hasServiceBenefitsAvailable = availableServices > 0;
+
+  let coverageEnabled = branchMatch && hasServiceBenefitsAvailable;
+  let coverageDisabledReason = null;
+  if (!hasContractedBranch) {
+    coverageEnabled = false;
+    coverageDisabledReason = "missing_contracted_branch";
+  } else if (!hasAppointmentBranch) {
+    coverageEnabled = false;
+    coverageDisabledReason = "appointment_branch_missing";
+  } else if (!branchMatch) {
+    coverageEnabled = false;
+    coverageDisabledReason = "branch_mismatch";
+  } else if (!hasServiceBenefitsAvailable) {
+    coverageEnabled = false;
+    coverageDisabledReason = "insufficient_benefits";
   }
 
   return {
@@ -1534,25 +2706,82 @@ export function createCoverageTracker(activeContext) {
     idSuscripcion: activeContext.active.id_suscripcion,
     serviceRemaining,
     planName: activeContext.active.nombre_plan || null,
+    idSucursalContratada: contractedBranchId,
+    sucursalPlanNombre: normalizeText(planBranchName) || null,
+    branchMatch,
+    hasServiceBenefitsAvailable,
+    requiredServiceIds,
+    requiredServices,
+    coverageEnabled,
+    coverageDisabledReason,
+    coverageDisabledMessage: null,
   };
 }
 
-export function consumeCoverageForServices(tracker, serviceItems = [], { isTitular = true } = {}) {
+export function filterCoverageTrackerByTariffServices(tracker, availableServiceIds = []) {
+  if (!tracker?.hasPlan || tracker?.coverageEnabled === false) return tracker;
+
+  const availableSet = new Set(
+    (Array.isArray(availableServiceIds) ? availableServiceIds : [])
+      .map((serviceId) => normalizeText(serviceId))
+      .filter(Boolean)
+  );
+
+  const filteredRequiredServices = (Array.isArray(tracker.requiredServices) ? tracker.requiredServices : [])
+    .filter((service) => availableSet.has(normalizeText(service?.id_servicio)));
+  const filteredRequiredServiceIds = filteredRequiredServices
+    .map((service) => normalizeText(service?.id_servicio))
+    .filter(Boolean);
+
+  const previousRemaining = tracker.serviceRemaining instanceof Map ? tracker.serviceRemaining : new Map();
+  const nextRemaining = new Map();
+  for (const serviceId of filteredRequiredServiceIds) {
+    const current = toInt(previousRemaining.get(serviceId), 0);
+    if (current > 0) {
+      nextRemaining.set(serviceId, current);
+    }
+  }
+
+  tracker.requiredServices = filteredRequiredServices;
+  tracker.requiredServiceIds = filteredRequiredServiceIds;
+  tracker.serviceRemaining = nextRemaining;
+  tracker.hasServiceBenefitsAvailable = filteredRequiredServiceIds.length > 0;
+
+  if (!tracker.hasServiceBenefitsAvailable) {
+    tracker.coverageEnabled = false;
+    tracker.coverageDisabledReason = "services_without_active_tariff";
+  }
+
+  return tracker;
+}
+
+export function consumeCoverageForServices(tracker, serviceItems = [], { isTitular = true, forcedServiceIds = [] } = {}) {
   const result = {
     items: [],
     coveredTotalHnl: 0,
     extraTotalHnl: 0,
+    coveredServiceIds: [],
+    forcedCoveredServiceIds: [],
   };
 
   const list = Array.isArray(serviceItems) ? serviceItems : [];
+  const forcedSet = new Set(
+    (Array.isArray(forcedServiceIds) ? forcedServiceIds : [])
+      .map((serviceId) => normalizeText(serviceId))
+      .filter(Boolean)
+  );
+  const coveredServiceIdSet = new Set();
+  const forcedCoveredServiceIdSet = new Set();
+
   for (const item of list) {
     const idServicio = normalizeText(item?.id_servicio);
     const nombre = normalizeText(item?.nombre_servicio) || "Servicio";
     const price = toNumber(item?.precio_hnl, 0);
     const quantity = 1;
+    const forcedByMembership = Boolean(idServicio && forcedSet.has(idServicio));
 
     let status = COVERAGE_STATUS.EXTRA_PENDING;
-    if (tracker?.hasPlan && isTitular && idServicio) {
+    if (tracker?.hasPlan && tracker.coverageEnabled !== false && isTitular && idServicio) {
       const current = toInt(tracker.serviceRemaining.get(idServicio), 0);
       if (current > 0) {
         tracker.serviceRemaining.set(idServicio, current - 1);
@@ -1562,6 +2791,8 @@ export function consumeCoverageForServices(tracker, serviceItems = [], { isTitul
 
     if (status === COVERAGE_STATUS.COVERED) {
       result.coveredTotalHnl += price * quantity;
+      coveredServiceIdSet.add(idServicio);
+      if (forcedByMembership) forcedCoveredServiceIdSet.add(idServicio);
     } else {
       result.extraTotalHnl += price * quantity;
     }
@@ -1575,8 +2806,11 @@ export function consumeCoverageForServices(tracker, serviceItems = [], { isTitul
       precio_unitario_hnl: price,
       total_hnl: price * quantity,
       coverage_status: status,
+      forced_by_membership: forcedByMembership,
     });
   }
+  result.coveredServiceIds = [...coveredServiceIdSet];
+  result.forcedCoveredServiceIds = [...forcedCoveredServiceIdSet];
   return result;
 }
 
@@ -1704,7 +2938,7 @@ export async function registerSubscriptionAlertEvent(client, { idSuscripcion, al
 
   const normalizedType = normalizeText(alertType).toLowerCase();
   if (!["adquisicion", "vencimiento_3_dias", "saldo_1_1"].includes(normalizedType)) {
-    throw new AppError(400, "Tipo de alerta de membresía inválido", {
+    throw new AppError(400, "Tipo de alerta de membres�a inv�lido", {
       code: "MEMBERSHIP_ALERT_TYPE_INVALID",
       details: { alert_type: alertType },
     });
@@ -1805,13 +3039,14 @@ export function summarizeCriticalBalance(snapshot, consumptionRows) {
   const cortesiasRestantes = Number(summary?.totales?.cortesias_restantes || 0);
   return {
     ...summary,
-    // AM: Mantiene nombre legacy por compatibilidad, pero el umbral crítico es solo por servicios.
+    // AM: Mantiene nombre legacy por compatibilidad, pero el umbral cr�tico es solo por servicios.
     is_critical_1_1: serviciosRestantes === 1 && (Number(summary?.totales?.cortesias_total || 0) <= 0 || cortesiasRestantes === 1),
     is_last_service_remaining: serviciosRestantes === 1,
   };
 }
 
 export { COVERAGE_STATUS, ALLOWED_MOTIVO_FIN };
+
 
 
 

@@ -8,8 +8,12 @@ import {
   replaceAssetIfNeeded,
 } from "../../services/storage/storageService.js";
 import {
+  createMembershipPurchaseOrder,
+  createMembershipOrderPaymentIntent,
+  confirmMembershipPaymentAndActivateSubscription,
   acquireMembershipPlan,
   cancelMembership,
+  cancelMembershipBySubscription,
   getClienteMembershipState,
   registerSubscriptionAlertEvent,
 } from "../../services/membershipService.js";
@@ -411,6 +415,42 @@ async function getClienteMailContext(client, clienteId) {
   return rows?.[0] ?? null;
 }
 
+async function getMembershipSubscriptionMailSummary(client, {
+  clienteId,
+  idSuscripcion,
+} = {}) {
+  const safeClienteId = String(clienteId || "").trim();
+  const safeSubscriptionId = String(idSuscripcion || "").trim();
+  if (!safeClienteId || !safeSubscriptionId) return null;
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_suscripcion,
+        s.inicio_at,
+        s.fin_at,
+        mp.nombre_plan,
+        COALESCE(mpo.total_hnl, mpo.subtotal_hnl, 0)::numeric AS total_pagado_hnl
+      FROM public.subscriptions s
+      JOIN public.membership_plans mp
+        ON mp.id_plan = s.id_plan
+      LEFT JOIN LATERAL (
+        SELECT mo.total_hnl, mo.subtotal_hnl
+        FROM public.membership_purchase_orders mo
+        WHERE mo.id_suscripcion = s.id_suscripcion
+        ORDER BY mo.created_at DESC
+        LIMIT 1
+      ) mpo ON TRUE
+      WHERE s.id_suscripcion = $1::uuid
+        AND s.id_cliente = $2::uuid
+      LIMIT 1
+    `,
+    [safeSubscriptionId, safeClienteId]
+  );
+
+  return rows?.[0] ?? null;
+}
+
 function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -697,6 +737,271 @@ export default async function clienteRoutes(app) {
   );
 
   app.post(
+    "/planes/orden",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_plan_sucursal"],
+          properties: {
+            id_plan_sucursal: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              success: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_order: { type: "string", format: "uuid" },
+                  estado_orden_codigo: { type: "string" },
+                  plan: { type: "object", additionalProperties: true },
+                  totales: { type: "object", additionalProperties: true },
+                  cliente: { type: "object", additionalProperties: true },
+                },
+                required: ["id_order", "estado_orden_codigo", "plan", "totales", "cliente"],
+                additionalProperties: true,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["success", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const order = await createMembershipPurchaseOrder(client, {
+          clienteId: context.clienteId,
+          usuarioId: context.userId ?? null,
+          idPlanSucursal: request.body.id_plan_sucursal,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return reply.code(201).send({
+          success: true,
+          data: order,
+          requestId: request.id,
+        });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear la orden de compra del plan",
+          "CLIENTE_MEMBERSHIP_ORDER_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/pago-intent",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_order"],
+          properties: {
+            id_order: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_payment_intent: { type: "string", format: "uuid" },
+                  id_order: { type: "string", format: "uuid" },
+                  origen_pago_codigo: { type: "string" },
+                  monto: { type: "number" },
+                  moneda_codigo: { type: "string" },
+                  client_secret: { type: "string" },
+                },
+                required: [
+                  "id_payment_intent",
+                  "id_order",
+                  "origen_pago_codigo",
+                  "monto",
+                  "moneda_codigo",
+                  "client_secret",
+                ],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const intent = await createMembershipOrderPaymentIntent(client, {
+          idOrder: request.body.id_order,
+          clienteId: context.clienteId,
+          usuarioId: context.userId ?? null,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, intent, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear el intent de pago para la orden de plan",
+          "CLIENTE_MEMBERSHIP_PAYMENT_INTENT_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/confirmar-pago",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_payment_intent"],
+          properties: {
+            id_payment_intent: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_suscripcion: { type: "string", format: "uuid" },
+                  estado: { type: "string" },
+                  email_enviado: { type: "boolean" },
+                },
+                required: ["id_suscripcion", "estado", "email_enviado"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const confirmation = await confirmMembershipPaymentAndActivateSubscription(client, {
+          idPaymentIntent: request.body.id_payment_intent,
+          clienteId: context.clienteId,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        let emailEnviado = false;
+        try {
+          if (app.mailer?.configured && confirmation?.id_suscripcion) {
+            const [mailContext, summary] = await Promise.all([
+              getClienteMailContext(client, context.clienteId),
+              getMembershipSubscriptionMailSummary(client, {
+                clienteId: context.clienteId,
+                idSuscripcion: confirmation.id_suscripcion,
+              }),
+            ]);
+
+            if (mailContext?.correo_principal && summary?.nombre_plan) {
+              const delivery = await app.mailer.sendMembershipPlanAcquiredEmail({
+                to: mailContext.correo_principal,
+                fullName: mailContext.nombre_completo,
+                planName: summary.nombre_plan,
+                startAt: summary.inicio_at,
+                endAt: summary.fin_at,
+                amountHnl: Number(summary.total_pagado_hnl || 0),
+              });
+              emailEnviado = Boolean(delivery?.sent);
+            }
+          }
+        } catch (mailError) {
+          request.log.warn(
+            { err: mailError, id_suscripcion: confirmation?.id_suscripcion, id_cliente: context.clienteId },
+            "No se pudo enviar correo de activacion de plan"
+          );
+          emailEnviado = false;
+        }
+
+        return sendOk(reply, {
+          ...confirmation,
+          email_enviado: emailEnviado,
+        }, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar el pago del plan",
+          "CLIENTE_MEMBERSHIP_PAYMENT_CONFIRM_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
     "/planes/adquirir",
     {
       preHandler: app.requireRoles(CLIENT_ROLES),
@@ -874,6 +1179,75 @@ export default async function clienteRoutes(app) {
           error,
           "No se pudo cancelar la membresía",
           "CLIENTE_MEMBERSHIP_CANCEL_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.patch(
+    "/planes/:id_suscripcion/cancelar",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_suscripcion"],
+          properties: {
+            id_suscripcion: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_suscripcion: { type: "string", format: "uuid" },
+                  estado_suscripcion_codigo: { type: "string" },
+                },
+                required: ["id_suscripcion", "estado_suscripcion_codigo"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const cancelled = await cancelMembershipBySubscription(client, {
+          clienteId: context.clienteId,
+          idSuscripcion: request.params.id_suscripcion,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+        return sendOk(reply, cancelled, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo cancelar la suscripcion del plan",
+          "CLIENTE_MEMBERSHIP_CANCEL_BY_SUBSCRIPTION_ERROR"
         );
       } finally {
         client.release();

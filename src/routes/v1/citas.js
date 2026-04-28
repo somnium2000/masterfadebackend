@@ -5,7 +5,9 @@ import {
   expireStaleAppointmentReservations,
   OCCUPIED_APPOINTMENT_STATES,
   assertUuid,
+  getHoldDurationMinutes,
   getSystemParameters,
+  parseSinglePackageId,
   parseDateOnly,
   resolveBookingSelection,
 } from "../../services/agendaService.js";
@@ -14,12 +16,19 @@ import {
   createCoverageTracker,
   consumeCoverageForServices,
   ensureSubscriptionLifecycle,
+  filterCoverageTrackerByTariffServices,
   getClienteMembershipState,
 } from "../../services/membershipService.js";
+import {
+  applyRewardRedeemForConfirmedGroup,
+  normalizeRedeemContextToken,
+  resolveRedeemContextForHold,
+} from "../../services/pointsService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const errorResponseSchema = {
   type: "object",
@@ -109,9 +118,21 @@ function sendHandled(reply, request, error, message, code) {
   request.log.error({ err: error }, message);
   return sendError(reply, 500, message, {
     code,
-    details: error instanceof Error ? error.message : "Unknown citas error",
     requestId: request.id,
   });
+}
+
+function buildSafeStepError(error) {
+  return {
+    message: error?.message || null,
+    code: error?.code || null,
+    constraint: error?.constraint || null,
+    detail: error?.detail || null,
+    table: error?.table || null,
+    column: error?.column || null,
+    routine: error?.routine || null,
+    stack: error?.stack || null,
+  };
 }
 
 function ensureClientContext(request) {
@@ -234,6 +255,248 @@ async function getAppointmentDetails(client, citaId) {
   }));
 }
 
+function isPointsTriggerCompileError(error) {
+  const code = String(error?.code || "").trim().toUpperCase();
+  if (code !== "0A000") return false;
+  const message = String(error?.message || "").toLowerCase();
+  const where = String(error?.where || "").toLowerCase();
+  return (
+    message.includes("trigger functions can only be called as triggers")
+    || where.includes("fn_trg_otorgar_puntos_por_cita")
+    || where.includes("fn_trg_otorgar_puntos_plan_confirmada")
+  );
+}
+
+async function expireReservationsBestEffort(dbClient, request, scope = "citas") {
+  try {
+    await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+  } catch (error) {
+    request.log.warn(
+      {
+        requestId: request.id,
+        scope,
+        code: error?.code || null,
+        message: error?.message || null,
+      },
+      "No se pudieron expirar reservas vencidas; se continua con la operacion"
+    );
+  }
+}
+
+async function getBranchNameById(client, idSucursal) {
+  const id = String(idSucursal || "").trim();
+  if (!id) return null;
+  const { rows } = await client.query(
+    `
+      SELECT nombre_sucursal
+      FROM public.sucursales
+      WHERE id_sucursal = $1::uuid
+      LIMIT 1
+    `,
+    [id]
+  );
+  return rows[0]?.nombre_sucursal ? String(rows[0].nombre_sucursal).trim() : null;
+}
+
+async function getGroupAppointmentsForNoPaymentConfirmation(client, { groupId }) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id_cita,
+        c.id_sucursal,
+        c.orden_integrante,
+        c.estado_cita_codigo,
+        COALESCE(c.es_canje_recompensa, FALSE) AS es_canje_recompensa,
+        COALESCE(c.total_pagar_hnl, 0)::numeric AS total_pagar_hnl,
+        hold.id_hold,
+        hold.estado_hold_codigo,
+        hold.expires_at
+      FROM public.citas c
+      LEFT JOIN LATERAL (
+        SELECT h.id_hold, h.estado_hold_codigo, h.expires_at
+        FROM public.citas_holds h
+        WHERE h.id_cita = c.id_cita
+        ORDER BY h.created_at DESC
+        LIMIT 1
+      ) hold ON TRUE
+      WHERE c.id_grupo_cita = $1::uuid
+        AND c.deleted_at IS NULL
+      ORDER BY c.orden_integrante ASC, c.created_at ASC
+    `,
+    [groupId]
+  );
+
+  return rows;
+}
+
+async function getGroupAppointmentConfirmationDetails(client, { groupId }) {
+  try {
+    const { rows } = await client.query(
+      `
+        SELECT
+          c.id_cita,
+          c.estado_cita_codigo,
+          c.alias_integrante,
+          c.orden_integrante,
+          c.contacto_nombre,
+          c.contacto_email,
+          c.inicio_at,
+          COALESCE(c.total_pagar_hnl, 0)::numeric AS monto_total_hnl,
+          COALESCE(c.total_pagar_hnl, 0)::numeric AS total_pagar_hnl,
+          s.nombre_sucursal,
+          COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Barbero') AS nombre_barbero
+        FROM public.citas c
+        JOIN public.sucursales s
+          ON s.id_sucursal = c.id_sucursal
+        JOIN public.empleados eb
+          ON eb.id_empleado = c.id_empleado_barbero
+        JOIN public.personas pb
+          ON pb.id_persona = eb.id_persona
+        WHERE c.id_grupo_cita = $1::uuid
+          AND c.deleted_at IS NULL
+        ORDER BY c.orden_integrante ASC, c.created_at ASC
+      `,
+      [groupId]
+    );
+    return rows;
+  } catch (error) {
+    if (error?.code !== "42703") throw error;
+    const { rows } = await client.query(
+      `
+        SELECT
+          c.id_cita,
+          c.estado_cita_codigo,
+          c.alias_integrante,
+          c.orden_integrante,
+          c.contacto_nombre,
+          c.contacto_email,
+          c.inicio_at,
+          COALESCE(c.total_pagar_hnl, 0)::numeric AS monto_total_hnl,
+          COALESCE(c.total_pagar_hnl, 0)::numeric AS total_pagar_hnl,
+          NULL::text AS nombre_sucursal,
+          NULL::text AS nombre_barbero
+        FROM public.citas c
+        WHERE c.id_grupo_cita = $1::uuid
+          AND c.deleted_at IS NULL
+        ORDER BY c.orden_integrante ASC, c.created_at ASC
+      `,
+      [groupId]
+    );
+    return rows;
+  }
+}
+
+async function sendNoPaymentConfirmationEmails(app, logger, {
+  groupId,
+  confirmationRows,
+} = {}) {
+  if (!app.mailer?.configured) {
+    return { emailEnviado: false, emailOmitido: "mailer_no_configurado" };
+  }
+  const rows = Array.isArray(confirmationRows) ? confirmationRows : [];
+  if (!rows.length) {
+    return { emailEnviado: false, emailOmitido: "sin_citas_confirmadas" };
+  }
+
+  const recipients = new Map();
+  for (const row of rows) {
+    const to = normalizeEmail(row?.contacto_email);
+    if (!EMAIL_PATTERN.test(to)) continue;
+    if (recipients.has(to)) continue;
+    recipients.set(to, safeText(row?.contacto_nombre) || safeText(row?.alias_integrante) || "Cliente");
+  }
+  if (!recipients.size) {
+    return { emailEnviado: false, emailOmitido: "sin_destinatario_valido" };
+  }
+
+  const bookingCode = buildBookingShortCode(groupId, 5);
+  const totalCoveredHnl = rows.reduce((acc, row) => acc + Number(row?.monto_total_hnl || 0), 0);
+  const detailLines = rows.map((row) => {
+    const alias = safeText(row?.alias_integrante) || `Integrante ${Number(row?.orden_integrante || 1)}`;
+    const whenLabel = formatDateTimeHn(row?.inicio_at);
+    const branchLabel = safeText(row?.nombre_sucursal) || "Sucursal";
+    const barberLabel = safeText(row?.nombre_barbero) || "Barbero";
+    return `${alias}: ${whenLabel} en ${branchLabel} con ${barberLabel}`;
+  });
+  const senderFrom = resolvePaymentsFromAlias();
+
+  let sentCount = 0;
+  for (const [to, recipientName] of recipients.entries()) {
+    try {
+      const template = buildNoPaymentConfirmationEmailTemplate({
+        recipientName,
+        bookingCode,
+        detailLines,
+        totalCoveredHnl,
+      });
+      const delivery = await app.mailer.sendMail({
+        to,
+        subject: template.subject,
+        text: template.text,
+        html: template.html,
+        from: senderFrom,
+      });
+      if (delivery?.sent) {
+        sentCount += 1;
+      } else {
+        logger?.warn?.(
+          { to, groupId, reason: safeText(delivery?.message) || "smtp_rechazo" },
+          "No se pudo enviar correo de confirmacion de cita cubierta por plan"
+        );
+      }
+    } catch (error) {
+      logger?.warn?.(
+        { err: error, to, groupId },
+        "Fallo envio de correo de confirmacion de cita cubierta por plan"
+      );
+    }
+  }
+
+  if (sentCount > 0) {
+    return { emailEnviado: true, emailOmitido: null };
+  }
+  return { emailEnviado: false, emailOmitido: "envio_fallido" };
+}
+
+async function getServicesWithActiveTariffByBranch(client, { idSucursal, serviceIds = [] }) {
+  const safeBranchId = String(idSucursal || "").trim();
+  const normalizedServiceIds = (Array.isArray(serviceIds) ? serviceIds : [])
+    .map((serviceId) => String(serviceId || "").trim())
+    .filter(Boolean);
+  if (!safeBranchId || normalizedServiceIds.length === 0) return [];
+
+  const { rows } = await client.query(
+    `
+      WITH ranked_tariffs AS (
+        SELECT
+          st.id_servicio,
+          ROW_NUMBER() OVER (
+            PARTITION BY st.id_servicio
+            ORDER BY
+              CASE WHEN st.id_empleado IS NULL THEN 1 ELSE 0 END DESC,
+              st.vigente_desde DESC,
+              st.id_tarifa DESC
+          ) AS row_num
+        FROM public.servicios_tarifas st
+        WHERE st.id_sucursal = $1::uuid
+          AND st.id_servicio = ANY($2::uuid[])
+          AND st.deleted_at IS NULL
+          AND st.activo IS TRUE
+          AND st.vigente_desde <= NOW()
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta > NOW())
+      )
+      SELECT id_servicio
+      FROM ranked_tariffs
+      WHERE row_num = 1
+    `,
+    [safeBranchId, normalizedServiceIds]
+  );
+
+  return rows
+    .map((row) => String(row.id_servicio || "").trim())
+    .filter(Boolean);
+}
+
 function isConflictError(error) {
   return error?.code === "23P01" || /YA_EXISTE_HOLD_ACTIVO_PARA_USUARIO/i.test(String(error?.message || ""));
 }
@@ -242,6 +505,161 @@ function parseIsoDateAndTime(rawDateTime) {
   const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
   if (!match) return { fecha: null, hora: null };
   return { fecha: match[1], hora: match[2] };
+}
+
+function normalizePersonName(rawValue) {
+  return String(rawValue || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((token) => token
+      .split(/([-'])/)
+      .map((part, index) => {
+        if (index % 2 === 1) return part;
+        const lower = String(part || "").toLocaleLowerCase("es-HN");
+        if (!lower) return "";
+        return `${lower.charAt(0).toLocaleUpperCase("es-HN")}${lower.slice(1)}`;
+      })
+      .join(""))
+    .join(" ");
+}
+
+function buildFullName(nombres, apellidos) {
+  return [normalizePersonName(nombres), normalizePersonName(apellidos)]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+function normalizePhone(rawValue) {
+  return String(rawValue || "").replace(/[^\d+]/g, "").slice(0, 20);
+}
+
+function hasPhoneLetters(rawValue) {
+  return /[A-Za-z]/.test(String(rawValue || ""));
+}
+
+function normalizeEmail(rawEmail) {
+  return String(rawEmail || "").trim().toLowerCase();
+}
+
+function safeText(value) {
+  const normalized = String(value || "").trim();
+  return normalized || null;
+}
+
+function hashString(value) {
+  const source = String(value || "");
+  let hash = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    hash = ((hash << 5) - hash) + source.charCodeAt(index);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function buildBookingShortCode(value, length = 5) {
+  const normalized = String(value || "").trim().toUpperCase();
+  if (!normalized) return "N/A";
+  const safeLength = Math.max(3, Math.min(5, Number(length) || 5));
+  const maxValue = 36 ** safeLength;
+  const hashed = hashString(normalized) % maxValue;
+  return hashed
+    .toString(36)
+    .toUpperCase()
+    .padStart(safeLength, "0")
+    .slice(-safeLength);
+}
+
+function escapeHtml(input) {
+  return String(input || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function resolvePaymentsFromAlias() {
+  const fromAddress = safeText(process.env.SMTP_FROM_PAYMENTS) || safeText(process.env.SMTP_FROM) || null;
+  if (!fromAddress) return null;
+  if (fromAddress.includes("<")) return fromAddress;
+  return `MasterFade Pagos <${fromAddress}>`;
+}
+
+function formatDateTimeHn(value) {
+  const parsed = new Date(value || "");
+  if (Number.isNaN(parsed.getTime())) return "Fecha por confirmar";
+  return parsed.toLocaleString("es-HN", { timeZone: HONDURAS_TIME_ZONE });
+}
+
+function buildNoPaymentConfirmationEmailTemplate({
+  recipientName,
+  bookingCode,
+  detailLines,
+  totalCoveredHnl,
+} = {}) {
+  const safeName = safeText(recipientName) || "Cliente";
+  const safeCode = safeText(bookingCode) || "N/A";
+  const coveredLabel = `HNL ${Number(totalCoveredHnl || 0).toFixed(2)}`;
+  const details = Array.isArray(detailLines) ? detailLines : [];
+  const detailText = details.map((line) => `- ${line}`);
+  const detailHtml = details
+    .map((line) => `<li style="margin:0 0 6px;color:#d9dce4;font-size:14px;line-height:1.6;">${escapeHtml(line)}</li>`)
+    .join("");
+  const subject = `Reserva confirmada #${safeCode}`;
+  const text = [
+    subject,
+    "",
+    `Hola ${safeName},`,
+    "",
+    "Tu cita fue confirmada y quedo cubierta por tu plan activo.",
+    `Codigo de cita: ${safeCode}`,
+    `Monto cubierto por tu plan: ${coveredLabel}`,
+    "",
+    "Detalle:",
+    ...detailText,
+  ].join("\n");
+  const html = `
+    <!doctype html>
+    <html lang="es">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>${escapeHtml(subject)}</title>
+      </head>
+      <body style="margin:0;padding:0;background:#0b0d12;font-family:Inter,Segoe UI,Arial,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:20px 12px;background:#0b0d12;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#141722;border:1px solid #2b2f3f;border-radius:18px;overflow:hidden;">
+                <tr>
+                  <td style="padding:26px 24px;background:linear-gradient(135deg,#1c2234 0%,#131722 50%,#204231 100%);border-bottom:1px solid #2b2f3f;">
+                    <p style="margin:0;color:#f1f4fa;font-size:12px;letter-spacing:0.28em;text-transform:uppercase;">MasterFade Citas</p>
+                    <h1 style="margin:10px 0 0;color:#f8f9fb;font-size:24px;line-height:1.25;">${escapeHtml(subject)}</h1>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:22px 24px 26px;">
+                    <p style="margin:0 0 14px;color:#f4f6fb;font-size:16px;font-weight:600;">Hola ${escapeHtml(safeName)},</p>
+                    <p style="margin:0 0 14px;color:#d9dce4;font-size:15px;line-height:1.7;">Tu cita fue confirmada y quedo cubierta por tu plan activo.</p>
+                    <div style="margin:0 0 14px;border:1px solid #2b2f3f;border-radius:12px;padding:10px 12px;background:#1a1f2e;">
+                      <p style="margin:0;color:#f8f9fb;font-size:14px;font-weight:700;">Codigo de cita: ${escapeHtml(safeCode)}</p>
+                      <p style="margin:6px 0 0;color:#5fd29b;font-size:14px;">Monto cubierto por tu plan: ${escapeHtml(coveredLabel)}</p>
+                    </div>
+                    <p style="margin:0 0 8px;color:#f4f6fb;font-size:14px;font-weight:600;">Detalle:</p>
+                    <ul style="margin:0 0 10px 18px;padding:0;">${detailHtml}</ul>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `;
+  return { subject, text, html };
 }
 
 function getDateTimePartsInTimeZone(dateValue, timeZone = HONDURAS_TIME_ZONE) {
@@ -340,7 +758,7 @@ function normalizeHoldBlocksPayload(body) {
     const ordenIntegrante = Number(item?.orden_integrante);
     const selectionType = String(item?.selection_type || "services").trim().toLowerCase();
     const servicios = Array.isArray(item?.servicios) ? item.servicios : [];
-    const packageId = item?.id_paquete ? assertUuid(item.id_paquete, "id_paquete") : null;
+    const packageId = parseSinglePackageId(item?.id_paquete, { required: false, field: "id_paquete" });
 
     if (!["services", "package", "mixed"].includes(selectionType)) {
       throw new AppError(400, `El integrante ${alias} tiene un selection_type invalido`, {
@@ -379,6 +797,169 @@ function normalizeHoldBlocksPayload(body) {
       serviceIds,
     };
   });
+}
+
+function buildUniqueServiceIds(...sources) {
+  const set = new Set();
+  for (const source of sources) {
+    for (const serviceId of Array.isArray(source) ? source : []) {
+      const normalized = String(serviceId || "").trim();
+      if (!normalized) continue;
+      set.add(normalized);
+    }
+  }
+  return [...set];
+}
+
+function mapServicesById(serviceItems = []) {
+  const map = new Map();
+  for (const item of Array.isArray(serviceItems) ? serviceItems : []) {
+    const idServicio = String(item?.id_servicio || "").trim();
+    if (!idServicio || map.has(idServicio)) continue;
+    map.set(idServicio, {
+      id_servicio: idServicio,
+      nombre_servicio: String(item?.nombre_servicio || "").trim() || "Servicio",
+    });
+  }
+  return map;
+}
+
+async function resolveAuthenticatedTitularContact(client, { personaId, claimsUser, titularPayload }) {
+  const profileResult = await client.query(
+    `
+      SELECT
+        p.nombres,
+        p.apellidos,
+        p.telefono_principal,
+        COALESCE(
+          NULLIF((
+            SELECT c.direccion_correo
+            FROM public.correos c
+            WHERE c.id_persona = p.id_persona
+              AND c.deleted_at IS NULL
+            ORDER BY c.es_principal DESC NULLS LAST, c.verificado DESC NULLS LAST, c.id_correo ASC
+            LIMIT 1
+          )::text, ''),
+          NULLIF($2::text, '')
+        ) AS email
+      FROM public.personas p
+      WHERE p.id_persona = $1::uuid
+        AND p.deleted_at IS NULL
+      LIMIT 1
+    `,
+    [personaId, claimsUser?.email ?? null]
+  );
+
+  const profileRow = profileResult.rows[0];
+  if (!profileRow) {
+    throw new AppError(409, "No se pudo resolver el perfil autenticado del titular", {
+      code: "CITAS_HOLD_TITULAR_PROFILE_NOT_FOUND",
+    });
+  }
+
+  const profileNombres = normalizePersonName(profileRow.nombres || "");
+  const profileApellidos = normalizePersonName(profileRow.apellidos || "");
+  const profilePhone = normalizePhone(profileRow.telefono_principal || "");
+  const profileEmail = normalizeEmail(profileRow.email || "");
+
+  if (!EMAIL_PATTERN.test(profileEmail)) {
+    throw new AppError(409, "No se pudo validar el correo de la cuenta autenticada", {
+      code: "CITAS_HOLD_ACCOUNT_EMAIL_INVALID",
+    });
+  }
+
+  const payload = titularPayload && typeof titularPayload === "object"
+    ? titularPayload
+    : {};
+  const inputNombres = normalizePersonName(payload.nombres || "");
+  const inputApellidos = normalizePersonName(payload.apellidos || "");
+  const inputPhoneRaw = String(payload.telefono || "").trim();
+  const inputPhone = normalizePhone(inputPhoneRaw);
+  const guardarNombresApellidos = Boolean(payload.guardar_nombres_apellidos);
+  const guardarTelefono = Boolean(payload.guardar_telefono);
+
+  if (inputPhoneRaw && hasPhoneLetters(inputPhoneRaw)) {
+    throw new AppError(400, "El telefono del titular no admite letras", {
+      code: "CITAS_HOLD_TITULAR_PHONE_INVALID",
+      details: { field: "titular.telefono" },
+    });
+  }
+  if (inputPhoneRaw && inputPhone.length < 8) {
+    throw new AppError(400, "El telefono del titular debe ser valido", {
+      code: "CITAS_HOLD_TITULAR_PHONE_INVALID",
+      details: { field: "titular.telefono" },
+    });
+  }
+
+  const missingNombres = !profileNombres;
+  const missingApellidos = !profileApellidos;
+  const missingTelefono = profilePhone.length < 8;
+
+  const effectiveNombres = profileNombres || (missingNombres ? inputNombres : "");
+  const effectiveApellidos = profileApellidos || (missingApellidos ? inputApellidos : "");
+  const effectivePhone = profilePhone || (missingTelefono ? inputPhone : "");
+  const fullName = buildFullName(effectiveNombres, effectiveApellidos);
+
+  if (!effectiveNombres) {
+    throw new AppError(400, "El nombre del titular es obligatorio", {
+      code: "CITAS_HOLD_TITULAR_NAME_REQUIRED",
+      details: { field: "titular.nombres" },
+    });
+  }
+  if (!effectiveApellidos) {
+    throw new AppError(400, "El apellido del titular es obligatorio", {
+      code: "CITAS_HOLD_TITULAR_LAST_NAME_REQUIRED",
+      details: { field: "titular.apellidos" },
+    });
+  }
+  if (!effectivePhone || effectivePhone.length < 8) {
+    throw new AppError(400, "El telefono del titular es obligatorio", {
+      code: "CITAS_HOLD_TITULAR_PHONE_REQUIRED",
+      details: { field: "titular.telefono" },
+    });
+  }
+
+  if (guardarNombresApellidos && (missingNombres || missingApellidos)) {
+    await client.query(
+      `
+        UPDATE public.personas
+        SET nombres = CASE
+              WHEN (nombres IS NULL OR btrim(nombres) = '') AND $2::text <> '' THEN $2
+              ELSE nombres
+            END,
+            apellidos = CASE
+              WHEN (apellidos IS NULL OR btrim(apellidos) = '') AND $3::text <> '' THEN $3
+              ELSE apellidos
+            END,
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+      `,
+      [personaId, inputNombres, inputApellidos]
+    );
+  }
+
+  if (guardarTelefono && missingTelefono && inputPhone.length >= 8) {
+    await client.query(
+      `
+        UPDATE public.personas
+        SET telefono_principal = CASE
+              WHEN telefono_principal IS NULL OR btrim(telefono_principal) = '' THEN $2
+              ELSE telefono_principal
+            END,
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+      `,
+      [personaId, inputPhone]
+    );
+  }
+
+  return {
+    fullName,
+    nombres: effectiveNombres,
+    apellidos: effectiveApellidos,
+    email: profileEmail,
+    telefono: effectivePhone,
+  };
 }
 
 function isSimulationNoPaymentEnabled(paramsMap) {
@@ -616,7 +1197,6 @@ export default async function citasRoutes(app) {
         if (isConflictError(error)) {
           return sendError(reply, 409, "Ya existe un hold activo o el horario solicitado no esta disponible", {
             code: "CITA_HOLD_CONFLICTO",
-            details: error instanceof Error ? error.message : "Cita conflict",
             requestId: request.id,
           });
         }
@@ -638,6 +1218,19 @@ export default async function citasRoutes(app) {
           required: ["id_sucursal"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
+            id_points_tx_canje: { anyOf: [{ type: "string", minLength: 16, maxLength: 1200 }, { type: "null" }] },
+            canje_context_token: { anyOf: [{ type: "string", minLength: 16, maxLength: 1200 }, { type: "null" }] },
+            titular: {
+              type: "object",
+              properties: {
+                nombres: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+                apellidos: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+                telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 20 }, { type: "null" }] },
+                guardar_nombres_apellidos: { type: "boolean" },
+                guardar_telefono: { type: "boolean" },
+              },
+              additionalProperties: false,
+            },
             integrantes: {
               type: "array",
               minItems: 1,
@@ -659,7 +1252,7 @@ export default async function citasRoutes(app) {
                       properties: {
                         id_servicio: { type: "string", format: "uuid" },
                       },
-                      additionalProperties: false,
+                      additionalProperties: true,
                     },
                   },
                 },
@@ -678,7 +1271,7 @@ export default async function citasRoutes(app) {
                 properties: {
                   id_servicio: { type: "string", format: "uuid" },
                 },
-                additionalProperties: false,
+                additionalProperties: true,
               },
             },
             notas: { anyOf: [{ type: "string", maxLength: 500 }, { type: "null" }] },
@@ -709,18 +1302,80 @@ export default async function citasRoutes(app) {
       let txStarted = false;
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
-        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+        await expireReservationsBestEffort(dbClient, request, "citas_hold_create");
 
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
+        const canjeContextTokenRaw = request.body?.canje_context_token ?? request.body?.id_points_tx_canje;
+        const canjeContextToken = canjeContextTokenRaw
+          ? normalizeRedeemContextToken(canjeContextTokenRaw)
+          : null;
         const branch = await ensureActiveBranch(dbClient, idSucursal);
         const integrantes = normalizeHoldBlocksPayload(request.body);
 
         await dbClient.query("BEGIN");
         txStarted = true;
-        const simulationNoPayment = isSimulationNoPaymentEnabled(await getSystemParameters(dbClient));
+        const titularContact = await resolveAuthenticatedTitularContact(dbClient, {
+          personaId,
+          claimsUser: request.claims?.user,
+          titularPayload: request.body?.titular,
+        });
+        const rewardRedeemContext = canjeContextToken
+          ? await resolveRedeemContextForHold(dbClient, {
+            idCliente: clienteId,
+            canjeContextToken,
+            idSucursal: branch.id_sucursal,
+          })
+          : null;
+        let rewardAppliedInHold = false;
+        let rewardCoveredTotalHnl = 0;
+        let rewardLinkedCitaId = null;
 
-        const activeMembership = await ensureSubscriptionLifecycle(dbClient, clienteId, { forUpdate: true });
-        const coverageTracker = createCoverageTracker(activeMembership);
+        let activeMembership = null;
+        let membershipComputationFailed = false;
+        try {
+          activeMembership = await ensureSubscriptionLifecycle(dbClient, clienteId, { forUpdate: true });
+        } catch (membershipError) {
+          membershipComputationFailed = true;
+          request.log.warn(
+            {
+              id_cliente: clienteId,
+              id_sucursal: branch.id_sucursal,
+              code: membershipError?.code || null,
+            },
+            "No se pudo calcular cobertura de membresia para hold. Se aplicara tarifa normal."
+          );
+          activeMembership = {
+            active: null,
+            summary: null,
+            time_remaining: null,
+            changed: false,
+          };
+        }
+        const contractedBranchId = String(activeMembership?.active?.id_sucursal_contratada || "").trim() || null;
+        const contractedBranchName = contractedBranchId
+          ? await getBranchNameById(dbClient, contractedBranchId)
+          : null;
+        const coverageTracker = createCoverageTracker(activeMembership, {
+          appointmentBranchId: branch.id_sucursal,
+          planBranchName: contractedBranchName,
+        });
+        if (coverageTracker?.coverageEnabled && Array.isArray(coverageTracker.requiredServiceIds) && coverageTracker.requiredServiceIds.length > 0) {
+          const servicesWithActiveTariff = await getServicesWithActiveTariffByBranch(dbClient, {
+            idSucursal: branch.id_sucursal,
+            serviceIds: coverageTracker.requiredServiceIds,
+          });
+          filterCoverageTrackerByTariffServices(coverageTracker, servicesWithActiveTariff);
+        }
+        if (membershipComputationFailed) {
+          coverageTracker.coverageEnabled = false;
+          coverageTracker.coverageDisabledReason = "coverage_resolution_error";
+          coverageTracker.coverageDisabledMessage = "No pudimos aplicar tu plan en este momento; calculamos la cita con tarifa normal.";
+        }
+        if (rewardRedeemContext) {
+          coverageTracker.coverageEnabled = false;
+          coverageTracker.coverageDisabledReason = "reward_redeem_active";
+          coverageTracker.coverageDisabledMessage = "Se aplicara tu recompensa de cortesia al titular. Los extras y acompanantes se cobran normalmente.";
+        }
         const hasMembership = Boolean(coverageTracker.hasPlan && coverageTracker.idSuscripcion);
 
         const groupInsert = await dbClient.query(
@@ -744,7 +1399,8 @@ export default async function citasRoutes(app) {
         );
 
         const groupRecord = groupInsert.rows[0];
-        const holdExpiresAt = new Date(Date.now() + (5 * 60 * 1000));
+        const holdDurationMin = await getHoldDurationMinutes(dbClient);
+        const holdExpiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
         const holdUserId = integrantes.length > 1 ? null : usuarioId;
         const bloquesResponse = [];
         let subtotalGrupo = 0;
@@ -753,11 +1409,19 @@ export default async function citasRoutes(app) {
         let extrasPendientesGrupo = 0;
         let coveredItemsCount = 0;
         let extraItemsCount = 0;
-        const createdAppointmentIds = [];
+        const coveredServicesByPlan = new Map();
+        const forcedServicesByPlan = new Map();
+        if (integrantes[0]) {
+          integrantes[0] = {
+            ...integrantes[0],
+            alias: titularContact.fullName || integrantes[0].alias || "Titular",
+          };
+        }
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
-          const selection = await resolveBookingSelection(dbClient, {
+          const isTitular = integrante.orden_integrante <= 1;
+          const selectionBase = await resolveBookingSelection(dbClient, {
             id_sucursal: branch.id_sucursal,
             selection_type: integrante.selection_type,
             servicios: integrante.serviceIds,
@@ -765,12 +1429,112 @@ export default async function citasRoutes(app) {
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
           });
+          let selection = selectionBase;
+          let forcedServiceIdsApplied = [];
 
-          const isTitular = integrante.orden_integrante <= 1;
-          const coverage = consumeCoverageForServices(coverageTracker, selection.serviceSelection.items, { isTitular });
+          const requiredServiceIds = (
+            isTitular
+            && coverageTracker?.coverageEnabled !== false
+            && Array.isArray(coverageTracker?.requiredServiceIds)
+          )
+            ? coverageTracker.requiredServiceIds
+            : [];
+          if (requiredServiceIds.length > 0) {
+            const baseSelectedServiceIds = new Set(
+              (Array.isArray(selectionBase?.serviceSelection?.items) ? selectionBase.serviceSelection.items : [])
+                .map((item) => String(item?.id_servicio || "").trim())
+                .filter(Boolean)
+            );
+            const missingRequiredServiceIds = requiredServiceIds.filter((serviceId) => !baseSelectedServiceIds.has(serviceId));
+            if (missingRequiredServiceIds.length > 0) {
+              const forcedSelectionType = ["package", "mixed"].includes(String(integrante.selection_type || "").trim().toLowerCase())
+                ? "mixed"
+                : "services";
+              const mergedServiceIds = buildUniqueServiceIds(integrante.serviceIds, missingRequiredServiceIds);
+              try {
+                const forcedSelection = await resolveBookingSelection(dbClient, {
+                  id_sucursal: branch.id_sucursal,
+                  selection_type: forcedSelectionType,
+                  servicios: mergedServiceIds,
+                  id_paquete: integrante.id_paquete,
+                  fecha_inicio: integrante.fecha_inicio,
+                  id_barbero: integrante.id_barbero,
+                });
+                selection = forcedSelection;
+                const forcedSelectedServiceIds = new Set(
+                  (Array.isArray(forcedSelection?.serviceSelection?.items) ? forcedSelection.serviceSelection.items : [])
+                    .map((item) => String(item?.id_servicio || "").trim())
+                    .filter(Boolean)
+                );
+                forcedServiceIdsApplied = missingRequiredServiceIds.filter((serviceId) => forcedSelectedServiceIds.has(serviceId));
+              } catch (forcedCoverageError) {
+                request.log.warn(
+                  {
+                    id_cliente: clienteId,
+                    id_sucursal: branch.id_sucursal,
+                    id_suscripcion: coverageTracker?.idSuscripcion || null,
+                    code: forcedCoverageError?.code || null,
+                  },
+                  "No se pudo forzar servicios del plan en hold. Se aplicara tarifa normal."
+                );
+                coverageTracker.coverageEnabled = false;
+                coverageTracker.coverageDisabledReason = "coverage_resolution_error";
+                coverageTracker.coverageDisabledMessage = "No pudimos aplicar tu plan en este momento; calculamos la cita con tarifa normal.";
+                forcedServiceIdsApplied = [];
+                selection = selectionBase;
+              }
+            }
+          }
+
+          const coverage = consumeCoverageForServices(
+            coverageTracker,
+            selection.serviceSelection.items,
+            { isTitular, forcedServiceIds: forcedServiceIdsApplied }
+          );
           const subtotalServicios = Number(selection.serviceSelection.monto_total_hnl || 0);
+          let rewardCoveredInBlock = 0;
+          if (isTitular && rewardRedeemContext) {
+            const rewardServiceId = String(rewardRedeemContext.id_servicio_canje || "").trim();
+            const rewardCoverageItem = coverage.items.find((item) => String(item?.id_servicio || "").trim() === rewardServiceId);
+            if (!rewardCoverageItem) {
+              throw new AppError(409, "El canje no corresponde al servicio seleccionado para el titular", {
+                code: "POINTS_REDEEM_SERVICE_MISMATCH",
+                details: {
+                  canje_context_token: rewardRedeemContext.canje_context_token,
+                  id_servicio_canje: rewardRedeemContext.id_servicio_canje,
+                },
+              });
+            }
+            rewardCoveredInBlock = Math.max(0, Number(rewardCoverageItem.total_hnl ?? rewardCoverageItem.precio_unitario_hnl ?? 0));
+            rewardCoverageItem.coverage_status = "cubierto_recompensa";
+            rewardCoverageItem.forced_by_membership = false;
+            coverage.coveredTotalHnl += rewardCoveredInBlock;
+            coverage.extraTotalHnl = Math.max(0, coverage.extraTotalHnl - rewardCoveredInBlock);
+          }
           const descuento = Number(coverage.coveredTotalHnl || 0);
           const totalPagar = Number(coverage.extraTotalHnl || 0);
+
+          if (isTitular && hasMembership) {
+            const selectedServiceMap = mapServicesById(selection.serviceSelection.items);
+            for (const coveredServiceId of Array.isArray(coverage.coveredServiceIds) ? coverage.coveredServiceIds : []) {
+              const mapped = selectedServiceMap.get(coveredServiceId) || {
+                id_servicio: coveredServiceId,
+                nombre_servicio: "Servicio",
+              };
+              if (!coveredServicesByPlan.has(mapped.id_servicio)) {
+                coveredServicesByPlan.set(mapped.id_servicio, mapped);
+              }
+            }
+            for (const forcedServiceId of Array.isArray(coverage.forcedCoveredServiceIds) ? coverage.forcedCoveredServiceIds : []) {
+              const mapped = selectedServiceMap.get(forcedServiceId) || {
+                id_servicio: forcedServiceId,
+                nombre_servicio: "Servicio",
+              };
+              if (!forcedServicesByPlan.has(mapped.id_servicio)) {
+                forcedServicesByPlan.set(mapped.id_servicio, mapped);
+              }
+            }
+          }
 
           const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
 
@@ -794,6 +1558,7 @@ export default async function citasRoutes(app) {
                 subtotal_servicios_hnl,
                 descuento_hnl,
                 total_pagar_hnl,
+                es_canje_recompensa,
                 selection_type,
                 id_paquete,
                 notas
@@ -816,9 +1581,10 @@ export default async function citasRoutes(app) {
                 $14::numeric,
                 $15::numeric,
                 $16::numeric,
-                $17::text,
-                $18::uuid,
-                $19
+                $17::boolean,
+                $18::text,
+                $19::uuid,
+                $20
               )
               RETURNING id_cita
             `,
@@ -839,6 +1605,7 @@ export default async function citasRoutes(app) {
               subtotalServicios,
               descuento,
               totalPagar,
+              Boolean(isTitular && rewardRedeemContext),
               selection.serviceSelection.selection_type || integrante.selection_type || "services",
               selection.serviceSelection.id_paquete || integrante.id_paquete || null,
               request.body?.notas ?? null,
@@ -846,7 +1613,11 @@ export default async function citasRoutes(app) {
           );
 
           const citaId = citaInsert.rows[0].id_cita;
-          createdAppointmentIds.push(citaId);
+          if (isTitular && rewardRedeemContext) {
+            rewardAppliedInHold = true;
+            rewardLinkedCitaId = citaId;
+            rewardCoveredTotalHnl += rewardCoveredInBlock;
+          }
 
           for (const serviceItem of selection.serviceSelection.items) {
             await dbClient.query(
@@ -887,7 +1658,9 @@ export default async function citasRoutes(app) {
           );
 
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
-          const coveredCount = coverage.items.filter((entry) => entry.coverage_status === "cubierto_plan").length;
+          const coveredCount = coverage.items.filter((entry) =>
+            entry.coverage_status === "cubierto_plan" || entry.coverage_status === "cubierto_recompensa"
+          ).length;
           const extraCount = coverage.items.filter((entry) => entry.coverage_status === "extra_pendiente").length;
           coveredItemsCount += coveredCount;
           extraItemsCount += extraCount;
@@ -905,7 +1678,7 @@ export default async function citasRoutes(app) {
             fecha: fecha || "",
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: simulationNoPayment ? "confirmada" : "en_espera",
+            estado_cita_codigo: "en_espera",
             monto_total_hnl: subtotalServicios,
             descuento_hnl: descuento,
             total_pagar_hnl: totalPagar,
@@ -917,22 +1690,48 @@ export default async function citasRoutes(app) {
             },
           });
         }
-
-        if (simulationNoPayment && createdAppointmentIds.length > 0) {
-          await confirmAppointmentsWithoutPayment(dbClient, {
-            citas: createdAppointmentIds,
-            motivo_confirmacion: "simulacion_sin_pago_cliente_hold",
+        if (rewardRedeemContext && !rewardAppliedInHold) {
+          throw new AppError(409, "No se pudo aplicar el canje al titular", {
+            code: "POINTS_REDEEM_NOT_APPLIED",
+            details: {
+              canje_context_token: rewardRedeemContext.canje_context_token,
+            },
           });
         }
 
         const membershipState = await getClienteMembershipState(dbClient, clienteId);
+        const planCoveredTotalHnl = rewardRedeemContext ? 0 : descuentoGrupo;
+        const hasCoveredAmount = planCoveredTotalHnl > 0;
+        let membershipMessage = null;
+        if (rewardRedeemContext && rewardAppliedInHold) {
+          membershipMessage = "Se aplico tu recompensa de cortesia al servicio seleccionado del titular.";
+        } else if (hasMembership && coverageTracker.coverageDisabledReason === "branch_mismatch") {
+          const planBranchLabel = coverageTracker.sucursalPlanNombre || "otra sucursal";
+          const citaBranchLabel = branch.nombre_sucursal || "la sucursal seleccionada";
+          membershipMessage = `Tu plan activo pertenece a ${planBranchLabel}. Si agendas en ${citaBranchLabel}, esta cita no sera cubierta por tu plan y deberas pagar el total.`;
+        } else if (hasMembership && coverageTracker.coverageDisabledReason === "missing_contracted_branch") {
+          membershipMessage = "Tu plan no tiene una sucursal valida asociada; calculamos la cita con tarifa normal.";
+        } else if (hasMembership && coverageTracker.coverageDisabledReason === "services_without_active_tariff") {
+          membershipMessage = "Tu plan no tiene servicios con tarifa activa en esta sucursal; calculamos la cita con tarifa normal.";
+        } else if (hasMembership && coverageTracker.coverageDisabledReason === "coverage_resolution_error") {
+          membershipMessage = coverageTracker.coverageDisabledMessage
+            || "No pudimos aplicar beneficios de tu plan en este momento; calculamos la cita con tarifa normal.";
+        } else if (hasMembership && (!coverageTracker.hasServiceBenefitsAvailable || !hasCoveredAmount)) {
+          membershipMessage = "Tu plan no tiene beneficios disponibles para cubrir esta cita.";
+        } else if (!hasMembership && membershipComputationFailed) {
+          membershipMessage = "No pudimos validar beneficios de plan en este momento; calculamos la cita con tarifa normal.";
+        }
+        const membershipCoverageActive = Boolean(hasMembership && coverageTracker.branchMatch && hasCoveredAmount);
+        const coveredServicesList = [...coveredServicesByPlan.values()];
+        const forcedServicesList = [...forcedServicesByPlan.values()];
         await dbClient.query("COMMIT");
         txStarted = false;
 
         return sendOk(reply, {
           id_grupo_cita: groupRecord.id_grupo_cita,
           estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
-          expires_at: simulationNoPayment ? null : holdExpiresAt.toISOString(),
+          expires_at: holdExpiresAt.toISOString(),
+          subtotal_hnl: subtotalGrupo,
           monto_total_hnl: subtotalGrupo,
           descuento_total_hnl: descuentoGrupo,
           total_pagar_hnl: totalGrupo,
@@ -941,18 +1740,57 @@ export default async function citasRoutes(app) {
             items_cubiertos: coveredItemsCount,
             items_extra: extraItemsCount,
           },
+          recompensa: rewardRedeemContext
+            ? {
+              aplicada: rewardAppliedInHold,
+              id_points_tx_canje: rewardRedeemContext.canje_context_token,
+              canje_context_token: rewardRedeemContext.canje_context_token,
+              servicio_nombre: rewardRedeemContext.servicio_nombre,
+              puntos_requeridos: rewardRedeemContext.puntos_requeridos,
+              cubierto_hnl: rewardCoveredTotalHnl,
+              extras_a_pagar_hnl: totalGrupo,
+              mensaje: rewardAppliedInHold
+                ? "Recompensa aplicada correctamente. Los extras y acompanantes se cobran aparte."
+                : "No se aplico la recompensa en este hold.",
+              id_cita_asociada: rewardLinkedCitaId,
+            }
+            : {
+              aplicada: false,
+              id_points_tx_canje: null,
+              canje_context_token: null,
+              servicio_nombre: null,
+              puntos_requeridos: 0,
+              cubierto_hnl: 0,
+              extras_a_pagar_hnl: totalGrupo,
+              mensaje: null,
+              id_cita_asociada: null,
+            },
           membresia: hasMembership
             ? {
-              cobertura_activa: true,
+              cobertura_activa: membershipCoverageActive,
               id_suscripcion: coverageTracker.idSuscripcion,
+              id_sucursal_contratada: coverageTracker.idSucursalContratada || null,
+              sucursal_plan_nombre: coverageTracker.sucursalPlanNombre || null,
               nombre_plan: coverageTracker.planName || null,
               estado_plan: membershipState?.estado_plan || "sin_plan_activo",
+              mensaje: membershipMessage,
+              servicios_cubiertos: coveredServicesList,
+              servicios_forzados: forcedServicesList,
+              cubierto_por_plan_hnl: planCoveredTotalHnl,
+              extras_a_pagar_hnl: totalGrupo,
             }
             : {
               cobertura_activa: false,
               id_suscripcion: null,
+              id_sucursal_contratada: null,
+              sucursal_plan_nombre: null,
               nombre_plan: null,
               estado_plan: "sin_plan_activo",
+              mensaje: membershipMessage,
+              servicios_cubiertos: [],
+              servicios_forzados: [],
+              cubierto_por_plan_hnl: 0,
+              extras_a_pagar_hnl: totalGrupo,
             },
           bloques: bloquesResponse,
         }, {
@@ -971,12 +1809,376 @@ export default async function citasRoutes(app) {
         if (isConflictError(error)) {
           return sendError(reply, 409, "Ya existe un conflicto de disponibilidad para uno de los bloques", {
             code: "CITAS_HOLD_CONFLICT",
-            details: error instanceof Error ? error.message : "Hold conflict",
+            requestId: request.id,
+          });
+        }
+
+        if (isPointsTriggerCompileError(error)) {
+          return sendError(reply, 409, "No pudimos procesar la reserva en este momento. Intenta nuevamente en unos minutos.", {
+            code: "CITAS_HOLD_POINTS_ENGINE_UNAVAILABLE",
             requestId: request.id,
           });
         }
 
         return sendHandled(reply, request, error, "No se pudo crear el hold de citas", "CITAS_HOLD_CREATE_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.post(
+    "/hold/:id_grupo_cita/confirmar",
+    {
+      preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_grupo_cita"],
+          properties: {
+            id_grupo_cita: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          properties: {
+            id_points_tx_canje: { anyOf: [{ type: "string", minLength: 16, maxLength: 1200 }, { type: "null" }] },
+            canje_context_token: { anyOf: [{ type: "string", minLength: 16, maxLength: 1200 }, { type: "null" }] },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_grupo_cita: { type: "string", format: "uuid" },
+                  codigo_cita: { type: "string" },
+                  estado_grupo_codigo: { type: "string" },
+                  total_pagar_hnl: { type: "number" },
+                  confirmado_sin_pago: { type: "boolean" },
+                  citas_confirmadas_count: { type: "integer" },
+                  recompensa_utilizada: {
+                    type: "object",
+                    properties: {
+                      aplicada: { type: "boolean" },
+                      ya_aplicada: { type: "boolean" },
+                      puntos_descontados: { type: "integer" },
+                      saldo_actual: { type: ["integer", "null"] },
+                      mensaje: { type: "string" },
+                    },
+                    additionalProperties: true,
+                  },
+                  citas_confirmadas: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        id_cita: { type: "string", format: "uuid" },
+                        codigo_cita: { type: "string" },
+                        estado_cita_codigo: { type: "string" },
+                      },
+                      required: ["id_cita", "codigo_cita", "estado_cita_codigo"],
+                      additionalProperties: false,
+                    },
+                  },
+                  ya_confirmadas: { type: "boolean" },
+                  email_enviado: { type: "boolean" },
+                  email_omitido: { type: ["string", "null"] },
+                },
+                required: [
+                  "id_grupo_cita",
+                  "codigo_cita",
+                  "estado_grupo_codigo",
+                  "total_pagar_hnl",
+                  "confirmado_sin_pago",
+                  "recompensa_utilizada",
+                  "citas_confirmadas",
+                  "citas_confirmadas_count",
+                  "ya_confirmadas",
+                  "email_enviado",
+                  "email_omitido",
+                ],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const dbClient = await app.db.connect();
+      let txStarted = false;
+      let step = "start";
+      let groupId = null;
+      try {
+        step = "ensureClientContext";
+        const { clienteId, personaId } = ensureClientContext(request);
+        step = "assertGroupId";
+        groupId = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+        step = "normalizeRedeemContextToken";
+        const canjeContextTokenRaw = request.body?.canje_context_token ?? request.body?.id_points_tx_canje;
+        const canjeContextToken = canjeContextTokenRaw
+          ? normalizeRedeemContextToken(canjeContextTokenRaw)
+          : null;
+        step = "expireReservationsBestEffort";
+        await expireReservationsBestEffort(dbClient, request, "citas_hold_confirm");
+
+        step = "loadGroup";
+        const groupResult = await dbClient.query(
+          `
+            SELECT id_grupo_cita, id_cliente_titular, id_persona_titular, estado_grupo_codigo
+            FROM public.citas_grupos
+            WHERE id_grupo_cita = $1::uuid
+            LIMIT 1
+          `,
+          [groupId]
+        );
+        const group = groupResult.rows[0] || null;
+        if (!group) {
+          throw new AppError(404, "La reserva indicada no existe", {
+            code: "CITAS_GROUP_NOT_FOUND",
+          });
+        }
+
+        step = "validateGroupOwnership";
+        const ownedByClient = String(group.id_cliente_titular || "") === String(clienteId)
+          || String(group.id_persona_titular || "") === String(personaId);
+        if (!ownedByClient) {
+          throw new AppError(403, "No tienes permisos para confirmar esta reserva", {
+            code: "CITAS_GROUP_FORBIDDEN",
+          });
+        }
+
+        step = "getGroupAppointmentsForNoPaymentConfirmation";
+        const rows = await getGroupAppointmentsForNoPaymentConfirmation(dbClient, { groupId });
+        if (!rows.length) {
+          throw new AppError(404, "La reserva indicada no existe", {
+            code: "CITAS_GROUP_NOT_FOUND",
+          });
+        }
+
+        const totalPagar = rows.reduce((acc, row) => acc + Number(row.total_pagar_hnl || 0), 0);
+        const pendingRows = rows.filter((row) => String(row.estado_cita_codigo || "").trim().toLowerCase() !== "confirmada");
+        if (totalPagar > 0 && pendingRows.length > 0) {
+          throw new AppError(409, "La reserva tiene saldo pendiente y debe completar pago", {
+            code: "CITAS_CONFIRM_PAYMENT_REQUIRED",
+            details: { total_pagar_hnl: totalPagar },
+          });
+        }
+
+        const codigoCitaGrupo = buildBookingShortCode(group.id_grupo_cita, 5);
+        if (pendingRows.length === 0) {
+          let rewardFinalization = {
+            aplicada: false,
+            ya_aplicada: false,
+            puntos_descontados: 0,
+            saldo_actual: null,
+            mensaje: "No se aplico canje en esta confirmacion.",
+          };
+          step = "tx_begin_already_confirmed";
+          await dbClient.query("BEGIN");
+          txStarted = true;
+          step = "applyRewardRedeemForConfirmedGroup_already_confirmed";
+          rewardFinalization = await applyRewardRedeemForConfirmedGroup(dbClient, {
+            idGrupoCita: group.id_grupo_cita,
+            idCliente: clienteId,
+            canjeContextToken,
+            motivo: "Canje de recompensa ruta a tu cortesia",
+            createdByUserId: request.claims?.user?.id_usuario ?? null,
+          });
+          step = "tx_commit_already_confirmed";
+          await dbClient.query("COMMIT");
+          txStarted = false;
+
+          const confirmedAppointments = rows.map((row) => ({
+            id_cita: row.id_cita,
+            codigo_cita: buildBookingShortCode(row.id_cita, 5),
+            estado_cita_codigo: String(row.estado_cita_codigo || "").trim().toLowerCase() || "confirmada",
+          }));
+          return sendOk(reply, {
+            id_grupo_cita: group.id_grupo_cita,
+            codigo_cita: codigoCitaGrupo,
+            estado_grupo_codigo: "confirmada",
+            total_pagar_hnl: totalPagar,
+            confirmado_sin_pago: true,
+            recompensa_utilizada: {
+              aplicada: rewardFinalization?.aplicada === true,
+              ya_aplicada: rewardFinalization?.ya_aplicada === true,
+              puntos_descontados: Number(rewardFinalization?.puntos_descontados || 0),
+              saldo_actual: Number.isFinite(Number(rewardFinalization?.saldo_actual))
+                ? Number(rewardFinalization.saldo_actual)
+                : null,
+              mensaje: rewardFinalization?.aplicada
+                ? "Recompensa utilizada. Se descontaron 10 puntos de tu ruta."
+                : (rewardFinalization?.ya_aplicada
+                  ? "La recompensa ya habia sido aplicada para esta cita."
+                  : "No se aplico canje en esta confirmacion."),
+            },
+            citas_confirmadas_count: confirmedAppointments.length,
+            citas_confirmadas: confirmedAppointments,
+            ya_confirmadas: true,
+            email_enviado: false,
+            email_omitido: "ya_confirmada",
+          }, {
+            requestId: request.id,
+          });
+        }
+
+        const nowMs = Date.now();
+        for (const row of pendingRows) {
+          const holdState = String(row.estado_hold_codigo || "").trim().toLowerCase();
+          if (holdState !== "activo") {
+            throw new AppError(409, "El hold de la reserva ya no esta activo", {
+              code: "CITAS_HOLD_INACTIVE",
+            });
+          }
+          const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
+          if (!expiresAt || Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= nowMs) {
+            throw new AppError(409, "El hold de la reserva expiro", {
+              code: "CITAS_HOLD_EXPIRED",
+            });
+          }
+        }
+
+        step = "tx_begin";
+        await dbClient.query("BEGIN");
+        txStarted = true;
+        const citaIds = pendingRows.map((row) => row.id_cita);
+        step = "confirmAppointmentsWithoutPayment";
+        await confirmAppointmentsWithoutPayment(dbClient, {
+          citas: citaIds,
+          motivo_confirmacion: "confirmacion_cliente_total_cero",
+        });
+        step = "applyRewardRedeemForConfirmedGroup";
+        const rewardFinalization = await applyRewardRedeemForConfirmedGroup(dbClient, {
+          idGrupoCita: group.id_grupo_cita,
+          idCliente: clienteId,
+          canjeContextToken,
+          motivo: "Canje de recompensa ruta a tu cortesia",
+          createdByUserId: request.claims?.user?.id_usuario ?? null,
+        });
+        step = "tx_commit";
+        await dbClient.query("COMMIT");
+        txStarted = false;
+
+        let details = [];
+        try {
+          step = "getGroupAppointmentConfirmationDetails";
+          details = await getGroupAppointmentConfirmationDetails(dbClient, { groupId: group.id_grupo_cita });
+        } catch (detailsError) {
+          request.log.warn(
+            { err: detailsError, id_grupo_cita: group.id_grupo_cita },
+            "No se pudo cargar el detalle de citas confirmadas; se responde con fallback seguro"
+          );
+          details = pendingRows.map((row) => ({
+            id_cita: row.id_cita,
+            estado_cita_codigo: "confirmada",
+            alias_integrante: null,
+            orden_integrante: null,
+            contacto_nombre: null,
+            contacto_email: null,
+            inicio_at: null,
+            monto_total_hnl: Number(row.total_pagar_hnl || 0),
+            total_pagar_hnl: Number(row.total_pagar_hnl || 0),
+            nombre_sucursal: null,
+            nombre_barbero: null,
+          }));
+        }
+        const citasConfirmadasPayload = details.map((row) => ({
+          id_cita: row.id_cita,
+          codigo_cita: buildBookingShortCode(row.id_cita, 5),
+          estado_cita_codigo: String(row.estado_cita_codigo || "").trim().toLowerCase() || "confirmada",
+        }));
+
+        let emailDispatch = { emailEnviado: false, emailOmitido: "sin_destinatario_valido" };
+        try {
+          step = "sendNoPaymentConfirmationEmails";
+          emailDispatch = await sendNoPaymentConfirmationEmails(app, request.log, {
+            groupId: group.id_grupo_cita,
+            confirmationRows: details,
+          });
+        } catch (error) {
+          request.log.warn(
+            { err: error, id_grupo_cita: group.id_grupo_cita },
+            "Fallo envio de correo post confirmacion sin pago"
+          );
+          emailDispatch = { emailEnviado: false, emailOmitido: "envio_fallido" };
+        }
+
+        return sendOk(reply, {
+          id_grupo_cita: group.id_grupo_cita,
+          codigo_cita: codigoCitaGrupo,
+          estado_grupo_codigo: "confirmada",
+          total_pagar_hnl: 0,
+          confirmado_sin_pago: true,
+          recompensa_utilizada: {
+            aplicada: rewardFinalization?.aplicada === true,
+            ya_aplicada: rewardFinalization?.ya_aplicada === true,
+            puntos_descontados: Number(rewardFinalization?.puntos_descontados || 0),
+            saldo_actual: Number.isFinite(Number(rewardFinalization?.saldo_actual))
+              ? Number(rewardFinalization.saldo_actual)
+              : null,
+            mensaje: rewardFinalization?.aplicada
+              ? "Recompensa utilizada. Se descontaron 10 puntos de tu ruta."
+              : (rewardFinalization?.ya_aplicada
+                ? "La recompensa ya habia sido aplicada para esta cita."
+                : "No se aplico canje en esta confirmacion."),
+          },
+          citas_confirmadas_count: citasConfirmadasPayload.length,
+          citas_confirmadas: citasConfirmadasPayload,
+          ya_confirmadas: false,
+          email_enviado: Boolean(emailDispatch.emailEnviado),
+          email_omitido: emailDispatch.emailOmitido ?? null,
+        }, {
+          requestId: request.id,
+        });
+      } catch (error) {
+        try {
+          if (txStarted) {
+            await dbClient.query("ROLLBACK");
+          }
+        } catch {
+          // no-op
+        }
+        request.log.error({
+          step,
+          err: buildSafeStepError(error),
+          id_grupo_cita: groupId,
+          tx_started: txStarted,
+        }, "CITAS_CONFIRM_NO_PAYMENT_STEP_FAILED");
+        if (isPointsTriggerCompileError(error)) {
+          return sendError(reply, 409, "No pudimos confirmar la reserva en este momento. Intenta nuevamente en unos minutos.", {
+            code: "CITAS_CONFIRM_POINTS_ENGINE_UNAVAILABLE",
+            requestId: request.id,
+          });
+        }
+        if (error?.code === "23505" && error?.constraint === "uq_points_tx_canje_por_cita") {
+          return sendError(reply, 409, "La recompensa ya fue aplicada para esta cita", {
+            code: "POINTS_REDEEM_ALREADY_APPLIED",
+            requestId: request.id,
+          });
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar la reserva sin pago",
+          "CITAS_CONFIRM_NO_PAYMENT_ERROR"
+        );
       } finally {
         dbClient.release();
       }

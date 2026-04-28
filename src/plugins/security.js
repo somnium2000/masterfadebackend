@@ -38,31 +38,50 @@ function isCsrfExemptPath(pathname) {
   return CSRF_EXEMPT_PATHS.some((allowed) => path === allowed || path.endsWith(allowed));
 }
 
-async function securityPlugin(app) {
-  // Lee CORS_ORIGENES (nombre canónico del proyecto) con fallback a CORS_ORIGINS y default local
-  const rawOrigins =
-    process.env.CORS_ORIGENES ||
-    process.env.CORS_ORIGINS ||
-    process.env.CORS_ORIGIN ||
-    "http://localhost:5173";
+function normalizeOrigin(value) {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return raw;
+  }
+}
 
-  const allowedOrigins = rawOrigins
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+async function securityPlugin(app) {
+  const allowedOrigins = Array.isArray(app?.config?.corsOrigins) && app.config.corsOrigins.length > 0
+    ? app.config.corsOrigins
+    : ["http://localhost:5173"];
+  const allowedOriginSet = new Set(allowedOrigins.map(normalizeOrigin).filter(Boolean));
+  const isDev = (process.env.NODE_ENV || process.env.ENTORNO || "development") === "development";
 
   await app.register(cors, {
     origin: (origin, cb) => {
       // Postman/curl no mandan Origin -> permitir
       if (!origin) return cb(null, true);
 
-      // Permitir solo los configurados
-      if (allowedOrigins.includes(origin)) return cb(null, true);
+      const normalizedOrigin = normalizeOrigin(origin);
 
-      // Bloquear lo demás
+      // Permitir solo los configurados
+      if (allowedOriginSet.has(normalizedOrigin)) return cb(null, true);
+
+      // Bloquear lo demas
+      if (isDev) {
+        app.log.warn(
+          {
+            origin_received: origin,
+            origin_normalized: normalizedOrigin,
+            allowed_origins: [...allowedOriginSet],
+          },
+          "[CORS] Origin bloqueado. Verifica CORS_ORIGENES en .env y que el frontend use localhost sin mezclar 127.0.0.1."
+        );
+      } else {
+        app.log.warn({ origin }, "CORS origin blocked");
+      }
       return cb(null, false);
     },
-    // Declarar TODOS los métodos que la API utiliza para que el preflight (OPTIONS) los autorice
+    // Declarar TODOS los metodos que la API utiliza para que el preflight (OPTIONS) los autorice
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id", "X-CSRF-Token"],
     exposedHeaders: ["X-Request-Id", "Retry-After"],
@@ -131,6 +150,6 @@ async function securityPlugin(app) {
   });
 }
 
-// Esto hace el plugin GLOBAL (sin encapsulación)
+// Esto hace el plugin GLOBAL (sin encapsulacion)
 export default fp(securityPlugin, { name: "security-plugin" });
 
