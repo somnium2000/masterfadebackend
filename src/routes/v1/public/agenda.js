@@ -108,6 +108,155 @@ const slotSchema = {
   additionalProperties: false,
 };
 
+const bookingPromotionSchema = {
+  type: "object",
+  properties: {
+    id_promocion: { type: "string", format: "uuid" },
+    id_sucursal: { type: "string", format: "uuid" },
+    titulo: { type: "string" },
+    subtitulo: { type: ["string", "null"] },
+    descripcion: { type: ["string", "null"] },
+    tipo_promocion: { type: "string" },
+    aplica_a: { type: "string", enum: ["servicio", "paquete"] },
+    mecanica: { type: "string", enum: ["porcentaje", "monto_fijo", "dos_por_uno"] },
+    id_servicio_objetivo: { type: ["string", "null"], format: "uuid" },
+    id_paquete_objetivo: { type: ["string", "null"], format: "uuid" },
+    valor_descuento: { type: ["number", "null"] },
+    cantidad_requerida: { type: ["integer", "null"] },
+    cantidad_bonificada: { type: ["integer", "null"] },
+    resumen_promocion: { type: "string" },
+    vigencia_desde: { type: ["string", "null"], format: "date" },
+    vigencia_hasta: { type: ["string", "null"], format: "date" },
+    vigencia_hora_desde: { type: ["string", "null"] },
+    vigencia_hora_hasta: { type: ["string", "null"] },
+    servicio_objetivo_nombre: { type: ["string", "null"] },
+    paquete_objetivo_nombre: { type: ["string", "null"] },
+  },
+  required: [
+    "id_promocion",
+    "id_sucursal",
+    "titulo",
+    "subtitulo",
+    "descripcion",
+    "tipo_promocion",
+    "aplica_a",
+    "mecanica",
+    "id_servicio_objetivo",
+    "id_paquete_objetivo",
+    "valor_descuento",
+    "cantidad_requerida",
+    "cantidad_bonificada",
+    "resumen_promocion",
+    "vigencia_desde",
+    "vigencia_hasta",
+    "vigencia_hora_desde",
+    "vigencia_hora_hasta",
+    "servicio_objetivo_nombre",
+    "paquete_objetivo_nombre",
+  ],
+  additionalProperties: false,
+};
+
+const PUBLIC_BOOKING_PROMOTIONS_SQL = `
+  -- JK: Expone promociones publicas utilizables en agendamiento con vigencia y datos operativos completos.
+  SELECT
+    p.id_promocion,
+    ps.id_sucursal,
+    p.titulo,
+    p.subtitulo,
+    p.parrafos,
+    p.tipo_promocion,
+    p.aplica_a,
+    p.mecanica,
+    p.id_servicio_objetivo,
+    p.id_paquete_objetivo,
+    p.valor_descuento,
+    p.cantidad_requerida,
+    p.cantidad_bonificada,
+    ps.vigencia_desde,
+    ps.vigencia_hasta,
+    ps.vigencia_hora_desde,
+    ps.vigencia_hora_hasta,
+    s.nombre_servicio AS servicio_objetivo_nombre,
+    pk.nombre_paquete AS paquete_objetivo_nombre
+  FROM public.promociones p
+  JOIN public.promociones_sucursal ps
+    ON ps.id_promocion = p.id_promocion
+  JOIN public.sucursales su
+    ON su.id_sucursal = ps.id_sucursal
+  LEFT JOIN public.servicios s
+    ON s.id_servicio = p.id_servicio_objetivo
+   AND s.deleted_at IS NULL
+  LEFT JOIN public.paquetes pk
+    ON pk.id_paquete = p.id_paquete_objetivo
+   AND pk.deleted_at IS NULL
+  WHERE ps.id_sucursal = $1::uuid
+    AND su.deleted_at IS NULL
+    AND su.estado IS TRUE
+    AND p.estado = 'publicada'
+    AND ps.visible_publico IS TRUE
+    AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= CURRENT_DATE)
+    AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= CURRENT_DATE)
+    AND (
+      (ps.vigencia_hora_desde IS NULL AND ps.vigencia_hora_hasta IS NULL)
+      OR (ps.vigencia_hora_desde IS NOT NULL AND ps.vigencia_hora_hasta IS NULL AND LOCALTIME >= ps.vigencia_hora_desde)
+      OR (ps.vigencia_hora_desde IS NULL AND ps.vigencia_hora_hasta IS NOT NULL AND LOCALTIME <= ps.vigencia_hora_hasta)
+      OR (
+        ps.vigencia_hora_desde IS NOT NULL
+        AND ps.vigencia_hora_hasta IS NOT NULL
+        AND (
+          (ps.vigencia_hora_desde <= ps.vigencia_hora_hasta AND LOCALTIME BETWEEN ps.vigencia_hora_desde AND ps.vigencia_hora_hasta)
+          OR (ps.vigencia_hora_desde > ps.vigencia_hora_hasta AND (LOCALTIME >= ps.vigencia_hora_desde OR LOCALTIME <= ps.vigencia_hora_hasta))
+        )
+      )
+    )
+    AND p.tipo_promocion IN ('descuento_servicio', 'descuento_paquete', 'dos_por_uno_servicio')
+    AND p.aplica_a IN ('servicio', 'paquete')
+    AND p.mecanica IN ('porcentaje', 'monto_fijo', 'dos_por_uno')
+    AND (
+      (p.mecanica = 'porcentaje' AND p.valor_descuento IS NOT NULL AND p.valor_descuento > 0 AND p.valor_descuento <= 100)
+      OR (p.mecanica = 'monto_fijo' AND p.valor_descuento IS NOT NULL AND p.valor_descuento > 0)
+      OR (p.mecanica = 'dos_por_uno' AND COALESCE(p.cantidad_requerida, 0) > 0 AND COALESCE(p.cantidad_bonificada, 0) > 0)
+    )
+    AND (
+      (
+        p.aplica_a = 'servicio'
+        AND p.id_servicio_objetivo IS NOT NULL
+        AND s.id_servicio IS NOT NULL
+        AND s.activo IS TRUE
+        AND s.agendable IS TRUE
+        AND s.visible_publico IS TRUE
+        AND EXISTS (
+          SELECT 1
+          FROM public.servicios_tarifas st
+          WHERE st.id_servicio = p.id_servicio_objetivo
+            AND st.id_sucursal = ps.id_sucursal
+            AND st.deleted_at IS NULL
+            AND st.activo IS TRUE
+            AND st.vigente_desde <= CURRENT_DATE
+            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+            AND st.precio_hnl > 0
+        )
+      )
+      OR (
+        p.aplica_a = 'paquete'
+        AND p.id_paquete_objetivo IS NOT NULL
+        AND pk.id_paquete IS NOT NULL
+        AND pk.activo IS TRUE
+        AND EXISTS (
+          SELECT 1
+          FROM public.paquetes_sucursal psq
+          WHERE psq.id_paquete = p.id_paquete_objetivo
+            AND psq.id_sucursal = ps.id_sucursal
+            AND psq.activo IS TRUE
+            AND psq.visible_publico IS TRUE
+            AND psq.precio_hnl > 0
+        )
+      )
+    )
+  ORDER BY ps.orden_visual ASC, p.titulo ASC
+`;
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -122,6 +271,95 @@ function sendHandled(reply, request, error, message, code) {
     code,
     requestId: request.id,
   });
+}
+
+function formatPromotionNumber(value, fractionDigits = 2) {
+  // JK: Formatea descuentos sin decimales innecesarios para el resumen visible en agendamiento.
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const fixed = parsed.toFixed(fractionDigits);
+  return fixed.includes(".")
+    ? fixed.replace(/\.?0+$/, "")
+    : fixed;
+}
+
+function normalizePromotionParagraphs(value) {
+  // JK: Permite leer descripcion de promociones tanto en arreglo JSON como en texto plano legado.
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry || "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split("\n")
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function buildPromotionSummary(row) {
+  // JK: Replica resumen operativo para evitar mostrar etiquetas engañosas en promociones incompletas.
+  const aplicaA = String(row?.aplica_a || "").toLowerCase();
+  const mecanica = String(row?.mecanica || "").toLowerCase();
+  const scopeLabel = aplicaA === "paquete" ? "Paquete" : "Servicio";
+  const hasServiceTarget = Boolean(String(row?.id_servicio_objetivo || "").trim());
+  const hasPackageTarget = Boolean(String(row?.id_paquete_objetivo || "").trim());
+  const value = Number(row?.valor_descuento);
+  const hasDiscountValue = Number.isFinite(value) && value > 0;
+
+  const missingOperationalData = (
+    (aplicaA === "servicio" && !hasServiceTarget)
+    || (aplicaA === "paquete" && !hasPackageTarget)
+    || (mecanica === "porcentaje" && !hasDiscountValue)
+    || (mecanica === "monto_fijo" && !hasDiscountValue)
+    || (mecanica === "dos_por_uno" && !hasServiceTarget)
+  );
+  if (missingOperationalData) return "Sin aplicación configurada";
+
+  if (mecanica === "porcentaje") {
+    const normalized = formatPromotionNumber(row?.valor_descuento);
+    return normalized ? `${scopeLabel} · ${normalized}%` : "Sin aplicación configurada";
+  }
+  if (mecanica === "monto_fijo") {
+    const normalized = formatPromotionNumber(row?.valor_descuento);
+    return normalized ? `${scopeLabel} · L ${normalized}` : "Sin aplicación configurada";
+  }
+  if (mecanica === "dos_por_uno") {
+    const requerida = Number(row?.cantidad_requerida ?? 1);
+    const bonificada = Number(row?.cantidad_bonificada ?? 1);
+    const safeRequerida = Number.isInteger(requerida) && requerida > 0 ? requerida : 1;
+    const safeBonificada = Number.isInteger(bonificada) && bonificada > 0 ? bonificada : 1;
+    return `${scopeLabel} · ${safeRequerida + safeBonificada}x${safeRequerida}`;
+  }
+
+  return "Sin aplicación configurada";
+}
+
+function mapBookingPromotionRow(row) {
+  // JK: Expone payload de promociones amigable para el flujo de agendamiento sin tocar contratos de pago.
+  const paragraphs = normalizePromotionParagraphs(row?.parrafos);
+  return {
+    id_promocion: row.id_promocion,
+    id_sucursal: row.id_sucursal,
+    titulo: row.titulo,
+    subtitulo: row.subtitulo ?? null,
+    descripcion: paragraphs[0] ?? (row.subtitulo ?? null),
+    tipo_promocion: row.tipo_promocion,
+    aplica_a: row.aplica_a,
+    mecanica: row.mecanica,
+    id_servicio_objetivo: row.id_servicio_objetivo ?? null,
+    id_paquete_objetivo: row.id_paquete_objetivo ?? null,
+    valor_descuento: row.valor_descuento == null ? null : Number(row.valor_descuento),
+    cantidad_requerida: row.cantidad_requerida == null ? null : Number(row.cantidad_requerida),
+    cantidad_bonificada: row.cantidad_bonificada == null ? null : Number(row.cantidad_bonificada),
+    resumen_promocion: buildPromotionSummary(row),
+    vigencia_desde: row.vigencia_desde ?? null,
+    vigencia_hasta: row.vigencia_hasta ?? null,
+    vigencia_hora_desde: row.vigencia_hora_desde ?? null,
+    vigencia_hora_hasta: row.vigencia_hora_hasta ?? null,
+    servicio_objetivo_nombre: row.servicio_objetivo_nombre ?? null,
+    paquete_objetivo_nombre: row.paquete_objetivo_nombre ?? null,
+  };
 }
 
 export default async function publicAgendaRoutes(app) {
@@ -171,6 +409,56 @@ export default async function publicAgendaRoutes(app) {
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo consultar el catalogo de barberos", "PUBLIC_AGENDA_BARBERS_ERROR");
+      }
+    }
+  );
+
+  app.get(
+    "/promociones",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          required: ["id_sucursal"],
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  promociones: { type: "array", items: bookingPromotionSchema },
+                },
+                required: ["promociones"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        // JK: Reusa limpieza de holds vencidos para mantener consistencia con disponibilidad pública.
+        await expireStaleAppointmentReservations(app.db, { logger: request.log });
+        const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
+        const { rows } = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_SQL, [idSucursal]);
+        return sendOk(reply, {
+          promociones: rows.map(mapBookingPromotionRow),
+        });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudieron consultar promociones disponibles para agendamiento", "PUBLIC_AGENDA_PROMOTIONS_ERROR");
       }
     }
   );
