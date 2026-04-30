@@ -3,6 +3,11 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
 import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
+import { getAgendamientoConfig } from "../../../services/agendaService.js";
+import {
+  confirmarComprobanteAgendamientoParaEnvio,
+  enviarComprobanteAgendamientoNoFiscal,
+} from "../../../services/comprobanteAgendamientoEmailService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 
@@ -470,6 +475,41 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
   return { pending: queued.rows.length, sent, failed };
 }
 
+async function dispatchPostPaymentReceiptEmailWithFallback({
+  app,
+  db,
+  logger,
+  idGrupoCita,
+  agendamientoConfig = null,
+  modo = "post_confirmacion",
+}) {
+  const effectiveConfig = agendamientoConfig || await getAgendamientoConfig(db, { logger });
+  try {
+    return await enviarComprobanteAgendamientoNoFiscal({
+      app,
+      pool: db,
+      logger,
+      id_grupo_cita: idGrupoCita,
+      modo,
+      comprobanteEmailHabilitado: Boolean(effectiveConfig?.comprobanteEmailHabilitado),
+    });
+  } catch (error) {
+    if (error instanceof AppError && error.code === "BOOKING_RECEIPT_NOT_FOUND") {
+      const legacy = await dispatchPostPaymentEmails(db, {
+        idGrupoCita,
+        mailer: app.mailer,
+        logger,
+      });
+      return {
+        source: "legacy_fallback",
+        mode: modo,
+        ...legacy,
+      };
+    }
+    throw error;
+  }
+}
+
 async function grantCompanionPoints(client, { idGrupoCita }) {
   const titularResult = await client.query(
     `
@@ -537,7 +577,11 @@ async function grantCompanionPoints(client, { idGrupoCita }) {
   }
 }
 
-async function confirmGroupAfterPaid(client, { idCitaAnchor }) {
+async function confirmGroupAfterPaid(client, {
+  idCitaAnchor,
+  agendamientoConfig = null,
+  logger = null,
+}) {
   const groupResult = await client.query(
     `
       SELECT
@@ -600,12 +644,26 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor }) {
     });
   }
 
-  await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
+  const receiptConfirm = await confirmarComprobanteAgendamientoParaEnvio({
+    client,
+    logger,
+    id_grupo_cita: idGrupoCita,
+    resultadoReservaCodigo: "confirmada",
+    comprobanteEmailHabilitado: Boolean(agendamientoConfig?.comprobanteEmailHabilitado),
+  });
+  if (!receiptConfirm.found) {
+    await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
+  }
   await grantCompanionPoints(client, { idGrupoCita });
   return {
     id_grupo_cita: idGrupoCita,
     total_hnl: totalGrupo,
     recompensa_utilizada: rewardRedemption,
+    comprobante: receiptConfirm.found ? {
+      id_comprobante_agendamiento: receiptConfirm.id_comprobante_agendamiento,
+      estado_comprobante_codigo: receiptConfirm.estado_comprobante_codigo,
+      resultado_reserva_codigo: receiptConfirm.resultado_reserva_codigo,
+    } : null,
   };
 }
 
@@ -804,10 +862,12 @@ export default async function publicPagosRoutes(app) {
       const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "") === "confirmada");
       if (allConfirmed) {
         try {
-          await dispatchPostPaymentEmails(app.db, {
-            idGrupoCita,
-            mailer: app.mailer,
+          await dispatchPostPaymentReceiptEmailWithFallback({
+            app,
+            db: app.db,
             logger: request.log,
+            idGrupoCita,
+            modo: "status_poll",
           });
         } catch (dispatchError) {
           request.log.error(
@@ -920,14 +980,22 @@ export default async function publicPagosRoutes(app) {
           `UPDATE public.payment_intents SET estado_intent_codigo = 'confirmado', updated_at = now() WHERE id_intent = $1::uuid`,
           [idIntent]
         );
-        const confirm = await confirmGroupAfterPaid(dbClient, { idCitaAnchor: intent.id_cita });
+        const agendamientoConfig = await getAgendamientoConfig(dbClient, { logger: request.log });
+        const confirm = await confirmGroupAfterPaid(dbClient, {
+          idCitaAnchor: intent.id_cita,
+          agendamientoConfig,
+          logger: request.log,
+        });
         await dbClient.query("COMMIT");
         let emailDelivery = { pending: 0, sent: 0, failed: 0 };
         try {
-          emailDelivery = await dispatchPostPaymentEmails(app.db, {
-            idGrupoCita,
-            mailer: app.mailer,
+          emailDelivery = await dispatchPostPaymentReceiptEmailWithFallback({
+            app,
+            db: app.db,
             logger: request.log,
+            idGrupoCita,
+            agendamientoConfig,
+            modo: "mock_complete",
           });
         } catch (dispatchError) {
           request.log.error(
