@@ -34,6 +34,9 @@ export const AGENDA_DEFAULT_TIME_ZONE = String(
   || process.env.APP_TIME_ZONE
   || "America/Tegucigalpa"
 ).trim();
+export const SERVICE_BARBER_ASSIGNMENTS_ENABLED = String(
+  process.env.SERVICE_BARBER_ASSIGNMENTS_ENABLED ?? "false"
+).trim().toLowerCase() === "true";
 export const SLOT_DISCARD_REASONS = {
   RESIDUAL_GAP_NOT_SELLABLE: "RESIDUAL_GAP_NOT_SELLABLE",
   DURATION_INSUFFICIENT: "DURATION_INSUFFICIENT",
@@ -903,6 +906,7 @@ function normalizeBookingSelectionType(rawValue, { required = false } = {}) {
 export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
+  const enforceBarberServiceAssignments = SERVICE_BARBER_ASSIGNMENTS_ENABLED && Boolean(safeBarberId);
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
   const uniqueIds = Array.from(new Set(requestedIds));
 
@@ -927,7 +931,9 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
           AND (
-            st.id_empleado IS NULL OR st.id_empleado = $3::uuid
+            st.id_empleado IS NULL
+            OR ($4::boolean IS TRUE AND st.id_empleado = $3::uuid)
+            OR ($4::boolean IS FALSE)
           )
           AND st.vigente_desde <= CURRENT_DATE
           AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
@@ -949,7 +955,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
-      [safeBranchId, uniqueIds, safeBarberId]
+      [safeBranchId, uniqueIds, safeBarberId, enforceBarberServiceAssignments]
     ),
     getGlobalBufferMinutes(client),
   ]);
