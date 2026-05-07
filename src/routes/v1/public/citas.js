@@ -565,58 +565,62 @@ function normalizeBlocksPayload(body, titularPayload) {
 async function resolveOrCreatePublicClient(client, payload) {
   const { nombre, nombres, apellidos, telefono, email, idSucursal } = payload;
 
-  const existingActiveUserByEmailResult = await client.query(
-    `
-      SELECT u.id_usuario
-      FROM public.usuarios u
-      JOIN public.personas p
-        ON p.id_persona = u.id_persona
-       AND p.deleted_at IS NULL
-      JOIN public.correos co
-        ON co.id_persona = p.id_persona
-       AND co.deleted_at IS NULL
-      WHERE u.deleted_at IS NULL
-        AND COALESCE(u.estado, TRUE) IS TRUE
-        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
-        AND lower(co.direccion_correo::text) = lower($1)
-      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-      LIMIT 1
-    `,
-    [email]
-  );
+  const ensureEmailDoesNotBelongActiveUser = async (correo) => {
+    const existingActiveUserByEmailResult = await client.query(
+      `
+        SELECT u.id_usuario
+        FROM public.usuarios u
+        JOIN public.personas p
+          ON p.id_persona = u.id_persona
+         AND p.deleted_at IS NULL
+        JOIN public.correos co
+          ON co.id_persona = p.id_persona
+         AND co.deleted_at IS NULL
+        WHERE u.deleted_at IS NULL
+          AND COALESCE(u.estado, TRUE) IS TRUE
+          AND COALESCE(u.estado_acceso, 'activo') = 'activo'
+          AND lower(co.direccion_correo::text) = lower($1)
+        ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+        LIMIT 1
+      `,
+      [correo]
+    );
 
-  if (existingActiveUserByEmailResult.rows[0]) {
-    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-      details: { field: "titular.email" },
-    });
-  }
+    if (existingActiveUserByEmailResult.rows[0]) {
+      throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
+        code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+        details: { field: "titular.email", email: correo },
+      });
+    }
 
-  const existingUserClientResult = await client.query(
-    `
-      SELECT c.id_cliente, c.id_persona
-      FROM public.clientes c
-      JOIN public.personas p
-        ON p.id_persona = c.id_persona
-       AND p.deleted_at IS NULL
-      JOIN public.correos co
-        ON co.id_persona = p.id_persona
-       AND co.deleted_at IS NULL
-      WHERE c.deleted_at IS NULL
-        AND c.estado IS TRUE
-        AND lower(co.direccion_correo::text) = lower($1)
-      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-      LIMIT 1
-    `,
-    [email]
-  );
+    const existingUserClientResult = await client.query(
+      `
+        SELECT c.id_cliente, c.id_persona
+        FROM public.clientes c
+        JOIN public.personas p
+          ON p.id_persona = c.id_persona
+         AND p.deleted_at IS NULL
+        JOIN public.correos co
+          ON co.id_persona = p.id_persona
+         AND co.deleted_at IS NULL
+        WHERE c.deleted_at IS NULL
+          AND c.estado IS TRUE
+          AND lower(co.direccion_correo::text) = lower($1)
+        ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+        LIMIT 1
+      `,
+      [correo]
+    );
 
-  if (existingUserClientResult.rows[0]) {
-    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-      details: { field: "titular.email" },
-    });
-  }
+    if (existingUserClientResult.rows[0]) {
+      throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
+        code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+        details: { field: "titular.email", email: correo },
+      });
+    }
+  };
+
+  await ensureEmailDoesNotBelongActiveUser(email);
 
   const existingPersonaResult = await client.query(
     `
@@ -733,6 +737,99 @@ export default async function publicCitasRoutes(app) {
           code: "PUBLIC_CITAS_CONTEXT_ERROR",
           requestId: request.id,
         });
+      }
+    }
+  );
+
+  app.post(
+    "/validar-titular",
+    {
+      schema: {
+        body: {
+          type: "object",
+          required: ["titular"],
+          properties: {
+            titular: {
+              type: "object",
+              required: ["nombre", "email", "telefono"],
+              properties: {
+                nombre: { type: "string", minLength: 1, maxLength: 120 },
+                email: { type: "string", format: "email", maxLength: 160 },
+                telefono: { type: "string", minLength: 8, maxLength: 20 },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const db = app.db;
+      if (!db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+      try {
+        const titularPayload = validateClientPayload(request.body?.titular);
+        const email = titularPayload.email;
+
+        const activeUserByEmailResult = await db.query(
+          `
+            SELECT u.id_usuario
+            FROM public.usuarios u
+            JOIN public.personas p
+              ON p.id_persona = u.id_persona
+             AND p.deleted_at IS NULL
+            JOIN public.correos co
+              ON co.id_persona = p.id_persona
+             AND co.deleted_at IS NULL
+            WHERE u.deleted_at IS NULL
+              AND COALESCE(u.estado, TRUE) IS TRUE
+              AND COALESCE(u.estado_acceso, 'activo') = 'activo'
+              AND lower(co.direccion_correo::text) = lower($1)
+            ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+            LIMIT 1
+          `,
+          [email]
+        );
+        if (activeUserByEmailResult.rows[0]) {
+          throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
+            code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+            details: { field: "titular.email", email },
+          });
+        }
+
+        const activeClientByEmailResult = await db.query(
+          `
+            SELECT c.id_cliente
+            FROM public.clientes c
+            JOIN public.personas p
+              ON p.id_persona = c.id_persona
+             AND p.deleted_at IS NULL
+            JOIN public.correos co
+              ON co.id_persona = p.id_persona
+             AND co.deleted_at IS NULL
+            WHERE c.deleted_at IS NULL
+              AND c.estado IS TRUE
+              AND lower(co.direccion_correo::text) = lower($1)
+            ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+            LIMIT 1
+          `,
+          [email]
+        );
+        if (activeClientByEmailResult.rows[0]) {
+          throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
+            code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+            details: { field: "titular.email", email },
+          });
+        }
+
+        return sendOk(reply, {
+          valid: true,
+          titular: { email },
+        });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo validar el titular publico", "PUBLIC_CITAS_TITULAR_VALIDATE_ERROR");
       }
     }
   );
@@ -948,6 +1045,158 @@ export default async function publicCitasRoutes(app) {
         }
 
         return sendHandled(reply, request, error, "No se pudo crear el hold publico", "PUBLIC_CITAS_HOLD_CREATE_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.delete(
+    "/hold/:id_grupo_cita",
+    {
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_grupo_cita"],
+          properties: {
+            id_grupo_cita: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_grupo_cita: { type: "string", format: "uuid" },
+                  released: { type: "boolean" },
+                  estado_grupo_codigo: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  citas_liberadas: { type: "integer" },
+                },
+                required: ["id_grupo_cita", "released", "estado_grupo_codigo", "citas_liberadas"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      const idGrupoCita = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+      const dbClient = await app.db.connect();
+      try {
+        await dbClient.query("BEGIN");
+        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+
+        const groupResult = await dbClient.query(
+          `
+            SELECT id_grupo_cita, estado_grupo_codigo
+            FROM public.citas_grupos
+            WHERE id_grupo_cita = $1::uuid
+            FOR UPDATE
+          `,
+          [idGrupoCita]
+        );
+        const group = groupResult.rows[0] || null;
+        if (!group) {
+          await dbClient.query("COMMIT");
+          return sendOk(reply, {
+            id_grupo_cita: idGrupoCita,
+            released: true,
+            estado_grupo_codigo: null,
+            citas_liberadas: 0,
+          });
+        }
+
+        const blockingStatesResult = await dbClient.query(
+          `
+            SELECT count(*)::int AS total
+            FROM public.citas
+            WHERE id_grupo_cita = $1::uuid
+              AND estado_cita_codigo IN ('confirmada', 'en_salon', 'en_atencion', 'completada', 'no_show')
+          `,
+          [idGrupoCita]
+        );
+        const blockingAppointments = Number(blockingStatesResult.rows?.[0]?.total || 0);
+        if (blockingAppointments > 0) {
+          await dbClient.query("ROLLBACK");
+          return sendError(reply, 409, "No se puede cancelar porque el grupo ya tiene citas confirmadas o en proceso.", {
+            code: "PUBLIC_CITAS_HOLD_RELEASE_NOT_ALLOWED",
+            requestId: request.id,
+          });
+        }
+
+        const citasResult = await dbClient.query(
+          `
+            UPDATE public.citas
+            SET estado_cita_codigo = 'cancelada',
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+              AND estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+            RETURNING id_cita
+          `,
+          [idGrupoCita]
+        );
+        const citaIds = Array.isArray(citasResult.rows)
+          ? citasResult.rows.map((row) => row.id_cita).filter(Boolean)
+          : [];
+
+        if (citaIds.length > 0) {
+          await dbClient.query(
+            `
+              UPDATE public.citas_holds
+              SET estado_hold_codigo = 'cancelado',
+                  updated_at = now()
+              WHERE id_cita = ANY($1::uuid[])
+                AND estado_hold_codigo = 'activo'
+            `,
+            [citaIds]
+          );
+        }
+
+        const nextGroupState = ["cancelada", "confirmada", "completada"].includes(String(group.estado_grupo_codigo || "").trim())
+          ? String(group.estado_grupo_codigo || "cancelada").trim()
+          : "cancelada";
+
+        await dbClient.query(
+          `
+            UPDATE public.citas_grupos
+            SET estado_grupo_codigo = $2::text,
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+          `,
+          [idGrupoCita, nextGroupState]
+        );
+
+        await dbClient.query("COMMIT");
+        return sendOk(reply, {
+          id_grupo_cita: idGrupoCita,
+          released: true,
+          estado_grupo_codigo: nextGroupState,
+          citas_liberadas: citaIds.length,
+        });
+      } catch (error) {
+        try {
+          await dbClient.query("ROLLBACK");
+        } catch {
+          // no-op
+        }
+        return sendHandled(reply, request, error, "No se pudo liberar el hold publico", "PUBLIC_CITAS_HOLD_RELEASE_ERROR");
       } finally {
         dbClient.release();
       }

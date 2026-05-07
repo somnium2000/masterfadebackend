@@ -1,5 +1,6 @@
 import fp from "fastify-plugin";
 import pool, {
+  getDbConfig,
   getSanitizedDbTarget,
   getSupabaseDbConnectionHints
 } from "../config/db-connection.js";
@@ -11,6 +12,12 @@ async function dbPlugin(app) {
   app.log.info(
     `DB target: host=${target.host}, port=${target.port}, db=${target.database}, user=${target.user} (${target.source})`
   );
+  const sslConfig = getDbConfig()?.ssl;
+  if (sslConfig && typeof sslConfig === "object" && sslConfig.rejectUnauthorized === false) {
+    app.log.warn(
+      "DB SSL esta en modo permissivo (rejectUnauthorized=false). Usalo solo en local/dev."
+    );
+  }
 
   if (process.env.DB_TEST_CONNECTION === "true") {
     try {
