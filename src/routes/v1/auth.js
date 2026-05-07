@@ -771,8 +771,32 @@ function verifySocialConfirmToken(token, jwtSecret) {
   return decoded;
 }
 
+function isPublicAuthRuntime() {
+  const nodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
+  const entorno = String(process.env.ENTORNO || "").trim().toLowerCase();
+  const frontendUrl = String(process.env.FRONTEND_URL || "").trim().toLowerCase();
+
+  if (["staging", "production", "prod"].includes(nodeEnv)) return true;
+  if (["qa", "staging", "preprod", "production", "prod"].includes(entorno)) return true;
+  if (frontendUrl.startsWith("https://")) return true;
+  return false;
+}
+
 function getFrontendBaseUrl() {
-  return (process.env.FRONTEND_URL || "http://localhost:5173").trim().replace(/\/+$/, "");
+  const frontendUrl = String(process.env.FRONTEND_URL || "").trim();
+  const normalized = frontendUrl.replace(/\/+$/, "");
+  const isPublicRuntime = isPublicAuthRuntime();
+
+  if (isPublicRuntime) {
+    if (!normalized.startsWith("https://")) {
+      const err = new Error("FRONTEND_URL HTTPS requerido para auth publico");
+      err.code = "AUTH_FRONTEND_URL_INVALID";
+      throw err;
+    }
+    return normalized;
+  }
+
+  return normalized || "http://localhost:5173";
 }
 
 function buildSocialConfirmFrontendUrl(token) {
