@@ -112,8 +112,38 @@ export function getSupabaseDbConnectionHints() {
     "Pooler (recomendado para backend persistente): host aws-0-<region>.pooler.supabase.com con puerto 5432 (session) o 6543 (transaction).",
     "User en pooler: postgres.<PROJECT_REF> (ej: postgres.pdzsmkjnyazpkoocjbpw).",
     "Direct: host db.<PROJECT_REF>.supabase.co con puerto 5432.",
-    "Asegura SSL: ssl: { rejectUnauthorized: false }"
+    "Asegura SSL: ssl: { rejectUnauthorized: true } y configura DB_SSL_CA_BASE64 si tu entorno requiere CA explicita."
   ].join(" ");
+}
+
+function resolveSslConfig() {
+  const isProduction = String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase() === "production";
+  const sslEnabledRaw = String(process.env.DB_SSL ?? "").trim().toLowerCase();
+  const sslEnabled = sslEnabledRaw
+    ? ["1", "true", "yes", "on", "require"].includes(sslEnabledRaw)
+    : true;
+
+  if (!sslEnabled) {
+    if (isProduction) {
+      throw new Error("DB_SSL no puede estar desactivado en produccion.");
+    }
+    return false;
+  }
+
+  const rejectUnauthorizedRaw = String(process.env.DB_SSL_REJECT_UNAUTHORIZED ?? "").trim().toLowerCase();
+  const rejectUnauthorized = rejectUnauthorizedRaw
+    ? ["1", "true", "yes", "on"].includes(rejectUnauthorizedRaw)
+    : isProduction;
+
+  const caBase64 = trimEnv("DB_SSL_CA_BASE64");
+  if (caBase64) {
+    return {
+      rejectUnauthorized,
+      ca: Buffer.from(caBase64, "base64").toString("utf-8"),
+    };
+  }
+
+  return { rejectUnauthorized };
 }
 
 function validateSupabaseTarget(target) {
@@ -168,6 +198,7 @@ function getPoolOptions() {
 function resolveDbSettings() {
   const databaseUrl = trimEnv("DATABASE_URL");
   const poolOptions = getPoolOptions();
+  const sslConfig = resolveSslConfig();
 
   if (databaseUrl) {
     const target = parseTargetFromDatabaseUrl(databaseUrl);
@@ -177,7 +208,7 @@ function resolveDbSettings() {
       target,
       pgConfig: {
         connectionString: databaseUrl,
-        ssl: { rejectUnauthorized: false },
+        ssl: sslConfig,
         ...poolOptions
       }
     };
@@ -200,7 +231,7 @@ function resolveDbSettings() {
       user: envTarget.user,
       password: envTarget.password,
       database: envTarget.database,
-      ssl: { rejectUnauthorized: false },
+      ssl: sslConfig,
       ...poolOptions
     }
   };
@@ -226,5 +257,11 @@ export function getSanitizedDbTarget() {
 }
 
 const pool = new Pool(getDbConfig());
+
+// AM: Fuerza UTF-8 por conexion para preservar caracteres Unicode (incluida la letra ñ)
+// de forma consistente entre app y PostgreSQL.
+pool.on("connect", (client) => {
+  client.query("SET client_encoding TO 'UTF8'").catch(() => {});
+});
 
 export default pool;

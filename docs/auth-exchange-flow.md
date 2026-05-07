@@ -409,15 +409,17 @@ No need to manually extract or store the token; the browser handles it.
 
 ## 6. Local Login (Staff / Admin)
 
-The existing `POST /v1/auth/login` endpoint remains for staff members who authenticate with a username and password. This endpoint does not involve Supabase Auth at all.
+> AM: Updated in Phase 1 (2026-03-08). This section replaces the old DB-password login description.
+
+`POST /v1/auth/login` is now Supabase-password based and email-first.
 
 ### Flow
 
-1. Staff member enters username + password on a dedicated login form.
-2. Frontend calls `POST /v1/auth/login` with `{ nombre_usuario, contrasena }`.
-3. Backend calls the database function `public.fn_login_usuario(username, password)`, which validates credentials (including bcrypt comparison) and returns user data with roles.
-4. Backend signs an APP JWT with the same claims structure and signing configuration as the exchange endpoint.
-5. The APP JWT is returned in the body and set as an httpOnly cookie.
+1. User enters email + password on login form.
+2. Frontend calls `POST /v1/auth/login` with `identifier/email` and `contrasena`.
+3. Backend authenticates against Supabase (`signInWithPassword`).
+4. Backend validates active internal profile in `public.usuarios` (`getAuthClaims`).
+5. Backend signs APP JWT with internal claims and returns it to frontend.
 
 ### Coexistence with social login
 
@@ -426,8 +428,8 @@ Both authentication paths produce the **exact same APP JWT format**. Downstream 
 | Property | Social Login (Exchange) | Local Login |
 |----------|------------------------|-------------|
 | Entry point | `POST /v1/auth/exchange` | `POST /v1/auth/login` |
-| Identity verification | Supabase `getUser(token)` | `fn_login_usuario(user, pass)` |
-| User lookup | `auth_uid` column | `nombre_usuario` column |
+| Identity verification | Supabase `getUser(token)` | Supabase `signInWithPassword(email, pass)` |
+| User lookup | `auth_uid` column | `public.usuarios` by `id_usuario = auth.users.id` |
 | First-time auto-registration | Yes (creates persona + usuario + cliente) | No (staff accounts are pre-created by admins) |
 | APP JWT issuer | `masterfade-api` | `masterfade-api` |
 | APP JWT claims | Identical structure | Identical structure |
@@ -437,7 +439,7 @@ Both authentication paths produce the **exact same APP JWT format**. Downstream 
 ### Why two endpoints instead of one
 
 - The exchange endpoint requires a valid Supabase token as input, which only exists after a social login. Staff members who do not use social login cannot produce a Supabase token.
-- The login endpoint validates credentials against the database directly. Routing social login users through `fn_login_usuario` would require syncing passwords, which defeats the purpose of delegating identity to Supabase.
+- The login endpoint validates credentials in Supabase too, but starts from explicit credentials (`email + password`) instead of a provider token exchange.
 - Keeping them separate makes each endpoint simple and single-purpose.
 
 ---

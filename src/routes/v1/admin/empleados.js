@@ -1,7 +1,7 @@
 import { sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
-const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const ADMIN_ALLOWED_ROLES = ["super_admin", "admin"];
 
 const requestIdSchema = { type: "string" };
 
@@ -78,6 +78,7 @@ const LIST_EMPLEADOS_SQL = `
 
 
 export default async function adminEmpleadosRoutes(app) {
+    // AM: Ruta legacy de listado. Se mantiene por compatibilidad, sin operaciones destructivas.
     app.get(
         "/",
         {
@@ -125,7 +126,6 @@ export default async function adminEmpleadosRoutes(app) {
                 request.log.error({ err: error }, "Admin empleados list error");
                 return sendError(reply, 500, "No se pudo consultar la lista de empleados", {
                     code: "ADMIN_EMPLEADOS_LIST_ERROR",
-                    details: error instanceof Error ? error.message : "Unknown admin empleados error",
                     requestId: request.id,
                 });
             }

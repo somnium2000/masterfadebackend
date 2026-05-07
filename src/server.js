@@ -6,10 +6,10 @@ import { buildApp } from "./app.js";
 
 const app = await buildApp();
 const port = Number(process.env.PORT || 3002);
-const host = process.env.HOST || "127.0.0.1";
+const host = process.env.HOST || "localhost";
 
 // NUEVO:
-// PORQUE: Evitar doble cierre por múltiples señales/errores.
+// PORQUE: Evitar doble cierre por múltiples señales/errores y evitar problemas.
 // IMPACTO: Previene errores de "close called twice" y ayuda a liberar el puerto correctamente.
 let isShuttingDown = false;
 
@@ -43,7 +43,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // NUEVO:
 // PORQUE: Si algo explota, cerramos ordenadamente en vez de dejar el proceso colgado.
-// IMPACTO: Menos puertos “pegados” por procesos zombie.
+// IMPACTO: Menos puertos "pegados" por procesos zombie.
 process.on("uncaughtException", (err) => shutdown("uncaughtException", err));
 process.on("unhandledRejection", (reason) =>
   shutdown("unhandledRejection", reason instanceof Error ? reason : new Error(String(reason)))

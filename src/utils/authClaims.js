@@ -5,6 +5,7 @@ export const AUTH_CLAIMS_SQL = `
       u.id_persona,
       p.nombres,
       p.apellidos,
+      p.telefono_principal,
       COALESCE(NULLIF(c.direccion_correo::text, ''), NULLIF(au.email::text, '')) AS email
     FROM public.usuarios u
     LEFT JOIN public.personas p
@@ -21,6 +22,8 @@ export const AUTH_CLAIMS_SQL = `
     WHERE u.id_usuario = $1::uuid
       AND u.deleted_at IS NULL
       AND u.estado IS TRUE
+      AND u.estado_acceso <> 'bloqueado'
+      AND u.estado_acceso <> 'inactivo'
   ),
   role_scope AS (
     SELECT
@@ -59,12 +62,14 @@ export const AUTH_CLAIMS_SQL = `
     JOIN public.empleados e
       ON e.id_persona = bu.id_persona
     WHERE e.estado IS TRUE
+      AND e.deleted_at IS NULL
   ),
   cliente_scope AS (
     SELECT ((array_agg(c.id_cliente::text ORDER BY c.id_cliente::text))[1])::uuid AS cliente_id
     FROM public.clientes c
     WHERE c.id_usuario = $1::uuid
       AND c.estado IS TRUE
+      AND c.deleted_at IS NULL
   )
   SELECT
     bu.id_usuario,
@@ -72,6 +77,7 @@ export const AUTH_CLAIMS_SQL = `
     bu.email,
     bu.nombres,
     bu.apellidos,
+    bu.telefono_principal,
     rs.roles,
     rs.branch_ids,
     es.empresa_id,
@@ -103,6 +109,7 @@ export async function getAuthClaims(app, userId) {
       email: row.email ?? null,
       nombres: row.nombres ?? null,
       apellidos: row.apellidos ?? null,
+      telefono_principal: row.telefono_principal ?? null,
     },
     roles: Array.isArray(row.roles) ? row.roles : [],
     branch_ids: Array.isArray(row.branch_ids) ? row.branch_ids : [],

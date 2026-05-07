@@ -2,3 +2,19 @@ node_modules/
 .env
 .DS_Store
 npm-debug.log*
+*.log
+*.zip
+coverage/
+dist/
+build/
+tmp/
+.cache/
+tmp_*
+*.tmp
+debug_*
+repro_*
+
+# Archivos comprimidos locales / respaldos
+*.zip
+*.rar
+*.7z
