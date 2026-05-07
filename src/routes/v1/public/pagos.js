@@ -4,6 +4,7 @@ import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
 import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
 import { getAgendamientoConfig } from "../../../services/agendaService.js";
+import { crearComprobanteAgendamientoNoFiscal } from "../../../services/comprobanteAgendamientoService.js";
 import {
   confirmarComprobanteAgendamientoParaEnvio,
   enviarComprobanteAgendamientoNoFiscal,
@@ -644,13 +645,41 @@ async function confirmGroupAfterPaid(client, {
     });
   }
 
-  const receiptConfirm = await confirmarComprobanteAgendamientoParaEnvio({
+  let receiptConfirm = await confirmarComprobanteAgendamientoParaEnvio({
     client,
     logger,
     id_grupo_cita: idGrupoCita,
     resultadoReservaCodigo: "confirmada",
     comprobanteEmailHabilitado: Boolean(agendamientoConfig?.comprobanteEmailHabilitado),
   });
+
+  if (!receiptConfirm.found) {
+    try {
+      await crearComprobanteAgendamientoNoFiscal({
+        client,
+        logger,
+        agendamientoConfig,
+        id_grupo_cita: idGrupoCita,
+      });
+      receiptConfirm = await confirmarComprobanteAgendamientoParaEnvio({
+        client,
+        logger,
+        id_grupo_cita: idGrupoCita,
+        resultadoReservaCodigo: "confirmada",
+        comprobanteEmailHabilitado: Boolean(agendamientoConfig?.comprobanteEmailHabilitado),
+      });
+    } catch (error) {
+      logger?.warn?.(
+        {
+          err: error,
+          code: "BOOKING_RECEIPT_CREATE_ON_PAYMENT_FAILED",
+          id_grupo_cita: idGrupoCita,
+        },
+        "No se pudo crear comprobante normalizado post-pago; se usara fallback legacy."
+      );
+    }
+  }
+
   if (!receiptConfirm.found) {
     await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
   }

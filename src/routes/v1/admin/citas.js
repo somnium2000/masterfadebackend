@@ -328,6 +328,7 @@ async function listOperationalAppointments(client, {
   fechaDesde = null,
   fechaHasta = null,
   limit = 100,
+  offset = 0,
   sortDirection = "asc",
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
@@ -404,6 +405,8 @@ async function listOperationalAppointments(client, {
 
   params.push(limit);
   const limitIdx = params.length;
+  params.push(Math.max(0, Number(offset) || 0));
+  const offsetIdx = params.length;
 
   const normalizedSortDirection = String(sortDirection || "asc").toLowerCase() === "desc" ? "DESC" : "ASC";
   const { rows } = await client.query(
@@ -642,11 +645,108 @@ async function listOperationalAppointments(client, {
       WHERE ${where.join(" AND ")}
       ORDER BY c.inicio_at ${normalizedSortDirection}, c.id_cita ${normalizedSortDirection}
       LIMIT $${limitIdx}::int
+      OFFSET $${offsetIdx}::int
     `,
     params
   );
 
   return rows.map(mapOperationalAppointment);
+}
+
+async function countOperationalAppointments(client, {
+  branchIds,
+  barberScopeId = null,
+  idEmpleadoBarbero = null,
+  idSucursal = null,
+  states = [],
+  q = null,
+  fechaDesde = null,
+  fechaHasta = null,
+} = {}) {
+  const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
+  const clientNameSql = contactColumnsSupport.has_contacto_nombre
+    ? "COALESCE(NULLIF(BTRIM(ci.contacto_nombre_snapshot), ''), NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
+    : "COALESCE(NULLIF(BTRIM(ci.contacto_nombre_snapshot), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
+
+  const params = [branchIds];
+  const where = [
+    "c.deleted_at IS NULL",
+    "c.id_sucursal = ANY($1::uuid[])",
+  ];
+
+  if (barberScopeId) {
+    params.push(assertUuid(barberScopeId, "id_empleado_barbero"));
+    where.push(`c.id_empleado_barbero = $${params.length}::uuid`);
+  }
+  if (idEmpleadoBarbero) {
+    const safeBarberId = assertUuid(idEmpleadoBarbero, "id_empleado_barbero");
+    if (barberScopeId && safeBarberId !== barberScopeId) {
+      throw new AppError(403, "No puedes consultar citas de otro barbero", {
+        code: "ADMIN_CITAS_BARBER_FORBIDDEN",
+      });
+    }
+    params.push(safeBarberId);
+    where.push(`c.id_empleado_barbero = $${params.length}::uuid`);
+  }
+
+  if (idSucursal) {
+    const safeBranch = assertUuid(idSucursal, "id_sucursal");
+    if (!branchIds.includes(safeBranch)) {
+      throw new AppError(403, "Sucursal fuera de tu alcance", {
+        code: "ADMIN_CITAS_BRANCH_FORBIDDEN",
+        details: { id_sucursal: safeBranch },
+      });
+    }
+    params.push(safeBranch);
+    where.push(`c.id_sucursal = $${params.length}::uuid`);
+  }
+
+  if (states.length) {
+    params.push(states);
+    where.push(`c.estado_cita_codigo = ANY($${params.length}::text[])`);
+  }
+
+  if (fechaDesde) {
+    params.push(`${fechaDesde}T00:00:00`);
+    where.push(`c.inicio_at >= $${params.length}::timestamptz`);
+  }
+
+  if (fechaHasta) {
+    params.push(`${fechaHasta}T23:59:59.999`);
+    where.push(`c.inicio_at <= $${params.length}::timestamptz`);
+  }
+
+  if (q) {
+    const value = `%${String(q || "").trim().toLowerCase()}%`;
+    params.push(value);
+    const idx = params.length;
+    where.push(`
+      (
+        lower(coalesce(${clientNameSql}, '')) LIKE $${idx}
+        OR lower(coalesce(concat(pb.nombres, ' ', pb.apellidos), '')) LIKE $${idx}
+        OR lower(c.id_cita::text) LIKE $${idx}
+      )
+    `);
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM public.citas c
+      JOIN public.empleados eb
+        ON eb.id_empleado = c.id_empleado_barbero
+      JOIN public.personas pb
+        ON pb.id_persona = eb.id_persona
+      LEFT JOIN public.personas pc
+        ON pc.id_persona = c.id_persona_cliente
+      LEFT JOIN public.citas_integrantes ci
+        ON ci.id_cita_integrante = c.id_cita_integrante
+      WHERE ${where.join(" AND ")}
+    `,
+    params
+  );
+
+  return Number(rows[0]?.total || 0);
 }
 
 async function getScopedAppointment(client, { idCita, branchIds, barberScopeId = null, forUpdate = false }) {
@@ -710,7 +810,7 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
       LEFT JOIN public.citas_integrantes ci
         ON ci.id_cita_integrante = c.id_cita_integrante
       WHERE ${where.join(" AND ")}
-      ${forUpdate ? "FOR UPDATE" : ""}
+      ${forUpdate ? "FOR UPDATE OF c" : ""}
       LIMIT 1
     `,
     params
@@ -1542,6 +1642,19 @@ export default async function adminCitasRoutes(app) {
       const roleScope = getRoleScope(request.claims);
       const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
       const states = parseStatusFilter(request.query?.estado, []);
+      const page = Math.max(1, Number.parseInt(String(request.query?.page ?? "1"), 10) || 1);
+      const limit = parseLimit(request.query?.limit, 9, 30);
+      const offset = (page - 1) * limit;
+      const total = await countOperationalAppointments(app.db, {
+        branchIds,
+        barberScopeId: roleScope.barber_empleado_id,
+        idSucursal: request.query?.id_sucursal ?? null,
+        idEmpleadoBarbero: request.query?.id_empleado_barbero ?? null,
+        states,
+        q: cleanText(request.query?.q),
+        fechaDesde,
+        fechaHasta,
+      });
       const citas = await listOperationalAppointments(app.db, {
         branchIds,
         barberScopeId: roleScope.barber_empleado_id,
@@ -1551,11 +1664,21 @@ export default async function adminCitasRoutes(app) {
         q: cleanText(request.query?.q),
         fechaDesde,
         fechaHasta,
-        limit: parseLimit(request.query?.limit, 200, 500),
+        limit,
+        offset,
         sortDirection: "desc",
       });
+      const totalPages = Math.max(1, Math.ceil(total / limit));
       return sendOk(reply, {
         citas,
+        pagination: {
+          page,
+          limit,
+          total,
+          total_pages: totalPages,
+          has_next: page < totalPages,
+          has_prev: page > 1,
+        },
         filtros: {
           id_sucursal: request.query?.id_sucursal ?? null,
           id_empleado_barbero: request.query?.id_empleado_barbero ?? null,
