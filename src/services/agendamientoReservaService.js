@@ -26,6 +26,21 @@ function normalizePromotionSelection(value) {
   return [...unique];
 }
 
+function splitGuestFullName(rawValue) {
+  const normalized = String(rawValue || "").trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return { nombres: "Cliente", apellidos: "Invitado" };
+  }
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (tokens.length === 1) {
+    return { nombres: tokens[0], apellidos: "Invitado" };
+  }
+  return {
+    nombres: tokens.slice(0, -1).join(" "),
+    apellidos: tokens[tokens.length - 1],
+  };
+}
+
 function roundMoney(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
@@ -118,7 +133,6 @@ async function findActiveUserByEmail(client, email) {
        AND co.deleted_at IS NULL
       WHERE u.deleted_at IS NULL
         AND COALESCE(u.estado, TRUE) IS TRUE
-        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
         AND lower(co.direccion_correo::text) = lower($1)
       ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
       LIMIT 1
@@ -218,6 +232,42 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
       },
     });
   }
+}
+
+async function ensureGuestPersonaForMember(client, member) {
+  if (member?.id_persona) return member;
+
+  const splitName = splitGuestFullName(member?.contacto_nombre_snapshot || member?.alias_integrante || "Cliente Invitado");
+  const { rows } = await client.query(
+    `
+      INSERT INTO public.personas (nombres, apellidos, telefono_principal)
+      VALUES ($1::text, $2::text, $3::text)
+      RETURNING id_persona
+    `,
+    [
+      splitName.nombres,
+      splitName.apellidos,
+      member?.contacto_telefono_snapshot || null,
+    ]
+  );
+  const idPersona = rows[0]?.id_persona || null;
+  if (!idPersona) return member;
+
+  if (member?.contacto_email_snapshot) {
+    await client.query(
+      `
+        INSERT INTO public.correos (id_persona, direccion_correo, es_principal, verificado)
+        VALUES ($1::uuid, $2::text, FALSE, FALSE)
+        ON CONFLICT DO NOTHING
+      `,
+      [idPersona, member.contacto_email_snapshot]
+    );
+  }
+
+  return {
+    ...member,
+    id_persona: idPersona,
+  };
 }
 
 async function insertGrupo(client, {
@@ -802,9 +852,15 @@ export async function crearReservaHoldBaseNormalizada({
 
     await validateMemberEmailsAgainstActiveUsers(client, normalizedMembers, actor, logger);
 
+    const membersForPersist = [];
+    for (const member of normalizedMembers) {
+      const hydratedMember = await ensureGuestPersonaForMember(client, member);
+      membersForPersist.push(hydratedMember);
+    }
+
     const groupRecord = await insertGrupo(client, {
       idSucursal: id_sucursal,
-      titular: titulares[0],
+      titular: membersForPersist[0],
       origenCodigo: origen_codigo,
       notas,
     });
@@ -819,7 +875,7 @@ export async function crearReservaHoldBaseNormalizada({
     let titularResolved = null;
     let beneficioAplicadoResumen = null;
 
-    for (const member of normalizedMembers) {
+    for (const member of membersForPersist) {
       const selection = await resolveBookingSelection(client, {
         id_sucursal,
         selection_type: member.selection_type,
@@ -1004,12 +1060,29 @@ export async function crearReservaHoldBaseNormalizada({
       [groupRecord.id_grupo_cita, roundMoney(totalGrupo)]
     );
 
-    const comprobanteResult = await crearComprobanteAgendamientoNoFiscal({
-      client,
-      logger,
-      agendamientoConfig: effectiveConfig,
-      id_grupo_cita: groupRecord.id_grupo_cita,
-    });
+    let comprobanteResult = null;
+    await client.query("SAVEPOINT booking_receipt_sp");
+    try {
+      comprobanteResult = await crearComprobanteAgendamientoNoFiscal({
+        client,
+        logger,
+        agendamientoConfig: effectiveConfig,
+        id_grupo_cita: groupRecord.id_grupo_cita,
+      });
+      await client.query("RELEASE SAVEPOINT booking_receipt_sp");
+    } catch (receiptError) {
+      await client.query("ROLLBACK TO SAVEPOINT booking_receipt_sp");
+      await client.query("RELEASE SAVEPOINT booking_receipt_sp");
+      logger?.warn?.(
+        {
+          err: receiptError,
+          code: "BOOKING_RECEIPT_CREATE_NON_BLOCKING_FAILED",
+          id_grupo_cita: groupRecord.id_grupo_cita,
+        },
+        "No se pudo generar comprobante durante hold. Se continua sin bloquear la reserva temporal."
+      );
+      comprobanteResult = null;
+    }
 
     await client.query("COMMIT");
     txStarted = false;

@@ -578,7 +578,6 @@ async function resolveOrCreatePublicClient(client, payload) {
          AND co.deleted_at IS NULL
         WHERE u.deleted_at IS NULL
           AND COALESCE(u.estado, TRUE) IS TRUE
-          AND COALESCE(u.estado_acceso, 'activo') = 'activo'
           AND lower(co.direccion_correo::text) = lower($1)
         ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
         LIMIT 1
@@ -785,7 +784,6 @@ export default async function publicCitasRoutes(app) {
              AND co.deleted_at IS NULL
             WHERE u.deleted_at IS NULL
               AND COALESCE(u.estado, TRUE) IS TRUE
-              AND COALESCE(u.estado_acceso, 'activo') = 'activo'
               AND lower(co.direccion_correo::text) = lower($1)
             ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
             LIMIT 1
