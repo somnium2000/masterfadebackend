@@ -17,6 +17,17 @@ function safeText(value) {
   return normalized || null;
 }
 
+function isHttpsUrl(value) {
+  const normalized = safeText(value);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -160,8 +171,45 @@ function buildPostPaymentEmailTemplate({
   };
 }
 
+function isPublicRuntimeContext() {
+  const nodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
+  const entorno = String(process.env.ENTORNO || "").trim().toLowerCase();
+  if (["production", "prod", "staging", "preprod"].includes(nodeEnv)) return true;
+  if (["qa", "staging", "preprod", "production", "prod"].includes(entorno)) return true;
+  if (isHttpsUrl(process.env.PUBLIC_WEB_URL)) return true;
+  if (isHttpsUrl(process.env.FRONTEND_PUBLIC_URL)) return true;
+  if (isHttpsUrl(process.env.FRONTEND_URL)) return true;
+  return false;
+}
+
+function resolvePublicWebBaseUrl() {
+  const publicWebUrl = safeText(process.env.PUBLIC_WEB_URL);
+  const frontendPublicUrl = safeText(process.env.FRONTEND_PUBLIC_URL);
+  const frontendUrl = safeText(process.env.FRONTEND_URL);
+  const isPublic = isPublicRuntimeContext();
+
+  if (isHttpsUrl(publicWebUrl)) return publicWebUrl;
+  if (isHttpsUrl(frontendPublicUrl)) return frontendPublicUrl;
+  if (isHttpsUrl(frontendUrl)) return frontendUrl;
+
+  if (!isPublic) {
+    return publicWebUrl || frontendPublicUrl || frontendUrl || "http://localhost:5173";
+  }
+
+  throw new AppError(
+    500,
+    "Configuracion invalida de retorno de pago publico",
+    {
+      code: "PUBLIC_PAGOS_CALLBACK_URL_INVALID",
+      details: {
+        field: "PUBLIC_WEB_URL",
+      },
+    }
+  );
+}
+
 function buildCallbackUrl(groupId) {
-  const base = safeText(process.env.PUBLIC_WEB_URL) || safeText(process.env.FRONTEND_PUBLIC_URL) || "http://localhost:5173";
+  const base = resolvePublicWebBaseUrl();
   return `${base.replace(/\/+$/, "")}/agendar/exito?id_grupo_cita=${encodeURIComponent(groupId)}`;
 }
 
