@@ -4,15 +4,16 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Dependencias de producción
+# Instalar dependencias de producción
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Código fuente mínimo necesario en runtime
+# Copiar código fuente necesario en runtime
 COPY app.js ./app.js
 COPY src ./src
 
-ENV NODE_ENV=production
+# Variables base seguras para contenedor.
+# NODE_ENV NO se fuerza aquí para permitir QA, staging o producción desde Easypanel.
 ENV HOST=0.0.0.0
 ENV PORT=3002
 
