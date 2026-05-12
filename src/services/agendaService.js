@@ -1,6 +1,10 @@
 import { AppError } from "../utils/errors.js";
 import { MockPaymentProvider } from "./payments/MockPaymentProvider.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
+import {
+  assertPaymentProviderConfig,
+  normalizePaymentProviderCode,
+} from "./payments/paymentRuntimeGuard.js";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -283,18 +287,31 @@ export async function getAgendamientoConfig(clientOrPool, { logger = null } = {}
 }
 
 function createProviderAdapterByCode(providerCode) {
-  const normalized = String(providerCode || "").trim().toLowerCase();
+  const normalized = normalizePaymentProviderCode(providerCode);
   if (!normalized) return null;
 
   if (normalized === "mock") {
+    try {
+      assertPaymentProviderConfig({ ...process.env, PAYMENT_PROVIDER: "mock" });
+    } catch {
+      return null;
+    }
     return new MockPaymentProvider({
       mockResult: String(process.env.MOCK_PAYMENT_RESULT || "PAID"),
     });
   }
 
-  const envProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
+  if (normalized === "simulator") {
+    try {
+      return PaymentProviderFactory.create({ providerCode: normalized });
+    } catch {
+      return null;
+    }
+  }
+
+  const envProvider = normalizePaymentProviderCode(process.env.PAYMENT_PROVIDER);
   if (normalized === envProvider) {
-    return PaymentProviderFactory.create();
+    return PaymentProviderFactory.create({ providerCode: normalized });
   }
 
   return null;

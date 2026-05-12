@@ -5,12 +5,22 @@ import { PaymentProviderFactory } from "../../../services/payments/PaymentProvid
 import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
 import { getAgendamientoConfig } from "../../../services/agendaService.js";
 import { crearComprobanteAgendamientoNoFiscal } from "../../../services/comprobanteAgendamientoService.js";
+import { processPaymentWebhook } from "../../../services/paymentWebhookService.js";
+import {
+  assertPaymentSimulatorUsable,
+  normalizePaymentProviderCode,
+} from "../../../services/payments/paymentRuntimeGuard.js";
 import {
   confirmarComprobanteAgendamientoParaEnvio,
   enviarComprobanteAgendamientoNoFiscal,
 } from "../../../services/comprobanteAgendamientoEmailService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const SIMULATOR_STATUS_TO_WEBHOOK_STATUS = {
+  success: "paid",
+  failed: "failed",
+  processing: "pending",
+};
 
 function safeText(value) {
   const normalized = String(value || "").trim();
@@ -33,7 +43,7 @@ function normalizeEmail(value) {
 }
 
 function getConfiguredPaymentProviderCode(app) {
-  return safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+  return normalizePaymentProviderCode(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER);
 }
 
 function isProductionRuntime(app) {
@@ -43,6 +53,19 @@ function isProductionRuntime(app) {
 
 function canUsePublicMockPayment(app) {
   return getConfiguredPaymentProviderCode(app) === "mock" && !isProductionRuntime(app);
+}
+
+function assertPublicSimulatorPaymentEnabled() {
+  try {
+    assertPaymentSimulatorUsable(process.env);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "PAYMENT_SIMULATOR_DISABLED";
+    throw new AppError(
+      message === "PAYMENT_SIMULATOR_FORBIDDEN_IN_PRODUCTION" ? 500 : 403,
+      "La simulacion de pago no esta disponible en este entorno",
+      { code: message }
+    );
+  }
 }
 
 function assertUuid(value, field = "id") {
@@ -227,7 +250,7 @@ function buildCallbackUrl(groupId) {
 }
 
 async function ensureProvider(client, providerCode) {
-  const code = String(providerCode || "mock").trim().toLowerCase();
+  const code = String(providerCode || "").trim().toLowerCase();
   if (!code) {
     throw new AppError(400, "Proveedor de pago requerido", { code: "PUBLIC_PAGOS_PROVIDER_REQUIRED" });
   }
@@ -758,6 +781,68 @@ async function confirmGroupAfterPaid(client, {
 }
 
 export default async function publicPagosRoutes(app) {
+  app.post("/webhooks/:provider", {
+    config: {
+      rawBody: true,
+      rateLimit: {
+        max: Number(process.env.PUBLIC_PAGOS_WEBHOOK_RATE_LIMIT_MAX || 120),
+        timeWindow: process.env.PUBLIC_PAGOS_WEBHOOK_RATE_LIMIT_WINDOW || "1 minute",
+        allowList: (request) => request.ip === "127.0.0.1" || request.ip === "::1",
+      },
+    },
+    schema: {
+      params: {
+        type: "object",
+        required: ["provider"],
+        properties: {
+          provider: { type: "string", minLength: 1, maxLength: 40 },
+        },
+        additionalProperties: false,
+      },
+      body: {
+        type: "object",
+        additionalProperties: true,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      if (normalizePaymentProviderCode(request.params?.provider) === "simulator") {
+        throw new AppError(403, "Usa el endpoint controlado de simulacion", {
+          code: "PUBLIC_PAGOS_SIMULATOR_WEBHOOK_FORBIDDEN",
+        });
+      }
+      const result = await processPaymentWebhook({
+        app,
+        db: app.db,
+        providerCode: request.params?.provider,
+        headers: request.headers,
+        body: request.body,
+        rawBody: request.rawBody,
+        logger: request.log,
+        requestId: request.id,
+      });
+      return sendOk(reply, result);
+    } catch (error) {
+      if (error instanceof AppError) {
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          "Public pagos webhook handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo procesar webhook publico de pago");
+      return sendError(reply, 500, "No se pudo procesar el webhook de pago", {
+        code: "PUBLIC_PAGOS_WEBHOOK_ERROR",
+        requestId: request.id,
+      });
+    }
+  });
+
   app.post("/crear-intent", {
     schema: {
       body: {
@@ -826,7 +911,7 @@ export default async function publicPagosRoutes(app) {
       }
 
       const idempotencyKey = `mf_public_${idGrupoCita}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
-      const providerAdapter = PaymentProviderFactory.create();
+      const providerAdapter = PaymentProviderFactory.create({ providerCode });
       const providerIntent = await providerAdapter.createIntent({
         idempotencyKey,
         montoHnl: totalGroup,
@@ -999,6 +1084,96 @@ export default async function publicPagosRoutes(app) {
       }
       request.log.error({ err: error }, "No se pudo consultar estado de pago publico");
       return sendError(reply, 500, "No se pudo consultar el estado del pago", { code: "PUBLIC_PAGOS_STATUS_ERROR", requestId: request.id });
+    }
+  });
+
+  app.post("/simulator/event", {
+    schema: {
+      body: {
+        type: "object",
+        required: ["status"],
+        properties: {
+          id_grupo_cita: { type: "string", format: "uuid" },
+          id_payment_intent: { type: "string", format: "uuid" },
+          provider_event_id: { type: "string", minLength: 1, maxLength: 120 },
+          status: { type: "string", enum: ["success", "failed", "processing"] },
+        },
+        additionalProperties: false,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      assertPublicSimulatorPaymentEnabled();
+      const idGrupoCita = request.body?.id_grupo_cita
+        ? assertUuid(request.body.id_grupo_cita, "id_grupo_cita")
+        : null;
+      const idIntent = request.body?.id_payment_intent
+        ? assertUuid(request.body.id_payment_intent, "id_payment_intent")
+        : null;
+      if (!idGrupoCita && !idIntent) {
+        throw new AppError(400, "Debes enviar id_grupo_cita o id_payment_intent", {
+          code: "PUBLIC_PAGOS_SIMULATOR_REFERENCE_REQUIRED",
+          details: { field: "id_grupo_cita" },
+        });
+      }
+
+      const requestedStatus = safeText(request.body?.status)?.toLowerCase();
+      const webhookStatus = SIMULATOR_STATUS_TO_WEBHOOK_STATUS[requestedStatus];
+      if (!webhookStatus) {
+        throw new AppError(400, "Estado de simulacion invalido", {
+          code: "PUBLIC_PAGOS_SIMULATOR_STATUS_INVALID",
+          details: { field: "status" },
+        });
+      }
+
+      const reference = idIntent || idGrupoCita;
+      const providerEventId = safeText(request.body?.provider_event_id)
+        || `simulator_${reference}_${requestedStatus}`;
+      const eventBody = {
+        provider_event_id: providerEventId,
+        event_type: `payment.${webhookStatus}`,
+        status: webhookStatus,
+        id_intent: idIntent,
+        id_grupo_cita: idGrupoCita,
+        provider_tx_id: webhookStatus === "paid" ? `tx_simulator_${reference}` : null,
+        metadata: {
+          id_intent: idIntent,
+          id_grupo_cita: idGrupoCita,
+        },
+      };
+
+      const result = await processPaymentWebhook({
+        app,
+        db: app.db,
+        providerCode: "simulator",
+        headers: request.headers,
+        body: eventBody,
+        rawBody: JSON.stringify(eventBody),
+        logger: request.log,
+        requestId: request.id,
+      });
+      return sendOk(reply, {
+        simulator_status: requestedStatus,
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code },
+          "Public pagos simulator event handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo procesar evento simulator de pago");
+      return sendError(reply, 500, "No se pudo procesar el evento de simulacion", {
+        code: "PUBLIC_PAGOS_SIMULATOR_EVENT_ERROR",
+        requestId: request.id,
+      });
     }
   });
 
