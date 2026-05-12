@@ -353,7 +353,9 @@ async function confirmGroupAfterPaid(client, {
   await client.query(
     `
       UPDATE public.citas_grupos
-      SET total_hnl = $2::numeric,
+      SET estado_grupo_codigo = 'completado',
+          release_token = NULL,
+          total_hnl = $2::numeric,
           updated_at = now()
       WHERE id_grupo_cita = $1::uuid
     `,
@@ -462,7 +464,9 @@ async function expireGroupAfterPaymentFailure(client, { idIntent, idGrupoCita, i
     await client.query(
       `
         UPDATE public.citas_grupos
-        SET updated_at = now()
+        SET estado_grupo_codigo = 'cancelado',
+            release_token = NULL,
+            updated_at = now()
         WHERE id_grupo_cita = $1::uuid
       `,
       [idGrupoCita]

@@ -47,6 +47,7 @@ export function getPaymentRuntimeSnapshot(env = process.env) {
   const entorno = normalizeRuntimeName(env.ENTORNO || env.APP_ENV || env.ENVIRONMENT);
   const provider = normalizePaymentProviderCode(env.PAYMENT_PROVIDER);
   const simulatorEnabled = parsePaymentBoolean(env.ENABLE_PAYMENT_SIMULATOR, false);
+  const qaSimulationEnabled = parsePaymentBoolean(env.ENABLE_QA_PAYMENT_SIMULATION, false);
   const productionHost = [
     env.FRONTEND_URL,
     env.PUBLIC_WEB_URL,
@@ -64,6 +65,7 @@ export function getPaymentRuntimeSnapshot(env = process.env) {
     entorno,
     provider,
     simulatorEnabled,
+    qaSimulationEnabled,
     productionHost,
     productionRuntime: PRODUCTION_MARKERS.has(nodeEnv) || PRODUCTION_MARKERS.has(entorno) || productionHost,
   };
@@ -77,6 +79,9 @@ export function assertPaymentProviderConfig(env = process.env) {
   }
   if (!KNOWN_PROVIDER_CODES.has(rawProvider.toLowerCase())) {
     throw new Error(`PAYMENT_PROVIDER_UNSUPPORTED: ${rawProvider}`);
+  }
+  if (snapshot.provider === "banpais") {
+    throw new Error("PAYMENT_PROVIDER_BANPAIS_NOT_IMPLEMENTED");
   }
   if (snapshot.provider === "mock") {
     const mockAllowed = !snapshot.productionRuntime
@@ -93,6 +98,7 @@ export function assertPaymentProviderConfig(env = process.env) {
 
 export function assertPaymentSimulatorUsable(env = process.env) {
   const snapshot = getPaymentRuntimeSnapshot(env);
+  const runtimeName = snapshot.entorno || snapshot.nodeEnv;
   if (snapshot.provider !== "simulator") {
     throw new Error("PAYMENT_SIMULATOR_PROVIDER_REQUIRED");
   }
@@ -106,8 +112,14 @@ export function assertPaymentSimulatorUsable(env = process.env) {
   ) {
     throw new Error("PAYMENT_SIMULATOR_FORBIDDEN_IN_PRODUCTION");
   }
-  if (!SIMULATOR_ALLOWED_ENTORNOS.has(snapshot.entorno)) {
+  if (["qa", "staging"].includes(runtimeName) && !snapshot.qaSimulationEnabled) {
+    throw new Error("PAYMENT_QA_SIMULATION_DISABLED");
+  }
+  if (!SIMULATOR_ALLOWED_ENTORNOS.has(runtimeName)) {
     throw new Error("PAYMENT_SIMULATOR_ENTORNO_NOT_ALLOWED");
+  }
+  if (["qa", "staging"].includes(runtimeName) && !safeText(env.PAYMENT_SIMULATOR_WEBHOOK_SECRET)) {
+    throw new Error("PAYMENT_SIMULATOR_SECRET_REQUIRED");
   }
   return snapshot;
 }

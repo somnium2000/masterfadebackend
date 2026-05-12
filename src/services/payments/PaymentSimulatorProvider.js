@@ -1,5 +1,5 @@
 import { PaymentProvider } from "./PaymentProvider.js";
-import { parsePaymentBoolean } from "./paymentRuntimeGuard.js";
+import { getPaymentRuntimeSnapshot, parsePaymentBoolean } from "./paymentRuntimeGuard.js";
 
 /**
  * Provider de simulacion controlada para QA/staging no productivo.
@@ -14,6 +14,14 @@ export class PaymentSimulatorProvider extends PaymentProvider {
   assertEnabled() {
     if (!this.enabled) {
       throw new Error("PAYMENT_SIMULATOR_DISABLED");
+    }
+    const snapshot = getPaymentRuntimeSnapshot(process.env);
+    const runtimeName = snapshot.entorno || snapshot.nodeEnv;
+    if (["qa", "staging"].includes(runtimeName) && !snapshot.qaSimulationEnabled) {
+      throw new Error("PAYMENT_QA_SIMULATION_DISABLED");
+    }
+    if (["qa", "staging"].includes(runtimeName) && !String(process.env.PAYMENT_SIMULATOR_WEBHOOK_SECRET || "").trim()) {
+      throw new Error("PAYMENT_SIMULATOR_SECRET_REQUIRED");
     }
   }
 
