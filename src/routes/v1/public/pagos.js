@@ -32,6 +32,19 @@ function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function getConfiguredPaymentProviderCode(app) {
+  return safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+}
+
+function isProductionRuntime(app) {
+  const nodeEnv = String(process.env.NODE_ENV || process.env.ENTORNO || "").trim().toLowerCase();
+  return Boolean(app.config?.isProduction) || ["production", "prod", "staging", "preprod"].includes(nodeEnv);
+}
+
+function canUsePublicMockPayment(app) {
+  return getConfiguredPaymentProviderCode(app) === "mock" && !isProductionRuntime(app);
+}
+
 function assertUuid(value, field = "id") {
   const normalized = String(value || "").trim();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)) {
@@ -767,7 +780,12 @@ export default async function publicPagosRoutes(app) {
       await dbClient.query("BEGIN");
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const titularEmail = normalizeEmail(request.body?.titular_email);
-      const providerCode = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+      const providerCode = getConfiguredPaymentProviderCode(app);
+      if (providerCode === "mock" && !canUsePublicMockPayment(app)) {
+        throw new AppError(500, "Proveedor de pago no permitido en este entorno", {
+          code: "PUBLIC_PAGOS_PROVIDER_MOCK_FORBIDDEN",
+        });
+      }
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       const invalidState = groupRows.some((row) => !["en_espera", "pendiente_pago"].includes(String(row.estado_cita_codigo || "")));
@@ -926,15 +944,19 @@ export default async function publicPagosRoutes(app) {
       const groupRows = await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail });
       const intentResult = await app.db.query(
         `
-          SELECT id_intent, estado_intent_codigo, expires_at, monto_hnl, moneda_codigo
-          FROM public.payment_intents
-          WHERE id_intent = $1::uuid
+          SELECT pi.id_intent, pi.estado_intent_codigo, pi.expires_at, pi.monto_hnl, pi.moneda_codigo
+          FROM public.payment_intents pi
+          JOIN public.citas c
+            ON c.id_cita = pi.id_cita
+          WHERE pi.id_intent = $1::uuid
+            AND c.id_grupo_cita = $2::uuid
+            AND c.deleted_at IS NULL
           LIMIT 1
         `,
-        [idIntent]
+        [idIntent, idGrupoCita]
       );
       if (!intentResult.rows[0]) {
-        throw new AppError(404, "Intent de pago no encontrado", { code: "PUBLIC_PAGOS_INTENT_NOT_FOUND" });
+        throw new AppError(404, "Intent de pago no encontrado para esta reserva", { code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH" });
       }
       const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "") === "confirmada");
       if (allConfirmed) {
@@ -984,8 +1006,9 @@ export default async function publicPagosRoutes(app) {
     schema: {
       body: {
         type: "object",
-        required: ["id_intent", "titular_email"],
+        required: ["id_grupo_cita", "id_intent", "titular_email"],
         properties: {
+          id_grupo_cita: { type: "string", format: "uuid" },
           id_intent: { type: "string", format: "uuid" },
           titular_email: { type: "string", format: "email", maxLength: 160 },
           provider_event_id: { type: "string", maxLength: 120 },
@@ -995,8 +1018,15 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
+    if (!canUsePublicMockPayment(app)) {
+      return sendError(reply, 403, "La simulacion de pago no esta disponible en este entorno", {
+        code: "PUBLIC_PAGOS_MOCK_DISABLED",
+        requestId: request.id,
+      });
+    }
     const dbClient = await app.db.connect();
     try {
+      const requestedGroupId = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
       const status = safeText(request.body?.status)?.toLowerCase() || "paid";
       const providerEventId = safeText(request.body?.provider_event_id) || `mock_${idIntent}_${status}`;
@@ -1016,14 +1046,19 @@ export default async function publicPagosRoutes(app) {
       }
 
       const groupLookup = await dbClient.query(
-        `SELECT id_grupo_cita FROM public.citas WHERE id_cita = $1::uuid LIMIT 1`,
+        `SELECT id_grupo_cita FROM public.citas WHERE id_cita = $1::uuid AND deleted_at IS NULL LIMIT 1`,
         [intent.id_cita]
       );
       const idGrupoCita = groupLookup.rows[0]?.id_grupo_cita ?? null;
       if (!idGrupoCita) {
         throw new AppError(409, "No se encontro grupo para el intent", { code: "PUBLIC_PAGOS_GROUP_REFERENCE_MISSING" });
       }
-      await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail: request.body?.titular_email });
+      if (String(idGrupoCita) !== String(requestedGroupId)) {
+        throw new AppError(403, "El intent de pago no pertenece a la reserva indicada", {
+          code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH",
+        });
+      }
+      await loadPublicGroup(dbClient, { groupId: requestedGroupId, titularEmail: request.body?.titular_email });
 
       const insertedEvent = await dbClient.query(
         `
@@ -1033,7 +1068,7 @@ export default async function publicPagosRoutes(app) {
           DO NOTHING
           RETURNING id_event
         `,
-        [intent.id_provider, providerEventId, `payment.${status}`, { status, id_intent: idIntent }, idIntent]
+        [intent.id_provider, providerEventId, `payment.${status}`, { status, id_intent: idIntent, id_grupo_cita: requestedGroupId }, idIntent]
       );
       if (!insertedEvent.rows[0]) {
         await dbClient.query("COMMIT");
