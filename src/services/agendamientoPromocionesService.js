@@ -589,6 +589,7 @@ export async function validarYAplicarPromocionesAgendamiento({
   if (!requestedIds.length) {
     return {
       promocionesAplicadas: [],
+      aplicaciones: [],
       descuentoTotalHnl: 0,
       totalAntesPromocionesHnl,
       totalDespuesPromocionesHnl: totalAntesPromocionesHnl,
@@ -612,6 +613,7 @@ export async function validarYAplicarPromocionesAgendamiento({
     }
     return {
       promocionesAplicadas: [],
+      aplicaciones: [],
       descuentoTotalHnl: 0,
       totalAntesPromocionesHnl,
       totalDespuesPromocionesHnl: totalAntesPromocionesHnl,
@@ -629,6 +631,7 @@ export async function validarYAplicarPromocionesAgendamiento({
 
   const rules = await loadPromotionRules(client, requestedIds);
   const promocionesAplicadas = [];
+  const aplicaciones = [];
   const appliedTargetLocks = new Set();
   let descuentoTotalHnl = 0;
   let totalRestante = totalAntesPromocionesHnl;
@@ -716,6 +719,15 @@ export async function validarYAplicarPromocionesAgendamiento({
         prioridad_aplicacion: rule.prioridad_aplicacion,
         es_acumulable: rule.es_acumulable,
       });
+      aplicaciones.push({
+        id_promocion: rule.id_promocion,
+        id_promocion_regla: rule.id_promocion_regla,
+        id_cita_paquete: row.id_cita_paquete || null,
+        id_cita_detalle: row.id_cita_detalle || null,
+        aplica_a_codigo: appliesTo,
+        base_calculo_hnl: roundMoney(row.base_calculo_hnl || 0),
+        descuento_hnl: roundMoney(row.descuento_hnl || 0),
+      });
     }
 
     descuentoTotalHnl = roundMoney(descuentoTotalHnl + descuento);
@@ -735,6 +747,7 @@ export async function validarYAplicarPromocionesAgendamiento({
 
   return {
     promocionesAplicadas,
+    aplicaciones,
     descuentoTotalHnl: roundMoney(descuentoTotalHnl),
     totalAntesPromocionesHnl,
     totalDespuesPromocionesHnl: roundMoney(Math.max(0, totalAntesPromocionesHnl - descuentoTotalHnl)),

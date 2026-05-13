@@ -5,6 +5,10 @@ import { assertUuid, expireStaleAppointmentReservations } from "../../services/a
 import { PaymentProviderFactory } from "../../services/payments/PaymentProviderFactory.js";
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
 import {
+  assertPaymentProviderConfig,
+  normalizePaymentProviderCode,
+} from "../../services/payments/paymentRuntimeGuard.js";
+import {
   confirmarComprobanteAgendamientoParaEnvio,
   enviarComprobanteAgendamientoNoFiscal,
 } from "../../services/comprobanteAgendamientoEmailService.js";
@@ -141,7 +145,16 @@ async function ensureProvider(client, providerCode) {
 }
 
 function getProviderAdapter(providerCode) {
-  if (providerCode === "mock") {
+  const normalizedProvider = normalizePaymentProviderCode(providerCode);
+  if (normalizedProvider === "mock") {
+    try {
+      assertPaymentProviderConfig({ ...process.env, PAYMENT_PROVIDER: "mock" });
+    } catch (error) {
+      throw new AppError(500, "Proveedor mock no permitido en este entorno", {
+        code: "PAGOS_PROVIDER_MOCK_FORBIDDEN",
+        cause: error,
+      });
+    }
     return new MockPaymentProvider({
       mockResult: safeText(process.env.MOCK_PAYMENT_RESULT) || "PAID",
     });
@@ -328,13 +341,18 @@ export default async function pagosRoutes(app) {
         await expireStaleAppointmentReservations(dbClient, { logger: request.log });
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
         const citaId = assertUuid(request.body?.id_cita, "id_cita");
-        const configuredProvider = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+        const configuredProvider = normalizePaymentProviderCode(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER);
+        if (!configuredProvider) {
+          throw new AppError(500, "Proveedor de pago no configurado", {
+            code: "PAGOS_PROVIDER_REQUIRED",
+          });
+        }
         if (app.config?.isProduction && configuredProvider === "mock") {
           throw new AppError(500, "Proveedor de pago no permitido en produccion", {
             code: "PAGOS_PROVIDER_MOCK_FORBIDDEN",
           });
         }
-        const providerAdapter = PaymentProviderFactory.create();
+        const providerAdapter = PaymentProviderFactory.create({ providerCode: configuredProvider });
 
         await dbClient.query("BEGIN");
         const provider = await ensureProvider(dbClient, configuredProvider);

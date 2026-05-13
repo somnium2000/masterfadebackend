@@ -9,6 +9,7 @@ import {
   parseDateTime,
 } from "../../../services/agendaService.js";
 import { crearReservaHoldBaseNormalizada } from "../../../services/agendamientoReservaService.js";
+import { releaseAppointmentHoldGroup } from "../../../services/appointmentHoldReleaseService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -937,6 +938,7 @@ export default async function publicCitasRoutes(app) {
                 type: "object",
                 properties: {
                   id_grupo_cita: { type: "string", format: "uuid" },
+                  release_token: { type: "string" },
                   estado_grupo_codigo: { type: "string" },
                   expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
                   subtotal_hnl: { type: "number" },
@@ -948,6 +950,7 @@ export default async function publicCitasRoutes(app) {
                 },
                 required: [
                   "id_grupo_cita",
+                  "release_token",
                   "estado_grupo_codigo",
                   "expires_at",
                   "subtotal_hnl",
@@ -1013,6 +1016,7 @@ export default async function publicCitasRoutes(app) {
           reply,
           {
             id_grupo_cita: holdResult.id_grupo_cita,
+            release_token: holdResult.release_token || "",
             estado_grupo_codigo: holdResult.estado_grupo_codigo || "activo",
             expires_at: holdResult.expires_at || null,
             subtotal_hnl: Number(holdResult.subtotal_hnl || 0),
@@ -1061,6 +1065,14 @@ export default async function publicCitasRoutes(app) {
           },
           additionalProperties: false,
         },
+        body: {
+          type: "object",
+          required: ["release_token"],
+          properties: {
+            release_token: { type: "string", minLength: 32, maxLength: 160 },
+          },
+          additionalProperties: false,
+        },
         response: {
           200: {
             type: "object",
@@ -1083,6 +1095,8 @@ export default async function publicCitasRoutes(app) {
             additionalProperties: true,
           },
           400: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
           409: errorResponseSchema,
           500: errorResponseSchema,
         },
@@ -1096,104 +1110,17 @@ export default async function publicCitasRoutes(app) {
       }
 
       const idGrupoCita = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+      const releaseToken = String(request.body?.release_token || "").trim();
       const dbClient = await app.db.connect();
       try {
-        await dbClient.query("BEGIN");
         await expireStaleAppointmentReservations(dbClient, { logger: request.log });
-
-        const groupResult = await dbClient.query(
-          `
-            SELECT id_grupo_cita, estado_grupo_codigo
-            FROM public.citas_grupos
-            WHERE id_grupo_cita = $1::uuid
-            FOR UPDATE
-          `,
-          [idGrupoCita]
-        );
-        const group = groupResult.rows[0] || null;
-        if (!group) {
-          await dbClient.query("COMMIT");
-          return sendOk(reply, {
-            id_grupo_cita: idGrupoCita,
-            released: true,
-            estado_grupo_codigo: null,
-            citas_liberadas: 0,
-          });
-        }
-
-        const blockingStatesResult = await dbClient.query(
-          `
-            SELECT count(*)::int AS total
-            FROM public.citas
-            WHERE id_grupo_cita = $1::uuid
-              AND estado_cita_codigo IN ('confirmada', 'en_salon', 'en_atencion', 'completada', 'no_show')
-          `,
-          [idGrupoCita]
-        );
-        const blockingAppointments = Number(blockingStatesResult.rows?.[0]?.total || 0);
-        if (blockingAppointments > 0) {
-          await dbClient.query("ROLLBACK");
-          return sendError(reply, 409, "No se puede cancelar porque el grupo ya tiene citas confirmadas o en proceso.", {
-            code: "PUBLIC_CITAS_HOLD_RELEASE_NOT_ALLOWED",
-            requestId: request.id,
-          });
-        }
-
-        const citasResult = await dbClient.query(
-          `
-            UPDATE public.citas
-            SET estado_cita_codigo = 'cancelada',
-                updated_at = now()
-            WHERE id_grupo_cita = $1::uuid
-              AND estado_cita_codigo IN ('en_espera', 'pendiente_pago')
-            RETURNING id_cita
-          `,
-          [idGrupoCita]
-        );
-        const citaIds = Array.isArray(citasResult.rows)
-          ? citasResult.rows.map((row) => row.id_cita).filter(Boolean)
-          : [];
-
-        if (citaIds.length > 0) {
-          await dbClient.query(
-            `
-              UPDATE public.citas_holds
-              SET estado_hold_codigo = 'cancelado',
-                  updated_at = now()
-              WHERE id_cita = ANY($1::uuid[])
-                AND estado_hold_codigo = 'activo'
-            `,
-            [citaIds]
-          );
-        }
-
-        const nextGroupState = ["cancelada", "confirmada", "completada"].includes(String(group.estado_grupo_codigo || "").trim())
-          ? String(group.estado_grupo_codigo || "cancelada").trim()
-          : "cancelada";
-
-        await dbClient.query(
-          `
-            UPDATE public.citas_grupos
-            SET estado_grupo_codigo = $2::text,
-                updated_at = now()
-            WHERE id_grupo_cita = $1::uuid
-          `,
-          [idGrupoCita, nextGroupState]
-        );
-
-        await dbClient.query("COMMIT");
-        return sendOk(reply, {
-          id_grupo_cita: idGrupoCita,
-          released: true,
-          estado_grupo_codigo: nextGroupState,
-          citas_liberadas: citaIds.length,
+        const releaseResult = await releaseAppointmentHoldGroup(dbClient, {
+          groupId: idGrupoCita,
+          mode: "public",
+          releaseToken,
         });
+        return sendOk(reply, releaseResult);
       } catch (error) {
-        try {
-          await dbClient.query("ROLLBACK");
-        } catch {
-          // no-op
-        }
         return sendHandled(reply, request, error, "No se pudo liberar el hold publico", "PUBLIC_CITAS_HOLD_RELEASE_ERROR");
       } finally {
         dbClient.release();
