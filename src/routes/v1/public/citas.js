@@ -8,7 +8,10 @@ import {
   parseSinglePackageId,
   parseDateTime,
 } from "../../../services/agendaService.js";
-import { crearReservaHoldBaseNormalizada } from "../../../services/agendamientoReservaService.js";
+import {
+  crearReservaHoldBaseNormalizada,
+  findActiveAccountByEmail,
+} from "../../../services/agendamientoReservaService.js";
 import { releaseAppointmentHoldGroup } from "../../../services/appointmentHoldReleaseService.js";
 
 const requestIdSchema = { type: "string" };
@@ -141,13 +144,51 @@ const PUBLIC_CITAS_SAFE_DETAIL_KEYS = new Set([
   "email",
   "rol_integrante_codigo",
   "orden_integrante",
+  "code",
+  "message",
+  "conflicts",
 ]);
+
+const PUBLIC_CITAS_SAFE_CONFLICT_KEYS = new Set([
+  "blockIndex",
+  "field",
+  "alias",
+  "email",
+  "rol_integrante_codigo",
+  "code",
+  "message",
+]);
+
+function sanitizePublicCitasConflict(rawConflict) {
+  if (!rawConflict || typeof rawConflict !== "object" || Array.isArray(rawConflict)) return null;
+  const safeConflict = {};
+  for (const [key, value] of Object.entries(rawConflict)) {
+    if (!PUBLIC_CITAS_SAFE_CONFLICT_KEYS.has(key)) continue;
+    if (key === "blockIndex") {
+      const parsed = Number(value);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeConflict[key] = parsed;
+      continue;
+    }
+    if (value == null) continue;
+    safeConflict[key] = String(value).trim().slice(0, key === "message" ? 220 : 160);
+  }
+  return Object.keys(safeConflict).length ? safeConflict : null;
+}
 
 function sanitizePublicCitasErrorDetails(rawDetails) {
   if (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails)) return undefined;
   const safeDetails = {};
   for (const [key, value] of Object.entries(rawDetails)) {
     if (!PUBLIC_CITAS_SAFE_DETAIL_KEYS.has(key)) continue;
+    if (key === "conflicts") {
+      if (!Array.isArray(value)) continue;
+      const conflicts = value
+        .map((item) => sanitizePublicCitasConflict(item))
+        .filter(Boolean)
+        .slice(0, 20);
+      if (conflicts.length) safeDetails[key] = conflicts;
+      continue;
+    }
     if (key === "blockIndex" || key === "maxCompanions" || key === "maxPromotions" || key === "orden_integrante") {
       const parsed = Number(value);
       if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeDetails[key] = parsed;
@@ -157,6 +198,106 @@ function sanitizePublicCitasErrorDetails(rawDetails) {
     safeDetails[key] = String(value).trim().slice(0, 160);
   }
   return Object.keys(safeDetails).length ? safeDetails : undefined;
+}
+
+function buildEmailActiveUserDetails({
+  email,
+  field = "titular.email",
+  blockIndex = 0,
+  alias = "Titular",
+  rolIntegranteCodigo = "titular",
+  ordenIntegrante = 1,
+} = {}) {
+  return {
+    field,
+    blockIndex,
+    alias,
+    email,
+    rol_integrante_codigo: rolIntegranteCodigo,
+    orden_integrante: ordenIntegrante,
+  };
+}
+
+function normalizeContactAlias(value, fallback) {
+  const normalized = String(value || "").trim().replace(/\s+/g, " ").slice(0, 80);
+  return normalized || fallback;
+}
+
+function normalizeContactValidationPayload(rawContact, fallbackIndex) {
+  const rawIndex = Number(rawContact?.blockIndex);
+  const blockIndex = Number.isInteger(rawIndex) && rawIndex >= 0
+    ? Math.min(rawIndex, 20)
+    : fallbackIndex;
+  const rolIntegranteCodigo = blockIndex === 0 ? "titular" : "acompanante";
+  const aliasFallback = blockIndex === 0 ? "Titular" : `Acompanante ${blockIndex}`;
+
+  return {
+    blockIndex,
+    rol_integrante_codigo: rolIntegranteCodigo,
+    alias: normalizeContactAlias(rawContact?.alias, aliasFallback),
+    email: normalizeEmail(rawContact?.email),
+  };
+}
+
+function buildContactEmailConflict(contact, code, message) {
+  return {
+    blockIndex: contact.blockIndex,
+    field: "contactEmail",
+    alias: contact.alias,
+    email: contact.email,
+    rol_integrante_codigo: contact.rol_integrante_codigo,
+    code,
+    message,
+  };
+}
+
+function buildActiveContactEmailMessage(contact) {
+  if (contact.rol_integrante_codigo === "titular") {
+    return "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.";
+  }
+  return `El correo de ${contact.alias} pertenece a una cuenta activa. Ese acompanante debe iniciar sesion o usar otro correo.`;
+}
+
+async function findContactEmailConflicts(client, contacts) {
+  const conflicts = [];
+  for (const contact of contacts) {
+    if (!contact.email) {
+      if (contact.rol_integrante_codigo === "titular") {
+        conflicts.push(buildContactEmailConflict(
+          contact,
+          "PUBLIC_CITAS_CONTACT_EMAIL_REQUIRED",
+          "Ingresa el correo del titular."
+        ));
+      }
+      continue;
+    }
+
+    if (!EMAIL_PATTERN.test(contact.email)) {
+      const message = contact.rol_integrante_codigo === "titular"
+        ? "Ingresa un correo valido del titular."
+        : `El correo de ${contact.alias} debe ser valido.`;
+      conflicts.push(buildContactEmailConflict(contact, "PUBLIC_CITAS_CONTACT_EMAIL_INVALID", message));
+      continue;
+    }
+
+    const activeAccount = await findActiveAccountByEmail(client, contact.email);
+    if (!activeAccount) continue;
+    conflicts.push(buildContactEmailConflict(
+      contact,
+      "EMAIL_BELONGS_TO_ACTIVE_USER",
+      buildActiveContactEmailMessage(contact)
+    ));
+  }
+  return conflicts;
+}
+
+async function ensureEmailDoesNotBelongActiveAccount(client, correo) {
+  const activeAccount = await findActiveAccountByEmail(client, correo);
+  if (!activeAccount) return;
+  throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
+    code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+    details: buildEmailActiveUserDetails({ email: correo }),
+  });
 }
 
 function sendHandled(reply, request, error, message, code) {
@@ -175,6 +316,7 @@ function sendHandled(reply, request, error, message, code) {
       code: error.code,
       ...(safeDetails ? { details: safeDetails } : {}),
       requestId: request.id,
+      exposeDetails: Boolean(safeDetails),
     });
   }
 
@@ -566,61 +708,7 @@ function normalizeBlocksPayload(body, titularPayload) {
 async function resolveOrCreatePublicClient(client, payload) {
   const { nombre, nombres, apellidos, telefono, email, idSucursal } = payload;
 
-  const ensureEmailDoesNotBelongActiveUser = async (correo) => {
-    const existingActiveUserByEmailResult = await client.query(
-      `
-        SELECT u.id_usuario
-        FROM public.usuarios u
-        JOIN public.personas p
-          ON p.id_persona = u.id_persona
-         AND p.deleted_at IS NULL
-        JOIN public.correos co
-          ON co.id_persona = p.id_persona
-         AND co.deleted_at IS NULL
-        WHERE u.deleted_at IS NULL
-          AND COALESCE(u.estado, TRUE) IS TRUE
-          AND lower(co.direccion_correo::text) = lower($1)
-        ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-        LIMIT 1
-      `,
-      [correo]
-    );
-
-    if (existingActiveUserByEmailResult.rows[0]) {
-      throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-        code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-        details: { field: "titular.email", email: correo },
-      });
-    }
-
-    const existingUserClientResult = await client.query(
-      `
-        SELECT c.id_cliente, c.id_persona
-        FROM public.clientes c
-        JOIN public.personas p
-          ON p.id_persona = c.id_persona
-         AND p.deleted_at IS NULL
-        JOIN public.correos co
-          ON co.id_persona = p.id_persona
-         AND co.deleted_at IS NULL
-        WHERE c.deleted_at IS NULL
-          AND c.estado IS TRUE
-          AND lower(co.direccion_correo::text) = lower($1)
-        ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-        LIMIT 1
-      `,
-      [correo]
-    );
-
-    if (existingUserClientResult.rows[0]) {
-      throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-        code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-        details: { field: "titular.email", email: correo },
-      });
-    }
-  };
-
-  await ensureEmailDoesNotBelongActiveUser(email);
+  await ensureEmailDoesNotBelongActiveAccount(client, email);
 
   const existingPersonaResult = await client.query(
     `
@@ -742,6 +830,86 @@ export default async function publicCitasRoutes(app) {
   );
 
   app.post(
+    "/validar-contactos",
+    {
+      schema: {
+        body: {
+          type: "object",
+          required: ["contactos"],
+          properties: {
+            contactos: {
+              type: "array",
+              minItems: 1,
+              maxItems: 20,
+              items: {
+                type: "object",
+                required: ["blockIndex", "rol_integrante_codigo", "alias"],
+                properties: {
+                  blockIndex: { type: "integer", minimum: 0, maximum: 20 },
+                  rol_integrante_codigo: { type: "string", enum: ["titular", "acompanante"] },
+                  alias: { type: "string", minLength: 1, maxLength: 80 },
+                  email: { anyOf: [{ type: "string", maxLength: 160 }, { type: "null" }] },
+                },
+                additionalProperties: false,
+              },
+            },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  valid: { type: "boolean" },
+                  checked: { type: "integer" },
+                },
+                required: ["valid", "checked"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const db = app.db;
+      if (!db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      try {
+        const rawContacts = Array.isArray(request.body?.contactos) ? request.body.contactos : [];
+        const contactos = rawContacts.map((contacto, index) => normalizeContactValidationPayload(contacto, index));
+        const conflicts = await findContactEmailConflicts(db, contactos);
+        if (conflicts.length > 0) {
+          throw new AppError(409, "Hay correos que deben corregirse antes de continuar.", {
+            code: "PUBLIC_CITAS_CONTACT_EMAIL_CONFLICT",
+            details: { conflicts },
+          });
+        }
+
+        return sendOk(reply, {
+          valid: true,
+          checked: contactos.filter((contacto) => contacto.email).length,
+        });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudieron validar los contactos publicos", "PUBLIC_CITAS_CONTACT_VALIDATE_ERROR");
+      }
+    }
+  );
+
+  app.post(
     "/validar-titular",
     {
       schema: {
@@ -773,55 +941,7 @@ export default async function publicCitasRoutes(app) {
         const titularPayload = validateClientPayload(request.body?.titular);
         const email = titularPayload.email;
 
-        const activeUserByEmailResult = await db.query(
-          `
-            SELECT u.id_usuario
-            FROM public.usuarios u
-            JOIN public.personas p
-              ON p.id_persona = u.id_persona
-             AND p.deleted_at IS NULL
-            JOIN public.correos co
-              ON co.id_persona = p.id_persona
-             AND co.deleted_at IS NULL
-            WHERE u.deleted_at IS NULL
-              AND COALESCE(u.estado, TRUE) IS TRUE
-              AND lower(co.direccion_correo::text) = lower($1)
-            ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-            LIMIT 1
-          `,
-          [email]
-        );
-        if (activeUserByEmailResult.rows[0]) {
-          throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-            code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-            details: { field: "titular.email", email },
-          });
-        }
-
-        const activeClientByEmailResult = await db.query(
-          `
-            SELECT c.id_cliente
-            FROM public.clientes c
-            JOIN public.personas p
-              ON p.id_persona = c.id_persona
-             AND p.deleted_at IS NULL
-            JOIN public.correos co
-              ON co.id_persona = p.id_persona
-             AND co.deleted_at IS NULL
-            WHERE c.deleted_at IS NULL
-              AND c.estado IS TRUE
-              AND lower(co.direccion_correo::text) = lower($1)
-            ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-            LIMIT 1
-          `,
-          [email]
-        );
-        if (activeClientByEmailResult.rows[0]) {
-          throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-            code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-            details: { field: "titular.email", email },
-          });
-        }
+        await ensureEmailDoesNotBelongActiveAccount(db, email);
 
         return sendOk(reply, {
           valid: true,
