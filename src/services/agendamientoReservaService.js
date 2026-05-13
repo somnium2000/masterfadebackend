@@ -196,10 +196,10 @@ function forceIsvZeroIfDisabled({
   };
 }
 
-async function findActiveUserByEmail(client, email) {
+export async function findActiveAccountByEmail(client, email) {
   const safeEmail = normalizeEmail(email);
   if (!safeEmail) return null;
-  const { rows } = await client.query(
+  const activeUserResult = await client.query(
     `
       SELECT u.id_usuario
       FROM public.usuarios u
@@ -217,7 +217,39 @@ async function findActiveUserByEmail(client, email) {
     `,
     [safeEmail]
   );
-  return rows[0] || null;
+  if (activeUserResult.rows[0]) {
+    return {
+      account_type: "usuario",
+      id_usuario: activeUserResult.rows[0].id_usuario,
+    };
+  }
+
+  const activeClientResult = await client.query(
+    `
+      SELECT c.id_cliente, c.id_persona
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+       AND p.deleted_at IS NULL
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE c.deleted_at IS NULL
+        AND c.estado IS TRUE
+        AND lower(co.direccion_correo::text) = lower($1)
+      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+      LIMIT 1
+    `,
+    [safeEmail]
+  );
+  if (activeClientResult.rows[0]) {
+    return {
+      account_type: "cliente",
+      id_cliente: activeClientResult.rows[0].id_cliente,
+      id_persona: activeClientResult.rows[0].id_persona,
+    };
+  }
+  return null;
 }
 
 function buildNormalizedMembers({ integrantes, titular, actor }) {
@@ -284,8 +316,8 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
   for (const member of members) {
     if (member.tipo_cliente_codigo !== "invitado") continue;
     if (!member.contacto_email_snapshot) continue;
-    const active = await findActiveUserByEmail(client, member.contacto_email_snapshot);
-    if (!active?.id_usuario) continue;
+    const active = await findActiveAccountByEmail(client, member.contacto_email_snapshot);
+    if (!active) continue;
     if (actorUsuario && actorUsuario === active.id_usuario) continue;
 
     if (logger?.warn) {
@@ -293,7 +325,7 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
         {
           code: "EMAIL_BELONGS_TO_ACTIVE_USER",
           blockIndex: member.index,
-          field: member.isTitular ? "titular.email" : "email",
+          field: member.isTitular ? "titular.email" : "contacto.email",
         },
         "Intento de reserva con correo perteneciente a usuario activo."
       );
@@ -301,11 +333,11 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
     throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
       code: "EMAIL_BELONGS_TO_ACTIVE_USER",
       details: {
-        field: member.isTitular ? "titular.email" : "email",
+        field: member.isTitular ? "titular.email" : "contacto.email",
         blockIndex: member.index,
         email: member.contacto_email_snapshot,
         rol_integrante_codigo: member.isTitular ? "titular" : "acompanante",
-        orden_integrante: Number(member.index) + 1,
+        orden_integrante: Number(member.orden_integrante || member.index + 1),
         alias: member.alias_integrante || null,
       },
     });

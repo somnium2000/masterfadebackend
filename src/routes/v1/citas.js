@@ -116,12 +116,39 @@ const citaDetalleItemSchema = {
   additionalProperties: false,
 };
 
+const CITAS_SAFE_DETAIL_KEYS = new Set([
+  "field",
+  "blockIndex",
+  "alias",
+  "email",
+  "rol_integrante_codigo",
+  "orden_integrante",
+]);
+
+function sanitizeCitasErrorDetails(rawDetails) {
+  if (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails)) return undefined;
+  const safeDetails = {};
+  for (const [key, value] of Object.entries(rawDetails)) {
+    if (!CITAS_SAFE_DETAIL_KEYS.has(key)) continue;
+    if (key === "blockIndex" || key === "orden_integrante") {
+      const parsed = Number(value);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeDetails[key] = parsed;
+      continue;
+    }
+    if (value == null) continue;
+    safeDetails[key] = String(value).trim().slice(0, 160);
+  }
+  return Object.keys(safeDetails).length ? safeDetails : undefined;
+}
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
+    const safeDetails = sanitizeCitasErrorDetails(error.details);
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
-      details: error.details,
+      ...(safeDetails ? { details: safeDetails } : {}),
       requestId: request.id,
+      exposeDetails: Boolean(safeDetails),
     });
   }
 
