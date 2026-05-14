@@ -1,6 +1,10 @@
 import { AppError } from "../utils/errors.js";
 import { MockPaymentProvider } from "./payments/MockPaymentProvider.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
+import {
+  assertPaymentProviderConfig,
+  normalizePaymentProviderCode,
+} from "./payments/paymentRuntimeGuard.js";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -46,20 +50,268 @@ export const SLOT_DISCARD_REASONS = {
   CROSS_BLOCK_BOUNDARY: "CROSS_BLOCK_BOUNDARY",
   RESOURCE_UNAVAILABLE: "RESOURCE_UNAVAILABLE",
 };
+export const AGENDAMIENTO_ISV_ALLOWED_MODES = ["no_aplica"];
+export const AGENDAMIENTO_CONFIG_DEFAULTS = {
+  maxAcompanantes: 4,
+  holdTtlMinutos: 5,
+  isvHabilitado: false,
+  isvPorcentajeDefault: 0,
+  isvModo: "no_aplica",
+  permitirSeleccionMixta: true,
+  maxPromocionesPorReserva: 5,
+  comprobanteEmailHabilitado: true,
+  validarPromocionesBackend: true,
+  validarPromocionesFrontend: true,
+  facturacionCaiHabilitada: false,
+  facturacionCaiIntegracionSarHabilitada: false,
+  emitirFacturaFiscal: false,
+};
+const AGENDAMIENTO_CONFIG_PARAMETER_KEYS = [
+  "agendamiento_max_acompanantes",
+  "agendamiento_hold_ttl_minutos",
+  "agendamiento_isv_habilitado",
+  "agendamiento_isv_porcentaje_default",
+  "agendamiento_isv_modo",
+  "agendamiento_permitir_seleccion_mixta",
+  "agendamiento_max_promociones_por_reserva",
+  "agendamiento_comprobante_email_habilitado",
+  "agendamiento_validar_promociones_backend",
+  "agendamiento_validar_promociones_frontend",
+  "facturacion_cai_habilitada",
+  "facturacion_cai_integracion_sar_habilitada",
+  "facturacion_emitir_factura_fiscal",
+  "hold_duracion_min",
+  "permitir_acompanantes",
+];
+
+function resolveAgendamientoRawValue(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  if (entry.valor_booleano !== null && entry.valor_booleano !== undefined) return entry.valor_booleano;
+  if (entry.valor_numero !== null && entry.valor_numero !== undefined) return entry.valor_numero;
+  if (entry.valor_texto !== null && entry.valor_texto !== undefined) return entry.valor_texto;
+  return null;
+}
+function parseConfigBoolean(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "si", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  return null;
+}
+
+function parseConfigInt(value) {
+  if (value == null || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.trunc(parsed);
+}
+
+function parseConfigDecimal(value) {
+  if (value == null || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return parsed;
+}
+
+function parseConfigText(value) {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
+function logAgendamientoConfigWarning(logger, details, message) {
+  if (!logger?.warn) return;
+  logger.warn(details, message);
+}
+
+export async function getAgendamientoConfig(clientOrPool, { logger = null } = {}) {
+  const defaults = { ...AGENDAMIENTO_CONFIG_DEFAULTS };
+  if (!clientOrPool || typeof clientOrPool.query !== "function") {
+    logAgendamientoConfigWarning(logger, { code: "AGENDA_CONFIG_SOURCE_UNAVAILABLE" }, "No hay cliente SQL disponible para leer parametros_sistema");
+    return defaults;
+  }
+
+  try {
+    const { rows } = await clientOrPool.query(
+      `
+        SELECT clave, valor_texto, valor_numero, valor_booleano
+        FROM public.parametros_sistema
+        WHERE clave = ANY($1::text[])
+      `,
+      [AGENDAMIENTO_CONFIG_PARAMETER_KEYS]
+    );
+
+    const valuesByKey = {};
+    for (const row of rows) {
+      valuesByKey[row.clave] = {
+        valor_texto: row.valor_texto ?? null,
+        valor_numero: row.valor_numero ?? null,
+        valor_booleano: row.valor_booleano ?? null,
+      };
+    }
+
+    const config = { ...defaults };
+    const newMaxCompanionsRaw = resolveAgendamientoRawValue(valuesByKey.agendamiento_max_acompanantes);
+    const newMaxCompanions = parseConfigInt(newMaxCompanionsRaw);
+    if (newMaxCompanions != null && newMaxCompanions >= 0 && newMaxCompanions <= 20) {
+      config.maxAcompanantes = newMaxCompanions;
+    } else if (newMaxCompanionsRaw != null) {
+      logAgendamientoConfigWarning(
+        logger,
+        { clave: "agendamiento_max_acompanantes", value: newMaxCompanionsRaw, fallback: defaults.maxAcompanantes },
+        "Parametro de agendamiento invalido: se aplico fallback seguro"
+      );
+    } else {
+      const legacyAllowCompanionsRaw = resolveAgendamientoRawValue(valuesByKey.permitir_acompanantes);
+      const legacyAllowCompanions = parseConfigBoolean(legacyAllowCompanionsRaw);
+      if (legacyAllowCompanions != null) {
+        config.maxAcompanantes = legacyAllowCompanions ? defaults.maxAcompanantes : 0;
+      }
+    }
+
+    const newHoldTtlRaw = resolveAgendamientoRawValue(valuesByKey.agendamiento_hold_ttl_minutos);
+    const newHoldTtl = parseConfigInt(newHoldTtlRaw);
+    if (newHoldTtl != null && newHoldTtl >= 1 && newHoldTtl <= 120) {
+      config.holdTtlMinutos = newHoldTtl;
+    } else if (newHoldTtlRaw != null) {
+      logAgendamientoConfigWarning(
+        logger,
+        { clave: "agendamiento_hold_ttl_minutos", value: newHoldTtlRaw, fallback: defaults.holdTtlMinutos },
+        "Parametro de agendamiento invalido: se aplico fallback seguro"
+      );
+    } else {
+      const legacyHoldRaw = resolveAgendamientoRawValue(valuesByKey.hold_duracion_min);
+      const legacyHold = parseConfigInt(legacyHoldRaw);
+      if (legacyHold != null && legacyHold >= 1 && legacyHold <= 120) {
+        config.holdTtlMinutos = legacyHold;
+      }
+    }
+
+    const isvHabilitadoRaw = resolveAgendamientoRawValue(valuesByKey.agendamiento_isv_habilitado);
+    const isvHabilitado = parseConfigBoolean(isvHabilitadoRaw);
+    if (isvHabilitado != null) {
+      config.isvHabilitado = isvHabilitado;
+    } else if (isvHabilitadoRaw != null) {
+      logAgendamientoConfigWarning(
+        logger,
+        { clave: "agendamiento_isv_habilitado", value: isvHabilitadoRaw, fallback: defaults.isvHabilitado },
+        "Parametro de agendamiento invalido: se aplico fallback seguro"
+      );
+    }
+
+    if (config.isvHabilitado) {
+      const isvPercentRaw = resolveAgendamientoRawValue(valuesByKey.agendamiento_isv_porcentaje_default);
+      const isvPercent = parseConfigDecimal(isvPercentRaw);
+      if (isvPercent != null && isvPercent >= 0 && isvPercent <= 100) {
+        config.isvPorcentajeDefault = isvPercent;
+      } else if (isvPercentRaw != null) {
+        logAgendamientoConfigWarning(
+          logger,
+          { clave: "agendamiento_isv_porcentaje_default", value: isvPercentRaw, fallback: defaults.isvPorcentajeDefault },
+          "Parametro de agendamiento invalido: se aplico fallback seguro"
+        );
+      }
+
+      const isvModeRaw = resolveAgendamientoRawValue(valuesByKey.agendamiento_isv_modo);
+      const isvMode = parseConfigText(isvModeRaw)?.toLowerCase();
+      if (isvMode && AGENDAMIENTO_ISV_ALLOWED_MODES.includes(isvMode)) {
+        config.isvModo = isvMode;
+      } else if (isvModeRaw != null) {
+        logAgendamientoConfigWarning(
+          logger,
+          { clave: "agendamiento_isv_modo", value: isvModeRaw, fallback: defaults.isvModo },
+          "Parametro de agendamiento invalido: se aplico fallback seguro"
+        );
+      }
+    } else {
+      config.isvPorcentajeDefault = 0;
+      config.isvModo = "no_aplica";
+    }
+
+    const boolMappings = [
+      ["agendamiento_permitir_seleccion_mixta", "permitirSeleccionMixta"],
+      ["agendamiento_comprobante_email_habilitado", "comprobanteEmailHabilitado"],
+      ["agendamiento_validar_promociones_backend", "validarPromocionesBackend"],
+      ["agendamiento_validar_promociones_frontend", "validarPromocionesFrontend"],
+      ["facturacion_cai_habilitada", "facturacionCaiHabilitada"],
+      ["facturacion_cai_integracion_sar_habilitada", "facturacionCaiIntegracionSarHabilitada"],
+      ["facturacion_emitir_factura_fiscal", "emitirFacturaFiscal"],
+    ];
+
+    for (const [key, target] of boolMappings) {
+      const rawValue = resolveAgendamientoRawValue(valuesByKey[key]);
+      const parsed = parseConfigBoolean(rawValue);
+      if (parsed != null) {
+        config[target] = parsed;
+      } else if (rawValue != null) {
+        logAgendamientoConfigWarning(
+          logger,
+          { clave: key, value: rawValue, fallback: defaults[target] },
+          "Parametro de agendamiento invalido: se aplico fallback seguro"
+        );
+      }
+    }
+
+    const maxPromotionsRaw = resolveAgendamientoRawValue(valuesByKey.agendamiento_max_promociones_por_reserva);
+    const maxPromotions = parseConfigInt(maxPromotionsRaw);
+    if (maxPromotions != null && maxPromotions >= 0 && maxPromotions <= 20) {
+      config.maxPromocionesPorReserva = maxPromotions;
+    } else if (maxPromotionsRaw != null) {
+      logAgendamientoConfigWarning(
+        logger,
+        {
+          clave: "agendamiento_max_promociones_por_reserva",
+          value: maxPromotionsRaw,
+          fallback: defaults.maxPromocionesPorReserva,
+        },
+        "Parametro de agendamiento invalido: se aplico fallback seguro"
+      );
+    }
+
+    return config;
+  } catch (error) {
+    if (logger?.error) {
+      logger.error(
+        { err: error, code: "AGENDA_CONFIG_LOAD_ERROR" },
+        "Fallo al leer configuracion de agendamiento desde parametros_sistema"
+      );
+    }
+    return defaults;
+  }
+}
 
 function createProviderAdapterByCode(providerCode) {
-  const normalized = String(providerCode || "").trim().toLowerCase();
+  const normalized = normalizePaymentProviderCode(providerCode);
   if (!normalized) return null;
 
   if (normalized === "mock") {
+    try {
+      assertPaymentProviderConfig({ ...process.env, PAYMENT_PROVIDER: "mock" });
+    } catch {
+      return null;
+    }
     return new MockPaymentProvider({
       mockResult: String(process.env.MOCK_PAYMENT_RESULT || "PAID"),
     });
   }
 
-  const envProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
+  if (normalized === "simulator") {
+    try {
+      return PaymentProviderFactory.create({ providerCode: normalized });
+    } catch {
+      return null;
+    }
+  }
+
+  const envProvider = normalizePaymentProviderCode(process.env.PAYMENT_PROVIDER);
   if (normalized === envProvider) {
-    return PaymentProviderFactory.create();
+    return PaymentProviderFactory.create({ providerCode: normalized });
   }
 
   return null;
@@ -179,7 +431,7 @@ export function parseSinglePackageId(rawValue, { required = false, field = "id_p
   }
 
   if (uniqueValues.length > 1) {
-    throw new AppError(400, "Solo puedes seleccionar un paquete por cita", {
+    throw new AppError(400, "Solo se permite un paquete por cita.", {
       code: "ONLY_ONE_PACKAGE_ALLOWED",
       details: { field },
     });
@@ -532,19 +784,8 @@ function isFullDayInterval(start, end) {
 }
 
 export async function getHoldDurationMinutes(client) {
-  const { rows } = await client.query(
-    `
-      SELECT COALESCE(valor_numero, 5)::int AS hold_duracion_min
-      FROM public.parametros_sistema
-      WHERE clave = 'hold_duracion_min'
-      LIMIT 1
-    `
-  );
-  const rawValue = Number(rows[0]?.hold_duracion_min ?? 5);
-  if (!Number.isFinite(rawValue)) return 5;
-  const normalized = Math.trunc(rawValue);
-  if (normalized < 1 || normalized > 120) return 5;
-  return normalized;
+  const config = await getAgendamientoConfig(client);
+  return Number(config.holdTtlMinutos ?? AGENDAMIENTO_CONFIG_DEFAULTS.holdTtlMinutos);
 }
 
 export async function getGlobalBufferMinutes(client) {
@@ -903,6 +1144,130 @@ function normalizeBookingSelectionType(rawValue, { required = false } = {}) {
   return normalized;
 }
 
+function roundMoney(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.round((parsed + Number.EPSILON) * 100) / 100;
+}
+
+function findDuplicateIds(values) {
+  const duplicates = new Set();
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const safeValue = String(value || "").trim();
+    if (!safeValue) continue;
+    if (seen.has(safeValue)) {
+      duplicates.add(safeValue);
+      continue;
+    }
+    seen.add(safeValue);
+  }
+  return Array.from(duplicates);
+}
+
+function buildChargeableDetail(item, originCode) {
+  const unitPrice = roundMoney(item?.precio_hnl);
+  return {
+    id_servicio: item?.id_servicio ?? null,
+    origen_item_codigo: originCode,
+    nombre_servicio_snapshot: item?.nombre_servicio ?? null,
+    duracion_min: Number(item?.duracion_min ?? 0),
+    buffer_min: Number(item?.buffer_min ?? 0),
+    precio_referencia_hnl: unitPrice,
+    precio_unitario_hnl: unitPrice,
+    subtotal_hnl: unitPrice,
+    descuento_hnl: 0,
+    isv_porcentaje: 0,
+    isv_hnl: 0,
+    total_linea_hnl: unitPrice,
+  };
+}
+
+function buildIncludedPackageDetail(item) {
+  const refPrice = roundMoney(item?.precio_hnl);
+  return {
+    id_servicio: item?.id_servicio ?? null,
+    origen_item_codigo: "paquete_incluido",
+    nombre_servicio_snapshot: item?.nombre_servicio ?? null,
+    duracion_min: Number(item?.duracion_min ?? 0),
+    buffer_min: Number(item?.buffer_min ?? 0),
+    precio_referencia_hnl: refPrice,
+    precio_unitario_hnl: 0,
+    subtotal_hnl: 0,
+    descuento_hnl: 0,
+    isv_porcentaje: 0,
+    isv_hnl: 0,
+    total_linea_hnl: 0,
+  };
+}
+
+function uniqueIdsFromItems(items) {
+  return Array.from(new Set(
+    (Array.isArray(items) ? items : [])
+      .map((item) => String(item?.id_servicio || "").trim())
+      .filter(Boolean)
+  ));
+}
+
+function buildPackageSnapshot(serviceSelection) {
+  const packageInfo = serviceSelection?.paquete || null;
+  if (!packageInfo) return null;
+  const packageTotal = roundMoney(packageInfo?.precio_hnl ?? serviceSelection?.monto_total_hnl ?? 0);
+  return {
+    id_paquete: packageInfo.id_paquete ?? null,
+    id_paquete_sucursal: packageInfo.id_paquete_sucursal ?? null,
+    nombre_paquete_snapshot: packageInfo.nombre_paquete ?? null,
+    descripcion_paquete_snapshot: packageInfo.descripcion ?? null,
+    duracion_total_min: Number(serviceSelection?.duracion_total_min ?? 0),
+    precio_lista_hnl: packageTotal,
+    descuento_hnl: 0,
+    isv_porcentaje: 0,
+    isv_hnl: 0,
+    total_hnl: packageTotal,
+  };
+}
+
+function buildNormalizedSelection({
+  selectionType,
+  packageSelection = null,
+  manualItems = [],
+  includedItems = [],
+  extraItems = [],
+}) {
+  const safeManualItems = Array.isArray(manualItems) ? manualItems : [];
+  const safeIncludedItems = Array.isArray(includedItems) ? includedItems : [];
+  const safeExtraItems = Array.isArray(extraItems) ? extraItems : [];
+
+  const manualDetails = safeManualItems.map((item) => buildChargeableDetail(item, "servicio_manual"));
+  const includedDetails = safeIncludedItems.map((item) => buildIncludedPackageDetail(item));
+  const extraDetails = safeExtraItems.map((item) => buildChargeableDetail(item, "servicio_extra"));
+  const details = [...manualDetails, ...includedDetails, ...extraDetails];
+
+  const packageSnapshot = buildPackageSnapshot(packageSelection);
+  const packageTotal = roundMoney(packageSnapshot?.total_hnl ?? 0);
+  const chargeableLinesTotal = roundMoney(
+    [...manualDetails, ...extraDetails].reduce((sum, detail) => sum + Number(detail.total_linea_hnl || 0), 0)
+  );
+  const subtotal = roundMoney(packageTotal + chargeableLinesTotal);
+
+  return {
+    selection_type: selectionType,
+    paquete: packageSnapshot,
+    detalles: details,
+    serviciosIncluidosIds: uniqueIdsFromItems(safeIncludedItems),
+    serviciosExtraIds: uniqueIdsFromItems(safeExtraItems),
+    serviciosCobrablesIds: uniqueIdsFromItems([...safeManualItems, ...safeExtraItems]),
+    duracion_total_min: Number(
+      [...safeManualItems, ...safeIncludedItems, ...safeExtraItems]
+        .reduce((sum, item) => sum + Number(item?.duracion_min ?? 0), 0)
+    ),
+    subtotal_hnl: subtotal,
+    descuento_hnl: 0,
+    isv_hnl: 0,
+    total_hnl: subtotal,
+  };
+}
+
 export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
@@ -1006,6 +1371,7 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
     `
       WITH picked_offer AS (
         SELECT
+          ps.id_paquete_sucursal,
           ps.id_paquete,
           ps.id_sucursal,
           ps.precio_hnl
@@ -1025,6 +1391,7 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
         p.id_paquete,
         p.nombre_paquete,
         p.descripcion,
+        po.id_paquete_sucursal,
         po.precio_hnl
       FROM public.paquetes p
       JOIN picked_offer po
@@ -1038,8 +1405,8 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
 
   const packageRow = packageResult.rows[0];
   if (!packageRow) {
-    throw new AppError(404, "El paquete solicitado no existe o no esta disponible para reserva publica", {
-      code: "AGENDA_PACKAGE_NOT_FOUND",
+    throw new AppError(404, "El paquete seleccionado no esta disponible.", {
+      code: "PACKAGE_NOT_AVAILABLE",
       details: { id_paquete: safePackageId, id_sucursal: safeBranchId },
     });
   }
@@ -1099,6 +1466,7 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
     id_paquete: safePackageId,
     paquete: {
       id_paquete: packageRow.id_paquete,
+      id_paquete_sucursal: packageRow.id_paquete_sucursal ?? null,
       nombre_paquete: packageRow.nombre_paquete,
       descripcion: packageRow.descripcion ?? null,
       precio_hnl: packagePrice,
@@ -1113,26 +1481,82 @@ export async function getBookingSelectionDetails(client, {
   servicios = null,
   id_paquete = null,
   id_barbero = null,
+  agendamientoConfig = null,
+  logger = null,
 } = {}) {
+  const effectiveConfig = agendamientoConfig || await getAgendamientoConfig(client, { logger });
+  const isMixedAllowed = Boolean(effectiveConfig?.permitirSeleccionMixta);
+  const isvWouldBeEnabled = Boolean(
+    effectiveConfig?.isvHabilitado
+    && Number(effectiveConfig?.isvPorcentajeDefault || 0) > 0
+    && String(effectiveConfig?.isvModo || "no_aplica").trim().toLowerCase() !== "no_aplica"
+  );
+  if (isvWouldBeEnabled && logger?.warn) {
+    logger.warn(
+      { code: "BOOKING_SELECTION_ISV_FORCED_ZERO_PHASE2" },
+      "ISV configurado como habilitado, pero en Fase 2 el resolvedor mantiene ISV en cero."
+    );
+  }
   const normalizedSelectionType = normalizeBookingSelectionType(selection_type, { required: true });
+  const parsedServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: false });
+  const rawPackageToken = Array.isArray(id_paquete)
+    ? id_paquete.map((entry) => String(entry || "").trim()).filter(Boolean).join(",")
+    : String(id_paquete || "").trim();
+  const duplicatedServiceIds = findDuplicateIds(parsedServiceIds);
+  if (duplicatedServiceIds.length > 0) {
+    throw new AppError(400, "Hay servicios seleccionados mas de una vez.", {
+      code: "DUPLICATED_SERVICE_SELECTION",
+      details: { field: "servicios", id_servicio: duplicatedServiceIds[0] },
+    });
+  }
+  if (!parsedServiceIds.length && !rawPackageToken) {
+    throw new AppError(400, "Debes seleccionar al menos un servicio o paquete.", {
+      code: "EMPTY_BOOKING_SELECTION",
+      details: { field: "selection" },
+    });
+  }
 
   if (normalizedSelectionType === "package") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    const normalizedSelection = buildNormalizedSelection({
+      selectionType: "package",
+      packageSelection,
+      includedItems: packageSelection.items,
+    });
+    return {
+      ...packageSelection,
+      normalizedSelection,
+    };
   }
 
   if (normalizedSelectionType === "mixed") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
-    const extraServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: true });
-    if (!extraServiceIds.length) {
+    if (!parsedServiceIds.length) {
+      const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+      const normalizedSelection = buildNormalizedSelection({
+        selectionType: "mixed",
+        packageSelection,
+        includedItems: packageSelection.items,
+        extraItems: [],
+      });
       return {
         ...packageSelection,
         selection_type: "mixed",
         servicios_extra: [],
         monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
+        normalizedSelection,
       };
     }
+
+    if (!isMixedAllowed) {
+      throw new AppError(409, "La seleccion mixta no esta disponible en este momento.", {
+        code: "MIXED_SELECTION_NOT_ALLOWED",
+      });
+    }
+
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    const extraServiceIds = parsedServiceIds;
 
     const packageServiceIds = new Set(
       (Array.isArray(packageSelection.items) ? packageSelection.items : [])
@@ -1141,9 +1565,9 @@ export async function getBookingSelectionDetails(client, {
     );
     const conflictingServiceIds = extraServiceIds.filter((idServicio) => packageServiceIds.has(idServicio));
     if (conflictingServiceIds.length > 0) {
-      throw new AppError(409, "Ese servicio ya lo incluye el paquete seleccionado", {
+      throw new AppError(409, "Uno de los servicios seleccionados ya esta incluido en el paquete.", {
         code: "SERVICE_ALREADY_INCLUDED_IN_PACKAGE",
-        details: { field: "servicios" },
+        details: { field: "servicios", id_servicio: conflictingServiceIds[0] },
       });
     }
 
@@ -1155,6 +1579,12 @@ export async function getBookingSelectionDetails(client, {
     const totalDuracion = Number(packageSelection.duracion_total_min || 0) + Number(extraSelection.duracion_total_min || 0);
     const totalMonto = Number(packageSelection.monto_total_hnl || 0) + Number(extraSelection.monto_total_hnl || 0);
     const globalBuffer = Number(extraSelection.buffer_total_min || packageSelection.buffer_total_min || 0);
+    const normalizedSelection = buildNormalizedSelection({
+      selectionType: "mixed",
+      packageSelection,
+      includedItems: packageSelection.items,
+      extraItems: extraSelection.items,
+    });
 
     return {
       ...packageSelection,
@@ -1164,15 +1594,31 @@ export async function getBookingSelectionDetails(client, {
       duracion_total_min: totalDuracion,
       buffer_total_min: mergedItems.length > 0 ? globalBuffer : 0,
       monto_total_hnl: totalMonto,
+      normalizedSelection: {
+        ...normalizedSelection,
+        duracion_total_min: totalDuracion,
+      },
     };
   }
 
-  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero);
+  if (!parsedServiceIds.length) {
+    throw new AppError(400, "Debes seleccionar al menos un servicio o paquete.", {
+      code: "EMPTY_BOOKING_SELECTION",
+      details: { field: "servicios" },
+    });
+  }
+
+  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, parsedServiceIds, id_barbero);
+  const normalizedSelection = buildNormalizedSelection({
+    selectionType: "services",
+    manualItems: servicesSelection.items,
+  });
   return {
     ...servicesSelection,
     selection_type: "services",
     id_paquete: null,
     paquete: null,
+    normalizedSelection,
   };
 }
 
@@ -1855,6 +2301,8 @@ export async function resolveBookingSelection(client, {
   id_barbero = null,
   selection_type = "services",
   id_paquete = null,
+  agendamientoConfig = null,
+  logger = null,
 }) {
   const branch = await ensureActiveBranch(client, id_sucursal);
   const serviceSelection = await getBookingSelectionDetails(client, {
@@ -1863,6 +2311,8 @@ export async function resolveBookingSelection(client, {
     servicios,
     id_paquete,
     id_barbero,
+    agendamientoConfig,
+    logger,
   });
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
   const { dateKey, timeKey } = extractDateAndTimeKeyFromDateTime(fecha_inicio, "fecha_inicio");
@@ -2383,3 +2833,4 @@ export function mapBlockRow(row) {
     nombre_sucursal: row.nombre_sucursal ?? null,
   };
 }
+
