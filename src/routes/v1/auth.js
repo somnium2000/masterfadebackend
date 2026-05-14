@@ -732,15 +732,19 @@ function buildCsrfCookieOptions(app, { remember = false } = {}) {
   };
 }
 
-function issueSessionCookies(app, reply, token, { remember = false } = {}) {
+function issueCsrfCookie(app, reply, { remember = false } = {}) {
   const csrfToken = jwt.sign(
     { type: "csrf", nonce: crypto.randomUUID() },
     app.config?.csrfSecret || process.env.CSRF_SECRET,
     { expiresIn: "12h" }
   );
-
-  reply.setCookie(AUTH_SESSION_COOKIE, token, buildCookieOptions(app, { remember }));
   reply.setCookie(AUTH_CSRF_COOKIE, csrfToken, buildCsrfCookieOptions(app, { remember }));
+  return csrfToken;
+}
+
+function issueSessionCookies(app, reply, token, { remember = false } = {}) {
+  reply.setCookie(AUTH_SESSION_COOKIE, token, buildCookieOptions(app, { remember }));
+  const csrfToken = issueCsrfCookie(app, reply, { remember });
   return csrfToken;
 }
 
@@ -1225,6 +1229,40 @@ export default async function authRoutes(app) {
           details: error instanceof Error ? error.message : "Unknown auth/me error",
         });
       }
+    }
+  );
+
+  app.get(
+    "/csrf",
+    {
+      preHandler: app.authenticate,
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  csrf_token: { type: "string" },
+                },
+                required: ["csrf_token"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const currentToken = String(request.cookies?.[AUTH_CSRF_COOKIE] || "").trim();
+      const csrfToken = currentToken || issueCsrfCookie(app, reply, { remember: false });
+      return sendOk(reply, { csrf_token: csrfToken }, { requestId: request.id });
     }
   );
 

@@ -4,6 +4,14 @@ import { sendOk } from "../../utils/response.js";
 import { assertUuid, expireStaleAppointmentReservations } from "../../services/agendaService.js";
 import { PaymentProviderFactory } from "../../services/payments/PaymentProviderFactory.js";
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
+import {
+  assertPaymentProviderConfig,
+  normalizePaymentProviderCode,
+} from "../../services/payments/paymentRuntimeGuard.js";
+import {
+  confirmarComprobanteAgendamientoParaEnvio,
+  enviarComprobanteAgendamientoNoFiscal,
+} from "../../services/comprobanteAgendamientoEmailService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
@@ -137,7 +145,16 @@ async function ensureProvider(client, providerCode) {
 }
 
 function getProviderAdapter(providerCode) {
-  if (providerCode === "mock") {
+  const normalizedProvider = normalizePaymentProviderCode(providerCode);
+  if (normalizedProvider === "mock") {
+    try {
+      assertPaymentProviderConfig({ ...process.env, PAYMENT_PROVIDER: "mock" });
+    } catch (error) {
+      throw new AppError(500, "Proveedor mock no permitido en este entorno", {
+        code: "PAGOS_PROVIDER_MOCK_FORBIDDEN",
+        cause: error,
+      });
+    }
     return new MockPaymentProvider({
       mockResult: safeText(process.env.MOCK_PAYMENT_RESULT) || "PAID",
     });
@@ -174,6 +191,7 @@ async function loadOwnedAppointment(client, { citaId, clienteId, personaId }) {
     `
       SELECT
         c.id_cita,
+        c.id_grupo_cita,
         c.id_sucursal,
         c.total_pagar_hnl,
         c.moneda_codigo,
@@ -238,6 +256,11 @@ async function expireHoldAndAppointment(client, { idIntent = null, idCita, idHol
 }
 
 export default async function pagosRoutes(app) {
+  app.log?.warn?.(
+    { route: "/v1/pagos", official_booking_route: "/v1/public/pagos" },
+    "Ruta /v1/pagos activa: para agendamiento se recomienda /v1/public/pagos para flujo completo."
+  );
+
   app.post(
     "/crear-intent",
     {
@@ -318,13 +341,18 @@ export default async function pagosRoutes(app) {
         await expireStaleAppointmentReservations(dbClient, { logger: request.log });
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
         const citaId = assertUuid(request.body?.id_cita, "id_cita");
-        const configuredProvider = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+        const configuredProvider = normalizePaymentProviderCode(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER);
+        if (!configuredProvider) {
+          throw new AppError(500, "Proveedor de pago no configurado", {
+            code: "PAGOS_PROVIDER_REQUIRED",
+          });
+        }
         if (app.config?.isProduction && configuredProvider === "mock") {
           throw new AppError(500, "Proveedor de pago no permitido en produccion", {
             code: "PAGOS_PROVIDER_MOCK_FORBIDDEN",
           });
         }
-        const providerAdapter = PaymentProviderFactory.create();
+        const providerAdapter = PaymentProviderFactory.create({ providerCode: configuredProvider });
 
         await dbClient.query("BEGIN");
         const provider = await ensureProvider(dbClient, configuredProvider);
@@ -668,8 +696,11 @@ export default async function pagosRoutes(app) {
               pi.id_cita,
               pi.id_hold,
               pi.monto_hnl,
-              pi.moneda_codigo
+              pi.moneda_codigo,
+              c.id_grupo_cita
             FROM public.payment_intents pi
+            JOIN public.citas c
+              ON c.id_cita = pi.id_cita
             WHERE pi.id_provider = $1::uuid
               AND (
                 ($2::text IS NOT NULL AND pi.referencia_externa = $2::text)
@@ -735,6 +766,7 @@ export default async function pagosRoutes(app) {
         }
 
         let paymentId = null;
+        let paidGroupConfirmation = null;
 
         if (normalizedStatus === "paid") {
           const insertedPayment = await dbClient.query(
@@ -770,6 +802,47 @@ export default async function pagosRoutes(app) {
           );
 
           paymentId = insertedPayment.rows[0]?.id_payment ?? null;
+          await dbClient.query(
+            `
+              UPDATE public.payment_intents
+              SET estado_intent_codigo = 'confirmado',
+                  updated_at = now()
+              WHERE id_intent = $1::uuid
+            `,
+            [intent.id_intent]
+          );
+          await dbClient.query(
+            `
+              UPDATE public.citas
+              SET estado_cita_codigo = 'confirmada',
+                  updated_at = now()
+              WHERE id_cita = $1::uuid
+                AND estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada')
+            `,
+            [intent.id_cita]
+          );
+          if (intent.id_hold) {
+            await dbClient.query(
+              `
+                UPDATE public.citas_holds
+                SET estado_hold_codigo = 'consumido',
+                    consumed_at = COALESCE(consumed_at, now()),
+                    updated_at = now()
+                WHERE id_hold = $1::uuid
+                  AND estado_hold_codigo IN ('activo', 'consumido')
+              `,
+              [intent.id_hold]
+            );
+          }
+          if (intent.id_grupo_cita) {
+            paidGroupConfirmation = await confirmarComprobanteAgendamientoParaEnvio({
+              client: dbClient,
+              logger: request.log,
+              id_grupo_cita: intent.id_grupo_cita,
+              resultadoReservaCodigo: "confirmada",
+              comprobanteEmailHabilitado: true,
+            });
+          }
         } else if (normalizedStatus === "failed" || normalizedStatus === "expired") {
           await expireHoldAndAppointment(dbClient, {
             idIntent: intent.id_intent,
@@ -824,6 +897,39 @@ export default async function pagosRoutes(app) {
 
         await dbClient.query("COMMIT");
 
+        let receiptDelivery = null;
+        if (normalizedStatus === "paid" && paidGroupConfirmation?.found) {
+          try {
+            receiptDelivery = await enviarComprobanteAgendamientoNoFiscal({
+              app,
+              pool: app.db,
+              logger: request.log,
+              id_grupo_cita: intent.id_grupo_cita,
+              id_comprobante_agendamiento: paidGroupConfirmation.id_comprobante_agendamiento,
+              modo: "post_confirmacion_pago_privado",
+              comprobanteEmailHabilitado: true,
+            });
+          } catch (receiptError) {
+            request.log.warn(
+              {
+                err: receiptError,
+                id_grupo_cita: intent.id_grupo_cita || null,
+                id_cita: intent.id_cita || null,
+              },
+              "No se pudo despachar comprobante normalizado en /v1/pagos."
+            );
+          }
+        } else if (normalizedStatus === "paid" && intent.id_grupo_cita && !paidGroupConfirmation?.found) {
+          request.log.warn(
+            {
+              id_cita: intent.id_cita,
+              id_grupo_cita: intent.id_grupo_cita,
+              code: "BOOKING_RECEIPT_NOT_FOUND",
+            },
+            "Pago confirmado en /v1/pagos sin comprobante normalizado; revisar uso de /v1/public/pagos."
+          );
+        }
+
         return sendOk(reply, {
           provider: providerCode,
           provider_event_id: providerEventId,
@@ -831,6 +937,15 @@ export default async function pagosRoutes(app) {
           processed: true,
           duplicate: false,
           extension_pending: false,
+          booking_confirmation: normalizedStatus === "paid" ? {
+            id_cita: intent.id_cita,
+            id_grupo_cita: intent.id_grupo_cita || null,
+            comprobante: paidGroupConfirmation?.found ? {
+              id_comprobante_agendamiento: paidGroupConfirmation.id_comprobante_agendamiento,
+              estado_comprobante_codigo: paidGroupConfirmation.estado_comprobante_codigo,
+            } : null,
+            email_delivery: receiptDelivery,
+          } : null,
         });
       } catch (error) {
         try {

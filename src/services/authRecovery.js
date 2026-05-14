@@ -4,8 +4,46 @@ function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+const PUBLIC_ENV_VALUES = new Set(["qa", "staging", "preprod", "prod", "production"]);
+
+function normalizeEnvValue(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isHttpsUrl(value) {
+  return String(value || "").trim().toLowerCase().startsWith("https://");
+}
+
+function resolveFrontendBaseUrlForRecovery() {
+  const frontendUrlRaw = String(process.env.FRONTEND_URL || "").trim();
+  const entorno = normalizeEnvValue(process.env.ENTORNO);
+  const nodeEnv = normalizeEnvValue(process.env.NODE_ENV);
+
+  const isPublicContext =
+    PUBLIC_ENV_VALUES.has(entorno) ||
+    PUBLIC_ENV_VALUES.has(nodeEnv) ||
+    isHttpsUrl(frontendUrlRaw);
+
+  if (isPublicContext) {
+    if (!isHttpsUrl(frontendUrlRaw)) {
+      throw new AppError(500, "FRONTEND_URL HTTPS requerido para recovery publico", {
+        code: "AUTH_RECOVERY_FRONTEND_URL_INVALID",
+        details: {
+          entorno: entorno || null,
+          node_env: nodeEnv || null,
+          frontend_url: frontendUrlRaw || null,
+        },
+      });
+    }
+    return frontendUrlRaw.replace(/\/+$/, "");
+  }
+
+  if (frontendUrlRaw) return frontendUrlRaw.replace(/\/+$/, "");
+  return "http://localhost:5173";
+}
+
 function buildDefaultRedirectTo() {
-  const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:5173").trim().replace(/\/+$/, "");
+  const frontendUrl = resolveFrontendBaseUrlForRecovery();
   return `${frontendUrl}/login`;
 }
 
