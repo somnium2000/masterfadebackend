@@ -37,23 +37,86 @@ function formatDateTimeHn(value) {
   return parsed.toLocaleString("es-HN", { timeZone: "America/Tegucigalpa" });
 }
 
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatMoney(value) {
+  return `HNL ${roundMoney(value || 0).toFixed(2)}`;
+}
+
+function formatSelectionTypeLabel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "package" || normalized === "paquete") return "Paquete";
+  if (normalized === "mixed" || normalized === "mixto") return "Paquete + servicios";
+  return "Servicios";
+}
+
+function resolveAppointmentDetailLabel(cita) {
+  const packageName = safeText(cita?.paquete?.nombre_paquete_snapshot);
+  const serviceNames = Array.isArray(cita?.servicios)
+    ? cita.servicios
+      .map((servicio) => safeText(servicio?.nombre_servicio_snapshot))
+      .filter(Boolean)
+    : [];
+
+  if (packageName && serviceNames.length) {
+    return `${packageName} (${serviceNames.join(", ")})`;
+  }
+  if (packageName) return packageName;
+  if (serviceNames.length) return serviceNames.join(", ");
+  return "Servicios";
+}
+
+function buildMemberLookup(integrantes) {
+  const rows = Array.isArray(integrantes) ? integrantes : [];
+  const lookup = new Map();
+  for (const row of rows) {
+    const order = Number(row?.orden_integrante);
+    if (!Number.isFinite(order)) continue;
+    lookup.set(order, row);
+  }
+  return lookup;
+}
+
 function buildComprobanteEmailTemplate({ recipientName, comprobante, payload }) {
   const safeName = safeText(recipientName) || "Cliente";
   const codigoComprobante = safeText(comprobante?.codigo_comprobante) || "N/A";
   const codigoReserva = safeText(comprobante?.codigo_reserva_snapshot) || safeText(payload?.codigo_reserva) || "N/A";
   const sucursal = safeText(payload?.sucursal?.nombre_sucursal) || "Sucursal";
   const citas = Array.isArray(payload?.citas) ? payload.citas : [];
-  const detailLines = citas.map((cita) => {
+  const integrantesByOrder = buildMemberLookup(payload?.integrantes);
+  const detailRows = citas.map((cita, index) => {
+    const order = Number(cita?.orden_integrante);
+    const member = Number.isFinite(order) ? integrantesByOrder.get(order) : null;
+    const alias = safeText(member?.alias_integrante)
+      || safeText(member?.nombre)
+      || `Integrante ${Number.isFinite(order) && order > 0 ? order : index + 1}`;
     const fecha = formatDateTimeHn(cita?.fecha_inicio);
-    const selection = safeText(cita?.selection_type) || "services";
-    const label = safeText(cita?.paquete?.nombre_paquete_snapshot) || "Servicios";
-    return `${fecha} - ${selection} - ${label}`;
+    const selection = formatSelectionTypeLabel(cita?.selection_type);
+    const label = resolveAppointmentDetailLabel(cita);
+    const totalLabel = formatMoney(cita?.total_pagar_hnl ?? cita?.total_hnl ?? 0);
+    return {
+      alias,
+      fecha,
+      selection,
+      label,
+      totalLabel,
+      text: `${alias}: ${fecha} - ${selection} - ${label} - ${totalLabel}`,
+    };
   });
+  const detailLines = detailRows.map((row) => row.text);
 
   const totals = payload?.totales || {};
-  const subtotal = roundMoney(totals.subtotal_hnl || 0).toFixed(2);
-  const descuento = roundMoney(totals.descuento_hnl || 0).toFixed(2);
-  const total = roundMoney(totals.total_pagar_hnl ?? totals.total_hnl ?? 0).toFixed(2);
+  const subtotal = formatMoney(totals.subtotal_hnl || 0);
+  const descuento = formatMoney(totals.descuento_hnl || 0);
+  const isv = formatMoney(totals.isv_hnl || 0);
+  const total = formatMoney(totals.total_pagar_hnl ?? totals.total_hnl ?? 0);
 
   const subject = `Comprobante de agendamiento #${codigoReserva}`;
   const text = [
@@ -67,17 +130,30 @@ function buildComprobanteEmailTemplate({ recipientName, comprobante, payload }) 
     "Detalle de citas:",
     ...(detailLines.length ? detailLines.map((line) => `- ${line}`) : ["- Sin detalle disponible"]),
     "",
-    `Subtotal: HNL ${subtotal}`,
-    `Descuento: HNL ${descuento}`,
-    "ISV: HNL 0.00",
-    `Total: HNL ${total}`,
+    `Subtotal: ${subtotal}`,
+    `Descuento: ${descuento}`,
+    `ISV: ${isv}`,
+    `Total: ${total}`,
     "",
     "Nota: Este comprobante es no fiscal y no sustituye una factura fiscal.",
   ].join("\n");
 
-  const htmlLines = detailLines.length
-    ? detailLines.map((line) => `<li>${line}</li>`).join("")
-    : "<li>Sin detalle disponible</li>";
+  const detailHtml = detailRows.length
+    ? detailRows.map((row) => `
+                      <tr>
+                        <td style="padding:12px 0;border-bottom:1px solid #252a39;">
+                          <p style="margin:0 0 4px;color:#f4f6fb;font-size:14px;font-weight:700;">${escapeHtml(row.alias)}</p>
+                          <p style="margin:0 0 4px;color:#d9dce4;font-size:14px;line-height:1.5;">${escapeHtml(row.fecha)}</p>
+                          <p style="margin:0;color:#aeb5c5;font-size:13px;line-height:1.5;">${escapeHtml(row.selection)} - ${escapeHtml(row.label)}</p>
+                        </td>
+                        <td align="right" style="padding:12px 0 12px 12px;border-bottom:1px solid #252a39;color:#d4b068;font-size:14px;font-weight:700;white-space:nowrap;">${escapeHtml(row.totalLabel)}</td>
+                      </tr>
+    `).join("")
+    : `
+                      <tr>
+                        <td style="padding:12px 0;color:#d9dce4;font-size:14px;line-height:1.5;">Sin detalle disponible</td>
+                      </tr>
+    `;
 
   const html = `
     <!doctype html>
@@ -85,24 +161,71 @@ function buildComprobanteEmailTemplate({ recipientName, comprobante, payload }) 
       <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>${subject}</title>
+        <title>${escapeHtml(subject)}</title>
       </head>
-      <body style="font-family:Arial,sans-serif;background:#f6f7fb;color:#1a1f2e;padding:18px;">
-        <h2 style="margin:0 0 12px;">Comprobante de agendamiento no fiscal</h2>
-        <p>Hola ${safeName},</p>
-        <p>Tu reserva fue confirmada y este es tu comprobante de agendamiento no fiscal.</p>
-        <p><strong>Codigo de reserva:</strong> ${codigoReserva}<br />
-        <strong>Codigo de comprobante:</strong> ${codigoComprobante}<br />
-        <strong>Sucursal:</strong> ${sucursal}</p>
-        <p><strong>Detalle de citas:</strong></p>
-        <ul>${htmlLines}</ul>
-        <p>
-          <strong>Subtotal:</strong> HNL ${subtotal}<br />
-          <strong>Descuento:</strong> HNL ${descuento}<br />
-          <strong>ISV:</strong> HNL 0.00<br />
-          <strong>Total:</strong> HNL ${total}
-        </p>
-        <p style="font-size:12px;color:#4d5566;">Nota: Este comprobante es no fiscal y no sustituye una factura fiscal.</p>
+      <body style="margin:0;padding:0;background:#0b0d12;font-family:Inter,Segoe UI,Arial,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:20px 12px;background:#0b0d12;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#141722;border:1px solid #2b2f3f;border-radius:18px;overflow:hidden;">
+                <tr>
+                  <td style="padding:26px 24px;background:linear-gradient(135deg,#1c2234 0%,#131722 50%,#2f2614 100%);border-bottom:1px solid #2b2f3f;">
+                    <p style="margin:0;color:#f1f4fa;font-size:12px;letter-spacing:0.28em;text-transform:uppercase;">MasterFade Citas</p>
+                    <h1 style="margin:10px 0 0;color:#f8f9fb;font-size:24px;line-height:1.25;">Comprobante de agendamiento</h1>
+                    <p style="margin:8px 0 0;color:#d4b068;font-size:14px;font-weight:700;">No fiscal</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:22px 24px 26px;">
+                    <p style="margin:0 0 14px;color:#f4f6fb;font-size:16px;font-weight:600;">Hola ${escapeHtml(safeName)},</p>
+                    <p style="margin:0 0 16px;color:#d9dce4;font-size:15px;line-height:1.7;">Tu reserva fue confirmada. Este es tu comprobante de agendamiento no fiscal.</p>
+
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:0 0 16px;border:1px solid #2b2f3f;border-radius:12px;background:#1a1f2e;">
+                      <tr>
+                        <td style="padding:12px 14px;">
+                          <p style="margin:0 0 8px;color:#aeb5c5;font-size:12px;text-transform:uppercase;letter-spacing:0.08em;">Reserva</p>
+                          <p style="margin:0;color:#f8f9fb;font-size:16px;font-weight:800;">${escapeHtml(codigoReserva)}</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:0 14px 12px;">
+                          <p style="margin:0;color:#d9dce4;font-size:14px;line-height:1.6;"><strong style="color:#f4f6fb;">Comprobante:</strong> ${escapeHtml(codigoComprobante)}</p>
+                          <p style="margin:4px 0 0;color:#d9dce4;font-size:14px;line-height:1.6;"><strong style="color:#f4f6fb;">Sucursal:</strong> ${escapeHtml(sucursal)}</p>
+                        </td>
+                      </tr>
+                    </table>
+
+                    <p style="margin:0 0 8px;color:#f4f6fb;font-size:14px;font-weight:700;">Detalle de citas</p>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:0 0 16px;">
+${detailHtml}
+                    </table>
+
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #2b2f3f;border-radius:12px;background:#10141f;">
+                      <tr>
+                        <td style="padding:12px 14px 6px;color:#aeb5c5;font-size:14px;">Subtotal</td>
+                        <td align="right" style="padding:12px 14px 6px;color:#f4f6fb;font-size:14px;">${escapeHtml(subtotal)}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:6px 14px;color:#aeb5c5;font-size:14px;">Descuento</td>
+                        <td align="right" style="padding:6px 14px;color:#f4f6fb;font-size:14px;">${escapeHtml(descuento)}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:6px 14px;color:#aeb5c5;font-size:14px;">ISV</td>
+                        <td align="right" style="padding:6px 14px;color:#f4f6fb;font-size:14px;">${escapeHtml(isv)}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px 14px 12px;border-top:1px solid #2b2f3f;color:#f8f9fb;font-size:16px;font-weight:800;">Total</td>
+                        <td align="right" style="padding:10px 14px 12px;border-top:1px solid #2b2f3f;color:#d4b068;font-size:16px;font-weight:800;">${escapeHtml(total)}</td>
+                      </tr>
+                    </table>
+
+                    <p style="margin:16px 0 0;color:#8f98aa;font-size:12px;line-height:1.6;">Nota: Este comprobante es no fiscal y no sustituye una factura fiscal.</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
       </body>
     </html>
   `;

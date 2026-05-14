@@ -1,5 +1,10 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
+import {
+  assertPaymentProviderConfig,
+  normalizePaymentProviderCode,
+  parsePaymentBoolean,
+} from "../services/payments/paymentRuntimeGuard.js";
 
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -53,7 +58,8 @@ async function envPlugin(app) {
   dotenv.config();
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
-  const paymentProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
+  const paymentProvider = normalizePaymentProviderCode(readRequired("PAYMENT_PROVIDER"));
+  assertPaymentProviderConfig(process.env);
   const frontendUrl = readRequired("FRONTEND_URL");
   const jwtSecret = readRequired("JWT_SECRET", { minLength: 24 });
   const cookieSecret = readRequired("COOKIE_SECRET", { minLength: 24 });
@@ -69,6 +75,7 @@ async function envPlugin(app) {
     cookieSecret,
     csrfSecret,
     paymentProvider,
+    paymentSimulatorEnabled: parsePaymentBoolean(process.env.ENABLE_PAYMENT_SIMULATOR, false),
     trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),
     cookieSameSite: String(process.env.AUTH_COOKIE_SAMESITE || "lax").trim().toLowerCase() || "lax",

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { AppError } from "../utils/errors.js";
 import {
   getAgendamientoConfig,
@@ -86,6 +87,83 @@ function parseBufferMinutes(value, { field, code = "BOOKING_DETAIL_AMOUNT_INVALI
   return parsed;
 }
 
+function getPromotionDiscountByDetail(promocionesResult) {
+  const discountByDetail = new Map();
+  for (const app of Array.isArray(promocionesResult?.aplicaciones) ? promocionesResult.aplicaciones : []) {
+    const detailId = normalizeText(app?.id_cita_detalle);
+    if (!detailId) continue;
+    const current = Number(discountByDetail.get(detailId) || 0);
+    discountByDetail.set(detailId, roundMoney(current + Number(app?.descuento_hnl || 0)));
+  }
+  return discountByDetail;
+}
+
+function getServiceNameFromSelection(normalizedSelection, serviceId) {
+  const targetId = normalizeText(serviceId);
+  if (!targetId) return "Servicio";
+  const details = Array.isArray(normalizedSelection?.detalles) ? normalizedSelection.detalles : [];
+  const found = details.find((item) => normalizeText(item?.id_servicio) === targetId);
+  return normalizeText(found?.nombre_servicio_snapshot) || "Servicio";
+}
+
+function calculateMembershipCoverageForSelection({
+  membresiaAgendamiento = null,
+  member = null,
+  normalizedSelection = null,
+  persistedSelection = null,
+  promocionesResult = null,
+  totalDespuesPromocionesHnl = 0,
+} = {}) {
+  const tracker = membresiaAgendamiento?.coverageTracker || null;
+  const totalBase = roundMoney(totalDespuesPromocionesHnl);
+  if (!tracker?.hasPlan || tracker.coverageEnabled === false || member?.rol_integrante_codigo !== "titular") {
+    return {
+      aplica: false,
+      monto_cubierto_hnl: 0,
+      monto_pendiente_hnl: totalBase,
+      servicios_cubiertos: [],
+    };
+  }
+
+  const discountByDetail = getPromotionDiscountByDetail(promocionesResult);
+  const detalles = Array.isArray(persistedSelection?.detalles) ? persistedSelection.detalles : [];
+  const serviciosCubiertos = [];
+  let montoCubierto = 0;
+
+  for (const detalle of detalles) {
+    const origin = String(detalle?.origen_item_codigo || "").trim().toLowerCase();
+    if (!["servicio_manual", "servicio_extra"].includes(origin)) continue;
+
+    const serviceId = normalizeText(detalle?.id_servicio);
+    if (!serviceId) continue;
+
+    const remaining = Number(tracker.serviceRemaining?.get(serviceId) || 0);
+    if (!Number.isFinite(remaining) || remaining <= 0) continue;
+
+    const lineTotal = roundMoney(detalle?.total_linea_hnl || 0);
+    const lineDiscount = roundMoney(discountByDetail.get(normalizeText(detalle?.id_cita_detalle)) || 0);
+    const lineEligible = roundMoney(Math.max(0, lineTotal - lineDiscount));
+    if (lineEligible <= 0) continue;
+
+    tracker.serviceRemaining.set(serviceId, remaining - 1);
+    montoCubierto = roundMoney(montoCubierto + lineEligible);
+    serviciosCubiertos.push({
+      id_servicio: serviceId,
+      nombre_servicio: getServiceNameFromSelection(normalizedSelection, serviceId),
+      monto_cubierto_hnl: lineEligible,
+      origen_item_codigo: origin,
+    });
+  }
+
+  montoCubierto = roundMoney(Math.min(totalBase, montoCubierto));
+  return {
+    aplica: montoCubierto > 0,
+    monto_cubierto_hnl: montoCubierto,
+    monto_pendiente_hnl: roundMoney(Math.max(0, totalBase - montoCubierto)),
+    servicios_cubiertos: serviciosCubiertos,
+  };
+}
+
 function forceIsvZeroIfDisabled({
   isvHabilitado,
   isvPorcentaje,
@@ -118,10 +196,10 @@ function forceIsvZeroIfDisabled({
   };
 }
 
-async function findActiveUserByEmail(client, email) {
+export async function findActiveAccountByEmail(client, email) {
   const safeEmail = normalizeEmail(email);
   if (!safeEmail) return null;
-  const { rows } = await client.query(
+  const activeUserResult = await client.query(
     `
       SELECT u.id_usuario
       FROM public.usuarios u
@@ -139,7 +217,39 @@ async function findActiveUserByEmail(client, email) {
     `,
     [safeEmail]
   );
-  return rows[0] || null;
+  if (activeUserResult.rows[0]) {
+    return {
+      account_type: "usuario",
+      id_usuario: activeUserResult.rows[0].id_usuario,
+    };
+  }
+
+  const activeClientResult = await client.query(
+    `
+      SELECT c.id_cliente, c.id_persona
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+       AND p.deleted_at IS NULL
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE c.deleted_at IS NULL
+        AND c.estado IS TRUE
+        AND lower(co.direccion_correo::text) = lower($1)
+      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+      LIMIT 1
+    `,
+    [safeEmail]
+  );
+  if (activeClientResult.rows[0]) {
+    return {
+      account_type: "cliente",
+      id_cliente: activeClientResult.rows[0].id_cliente,
+      id_persona: activeClientResult.rows[0].id_persona,
+    };
+  }
+  return null;
 }
 
 function buildNormalizedMembers({ integrantes, titular, actor }) {
@@ -206,8 +316,8 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
   for (const member of members) {
     if (member.tipo_cliente_codigo !== "invitado") continue;
     if (!member.contacto_email_snapshot) continue;
-    const active = await findActiveUserByEmail(client, member.contacto_email_snapshot);
-    if (!active?.id_usuario) continue;
+    const active = await findActiveAccountByEmail(client, member.contacto_email_snapshot);
+    if (!active) continue;
     if (actorUsuario && actorUsuario === active.id_usuario) continue;
 
     if (logger?.warn) {
@@ -215,7 +325,7 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
         {
           code: "EMAIL_BELONGS_TO_ACTIVE_USER",
           blockIndex: member.index,
-          field: member.isTitular ? "titular.email" : "email",
+          field: member.isTitular ? "titular.email" : "contacto.email",
         },
         "Intento de reserva con correo perteneciente a usuario activo."
       );
@@ -223,11 +333,11 @@ async function validateMemberEmailsAgainstActiveUsers(client, members, actor, lo
     throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
       code: "EMAIL_BELONGS_TO_ACTIVE_USER",
       details: {
-        field: member.isTitular ? "titular.email" : "email",
+        field: member.isTitular ? "titular.email" : "contacto.email",
         blockIndex: member.index,
         email: member.contacto_email_snapshot,
         rol_integrante_codigo: member.isTitular ? "titular" : "acompanante",
-        orden_integrante: Number(member.index) + 1,
+        orden_integrante: Number(member.orden_integrante || member.index + 1),
         alias: member.alias_integrante || null,
       },
     });
@@ -275,6 +385,7 @@ async function insertGrupo(client, {
   titular,
   origenCodigo,
   notas,
+  releaseToken = null,
 }) {
   const { rows } = await client.query(
     `
@@ -285,7 +396,8 @@ async function insertGrupo(client, {
         id_usuario_titular,
         origen_codigo,
         estado_grupo_codigo,
-        notas
+        notas,
+        release_token
       )
       VALUES (
         $1::uuid,
@@ -294,7 +406,8 @@ async function insertGrupo(client, {
         $4::uuid,
         $5::text,
         'activo',
-        $6
+        $6,
+        $7
       )
       RETURNING id_grupo_cita, estado_grupo_codigo
     `,
@@ -305,6 +418,7 @@ async function insertGrupo(client, {
       titular?.id_usuario || null,
       origenCodigo || "publico",
       notas || null,
+      releaseToken || null,
     ]
   );
   return rows[0];
@@ -796,6 +910,7 @@ export async function crearReservaHoldBaseNormalizada({
   hold_state = "activo",
   appointment_state = "en_espera",
   beneficioAgendamiento = null,
+  membresiaAgendamiento = null,
 } = {}) {
   if (!client || typeof client.query !== "function") {
     throw new AppError(500, "No se pudo crear la reserva en este momento.", {
@@ -845,6 +960,10 @@ export async function crearReservaHoldBaseNormalizada({
     });
   }
 
+  const releaseToken = String(origen_codigo || "").trim().toLowerCase() === "publico"
+    ? crypto.randomBytes(32).toString("hex")
+    : null;
+
   let txStarted = false;
   try {
     await client.query("BEGIN");
@@ -863,6 +982,7 @@ export async function crearReservaHoldBaseNormalizada({
       titular: membersForPersist[0],
       origenCodigo: origen_codigo,
       notas,
+      releaseToken,
     });
     const holdDurationMin = Math.max(1, Number(effectiveConfig.holdTtlMinutos || 5));
     const expiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
@@ -874,6 +994,8 @@ export async function crearReservaHoldBaseNormalizada({
     let totalGrupo = 0;
     let titularResolved = null;
     let beneficioAplicadoResumen = null;
+    let membresiaCubiertoGrupo = 0;
+    const membresiaServiciosCubiertos = new Map();
 
     for (const member of membersForPersist) {
       const selection = await resolveBookingSelection(client, {
@@ -969,26 +1091,40 @@ export async function crearReservaHoldBaseNormalizada({
         normalizedSelection?.total_hnl
           ?? citaInsert.totalPagar
       );
-      const beneficioCita = calcularCoberturaCanjeSobreSeleccion({
+      const descuentoPromociones = roundMoney(promocionesResult?.descuentoTotalHnl || 0);
+      const membresiaCita = calculateMembershipCoverageForSelection({
+        membresiaAgendamiento,
+        member,
+        normalizedSelection,
+        persistedSelection,
+        promocionesResult,
+        totalDespuesPromocionesHnl: totalDespuesPromociones,
+      });
+      const descuentoMembresia = roundMoney(membresiaCita?.monto_cubierto_hnl || 0);
+      const totalDespuesMembresia = roundMoney(
+        membresiaCita?.aplica
+          ? membresiaCita.monto_pendiente_hnl
+          : totalDespuesPromociones
+      );
+      const beneficioCitaFinal = calcularCoberturaCanjeSobreSeleccion({
         beneficioAgendamiento,
         member,
         normalizedSelection,
-        totalDespuesPromocionesHnl: totalDespuesPromociones,
+        totalDespuesPromocionesHnl: totalDespuesMembresia,
       });
-      const descuentoPromociones = roundMoney(promocionesResult?.descuentoTotalHnl || 0);
-      const descuentoCanje = roundMoney(beneficioCita?.monto_cubierto_hnl || 0);
-      const descuentoTotal = roundMoney(descuentoPromociones + descuentoCanje);
+      const descuentoCanje = roundMoney(beneficioCitaFinal?.monto_cubierto_hnl || 0);
+      const descuentoTotal = roundMoney(descuentoPromociones + descuentoMembresia + descuentoCanje);
       const totalFinalCita = roundMoney(
-        beneficioCita?.aplica
-          ? beneficioCita.monto_pendiente_hnl
-          : totalDespuesPromociones
+        beneficioCitaFinal?.aplica
+          ? beneficioCitaFinal.monto_pendiente_hnl
+          : totalDespuesMembresia
       );
 
       await updateCitaTotalsAfterPromotions(client, {
         idCita: citaInsert.id_cita,
         descuentoTotalHnl: descuentoTotal,
         totalPagarHnl: totalFinalCita,
-        esCanjeRecompensa: Boolean(beneficioCita?.aplica),
+        esCanjeRecompensa: Boolean(beneficioCitaFinal?.aplica),
       });
 
       await insertHold(client, {
@@ -1003,16 +1139,28 @@ export async function crearReservaHoldBaseNormalizada({
       descuentoGrupo += descuentoTotal;
       totalGrupo += totalCita;
 
-      if (beneficioCita?.aplica) {
+      if (membresiaCita?.aplica) {
+        membresiaCubiertoGrupo = roundMoney(membresiaCubiertoGrupo + descuentoMembresia);
+        for (const service of Array.isArray(membresiaCita.servicios_cubiertos) ? membresiaCita.servicios_cubiertos : []) {
+          const serviceId = normalizeText(service?.id_servicio);
+          if (!serviceId || membresiaServiciosCubiertos.has(serviceId)) continue;
+          membresiaServiciosCubiertos.set(serviceId, {
+            id_servicio: serviceId,
+            nombre_servicio: normalizeText(service?.nombre_servicio) || "Servicio",
+          });
+        }
+      }
+
+      if (beneficioCitaFinal?.aplica) {
         beneficioAplicadoResumen = {
           aplica: true,
           tipo_beneficio_codigo: beneficioAgendamiento?.tipo_beneficio_codigo || "canje_recompensa",
           canje_context_token: beneficioAgendamiento?.canje_context_token || null,
           id_points_tx_canje: beneficioAgendamiento?.id_points_tx_canje || null,
-          id_servicio_objetivo: beneficioCita.id_servicio_objetivo || beneficioAgendamiento?.id_servicio_objetivo || null,
+          id_servicio_objetivo: beneficioCitaFinal.id_servicio_objetivo || beneficioAgendamiento?.id_servicio_objetivo || null,
           puntos_requeridos: Number(beneficioAgendamiento?.puntos_requeridos || 0),
-          monto_cubierto_hnl: roundMoney(beneficioCita.monto_cubierto_hnl || 0),
-          monto_pendiente_hnl: roundMoney(beneficioCita.monto_pendiente_hnl || 0),
+          monto_cubierto_hnl: roundMoney(beneficioCitaFinal.monto_cubierto_hnl || 0),
+          monto_pendiente_hnl: roundMoney(beneficioCitaFinal.monto_pendiente_hnl || 0),
           consumir_en_confirmacion: Boolean(beneficioAgendamiento?.consumir_en_confirmacion),
           metadata_segura: beneficioAgendamiento?.metadata_segura || null,
         };
@@ -1030,7 +1178,9 @@ export async function crearReservaHoldBaseNormalizada({
         estado_cita_codigo: appointment_state,
         monto_total_hnl: totalCita,
         descuento_promociones_hnl: descuentoPromociones,
+        cubierto_por_plan_hnl: descuentoMembresia,
         beneficio_canje_hnl: descuentoCanje,
+        total_pagar_hnl: totalCita,
         duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
         buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
       });
@@ -1046,6 +1196,7 @@ export async function crearReservaHoldBaseNormalizada({
         selection_type: selection.serviceSelection.selection_type || member.selection_type,
         total_hnl: totalCita,
         descuento_promociones_hnl: descuentoPromociones,
+        cubierto_por_plan_hnl: descuentoMembresia,
         beneficio_canje_hnl: descuentoCanje,
       });
     }
@@ -1100,7 +1251,21 @@ export async function crearReservaHoldBaseNormalizada({
       citas,
       bloques,
       beneficio: beneficioAplicadoResumen,
+      membresia: {
+        cobertura_activa: Boolean(membresiaAgendamiento?.coverageTracker?.hasPlan && membresiaCubiertoGrupo > 0),
+        id_suscripcion: membresiaAgendamiento?.coverageTracker?.idSuscripcion || null,
+        id_sucursal_contratada: membresiaAgendamiento?.coverageTracker?.idSucursalContratada || null,
+        sucursal_plan_nombre: membresiaAgendamiento?.coverageTracker?.sucursalPlanNombre || null,
+        nombre_plan: membresiaAgendamiento?.coverageTracker?.planName || null,
+        estado_plan: membresiaAgendamiento?.estado_plan || (membresiaAgendamiento?.coverageTracker?.hasPlan ? "activo" : "sin_plan_activo"),
+        mensaje: membresiaAgendamiento?.mensaje || null,
+        servicios_cubiertos: [...membresiaServiciosCubiertos.values()],
+        servicios_forzados: [],
+        cubierto_por_plan_hnl: roundMoney(membresiaCubiertoGrupo),
+        extras_a_pagar_hnl: roundMoney(totalGrupo),
+      },
       comprobante: comprobanteResult,
+      release_token: releaseToken,
     };
   } catch (error) {
     if (txStarted) {

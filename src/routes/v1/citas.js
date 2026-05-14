@@ -14,6 +14,7 @@ import {
 } from "../../services/agendaService.js";
 import { confirmAppointmentsWithoutPayment, confirmAppointmentWithoutPayment } from "../../services/appointmentConfirmationService.js";
 import { crearReservaHoldBaseNormalizada } from "../../services/agendamientoReservaService.js";
+import { releaseAppointmentHoldGroup } from "../../services/appointmentHoldReleaseService.js";
 import { prepararBeneficioCanjeAgendamiento } from "../../services/agendamientoBeneficiosService.js";
 import {
   confirmarComprobanteAgendamientoParaEnvio,
@@ -115,12 +116,39 @@ const citaDetalleItemSchema = {
   additionalProperties: false,
 };
 
+const CITAS_SAFE_DETAIL_KEYS = new Set([
+  "field",
+  "blockIndex",
+  "alias",
+  "email",
+  "rol_integrante_codigo",
+  "orden_integrante",
+]);
+
+function sanitizeCitasErrorDetails(rawDetails) {
+  if (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails)) return undefined;
+  const safeDetails = {};
+  for (const [key, value] of Object.entries(rawDetails)) {
+    if (!CITAS_SAFE_DETAIL_KEYS.has(key)) continue;
+    if (key === "blockIndex" || key === "orden_integrante") {
+      const parsed = Number(value);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeDetails[key] = parsed;
+      continue;
+    }
+    if (value == null) continue;
+    safeDetails[key] = String(value).trim().slice(0, 160);
+  }
+  return Object.keys(safeDetails).length ? safeDetails : undefined;
+}
+
 function sendHandled(reply, request, error, message, code) {
   if (error instanceof AppError) {
+    const safeDetails = sanitizeCitasErrorDetails(error.details);
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
-      details: error.details,
+      ...(safeDetails ? { details: safeDetails } : {}),
       requestId: request.id,
+      exposeDetails: Boolean(safeDetails),
     });
   }
 
@@ -504,6 +532,114 @@ async function getServicesWithActiveTariffByBranch(client, { idSucursal, service
   return rows
     .map((row) => String(row.id_servicio || "").trim())
     .filter(Boolean);
+}
+
+function resolveMembershipHoldMessage({ hasMembership, coverageTracker, membershipComputationFailed, rewardActive, branchName }) {
+  if (rewardActive) {
+    return "Se aplicara tu recompensa de cortesia al titular. Los extras y acompanantes se cobran normalmente.";
+  }
+  if (hasMembership && coverageTracker?.coverageDisabledReason === "branch_mismatch") {
+    const planBranchLabel = coverageTracker.sucursalPlanNombre || "otra sucursal";
+    const citaBranchLabel = branchName || "la sucursal seleccionada";
+    return `Tu plan activo pertenece a ${planBranchLabel}. Si agendas en ${citaBranchLabel}, esta cita no sera cubierta por tu plan y deberas pagar el total.`;
+  }
+  if (hasMembership && coverageTracker?.coverageDisabledReason === "missing_contracted_branch") {
+    return "Tu plan no tiene una sucursal valida asociada; calculamos la cita con tarifa normal.";
+  }
+  if (hasMembership && coverageTracker?.coverageDisabledReason === "services_without_active_tariff") {
+    return "Tu plan no tiene servicios con tarifa activa en esta sucursal; calculamos la cita con tarifa normal.";
+  }
+  if (hasMembership && coverageTracker?.coverageDisabledReason === "coverage_resolution_error") {
+    return coverageTracker.coverageDisabledMessage
+      || "No pudimos aplicar beneficios de tu plan en este momento; calculamos la cita con tarifa normal.";
+  }
+  if (hasMembership && !coverageTracker?.hasServiceBenefitsAvailable) {
+    return "Tu plan no tiene beneficios disponibles para cubrir esta cita.";
+  }
+  if (!hasMembership && membershipComputationFailed) {
+    return "No pudimos validar beneficios de plan en este momento; calculamos la cita con tarifa normal.";
+  }
+  return null;
+}
+
+async function buildMembershipContextForNormalizedHold(client, {
+  clienteId,
+  idSucursal,
+  branchName = null,
+  rewardActive = false,
+  logger = null,
+} = {}) {
+  let membershipState = null;
+  try {
+    membershipState = await getClienteMembershipState(client, clienteId);
+  } catch (error) {
+    logger?.warn?.(
+      { id_cliente: clienteId, code: error?.code || null },
+      "No se pudo leer estado de membresia para respuesta de hold."
+    );
+  }
+
+  if (rewardActive) {
+    return {
+      coverageTracker: createCoverageTracker(null, { appointmentBranchId: idSucursal, planBranchName: null }),
+      estado_plan: membershipState?.estado_plan || "sin_plan_activo",
+      mensaje: resolveMembershipHoldMessage({ rewardActive: true }),
+    };
+  }
+
+  let activeMembership = null;
+  let membershipComputationFailed = false;
+  try {
+    activeMembership = await ensureSubscriptionLifecycle(client, clienteId, { forUpdate: false });
+  } catch (error) {
+    membershipComputationFailed = true;
+    logger?.warn?.(
+      { id_cliente: clienteId, id_sucursal: idSucursal, code: error?.code || null },
+      "No se pudo calcular cobertura de membresia para hold normalizado. Se aplicara tarifa normal."
+    );
+    activeMembership = {
+      active: null,
+      summary: null,
+      time_remaining: null,
+      changed: false,
+    };
+  }
+
+  const contractedBranchId = String(activeMembership?.active?.id_sucursal_contratada || "").trim() || null;
+  const contractedBranchName = contractedBranchId
+    ? await getBranchNameById(client, contractedBranchId)
+    : null;
+  const coverageTracker = createCoverageTracker(activeMembership, {
+    appointmentBranchId: idSucursal,
+    planBranchName: contractedBranchName,
+  });
+
+  if (coverageTracker?.coverageEnabled && Array.isArray(coverageTracker.requiredServiceIds) && coverageTracker.requiredServiceIds.length > 0) {
+    const servicesWithActiveTariff = await getServicesWithActiveTariffByBranch(client, {
+      idSucursal,
+      serviceIds: coverageTracker.requiredServiceIds,
+    });
+    filterCoverageTrackerByTariffServices(coverageTracker, servicesWithActiveTariff);
+  }
+
+  if (membershipComputationFailed) {
+    coverageTracker.coverageEnabled = false;
+    coverageTracker.coverageDisabledReason = "coverage_resolution_error";
+    coverageTracker.coverageDisabledMessage = "No pudimos aplicar tu plan en este momento; calculamos la cita con tarifa normal.";
+  }
+
+  const hasMembership = Boolean(coverageTracker.hasPlan && coverageTracker.idSuscripcion);
+  return {
+    coverageTracker,
+    estado_plan: membershipState?.estado_plan || (hasMembership ? "activo" : "sin_plan_activo"),
+    mensaje: resolveMembershipHoldMessage({
+      hasMembership,
+      coverageTracker,
+      membershipComputationFailed,
+      rewardActive: false,
+      branchName,
+    }),
+  };
 }
 
 function isConflictError(error) {
@@ -1488,6 +1624,13 @@ export default async function citasRoutes(app) {
               agendamientoConfig,
             })
             : null;
+          const membresiaAgendamiento = await buildMembershipContextForNormalizedHold(dbClient, {
+            clienteId,
+            idSucursal: branch.id_sucursal,
+            branchName: branch.nombre_sucursal,
+            rewardActive: Boolean(beneficioAgendamiento?.aplica),
+            logger: request.log,
+          });
 
           const holdResult = await crearReservaHoldBaseNormalizada({
             client: dbClient,
@@ -1512,22 +1655,27 @@ export default async function citasRoutes(app) {
             hold_state: "activo",
             appointment_state: "en_espera",
             beneficioAgendamiento,
+            membresiaAgendamiento,
           });
 
-          const totalHnl = Number(holdResult?.monto_total_hnl ?? holdResult?.total_hnl ?? 0);
           const bloques = Array.isArray(holdResult?.bloques) ? holdResult.bloques : [];
           const beneficio = holdResult?.beneficio || null;
+          const membresia = holdResult?.membresia || null;
+          const totalPagarHnl = Number(holdResult?.total_pagar_hnl || 0);
+          const membresiaItemsCubiertos = Array.isArray(membresia?.servicios_cubiertos)
+            ? membresia.servicios_cubiertos.length
+            : 0;
           return sendOk(reply, {
             id_grupo_cita: holdResult.id_grupo_cita,
             estado_grupo_codigo: holdResult.estado_grupo_codigo || "activo",
             expires_at: holdResult.expires_at || null,
-            subtotal_hnl: totalHnl,
-            monto_total_hnl: totalHnl,
-            descuento_total_hnl: Number(beneficio?.monto_cubierto_hnl || 0),
-            total_pagar_hnl: totalHnl,
-            extras_pendientes_hnl: totalHnl,
+            subtotal_hnl: Number(holdResult?.subtotal_hnl || 0),
+            monto_total_hnl: Number(holdResult?.monto_total_hnl || totalPagarHnl),
+            descuento_total_hnl: Number(holdResult?.descuento_total_hnl || 0),
+            total_pagar_hnl: totalPagarHnl,
+            extras_pendientes_hnl: Number(holdResult?.extras_a_pagar_hnl ?? totalPagarHnl),
             resumen_cobertura: {
-              items_cubiertos: beneficio?.aplica ? 1 : 0,
+              items_cubiertos: membresiaItemsCubiertos + (beneficio?.aplica ? 1 : 0),
               items_extra: 0,
             },
             recompensa: {
@@ -1537,13 +1685,13 @@ export default async function citasRoutes(app) {
               servicio_nombre: beneficio?.metadata_segura?.servicio_nombre || null,
               puntos_requeridos: Number(beneficio?.puntos_requeridos || 0),
               cubierto_hnl: Number(beneficio?.monto_cubierto_hnl || 0),
-              extras_a_pagar_hnl: Number(beneficio?.monto_pendiente_hnl ?? totalHnl),
+              extras_a_pagar_hnl: Number(beneficio?.monto_pendiente_hnl ?? totalPagarHnl),
               mensaje: beneficio?.aplica
                 ? "Recompensa aplicada correctamente. Los extras y acompanantes se cobran aparte."
                 : null,
               id_cita_asociada: null,
             },
-            membresia: {
+            membresia: membresia || {
               cobertura_activa: false,
               id_suscripcion: null,
               id_sucursal_contratada: null,
@@ -1553,8 +1701,8 @@ export default async function citasRoutes(app) {
               mensaje: null,
               servicios_cubiertos: [],
               servicios_forzados: [],
-              cubierto_por_plan_hnl: Number(beneficio?.monto_cubierto_hnl || 0),
-              extras_a_pagar_hnl: Number(beneficio?.monto_pendiente_hnl ?? totalHnl),
+              cubierto_por_plan_hnl: 0,
+              extras_a_pagar_hnl: totalPagarHnl,
             },
             bloques,
           }, {
@@ -2080,6 +2228,70 @@ export default async function citasRoutes(app) {
         }
 
         return sendHandled(reply, request, error, "No se pudo crear el hold de citas", "CITAS_HOLD_CREATE_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.delete(
+    "/hold/:id_grupo_cita",
+    {
+      preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_grupo_cita"],
+          properties: {
+            id_grupo_cita: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_grupo_cita: { type: "string", format: "uuid" },
+                  released: { type: "boolean" },
+                  estado_grupo_codigo: { type: "string" },
+                  citas_liberadas: { type: "integer" },
+                },
+                required: ["id_grupo_cita", "released", "estado_grupo_codigo", "citas_liberadas"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const dbClient = await app.db.connect();
+      try {
+        const { clienteId, personaId } = ensureClientContext(request);
+        const groupId = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+        await expireReservationsBestEffort(dbClient, request, "citas_hold_release");
+        const releaseResult = await releaseAppointmentHoldGroup(dbClient, {
+          groupId,
+          mode: "authenticated",
+          clienteId,
+          personaId,
+        });
+        return sendOk(reply, releaseResult);
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo liberar el hold autenticado", "CITAS_HOLD_RELEASE_ERROR");
       } finally {
         dbClient.release();
       }

@@ -5,12 +5,23 @@ import { PaymentProviderFactory } from "../../../services/payments/PaymentProvid
 import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
 import { getAgendamientoConfig } from "../../../services/agendaService.js";
 import { crearComprobanteAgendamientoNoFiscal } from "../../../services/comprobanteAgendamientoService.js";
+import { processPaymentWebhook } from "../../../services/paymentWebhookService.js";
+import {
+  assertPaymentSimulatorUsable,
+  getPaymentRuntimeSnapshot,
+  normalizePaymentProviderCode,
+} from "../../../services/payments/paymentRuntimeGuard.js";
 import {
   confirmarComprobanteAgendamientoParaEnvio,
   enviarComprobanteAgendamientoNoFiscal,
 } from "../../../services/comprobanteAgendamientoEmailService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const SIMULATOR_STATUS_TO_WEBHOOK_STATUS = {
+  success: "paid",
+  failed: "failed",
+  processing: "pending",
+};
 
 function safeText(value) {
   const normalized = String(value || "").trim();
@@ -30,6 +41,74 @@ function isHttpsUrl(value) {
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function getConfiguredPaymentProviderCode(app) {
+  return normalizePaymentProviderCode(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER);
+}
+
+function isProductionRuntime(app) {
+  const nodeEnv = String(process.env.NODE_ENV || process.env.ENTORNO || "").trim().toLowerCase();
+  return Boolean(app.config?.isProduction) || ["production", "prod", "staging", "preprod"].includes(nodeEnv);
+}
+
+function canUsePublicMockPayment(app) {
+  return getConfiguredPaymentProviderCode(app) === "mock" && !isProductionRuntime(app);
+}
+
+function assertPublicSimulatorPaymentEnabled() {
+  try {
+    const snapshot = assertPaymentSimulatorUsable(process.env);
+    const runtimeName = snapshot.entorno || snapshot.nodeEnv;
+    if (runtimeName !== "qa") {
+      throw new Error("PAYMENT_QA_SIMULATION_ENTORNO_REQUIRED");
+    }
+    if (!getPaymentRuntimeSnapshot(process.env).qaSimulationEnabled) {
+      throw new Error("PAYMENT_QA_SIMULATION_DISABLED");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "PAYMENT_SIMULATOR_DISABLED";
+    throw new AppError(
+      message === "PAYMENT_SIMULATOR_FORBIDDEN_IN_PRODUCTION" ? 500 : 403,
+      "La simulacion de pago no esta disponible en este entorno",
+      { code: message }
+    );
+  }
+}
+
+async function resolveSimulatorIntentReference(db, { idIntent = null, idGrupoCita = null }) {
+  const result = await db.query(
+    `
+      SELECT pi.id_intent, c.id_grupo_cita
+      FROM public.payment_intents pi
+      JOIN public.citas c
+        ON c.id_cita = pi.id_cita
+       AND c.deleted_at IS NULL
+      WHERE ($1::uuid IS NOT NULL AND pi.id_intent = $1::uuid)
+         OR ($2::uuid IS NOT NULL AND c.id_grupo_cita = $2::uuid)
+      ORDER BY
+        CASE WHEN $1::uuid IS NOT NULL AND pi.id_intent = $1::uuid THEN 0 ELSE 1 END,
+        pi.created_at DESC
+      LIMIT 1
+    `,
+    [idIntent, idGrupoCita]
+  );
+  const intent = result.rows[0] ?? null;
+  if (!intent?.id_intent) {
+    throw new AppError(404, "Intent de pago no encontrado para simular", {
+      code: "PUBLIC_PAGOS_SIMULATOR_INTENT_NOT_FOUND",
+      details: { field: idIntent ? "id_intent" : "id_grupo_cita" },
+    });
+  }
+  if (idGrupoCita && String(intent.id_grupo_cita) !== String(idGrupoCita)) {
+    throw new AppError(403, "El intent no pertenece a la reserva indicada", {
+      code: "PUBLIC_PAGOS_SIMULATOR_INTENT_GROUP_MISMATCH",
+    });
+  }
+  return {
+    idIntent: String(intent.id_intent),
+    idGrupoCita: String(intent.id_grupo_cita || idGrupoCita || ""),
+  };
 }
 
 function assertUuid(value, field = "id") {
@@ -214,7 +293,7 @@ function buildCallbackUrl(groupId) {
 }
 
 async function ensureProvider(client, providerCode) {
-  const code = String(providerCode || "mock").trim().toLowerCase();
+  const code = String(providerCode || "").trim().toLowerCase();
   if (!code) {
     throw new AppError(400, "Proveedor de pago requerido", { code: "PUBLIC_PAGOS_PROVIDER_REQUIRED" });
   }
@@ -631,6 +710,7 @@ async function confirmGroupAfterPaid(client, {
   agendamientoConfig = null,
   logger = null,
 }) {
+  // TODO: Unificar esta confirmacion mock-local con paymentWebhookService para evitar doble mantenimiento.
   const groupResult = await client.query(
     `
       SELECT
@@ -654,6 +734,18 @@ async function confirmGroupAfterPaid(client, {
     [idGrupoCita]
   );
   const totalGrupo = Number(totalResult.rows[0]?.total ?? 0);
+
+  await client.query(
+    `
+      UPDATE public.citas_grupos
+      SET estado_grupo_codigo = 'completado',
+          release_token = NULL,
+          total_hnl = $2::numeric,
+          updated_at = now()
+      WHERE id_grupo_cita = $1::uuid
+    `,
+    [idGrupoCita, totalGrupo]
+  );
 
   await client.query(
     `
@@ -745,6 +837,68 @@ async function confirmGroupAfterPaid(client, {
 }
 
 export default async function publicPagosRoutes(app) {
+  app.post("/webhooks/:provider", {
+    config: {
+      rawBody: true,
+      rateLimit: {
+        max: Number(process.env.PUBLIC_PAGOS_WEBHOOK_RATE_LIMIT_MAX || 120),
+        timeWindow: process.env.PUBLIC_PAGOS_WEBHOOK_RATE_LIMIT_WINDOW || "1 minute",
+        allowList: (request) => request.ip === "127.0.0.1" || request.ip === "::1",
+      },
+    },
+    schema: {
+      params: {
+        type: "object",
+        required: ["provider"],
+        properties: {
+          provider: { type: "string", minLength: 1, maxLength: 40 },
+        },
+        additionalProperties: false,
+      },
+      body: {
+        type: "object",
+        additionalProperties: true,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      if (normalizePaymentProviderCode(request.params?.provider) === "simulator") {
+        throw new AppError(403, "Usa el endpoint controlado de simulacion", {
+          code: "PUBLIC_PAGOS_SIMULATOR_WEBHOOK_FORBIDDEN",
+        });
+      }
+      const result = await processPaymentWebhook({
+        app,
+        db: app.db,
+        providerCode: request.params?.provider,
+        headers: request.headers,
+        body: request.body,
+        rawBody: request.rawBody,
+        logger: request.log,
+        requestId: request.id,
+      });
+      return sendOk(reply, result);
+    } catch (error) {
+      if (error instanceof AppError) {
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          "Public pagos webhook handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo procesar webhook publico de pago");
+      return sendError(reply, 500, "No se pudo procesar el webhook de pago", {
+        code: "PUBLIC_PAGOS_WEBHOOK_ERROR",
+        requestId: request.id,
+      });
+    }
+  });
+
   app.post("/crear-intent", {
     schema: {
       body: {
@@ -767,7 +921,12 @@ export default async function publicPagosRoutes(app) {
       await dbClient.query("BEGIN");
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const titularEmail = normalizeEmail(request.body?.titular_email);
-      const providerCode = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+      const providerCode = getConfiguredPaymentProviderCode(app);
+      if (providerCode === "mock" && !canUsePublicMockPayment(app)) {
+        throw new AppError(500, "Proveedor de pago no permitido en este entorno", {
+          code: "PUBLIC_PAGOS_PROVIDER_MOCK_FORBIDDEN",
+        });
+      }
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       const invalidState = groupRows.some((row) => !["en_espera", "pendiente_pago"].includes(String(row.estado_cita_codigo || "")));
@@ -808,7 +967,7 @@ export default async function publicPagosRoutes(app) {
       }
 
       const idempotencyKey = `mf_public_${idGrupoCita}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
-      const providerAdapter = PaymentProviderFactory.create();
+      const providerAdapter = PaymentProviderFactory.create({ providerCode });
       const providerIntent = await providerAdapter.createIntent({
         idempotencyKey,
         montoHnl: totalGroup,
@@ -926,15 +1085,19 @@ export default async function publicPagosRoutes(app) {
       const groupRows = await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail });
       const intentResult = await app.db.query(
         `
-          SELECT id_intent, estado_intent_codigo, expires_at, monto_hnl, moneda_codigo
-          FROM public.payment_intents
-          WHERE id_intent = $1::uuid
+          SELECT pi.id_intent, pi.estado_intent_codigo, pi.expires_at, pi.monto_hnl, pi.moneda_codigo
+          FROM public.payment_intents pi
+          JOIN public.citas c
+            ON c.id_cita = pi.id_cita
+          WHERE pi.id_intent = $1::uuid
+            AND c.id_grupo_cita = $2::uuid
+            AND c.deleted_at IS NULL
           LIMIT 1
         `,
-        [idIntent]
+        [idIntent, idGrupoCita]
       );
       if (!intentResult.rows[0]) {
-        throw new AppError(404, "Intent de pago no encontrado", { code: "PUBLIC_PAGOS_INTENT_NOT_FOUND" });
+        throw new AppError(404, "Intent de pago no encontrado para esta reserva", { code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH" });
       }
       const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "") === "confirmada");
       if (allConfirmed) {
@@ -980,12 +1143,108 @@ export default async function publicPagosRoutes(app) {
     }
   });
 
+  app.post("/simulator/event", {
+    schema: {
+      body: {
+        type: "object",
+        required: ["status"],
+        properties: {
+          id_grupo_cita: { type: "string", format: "uuid" },
+          id_intent: { type: "string", format: "uuid" },
+          id_payment_intent: { type: "string", format: "uuid" },
+          titular_email: { type: "string", format: "email", maxLength: 160 },
+          provider_event_id: { type: "string", minLength: 1, maxLength: 120 },
+          status: { type: "string", enum: ["success", "failed", "processing"] },
+        },
+        additionalProperties: false,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      assertPublicSimulatorPaymentEnabled();
+      const idGrupoCita = request.body?.id_grupo_cita
+        ? assertUuid(request.body.id_grupo_cita, "id_grupo_cita")
+        : null;
+      const rawIntentId = request.body?.id_intent || request.body?.id_payment_intent;
+      const idIntent = rawIntentId
+        ? assertUuid(rawIntentId, request.body?.id_intent ? "id_intent" : "id_payment_intent")
+        : null;
+      if (!idGrupoCita && !idIntent) {
+        throw new AppError(400, "Debes enviar id_grupo_cita o id_intent", {
+          code: "PUBLIC_PAGOS_SIMULATOR_REFERENCE_REQUIRED",
+          details: { field: "id_grupo_cita" },
+        });
+      }
+
+      const requestedStatus = safeText(request.body?.status)?.toLowerCase();
+      const webhookStatus = SIMULATOR_STATUS_TO_WEBHOOK_STATUS[requestedStatus];
+      if (!webhookStatus) {
+        throw new AppError(400, "Estado de simulacion invalido", {
+          code: "PUBLIC_PAGOS_SIMULATOR_STATUS_INVALID",
+          details: { field: "status" },
+        });
+      }
+
+      const reference = await resolveSimulatorIntentReference(app.db, { idIntent, idGrupoCita });
+      const providerEventId = `simulator:${reference.idIntent}:${webhookStatus}`;
+      const eventBody = {
+        provider_event_id: providerEventId,
+        event_type: `payment.${webhookStatus}`,
+        status: webhookStatus,
+        id_intent: reference.idIntent,
+        id_grupo_cita: reference.idGrupoCita,
+        provider_tx_id: webhookStatus === "paid" ? `tx_simulator_${reference.idIntent}` : null,
+        metadata: {
+          id_intent: reference.idIntent,
+          id_grupo_cita: reference.idGrupoCita,
+        },
+      };
+
+      const result = await processPaymentWebhook({
+        app,
+        db: app.db,
+        providerCode: "simulator",
+        headers: {
+          ...request.headers,
+          "x-webhook-signature": process.env.PAYMENT_SIMULATOR_WEBHOOK_SECRET || "",
+        },
+        body: eventBody,
+        rawBody: JSON.stringify(eventBody),
+        logger: request.log,
+        requestId: request.id,
+      });
+      return sendOk(reply, {
+        simulator_status: requestedStatus,
+        ...result,
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code },
+          "Public pagos simulator event handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo procesar evento simulator de pago");
+      return sendError(reply, 500, "No se pudo procesar el evento de simulacion", {
+        code: "PUBLIC_PAGOS_SIMULATOR_EVENT_ERROR",
+        requestId: request.id,
+      });
+    }
+  });
+
   app.post("/mock-completar", {
     schema: {
       body: {
         type: "object",
-        required: ["id_intent", "titular_email"],
+        required: ["id_grupo_cita", "id_intent", "titular_email"],
         properties: {
+          id_grupo_cita: { type: "string", format: "uuid" },
           id_intent: { type: "string", format: "uuid" },
           titular_email: { type: "string", format: "email", maxLength: 160 },
           provider_event_id: { type: "string", maxLength: 120 },
@@ -995,8 +1254,15 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
+    if (!canUsePublicMockPayment(app)) {
+      return sendError(reply, 403, "La simulacion de pago no esta disponible en este entorno", {
+        code: "PUBLIC_PAGOS_MOCK_DISABLED",
+        requestId: request.id,
+      });
+    }
     const dbClient = await app.db.connect();
     try {
+      const requestedGroupId = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
       const status = safeText(request.body?.status)?.toLowerCase() || "paid";
       const providerEventId = safeText(request.body?.provider_event_id) || `mock_${idIntent}_${status}`;
@@ -1016,14 +1282,19 @@ export default async function publicPagosRoutes(app) {
       }
 
       const groupLookup = await dbClient.query(
-        `SELECT id_grupo_cita FROM public.citas WHERE id_cita = $1::uuid LIMIT 1`,
+        `SELECT id_grupo_cita FROM public.citas WHERE id_cita = $1::uuid AND deleted_at IS NULL LIMIT 1`,
         [intent.id_cita]
       );
       const idGrupoCita = groupLookup.rows[0]?.id_grupo_cita ?? null;
       if (!idGrupoCita) {
         throw new AppError(409, "No se encontro grupo para el intent", { code: "PUBLIC_PAGOS_GROUP_REFERENCE_MISSING" });
       }
-      await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail: request.body?.titular_email });
+      if (String(idGrupoCita) !== String(requestedGroupId)) {
+        throw new AppError(403, "El intent de pago no pertenece a la reserva indicada", {
+          code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH",
+        });
+      }
+      await loadPublicGroup(dbClient, { groupId: requestedGroupId, titularEmail: request.body?.titular_email });
 
       const insertedEvent = await dbClient.query(
         `
@@ -1033,7 +1304,7 @@ export default async function publicPagosRoutes(app) {
           DO NOTHING
           RETURNING id_event
         `,
-        [intent.id_provider, providerEventId, `payment.${status}`, { status, id_intent: idIntent }, idIntent]
+        [intent.id_provider, providerEventId, `payment.${status}`, { status, id_intent: idIntent, id_grupo_cita: requestedGroupId }, idIntent]
       );
       if (!insertedEvent.rows[0]) {
         await dbClient.query("COMMIT");
@@ -1087,6 +1358,16 @@ export default async function publicPagosRoutes(app) {
         await dbClient.query(
           `UPDATE public.payment_intents SET estado_intent_codigo = $2::text, updated_at = now() WHERE id_intent = $1::uuid`,
           [idIntent, status === "failed" ? "fallido" : "expirado"]
+        );
+        await dbClient.query(
+          `
+            UPDATE public.citas_grupos
+            SET estado_grupo_codigo = 'cancelado',
+                release_token = NULL,
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+          `,
+          [idGrupoCita]
         );
         await dbClient.query(
           `
