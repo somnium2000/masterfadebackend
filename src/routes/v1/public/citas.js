@@ -10,6 +10,10 @@ import {
   parseDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
+import {
+  previewPromotionsForAppointment,
+  recordPromotionApplications,
+} from "../../../services/promociones/promocionesService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -86,6 +90,8 @@ const holdBlockSchema = {
     fecha_inicio: { type: "string", format: "date-time" },
     estado_cita_codigo: { type: "string" },
     monto_total_hnl: { type: "number" },
+    descuento_hnl: { type: "number" },
+    total_pagar_hnl: { type: "number" },
     duracion_total_min: { type: "integer" },
     buffer_total_min: { type: "integer" },
   },
@@ -100,6 +106,8 @@ const holdBlockSchema = {
     "fecha_inicio",
     "estado_cita_codigo",
     "monto_total_hnl",
+    "descuento_hnl",
+    "total_pagar_hnl",
     "duracion_total_min",
     "buffer_total_min",
   ],
@@ -458,6 +466,8 @@ function normalizeBlocksPayload(body, titularPayload) {
       id_barbero: body?.id_barbero ?? null,
       selection_type: body?.selection_type ?? "services",
       id_paquete: body?.id_paquete ?? null,
+      id_promocion: body?.id_promocion ?? null,
+      id_promocion_regla: body?.id_promocion_regla ?? null,
       fecha_inicio: body.fecha_inicio,
       servicios: body.servicios,
     }]
@@ -513,6 +523,8 @@ function normalizeBlocksPayload(body, titularPayload) {
       id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
       selection_type: selectionType,
       id_paquete: packageId,
+      id_promocion: item?.id_promocion ? assertUuid(item.id_promocion, "id_promocion") : null,
+      id_promocion_regla: item?.id_promocion_regla ? assertUuid(item.id_promocion_regla, "id_promocion_regla") : null,
       fecha_inicio: fechaInicio,
       serviceIds,
       contacto: index === 0
@@ -764,6 +776,8 @@ export default async function publicCitasRoutes(app) {
                       additionalProperties: false,
                     },
                   },
+                  id_promocion: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  id_promocion_regla: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                 },
                 additionalProperties: false,
               },
@@ -783,6 +797,8 @@ export default async function publicCitasRoutes(app) {
                 additionalProperties: false,
               },
             },
+            id_promocion: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+            id_promocion_regla: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             notas: { anyOf: [{ type: "string", maxLength: 500 }, { type: "null" }] },
           },
           additionalProperties: false,
@@ -799,6 +815,11 @@ export default async function publicCitasRoutes(app) {
                   estado_grupo_codigo: { type: "string" },
                   expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
                   monto_total_hnl: { type: "number" },
+                  subtotal_hnl: { type: "number" },
+                  descuento_total_hnl: { type: "number" },
+                  total_hnl: { type: "number" },
+                  promociones_aplicadas: { type: "array", items: { type: "object", additionalProperties: true } },
+                  promociones_descartadas: { type: "array", items: { type: "object", additionalProperties: true } },
                   bloques: { type: "array", items: holdBlockSchema },
                 },
                 required: ["id_grupo_cita", "estado_grupo_codigo", "expires_at", "monto_total_hnl", "bloques"],
@@ -873,6 +894,10 @@ export default async function publicCitasRoutes(app) {
         const groupRecord = groupInsert.rows[0];
         const bloquesResponse = [];
         let totalGrupo = 0;
+        let subtotalGrupo = 0;
+        let descuentoGrupo = 0;
+        const promocionesAplicadasGrupo = [];
+        const promocionesDescartadasGrupo = [];
         let titularResolved = null;
 
         for (let index = 0; index < integrantes.length; index += 1) {
@@ -912,6 +937,75 @@ export default async function publicCitasRoutes(app) {
           }
 
           const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
+          const subtotalServicios = Number(selection.serviceSelection.monto_total_hnl || 0);
+          let descuentoPromociones = 0;
+          let totalPagar = subtotalServicios;
+          let promocionesPreview = null;
+
+          try {
+            const promoContext = {
+              id_sucursal: branch.id_sucursal,
+              id_empleado_barbero: selection.barber.id_empleado,
+              id_cliente: clientProfile.id_cliente || null,
+              id_persona: clientProfile.id_persona || null,
+              id_grupo_cita: groupRecord.id_grupo_cita,
+              fecha_hora: selection.startDateTime.toISOString(),
+              fecha: selection.startDateTime.toISOString().slice(0, 10),
+              fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
+              hora: selection.startDateTime.toISOString().slice(11, 16),
+              subtotal_hnl: subtotalServicios,
+              servicios: selection.serviceSelection.items || [],
+              paquetes: selection.serviceSelection.id_paquete
+                ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+                : [],
+              id_promocion: integrante.id_promocion || null,
+              id_promocion_regla: integrante.id_promocion_regla || null,
+              canal: "public",
+              es_cliente_autenticado: Boolean(clientProfile.id_cliente),
+              es_titular: index === 0,
+            };
+            promocionesPreview = await previewPromotionsForAppointment(dbClient, promoContext);
+            if (!promocionesPreview.usedFallbackLegacy) {
+              if (integrante.id_promocion_regla) {
+                const reglaSeleccionada = String(integrante.id_promocion_regla || "");
+                const candidatasAplicadas = Array.isArray(promocionesPreview.promociones_aplicadas)
+                  ? promocionesPreview.promociones_aplicadas
+                  : [];
+                const keepApplied = candidatasAplicadas.filter(
+                  (row) => String(row.id_promocion_regla || "") === reglaSeleccionada
+                );
+                const movedToDiscarded = candidatasAplicadas
+                  .filter((row) => String(row.id_promocion_regla || "") !== reglaSeleccionada)
+                  .map((row) => ({
+                    ...row,
+                    motivo_codigo: "PROMOCION_NO_SELECCIONADA",
+                    motivo: "Se aplico solo la promocion seleccionada por el cliente.",
+                  }));
+                promocionesPreview.promociones_aplicadas = keepApplied;
+                promocionesPreview.promociones_descartadas = [
+                  ...(promocionesPreview.promociones_descartadas || []),
+                  ...movedToDiscarded,
+                ];
+                descuentoPromociones = Number(
+                  keepApplied.reduce((sum, row) => sum + Number(row.descuento_calculado_hnl || 0), 0).toFixed(2)
+                );
+              } else {
+                descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
+              }
+              totalPagar = Math.max(0, Number((subtotalServicios - descuentoPromociones).toFixed(2)));
+            }
+          } catch (promoError) {
+            request.log.warn(
+              {
+                requestId: request.id,
+                id_sucursal: branch.id_sucursal,
+                id_grupo_cita: groupRecord.id_grupo_cita,
+                code: promoError?.code || null,
+                message: promoError?.message || null,
+              },
+              "No se pudo evaluar promociones normalizadas en hold publico; se continua sin descuento"
+            );
+          }
 
           const citaInsert = await dbClient.query(
             `
@@ -956,14 +1050,14 @@ export default async function publicCitasRoutes(app) {
                 $12::int,
                 $13::int,
                 $14::numeric,
-                0,
                 $15::numeric,
-                $16::text,
-                $17::uuid,
-                $18,
+                $16::numeric,
+                $17::text,
+                $18::uuid,
                 $19,
                 $20,
-                $21
+                $21,
+                $22
               )
               RETURNING id_cita
             `,
@@ -981,8 +1075,9 @@ export default async function publicCitasRoutes(app) {
               finAt.toISOString(),
               selection.serviceSelection.duracion_total_min,
               selection.serviceSelection.buffer_total_min,
-              selection.serviceSelection.monto_total_hnl,
-              selection.serviceSelection.monto_total_hnl,
+              subtotalServicios,
+              descuentoPromociones,
+              totalPagar,
               selection.serviceSelection.selection_type || integrante.selection_type || "services",
               selection.serviceSelection.id_paquete || integrante.id_paquete || null,
               integrante.contacto?.nombre || integrante.alias,
@@ -993,6 +1088,35 @@ export default async function publicCitasRoutes(app) {
           );
 
           const citaId = citaInsert.rows[0].id_cita;
+          if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
+            try {
+              await recordPromotionApplications(
+                dbClient,
+                {
+                  id_grupo_cita: groupRecord.id_grupo_cita,
+                  id_cita: citaId,
+                  id_cliente: clientProfile.id_cliente || null,
+                  id_persona: clientProfile.id_persona || null,
+                  id_sucursal: branch.id_sucursal,
+                  fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
+                  subtotal_hnl: subtotalServicios,
+                },
+                promocionesPreview,
+                { formal: false }
+              );
+            } catch (promoPersistError) {
+              request.log.warn(
+                {
+                  requestId: request.id,
+                  id_cita: citaId,
+                  id_grupo_cita: groupRecord.id_grupo_cita,
+                  code: promoPersistError?.code || null,
+                  message: promoPersistError?.message || null,
+                },
+                "No se pudo registrar trazabilidad de promociones en hold publico; se continua"
+              );
+            }
+          }
           for (const serviceItem of selection.serviceSelection.items) {
             await dbClient.query(
               `
@@ -1031,7 +1155,11 @@ export default async function publicCitasRoutes(app) {
             [citaId, holdState, expiresAt.toISOString()]
           );
 
-          totalGrupo += Number(selection.serviceSelection.monto_total_hnl || 0);
+          subtotalGrupo += subtotalServicios;
+          descuentoGrupo += descuentoPromociones;
+          totalGrupo += totalPagar;
+          promocionesAplicadasGrupo.push(...(promocionesPreview?.promociones_aplicadas || []));
+          promocionesDescartadasGrupo.push(...(promocionesPreview?.promociones_descartadas || []));
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
 
           bloquesResponse.push({
@@ -1044,7 +1172,9 @@ export default async function publicCitasRoutes(app) {
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
             estado_cita_codigo: targetAppointmentState,
-            monto_total_hnl: Number(selection.serviceSelection.monto_total_hnl || 0),
+            monto_total_hnl: subtotalServicios,
+            descuento_hnl: descuentoPromociones,
+            total_pagar_hnl: totalPagar,
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
           });
@@ -1059,6 +1189,11 @@ export default async function publicCitasRoutes(app) {
             estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
             expires_at: expiresAt.toISOString(),
             monto_total_hnl: totalGrupo,
+            subtotal_hnl: Number(subtotalGrupo.toFixed(2)),
+            descuento_total_hnl: Number(descuentoGrupo.toFixed(2)),
+            total_hnl: Number(totalGrupo.toFixed(2)),
+            promociones_aplicadas: promocionesAplicadasGrupo,
+            promociones_descartadas: promocionesDescartadasGrupo,
             bloques: bloquesResponse,
           },
           { statusCode: 201 }
