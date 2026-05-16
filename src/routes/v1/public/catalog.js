@@ -2,6 +2,7 @@ import { sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 
 const requestIdSchema = { type: "string" };
+const BUSINESS_TIME_ZONE = "America/Tegucigalpa";
 
 const errorResponseSchema = {
   type: "object",
@@ -652,6 +653,8 @@ const PUBLIC_PROMOTIONS_SQL = `
       p.estado,
       ps.vigencia_desde,
       ps.vigencia_hasta,
+      ps.vigencia_hora_desde,
+      ps.vigencia_hora_hasta,
       ps.orden_visual,
       ps.destacada
     FROM public.promociones p
@@ -659,12 +662,15 @@ const PUBLIC_PROMOTIONS_SQL = `
       ON ps.id_promocion = p.id_promocion
     JOIN public.sucursales s
       ON s.id_sucursal = ps.id_sucursal
+    CROSS JOIN (
+      SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::date AS business_date
+    ) business_clock
     WHERE s.deleted_at IS NULL
       AND s.estado IS TRUE
       AND p.estado = 'publicada'
       AND ps.visible_publico IS TRUE
-      AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= CURRENT_DATE)
-      AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= CURRENT_DATE)
+      AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= business_clock.business_date)
+      AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= business_clock.business_date)
       AND ($1::uuid IS NULL OR ps.id_sucursal = $1::uuid)
   ),
   ranked AS (
@@ -699,6 +705,90 @@ const PUBLIC_PROMOTIONS_SQL = `
   WHERE ($1::uuid IS NULL AND rn = 1) OR ($1::uuid IS NOT NULL)
   ORDER BY destacada DESC, orden_visual ASC, titulo ASC
 `;
+
+function getBusinessNowParts() {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(new Date());
+  const pick = (type) => parts.find((entry) => entry.type === type)?.value || "";
+  return {
+    date: `${pick("year")}-${pick("month")}-${pick("day")}`,
+    time: `${pick("hour")}:${pick("minute")}:${pick("second")}`,
+  };
+}
+
+function normalizeIsoDateOnly(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const match = String(value).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+}
+
+function normalizeTimeOnly(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const match = String(value).trim().match(/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
+  if (!match) return null;
+  return `${match[1]}:${match[2]}:${match[3] || "00"}`;
+}
+
+function timeToSeconds(value) {
+  const normalized = normalizeTimeOnly(value);
+  if (!normalized) return null;
+  const [hours, minutes, seconds] = normalized.split(":").map((entry) => Number(entry));
+  return (hours * 3600) + (minutes * 60) + seconds;
+}
+
+function getPromotionVigenciaStatus(promotion, nowParts = getBusinessNowParts()) {
+  const nowDate = normalizeIsoDateOnly(nowParts?.date);
+  const nowTime = normalizeTimeOnly(nowParts?.time);
+  const nowSeconds = timeToSeconds(nowTime);
+  const vigenciaDesde = normalizeIsoDateOnly(promotion?.vigencia_desde);
+  const vigenciaHasta = normalizeIsoDateOnly(promotion?.vigencia_hasta);
+  const horaDesde = normalizeTimeOnly(promotion?.vigencia_hora_desde);
+  const horaHasta = normalizeTimeOnly(promotion?.vigencia_hora_hasta);
+  const horaDesdeSeconds = timeToSeconds(horaDesde);
+  const horaHastaSeconds = timeToSeconds(horaHasta);
+  const crossesMidnight = (
+    horaDesdeSeconds != null
+    && horaHastaSeconds != null
+    && horaDesdeSeconds > horaHastaSeconds
+  );
+
+  if (!vigenciaDesde && !vigenciaHasta && !horaDesde && !horaHasta) return "sin_vigencia";
+  if (vigenciaDesde && nowDate && nowDate < vigenciaDesde) return "programada";
+  if (vigenciaHasta && nowDate && nowDate > vigenciaHasta) return "vencida";
+
+  let inWindow = true;
+  if (horaDesdeSeconds != null || horaHastaSeconds != null) {
+    if (horaDesdeSeconds != null && horaHastaSeconds == null) inWindow = nowSeconds >= horaDesdeSeconds;
+    else if (horaDesdeSeconds == null && horaHastaSeconds != null) inWindow = nowSeconds <= horaHastaSeconds;
+    else if (!crossesMidnight) inWindow = nowSeconds >= horaDesdeSeconds && nowSeconds <= horaHastaSeconds;
+    else inWindow = nowSeconds >= horaDesdeSeconds || nowSeconds <= horaHastaSeconds;
+  }
+
+  if (crossesMidnight && vigenciaDesde && nowDate === vigenciaDesde) {
+    inWindow = nowSeconds >= horaDesdeSeconds;
+  }
+  if (crossesMidnight && vigenciaHasta && nowDate === vigenciaHasta) {
+    inWindow = nowSeconds <= horaHastaSeconds;
+  }
+
+  if (!inWindow) {
+    if (vigenciaDesde && nowDate === vigenciaDesde) return "programada";
+    if (vigenciaHasta && nowDate === vigenciaHasta) return "vencida";
+    if (horaDesdeSeconds != null && nowSeconds < horaDesdeSeconds) return "programada";
+    return "vencida";
+  }
+
+  return "vigente";
+}
 
 function mapServiceRow(row) {
   const grupoCatalogo = String(row.grupo_catalogo || "barberia").trim().toLowerCase() === "otros" ? "otros" : "barberia";
@@ -1126,8 +1216,13 @@ export default async function publicCatalogRoutes(app) {
 
       try {
         const { rows } = await app.db.query(PUBLIC_PROMOTIONS_SQL, [request.query?.id_sucursal ?? null]);
+        const businessNow = getBusinessNowParts();
+        const activeRows = rows.filter((row) => {
+          const status = getPromotionVigenciaStatus(row, businessNow);
+          return status === "vigente" || status === "sin_vigencia";
+        });
         return sendOk(reply, {
-          promociones: rows.map(mapPromotionRow),
+          promociones: activeRows.map(mapPromotionRow),
         });
       } catch (error) {
         request.log.error({ err: error }, "Public catalog promociones error");

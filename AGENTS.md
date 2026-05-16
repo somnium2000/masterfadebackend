@@ -1,8 +1,9 @@
+```md
 # Backend AGENTS.md - MasterFade
 
 ## Rol
 
-Act鷄 como ingeniero backend senior especializado en Fastify, seguridad, permisos, validaciones y estabilidad para QA/producci髇.
+Act煤a como ingeniero backend senior especializado en Fastify, seguridad, permisos, validaciones y estabilidad para QA/producci贸n.
 
 ## Contexto backend
 
@@ -23,19 +24,19 @@ Stack:
 2. No tocar rutas, servicios o middlewares fuera del alcance solicitado.
 3. No refactorizar por preferencia personal.
 4. No cambiar contratos API sin revisar impacto en frontend.
-5. Toda ruta privada debe validar autenticaci髇.
-6. Toda operaci髇 sensible debe validar roles/permisos.
+5. Toda ruta privada debe validar autenticaci贸n.
+6. Toda operaci贸n sensible debe validar roles/permisos.
 7. No confiar solo en validaciones del frontend.
 8. Validar payloads en backend.
-9. No exponer error.message, stack traces, errores SQL ni detalles t閏nicos al cliente.
+9. No exponer error.message, stack traces, errores SQL ni detalles t茅cnicos al cliente.
 10. Usar respuestas controladas y mensajes seguros.
 11. Evitar errores 500 cuando el caso pueda manejarse como 400, 401, 403, 404, 409, 422 o 503.
 12. Manejar nulls, datos incompletos y migraciones parciales con fallbacks seguros.
 13. No eliminar datos si el negocio requiere inactivar/cancelar/deshabilitar.
-14. Mantener trazabilidad en flujos cr韙icos: citas, pagos, membres韆s, personas y seguridad.
+14. Mantener trazabilidad en flujos cr铆ticos: citas, pagos, membres铆as, personas y seguridad.
 15. Los comentarios nuevos deben ser puntuales y llevar iniciales AM.
 
-## M骴ulos cr韙icos
+## M贸dulos cr铆ticos
 
 Revisar con especial cuidado:
 
@@ -50,16 +51,16 @@ Revisar con especial cuidado:
 - src/routes/v1/admin/seguridad.js
 - src/services/membershipService.js
 
-## Validaci髇 obligatoria antes de cerrar
+## Validaci贸n obligatoria antes de cerrar
 
 1. Auth.
 2. Roles/permisos.
-3. Validaci髇 de payload.
+3. Validaci贸n de payload.
 4. Manejo de errores.
 5. Status codes correctos.
 6. Contrato API.
 7. Impacto frontend.
-8. Ausencia de filtraci髇 t閏nica.
+8. Ausencia de filtraci贸n t茅cnica.
 9. Build/test/lint si aplica.
 
 ## Formato final obligatorio
@@ -71,3 +72,4 @@ D. Cambios aplicados
 E. Validaciones realizadas  
 F. Riesgos pendientes  
 G. Impacto frontend si aplica  
+```

@@ -24,6 +24,11 @@ import {
   normalizeRedeemContextToken,
   resolveRedeemContextForHold,
 } from "../../services/pointsService.js";
+import {
+  previewPromotionsForAppointment,
+  recordPromotionApplications,
+  markPromotionUsagesForGroup,
+} from "../../services/promociones/promocionesService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
@@ -1512,7 +1517,49 @@ export default async function citasRoutes(app) {
             coverage.extraTotalHnl = Math.max(0, coverage.extraTotalHnl - rewardCoveredInBlock);
           }
           const descuento = Number(coverage.coveredTotalHnl || 0);
-          const totalPagar = Number(coverage.extraTotalHnl || 0);
+          let totalPagar = Number(coverage.extraTotalHnl || 0);
+          let descuentoPromociones = 0;
+          let promocionesPreview = null;
+
+          try {
+            const promoContext = {
+              id_sucursal: branch.id_sucursal,
+              id_empleado_barbero: selection.barber.id_empleado,
+              id_cliente: clienteId,
+              id_persona: personaId,
+              id_grupo_cita: groupRecord.id_grupo_cita,
+              fecha_hora: selection.startDateTime.toISOString(),
+              fecha: selection.startDateTime.toISOString().slice(0, 10),
+              fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
+              hora: selection.startDateTime.toISOString().slice(11, 16),
+              subtotal_hnl: totalPagar,
+              servicios: selection.serviceSelection.items || [],
+              paquetes: selection.serviceSelection.id_paquete
+                ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+                : [],
+              codigo_promocional: request.body?.codigo_promocional || null,
+              canal: "privado",
+              es_cliente_autenticado: true,
+              es_titular: isTitular,
+            };
+            promocionesPreview = await previewPromotionsForAppointment(dbClient, promoContext);
+            if (!promocionesPreview.usedFallbackLegacy) {
+              descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
+              totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
+            }
+          } catch (promoError) {
+            request.log.warn(
+              {
+                requestId: request.id,
+                id_sucursal: branch.id_sucursal,
+                id_grupo_cita: groupRecord.id_grupo_cita,
+                code: promoError?.code || null,
+                message: promoError?.message || null,
+              },
+              "No se pudo evaluar promociones normalizadas; se mantiene fallback legacy"
+            );
+          }
+          const descuentoTotal = Number((descuento + descuentoPromociones).toFixed(2));
 
           if (isTitular && hasMembership) {
             const selectedServiceMap = mapServicesById(selection.serviceSelection.items);
@@ -1603,7 +1650,7 @@ export default async function citasRoutes(app) {
               selection.serviceSelection.duracion_total_min,
               selection.serviceSelection.buffer_total_min,
               subtotalServicios,
-              descuento,
+              descuentoTotal,
               totalPagar,
               Boolean(isTitular && rewardRedeemContext),
               selection.serviceSelection.selection_type || integrante.selection_type || "services",
@@ -1613,6 +1660,35 @@ export default async function citasRoutes(app) {
           );
 
           const citaId = citaInsert.rows[0].id_cita;
+          if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
+            try {
+              await recordPromotionApplications(
+                dbClient,
+                {
+                  id_grupo_cita: groupRecord.id_grupo_cita,
+                  id_cita: citaId,
+                  id_cliente: clienteId,
+                  id_persona: personaId,
+                  id_sucursal: branch.id_sucursal,
+                  fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
+                  subtotal_hnl: Number(coverage.extraTotalHnl || 0),
+                },
+                promocionesPreview,
+                { formal: false }
+              );
+            } catch (promoPersistError) {
+              request.log.warn(
+                {
+                  requestId: request.id,
+                  id_cita: citaId,
+                  id_grupo_cita: groupRecord.id_grupo_cita,
+                  code: promoPersistError?.code || null,
+                  message: promoPersistError?.message || null,
+                },
+                "No se pudo registrar trazabilidad de promociones en hold; se continua"
+              );
+            }
+          }
           if (isTitular && rewardRedeemContext) {
             rewardAppliedInHold = true;
             rewardLinkedCitaId = citaId;
@@ -1665,7 +1741,7 @@ export default async function citasRoutes(app) {
           coveredItemsCount += coveredCount;
           extraItemsCount += extraCount;
           subtotalGrupo += subtotalServicios;
-          descuentoGrupo += descuento;
+          descuentoGrupo += descuentoTotal;
           totalGrupo += totalPagar;
           extrasPendientesGrupo += totalPagar;
 
@@ -1680,7 +1756,7 @@ export default async function citasRoutes(app) {
             fecha_inicio: selection.startDateTime.toISOString(),
             estado_cita_codigo: "en_espera",
             monto_total_hnl: subtotalServicios,
-            descuento_hnl: descuento,
+            descuento_hnl: descuentoTotal,
             total_pagar_hnl: totalPagar,
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
@@ -2000,6 +2076,12 @@ export default async function citasRoutes(app) {
             motivo: "Canje de recompensa ruta a tu cortesia",
             createdByUserId: request.claims?.user?.id_usuario ?? null,
           });
+          step = "markPromotionUsagesForGroup_already_confirmed";
+          await markPromotionUsagesForGroup(dbClient, {
+            id_grupo_cita: group.id_grupo_cita,
+            id_cliente: clienteId,
+            id_persona: personaId,
+          });
           step = "tx_commit_already_confirmed";
           await dbClient.query("COMMIT");
           txStarted = false;
@@ -2070,6 +2152,12 @@ export default async function citasRoutes(app) {
           canjeContextToken,
           motivo: "Canje de recompensa ruta a tu cortesia",
           createdByUserId: request.claims?.user?.id_usuario ?? null,
+        });
+        step = "markPromotionUsagesForGroup";
+        await markPromotionUsagesForGroup(dbClient, {
+          id_grupo_cita: group.id_grupo_cita,
+          id_cliente: clienteId,
+          id_persona: personaId,
         });
         step = "tx_commit";
         await dbClient.query("COMMIT");

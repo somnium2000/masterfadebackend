@@ -23,6 +23,7 @@ import {
 } from "../../../services/agendaService.js";
 
 const requestIdSchema = { type: "string" };
+const BUSINESS_TIME_ZONE = "America/Tegucigalpa";
 
 const errorResponseSchema = {
   type: "object",
@@ -115,6 +116,7 @@ const bookingPromotionSchema = {
   type: "object",
   properties: {
     id_promocion: { type: "string", format: "uuid" },
+    id_promocion_regla: { type: "string", format: "uuid" },
     id_sucursal: { type: "string", format: "uuid" },
     titulo: { type: "string" },
     subtitulo: { type: ["string", "null"] },
@@ -137,6 +139,7 @@ const bookingPromotionSchema = {
   },
   required: [
     "id_promocion",
+    "id_promocion_regla",
     "id_sucursal",
     "titulo",
     "subtitulo",
@@ -161,9 +164,10 @@ const bookingPromotionSchema = {
 };
 
 const PUBLIC_BOOKING_PROMOTIONS_SQL = `
-  -- JK: Expone promociones publicas utilizables en agendamiento con vigencia y datos operativos completos.
+  // JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
   SELECT
     p.id_promocion,
+    pra.id_promocion_regla,
     ps.id_sucursal,
     p.titulo,
     p.subtitulo,
@@ -171,10 +175,10 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
     p.tipo_promocion,
     p.aplica_a,
     p.mecanica,
-    p.id_servicio_objetivo,
-    p.id_paquete_objetivo,
-    p.valor_descuento,
-    p.cantidad_requerida,
+    COALESCE(pia.id_servicio, p.id_servicio_objetivo) AS id_servicio_objetivo,
+    COALESCE(pia.id_paquete, p.id_paquete_objetivo) AS id_paquete_objetivo,
+    COALESCE(pra.valor_descuento, p.valor_descuento) AS valor_descuento,
+    COALESCE(pia.cantidad_minima, p.cantidad_requerida) AS cantidad_requerida,
     p.cantidad_bonificada,
     ps.vigencia_desde,
     ps.vigencia_hasta,
@@ -185,34 +189,33 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
   FROM public.promociones p
   JOIN public.promociones_sucursal ps
     ON ps.id_promocion = p.id_promocion
+  JOIN public.promociones_reglas_agendamiento pra
+    ON pra.id_promocion = p.id_promocion
+   AND pra.activo IS TRUE
+  LEFT JOIN public.promociones_items_agendamiento pia
+    ON pia.id_promocion_regla = pra.id_promocion_regla
+   AND (
+      (pia.tipo_item_codigo = 'servicio' AND pia.id_servicio IS NOT NULL)
+      OR (pia.tipo_item_codigo = 'paquete' AND pia.id_paquete IS NOT NULL)
+   )
   JOIN public.sucursales su
     ON su.id_sucursal = ps.id_sucursal
   LEFT JOIN public.servicios s
-    ON s.id_servicio = p.id_servicio_objetivo
+    ON s.id_servicio = COALESCE(pia.id_servicio, p.id_servicio_objetivo)
    AND s.deleted_at IS NULL
   LEFT JOIN public.paquetes pk
-    ON pk.id_paquete = p.id_paquete_objetivo
+    ON pk.id_paquete = COALESCE(pia.id_paquete, p.id_paquete_objetivo)
    AND pk.deleted_at IS NULL
+  CROSS JOIN (
+    SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::date AS business_date
+  ) business_clock
   WHERE ps.id_sucursal = $1::uuid
     AND su.deleted_at IS NULL
     AND su.estado IS TRUE
     AND p.estado = 'publicada'
     AND ps.visible_publico IS TRUE
-    AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= CURRENT_DATE)
-    AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= CURRENT_DATE)
-    AND (
-      (ps.vigencia_hora_desde IS NULL AND ps.vigencia_hora_hasta IS NULL)
-      OR (ps.vigencia_hora_desde IS NOT NULL AND ps.vigencia_hora_hasta IS NULL AND LOCALTIME >= ps.vigencia_hora_desde)
-      OR (ps.vigencia_hora_desde IS NULL AND ps.vigencia_hora_hasta IS NOT NULL AND LOCALTIME <= ps.vigencia_hora_hasta)
-      OR (
-        ps.vigencia_hora_desde IS NOT NULL
-        AND ps.vigencia_hora_hasta IS NOT NULL
-        AND (
-          (ps.vigencia_hora_desde <= ps.vigencia_hora_hasta AND LOCALTIME BETWEEN ps.vigencia_hora_desde AND ps.vigencia_hora_hasta)
-          OR (ps.vigencia_hora_desde > ps.vigencia_hora_hasta AND (LOCALTIME >= ps.vigencia_hora_desde OR LOCALTIME <= ps.vigencia_hora_hasta))
-        )
-      )
-    )
+    AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= business_clock.business_date)
+    AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= business_clock.business_date)
     AND p.tipo_promocion IN ('descuento_servicio', 'descuento_paquete', 'dos_por_uno_servicio')
     AND p.aplica_a IN ('servicio', 'paquete')
     AND p.mecanica IN ('porcentaje', 'monto_fijo', 'dos_por_uno')
@@ -224,7 +227,7 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
     AND (
       (
         p.aplica_a = 'servicio'
-        AND p.id_servicio_objetivo IS NOT NULL
+        AND COALESCE(pia.id_servicio, p.id_servicio_objetivo) IS NOT NULL
         AND s.id_servicio IS NOT NULL
         AND s.activo IS TRUE
         AND s.agendable IS TRUE
@@ -232,7 +235,7 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
         AND EXISTS (
           SELECT 1
           FROM public.servicios_tarifas st
-          WHERE st.id_servicio = p.id_servicio_objetivo
+          WHERE st.id_servicio = COALESCE(pia.id_servicio, p.id_servicio_objetivo)
             AND st.id_sucursal = ps.id_sucursal
             AND st.deleted_at IS NULL
             AND st.activo IS TRUE
@@ -243,13 +246,13 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
       )
       OR (
         p.aplica_a = 'paquete'
-        AND p.id_paquete_objetivo IS NOT NULL
+        AND COALESCE(pia.id_paquete, p.id_paquete_objetivo) IS NOT NULL
         AND pk.id_paquete IS NOT NULL
         AND pk.activo IS TRUE
         AND EXISTS (
           SELECT 1
           FROM public.paquetes_sucursal psq
-          WHERE psq.id_paquete = p.id_paquete_objetivo
+          WHERE psq.id_paquete = COALESCE(pia.id_paquete, p.id_paquete_objetivo)
             AND psq.id_sucursal = ps.id_sucursal
             AND psq.activo IS TRUE
             AND psq.visible_publico IS TRUE
@@ -350,7 +353,10 @@ function buildPromotionSummary(row) {
     || (aplicaA === "paquete" && !hasPackageTarget)
     || (mecanica === "porcentaje" && !hasDiscountValue)
     || (mecanica === "monto_fijo" && !hasDiscountValue)
-    || (mecanica === "dos_por_uno" && !hasServiceTarget)
+    || (
+      mecanica === "dos_por_uno"
+      && ((aplicaA === "paquete" && !hasPackageTarget) || (aplicaA !== "paquete" && !hasServiceTarget))
+    )
   );
   if (missingOperationalData) return "Sin aplicación configurada";
 
@@ -367,18 +373,19 @@ function buildPromotionSummary(row) {
     const bonificada = Number(row?.cantidad_bonificada ?? 1);
     const safeRequerida = Number.isInteger(requerida) && requerida > 0 ? requerida : 1;
     const safeBonificada = Number.isInteger(bonificada) && bonificada > 0 ? bonificada : 1;
-    return `${scopeLabel} · ${safeRequerida + safeBonificada}x${safeRequerida}`;
+    const paidUnits = Math.max(0, safeRequerida - safeBonificada);
+    return `${scopeLabel} · Compra ${safeRequerida}, paga ${paidUnits}`;
   }
 
   return "Sin aplicación configurada";
 }
 
 function mapBookingPromotionRow(row) {
-  // JK: Expone payload de promociones amigable para el flujo de agendamiento sin tocar contratos de pago.
   const paragraphs = normalizePromotionParagraphs(row?.parrafos);
   return {
     id_promocion: row.id_promocion,
-    id_sucursal: row.id_sucursal,
+    id_promocion_regla: row.id_promocion_regla,
+    id_sucursal: String(row.id_sucursal || "").trim(),
     titulo: row.titulo,
     subtitulo: row.subtitulo ?? null,
     descripcion: paragraphs[0] ?? (row.subtitulo ?? null),

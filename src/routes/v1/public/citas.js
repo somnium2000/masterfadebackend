@@ -86,6 +86,8 @@ const holdBlockSchema = {
     fecha_inicio: { type: "string", format: "date-time" },
     estado_cita_codigo: { type: "string" },
     monto_total_hnl: { type: "number" },
+    descuento_hnl: { type: "number" },
+    total_pagar_hnl: { type: "number" },
     duracion_total_min: { type: "integer" },
     buffer_total_min: { type: "integer" },
   },
@@ -100,6 +102,8 @@ const holdBlockSchema = {
     "fecha_inicio",
     "estado_cita_codigo",
     "monto_total_hnl",
+    "descuento_hnl",
+    "total_pagar_hnl",
     "duracion_total_min",
     "buffer_total_min",
   ],
@@ -458,6 +462,8 @@ function normalizeBlocksPayload(body, titularPayload) {
       id_barbero: body?.id_barbero ?? null,
       selection_type: body?.selection_type ?? "services",
       id_paquete: body?.id_paquete ?? null,
+      id_promocion: body?.id_promocion ?? null,
+      id_promocion_regla: body?.id_promocion_regla ?? null,
       fecha_inicio: body.fecha_inicio,
       servicios: body.servicios,
     }]
@@ -764,6 +770,8 @@ export default async function publicCitasRoutes(app) {
                       additionalProperties: false,
                     },
                   },
+                  id_promocion: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  id_promocion_regla: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                 },
                 additionalProperties: false,
               },
@@ -783,6 +791,8 @@ export default async function publicCitasRoutes(app) {
                 additionalProperties: false,
               },
             },
+            id_promocion: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+            id_promocion_regla: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
             notas: { anyOf: [{ type: "string", maxLength: 500 }, { type: "null" }] },
           },
           additionalProperties: false,
@@ -799,6 +809,11 @@ export default async function publicCitasRoutes(app) {
                   estado_grupo_codigo: { type: "string" },
                   expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
                   monto_total_hnl: { type: "number" },
+                  subtotal_hnl: { type: "number" },
+                  descuento_total_hnl: { type: "number" },
+                  total_hnl: { type: "number" },
+                  promociones_aplicadas: { type: "array", items: { type: "object", additionalProperties: true } },
+                  promociones_descartadas: { type: "array", items: { type: "object", additionalProperties: true } },
                   bloques: { type: "array", items: holdBlockSchema },
                 },
                 required: ["id_grupo_cita", "estado_grupo_codigo", "expires_at", "monto_total_hnl", "bloques"],
@@ -1094,4 +1109,3 @@ export default async function publicCitasRoutes(app) {
     }
   );
 }
-
