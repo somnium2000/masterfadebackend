@@ -18,11 +18,6 @@ const CSRF_EXEMPT_PATHS = [
   "/v1/auth/reset-password",
   "/v1/pagos/webhook/mock",
   "/v1/pagos/webhook/banpais",
-  "/v1/public/pagos/webhooks/mock",
-  "/v1/public/pagos/webhooks/banpais",
-];
-const CSRF_EXEMPT_PREFIXES = [
-  "/v1/public/pagos/webhooks/",
 ];
 
 function parseBoolean(value, fallback = false) {
@@ -40,8 +35,7 @@ function isUnsafeMethod(method) {
 
 function isCsrfExemptPath(pathname) {
   const path = String(pathname || "");
-  return CSRF_EXEMPT_PATHS.some((allowed) => path === allowed || path.endsWith(allowed))
-    || CSRF_EXEMPT_PREFIXES.some((allowed) => path.startsWith(allowed));
+  return CSRF_EXEMPT_PATHS.some((allowed) => path === allowed || path.endsWith(allowed));
 }
 
 function normalizeOrigin(value) {
@@ -134,8 +128,7 @@ async function securityPlugin(app) {
     if (!isUnsafeMethod(request.method)) return;
 
     const routePath = String(request.routerPath || request.routeOptions?.url || "");
-    const requestPath = String(request.url || "").split("?")[0];
-    if (isCsrfExemptPath(routePath) || isCsrfExemptPath(requestPath)) return;
+    if (isCsrfExemptPath(routePath)) return;
 
     const sessionCookie = request.cookies?.[SESSION_COOKIE_NAME];
     if (!sessionCookie) return;

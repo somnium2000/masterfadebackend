@@ -1,9 +1,4 @@
 import { MockPaymentProvider } from "./MockPaymentProvider.js";
-import { PaymentSimulatorProvider, isPaymentSimulatorEnabled } from "./PaymentSimulatorProvider.js";
-import {
-    assertPaymentProviderConfig,
-    normalizePaymentProviderCode,
-} from "./paymentRuntimeGuard.js";
 // import { BanpaisPaymentProvider } from "./BanpaisPaymentProvider.js"; // Descomentar en Sprint 3
 
 /**
@@ -19,41 +14,26 @@ import {
  */
 export class PaymentProviderFactory {
     static _instance = null;
-    static _instances = new Map();
-
-    static _normalizeProvider(providerCode) {
-        return normalizePaymentProviderCode(providerCode || process.env.PAYMENT_PROVIDER);
-    }
-
-    static _assertProviderAllowed(provider) {
-        assertPaymentProviderConfig({
-            ...process.env,
-            PAYMENT_PROVIDER: provider,
-        });
-    }
 
     /**
      * Retorna instancia singleton del proveedor activo.
      * @returns {import('./PaymentProvider.js').PaymentProvider}
      */
-    static create({ providerCode } = {}) {
-        const provider = PaymentProviderFactory._normalizeProvider(providerCode);
-        PaymentProviderFactory._assertProviderAllowed(provider);
-
-        if (PaymentProviderFactory._instances.has(provider)) {
-            return PaymentProviderFactory._instances.get(provider);
+    static create() {
+        if (PaymentProviderFactory._instance) {
+            return PaymentProviderFactory._instance;
         }
 
-        let instance;
+        const provider = String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase().trim();
+        const nodeEnv = String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase();
+        if ((nodeEnv === "production" || nodeEnv === "prod") && provider === "mock") {
+            throw new Error("PAYMENT_PROVIDER=mock no esta permitido en produccion.");
+        }
+
         switch (provider) {
             case "mock":
-                instance = new MockPaymentProvider({
+                PaymentProviderFactory._instance = new MockPaymentProvider({
                     mockResult: process.env.MOCK_PAYMENT_RESULT || "PAID",
-                });
-                break;
-            case "simulator":
-                instance = new PaymentSimulatorProvider({
-                    enabled: isPaymentSimulatorEnabled(),
                 });
                 break;
 
@@ -66,17 +46,14 @@ export class PaymentProviderFactory {
             //   break;
 
             default:
-                throw new Error(`PAYMENT_PROVIDER no reconocido: ${provider}. Proveedores disponibles: mock, simulator.`);
+                PaymentProviderFactory._instance = new MockPaymentProvider();
         }
 
-        PaymentProviderFactory._instances.set(provider, instance);
-        PaymentProviderFactory._instance = instance;
-        return instance;
+        return PaymentProviderFactory._instance;
     }
 
     /** Reiniciar singleton (útil en tests) */
     static reset() {
         PaymentProviderFactory._instance = null;
-        PaymentProviderFactory._instances.clear();
     }
 }

@@ -2,17 +2,14 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
   assertUuid,
+  ensureActiveBranch,
   expireStaleAppointmentReservations,
-  getAgendamientoConfig,
+  getHoldDurationMinutes,
   getSystemParameters,
   parseSinglePackageId,
   parseDateTime,
+  resolveBookingSelection,
 } from "../../../services/agendaService.js";
-import {
-  crearReservaHoldBaseNormalizada,
-  findActiveAccountByEmail,
-} from "../../../services/agendamientoReservaService.js";
-import { releaseAppointmentHoldGroup } from "../../../services/appointmentHoldReleaseService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -113,87 +110,38 @@ const holdBlockSchema = {
   additionalProperties: false,
 };
 
-function normalizePublicParams(paramsMap, agendamientoConfig = null) {
+function normalizePublicParams(paramsMap) {
   const hold = paramsMap?.hold_duracion_min?.valor_numero;
   const noShow = paramsMap?.no_show_min?.valor_numero;
   const globalBuffer = paramsMap?.agenda_buffer_global_min?.valor_numero;
   const companions = paramsMap?.permitir_acompanantes?.valor_booleano;
   const fullPayment = paramsMap?.pago_total_obligatorio?.valor_booleano;
   const simulationNoPayment = paramsMap?.simulacion_sin_pago?.valor_booleano;
-  const holdTtlMinutos = Number(agendamientoConfig?.holdTtlMinutos);
-  const maxAcompanantes = Number(agendamientoConfig?.maxAcompanantes);
-  const allowCompanionsFromConfig = Number.isFinite(maxAcompanantes) ? maxAcompanantes > 0 : null;
 
   return {
-    hold_duracion_min: Number.isFinite(holdTtlMinutos)
-      ? holdTtlMinutos
-      : (Number.isFinite(Number(hold)) ? Number(hold) : 5),
+    hold_duracion_min: Number.isFinite(Number(hold)) ? Number(hold) : 5,
     no_show_min: Number.isFinite(Number(noShow)) ? Number(noShow) : 10,
     agenda_buffer_global_min: Number.isFinite(Number(globalBuffer)) ? Number(globalBuffer) : 0,
-    permitir_acompanantes: typeof allowCompanionsFromConfig === "boolean"
-      ? allowCompanionsFromConfig
-      : (typeof companions === "boolean" ? companions : false),
+    permitir_acompanantes: typeof companions === "boolean" ? companions : false,
     pago_total_obligatorio: typeof fullPayment === "boolean" ? fullPayment : true,
     simulacion_sin_pago: typeof simulationNoPayment === "boolean" ? simulationNoPayment : false,
   };
 }
+
 const PUBLIC_CITAS_SAFE_DETAIL_KEYS = new Set([
   "field",
   "blockIndex",
   "maxCompanions",
   "selection_type",
   "alias",
-  "id_servicio",
-  "maxPromotions",
-  "email",
-  "rol_integrante_codigo",
-  "orden_integrante",
-  "code",
-  "message",
-  "conflicts",
 ]);
-
-const PUBLIC_CITAS_SAFE_CONFLICT_KEYS = new Set([
-  "blockIndex",
-  "field",
-  "alias",
-  "email",
-  "rol_integrante_codigo",
-  "code",
-  "message",
-]);
-
-function sanitizePublicCitasConflict(rawConflict) {
-  if (!rawConflict || typeof rawConflict !== "object" || Array.isArray(rawConflict)) return null;
-  const safeConflict = {};
-  for (const [key, value] of Object.entries(rawConflict)) {
-    if (!PUBLIC_CITAS_SAFE_CONFLICT_KEYS.has(key)) continue;
-    if (key === "blockIndex") {
-      const parsed = Number(value);
-      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeConflict[key] = parsed;
-      continue;
-    }
-    if (value == null) continue;
-    safeConflict[key] = String(value).trim().slice(0, key === "message" ? 220 : 160);
-  }
-  return Object.keys(safeConflict).length ? safeConflict : null;
-}
 
 function sanitizePublicCitasErrorDetails(rawDetails) {
   if (!rawDetails || typeof rawDetails !== "object" || Array.isArray(rawDetails)) return undefined;
   const safeDetails = {};
   for (const [key, value] of Object.entries(rawDetails)) {
     if (!PUBLIC_CITAS_SAFE_DETAIL_KEYS.has(key)) continue;
-    if (key === "conflicts") {
-      if (!Array.isArray(value)) continue;
-      const conflicts = value
-        .map((item) => sanitizePublicCitasConflict(item))
-        .filter(Boolean)
-        .slice(0, 20);
-      if (conflicts.length) safeDetails[key] = conflicts;
-      continue;
-    }
-    if (key === "blockIndex" || key === "maxCompanions" || key === "maxPromotions" || key === "orden_integrante") {
+    if (key === "blockIndex" || key === "maxCompanions") {
       const parsed = Number(value);
       if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 20) safeDetails[key] = parsed;
       continue;
@@ -202,106 +150,6 @@ function sanitizePublicCitasErrorDetails(rawDetails) {
     safeDetails[key] = String(value).trim().slice(0, 160);
   }
   return Object.keys(safeDetails).length ? safeDetails : undefined;
-}
-
-function buildEmailActiveUserDetails({
-  email,
-  field = "titular.email",
-  blockIndex = 0,
-  alias = "Titular",
-  rolIntegranteCodigo = "titular",
-  ordenIntegrante = 1,
-} = {}) {
-  return {
-    field,
-    blockIndex,
-    alias,
-    email,
-    rol_integrante_codigo: rolIntegranteCodigo,
-    orden_integrante: ordenIntegrante,
-  };
-}
-
-function normalizeContactAlias(value, fallback) {
-  const normalized = String(value || "").trim().replace(/\s+/g, " ").slice(0, 80);
-  return normalized || fallback;
-}
-
-function normalizeContactValidationPayload(rawContact, fallbackIndex) {
-  const rawIndex = Number(rawContact?.blockIndex);
-  const blockIndex = Number.isInteger(rawIndex) && rawIndex >= 0
-    ? Math.min(rawIndex, 20)
-    : fallbackIndex;
-  const rolIntegranteCodigo = blockIndex === 0 ? "titular" : "acompanante";
-  const aliasFallback = blockIndex === 0 ? "Titular" : `Acompanante ${blockIndex}`;
-
-  return {
-    blockIndex,
-    rol_integrante_codigo: rolIntegranteCodigo,
-    alias: normalizeContactAlias(rawContact?.alias, aliasFallback),
-    email: normalizeEmail(rawContact?.email),
-  };
-}
-
-function buildContactEmailConflict(contact, code, message) {
-  return {
-    blockIndex: contact.blockIndex,
-    field: "contactEmail",
-    alias: contact.alias,
-    email: contact.email,
-    rol_integrante_codigo: contact.rol_integrante_codigo,
-    code,
-    message,
-  };
-}
-
-function buildActiveContactEmailMessage(contact) {
-  if (contact.rol_integrante_codigo === "titular") {
-    return "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.";
-  }
-  return `El correo de ${contact.alias} pertenece a una cuenta activa. Ese acompanante debe iniciar sesion o usar otro correo.`;
-}
-
-async function findContactEmailConflicts(client, contacts) {
-  const conflicts = [];
-  for (const contact of contacts) {
-    if (!contact.email) {
-      if (contact.rol_integrante_codigo === "titular") {
-        conflicts.push(buildContactEmailConflict(
-          contact,
-          "PUBLIC_CITAS_CONTACT_EMAIL_REQUIRED",
-          "Ingresa el correo del titular."
-        ));
-      }
-      continue;
-    }
-
-    if (!EMAIL_PATTERN.test(contact.email)) {
-      const message = contact.rol_integrante_codigo === "titular"
-        ? "Ingresa un correo valido del titular."
-        : `El correo de ${contact.alias} debe ser valido.`;
-      conflicts.push(buildContactEmailConflict(contact, "PUBLIC_CITAS_CONTACT_EMAIL_INVALID", message));
-      continue;
-    }
-
-    const activeAccount = await findActiveAccountByEmail(client, contact.email);
-    if (!activeAccount) continue;
-    conflicts.push(buildContactEmailConflict(
-      contact,
-      "EMAIL_BELONGS_TO_ACTIVE_USER",
-      buildActiveContactEmailMessage(contact)
-    ));
-  }
-  return conflicts;
-}
-
-async function ensureEmailDoesNotBelongActiveAccount(client, correo) {
-  const activeAccount = await findActiveAccountByEmail(client, correo);
-  if (!activeAccount) return;
-  throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar.", {
-    code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-    details: buildEmailActiveUserDetails({ email: correo }),
-  });
 }
 
 function sendHandled(reply, request, error, message, code) {
@@ -320,7 +168,6 @@ function sendHandled(reply, request, error, message, code) {
       code: error.code,
       ...(safeDetails ? { details: safeDetails } : {}),
       requestId: request.id,
-      exposeDetails: Boolean(safeDetails),
     });
   }
 
@@ -341,8 +188,7 @@ function isAvailabilityConflictError(error) {
   if (error.statusCode !== 409) return false;
   const safeCode = String(error.code || "").trim().toUpperCase();
   return safeCode.startsWith("AGENDA_")
-    || safeCode === "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER"
-    || safeCode === "SLOT_NOT_AVAILABLE";
+    || safeCode === "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER";
 }
 
 function resolveSafeConflictReason(error) {
@@ -351,7 +197,6 @@ function resolveSafeConflictReason(error) {
   const safeCode = String(error.code || "").trim().toUpperCase();
   if (safeCode.startsWith("AGENDA_")) return safeCode;
   if (safeCode === "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER") return safeCode;
-  if (safeCode === "SLOT_NOT_AVAILABLE") return safeCode;
   return "UNKNOWN_CONFLICT";
 }
 
@@ -411,6 +256,14 @@ function hasUnsafeText(rawValue) {
 
 function normalizeEmail(rawEmail) {
   return String(rawEmail || "").trim().toLowerCase();
+}
+
+function parseIsoDateAndTime(rawDateTime) {
+  const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (!match) {
+    return { fecha: null, hora: null };
+  }
+  return { fecha: match[1], hora: match[2] };
 }
 
 function getDateTimePartsInTimeZone(dateValue, timeZone = HONDURAS_TIME_ZONE) {
@@ -598,24 +451,6 @@ function validateCompanionContactPayload(contacto, { alias, index }) {
 }
 
 function normalizeBlocksPayload(body, titularPayload) {
-  const normalizePromotionIds = (rawValue, fieldBase) => {
-    const list = Array.isArray(rawValue) ? rawValue : (rawValue ? [rawValue] : []);
-    const unique = new Set();
-    for (let i = 0; i < list.length; i += 1) {
-      const safeId = assertUuid(list[i], `${fieldBase}[${i}]`);
-      if (safeId) unique.add(safeId);
-    }
-    return [...unique];
-  };
-
-  const rootPromotionIds = normalizePromotionIds(
-    [
-      ...(body?.promotionId ? [body.promotionId] : []),
-      ...(Array.isArray(body?.promotionIds) ? body.promotionIds : []),
-    ],
-    "promotionIds"
-  );
-
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
   const hasLegacySelection = body?.selection_type === "package" || body?.selection_type === "mixed"
     ? Boolean(body?.fecha_inicio && body?.id_paquete)
@@ -674,17 +509,6 @@ function normalizeBlocksPayload(body, titularPayload) {
     const serviceIds = (selectionType === "services" || selectionType === "mixed")
       ? servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"))
       : [];
-    const blockPromotionIds = normalizePromotionIds(
-      [
-        ...(item?.promotionId ? [item.promotionId] : []),
-        ...(Array.isArray(item?.promotionIds) ? item.promotionIds : []),
-      ],
-      `integrantes[${index}].promotionIds`
-    );
-    const promotionIds = [...new Set([
-      ...(index === 0 ? rootPromotionIds : []),
-      ...blockPromotionIds,
-    ])];
 
     const fechaInicio = String(item?.fecha_inicio || "").trim();
     assertDateTimeNotPastInHonduras(fechaInicio, "fecha_inicio");
@@ -695,7 +519,6 @@ function normalizeBlocksPayload(body, titularPayload) {
       id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
       selection_type: selectionType,
       id_paquete: packageId,
-      promotionIds,
       fecha_inicio: fechaInicio,
       serviceIds,
       contacto: index === 0
@@ -714,7 +537,58 @@ function normalizeBlocksPayload(body, titularPayload) {
 async function resolveOrCreatePublicClient(client, payload) {
   const { nombre, nombres, apellidos, telefono, email, idSucursal } = payload;
 
-  await ensureEmailDoesNotBelongActiveAccount(client, email);
+  const existingActiveUserByEmailResult = await client.query(
+    `
+      SELECT u.id_usuario
+      FROM public.usuarios u
+      JOIN public.personas p
+        ON p.id_persona = u.id_persona
+       AND p.deleted_at IS NULL
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE u.deleted_at IS NULL
+        AND COALESCE(u.estado, TRUE) IS TRUE
+        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
+        AND lower(co.direccion_correo::text) = lower($1)
+      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+      LIMIT 1
+    `,
+    [email]
+  );
+
+  if (existingActiveUserByEmailResult.rows[0]) {
+    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesión para continuar.", {
+      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+      details: { field: "titular.email" },
+    });
+  }
+
+  const existingUserClientResult = await client.query(
+    `
+      SELECT c.id_cliente, c.id_persona
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+       AND p.deleted_at IS NULL
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE c.deleted_at IS NULL
+        AND c.estado IS TRUE
+        AND lower(co.direccion_correo::text) = lower($1)
+      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
+      LIMIT 1
+    `,
+    [email]
+  );
+
+  if (existingUserClientResult.rows[0]) {
+    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesión para continuar.", {
+      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+      details: { field: "titular.email" },
+    });
+  }
 
   const existingPersonaResult = await client.query(
     `
@@ -815,14 +689,13 @@ export default async function publicCitasRoutes(app) {
           ),
           getSystemParameters(app.db),
         ]);
-        const agendamientoConfig = await getAgendamientoConfig(app.db, { logger: request.log });
 
         const sucursales = branchResult.rows.map((row) => ({
           id_sucursal: row.id_sucursal,
           nombre_sucursal: row.nombre_sucursal || "Sucursal",
         }));
 
-        const parametros = normalizePublicParams(paramsMap, agendamientoConfig);
+        const parametros = normalizePublicParams(paramsMap);
 
         return sendOk(reply, { sucursales, parametros });
       } catch (error) {
@@ -831,130 +704,6 @@ export default async function publicCitasRoutes(app) {
           code: "PUBLIC_CITAS_CONTEXT_ERROR",
           requestId: request.id,
         });
-      }
-    }
-  );
-
-  app.post(
-    "/validar-contactos",
-    {
-      schema: {
-        body: {
-          type: "object",
-          required: ["contactos"],
-          properties: {
-            contactos: {
-              type: "array",
-              minItems: 1,
-              maxItems: 20,
-              items: {
-                type: "object",
-                required: ["blockIndex", "rol_integrante_codigo", "alias"],
-                properties: {
-                  blockIndex: { type: "integer", minimum: 0, maximum: 20 },
-                  rol_integrante_codigo: { type: "string", enum: ["titular", "acompanante"] },
-                  alias: { type: "string", minLength: 1, maxLength: 80 },
-                  email: { anyOf: [{ type: "string", maxLength: 160 }, { type: "null" }] },
-                },
-                additionalProperties: false,
-              },
-            },
-          },
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: {
-                type: "object",
-                properties: {
-                  valid: { type: "boolean" },
-                  checked: { type: "integer" },
-                },
-                required: ["valid", "checked"],
-                additionalProperties: false,
-              },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          409: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const db = app.db;
-      if (!db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
-      }
-
-      try {
-        const rawContacts = Array.isArray(request.body?.contactos) ? request.body.contactos : [];
-        const contactos = rawContacts.map((contacto, index) => normalizeContactValidationPayload(contacto, index));
-        const conflicts = await findContactEmailConflicts(db, contactos);
-        if (conflicts.length > 0) {
-          throw new AppError(409, "Hay correos que deben corregirse antes de continuar.", {
-            code: "PUBLIC_CITAS_CONTACT_EMAIL_CONFLICT",
-            details: { conflicts },
-          });
-        }
-
-        return sendOk(reply, {
-          valid: true,
-          checked: contactos.filter((contacto) => contacto.email).length,
-        });
-      } catch (error) {
-        return sendHandled(reply, request, error, "No se pudieron validar los contactos publicos", "PUBLIC_CITAS_CONTACT_VALIDATE_ERROR");
-      }
-    }
-  );
-
-  app.post(
-    "/validar-titular",
-    {
-      schema: {
-        body: {
-          type: "object",
-          required: ["titular"],
-          properties: {
-            titular: {
-              type: "object",
-              required: ["nombre", "email", "telefono"],
-              properties: {
-                nombre: { type: "string", minLength: 1, maxLength: 120 },
-                email: { type: "string", format: "email", maxLength: 160 },
-                telefono: { type: "string", minLength: 8, maxLength: 20 },
-              },
-            },
-          },
-        },
-      },
-    },
-    async (request, reply) => {
-      const db = app.db;
-      if (!db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
-      }
-      try {
-        const titularPayload = validateClientPayload(request.body?.titular);
-        const email = titularPayload.email;
-
-        await ensureEmailDoesNotBelongActiveAccount(db, email);
-
-        return sendOk(reply, {
-          valid: true,
-          titular: { email },
-        });
-      } catch (error) {
-        return sendHandled(reply, request, error, "No se pudo validar el titular publico", "PUBLIC_CITAS_TITULAR_VALIDATE_ERROR");
       }
     }
   );
@@ -995,15 +744,9 @@ export default async function publicCitasRoutes(app) {
                 properties: {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
-                  rol_integrante_codigo: { type: "string", enum: ["titular", "acompanante"] },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   selection_type: { type: "string", enum: ["services", "package", "mixed"] },
                   id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
-                  promotionId: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
-                  promotionIds: {
-                    type: "array",
-                    items: { type: "string", format: "uuid" },
-                  },
                   contacto: {
                     type: "object",
                     properties: {
@@ -1037,11 +780,6 @@ export default async function publicCitasRoutes(app) {
             fecha_inicio: { type: "string", format: "date-time" },
             selection_type: { type: "string", enum: ["services", "package", "mixed"] },
             id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
-            promotionId: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
-            promotionIds: {
-              type: "array",
-              items: { type: "string", format: "uuid" },
-            },
             servicios: {
               type: "array",
               items: {
@@ -1068,13 +806,8 @@ export default async function publicCitasRoutes(app) {
                 type: "object",
                 properties: {
                   id_grupo_cita: { type: "string", format: "uuid" },
-                  release_token: { type: "string" },
                   estado_grupo_codigo: { type: "string" },
                   expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
-                  subtotal_hnl: { type: "number" },
-                  descuento_total_hnl: { type: "number" },
-                  total_pagar_hnl: { type: "number" },
-                  extras_a_pagar_hnl: { type: "number" },
                   monto_total_hnl: { type: "number" },
                   subtotal_hnl: { type: "number" },
                   descuento_total_hnl: { type: "number" },
@@ -1083,18 +816,7 @@ export default async function publicCitasRoutes(app) {
                   promociones_descartadas: { type: "array", items: { type: "object", additionalProperties: true } },
                   bloques: { type: "array", items: holdBlockSchema },
                 },
-                required: [
-                  "id_grupo_cita",
-                  "release_token",
-                  "estado_grupo_codigo",
-                  "expires_at",
-                  "subtotal_hnl",
-                  "descuento_total_hnl",
-                  "total_pagar_hnl",
-                  "extras_a_pagar_hnl",
-                  "monto_total_hnl",
-                  "bloques",
-                ],
+                required: ["id_grupo_cita", "estado_grupo_codigo", "expires_at", "monto_total_hnl", "bloques"],
                 additionalProperties: false,
               },
               requestId: requestIdSchema,
@@ -1122,48 +844,247 @@ export default async function publicCitasRoutes(app) {
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const titularPayload = validateClientPayload(request.body?.titular);
         const integrantes = normalizeBlocksPayload(request.body, titularPayload);
-        const agendamientoConfig = await getAgendamientoConfig(dbClient, { logger: request.log });
+        if (integrantes.length > 5) {
+          throw new AppError(400, "Solo se permiten hasta 4 acompañantes por reserva", {
+            code: "PUBLIC_CITAS_MAX_COMPANIONS",
+            details: { field: "integrantes", maxCompanions: 4 },
+          });
+        }
+        const titularDateTime = parseIsoDateAndTime(integrantes[0]?.fecha_inicio || "");
+        const branch = await ensureActiveBranch(dbClient, idSucursal);
+
+        await dbClient.query("BEGIN");
 
         const clientProfile = await resolveOrCreatePublicClient(dbClient, {
           ...titularPayload,
-          idSucursal,
+          idSucursal: branch.id_sucursal,
         });
 
-        const holdResult = await crearReservaHoldBaseNormalizada({
-          client: dbClient,
-          logger: request.log,
-          actor: null,
-          titular: {
-            id_usuario: null,
-            id_persona: clientProfile.id_persona,
-            id_cliente: clientProfile.id_cliente,
-          },
-          integrantes,
-          id_sucursal: idSucursal,
-          origen_codigo: "publico",
-          notas: request.body?.notas ?? null,
-          agendamientoConfig,
-          hold_state: "activo",
-          appointment_state: "en_espera",
-        });
+        const holdDurationMin = await getHoldDurationMinutes(dbClient);
+        const expiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
+        const targetAppointmentState = "en_espera";
+        const holdState = "activo";
+
+        const groupInsert = await dbClient.query(
+          `
+            INSERT INTO public.citas_grupos (
+              id_sucursal,
+              id_persona_titular,
+              id_cliente_titular,
+              estado_grupo_codigo,
+              notas
+            )
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'activo', $4)
+            RETURNING id_grupo_cita, estado_grupo_codigo
+          `,
+          [
+            branch.id_sucursal,
+            clientProfile.id_persona,
+            clientProfile.id_cliente,
+            request.body?.notas ?? null,
+          ]
+        );
+
+        const groupRecord = groupInsert.rows[0];
+        const bloquesResponse = [];
+        let totalGrupo = 0;
+        let titularResolved = null;
+
+        for (let index = 0; index < integrantes.length; index += 1) {
+          const integrante = integrantes[index];
+          const splitDateTime = parseIsoDateAndTime(integrante.fecha_inicio);
+          if (index > 0 && splitDateTime.fecha !== titularDateTime.fecha) {
+            throw new AppError(409, "Los acompañantes deben agendarse en la misma fecha del titular", {
+              code: "PUBLIC_CITAS_COMPANION_DATE_MISMATCH",
+              details: { field: "fecha_inicio", alias: integrante.alias, blockIndex: index },
+            });
+          }
+          const selection = await resolveBookingSelection(dbClient, {
+            id_sucursal: branch.id_sucursal,
+            selection_type: integrante.selection_type,
+            servicios: integrante.serviceIds,
+            id_paquete: integrante.id_paquete,
+            fecha_inicio: integrante.fecha_inicio,
+            id_barbero: integrante.id_barbero,
+          });
+          if (
+            index > 0
+            && titularResolved
+            && splitDateTime.hora
+            && splitDateTime.hora === titularResolved.hora
+            && selection.barber.id_empleado === titularResolved.id_barbero
+          ) {
+            throw new AppError(409, "Un acompañante no puede tomar la misma hora del titular con el mismo barbero", {
+              code: "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER",
+              details: { field: "fecha_inicio", alias: integrante.alias, blockIndex: index },
+            });
+          }
+          if (index === 0) {
+            titularResolved = {
+              hora: splitDateTime.hora,
+              id_barbero: selection.barber.id_empleado,
+            };
+          }
+
+          const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
+
+          const citaInsert = await dbClient.query(
+            `
+              INSERT INTO public.citas (
+                id_grupo_cita,
+                orden_integrante,
+                alias_integrante,
+                id_sucursal,
+                id_empleado_barbero,
+                id_persona_cliente,
+                id_cliente,
+                creada_por_usuario_id,
+                asignada_automaticamente,
+                estado_cita_codigo,
+                inicio_at,
+                fin_at,
+                duracion_total_min,
+                buffer_total_min,
+                subtotal_servicios_hnl,
+              descuento_hnl,
+              total_pagar_hnl,
+              selection_type,
+              id_paquete,
+              contacto_nombre,
+              contacto_email,
+              contacto_telefono,
+              notas
+            )
+            VALUES (
+                $1::uuid,
+                $2::int,
+                $3,
+                $4::uuid,
+                $5::uuid,
+                $6::uuid,
+                $7::uuid,
+                NULL,
+                $8::boolean,
+                $9::text,
+                $10::timestamptz,
+                $11::timestamptz,
+                $12::int,
+                $13::int,
+                $14::numeric,
+                0,
+                $15::numeric,
+                $16::text,
+                $17::uuid,
+                $18,
+                $19,
+                $20,
+                $21
+              )
+              RETURNING id_cita
+            `,
+            [
+              groupRecord.id_grupo_cita,
+              integrante.orden_integrante,
+              integrante.alias,
+              branch.id_sucursal,
+              selection.barber.id_empleado,
+              clientProfile.id_persona,
+              clientProfile.id_cliente,
+              !integrante.id_barbero,
+              targetAppointmentState,
+              selection.startDateTime.toISOString(),
+              finAt.toISOString(),
+              selection.serviceSelection.duracion_total_min,
+              selection.serviceSelection.buffer_total_min,
+              selection.serviceSelection.monto_total_hnl,
+              selection.serviceSelection.monto_total_hnl,
+              selection.serviceSelection.selection_type || integrante.selection_type || "services",
+              selection.serviceSelection.id_paquete || integrante.id_paquete || null,
+              integrante.contacto?.nombre || integrante.alias,
+              integrante.contacto?.email || null,
+              integrante.contacto?.telefono || null,
+              request.body?.notas ?? null,
+            ]
+          );
+
+          const citaId = citaInsert.rows[0].id_cita;
+          for (const serviceItem of selection.serviceSelection.items) {
+            await dbClient.query(
+              `
+                INSERT INTO public.citas_detalles (
+                  id_cita,
+                  id_servicio,
+                  cantidad,
+                  duracion_min,
+                  buffer_min,
+                  precio_unitario_hnl,
+                  subtotal_hnl
+                )
+                VALUES ($1::uuid, $2::uuid, 1, $3::int, $4::int, $5::numeric, $6::numeric)
+              `,
+              [
+                citaId,
+                serviceItem.id_servicio,
+                serviceItem.duracion_min,
+                serviceItem.buffer_min,
+                serviceItem.precio_hnl,
+                serviceItem.precio_hnl,
+              ]
+            );
+          }
+
+          await dbClient.query(
+            `
+              INSERT INTO public.citas_holds (
+                id_cita,
+                id_usuario,
+                estado_hold_codigo,
+                expires_at
+              )
+              VALUES ($1::uuid, NULL, $2::text, $3::timestamptz)
+            `,
+            [citaId, holdState, expiresAt.toISOString()]
+          );
+
+          totalGrupo += Number(selection.serviceSelection.monto_total_hnl || 0);
+          const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
+
+          bloquesResponse.push({
+            id_cita: citaId,
+            orden_integrante: integrante.orden_integrante,
+            alias: integrante.alias,
+            id_barbero: selection.barber.id_empleado,
+            nombre_barbero: selection.barber.nombre_completo,
+            fecha: fecha || "",
+            hora: hora || "",
+            fecha_inicio: selection.startDateTime.toISOString(),
+            estado_cita_codigo: targetAppointmentState,
+            monto_total_hnl: Number(selection.serviceSelection.monto_total_hnl || 0),
+            duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
+            buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
+          });
+        }
+
+        await dbClient.query("COMMIT");
 
         return sendOk(
           reply,
           {
-            id_grupo_cita: holdResult.id_grupo_cita,
-            release_token: holdResult.release_token || "",
-            estado_grupo_codigo: holdResult.estado_grupo_codigo || "activo",
-            expires_at: holdResult.expires_at || null,
-            subtotal_hnl: Number(holdResult.subtotal_hnl || 0),
-            descuento_total_hnl: Number(holdResult.descuento_total_hnl || 0),
-            total_pagar_hnl: Number(holdResult.total_pagar_hnl || 0),
-            extras_a_pagar_hnl: Number(holdResult.extras_a_pagar_hnl || 0),
-            monto_total_hnl: Number(holdResult.monto_total_hnl || 0),
-            bloques: Array.isArray(holdResult.bloques) ? holdResult.bloques : [],
+            id_grupo_cita: groupRecord.id_grupo_cita,
+            estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
+            expires_at: expiresAt.toISOString(),
+            monto_total_hnl: totalGrupo,
+            bloques: bloquesResponse,
           },
           { statusCode: 201 }
         );
       } catch (error) {
+        try {
+          await dbClient.query("ROLLBACK");
+        } catch {
+          // no-op
+        }
+
         if (isAvailabilityConflictError(error)) {
           const reason = resolveSafeConflictReason(error);
           request.log.warn(
@@ -1174,7 +1095,7 @@ export default async function publicCitasRoutes(app) {
             },
             "Public hold rejected by agenda conflict"
           );
-          return sendError(reply, 409, "La hora seleccionada ya no esta disponible.", {
+          return sendError(reply, 409, "La hora seleccionada ya no está disponible.", {
             code: "PUBLIC_CITAS_HOLD_CONFLICT",
             reason,
             requestId: request.id,
@@ -1182,81 +1103,6 @@ export default async function publicCitasRoutes(app) {
         }
 
         return sendHandled(reply, request, error, "No se pudo crear el hold publico", "PUBLIC_CITAS_HOLD_CREATE_ERROR");
-      } finally {
-        dbClient.release();
-      }
-    }
-  );
-
-  app.delete(
-    "/hold/:id_grupo_cita",
-    {
-      schema: {
-        params: {
-          type: "object",
-          required: ["id_grupo_cita"],
-          properties: {
-            id_grupo_cita: { type: "string", format: "uuid" },
-          },
-          additionalProperties: false,
-        },
-        body: {
-          type: "object",
-          required: ["release_token"],
-          properties: {
-            release_token: { type: "string", minLength: 32, maxLength: 160 },
-          },
-          additionalProperties: false,
-        },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: {
-                type: "object",
-                properties: {
-                  id_grupo_cita: { type: "string", format: "uuid" },
-                  released: { type: "boolean" },
-                  estado_grupo_codigo: { anyOf: [{ type: "string" }, { type: "null" }] },
-                  citas_liberadas: { type: "integer" },
-                },
-                required: ["id_grupo_cita", "released", "estado_grupo_codigo", "citas_liberadas"],
-                additionalProperties: false,
-              },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          400: errorResponseSchema,
-          403: errorResponseSchema,
-          404: errorResponseSchema,
-          409: errorResponseSchema,
-          500: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      if (!app.db) {
-        return sendError(reply, 500, "Base de datos no configurada", {
-          code: "DB_NOT_CONFIGURED",
-        });
-      }
-
-      const idGrupoCita = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
-      const releaseToken = String(request.body?.release_token || "").trim();
-      const dbClient = await app.db.connect();
-      try {
-        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
-        const releaseResult = await releaseAppointmentHoldGroup(dbClient, {
-          groupId: idGrupoCita,
-          mode: "public",
-          releaseToken,
-        });
-        return sendOk(reply, releaseResult);
-      } catch (error) {
-        return sendHandled(reply, request, error, "No se pudo liberar el hold publico", "PUBLIC_CITAS_HOLD_RELEASE_ERROR");
       } finally {
         dbClient.release();
       }

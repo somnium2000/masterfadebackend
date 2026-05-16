@@ -80,7 +80,6 @@ const COMMUNICATION_MANUAL_EXCLUSION_REASON = "exclusion_manual";
 const COMMUNICATION_SEND_LOCK_NAMESPACE = 82051;
 const COMMUNICATION_SCHEDULER_INTERVAL_MS_DEFAULT = 60000;
 const COMMUNICATION_SCHEDULER_MAX_CAMPAIGNS_PER_TICK = 10;
-let communicationSchedulerTickInProgress = false;
 const COMMUNICATION_ELIGIBILITY_STATES = ["elegible", "excluido"];
 const COMMUNICATION_ELIGIBILITY_REASONS = [
   "sin_correo",
@@ -1361,27 +1360,8 @@ async function listDueCampaignIdsForAutomaticDispatch(client, limit = COMMUNICAT
 
 async function runCommunicationScheduledDispatchTick(app) {
   if (!app.mailer?.configured) return;
-  if (!app.db) {
-    app.log.error("Scheduler de comunicacion omitido: app.db no configurado");
-    return;
-  }
-  if (communicationSchedulerTickInProgress) {
-    app.log.warn("Scheduler de comunicacion: tick omitido por ejecucion en progreso");
-    return;
-  }
-
-  communicationSchedulerTickInProgress = true;
-  let client = null;
-  const onClientError = (error) => {
-    app.log.error({ err: error }, "Scheduler de comunicacion: error en cliente PostgreSQL");
-  };
-
+  const client = await app.db.connect();
   try {
-    client = await app.db.connect();
-    if (typeof client?.on === "function") {
-      client.on("error", onClientError);
-    }
-
     const campaignIds = await listDueCampaignIdsForAutomaticDispatch(client);
     for (const campaignId of campaignIds) {
       let lockAcquired = false;
@@ -1417,20 +1397,8 @@ async function runCommunicationScheduledDispatchTick(app) {
         }
       }
     }
-  } catch (error) {
-    app.log.error({ err: error }, "Fallo en tick de scheduler de comunicacion");
   } finally {
-    if (client) {
-      if (typeof client?.removeListener === "function") {
-        client.removeListener("error", onClientError);
-      }
-      try {
-        client.release();
-      } catch (releaseError) {
-        app.log.error({ err: releaseError }, "Scheduler de comunicacion: no se pudo liberar cliente PostgreSQL");
-      }
-    }
-    communicationSchedulerTickInProgress = false;
+    client.release();
   }
 }
 

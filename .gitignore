@@ -13,8 +13,3 @@ tmp_*
 *.tmp
 debug_*
 repro_*
-
-# Archivos comprimidos locales / respaldos
-*.zip
-*.rar
-*.7z
