@@ -1,4 +1,3 @@
-```js
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
@@ -1264,4 +1263,3 @@ export default async function publicCitasRoutes(app) {
     }
   );
 }
-```
