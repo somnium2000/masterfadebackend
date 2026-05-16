@@ -1,3 +1,4 @@
+```js
 import {
   AppError,
   sendError,
@@ -136,6 +137,9 @@ const bookingPromotionSchema = {
     vigencia_hora_hasta: { type: ["string", "null"] },
     servicio_objetivo_nombre: { type: ["string", "null"] },
     paquete_objetivo_nombre: { type: ["string", "null"] },
+    es_acumulable: { type: "boolean" },
+    applicable: { type: "boolean" },
+    reason_code: { type: ["string", "null"] },
   },
   required: [
     "id_promocion",
@@ -159,6 +163,9 @@ const bookingPromotionSchema = {
     "vigencia_hora_hasta",
     "servicio_objetivo_nombre",
     "paquete_objetivo_nombre",
+    "es_acumulable",
+    "applicable",
+    "reason_code",
   ],
   additionalProperties: false,
 };
@@ -263,89 +270,65 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
   ORDER BY ps.orden_visual ASC, p.titulo ASC
 `;
 
-function getBusinessNowParts() {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: BUSINESS_TIME_ZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-  const parts = formatter.formatToParts(new Date());
-  const pick = (type) => parts.find((entry) => entry.type === type)?.value || "";
-  return {
-    date: `${pick("year")}-${pick("month")}-${pick("day")}`,
-    time: `${pick("hour")}:${pick("minute")}:${pick("second")}`,
-  };
-}
-
-function normalizeIsoDateOnly(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const match = String(value).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
-  return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
-}
-
-function normalizeTimeOnly(value) {
-  if (value === undefined || value === null || value === "") return null;
-  const match = String(value).trim().match(/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
-  if (!match) return null;
-  return `${match[1]}:${match[2]}:${match[3] || "00"}`;
-}
-
-function timeToSeconds(value) {
-  const normalized = normalizeTimeOnly(value);
-  if (!normalized) return null;
-  const [hours, minutes, seconds] = normalized.split(":").map((entry) => Number(entry));
-  return (hours * 3600) + (minutes * 60) + seconds;
-}
-
-function getPromotionVigenciaStatus(promotion, nowParts = getBusinessNowParts()) {
-  const nowDate = normalizeIsoDateOnly(nowParts?.date);
-  const nowTime = normalizeTimeOnly(nowParts?.time);
-  const nowSeconds = timeToSeconds(nowTime);
-  const vigenciaDesde = normalizeIsoDateOnly(promotion?.vigencia_desde);
-  const vigenciaHasta = normalizeIsoDateOnly(promotion?.vigencia_hasta);
-  const horaDesde = normalizeTimeOnly(promotion?.vigencia_hora_desde);
-  const horaHasta = normalizeTimeOnly(promotion?.vigencia_hora_hasta);
-  const horaDesdeSeconds = timeToSeconds(horaDesde);
-  const horaHastaSeconds = timeToSeconds(horaHasta);
-  const crossesMidnight = (
-    horaDesdeSeconds != null
-    && horaHastaSeconds != null
-    && horaDesdeSeconds > horaHastaSeconds
-  );
-
-  if (!vigenciaDesde && !vigenciaHasta && !horaDesde && !horaHasta) return "sin_vigencia";
-  if (vigenciaDesde && nowDate && nowDate < vigenciaDesde) return "programada";
-  if (vigenciaHasta && nowDate && nowDate > vigenciaHasta) return "vencida";
-
-  let inWindow = true;
-  if (horaDesdeSeconds != null || horaHastaSeconds != null) {
-    if (horaDesdeSeconds != null && horaHastaSeconds == null) inWindow = nowSeconds >= horaDesdeSeconds;
-    else if (horaDesdeSeconds == null && horaHastaSeconds != null) inWindow = nowSeconds <= horaHastaSeconds;
-    else if (!crossesMidnight) inWindow = nowSeconds >= horaDesdeSeconds && nowSeconds <= horaHastaSeconds;
-    else inWindow = nowSeconds >= horaDesdeSeconds || nowSeconds <= horaHastaSeconds;
-  }
-
-  if (crossesMidnight && vigenciaDesde && nowDate === vigenciaDesde) {
-    inWindow = nowSeconds >= horaDesdeSeconds;
-  }
-  if (crossesMidnight && vigenciaHasta && nowDate === vigenciaHasta) {
-    inWindow = nowSeconds <= horaHastaSeconds;
-  }
-
-  if (!inWindow) {
-    if (vigenciaDesde && nowDate === vigenciaDesde) return "programada";
-    if (vigenciaHasta && nowDate === vigenciaHasta) return "vencida";
-    if (horaDesdeSeconds != null && nowSeconds < horaDesdeSeconds) return "programada";
-    return "vencida";
-  }
-
-  return "vigente";
-}
+const PUBLIC_BOOKING_PROMOTIONS_NORMALIZED_SQL = `
+  SELECT
+    r.id_promocion_regla,
+    r.id_promocion,
+    COALESCE(ps.id_sucursal, $1::uuid) AS id_sucursal,
+    p.titulo,
+    p.subtitulo,
+    p.parrafos,
+    p.tipo_promocion,
+    r.aplica_a_codigo AS aplica_a,
+    r.tipo_descuento_codigo AS mecanica,
+    r.valor_descuento,
+    r.es_acumulable,
+    1::int AS cantidad_requerida,
+    1::int AS cantidad_bonificada,
+    ps.vigencia_desde,
+    ps.vigencia_hasta,
+    ps.vigencia_hora_desde,
+    ps.vigencia_hora_hasta,
+    svc_item.id_servicio AS id_servicio_objetivo,
+    pkg_item.id_paquete AS id_paquete_objetivo,
+    s.nombre_servicio AS servicio_objetivo_nombre,
+    pk.nombre_paquete AS paquete_objetivo_nombre
+  FROM public.promociones_reglas_agendamiento r
+  JOIN public.promociones p
+    ON p.id_promocion = r.id_promocion
+  LEFT JOIN public.promociones_sucursal ps
+    ON ps.id_promocion = p.id_promocion
+   AND ps.id_sucursal = $1::uuid
+  LEFT JOIN LATERAL (
+    SELECT i.id_servicio
+    FROM public.promociones_items_agendamiento i
+    WHERE i.id_promocion_regla = r.id_promocion_regla
+      AND i.tipo_item_codigo = 'servicio'
+    ORDER BY i.created_at ASC
+    LIMIT 1
+  ) svc_item ON true
+  LEFT JOIN LATERAL (
+    SELECT i.id_paquete
+    FROM public.promociones_items_agendamiento i
+    WHERE i.id_promocion_regla = r.id_promocion_regla
+      AND i.tipo_item_codigo = 'paquete'
+    ORDER BY i.created_at ASC
+    LIMIT 1
+  ) pkg_item ON true
+  LEFT JOIN public.servicios s
+    ON s.id_servicio = svc_item.id_servicio
+   AND s.deleted_at IS NULL
+  LEFT JOIN public.paquetes pk
+    ON pk.id_paquete = pkg_item.id_paquete
+   AND pk.deleted_at IS NULL
+  WHERE p.estado = 'publicada'
+    AND r.activo IS TRUE
+    AND (
+      ps.id_promocion_sucursal IS NULL
+      OR ps.visible_publico IS TRUE
+    )
+  ORDER BY r.prioridad_aplicacion ASC, p.titulo ASC
+`;
 
 const curatedPeriodSchema = {
   type: "object",
@@ -470,7 +453,7 @@ function mapBookingPromotionRow(row) {
   return {
     id_promocion: row.id_promocion,
     id_promocion_regla: row.id_promocion_regla,
-    id_sucursal: row.id_sucursal,
+    id_sucursal: String(row.id_sucursal || "").trim(),
     titulo: row.titulo,
     subtitulo: row.subtitulo ?? null,
     descripcion: paragraphs[0] ?? (row.subtitulo ?? null),
@@ -489,7 +472,45 @@ function mapBookingPromotionRow(row) {
     vigencia_hora_hasta: row.vigencia_hora_hasta ?? null,
     servicio_objetivo_nombre: row.servicio_objetivo_nombre ?? null,
     paquete_objetivo_nombre: row.paquete_objetivo_nombre ?? null,
+    es_acumulable: Boolean(row.es_acumulable ?? false),
+    applicable: true,
+    reason_code: null,
   };
+}
+
+function normalizeCsvUuids(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+}
+
+function evaluatePromotionApplicability(row, query) {
+  const selectionType = String(query?.selection_type || "").trim().toLowerCase();
+  const selectedServiceIds = new Set(normalizeCsvUuids(query?.servicios));
+  const selectedPackageId = String(query?.id_paquete || "").trim();
+  const appliesTo = String(row?.aplica_a || "").trim().toLowerCase();
+  const targetServiceId = String(row?.id_servicio_objetivo || "").trim();
+  const targetPackageId = String(row?.id_paquete_objetivo || "").trim();
+
+  if (selectionType) {
+    if (appliesTo === "servicio" && !["services", "mixed"].includes(selectionType)) {
+      return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
+    }
+    if (appliesTo === "paquete" && !["package", "mixed"].includes(selectionType)) {
+      return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
+    }
+  }
+
+  if (appliesTo === "servicio" && targetServiceId && selectedServiceIds.size > 0 && !selectedServiceIds.has(targetServiceId)) {
+    return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
+  }
+  if (appliesTo === "paquete" && targetPackageId && selectedPackageId && selectedPackageId !== targetPackageId) {
+    return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
+  }
+
+  return { applicable: true, reason_code: null };
 }
 
 function canExposeSlotDebug(request) {
@@ -534,6 +555,10 @@ export default async function publicAgendaRoutes(app) {
           required: ["id_sucursal"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
+            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
+            servicios: { type: "string" },
+            id_paquete: { type: "string", format: "uuid" },
+            fecha: { type: "string", format: "date" },
           },
           additionalProperties: false,
         },
@@ -620,14 +645,22 @@ export default async function publicAgendaRoutes(app) {
         // JK: Reusa limpieza de holds vencidos para mantener consistencia con disponibilidad pública.
         await expireStaleAppointmentReservations(app.db, { logger: request.log });
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
-        const { rows } = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_SQL, [idSucursal]);
-        const businessNow = getBusinessNowParts();
-        const activeRows = rows.filter((row) => {
-          const status = getPromotionVigenciaStatus(row, businessNow);
-          return status === "vigente" || status === "sin_vigencia";
+        let { rows } = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_SQL, [idSucursal]);
+        if (!Array.isArray(rows) || rows.length === 0) {
+          const normalizedResult = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_NORMALIZED_SQL, [idSucursal]);
+          rows = normalizedResult.rows || [];
+        }
+        const mapped = rows.map((row) => {
+          const base = mapBookingPromotionRow(row);
+          const applicability = evaluatePromotionApplicability(base, request.query);
+          return {
+            ...base,
+            applicable: applicability.applicable,
+            reason_code: applicability.reason_code,
+          };
         });
         return sendOk(reply, {
-          promociones: activeRows.map(mapBookingPromotionRow),
+          promociones: mapped,
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudieron consultar promociones disponibles para agendamiento", "PUBLIC_AGENDA_PROMOTIONS_ERROR");
@@ -905,3 +938,4 @@ export default async function publicAgendaRoutes(app) {
     }
   );
 }
+```

@@ -5,6 +5,12 @@ import { assertUuid } from "./agendaService.js";
 const DEFAULT_PUNTOS_PARA_PREMIO = 10;
 const HISTORIAL_DEFAULT_LIMIT = 20;
 const HISTORIAL_MAX_LIMIT = 100;
+const CLIENT_SEARCH_MIN_LENGTH = 2;
+const CLIENT_SEARCH_MAX_LENGTH = 80;
+const CLIENT_SEARCH_DEFAULT_LIMIT = 10;
+const CLIENT_SEARCH_MAX_LIMIT = 20;
+const MANUAL_ADJUST_TYPE_ADD = "ajustar";
+const MANUAL_ADJUST_TYPE_SUBTRACT = "ajuste_resta";
 const REWARD_SERVICE_NAMES_NO_PLAN = ["corte de cabello", "corte de barba"];
 const REWARD_SERVICE_NAMES_WITH_PLAN = ["facial express"];
 const REDEEM_CONTEXT_TOKEN_PREFIX = "mf_reward_ctx_v1";
@@ -122,6 +128,16 @@ function resolveHistoryLimit(limit) {
   const parsed = Number(limit);
   if (!Number.isFinite(parsed)) return HISTORIAL_DEFAULT_LIMIT;
   return Math.max(1, Math.min(Math.trunc(parsed), HISTORIAL_MAX_LIMIT));
+}
+
+function normalizeClientSearchQuery(value) {
+  return normalizeText(value).replace(/\s+/g, " ");
+}
+
+function resolveClientSearchLimit(limit) {
+  const parsed = Number(limit);
+  if (!Number.isFinite(parsed)) return CLIENT_SEARCH_DEFAULT_LIMIT;
+  return Math.max(1, Math.min(Math.trunc(parsed), CLIENT_SEARCH_MAX_LIMIT));
 }
 
 function sanitizeMovimientoRow(row) {
@@ -417,6 +433,12 @@ function assertMotivoObligatorio(motivo, field = "motivo") {
       details: { field },
     });
   }
+  if (normalized.length < 5) {
+    throw new AppError(400, `${field} debe tener al menos 5 caracteres`, {
+      code: "POINTS_REASON_TOO_SHORT",
+      details: { field, min_length: 5 },
+    });
+  }
   if (normalized.length > 300) {
     throw new AppError(400, `${field} excede el maximo de 300 caracteres`, {
       code: "POINTS_REASON_TOO_LONG",
@@ -426,15 +448,170 @@ function assertMotivoObligatorio(motivo, field = "motivo") {
   return normalized;
 }
 
-function assertIntegerPoints(value) {
+function assertAjusteAccion(value) {
+  const action = normalizeText(value).toLowerCase();
+  if (action !== "sumar" && action !== "restar") {
+    throw new AppError(400, "accion debe ser sumar o restar", {
+      code: "POINTS_ADJUSTMENT_INVALID_ACTION",
+      details: { accion: value },
+    });
+  }
+  return action;
+}
+
+export async function searchActiveClientesForAdminPoints(app, { q, limit } = {}) {
+  if (!app?.db) {
+    throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
+  }
+
+  const query = normalizeClientSearchQuery(q);
+  if (!query || query.length < CLIENT_SEARCH_MIN_LENGTH) {
+    return { clientes: [] };
+  }
+  if (query.length > CLIENT_SEARCH_MAX_LENGTH) {
+    throw new AppError(400, "La busqueda de cliente excede el maximo permitido", {
+      code: "POINTS_CLIENT_SEARCH_QUERY_TOO_LONG",
+      details: { max_length: CLIENT_SEARCH_MAX_LENGTH },
+    });
+  }
+
+  const safeLimit = resolveClientSearchLimit(limit);
+  const queryLower = query.toLowerCase();
+  const containsPattern = `%${queryLower}%`;
+  const startsWithPattern = `${queryLower}%`;
+
+  const { rows } = await app.db.query(
+    `
+      SELECT
+        c.id_cliente,
+        TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, ''))) AS nombre_cliente,
+        COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo,
+        NULLIF(p.telefono_principal, '') AS telefono,
+        c.id_usuario
+      FROM public.clientes c
+      JOIN public.personas p
+        ON p.id_persona = c.id_persona
+      JOIN public.usuarios u
+        ON u.id_usuario = c.id_usuario
+        AND u.deleted_at IS NULL
+      LEFT JOIN auth.users au
+        ON au.id = c.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT c2.direccion_correo::text AS email
+        FROM public.correos c2
+        WHERE c2.id_persona = c.id_persona
+          AND c2.deleted_at IS NULL
+        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
+        LIMIT 1
+      ) cp ON TRUE
+      WHERE c.deleted_at IS NULL
+        AND COALESCE(c.estado, TRUE) IS TRUE
+        AND c.id_usuario IS NOT NULL
+        AND COALESCE(u.estado, TRUE) IS TRUE
+        AND COALESCE(u.estado_acceso, 'pendiente_password') NOT IN ('bloqueado', 'inactivo')
+        AND (
+          LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $1::text
+          OR LOWER(COALESCE(p.telefono_principal, '')) LIKE $1::text
+          OR LOWER(COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, ''), '')) LIKE $1::text
+        )
+      ORDER BY
+        CASE
+          WHEN LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $2::text THEN 0
+          WHEN LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $1::text THEN 1
+          WHEN LOWER(COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, ''), '')) LIKE $1::text THEN 2
+          WHEN LOWER(COALESCE(p.telefono_principal, '')) LIKE $1::text THEN 3
+          ELSE 4
+        END,
+        LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) ASC,
+        c.id_cliente ASC
+      LIMIT $3::int
+    `,
+    [containsPattern, startsWithPattern, safeLimit]
+  );
+
+  return {
+    clientes: rows.map((row) => ({
+      id_cliente: row.id_cliente,
+      nombre_cliente: row.nombre_cliente || "Cliente",
+      correo: row.correo || null,
+      telefono: row.telefono || null,
+      id_usuario: row.id_usuario || null,
+    })),
+  };
+}
+
+function assertPositiveIntegerPoints(value) {
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed === 0) {
-    throw new AppError(400, "puntos debe ser un entero distinto de 0", {
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new AppError(400, "puntos debe ser un entero mayor que 0", {
       code: "POINTS_ADJUSTMENT_INVALID",
       details: { puntos: value },
     });
   }
   return parsed;
+}
+
+async function ensureClienteHasActiveAccessUser(client, idUsuario, idCliente) {
+  const safeUserId = assertUuid(idUsuario, "id_usuario_cliente");
+  const { rows } = await client.query(
+    `
+      SELECT u.id_usuario
+      FROM public.usuarios u
+      WHERE u.id_usuario = $1::uuid
+        AND u.deleted_at IS NULL
+        AND COALESCE(u.estado, TRUE) IS TRUE
+        AND COALESCE(u.estado_acceso, 'pendiente_password') NOT IN ('bloqueado', 'inactivo')
+      LIMIT 1
+    `,
+    [safeUserId]
+  );
+  if (!rows[0]) {
+    throw new AppError(409, "El cliente no tiene usuario activo", {
+      code: "POINTS_CLIENT_USER_INACTIVE",
+      details: { id_cliente: idCliente, id_usuario: safeUserId },
+    });
+  }
+}
+
+async function resolveManualAdjustmentTypes(client) {
+  const requiredTypes = [MANUAL_ADJUST_TYPE_ADD, MANUAL_ADJUST_TYPE_SUBTRACT];
+  const { rows } = await client.query(
+    `
+      SELECT tipo_puntos_codigo, signo
+      FROM public.tipos_puntos
+      WHERE tipo_puntos_codigo = ANY($1::text[])
+    `,
+    [requiredTypes]
+  );
+
+  const signByType = new Map(
+    rows.map((row) => [normalizeText(row.tipo_puntos_codigo).toLowerCase(), Number(row.signo || 0)])
+  );
+
+  const missingTypes = requiredTypes.filter((code) => !signByType.has(code));
+  if (missingTypes.length > 0) {
+    throw new AppError(409, "Faltan tipos de puntos requeridos para ajuste manual", {
+      code: "POINTS_ADJUSTMENT_TYPE_MISSING",
+      details: { missing_types: missingTypes },
+    });
+  }
+
+  if (signByType.get(MANUAL_ADJUST_TYPE_ADD) !== 1 || signByType.get(MANUAL_ADJUST_TYPE_SUBTRACT) !== -1) {
+    throw new AppError(409, "La configuracion de tipos de puntos para ajuste manual es invalida", {
+      code: "POINTS_ADJUSTMENT_TYPE_CONFIG_INVALID",
+      details: {
+        required: {
+          [MANUAL_ADJUST_TYPE_ADD]: 1,
+          [MANUAL_ADJUST_TYPE_SUBTRACT]: -1,
+        },
+      },
+    });
+  }
+
+  return {
+    sumar: MANUAL_ADJUST_TYPE_ADD,
+    restar: MANUAL_ADJUST_TYPE_SUBTRACT,
+  };
 }
 
 export function normalizeRedeemContextToken(value) {
@@ -840,6 +1017,7 @@ export async function getClientePointsSummary(app, idCliente, { historyLimit = H
 
 export async function addManualPointsAdjustment(app, {
   idCliente,
+  accion,
   puntos,
   motivo,
   usuarioAdmin,
@@ -849,7 +1027,8 @@ export async function addManualPointsAdjustment(app, {
   }
 
   const safeClienteId = assertUuid(idCliente, "id_cliente");
-  const safePuntos = assertIntegerPoints(puntos);
+  const safeAccion = assertAjusteAccion(accion);
+  const safePuntos = assertPositiveIntegerPoints(puntos);
   const safeMotivo = assertMotivoObligatorio(motivo);
   const adminUserId = assertAdminUserId(usuarioAdmin);
   const dbClient = await app.db.connect();
@@ -858,20 +1037,23 @@ export async function addManualPointsAdjustment(app, {
     await dbClient.query("BEGIN");
     await lockClientePointsScope(dbClient, safeClienteId);
     const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: true });
+    await ensureClienteHasActiveAccessUser(dbClient, cliente.id_usuario, safeClienteId);
+    const adjustmentTypes = await resolveManualAdjustmentTypes(dbClient);
     await materializeCyclesIfAvailable(dbClient, safeClienteId);
 
     const saldoActual = await getSaldoActual(dbClient, safeClienteId);
-    const saldoSiguiente = saldoActual + safePuntos;
-    if (saldoSiguiente < 0) {
-      throw new AppError(409, "El ajuste dejaria saldo negativo", {
-        code: "POINTS_NEGATIVE_BALANCE_FORBIDDEN",
+    if (safeAccion === "restar" && saldoActual < safePuntos) {
+      throw new AppError(422, "No hay puntos suficientes para restar", {
+        code: "POINTS_INSUFFICIENT_BALANCE",
         details: {
           saldo_actual: saldoActual,
           puntos: safePuntos,
-          saldo_resultante: saldoSiguiente,
         },
       });
     }
+    const signedPoints = safeAccion === "restar" ? -safePuntos : safePuntos;
+    const saldoSiguiente = saldoActual + signedPoints;
+    const tipoPuntosCodigo = safeAccion === "restar" ? adjustmentTypes.restar : adjustmentTypes.sumar;
 
     const insertResult = await dbClient.query(
       `
@@ -887,11 +1069,11 @@ export async function addManualPointsAdjustment(app, {
         VALUES (
           $1::uuid,
           $2::uuid,
-          'ajustar',
+          $3::text,
           'sistema',
-          $3::int,
-          $4::text,
-          $5::uuid
+          $4::int,
+          $5::text,
+          $6::uuid
         )
         RETURNING
           id_points_tx,
@@ -902,7 +1084,14 @@ export async function addManualPointsAdjustment(app, {
           motivo,
           created_at
       `,
-      [safeClienteId, cliente.id_sucursal_origen || null, safePuntos, safeMotivo, adminUserId]
+      [
+        safeClienteId,
+        cliente.id_sucursal_origen || null,
+        tipoPuntosCodigo,
+        safePuntos,
+        safeMotivo,
+        adminUserId,
+      ]
     );
 
     const movimiento = insertResult.rows[0];
@@ -915,8 +1104,10 @@ export async function addManualPointsAdjustment(app, {
       tipo_puntos_codigo: movimiento.tipo_puntos_codigo,
       origen_punto_codigo: movimiento.origen_punto_codigo,
       puntos: Number(movimiento.puntos || 0),
+      accion: safeAccion,
       motivo: movimiento.motivo ?? null,
       saldo_actual: saldoActualizado,
+      saldo_siguiente: saldoSiguiente,
       created_at: movimiento.created_at ? new Date(movimiento.created_at).toISOString() : null,
     };
   } catch (error) {
