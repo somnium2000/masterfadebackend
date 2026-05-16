@@ -1,8 +1,13 @@
+```js
 import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
 import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
+import {
+  markPromotionUsagesForGroup,
+  previewPromotionsForAppointment,
+} from "../../../services/promociones/promocionesService.js";
 import { getAgendamientoConfig } from "../../../services/agendaService.js";
 import { crearComprobanteAgendamientoNoFiscal } from "../../../services/comprobanteAgendamientoService.js";
 import { processPaymentWebhook } from "../../../services/paymentWebhookService.js";
@@ -402,6 +407,136 @@ async function resolvePublicIntentCreatorUserId(client, { groupRows }) {
   return fallbackUserId;
 }
 
+async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
+  const citasResult = await client.query(
+    `
+      SELECT
+        c.id_cita,
+        c.id_grupo_cita,
+        c.id_sucursal,
+        c.id_empleado_barbero,
+        c.inicio_at,
+        c.selection_type,
+        c.id_paquete,
+        COALESCE(c.subtotal_servicios_hnl, 0)::numeric AS subtotal_servicios_hnl
+      FROM public.citas c
+      WHERE c.id_grupo_cita = $1::uuid
+        AND c.deleted_at IS NULL
+      ORDER BY c.orden_integrante ASC, c.created_at ASC
+    `,
+    [idGrupoCita]
+  );
+
+  const promocionesAplicadas = [];
+  const promocionesDescartadas = [];
+  let subtotal = 0;
+  let descuentoTotal = 0;
+  let total = 0;
+
+  for (const cita of citasResult.rows || []) {
+    const detallesResult = await client.query(
+      `
+        SELECT id_servicio, cantidad, precio_unitario_hnl, subtotal_hnl
+        FROM public.citas_detalles
+        WHERE id_cita = $1::uuid
+      `,
+      [cita.id_cita]
+    );
+    const selectedPromoResult = await client.query(
+      `
+        SELECT id_promocion, id_promocion_regla
+        FROM public.citas_promociones
+        WHERE id_cita = $1::uuid
+          AND estado_aplicacion_codigo = 'aplicada'
+        ORDER BY created_at ASC
+        LIMIT 1
+      `,
+      [cita.id_cita]
+    );
+    const selectedPromo = selectedPromoResult.rows[0] || null;
+    const subtotalCita = Number(cita.subtotal_servicios_hnl || 0);
+    let descuentoCita = 0;
+    let totalCita = subtotalCita;
+
+    try {
+      const preview = await previewPromotionsForAppointment(client, {
+        id_sucursal: cita.id_sucursal,
+        id_empleado_barbero: cita.id_empleado_barbero,
+        id_grupo_cita: cita.id_grupo_cita,
+        id_cita: cita.id_cita,
+        fecha_hora: cita.inicio_at,
+        fecha: new Date(cita.inicio_at).toISOString().slice(0, 10),
+        fecha_operativa: new Date(cita.inicio_at).toISOString().slice(0, 10),
+        hora: new Date(cita.inicio_at).toISOString().slice(11, 16),
+        subtotal_hnl: subtotalCita,
+        servicios: (detallesResult.rows || []).map((row) => ({
+          id_servicio: row.id_servicio,
+          cantidad: Number(row.cantidad || 1),
+          precio_unitario_hnl: Number(row.precio_unitario_hnl || 0),
+          subtotal_hnl: Number(row.subtotal_hnl || 0),
+        })),
+        paquetes: cita.id_paquete ? [{ id_paquete: cita.id_paquete }] : [],
+        id_promocion: selectedPromo?.id_promocion || null,
+        id_promocion_regla: selectedPromo?.id_promocion_regla || null,
+        canal: "public",
+      });
+
+      if (!preview.usedFallbackLegacy) {
+        const selectedRuleId = String(selectedPromo?.id_promocion_regla || "").trim();
+        if (selectedRuleId) {
+          const candidatasAplicadas = Array.isArray(preview.promociones_aplicadas) ? preview.promociones_aplicadas : [];
+          const keepApplied = candidatasAplicadas.filter(
+            (row) => String(row.id_promocion_regla || "") === selectedRuleId
+          );
+          const movedToDiscarded = candidatasAplicadas
+            .filter((row) => String(row.id_promocion_regla || "") !== selectedRuleId)
+            .map((row) => ({
+              ...row,
+              motivo_codigo: "PROMOCION_NO_SELECCIONADA",
+              motivo: "Se aplico solo la promocion seleccionada por el cliente.",
+            }));
+          preview.promociones_aplicadas = keepApplied;
+          preview.promociones_descartadas = [...(preview.promociones_descartadas || []), ...movedToDiscarded];
+          descuentoCita = Number(
+            keepApplied.reduce((sum, row) => sum + Number(row.descuento_calculado_hnl || 0), 0).toFixed(2)
+          );
+        } else {
+          descuentoCita = Number(preview.descuento_total_hnl || 0);
+        }
+        totalCita = Math.max(0, Number((subtotalCita - descuentoCita).toFixed(2)));
+        promocionesAplicadas.push(...(preview.promociones_aplicadas || []));
+        promocionesDescartadas.push(...(preview.promociones_descartadas || []));
+      }
+    } catch {
+      descuentoCita = 0;
+      totalCita = subtotalCita;
+    }
+
+    await client.query(
+      `
+        UPDATE public.citas
+        SET descuento_hnl = $2::numeric,
+            total_pagar_hnl = $3::numeric,
+            updated_at = now()
+        WHERE id_cita = $1::uuid
+      `,
+      [cita.id_cita, descuentoCita, totalCita]
+    );
+
+    subtotal += subtotalCita;
+    descuentoTotal += descuentoCita;
+    total += totalCita;
+  }
+
+  return {
+    subtotal_hnl: Number(subtotal.toFixed(2)),
+    descuento_total_hnl: Number(descuentoTotal.toFixed(2)),
+    total_hnl: Number(total.toFixed(2)),
+    promociones_aplicadas: promocionesAplicadas,
+    promociones_descartadas: promocionesDescartadas,
+  };
+}
+
 async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
   const rows = await client.query(
     `
@@ -784,6 +919,10 @@ async function confirmGroupAfterPaid(client, {
       motivo: "Canje de recompensa ruta a tu cortesia",
     });
   }
+  await markPromotionUsagesForGroup(client, {
+    id_grupo_cita: idGrupoCita,
+    id_cliente: idClienteTitular || null,
+  });
 
   let receiptConfirm = await confirmarComprobanteAgendamientoParaEnvio({
     client,
@@ -928,6 +1067,7 @@ export default async function publicPagosRoutes(app) {
         });
       }
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       const invalidState = groupRows.some((row) => !["en_espera", "pendiente_pago"].includes(String(row.estado_cita_codigo || "")));
       if (invalidState) {
@@ -939,7 +1079,7 @@ export default async function publicPagosRoutes(app) {
       }
       const provider = await ensureProvider(dbClient, providerCode);
       const anchor = groupRows[0];
-      const totalGroup = groupRows.reduce((acc, row) => acc + Number(row.total_pagar_hnl || 0), 0);
+      const totalGroup = Number(pricing.total_hnl || 0);
       const existingIntent = await dbClient.query(
         `
           SELECT id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
@@ -955,15 +1095,33 @@ export default async function publicPagosRoutes(app) {
           [anchor.id_cita, provider.id_provider, createdByUserId, ACTIVE_INTENT_STATES]
         );
       if (existingIntent.rows[0]) {
-        await dbClient.query("COMMIT");
-        return sendOk(reply, {
-          id_intent: existingIntent.rows[0].id_intent,
-          payment_url: existingIntent.rows[0].link_pago_url ?? null,
-          expires_at: new Date(existingIntent.rows[0].expires_at).toISOString(),
-          monto_hnl: Number(existingIntent.rows[0].monto_hnl || 0),
-          moneda_codigo: existingIntent.rows[0].moneda_codigo || "HNL",
-          estado_intent_codigo: existingIntent.rows[0].estado_intent_codigo,
-        });
+        const existingAmount = Number(existingIntent.rows[0].monto_hnl || 0);
+        if (Math.abs(existingAmount - totalGroup) < 0.000001) {
+          await dbClient.query("COMMIT");
+          return sendOk(reply, {
+            id_intent: existingIntent.rows[0].id_intent,
+            payment_url: existingIntent.rows[0].link_pago_url ?? null,
+            expires_at: new Date(existingIntent.rows[0].expires_at).toISOString(),
+            monto_hnl: Number(existingIntent.rows[0].monto_hnl || 0),
+            moneda_codigo: existingIntent.rows[0].moneda_codigo || "HNL",
+            estado_intent_codigo: existingIntent.rows[0].estado_intent_codigo,
+            subtotal_hnl: pricing.subtotal_hnl,
+            descuento_total_hnl: pricing.descuento_total_hnl,
+            total_hnl: pricing.total_hnl,
+            promociones_aplicadas: pricing.promociones_aplicadas,
+            promociones_descartadas: pricing.promociones_descartadas,
+          });
+        }
+
+        await dbClient.query(
+          `
+            UPDATE public.payment_intents
+            SET estado_intent_codigo = 'expirado',
+                updated_at = now()
+            WHERE id_intent = $1::uuid
+          `,
+          [existingIntent.rows[0].id_intent]
+        );
       }
 
       const idempotencyKey = `mf_public_${idGrupoCita}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
@@ -1042,6 +1200,11 @@ export default async function publicPagosRoutes(app) {
         monto_hnl: Number(created.rows[0].monto_hnl || 0),
         moneda_codigo: created.rows[0].moneda_codigo || "HNL",
         estado_intent_codigo: created.rows[0].estado_intent_codigo,
+        subtotal_hnl: pricing.subtotal_hnl,
+        descuento_total_hnl: pricing.descuento_total_hnl,
+        total_hnl: pricing.total_hnl,
+        promociones_aplicadas: pricing.promociones_aplicadas,
+        promociones_descartadas: pricing.promociones_descartadas,
       }, { statusCode: 201 });
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }

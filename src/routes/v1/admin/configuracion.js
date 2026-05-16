@@ -1623,7 +1623,8 @@ function construirResumenPromocion(row) {
     const bonificada = Number(row?.cantidad_bonificada ?? 1);
     const safeRequerida = Number.isInteger(requerida) && requerida > 0 ? requerida : 1;
     const safeBonificada = Number.isInteger(bonificada) && bonificada > 0 ? bonificada : 1;
-    return `${scopeLabel} · ${safeRequerida + safeBonificada}x${safeRequerida}`;
+    const paidUnits = Math.max(0, safeRequerida - safeBonificada);
+    return `${scopeLabel} · Compra ${safeRequerida}, paga ${paidUnits}`;
   }
 
   return scopeLabel;
@@ -1701,14 +1702,19 @@ function validatePromotionBusinessConsistency(values) {
     }
     const requerida = Number(values.cantidad_requerida);
     const bonificada = Number(values.cantidad_bonificada);
-    if (!Number.isInteger(requerida) || requerida <= 0) {
-      throw new AppError(400, "cantidad_requerida debe ser un entero mayor que 0 para mecanica=dos_por_uno", {
+    if (!Number.isInteger(requerida) || requerida <= 1) {
+      throw new AppError(400, "cantidad_requerida debe ser un entero mayor que 1 para mecanica=dos_por_uno", {
         code: "CONFIG_PROMOTION_2X1_REQUIRED_QTY_INVALID",
       });
     }
     if (!Number.isInteger(bonificada) || bonificada <= 0) {
       throw new AppError(400, "cantidad_bonificada debe ser un entero mayor que 0 para mecanica=dos_por_uno", {
         code: "CONFIG_PROMOTION_2X1_BONUS_QTY_INVALID",
+      });
+    }
+    if (bonificada >= requerida) {
+      throw new AppError(400, "cantidad_bonificada debe ser menor que cantidad_requerida para mecanica=dos_por_uno", {
+        code: "CONFIG_PROMOTION_2X1_QTY_RELATION_INVALID",
       });
     }
   } else {
@@ -1803,6 +1809,192 @@ async function validatePromotionBusinessRules(client, values) {
     return;
   }
   await ensurePromotionPackageTargetAvailable(client, values.id_paquete_objetivo, values.id_sucursal);
+}
+
+function resolveNormalizedDiscountType(mechanic) {
+  const safeMechanic = String(mechanic || "").trim().toLowerCase();
+  if (safeMechanic === "porcentaje") return "porcentaje";
+  if (safeMechanic === "dos_por_uno") return "bonificacion";
+  return "monto_fijo";
+}
+
+function resolveNormalizedPromotionTypeCode(tipoPromocion, aplicaA) {
+  if (String(aplicaA || "").trim().toLowerCase() === "paquete") return "descuento_paquete";
+  if (String(tipoPromocion || "").trim().toLowerCase() === "descuento_paquete") return "descuento_paquete";
+  return "descuento_servicio";
+}
+
+function resolveNormalizedRuleMode(mechanic) {
+  const safeMechanic = String(mechanic || "").trim().toLowerCase();
+  if (safeMechanic === "dos_por_uno") return "automatico";
+  return "automatico";
+}
+
+function hasSufficientCommercialDataForNormalizedSync({
+  tipoPromocion,
+  aplicaA,
+  mecanica,
+  idServicioObjetivo,
+  idPaqueteObjetivo,
+  valorDescuento,
+  cantidadRequerida,
+  cantidadBonificada,
+} = {}) {
+  if (!PROMOTION_TYPES.includes(String(tipoPromocion || "").trim().toLowerCase())) return false;
+  if (!PROMOTION_TARGETS.includes(String(aplicaA || "").trim().toLowerCase())) return false;
+  if (!PROMOTION_MECHANICS.includes(String(mecanica || "").trim().toLowerCase())) return false;
+
+  if (aplicaA === "servicio" && !idServicioObjetivo) return false;
+  if (aplicaA === "paquete" && !idPaqueteObjetivo) return false;
+
+  if (mecanica === "porcentaje") {
+    const value = Number(valorDescuento);
+    return Number.isFinite(value) && value > 0 && value <= 100;
+  }
+  if (mecanica === "monto_fijo") {
+    const value = Number(valorDescuento);
+    return Number.isFinite(value) && value > 0;
+  }
+  if (mecanica === "dos_por_uno") {
+    const requerida = Number(cantidadRequerida);
+    const bonificada = Number(cantidadBonificada);
+    return Number.isInteger(requerida) && requerida > 1 && Number.isInteger(bonificada) && bonificada > 0 && bonificada < requerida;
+  }
+  return false;
+}
+
+async function syncNormalizedPromotionRule(client, {
+  idPromocion,
+  tipoPromocion,
+  aplicaA,
+  mecanica,
+  idServicioObjetivo,
+  idPaqueteObjetivo,
+  valorDescuento,
+  cantidadRequerida,
+  cantidadBonificada,
+} = {}) {
+  if (!idPromocion) return;
+
+  const existingRule = await client.query(
+    `
+      SELECT id_promocion_regla
+      FROM public.promociones_reglas_agendamiento
+      WHERE id_promocion = $1::uuid
+      ORDER BY created_at ASC
+      LIMIT 1
+    `,
+    [idPromocion]
+  );
+
+  const tipoPromocionAgendamiento = resolveNormalizedPromotionTypeCode(tipoPromocion, aplicaA);
+  const tipoDescuento = resolveNormalizedDiscountType(mecanica);
+  const modoAplicacion = resolveNormalizedRuleMode(mecanica);
+  const normalizedValor = (
+    mecanica === "dos_por_uno"
+      ? 0
+      : (valorDescuento == null ? 0 : Number(valorDescuento))
+  );
+  const normalizedCantidadMinima = (
+    mecanica === "dos_por_uno"
+      ? Number(cantidadRequerida)
+      : 1
+  );
+  let idPromocionRegla = existingRule.rows[0]?.id_promocion_regla || null;
+
+  if (!idPromocionRegla) {
+    const insertedRule = await client.query(
+      `
+        INSERT INTO public.promociones_reglas_agendamiento (
+          id_promocion,
+          tipo_promocion_agendamiento_codigo,
+          tipo_descuento_codigo,
+          aplica_a_codigo,
+          valor_descuento,
+          es_acumulable,
+          prioridad_aplicacion,
+          requiere_codigo,
+          codigo_promocional,
+          max_usos_por_reserva,
+          max_usos_por_cliente,
+          modo_aplicacion_codigo,
+          min_subtotal_hnl,
+          max_descuento_hnl,
+          activo
+        )
+        VALUES (
+          $1::uuid,
+          $2::text,
+          $3::text,
+          $4::text,
+          $5::numeric,
+          FALSE,
+          100,
+          FALSE,
+          NULL,
+          NULL,
+          NULL,
+          $6::text,
+          0,
+          NULL,
+          TRUE
+        )
+        RETURNING id_promocion_regla
+      `,
+      [idPromocion, tipoPromocionAgendamiento, tipoDescuento, aplicaA, normalizedValor, modoAplicacion]
+    );
+    idPromocionRegla = insertedRule.rows[0].id_promocion_regla;
+  } else {
+    await client.query(
+      `
+        UPDATE public.promociones_reglas_agendamiento
+        SET
+          tipo_promocion_agendamiento_codigo = $2::text,
+          tipo_descuento_codigo = $3::text,
+          aplica_a_codigo = $4::text,
+          valor_descuento = $5::numeric,
+          modo_aplicacion_codigo = $6::text,
+          activo = TRUE,
+          updated_at = NOW()
+        WHERE id_promocion_regla = $1::uuid
+      `,
+      [idPromocionRegla, tipoPromocionAgendamiento, tipoDescuento, aplicaA, normalizedValor, modoAplicacion]
+    );
+  }
+
+  await client.query(
+    `
+      DELETE FROM public.promociones_items_agendamiento
+      WHERE id_promocion_regla = $1::uuid
+    `,
+    [idPromocionRegla]
+  );
+
+  await client.query(
+    `
+      INSERT INTO public.promociones_items_agendamiento (
+        id_promocion_regla,
+        tipo_item_codigo,
+        id_servicio,
+        id_paquete,
+        cantidad_minima
+      )
+      VALUES (
+        $1::uuid,
+        $2::text,
+        $3::uuid,
+        $4::uuid,
+        $5::int
+      )
+    `,
+    [
+      idPromocionRegla,
+      aplicaA === "paquete" ? "paquete" : "servicio",
+      aplicaA === "servicio" ? (idServicioObjetivo || null) : null,
+      aplicaA === "paquete" ? (idPaqueteObjetivo || null) : null,
+      normalizedCantidadMinima,
+    ]
+  );
 }
 
 function mapPromotionRow(row) {
@@ -2367,6 +2559,7 @@ export default async function adminConfiguracionRoutes(app) {
           403: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          422: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
@@ -2465,6 +2658,7 @@ export default async function adminConfiguracionRoutes(app) {
           403: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          422: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
@@ -3457,17 +3651,40 @@ export default async function adminConfiguracionRoutes(app) {
           orden_visual: ordenVisual,
         };
         validatePromotionPublication(publicationSnapshot);
-        await validatePromotionBusinessRules(client, {
-          id_sucursal: branchId,
-          tipo_promocion: tipoPromocion,
-          aplica_a: aplicaA,
+        const commercialDataSnapshot = {
+          tipoPromocion,
+          aplicaA,
           mecanica,
-          id_servicio_objetivo: idServicioObjetivo,
-          id_paquete_objetivo: idPaqueteObjetivo,
-          valor_descuento: valorDescuento,
-          cantidad_requerida: cantidadRequerida,
-          cantidad_bonificada: cantidadBonificada,
-        });
+          idServicioObjetivo,
+          idPaqueteObjetivo,
+          valorDescuento,
+          cantidadRequerida,
+          cantidadBonificada,
+        };
+        const canSyncNormalizedRule = hasSufficientCommercialDataForNormalizedSync(commercialDataSnapshot);
+        if (estado === "publicada" && !canSyncNormalizedRule) {
+          throw new AppError(422, "Datos comerciales incompletos para publicar la promocion", {
+            code: "CONFIG_PROMOTION_COMMERCIAL_DATA_REQUIRED",
+            details: {
+              tipo_promocion: tipoPromocion,
+              aplica_a: aplicaA,
+              mecanica,
+            },
+          });
+        }
+        if (canSyncNormalizedRule) {
+          await validatePromotionBusinessRules(client, {
+            id_sucursal: branchId,
+            tipo_promocion: tipoPromocion,
+            aplica_a: aplicaA,
+            mecanica,
+            id_servicio_objetivo: idServicioObjetivo,
+            id_paquete_objetivo: idPaqueteObjetivo,
+            valor_descuento: valorDescuento,
+            cantidad_requerida: cantidadRequerida,
+            cantidad_bonificada: cantidadBonificada,
+          });
+        }
 
         await ensurePromotionSlugUnique(client, slug);
         await ensureFeaturedPromotionConflict(client, {
@@ -3580,6 +3797,33 @@ export default async function adminConfiguracionRoutes(app) {
           [idPromocion, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, vigenciaHoraDesde, vigenciaHoraHasta, ordenVisual, destacada]
         );
 
+        if (canSyncNormalizedRule) {
+          await syncNormalizedPromotionRule(client, {
+            idPromocion,
+            tipoPromocion,
+            aplicaA,
+            mecanica,
+            idServicioObjetivo,
+            idPaqueteObjetivo,
+            valorDescuento,
+            cantidadRequerida,
+            cantidadBonificada,
+          });
+        } else {
+          request.log.warn(
+            {
+              requestId: request.id,
+              operation: "promotion_create",
+              id_promocion: idPromocion,
+              estado,
+              tipo_promocion: tipoPromocion,
+              aplica_a: aplicaA,
+              mecanica,
+            },
+            "Sincronizacion normalizada omitida por datos comerciales incompletos"
+          );
+        }
+
         const finalPromotion = await getPromotionScoped(client, idPromocion, branchId);
         if (!finalPromotion) {
           throw new AppError(404, "No se pudo recuperar la promocion creada para la sucursal", {
@@ -3590,6 +3834,30 @@ export default async function adminConfiguracionRoutes(app) {
 
         return sendOk(reply, { promocion: mapPromotionRow(finalPromotion) }, { statusCode: 201, requestId: request.id });
       } catch (error) {
+        request.log.error(
+          {
+            requestId: request.id,
+            operation: "promotion_create",
+            id_promocion: null,
+            id_sucursal: request.body?.id_sucursal,
+            payload: {
+              estado: request.body?.estado,
+              tipo_promocion: request.body?.tipo_promocion,
+              aplica_a: request.body?.aplica_a,
+              mecanica: request.body?.mecanica,
+              id_servicio_objetivo: request.body?.id_servicio_objetivo ?? null,
+              id_paquete_objetivo: request.body?.id_paquete_objetivo ?? null,
+            },
+            pg: {
+              code: error?.code,
+              constraint: error?.constraint,
+              table: error?.table,
+              detail: error?.detail,
+            },
+            err: error,
+          },
+          "Fallo en create de promocion de configuracion"
+        );
         await client.query("ROLLBACK").catch(() => {});
         return sendHandledError(reply, request, error, "No se pudo crear la promocion", "CONFIG_PROMOTION_CREATE_ERROR");
       } finally {
@@ -3804,17 +4072,40 @@ export default async function adminConfiguracionRoutes(app) {
           orden_visual: ordenVisual,
         };
         validatePromotionPublication(publicationSnapshot);
-        await validatePromotionBusinessRules(client, {
-          id_sucursal: branchId,
-          tipo_promocion: tipoPromocion,
-          aplica_a: aplicaA,
+        const commercialDataSnapshot = {
+          tipoPromocion,
+          aplicaA,
           mecanica,
-          id_servicio_objetivo: idServicioObjetivo,
-          id_paquete_objetivo: idPaqueteObjetivo,
-          valor_descuento: valorDescuento,
-          cantidad_requerida: cantidadRequerida,
-          cantidad_bonificada: cantidadBonificada,
-        });
+          idServicioObjetivo,
+          idPaqueteObjetivo,
+          valorDescuento,
+          cantidadRequerida,
+          cantidadBonificada,
+        };
+        const canSyncNormalizedRule = hasSufficientCommercialDataForNormalizedSync(commercialDataSnapshot);
+        if (estado === "publicada" && !canSyncNormalizedRule) {
+          throw new AppError(422, "Datos comerciales incompletos para publicar la promocion", {
+            code: "CONFIG_PROMOTION_COMMERCIAL_DATA_REQUIRED",
+            details: {
+              tipo_promocion: tipoPromocion,
+              aplica_a: aplicaA,
+              mecanica,
+            },
+          });
+        }
+        if (canSyncNormalizedRule) {
+          await validatePromotionBusinessRules(client, {
+            id_sucursal: branchId,
+            tipo_promocion: tipoPromocion,
+            aplica_a: aplicaA,
+            mecanica,
+            id_servicio_objetivo: idServicioObjetivo,
+            id_paquete_objetivo: idPaqueteObjetivo,
+            valor_descuento: valorDescuento,
+            cantidad_requerida: cantidadRequerida,
+            cantidad_bonificada: cantidadBonificada,
+          });
+        }
 
         await ensurePromotionSlugUnique(client, slug, request.params.id);
         await ensureFeaturedPromotionConflict(client, {
@@ -3907,7 +4198,7 @@ export default async function adminConfiguracionRoutes(app) {
           ]
         );
 
-        await client.query(
+        const updatedPromotionBranch = await client.query(
           `
             UPDATE public.promociones_sucursal
             SET
@@ -3925,6 +4216,53 @@ export default async function adminConfiguracionRoutes(app) {
           `,
           [request.params.id, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, vigenciaHoraDesde, vigenciaHoraHasta, ordenVisual, destacada]
         );
+        if (!updatedPromotionBranch.rowCount) {
+          await client.query(
+            `
+              INSERT INTO public.promociones_sucursal (
+                id_promocion,
+                id_sucursal,
+                visible_publico,
+                vigencia_desde,
+                vigencia_hasta,
+                vigencia_hora_desde,
+                vigencia_hora_hasta,
+                orden_visual,
+                destacada,
+                updated_at
+              )
+              VALUES ($1::uuid, $2::uuid, $3::boolean, $4::date, $5::date, $6::time, $7::time, $8::int, $9::boolean, NOW())
+            `,
+            [request.params.id, branchId, visiblePublico, vigenciaDesde, vigenciaHasta, vigenciaHoraDesde, vigenciaHoraHasta, ordenVisual, destacada]
+          );
+        }
+
+        if (canSyncNormalizedRule) {
+          await syncNormalizedPromotionRule(client, {
+            idPromocion: request.params.id,
+            tipoPromocion,
+            aplicaA,
+            mecanica,
+            idServicioObjetivo,
+            idPaqueteObjetivo,
+            valorDescuento,
+            cantidadRequerida,
+            cantidadBonificada,
+          });
+        } else {
+          request.log.warn(
+            {
+              requestId: request.id,
+              operation: "promotion_update",
+              id_promocion: request.params.id,
+              estado,
+              tipo_promocion: tipoPromocion,
+              aplica_a: aplicaA,
+              mecanica,
+            },
+            "Sincronizacion normalizada omitida por datos comerciales incompletos"
+          );
+        }
 
         const finalPromotion = await getPromotionScoped(client, request.params.id, branchId);
         if (!finalPromotion) {
@@ -3947,6 +4285,30 @@ export default async function adminConfiguracionRoutes(app) {
 
         return sendOk(reply, { promocion: mapPromotionRow(finalPromotion) }, { requestId: request.id });
       } catch (error) {
+        request.log.error(
+          {
+            requestId: request.id,
+            operation: "promotion_update",
+            id_promocion: request.params?.id ?? null,
+            id_sucursal: request.body?.id_sucursal,
+            payload: {
+              estado: request.body?.estado,
+              tipo_promocion: request.body?.tipo_promocion,
+              aplica_a: request.body?.aplica_a,
+              mecanica: request.body?.mecanica,
+              id_servicio_objetivo: request.body?.id_servicio_objetivo ?? null,
+              id_paquete_objetivo: request.body?.id_paquete_objetivo ?? null,
+            },
+            pg: {
+              code: error?.code,
+              constraint: error?.constraint,
+              table: error?.table,
+              detail: error?.detail,
+            },
+            err: error,
+          },
+          "Fallo en update de promocion de configuracion"
+        );
         await client.query("ROLLBACK").catch(() => {});
         return sendHandledError(reply, request, error, "No se pudo actualizar la promocion", "CONFIG_PROMOTION_UPDATE_ERROR");
       } finally {
