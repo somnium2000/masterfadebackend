@@ -7,17 +7,6 @@ import {
   markPromotionUsagesForGroup,
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
-import { getAgendamientoConfig } from "../../../services/agendaService.js";
-import { processPaymentWebhook } from "../../../services/paymentWebhookService.js";
-import {
-  assertPaymentSimulatorUsable,
-  getPaymentRuntimeSnapshot,
-  normalizePaymentProviderCode,
-} from "../../../services/payments/paymentRuntimeGuard.js";
-import {
-  confirmarComprobanteAgendamientoParaEnvio,
-  enviarComprobanteAgendamientoNoFiscal,
-} from "../../../services/comprobanteAgendamientoEmailService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 
