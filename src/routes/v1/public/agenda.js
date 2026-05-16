@@ -1,4 +1,3 @@
-```js
 import {
   AppError,
   sendError,
@@ -171,7 +170,7 @@ const bookingPromotionSchema = {
 };
 
 const PUBLIC_BOOKING_PROMOTIONS_SQL = `
-  -- JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
+  // JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
   SELECT
     p.id_promocion,
     pra.id_promocion_regla,
@@ -448,7 +447,7 @@ function buildPromotionSummary(row) {
 }
 
 function mapBookingPromotionRow(row) {
-  // JK: Expone payload de promociones amigable para el flujo de agendamiento sin tocar contratos de pago.
+ 
   const paragraphs = normalizePromotionParagraphs(row?.parrafos);
   return {
     id_promocion: row.id_promocion,
@@ -938,4 +937,3 @@ export default async function publicAgendaRoutes(app) {
     }
   );
 }
-```
