@@ -8,7 +8,6 @@ import {
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
 import { getAgendamientoConfig } from "../../../services/agendaService.js";
-import { crearComprobanteAgendamientoNoFiscal } from "../../../services/comprobanteAgendamientoService.js";
 import { processPaymentWebhook } from "../../../services/paymentWebhookService.js";
 import {
   assertPaymentSimulatorUsable,
