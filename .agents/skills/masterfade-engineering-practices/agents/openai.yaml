@@ -1,0 +1,4 @@
+interface:
+  display_name: "MasterFade Engineering Practices"
+  short_description: "Code safely in MasterFade repos"
+  default_prompt: "Use $masterfade-engineering-practices to implement a small, verifiable MasterFade code change."
