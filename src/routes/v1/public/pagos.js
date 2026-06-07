@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
-import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
+import { applyRewardRedeemForConfirmedGroup, grantCompanionPointsForConfirmedGroup } from "../../../services/pointsService.js";
+import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
   markPromotionUsagesForGroup,
   previewPromotionsForAppointment,
@@ -161,6 +162,25 @@ function buildPostPaymentEmailTemplate({
 function buildCallbackUrl(groupId) {
   const base = safeText(process.env.PUBLIC_WEB_URL) || safeText(process.env.FRONTEND_PUBLIC_URL) || "http://localhost:5173";
   return `${base.replace(/\/+$/, "")}/agendar/exito?id_grupo_cita=${encodeURIComponent(groupId)}`;
+}
+
+function isTodoPagoSimulationEnabled(app) {
+  return app.config?.paymentProvider === "todopago"
+    && app.config?.todoPago?.mode === "preprod_simulated"
+    && app.config?.todoPago?.simulatedEnabled === true;
+}
+
+function resolveTodoPagoSimulationAmount(app, requestedAmount, fallbackAmount) {
+  const safeFallback = Number(fallbackAmount || 0);
+  if (!isTodoPagoSimulationEnabled(app)) return safeFallback;
+  const safeRequested = Number(requestedAmount);
+  if (!Number.isFinite(safeRequested) || safeRequested <= 0) return safeFallback;
+  return safeRequested;
+}
+
+function buildTodoPagoSimulatorEventId(idIntent, responseCode) {
+  const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+  return `todopago_sim_${idIntent}_${String(responseCode || "NA").slice(0, 8)}_${suffix}`.slice(0, 120);
 }
 
 async function ensureProvider(client, providerCode) {
@@ -604,73 +624,6 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
   return { pending: queued.rows.length, sent, failed };
 }
 
-async function grantCompanionPoints(client, { idGrupoCita }) {
-  const titularResult = await client.query(
-    `
-      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario
-      FROM public.citas_grupos cg
-      JOIN public.clientes c
-        ON c.id_cliente = cg.id_cliente_titular
-      WHERE cg.id_grupo_cita = $1::uuid
-      LIMIT 1
-    `,
-    [idGrupoCita]
-  );
-  const titular = titularResult.rows[0];
-  if (!titular?.id_cliente || !titular?.id_usuario) return;
-
-  const companions = await client.query(
-    `
-      SELECT id_cita, id_sucursal, inicio_at
-      FROM public.citas
-      WHERE id_grupo_cita = $1::uuid
-        AND deleted_at IS NULL
-        AND orden_integrante > 1
-        AND estado_cita_codigo = 'confirmada'
-      ORDER BY orden_integrante ASC
-    `,
-    [idGrupoCita]
-  );
-  for (const companion of companions.rows) {
-    const cycleResult = await client.query(
-      `SELECT * FROM public.fn_points_get_or_create_active_cycle($1::uuid, $2::int, $3::timestamptz) LIMIT 1`,
-      [titular.id_cliente, 12, companion.inicio_at || new Date().toISOString()]
-    );
-    const cycleId = cycleResult.rows[0]?.id_cycle ?? null;
-    if (!cycleId) continue;
-    await client.query(
-      `
-        INSERT INTO public.points_transactions (
-          id_cliente,
-          id_cita,
-          id_cycle,
-          id_sucursal_origen,
-          tipo_puntos_codigo,
-          origen_punto_codigo,
-          puntos,
-          vence_at,
-          motivo,
-          creado_por_usuario_id
-        )
-        VALUES (
-          $1::uuid,
-          $2::uuid,
-          $3::uuid,
-          $4::uuid,
-          'acumular',
-          'integrante',
-          1,
-          (SELECT vence_at FROM public.points_cycles WHERE id_cycle = $3::uuid),
-          'Punto por acompañante pagado',
-          $5::uuid
-        )
-        ON CONFLICT DO NOTHING
-      `,
-      [titular.id_cliente, companion.id_cita, cycleId, companion.id_sucursal, titular.id_usuario]
-    );
-  }
-}
-
 async function confirmGroupAfterPaid(client, { idCitaAnchor }) {
   const groupResult = await client.query(
     `
@@ -739,7 +692,7 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor }) {
   });
 
   await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
-  await grantCompanionPoints(client, { idGrupoCita });
+  await grantCompanionPointsForConfirmedGroup(client, { idGrupoCita });
   return {
     id_grupo_cita: idGrupoCita,
     total_hnl: totalGrupo,
@@ -1134,6 +1087,209 @@ export default async function publicPagosRoutes(app) {
       }
       request.log.error({ err: error }, "No se pudo completar pago mock");
       return sendError(reply, 500, "No se pudo completar el pago", { code: "PUBLIC_PAGOS_MOCK_COMPLETE_ERROR", requestId: request.id });
+    } finally {
+      dbClient.release();
+    }
+  });
+
+  app.post("/simulator/event", {
+    schema: {
+      body: {
+        type: "object",
+        required: ["id_intent", "id_grupo_cita", "titular_email"],
+        properties: {
+          id_intent: { type: "string", format: "uuid" },
+          id_grupo_cita: { type: "string", format: "uuid" },
+          titular_email: { type: "string", format: "email", maxLength: 160 },
+          status: { type: "string", maxLength: 32 },
+          monto_prueba_hnl: { type: "number", minimum: 0.01 },
+        },
+        additionalProperties: false,
+      },
+    },
+  }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      if (!isTodoPagoSimulationEnabled(app)) {
+        throw new AppError(409, "El simulador de TodoPago no esta disponible en este entorno", {
+          code: "PUBLIC_PAGOS_TODOPAGO_SIMULATOR_DISABLED",
+        });
+      }
+
+      const idIntent = assertUuid(request.body?.id_intent, "id_intent");
+      const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
+      const titularEmail = safeText(request.body?.titular_email);
+
+      await dbClient.query("BEGIN");
+
+      const intentResult = await dbClient.query(
+        `
+          SELECT
+            pi.id_intent,
+            pi.id_cita,
+            pi.id_provider,
+            pi.estado_intent_codigo,
+            pi.monto_hnl,
+            pi.moneda_codigo,
+            c.id_grupo_cita
+          FROM public.payment_intents pi
+          JOIN public.citas c
+            ON c.id_cita = pi.id_cita
+          WHERE pi.id_intent = $1::uuid
+          LIMIT 1
+        `,
+        [idIntent]
+      );
+      const intent = intentResult.rows[0];
+      if (!intent) {
+        throw new AppError(404, "Intent no encontrado", { code: "PUBLIC_PAGOS_INTENT_NOT_FOUND" });
+      }
+      if (String(intent.id_grupo_cita || "").trim() !== idGrupoCita) {
+        throw new AppError(409, "El intent no pertenece a la reserva indicada", {
+          code: "PUBLIC_PAGOS_GROUP_INTENT_MISMATCH",
+        });
+      }
+
+      await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+
+      const currentState = safeText(intent.estado_intent_codigo)?.toLowerCase() || "";
+      if (currentState === "confirmado") {
+        await dbClient.query("COMMIT");
+        return sendOk(reply, {
+          processed: false,
+          duplicate: true,
+          booking_confirmed: true,
+          estado_intent_codigo: "confirmado",
+          normalized_status: "PAID",
+          response_code: "00",
+          response_text: "APPROVAL 599",
+          message: "El pago de esta reserva ya fue confirmado.",
+        });
+      }
+      if (!["creado", "link_generado", "pendiente_confirmacion", "fallido"].includes(currentState)) {
+        throw new AppError(409, "El intent no esta disponible para simulacion", {
+          code: "PUBLIC_PAGOS_INTENT_STATE_INVALID",
+        });
+      }
+
+      const amountForSimulation = resolveTodoPagoSimulationAmount(
+        app,
+        request.body?.monto_prueba_hnl,
+        intent.monto_hnl
+      );
+      const simulation = resolveTodoPagoSimulatedResponse(amountForSimulation);
+      const providerEventId = buildTodoPagoSimulatorEventId(idIntent, simulation.responseCode);
+
+      await dbClient.query(
+        `
+          INSERT INTO public.payment_events (id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent)
+          VALUES ($1::uuid, $2::text, $3::text, TRUE, $4::jsonb, $5::uuid)
+        `,
+        [
+          intent.id_provider,
+          providerEventId,
+          "payment.simulated.result",
+          {
+            provider: "todopago",
+            mode: "preprod_simulated",
+            response_code: simulation.responseCode,
+            response_text: simulation.responseText,
+            provider_status_raw: simulation.responseText,
+            normalized_status: simulation.normalizedStatus,
+            monto_resuelto_hnl: amountForSimulation,
+            monto_intent_hnl: Number(intent.monto_hnl || 0),
+          },
+          idIntent,
+        ]
+      );
+
+      if (simulation.normalizedStatus === "PAID") {
+        await dbClient.query(
+          `
+            INSERT INTO public.payments (
+              id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
+            )
+            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, now(), FALSE)
+            ON CONFLICT (provider_tx_id) DO UPDATE SET updated_at = now()
+          `,
+          [
+            idIntent,
+            `todopago_sim_${idIntent}_${simulation.responseCode}`,
+            Number(intent.monto_hnl || 0),
+            safeText(intent.moneda_codigo) || "HNL",
+          ]
+        );
+        await dbClient.query(
+          `UPDATE public.payment_intents SET estado_intent_codigo = 'confirmado', updated_at = now() WHERE id_intent = $1::uuid`,
+          [idIntent]
+        );
+        const confirm = await confirmGroupAfterPaid(dbClient, { idCitaAnchor: intent.id_cita });
+        await dbClient.query("COMMIT");
+
+        let emailDelivery = { pending: 0, sent: 0, failed: 0 };
+        try {
+          emailDelivery = await dispatchPostPaymentEmails(app.db, {
+            idGrupoCita,
+            mailer: app.mailer,
+            logger: request.log,
+          });
+        } catch (dispatchError) {
+          request.log.error(
+            { err: dispatchError, idGrupoCita, requestId: request.id },
+            "No se pudo despachar correo post-pago al completar pago simulado TodoPago"
+          );
+        }
+
+        return sendOk(reply, {
+          processed: true,
+          duplicate: false,
+          booking_confirmed: true,
+          estado_intent_codigo: "confirmado",
+          normalized_status: simulation.normalizedStatus,
+          response_code: simulation.responseCode,
+          response_text: simulation.responseText,
+          message: simulation.userMessage,
+          booking: confirm,
+          email_delivery: emailDelivery,
+        });
+      }
+
+      const nextIntentState = simulation.normalizedStatus === "PENDING" ? "pendiente_confirmacion" : "fallido";
+      await dbClient.query(
+        `UPDATE public.payment_intents SET estado_intent_codigo = $2::text, updated_at = now() WHERE id_intent = $1::uuid`,
+        [idIntent, nextIntentState]
+      );
+      await dbClient.query("COMMIT");
+
+      return sendOk(reply, {
+        processed: true,
+        duplicate: false,
+        booking_confirmed: false,
+        estado_intent_codigo: nextIntentState,
+        normalized_status: simulation.normalizedStatus,
+        response_code: simulation.responseCode,
+        response_text: simulation.responseText,
+        message: simulation.userMessage,
+      });
+    } catch (error) {
+      try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
+      if (error instanceof AppError) {
+        request.log.warn(
+          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          "Public pagos simulator handled AppError"
+        );
+        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          ...(safeDetails ? { details: safeDetails } : {}),
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo completar pago simulado TodoPago");
+      return sendError(reply, 500, "No se pudo completar el pago simulado", {
+        code: "PUBLIC_PAGOS_SIMULATOR_COMPLETE_ERROR",
+        requestId: request.id,
+      });
     } finally {
       dbClient.release();
     }

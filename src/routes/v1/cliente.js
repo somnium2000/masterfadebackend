@@ -11,6 +11,7 @@ import {
   createMembershipPurchaseOrder,
   createMembershipOrderPaymentIntent,
   confirmMembershipPaymentAndActivateSubscription,
+  processMembershipSimulatorEvent,
   acquireMembershipPlan,
   cancelMembership,
   cancelMembershipBySubscription,
@@ -889,6 +890,69 @@ export default async function clienteRoutes(app) {
           error,
           "No se pudo crear el intent de pago para la orden de plan",
           "CLIENTE_MEMBERSHIP_PAYMENT_INTENT_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/planes/simulator/event",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        body: {
+          type: "object",
+          required: ["id_payment_intent"],
+          properties: {
+            id_payment_intent: { type: "string", format: "uuid" },
+            monto_prueba_hnl: { type: "number", minimum: 0.01 },
+          },
+          additionalProperties: false,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (
+        app.config?.paymentProvider !== "todopago"
+        || app.config?.todoPago?.mode !== "preprod_simulated"
+        || app.config?.todoPago?.simulatedEnabled !== true
+      ) {
+        return sendError(reply, 409, "El simulador de pagos no esta disponible en este entorno.", {
+          code: "CLIENTE_MEMBERSHIP_SIMULATOR_DISABLED",
+          requestId: request.id,
+        });
+      }
+
+      const context = ensureClienteContext(request);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const simulated = await processMembershipSimulatorEvent(client, {
+          idPaymentIntent: request.body.id_payment_intent,
+          clienteId: context.clienteId,
+          montoPruebaHnl: request.body?.monto_prueba_hnl ?? null,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, simulated, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo procesar la simulacion del pago del plan",
+          "CLIENTE_MEMBERSHIP_SIMULATOR_ERROR"
         );
       } finally {
         client.release();

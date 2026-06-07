@@ -1,4 +1,5 @@
 import { MockPaymentProvider } from "./MockPaymentProvider.js";
+import { TodoPagoPreprodSimulatedProvider } from "./TodoPagoPreprodSimulatedProvider.js";
 // import { BanpaisPaymentProvider } from "./BanpaisPaymentProvider.js"; // Descomentar en Sprint 3
 
 /**
@@ -25,6 +26,7 @@ export class PaymentProviderFactory {
         }
 
         const provider = String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase().trim();
+        const todoPagoMode = String(process.env.TODOPAGO_MODE || "preprod_simulated").toLowerCase().trim();
         const nodeEnv = String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase();
         if ((nodeEnv === "production" || nodeEnv === "prod") && provider === "mock") {
             throw new Error("PAYMENT_PROVIDER=mock no esta permitido en produccion.");
@@ -37,6 +39,16 @@ export class PaymentProviderFactory {
                 });
                 break;
 
+            case "todopago":
+                if (todoPagoMode === "preprod_simulated") {
+                    PaymentProviderFactory._instance = new TodoPagoPreprodSimulatedProvider();
+                    break;
+                }
+                if (todoPagoMode === "preprod_real" || todoPagoMode === "prod_real") {
+                    throw new Error("TodoPago real aun no esta implementado; falta documentacion tecnica oficial.");
+                }
+                throw new Error(`TODOPAGO_MODE invalido: ${todoPagoMode}`);
+
             // case "banpais":
             //   PaymentProviderFactory._instance = new BanpaisPaymentProvider({
             //     apiKey: process.env.BANPAIS_API_KEY,
@@ -46,7 +58,7 @@ export class PaymentProviderFactory {
             //   break;
 
             default:
-                PaymentProviderFactory._instance = new MockPaymentProvider();
+                throw new Error(`PAYMENT_PROVIDER invalido o no soportado: ${provider}`);
         }
 
         return PaymentProviderFactory._instance;

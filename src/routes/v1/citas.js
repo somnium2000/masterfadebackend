@@ -14,6 +14,7 @@ import {
 import { confirmAppointmentsWithoutPayment, confirmAppointmentWithoutPayment } from "../../services/appointmentConfirmationService.js";
 import {
   createCoverageTracker,
+  consumeMembershipForCompletedAppointment,
   consumeCoverageForServices,
   ensureSubscriptionLifecycle,
   filterCoverageTrackerByTariffServices,
@@ -21,7 +22,9 @@ import {
 } from "../../services/membershipService.js";
 import {
   applyRewardRedeemForConfirmedGroup,
+  grantEngagementPointsForConfirmedGroup,
   normalizeRedeemContextToken,
+  resolveRewardRedeemGateForCliente,
   resolveRedeemContextForHold,
 } from "../../services/pointsService.js";
 import {
@@ -34,6 +37,8 @@ const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const PENDING_EXPIRED_MESSAGE = "Esta reserva ya expiro. Agenda nuevamente.";
 
 const errorResponseSchema = {
   type: "object",
@@ -70,6 +75,11 @@ const citaResumenSchema = {
     buffer_total_min: { type: "integer" },
     total_pagar_hnl: { type: "number" },
     notas: { type: ["string", "null"] },
+    tipo_cita_visual: { type: "string" },
+    tipo_cita_label: { type: "string" },
+    es_canje_recompensa: { type: "boolean" },
+    es_membresia: { type: "boolean" },
+    tiene_acompanantes: { type: "boolean" },
   },
   required: [
     "id_cita",
@@ -84,6 +94,11 @@ const citaResumenSchema = {
     "buffer_total_min",
     "total_pagar_hnl",
     "notas",
+    "tipo_cita_visual",
+    "tipo_cita_label",
+    "es_canje_recompensa",
+    "es_membresia",
+    "tiene_acompanantes",
   ],
   additionalProperties: false,
 };
@@ -171,7 +186,19 @@ function mapAppointmentRow(row) {
     buffer_total_min: Number(row.buffer_total_min ?? 0),
     total_pagar_hnl: Number(row.total_pagar_hnl ?? 0),
     notas: row.notas ?? null,
+    tipo_cita_visual: String(row.tipo_cita_visual || "pago_normal"),
+    tipo_cita_label: String(row.tipo_cita_label || "Pago normal"),
+    es_canje_recompensa: Boolean(row.es_canje_recompensa),
+    es_membresia: Boolean(row.es_membresia),
+    tiene_acompanantes: Boolean(row.tiene_acompanantes),
   };
+}
+
+function toIsoOrNull(value) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
 }
 
 async function listAppointmentRows(client, { clienteId, personaId, citaId = null, estado = null, fechaDesde = null, fechaHasta = null }) {
@@ -212,7 +239,30 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
         c.duracion_total_min,
         c.buffer_total_min,
         c.total_pagar_hnl,
-        c.notas
+        c.notas,
+        CASE
+          WHEN c.estado_cita_codigo = 'pendiente_pago' THEN 'pendiente_pago'
+          WHEN grp.group_has_reward THEN
+            CASE
+              WHEN grp.has_companions THEN 'cortesia_acompanantes'
+              ELSE 'cortesia'
+            END
+          WHEN mem.is_membership THEN 'membresia'
+          ELSE 'pago_normal'
+        END AS tipo_cita_visual,
+        CASE
+          WHEN c.estado_cita_codigo = 'pendiente_pago' THEN 'Pendiente de pago'
+          WHEN grp.group_has_reward THEN
+            CASE
+              WHEN grp.has_companions THEN 'Cortesía + acompañantes'
+              ELSE 'Cortesía'
+            END
+          WHEN mem.is_membership THEN 'Membresía'
+          ELSE 'Pago normal'
+        END AS tipo_cita_label,
+        grp.group_has_reward AS es_canje_recompensa,
+        mem.is_membership AS es_membresia,
+        grp.has_companions AS tiene_acompanantes
       FROM public.citas c
       JOIN public.sucursales s
         ON s.id_sucursal = c.id_sucursal
@@ -220,6 +270,30 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
         ON eb.id_empleado = c.id_empleado_barbero
       JOIN public.personas pb
         ON pb.id_persona = eb.id_persona
+      LEFT JOIN LATERAL (
+        SELECT
+          EXISTS (
+            SELECT 1
+            FROM public.citas cg
+            WHERE cg.id_grupo_cita = c.id_grupo_cita
+              AND cg.deleted_at IS NULL
+              AND COALESCE(cg.es_canje_recompensa, FALSE) IS TRUE
+          ) AS group_has_reward,
+          EXISTS (
+            SELECT 1
+            FROM public.citas ci
+            WHERE ci.id_grupo_cita = c.id_grupo_cita
+              AND ci.deleted_at IS NULL
+              AND COALESCE(ci.orden_integrante, 1) > 1
+          ) AS has_companions
+      ) grp ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT EXISTS (
+          SELECT 1
+          FROM public.subscription_consumptions sc
+          WHERE sc.id_cita = c.id_cita
+        ) AS is_membership
+      ) mem ON TRUE
       WHERE ${conditions.join(" AND ")}
       ORDER BY c.inicio_at DESC, c.id_cita DESC
     `,
@@ -541,12 +615,321 @@ function normalizePhone(rawValue) {
   return String(rawValue || "").replace(/[^\d+]/g, "").slice(0, 20);
 }
 
-function hasPhoneLetters(rawValue) {
-  return /[A-Za-z]/.test(String(rawValue || ""));
-}
-
 function normalizeEmail(rawEmail) {
   return String(rawEmail || "").trim().toLowerCase();
+}
+
+async function getClientPendingPaymentGroupRows(client, { clienteId, personaId, groupId = null }) {
+  const params = [clienteId, personaId];
+  const groupFilter = groupId ? "AND c.id_grupo_cita = $3::uuid" : "";
+  if (groupId) params.push(groupId);
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id_grupo_cita,
+        c.id_cita,
+        c.orden_integrante,
+        c.alias_integrante,
+        c.estado_cita_codigo,
+        c.inicio_at,
+        c.total_pagar_hnl,
+        c.id_sucursal,
+        s.nombre_sucursal,
+        c.id_empleado_barbero,
+        COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Barbero') AS nombre_barbero,
+        hold.id_hold,
+        hold.estado_hold_codigo,
+        hold.expires_at AS hold_expires_at,
+        pi.id_intent,
+        pi.estado_intent_codigo,
+        pi.link_pago_url,
+        pi.expires_at AS intent_expires_at,
+        pi.monto_hnl AS intent_monto_hnl,
+        pi.moneda_codigo AS intent_moneda_codigo
+      FROM public.citas c
+      JOIN public.sucursales s
+        ON s.id_sucursal = c.id_sucursal
+      JOIN public.empleados eb
+        ON eb.id_empleado = c.id_empleado_barbero
+      JOIN public.personas pb
+        ON pb.id_persona = eb.id_persona
+      LEFT JOIN LATERAL (
+        SELECT h.id_hold, h.estado_hold_codigo, h.expires_at
+        FROM public.citas_holds h
+        WHERE h.id_cita = c.id_cita
+        ORDER BY h.created_at DESC
+        LIMIT 1
+      ) hold ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT
+          pi.id_intent,
+          pi.estado_intent_codigo,
+          pi.link_pago_url,
+          pi.expires_at,
+          pi.monto_hnl,
+          pi.moneda_codigo
+        FROM public.payment_intents pi
+        WHERE pi.id_cita = c.id_cita
+        ORDER BY pi.created_at DESC
+        LIMIT 1
+      ) pi ON TRUE
+      WHERE c.deleted_at IS NULL
+        AND c.estado_cita_codigo = 'pendiente_pago'
+        AND (c.id_cliente = $1::uuid OR c.id_persona_cliente = $2::uuid)
+        ${groupFilter}
+      ORDER BY c.created_at DESC, c.orden_integrante ASC
+    `,
+    params
+  );
+
+  return rows;
+}
+
+async function getServicesByAppointmentIds(client, citaIds = []) {
+  const ids = Array.isArray(citaIds) ? citaIds.map((id) => String(id || "").trim()).filter(Boolean) : [];
+  if (!ids.length) return new Map();
+  const { rows } = await client.query(
+    `
+      SELECT
+        cd.id_cita,
+        cd.id_servicio,
+        s.nombre_servicio,
+        cd.cantidad,
+        cd.duracion_min,
+        cd.buffer_min,
+        cd.precio_unitario_hnl,
+        cd.subtotal_hnl
+      FROM public.citas_detalles cd
+      JOIN public.servicios s
+        ON s.id_servicio = cd.id_servicio
+      WHERE cd.id_cita = ANY($1::uuid[])
+      ORDER BY cd.created_at ASC, cd.id_cita_detalle ASC
+    `,
+    [ids]
+  );
+
+  const mapped = new Map();
+  for (const row of rows) {
+    const citaId = String(row.id_cita || "").trim();
+    if (!citaId) continue;
+    if (!mapped.has(citaId)) mapped.set(citaId, []);
+    mapped.get(citaId).push({
+      id_servicio: row.id_servicio,
+      nombre_servicio: row.nombre_servicio ?? null,
+      cantidad: Number(row.cantidad ?? 1),
+      duracion_min: Number(row.duracion_min ?? 0),
+      buffer_min: Number(row.buffer_min ?? 0),
+      precio_unitario_hnl: Number(row.precio_unitario_hnl ?? 0),
+      subtotal_hnl: Number(row.subtotal_hnl ?? 0),
+    });
+  }
+  return mapped;
+}
+
+async function getDiscardStateCode(client) {
+  const { rows } = await client.query(
+    `
+      SELECT estado_cita_codigo
+      FROM public.estados_cita
+      WHERE estado_cita_codigo = 'cancelada_por_cliente'
+      LIMIT 1
+    `
+  );
+  if (rows[0]?.estado_cita_codigo) return "cancelada_por_cliente";
+
+  // Mantiene compatibilidad operativa si el catalogo no fue sembrado aun en el entorno.
+  await client.query(
+    `
+      INSERT INTO public.estados_cita (estado_cita_codigo, descripcion)
+      VALUES ('cancelada_por_cliente', 'Cancelada por cliente desde historial de pendiente')
+      ON CONFLICT (estado_cita_codigo) DO NOTHING
+    `
+  );
+  const check = await client.query(
+    `
+      SELECT estado_cita_codigo
+      FROM public.estados_cita
+      WHERE estado_cita_codigo = 'cancelada_por_cliente'
+      LIMIT 1
+    `
+  );
+  if (check.rows[0]?.estado_cita_codigo) return "cancelada_por_cliente";
+  return null;
+}
+
+async function markPendingGroupExpired(client, groupId) {
+  await client.query(
+    `
+      UPDATE public.citas_holds h
+      SET estado_hold_codigo = 'expirado',
+          updated_at = now()
+      FROM public.citas c
+      WHERE c.id_grupo_cita = $1::uuid
+        AND c.id_cita = h.id_cita
+        AND c.deleted_at IS NULL
+        AND h.estado_hold_codigo = 'activo'
+    `,
+    [groupId]
+  );
+  await client.query(
+    `
+      UPDATE public.payment_intents pi
+      SET estado_intent_codigo = 'expirado',
+          updated_at = now()
+      FROM public.citas c
+      WHERE c.id_grupo_cita = $1::uuid
+        AND c.id_cita = pi.id_cita
+        AND c.deleted_at IS NULL
+        AND pi.estado_intent_codigo = ANY($2::text[])
+    `,
+    [groupId, ACTIVE_PAYMENT_INTENT_STATES]
+  );
+  await client.query(
+    `
+      UPDATE public.citas
+      SET estado_cita_codigo = 'expirada',
+          updated_at = now()
+      WHERE id_grupo_cita = $1::uuid
+        AND deleted_at IS NULL
+        AND estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+    `,
+    [groupId]
+  );
+}
+
+function buildPendingGroupPayload(groupRows, servicesByCita, { multiplePendingDetected = false } = {}) {
+  const rows = Array.isArray(groupRows) ? groupRows : [];
+  if (!rows.length) return null;
+  const first = rows[0];
+  const nowMs = Date.now();
+  const holdExpiresMs = first?.hold_expires_at ? new Date(first.hold_expires_at).getTime() : NaN;
+  const intentExpiresMs = first?.intent_expires_at ? new Date(first.intent_expires_at).getTime() : NaN;
+  const holdActive = String(first?.estado_hold_codigo || "").trim().toLowerCase() === "activo";
+  const intentActive = ACTIVE_PAYMENT_INTENT_STATES.includes(String(first?.estado_intent_codigo || "").trim().toLowerCase());
+  const holdVigente = holdActive && Number.isFinite(holdExpiresMs) && holdExpiresMs > nowMs;
+  const intentVigente = intentActive && Number.isFinite(intentExpiresMs) && intentExpiresMs > nowMs;
+  const vigente = holdVigente && intentVigente;
+
+  const citas = rows.map((row) => {
+    const citaId = String(row.id_cita || "").trim();
+    return {
+      id_cita: row.id_cita,
+      orden_integrante: Number(row.orden_integrante ?? 1),
+      alias_integrante: row.alias_integrante ?? null,
+      estado_cita_codigo: row.estado_cita_codigo,
+      inicio_at: toIsoOrNull(row.inicio_at),
+      id_sucursal: row.id_sucursal,
+      nombre_sucursal: row.nombre_sucursal ?? null,
+      id_empleado_barbero: row.id_empleado_barbero,
+      nombre_barbero: row.nombre_barbero ?? null,
+      total_pagar_hnl: Number(row.total_pagar_hnl ?? 0),
+      servicios: servicesByCita.get(citaId) || [],
+    };
+  });
+
+  const totalPendiente = rows.reduce((acc, row) => acc + Number(row.total_pagar_hnl ?? 0), 0);
+  const firstDate = rows
+    .map((row) => new Date(row.inicio_at))
+    .filter((date) => !Number.isNaN(date.getTime()))
+    .sort((a, b) => a.getTime() - b.getTime())[0];
+
+  return {
+    id_grupo_cita: first.id_grupo_cita,
+    estado: vigente ? "pendiente_pago_vigente" : "expirada",
+    vigente,
+    multiple_pending_detected: multiplePendingDetected,
+    total_pendiente_hnl: Number(totalPendiente.toFixed(2)),
+    fecha_hora_referencia: firstDate ? firstDate.toISOString() : null,
+    expires_at: toIsoOrNull(first.hold_expires_at),
+    sucursal: {
+      id_sucursal: first.id_sucursal,
+      nombre_sucursal: first.nombre_sucursal ?? null,
+    },
+    payment_intent: first.id_intent ? {
+      id_intent: first.id_intent,
+      estado_intent_codigo: first.estado_intent_codigo ?? null,
+      payment_url: first.link_pago_url ?? null,
+      monto_hnl: Number(first.intent_monto_hnl ?? totalPendiente),
+      moneda_codigo: first.intent_moneda_codigo ?? "HNL",
+      expires_at: toIsoOrNull(first.intent_expires_at),
+      vigente: intentVigente,
+    } : null,
+    citas,
+  };
+}
+
+async function resolveClientPendingGroup(client, { clienteId, personaId, groupId = null } = {}) {
+  const rows = await getClientPendingPaymentGroupRows(client, { clienteId, personaId, groupId });
+  if (!rows.length) return { primary: null, groups: [] };
+
+  const grouped = new Map();
+  for (const row of rows) {
+    const key = String(row.id_grupo_cita || "").trim();
+    if (!key) continue;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  }
+  const groups = [...grouped.values()];
+  const nowMs = Date.now();
+  const withRank = groups.map((groupRows) => {
+    const first = groupRows[0];
+    const holdExpiresMs = first?.hold_expires_at ? new Date(first.hold_expires_at).getTime() : NaN;
+    const intentExpiresMs = first?.intent_expires_at ? new Date(first.intent_expires_at).getTime() : NaN;
+    const holdActive = String(first?.estado_hold_codigo || "").trim().toLowerCase() === "activo";
+    const intentActive = ACTIVE_PAYMENT_INTENT_STATES.includes(String(first?.estado_intent_codigo || "").trim().toLowerCase());
+    const vigente = holdActive
+      && Number.isFinite(holdExpiresMs)
+      && holdExpiresMs > nowMs
+      && intentActive
+      && Number.isFinite(intentExpiresMs)
+      && intentExpiresMs > nowMs;
+    const createdAtMs = groupRows
+      .map((row) => new Date(row.inicio_at).getTime())
+      .filter((value) => Number.isFinite(value))
+      .sort((a, b) => b - a)[0] || 0;
+    return { groupRows, vigente, createdAtMs };
+  });
+
+  const ranked = withRank.sort((left, right) => {
+    if (left.vigente !== right.vigente) return left.vigente ? -1 : 1;
+    return right.createdAtMs - left.createdAtMs;
+  });
+  return { primary: ranked[0] || null, groups: ranked };
+}
+
+async function consumeMembershipForConfirmedRows(client, request, {
+  rows = [],
+  clienteId,
+  usuarioId,
+} = {}) {
+  const source = Array.isArray(rows) ? rows : [];
+  for (const row of source) {
+    if (Number(row?.orden_integrante || 1) > 1) continue;
+    const citaId = String(row?.id_cita || "").trim();
+    const branchId = String(row?.id_sucursal || "").trim();
+    if (!citaId || !branchId) continue;
+    try {
+      await consumeMembershipForCompletedAppointment(client, {
+        idCita: citaId,
+        idCliente: clienteId,
+        idSucursal: branchId,
+        ordenIntegrante: Number(row?.orden_integrante || 1),
+        usuarioEjecutorId: usuarioId || null,
+      });
+    } catch (membershipError) {
+      request.log.warn(
+        {
+          requestId: request.id,
+          id_grupo_cita: String(row?.id_grupo_cita || ""),
+          id_cita: citaId,
+          code: membershipError?.code || null,
+          message: membershipError?.message || null,
+        },
+        "No se pudo registrar consumo de membresia para cita confirmada"
+      );
+    }
+  }
 }
 
 function safeText(value) {
@@ -829,7 +1212,7 @@ function mapServicesById(serviceItems = []) {
   return map;
 }
 
-async function resolveAuthenticatedTitularContact(client, { personaId, claimsUser, titularPayload }) {
+async function resolveAuthenticatedTitularContact(client, { personaId, claimsUser }) {
   const profileResult = await client.query(
     `
       SELECT
@@ -866,104 +1249,25 @@ async function resolveAuthenticatedTitularContact(client, { personaId, claimsUse
   const profileApellidos = normalizePersonName(profileRow.apellidos || "");
   const profilePhone = normalizePhone(profileRow.telefono_principal || "");
   const profileEmail = normalizeEmail(profileRow.email || "");
-
-  if (!EMAIL_PATTERN.test(profileEmail)) {
-    throw new AppError(409, "No se pudo validar el correo de la cuenta autenticada", {
-      code: "CITAS_HOLD_ACCOUNT_EMAIL_INVALID",
+  // AM: FASE 1A - Perfil mínimo obligatorio para hold autenticado.
+  const missingFields = [];
+  if (!profileNombres) missingFields.push("nombres");
+  if (!profileApellidos) missingFields.push("apellidos");
+  if (!profilePhone || profilePhone.length < 8) missingFields.push("telefono_principal");
+  if (!EMAIL_PATTERN.test(profileEmail)) missingFields.push("correo_principal");
+  if (missingFields.length > 0) {
+    throw new AppError(409, "Completa tu perfil antes de agendar una cita.", {
+      code: "CLIENT_PROFILE_INCOMPLETE",
+      details: { missing_fields: missingFields },
     });
-  }
-
-  const payload = titularPayload && typeof titularPayload === "object"
-    ? titularPayload
-    : {};
-  const inputNombres = normalizePersonName(payload.nombres || "");
-  const inputApellidos = normalizePersonName(payload.apellidos || "");
-  const inputPhoneRaw = String(payload.telefono || "").trim();
-  const inputPhone = normalizePhone(inputPhoneRaw);
-  const guardarNombresApellidos = Boolean(payload.guardar_nombres_apellidos);
-  const guardarTelefono = Boolean(payload.guardar_telefono);
-
-  if (inputPhoneRaw && hasPhoneLetters(inputPhoneRaw)) {
-    throw new AppError(400, "El telefono del titular no admite letras", {
-      code: "CITAS_HOLD_TITULAR_PHONE_INVALID",
-      details: { field: "titular.telefono" },
-    });
-  }
-  if (inputPhoneRaw && inputPhone.length < 8) {
-    throw new AppError(400, "El telefono del titular debe ser valido", {
-      code: "CITAS_HOLD_TITULAR_PHONE_INVALID",
-      details: { field: "titular.telefono" },
-    });
-  }
-
-  const missingNombres = !profileNombres;
-  const missingApellidos = !profileApellidos;
-  const missingTelefono = profilePhone.length < 8;
-
-  const effectiveNombres = profileNombres || (missingNombres ? inputNombres : "");
-  const effectiveApellidos = profileApellidos || (missingApellidos ? inputApellidos : "");
-  const effectivePhone = profilePhone || (missingTelefono ? inputPhone : "");
-  const fullName = buildFullName(effectiveNombres, effectiveApellidos);
-
-  if (!effectiveNombres) {
-    throw new AppError(400, "El nombre del titular es obligatorio", {
-      code: "CITAS_HOLD_TITULAR_NAME_REQUIRED",
-      details: { field: "titular.nombres" },
-    });
-  }
-  if (!effectiveApellidos) {
-    throw new AppError(400, "El apellido del titular es obligatorio", {
-      code: "CITAS_HOLD_TITULAR_LAST_NAME_REQUIRED",
-      details: { field: "titular.apellidos" },
-    });
-  }
-  if (!effectivePhone || effectivePhone.length < 8) {
-    throw new AppError(400, "El telefono del titular es obligatorio", {
-      code: "CITAS_HOLD_TITULAR_PHONE_REQUIRED",
-      details: { field: "titular.telefono" },
-    });
-  }
-
-  if (guardarNombresApellidos && (missingNombres || missingApellidos)) {
-    await client.query(
-      `
-        UPDATE public.personas
-        SET nombres = CASE
-              WHEN (nombres IS NULL OR btrim(nombres) = '') AND $2::text <> '' THEN $2
-              ELSE nombres
-            END,
-            apellidos = CASE
-              WHEN (apellidos IS NULL OR btrim(apellidos) = '') AND $3::text <> '' THEN $3
-              ELSE apellidos
-            END,
-            updated_at = NOW()
-        WHERE id_persona = $1::uuid
-      `,
-      [personaId, inputNombres, inputApellidos]
-    );
-  }
-
-  if (guardarTelefono && missingTelefono && inputPhone.length >= 8) {
-    await client.query(
-      `
-        UPDATE public.personas
-        SET telefono_principal = CASE
-              WHEN telefono_principal IS NULL OR btrim(telefono_principal) = '' THEN $2
-              ELSE telefono_principal
-            END,
-            updated_at = NOW()
-        WHERE id_persona = $1::uuid
-      `,
-      [personaId, inputPhone]
-    );
   }
 
   return {
-    fullName,
-    nombres: effectiveNombres,
-    apellidos: effectiveApellidos,
+    fullName: buildFullName(profileNombres, profileApellidos),
+    nombres: profileNombres,
+    apellidos: profileApellidos,
     email: profileEmail,
-    telefono: effectivePhone,
+    telefono: profilePhone,
   };
 }
 
@@ -1050,6 +1354,33 @@ export default async function citasRoutes(app) {
       const dbClient = await app.db.connect();
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
+        const pendingResolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
+        if (pendingResolved.primary?.vigente) {
+          const pendingRows = pendingResolved.primary.groupRows;
+          const servicesByCita = await getServicesByAppointmentIds(
+            dbClient,
+            pendingRows.map((row) => row.id_cita)
+          );
+          const pendingPayload = buildPendingGroupPayload(pendingRows, servicesByCita, {
+            multiplePendingDetected: pendingResolved.groups.length > 1,
+          });
+          throw new AppError(
+            409,
+            "Tienes una reserva pendiente de pago. Completa o descarta esa reserva antes de agendar una nueva cita.",
+            {
+              code: "CLIENT_PENDING_APPOINTMENT_EXISTS",
+              details: {
+                id_grupo_cita: pendingPayload?.id_grupo_cita || null,
+                fecha_hora: pendingPayload?.fecha_hora_referencia || null,
+                id_sucursal: pendingPayload?.sucursal?.id_sucursal || null,
+                sucursal: pendingPayload?.sucursal?.nombre_sucursal || null,
+                total_pendiente_hnl: Number(pendingPayload?.total_pendiente_hnl || 0),
+                expires_at: pendingPayload?.expires_at || null,
+                multiple_pending_detected: pendingPayload?.multiple_pending_detected === true,
+              },
+            }
+          );
+        }
         const selectionType = String(request.body?.selection_type || "services").trim().toLowerCase();
         const serviceIds = Array.isArray(request.body?.servicios)
           ? request.body.servicios.map((item) => item.id_servicio)
@@ -1308,6 +1639,33 @@ export default async function citasRoutes(app) {
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
         await expireReservationsBestEffort(dbClient, request, "citas_hold_create");
+        const pendingResolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
+        if (pendingResolved.primary?.vigente) {
+          const pendingRows = pendingResolved.primary.groupRows;
+          const servicesByCita = await getServicesByAppointmentIds(
+            dbClient,
+            pendingRows.map((row) => row.id_cita)
+          );
+          const pendingPayload = buildPendingGroupPayload(pendingRows, servicesByCita, {
+            multiplePendingDetected: pendingResolved.groups.length > 1,
+          });
+          throw new AppError(
+            409,
+            "Tienes una reserva pendiente de pago. Completa o descarta esa reserva antes de agendar una nueva cita.",
+            {
+              code: "CLIENT_PENDING_APPOINTMENT_EXISTS",
+              details: {
+                id_grupo_cita: pendingPayload?.id_grupo_cita || null,
+                fecha_hora: pendingPayload?.fecha_hora_referencia || null,
+                id_sucursal: pendingPayload?.sucursal?.id_sucursal || null,
+                sucursal: pendingPayload?.sucursal?.nombre_sucursal || null,
+                total_pendiente_hnl: Number(pendingPayload?.total_pendiente_hnl || 0),
+                expires_at: pendingPayload?.expires_at || null,
+                multiple_pending_detected: pendingPayload?.multiple_pending_detected === true,
+              },
+            }
+          );
+        }
 
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const canjeContextTokenRaw = request.body?.canje_context_token ?? request.body?.id_points_tx_canje;
@@ -1322,7 +1680,6 @@ export default async function citasRoutes(app) {
         const titularContact = await resolveAuthenticatedTitularContact(dbClient, {
           personaId,
           claimsUser: request.claims?.user,
-          titularPayload: request.body?.titular,
         });
         const rewardRedeemContext = canjeContextToken
           ? await resolveRedeemContextForHold(dbClient, {
@@ -1331,6 +1688,26 @@ export default async function citasRoutes(app) {
             idSucursal: branch.id_sucursal,
           })
           : null;
+        if (!rewardRedeemContext) {
+          const rewardGate = await resolveRewardRedeemGateForCliente(dbClient, {
+            idCliente: clienteId,
+            idSucursal: branch.id_sucursal,
+          });
+          if (rewardGate.reward_redeem_required) {
+            throw new AppError(
+              409,
+              "Tienes una cortesía disponible. Para continuar, debes canjear tu recompensa antes de agendar una cita normal.",
+              {
+                code: "REWARD_REDEEM_REQUIRED",
+                details: {
+                  recompensas_disponibles: Number(rewardGate.recompensas_disponibles || 0),
+                  progreso_actual: Number(rewardGate.progreso_actual || 0),
+                  puntos_para_premio: Number(rewardGate.puntos_para_premio || 0),
+                },
+              }
+            );
+          }
+        }
         let rewardAppliedInHold = false;
         let rewardCoveredTotalHnl = 0;
         let rewardLinkedCitaId = null;
@@ -1661,7 +2038,9 @@ export default async function citasRoutes(app) {
 
           const citaId = citaInsert.rows[0].id_cita;
           if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
+            const promoSavepoint = `sp_promo_hold_${integrante.orden_integrante}`;
             try {
+              await dbClient.query(`SAVEPOINT ${promoSavepoint}`);
               await recordPromotionApplications(
                 dbClient,
                 {
@@ -1676,7 +2055,12 @@ export default async function citasRoutes(app) {
                 promocionesPreview,
                 { formal: false }
               );
+              await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
             } catch (promoPersistError) {
+              try {
+                await dbClient.query(`ROLLBACK TO SAVEPOINT ${promoSavepoint}`);
+                await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
+              } catch {}
               request.log.warn(
                 {
                   requestId: request.id,
@@ -1798,6 +2182,22 @@ export default async function citasRoutes(app) {
           membershipMessage = "No pudimos validar beneficios de plan en este momento; calculamos la cita con tarifa normal.";
         }
         const membershipCoverageActive = Boolean(hasMembership && coverageTracker.branchMatch && hasCoveredAmount);
+        // AM: Señales explícitas de contrato para UX de membresía en hold autenticado.
+        const membershipBranchMismatch = Boolean(hasMembership && coverageTracker.coverageDisabledReason === "branch_mismatch");
+        const membershipStateCode = String(membershipState?.estado_plan || "").trim().toLowerCase();
+        const hasMembershipHistory = membershipState?.tiene_historial === true;
+        let membershipReasonNoAplica = null;
+        if (membershipComputationFailed) {
+          membershipReasonNoAplica = "ERROR_MEMBRESIA";
+        } else if (membershipBranchMismatch) {
+          membershipReasonNoAplica = "SUCURSAL_DIFERENTE";
+        } else if (membershipCoverageActive) {
+          membershipReasonNoAplica = null;
+        } else if (!hasMembership && hasMembershipHistory && membershipStateCode && membershipStateCode !== "sin_plan_activo") {
+          membershipReasonNoAplica = "PLAN_NO_ACTIVO";
+        } else if (!hasMembership) {
+          membershipReasonNoAplica = "SIN_PLAN";
+        }
         const coveredServicesList = [...coveredServicesByPlan.values()];
         const forcedServicesList = [...forcedServicesByPlan.values()];
         await dbClient.query("COMMIT");
@@ -1849,6 +2249,10 @@ export default async function citasRoutes(app) {
               sucursal_plan_nombre: coverageTracker.sucursalPlanNombre || null,
               nombre_plan: coverageTracker.planName || null,
               estado_plan: membershipState?.estado_plan || "sin_plan_activo",
+              aplica_en_cita: membershipCoverageActive,
+              branch_mismatch: membershipBranchMismatch,
+              motivo_no_aplica: membershipReasonNoAplica,
+              acompanantes_cubiertos: false,
               mensaje: membershipMessage,
               servicios_cubiertos: coveredServicesList,
               servicios_forzados: forcedServicesList,
@@ -1862,6 +2266,10 @@ export default async function citasRoutes(app) {
               sucursal_plan_nombre: null,
               nombre_plan: null,
               estado_plan: "sin_plan_activo",
+              aplica_en_cita: false,
+              branch_mismatch: membershipBranchMismatch,
+              motivo_no_aplica: membershipReasonNoAplica,
+              acompanantes_cubiertos: false,
               mensaje: membershipMessage,
               servicios_cubiertos: [],
               servicios_forzados: [],
@@ -2082,6 +2490,16 @@ export default async function citasRoutes(app) {
             id_cliente: clienteId,
             id_persona: personaId,
           });
+          step = "consumeMembershipForConfirmedRows_already_confirmed";
+          await consumeMembershipForConfirmedRows(dbClient, request, {
+            rows,
+            clienteId,
+            usuarioId: request.claims?.user?.id_usuario ?? null,
+          });
+          step = "grantEngagementPointsForConfirmedGroup_already_confirmed";
+          await grantEngagementPointsForConfirmedGroup(dbClient, {
+            idGrupoCita: group.id_grupo_cita,
+          });
           step = "tx_commit_already_confirmed";
           await dbClient.query("COMMIT");
           txStarted = false;
@@ -2158,6 +2576,16 @@ export default async function citasRoutes(app) {
           id_grupo_cita: group.id_grupo_cita,
           id_cliente: clienteId,
           id_persona: personaId,
+        });
+        step = "consumeMembershipForConfirmedRows";
+        await consumeMembershipForConfirmedRows(dbClient, request, {
+          rows: pendingRows,
+          clienteId,
+          usuarioId: request.claims?.user?.id_usuario ?? null,
+        });
+        step = "grantEngagementPointsForConfirmedGroup";
+        await grantEngagementPointsForConfirmedGroup(dbClient, {
+          idGrupoCita: group.id_grupo_cita,
         });
         step = "tx_commit";
         await dbClient.query("COMMIT");
@@ -2267,6 +2695,272 @@ export default async function citasRoutes(app) {
           "No se pudo confirmar la reserva sin pago",
           "CITAS_CONFIRM_NO_PAYMENT_ERROR"
         );
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.get(
+    "/pendiente",
+    {
+      preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  pendiente: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
+                },
+                required: ["pendiente"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const dbClient = await app.db.connect();
+      try {
+        const { clienteId, personaId } = ensureClientContext(request);
+        await expireReservationsBestEffort(dbClient, request, "citas_pending_get");
+        const resolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
+        if (!resolved.primary) {
+          return sendOk(reply, { pendiente: null });
+        }
+        const primaryRows = resolved.primary.groupRows;
+        const primaryGroupId = String(primaryRows[0]?.id_grupo_cita || "").trim();
+        const servicesByCita = await getServicesByAppointmentIds(
+          dbClient,
+          primaryRows.map((row) => row.id_cita)
+        );
+        const payload = buildPendingGroupPayload(primaryRows, servicesByCita, {
+          multiplePendingDetected: resolved.groups.length > 1,
+        });
+        if (!payload?.vigente && primaryGroupId) {
+          await dbClient.query("BEGIN");
+          await markPendingGroupExpired(dbClient, primaryGroupId);
+          await dbClient.query("COMMIT");
+          const refreshed = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
+          if (!refreshed.primary) {
+            return sendOk(reply, { pendiente: null });
+          }
+          const refreshedRows = refreshed.primary.groupRows;
+          const refreshedServices = await getServicesByAppointmentIds(
+            dbClient,
+            refreshedRows.map((row) => row.id_cita)
+          );
+          const refreshedPayload = buildPendingGroupPayload(refreshedRows, refreshedServices, {
+            multiplePendingDetected: refreshed.groups.length > 1,
+          });
+          return sendOk(reply, { pendiente: refreshedPayload });
+        }
+        return sendOk(reply, { pendiente: payload });
+      } catch (error) {
+        try { await dbClient.query("ROLLBACK"); } catch {}
+        return sendHandled(reply, request, error, "No se pudo consultar la reserva pendiente", "CITAS_PENDING_GET_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.post(
+    "/pendiente/:id_grupo_cita/retomar",
+    {
+      preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_grupo_cita"],
+          properties: {
+            id_grupo_cita: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const dbClient = await app.db.connect();
+      try {
+        const { clienteId, personaId } = ensureClientContext(request);
+        const groupId = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+        await expireReservationsBestEffort(dbClient, request, "citas_pending_resume");
+        const resolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId, groupId });
+        if (!resolved.primary) {
+          throw new AppError(404, "No se encontro una reserva pendiente para retomar", {
+            code: "PENDING_APPOINTMENT_NOT_FOUND",
+          });
+        }
+        const primaryRows = resolved.primary.groupRows;
+        const servicesByCita = await getServicesByAppointmentIds(
+          dbClient,
+          primaryRows.map((row) => row.id_cita)
+        );
+        const payload = buildPendingGroupPayload(primaryRows, servicesByCita, {
+          multiplePendingDetected: resolved.groups.length > 1,
+        });
+        if (!payload?.vigente || !payload?.payment_intent?.id_intent) {
+          await dbClient.query("BEGIN");
+          await markPendingGroupExpired(dbClient, groupId);
+          await dbClient.query("COMMIT");
+          throw new AppError(409, PENDING_EXPIRED_MESSAGE, {
+            code: "PENDING_APPOINTMENT_EXPIRED",
+            details: {
+              id_grupo_cita: groupId,
+            },
+          });
+        }
+        return sendOk(reply, {
+          id_grupo_cita: payload.id_grupo_cita,
+          estado: payload.estado,
+          expires_at: payload.expires_at,
+          multiple_pending_detected: payload.multiple_pending_detected === true,
+          payment_intent: payload.payment_intent,
+          total_pendiente_hnl: payload.total_pendiente_hnl,
+        });
+      } catch (error) {
+        try { await dbClient.query("ROLLBACK"); } catch {}
+        return sendHandled(reply, request, error, "No se pudo retomar la reserva pendiente", "CITAS_PENDING_RESUME_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.post(
+    "/pendiente/:id_grupo_cita/descartar",
+    {
+      preHandler: app.requireRoles(CLIENT_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_grupo_cita"],
+          properties: {
+            id_grupo_cita: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const dbClient = await app.db.connect();
+      try {
+        const { clienteId, personaId } = ensureClientContext(request);
+        const groupId = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+        const resolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId, groupId });
+        if (!resolved.primary) {
+          return sendOk(reply, {
+            id_grupo_cita: groupId,
+            estado_final: "sin_pendiente",
+            descartada: true,
+            idempotent: true,
+          });
+        }
+        const discardState = await getDiscardStateCode(dbClient);
+        if (!discardState) {
+          throw new AppError(409, "No existe estado cancelada_por_cliente configurado. Solicita habilitar el catalogo de estados.", {
+            code: "PENDING_DISCARD_STATE_UNAVAILABLE",
+          });
+        }
+        await dbClient.query("BEGIN");
+        await dbClient.query(
+          `
+            UPDATE public.citas
+            SET estado_cita_codigo = $2::text,
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+              AND deleted_at IS NULL
+              AND estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+          `,
+          [groupId, discardState]
+        );
+        await dbClient.query(
+          `
+            UPDATE public.citas_holds h
+            SET estado_hold_codigo = CASE
+              WHEN h.estado_hold_codigo = 'consumido' THEN h.estado_hold_codigo
+              ELSE 'expirado'
+            END,
+            updated_at = now()
+            FROM public.citas c
+            WHERE c.id_grupo_cita = $1::uuid
+              AND c.id_cita = h.id_cita
+              AND c.deleted_at IS NULL
+          `,
+          [groupId]
+        );
+        await dbClient.query(
+          `
+            UPDATE public.payment_intents pi
+            SET estado_intent_codigo = 'expirado',
+                updated_at = now()
+            FROM public.citas c
+            WHERE c.id_grupo_cita = $1::uuid
+              AND c.id_cita = pi.id_cita
+              AND c.deleted_at IS NULL
+              AND pi.estado_intent_codigo = ANY($2::text[])
+          `,
+          [groupId, ACTIVE_PAYMENT_INTENT_STATES]
+        );
+        await dbClient.query("COMMIT");
+        return sendOk(reply, {
+          id_grupo_cita: groupId,
+          estado_final: discardState,
+          descartada: true,
+          idempotent: false,
+        });
+      } catch (error) {
+        try { await dbClient.query("ROLLBACK"); } catch {}
+        return sendHandled(reply, request, error, "No se pudo descartar la reserva pendiente", "CITAS_PENDING_DISCARD_ERROR");
       } finally {
         dbClient.release();
       }
