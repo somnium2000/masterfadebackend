@@ -1,3 +1,4 @@
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
@@ -10,10 +11,32 @@ import {
   parseDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
+import {
+  getCandidatePromotionRules,
+  getPromotionCodesByRules,
+  getPromotionCompatibility,
+  getPromotionUsageStats,
+} from "../../../services/promociones/promocionesRepository.js";
+import {
+  buildPromotionResult,
+  evaluatePromotions,
+  resolvePromotionConflicts,
+} from "../../../services/promociones/promocionesEngine.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
+const MAX_PUBLIC_PROMOTIONS_PER_BOOKING = 5;
+const PUBLIC_RELEASE_TOKEN_COLUMNS = new Set(["release_token_hash", "release_token_created_at"]);
+const PUBLIC_RELEASE_REJECTED_APPOINTMENT_STATES = new Set([
+  "confirmada",
+  "en_salon",
+  "en_atencion",
+  "completada",
+  "no_show",
+  "pendiente_pago",
+]);
+const PUBLIC_RELEASE_CANCELLABLE_APPOINTMENT_STATES = ["en_espera"];
 const errorResponseSchema = {
   type: "object",
   properties: {
@@ -134,6 +157,7 @@ const PUBLIC_CITAS_SAFE_DETAIL_KEYS = new Set([
   "maxCompanions",
   "selection_type",
   "alias",
+  "reason",
 ]);
 
 function sanitizePublicCitasErrorDetails(rawDetails) {
@@ -198,6 +222,39 @@ function resolveSafeConflictReason(error) {
   if (safeCode.startsWith("AGENDA_")) return safeCode;
   if (safeCode === "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER") return safeCode;
   return "UNKNOWN_CONFLICT";
+}
+
+async function getPublicHoldReleaseTokenSupport(client) {
+  const { rows } = await client.query(
+    `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'citas_grupos'
+        AND column_name = ANY($1::text[])
+    `,
+    [Array.from(PUBLIC_RELEASE_TOKEN_COLUMNS)]
+  );
+  const columns = new Set(rows.map((row) => String(row.column_name || "").trim()));
+  return {
+    supported: columns.has("release_token_hash") && columns.has("release_token_created_at"),
+  };
+}
+
+function generatePublicReleaseToken() {
+  return randomBytes(32).toString("hex");
+}
+
+function hashPublicReleaseToken(token) {
+  return createHash("sha256").update(String(token || ""), "utf8").digest("hex");
+}
+
+function isPublicReleaseTokenValid(token, expectedHash) {
+  const normalizedHash = String(expectedHash || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(normalizedHash)) return false;
+  const actual = Buffer.from(hashPublicReleaseToken(token), "hex");
+  const expected = Buffer.from(normalizedHash, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 function splitFullName(rawName) {
@@ -590,6 +647,54 @@ function validateCompanionContactPayload(contacto, { alias, index }) {
   };
 }
 
+function normalizeRequestedPromotionEntry(rawPromotion, { alias, index }) {
+  const idPromocionRaw = String(rawPromotion?.id_promocion || "").trim();
+  const idPromocionReglaRaw = String(rawPromotion?.id_promocion_regla || "").trim();
+  if (!idPromocionRaw || !idPromocionReglaRaw) {
+    throw new AppError(400, "La promocion seleccionada debe enviar promocion y regla", {
+      code: "PUBLIC_CITAS_PROMOTION_CONTRACT_INVALID",
+      details: { field: "promociones", alias, blockIndex: index },
+    });
+  }
+  return {
+    id_promocion: assertUuid(idPromocionRaw, "id_promocion"),
+    id_promocion_regla: assertUuid(idPromocionReglaRaw, "id_promocion_regla"),
+  };
+}
+
+function normalizeRequestedPromotionsPayload(item, { alias, index }) {
+  const rawPromotions = Array.isArray(item?.promociones) && item.promociones.length > 0
+    ? item.promociones
+    : (
+        item?.id_promocion || item?.id_promocion_regla
+          ? [{ id_promocion: item?.id_promocion, id_promocion_regla: item?.id_promocion_regla }]
+          : []
+      );
+  if (!rawPromotions.length) return [];
+  if (rawPromotions.length > MAX_PUBLIC_PROMOTIONS_PER_BOOKING) {
+    throw new AppError(400, "Has seleccionado mas promociones de las permitidas", {
+      code: "PUBLIC_CITAS_PROMOTIONS_MAX_EXCEEDED",
+      details: { field: "promociones", alias, blockIndex: index },
+    });
+  }
+
+  const normalized = [];
+  const seenKeys = new Set();
+  for (const rawPromotion of rawPromotions) {
+    const promotion = normalizeRequestedPromotionEntry(rawPromotion, { alias, index });
+    const key = `${promotion.id_promocion}:${promotion.id_promocion_regla}`;
+    if (seenKeys.has(key)) {
+      throw new AppError(400, "Una promocion no puede repetirse en el mismo integrante", {
+        code: "PUBLIC_CITAS_PROMOTION_DUPLICATED",
+        details: { field: "promociones", alias, blockIndex: index },
+      });
+    }
+    seenKeys.add(key);
+    normalized.push(promotion);
+  }
+  return normalized;
+}
+
 function normalizeBlocksPayload(body, titularPayload) {
   const hasGroupedPayload = Array.isArray(body?.integrantes) && body.integrantes.length > 0;
   const hasLegacySelection = body?.selection_type === "package" || body?.selection_type === "mixed"
@@ -617,7 +722,7 @@ function normalizeBlocksPayload(body, titularPayload) {
     });
   }
 
-  return rawBlocks.map((item, index) => {
+  const normalizedBlocks = rawBlocks.map((item, index) => {
     const aliasFallback = index === 0 ? "Titular" : `Acompanante ${index}`;
     const alias = String(item?.alias || aliasFallback).trim().slice(0, 80) || aliasFallback;
     const ordenIntegrante = Number(item?.orden_integrante);
@@ -649,6 +754,7 @@ function normalizeBlocksPayload(body, titularPayload) {
     const serviceIds = (selectionType === "services" || selectionType === "mixed")
       ? servicios.map((service) => assertUuid(service?.id_servicio, "id_servicio"))
       : [];
+    const requestedPromotions = normalizeRequestedPromotionsPayload(item, { alias, index });
 
     const fechaInicio = String(item?.fecha_inicio || "").trim();
     assertDateTimeNotPastInHonduras(fechaInicio, "fecha_inicio");
@@ -659,6 +765,7 @@ function normalizeBlocksPayload(body, titularPayload) {
       id_barbero: item?.id_barbero ? assertUuid(item.id_barbero, "id_barbero") : null,
       selection_type: selectionType,
       id_paquete: packageId,
+      promociones: requestedPromotions,
       fecha_inicio: fechaInicio,
       serviceIds,
       contacto: index === 0
@@ -672,6 +779,131 @@ function normalizeBlocksPayload(body, titularPayload) {
         : validateCompanionContactPayload(item?.contacto, { alias, index }),
     };
   });
+  const totalRequestedPromotions = normalizedBlocks.reduce(
+    (sum, block) => sum + (Array.isArray(block.promociones) ? block.promociones.length : 0),
+    0
+  );
+  if (totalRequestedPromotions > MAX_PUBLIC_PROMOTIONS_PER_BOOKING) {
+    throw new AppError(400, "Has seleccionado mas promociones de las permitidas", {
+      code: "PUBLIC_CITAS_PROMOTIONS_MAX_EXCEEDED",
+      details: { field: "promociones" },
+    });
+  }
+  return normalizedBlocks;
+}
+
+function buildPromotionCodesByRule(codeRows = []) {
+  const map = new Map();
+  for (const row of codeRows) {
+    if (!map.has(row.id_promocion_regla)) map.set(row.id_promocion_regla, []);
+    map.get(row.id_promocion_regla).push(row);
+  }
+  return map;
+}
+
+function buildPromotionCompatibilityMap(rows = []) {
+  const map = new Map();
+  for (const row of rows) {
+    const key = [row.id_promocion_regla_a, row.id_promocion_regla_b].sort().join(":");
+    map.set(key, Boolean(row.compatible));
+  }
+  return map;
+}
+
+function buildPromotionRequestKey(promotion) {
+  return `${String(promotion?.id_promocion || "").trim()}:${String(promotion?.id_promocion_regla || "").trim()}`;
+}
+
+async function resolveRequestedPromotionsForPublicHold(client, {
+  branch,
+  clientProfile,
+  groupRecord,
+  integrante,
+  selection,
+  index,
+}) {
+  const requestedPromotions = Array.isArray(integrante?.promociones) ? integrante.promociones : [];
+  if (!requestedPromotions.length) {
+    return { descuento_hnl: 0, aplicadas: [], descartadas: [] };
+  }
+
+  const requestedKeys = new Set(requestedPromotions.map(buildPromotionRequestKey));
+  const startIso = selection.startDateTime.toISOString();
+  const promoContext = {
+    id_sucursal: branch.id_sucursal,
+    id_empleado_barbero: selection.barber.id_empleado,
+    id_cliente: clientProfile.id_cliente,
+    id_persona: clientProfile.id_persona,
+    id_grupo_cita: groupRecord.id_grupo_cita,
+    fecha_hora: startIso,
+    fecha: startIso.slice(0, 10),
+    fecha_operativa: startIso.slice(0, 10),
+    hora: startIso.slice(11, 16),
+    subtotal_hnl: selection.serviceSelection.monto_total_hnl,
+    servicios: selection.serviceSelection.items || [],
+    paquetes: selection.serviceSelection.id_paquete
+      ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+      : [],
+    canal: "public",
+    es_cliente_autenticado: false,
+    es_titular: index === 0,
+  };
+
+  const candidates = (await getCandidatePromotionRules(client, promoContext))
+    .filter((row) => requestedKeys.has(buildPromotionRequestKey(row)) && row.visible_publico === true);
+  const candidateKeys = new Set(candidates.map(buildPromotionRequestKey));
+  const missingRequest = requestedPromotions.find((promotion) => !candidateKeys.has(buildPromotionRequestKey(promotion)));
+  if (missingRequest) {
+    throw new AppError(409, "La promocion seleccionada no aplica para esta reserva", {
+      code: "PUBLIC_CITAS_PROMOTION_NOT_APPLICABLE",
+      details: {
+        field: "promociones",
+        alias: integrante.alias,
+        blockIndex: index,
+        reason: "PROMOCION_NO_DISPONIBLE",
+      },
+    });
+  }
+
+  const ruleIds = candidates.map((row) => row.id_promocion_regla);
+  const [codeRows, compatibilityRows, usageStats] = await Promise.all([
+    getPromotionCodesByRules(client, ruleIds),
+    getPromotionCompatibility(client, ruleIds),
+    getPromotionUsageStats(client, promoContext, ruleIds),
+  ]);
+  const codesByRule = buildPromotionCodesByRule(codeRows);
+  const evaluated = evaluatePromotions(
+    promoContext,
+    candidates.map((candidate) => ({
+      ...candidate,
+      codes: codesByRule.get(candidate.id_promocion_regla) || [],
+    })),
+    usageStats
+  );
+  const resolved = resolvePromotionConflicts(promoContext, evaluated, buildPromotionCompatibilityMap(compatibilityRows));
+  const result = buildPromotionResult(promoContext, resolved);
+  const appliedKeys = new Set((result.promociones_aplicadas || []).map(buildPromotionRequestKey));
+  const rejectedRequest = requestedPromotions.find((promotion) => !appliedKeys.has(buildPromotionRequestKey(promotion)));
+  if (rejectedRequest) {
+    const rejectedKey = buildPromotionRequestKey(rejectedRequest);
+    const discarded = (result.promociones_descartadas || []).find((row) => buildPromotionRequestKey(row) === rejectedKey);
+    const evaluatedRejected = evaluated.find((row) => buildPromotionRequestKey(row) === rejectedKey);
+    throw new AppError(409, "La promocion seleccionada no aplica para esta reserva", {
+      code: "PUBLIC_CITAS_PROMOTION_NOT_APPLICABLE",
+      details: {
+        field: "promociones",
+        alias: integrante.alias,
+        blockIndex: index,
+        reason: discarded?.motivo_codigo || evaluatedRejected?.reasonCode || "PROMOCION_NO_APLICADA",
+      },
+    });
+  }
+
+  return {
+    descuento_hnl: normalizeMoney(result.descuento_total_hnl),
+    aplicadas: result.promociones_aplicadas || [],
+    descartadas: result.promociones_descartadas || [],
+  };
 }
 
 async function resolveOrCreatePublicClient(client, payload) {
@@ -980,6 +1212,7 @@ export default async function publicCitasRoutes(app) {
                 properties: {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
+                  rol_integrante_codigo: { type: "string", maxLength: 40 },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   selection_type: { type: "string", enum: ["services", "package", "mixed"] },
                   id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
@@ -1008,6 +1241,19 @@ export default async function publicCitasRoutes(app) {
                   },
                   id_promocion: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   id_promocion_regla: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  promociones: {
+                    type: "array",
+                    maxItems: MAX_PUBLIC_PROMOTIONS_PER_BOOKING,
+                    items: {
+                      type: "object",
+                      required: ["id_promocion", "id_promocion_regla"],
+                      properties: {
+                        id_promocion: { type: "string", format: "uuid" },
+                        id_promocion_regla: { type: "string", format: "uuid" },
+                      },
+                      additionalProperties: false,
+                    },
+                  },
                 },
                 additionalProperties: false,
               },
@@ -1047,7 +1293,10 @@ export default async function publicCitasRoutes(app) {
                   monto_total_hnl: { type: "number" },
                   subtotal_hnl: { type: "number" },
                   descuento_total_hnl: { type: "number" },
+                  total_pagar_hnl: { type: "number" },
+                  extras_a_pagar_hnl: { type: "number" },
                   total_hnl: { type: "number" },
+                  release_token: { type: "string" },
                   promociones_aplicadas: { type: "array", items: { type: "object", additionalProperties: true } },
                   promociones_descartadas: { type: "array", items: { type: "object", additionalProperties: true } },
                   bloques: { type: "array", items: holdBlockSchema },
@@ -1122,11 +1371,27 @@ export default async function publicCitasRoutes(app) {
         );
 
         const groupRecord = groupInsert.rows[0];
+        const releaseTokenSupport = await getPublicHoldReleaseTokenSupport(dbClient);
+        const releaseToken = releaseTokenSupport.supported ? generatePublicReleaseToken() : null;
+        if (releaseToken) {
+          await dbClient.query(
+            `
+              UPDATE public.citas_grupos
+              SET release_token_hash = $2::text,
+                  release_token_created_at = now(),
+                  updated_at = now()
+              WHERE id_grupo_cita = $1::uuid
+            `,
+            [groupRecord.id_grupo_cita, hashPublicReleaseToken(releaseToken)]
+          );
+        }
         const bloquesResponse = [];
         let subtotalGrupo = 0;
         let descuentoGrupo = 0;
         let totalGrupo = 0;
         let titularResolved = null;
+        const promocionesAplicadasGrupo = [];
+        const promocionesDescartadasGrupo = [];
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
@@ -1165,6 +1430,17 @@ export default async function publicCitasRoutes(app) {
           }
 
           const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
+          const subtotalServiciosHnl = normalizeMoney(selection.serviceSelection.monto_total_hnl);
+          const promotionResult = await resolveRequestedPromotionsForPublicHold(dbClient, {
+            branch,
+            clientProfile,
+            groupRecord,
+            integrante,
+            selection,
+            index,
+          });
+          const descuentoHnl = normalizeMoney(promotionResult.descuento_hnl);
+          const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
 
           const citaInsert = await dbClient.query(
             `
@@ -1184,16 +1460,16 @@ export default async function publicCitasRoutes(app) {
                 duracion_total_min,
                 buffer_total_min,
                 subtotal_servicios_hnl,
-              descuento_hnl,
-              total_pagar_hnl,
-              selection_type,
-              id_paquete,
-              contacto_nombre,
-              contacto_email,
-              contacto_telefono,
-              notas
-            )
-            VALUES (
+                descuento_hnl,
+                total_pagar_hnl,
+                selection_type,
+                id_paquete,
+                contacto_nombre,
+                contacto_email,
+                contacto_telefono,
+                notas
+              )
+              VALUES (
                 $1::uuid,
                 $2::int,
                 $3,
@@ -1209,14 +1485,14 @@ export default async function publicCitasRoutes(app) {
                 $12::int,
                 $13::int,
                 $14::numeric,
-                0,
                 $15::numeric,
-                $16::text,
-                $17::uuid,
-                $18,
+                $16::numeric,
+                $17::text,
+                $18::uuid,
                 $19,
                 $20,
-                $21
+                $21,
+                $22
               )
               RETURNING id_cita
             `,
@@ -1234,8 +1510,9 @@ export default async function publicCitasRoutes(app) {
               finAt.toISOString(),
               selection.serviceSelection.duracion_total_min,
               selection.serviceSelection.buffer_total_min,
-              selection.serviceSelection.monto_total_hnl,
-              selection.serviceSelection.monto_total_hnl,
+              subtotalServiciosHnl,
+              descuentoHnl,
+              totalPagarHnl,
               selection.serviceSelection.selection_type || integrante.selection_type || "services",
               selection.serviceSelection.id_paquete || integrante.id_paquete || null,
               integrante.contacto?.nombre || integrante.alias,
@@ -1246,6 +1523,20 @@ export default async function publicCitasRoutes(app) {
           );
 
           const citaId = citaInsert.rows[0].id_cita;
+          for (const appliedPromotion of promotionResult.aplicadas || []) {
+            promocionesAplicadasGrupo.push({
+              ...appliedPromotion,
+              orden_integrante: integrante.orden_integrante,
+              alias: integrante.alias,
+            });
+          }
+          for (const discardedPromotion of promotionResult.descartadas || []) {
+            promocionesDescartadasGrupo.push({
+              ...discardedPromotion,
+              orden_integrante: integrante.orden_integrante,
+              alias: integrante.alias,
+            });
+          }
           for (const serviceItem of selection.serviceSelection.items) {
             await dbClient.query(
               `
@@ -1284,12 +1575,6 @@ export default async function publicCitasRoutes(app) {
             [citaId, holdState, expiresAt.toISOString()]
           );
 
-          const subtotalServiciosHnl = normalizeMoney(selection.serviceSelection.monto_total_hnl);
-          const descuentoHnl = normalizeMoney(selection.serviceSelection.descuento_hnl);
-          const totalPagarHnl = normalizeMoney(
-            selection.serviceSelection.total_pagar_hnl ?? (subtotalServiciosHnl - descuentoHnl)
-          );
-
           subtotalGrupo += subtotalServiciosHnl;
           descuentoGrupo += descuentoHnl;
           totalGrupo += totalPagarHnl;
@@ -1321,12 +1606,15 @@ export default async function publicCitasRoutes(app) {
             id_grupo_cita: groupRecord.id_grupo_cita,
             estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
             expires_at: expiresAt.toISOString(),
-            monto_total_hnl: totalGrupo,
+            monto_total_hnl: subtotalGrupo,
             subtotal_hnl: subtotalGrupo,
             descuento_total_hnl: descuentoGrupo,
+            total_pagar_hnl: totalGrupo,
+            extras_a_pagar_hnl: totalGrupo,
             total_hnl: totalGrupo,
-            promociones_aplicadas: [],
-            promociones_descartadas: [],
+            ...(releaseToken ? { release_token: releaseToken } : {}),
+            promociones_aplicadas: promocionesAplicadasGrupo,
+            promociones_descartadas: promocionesDescartadasGrupo,
             bloques: bloquesResponse,
           },
           { statusCode: 201 }
@@ -1356,6 +1644,214 @@ export default async function publicCitasRoutes(app) {
         }
 
         return sendHandled(reply, request, error, "No se pudo crear el hold publico", "PUBLIC_CITAS_HOLD_CREATE_ERROR");
+      } finally {
+        dbClient.release();
+      }
+    }
+  );
+
+  app.delete(
+    "/hold/:id_grupo_cita",
+    {
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_grupo_cita"],
+          properties: {
+            id_grupo_cita: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          required: ["release_token"],
+          properties: {
+            release_token: { type: "string", minLength: 16, maxLength: 256 },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_grupo_cita: { type: "string", format: "uuid" },
+                  estado_final: { type: "string" },
+                  liberado: { type: "boolean" },
+                  idempotent: { type: "boolean" },
+                  citas_canceladas: { type: "integer" },
+                  holds_expirados: { type: "integer" },
+                },
+                required: ["id_grupo_cita", "estado_final", "liberado", "idempotent"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!app.db) {
+        return sendError(reply, 500, "Base de datos no configurada", {
+          code: "DB_NOT_CONFIGURED",
+        });
+      }
+
+      const dbClient = await app.db.connect();
+      let transactionStarted = false;
+      try {
+        const groupId = assertUuid(request.params?.id_grupo_cita, "id_grupo_cita");
+        const releaseToken = String(request.body?.release_token || "").trim();
+        if (!releaseToken) {
+          throw new AppError(400, "Debes enviar el token de liberacion de la reserva temporal", {
+            code: "PUBLIC_CITAS_HOLD_RELEASE_TOKEN_REQUIRED",
+          });
+        }
+
+        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+        const releaseTokenSupport = await getPublicHoldReleaseTokenSupport(dbClient);
+        if (!releaseTokenSupport.supported) {
+          throw new AppError(409, "La liberacion segura del hold publico no esta configurada", {
+            code: "PUBLIC_CITAS_HOLD_RELEASE_NOT_CONFIGURED",
+          });
+        }
+
+        await dbClient.query("BEGIN");
+        transactionStarted = true;
+
+        const groupResult = await dbClient.query(
+          `
+            SELECT id_grupo_cita, estado_grupo_codigo, release_token_hash
+            FROM public.citas_grupos
+            WHERE id_grupo_cita = $1::uuid
+            FOR UPDATE
+          `,
+          [groupId]
+        );
+        const group = groupResult.rows[0];
+        if (!group) {
+          throw new AppError(404, "No encontramos la reserva temporal indicada", {
+            code: "PUBLIC_CITAS_HOLD_NOT_FOUND",
+          });
+        }
+        if (!isPublicReleaseTokenValid(releaseToken, group.release_token_hash)) {
+          throw new AppError(403, "No se pudo validar la reserva temporal publica", {
+            code: "PUBLIC_CITAS_HOLD_RELEASE_TOKEN_INVALID",
+          });
+        }
+
+        const citasResult = await dbClient.query(
+          `
+            SELECT id_cita, estado_cita_codigo
+            FROM public.citas
+            WHERE id_grupo_cita = $1::uuid
+              AND deleted_at IS NULL
+            FOR UPDATE
+          `,
+          [groupId]
+        );
+        const citas = citasResult.rows;
+        const rejectedState = citas.find((row) => (
+          PUBLIC_RELEASE_REJECTED_APPOINTMENT_STATES.has(String(row.estado_cita_codigo || "").trim().toLowerCase())
+        ));
+        if (
+          String(group.estado_grupo_codigo || "").trim().toLowerCase() === "completado"
+          || rejectedState
+        ) {
+          throw new AppError(409, "La reserva temporal ya no puede liberarse", {
+            code: "PUBLIC_CITAS_HOLD_RELEASE_FINAL_STATE",
+          });
+        }
+
+        const holdsResult = await dbClient.query(
+          `
+            SELECT h.id_hold, h.estado_hold_codigo
+            FROM public.citas_holds h
+            JOIN public.citas c
+              ON c.id_cita = h.id_cita
+            WHERE c.id_grupo_cita = $1::uuid
+              AND c.deleted_at IS NULL
+            FOR UPDATE OF h
+          `,
+          [groupId]
+        );
+        const hasConsumedHold = holdsResult.rows.some((row) => (
+          String(row.estado_hold_codigo || "").trim().toLowerCase() === "consumido"
+        ));
+        if (hasConsumedHold) {
+          throw new AppError(409, "La reserva temporal ya no puede liberarse", {
+            code: "PUBLIC_CITAS_HOLD_RELEASE_CONSUMED",
+          });
+        }
+
+        const cancelCitasResult = await dbClient.query(
+          `
+            UPDATE public.citas
+            SET estado_cita_codigo = 'cancelada',
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+              AND deleted_at IS NULL
+              AND estado_cita_codigo = ANY($2::text[])
+          `,
+          [groupId, PUBLIC_RELEASE_CANCELLABLE_APPOINTMENT_STATES]
+        );
+        const expireHoldsResult = await dbClient.query(
+          `
+            UPDATE public.citas_holds h
+            SET estado_hold_codigo = 'expirado',
+                updated_at = now()
+            FROM public.citas c
+            WHERE c.id_grupo_cita = $1::uuid
+              AND c.id_cita = h.id_cita
+              AND c.deleted_at IS NULL
+              AND h.estado_hold_codigo = 'activo'
+          `,
+          [groupId]
+        );
+        await dbClient.query(
+          `
+            UPDATE public.citas_grupos
+            SET estado_grupo_codigo = 'cancelado',
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+              AND estado_grupo_codigo <> 'cancelado'
+          `,
+          [groupId]
+        );
+
+        await dbClient.query("COMMIT");
+        transactionStarted = false;
+
+        const citasCanceladas = Number(cancelCitasResult.rowCount || 0);
+        const holdsExpirados = Number(expireHoldsResult.rowCount || 0);
+        return sendOk(reply, {
+          id_grupo_cita: groupId,
+          estado_final: "cancelado",
+          liberado: true,
+          idempotent: citasCanceladas === 0 && holdsExpirados === 0,
+          citas_canceladas: citasCanceladas,
+          holds_expirados: holdsExpirados,
+        });
+      } catch (error) {
+        if (transactionStarted) {
+          try {
+            await dbClient.query("ROLLBACK");
+          } catch {
+            // no-op
+          }
+        }
+        return sendHandled(reply, request, error, "No se pudo liberar el hold publico", "PUBLIC_CITAS_HOLD_RELEASE_ERROR");
       } finally {
         dbClient.release();
       }
