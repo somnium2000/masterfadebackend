@@ -164,7 +164,7 @@ const bookingPromotionSchema = {
 };
 
 const PUBLIC_BOOKING_PROMOTIONS_SQL = `
-  // JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
+  -- JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
   SELECT
     p.id_promocion,
     pra.id_promocion_regla,

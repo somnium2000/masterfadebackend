@@ -40,6 +40,37 @@ function buildCodesByRule(codeRows = []) {
   return map;
 }
 
+function buildScopedPromotionPayload(base = {}, context = {}, item = {}) {
+  const applyCode = String(item.aplica_a_codigo || base.aplica_a_codigo || "").trim().toLowerCase();
+  const payload = {
+    ...base,
+    aplica_a_codigo: applyCode,
+    id_cita: context.id_cita || null,
+    id_cita_integrante: null,
+    id_cita_paquete: null,
+    id_cita_detalle: null,
+  };
+
+  if (applyCode === "reserva") {
+    payload.id_cita = null;
+    return payload;
+  }
+  if (applyCode === "titular") {
+    payload.id_cita = null;
+    payload.id_cita_integrante = context.id_cita_integrante || null;
+    return payload.id_cita_integrante ? payload : null;
+  }
+  if (applyCode === "paquete") {
+    payload.id_cita_paquete = context.id_cita_paquete || item.id_cita_paquete || null;
+    return payload.id_cita && payload.id_cita_paquete ? payload : null;
+  }
+  if (applyCode === "servicio") {
+    payload.id_cita_detalle = context.id_cita_detalle || item.id_cita_detalle || null;
+    return payload.id_cita && payload.id_cita_detalle ? payload : null;
+  }
+  return null;
+}
+
 export async function previewPromotionsForAppointment(db, context = {}) {
   const candidates = await getCandidatePromotionRules(db, context);
   if (!candidates.length) {
@@ -83,9 +114,8 @@ export async function recordPromotionApplications(db, context = {}, result = {},
   const inserted = { aplicadas: [], descartadas: [], usos: [] };
 
   for (const applied of result.promociones_aplicadas || []) {
-    const idCitaPromocion = await insertAppointmentPromotionApplication(db, {
+    const appliedPayload = buildScopedPromotionPayload({
       id_grupo_cita: context.id_grupo_cita,
-      id_cita: context.id_cita || null,
       id_promocion: applied.id_promocion,
       id_promocion_regla: applied.id_promocion_regla,
       aplica_a_codigo: applied.aplica_a_codigo,
@@ -98,7 +128,11 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       es_acumulable: applied.es_acumulable,
       estado_aplicacion_codigo: "aplicada",
       motivo_no_aplicada: null,
-    });
+    }, context, applied);
+
+    if (!appliedPayload) continue;
+
+    const idCitaPromocion = await insertAppointmentPromotionApplication(db, appliedPayload);
     inserted.aplicadas.push(idCitaPromocion);
 
     if (isFormal && idCitaPromocion) {
@@ -122,9 +156,8 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       ? "descartada_por_conflicto"
       : "no_aplicada";
 
-    const idCitaPromocion = await insertAppointmentPromotionApplication(db, {
+    const discardedPayload = buildScopedPromotionPayload({
       id_grupo_cita: context.id_grupo_cita,
-      id_cita: context.id_cita || null,
       id_promocion: discarded.id_promocion,
       id_promocion_regla: discarded.id_promocion_regla,
       aplica_a_codigo: discarded.aplica_a_codigo || "reserva",
@@ -137,7 +170,11 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       es_acumulable: false,
       estado_aplicacion_codigo: status,
       motivo_no_aplicada: discarded.motivo || "No elegible",
-    });
+    }, context, discarded);
+
+    if (!discardedPayload) continue;
+
+    const idCitaPromocion = await insertAppointmentPromotionApplication(db, discardedPayload);
     inserted.descartadas.push(idCitaPromocion);
   }
 

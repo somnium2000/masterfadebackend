@@ -258,6 +258,146 @@ function normalizeEmail(rawEmail) {
   return String(rawEmail || "").trim().toLowerCase();
 }
 
+function normalizeDocument(rawValue) {
+  return String(rawValue || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeMoney(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizePublicContactValidationEntry(contacto, fallbackIndex = 0) {
+  const blockIndex = Number.isInteger(Number(contacto?.blockIndex))
+    ? Math.max(0, Math.trunc(Number(contacto.blockIndex)))
+    : fallbackIndex;
+  const aliasFallback = blockIndex === 0 ? "Titular" : `Acompanante ${blockIndex}`;
+  const alias = String(contacto?.alias || aliasFallback).trim().slice(0, 80) || aliasFallback;
+  const rolIntegranteCodigo = String(contacto?.rol_integrante_codigo || (blockIndex === 0 ? "titular" : "acompanante"))
+    .trim()
+    .toLowerCase();
+  const email = normalizeEmail(contacto?.email);
+  const rawTelefono = String(contacto?.telefono || "").trim();
+  const telefono = normalizePhone(rawTelefono);
+  const dni = normalizeDocument(contacto?.dni);
+
+  if (email && !EMAIL_PATTERN.test(email)) {
+    throw new AppError(400, "El correo del contacto debe ser valido", {
+      code: "PUBLIC_CITAS_CONTACT_EMAIL_INVALID",
+      details: { field: "contacto.email", alias, blockIndex },
+    });
+  }
+  if (rawTelefono && hasPhoneLetters(rawTelefono)) {
+    throw new AppError(400, "El telefono del contacto no admite letras", {
+      code: "PUBLIC_CITAS_CONTACT_PHONE_INVALID",
+      details: { field: "contacto.telefono", alias, blockIndex },
+    });
+  }
+  if (telefono && telefono.length < 8) {
+    throw new AppError(400, "El telefono del contacto debe ser valido", {
+      code: "PUBLIC_CITAS_CONTACT_PHONE_INVALID",
+      details: { field: "contacto.telefono", alias, blockIndex },
+    });
+  }
+
+  return {
+    blockIndex,
+    alias,
+    rol_integrante_codigo: rolIntegranteCodigo,
+    email: email || null,
+    telefono: telefono || null,
+    dni: dni || null,
+  };
+}
+
+function buildDuplicateContactConflict(entry, field, message, code = "CONTACTO_DUPLICADO") {
+  return {
+    blockIndex: entry.blockIndex,
+    alias: entry.alias,
+    rol_integrante_codigo: entry.rol_integrante_codigo,
+    field,
+    code,
+    message,
+    email: entry.email || null,
+    telefono: entry.telefono || null,
+    dni: entry.dni || null,
+  };
+}
+
+function collectDuplicateContactConflicts(contactos = []) {
+  const groups = new Map();
+  const register = (type, value, entry) => {
+    if (!value) return;
+    const key = `${type}:${value}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(entry);
+  };
+
+  contactos.forEach((entry) => {
+    register("email", entry.email, entry);
+    register("telefono", entry.telefono, entry);
+    register("dni", entry.dni, entry);
+  });
+
+  const conflicts = [];
+  groups.forEach((entries, key) => {
+    if (entries.length <= 1) return;
+    const [type] = key.split(":");
+    const message = type === "telefono"
+      ? "Hay telefonos repetidos en la reserva."
+      : type === "dni"
+        ? "Hay DNI repetidos en la reserva."
+        : "Hay contactos repetidos en la reserva.";
+    const field = type === "telefono"
+      ? "contacto.telefono"
+      : type === "dni"
+        ? "contacto.dni"
+        : "contacto.email";
+    entries.forEach((entry) => {
+      conflicts.push(buildDuplicateContactConflict(entry, field, message));
+    });
+  });
+  return conflicts;
+}
+
+async function collectExistingActiveEmailConflicts(client, contactos = []) {
+  const emails = Array.from(new Set(contactos.map((entry) => entry.email).filter(Boolean)));
+  if (!client || emails.length === 0) return [];
+
+  const existingUserRows = await client.query(
+    `
+      SELECT DISTINCT lower(co.direccion_correo::text) AS email
+      FROM public.usuarios u
+      JOIN public.personas p
+        ON p.id_persona = u.id_persona
+       AND p.deleted_at IS NULL
+      JOIN public.correos co
+        ON co.id_persona = p.id_persona
+       AND co.deleted_at IS NULL
+      WHERE u.deleted_at IS NULL
+        AND COALESCE(u.estado, TRUE) IS TRUE
+        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
+        AND lower(co.direccion_correo::text) = ANY($1::text[])
+    `,
+    [emails]
+  );
+
+  const activeUserEmails = new Set(existingUserRows.rows.map((row) => normalizeEmail(row.email)));
+  return contactos
+    .filter((entry) => entry.email && activeUserEmails.has(entry.email))
+    .map((entry) => ({
+      blockIndex: entry.blockIndex,
+      alias: entry.alias,
+      rol_integrante_codigo: entry.rol_integrante_codigo,
+      field: "contacto.email",
+      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
+      email: entry.email,
+      message: entry.blockIndex === 0
+        ? "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar."
+        : `El correo de ${entry.alias} pertenece a una cuenta activa. Ese acompanante debe iniciar sesion o usar otro correo.`,
+    }));
+}
+
 function parseIsoDateAndTime(rawDateTime) {
   const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
   if (!match) {
@@ -650,6 +790,102 @@ async function resolveOrCreatePublicClient(client, payload) {
 }
 
 export default async function publicCitasRoutes(app) {
+  app.post(
+    "/validar-contactos",
+    {
+      schema: {
+        body: {
+          type: "object",
+          required: ["contactos"],
+          properties: {
+            contactos: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                properties: {
+                  blockIndex: { type: "integer", minimum: 0 },
+                  rol_integrante_codigo: { type: "string", maxLength: 40 },
+                  alias: { type: "string", maxLength: 80 },
+                  email: { anyOf: [{ type: "string", maxLength: 160 }, { type: "null" }] },
+                  telefono: { anyOf: [{ type: "string", maxLength: 20 }, { type: "null" }] },
+                  dni: { anyOf: [{ type: "string", maxLength: 32 }, { type: "null" }] },
+                },
+                additionalProperties: true,
+              },
+            },
+          },
+          additionalProperties: false,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const contactos = Array.isArray(request.body?.contactos)
+          ? request.body.contactos.map((contacto, index) => normalizePublicContactValidationEntry(contacto, index))
+          : [];
+        if (!contactos.length) {
+          throw new AppError(400, "Debes enviar al menos un contacto para validar", {
+            code: "PUBLIC_CITAS_CONTACTS_REQUIRED",
+            details: { field: "contactos" },
+          });
+        }
+
+        const duplicateConflicts = collectDuplicateContactConflicts(contactos);
+        const activeEmailConflicts = app.db
+          ? await collectExistingActiveEmailConflicts(app.db, contactos)
+          : [];
+        const conflicts = [...duplicateConflicts, ...activeEmailConflicts];
+
+        if (conflicts.length > 0) {
+          const hasActiveUserConflict = conflicts.some((conflict) => conflict.code === "EMAIL_BELONGS_TO_ACTIVE_USER");
+          const errorCode = hasActiveUserConflict
+            ? "PUBLIC_CITAS_CONTACT_EMAIL_CONFLICT"
+            : "PUBLIC_CITAS_CONTACT_DUPLICATE_CONFLICT";
+          const errorMessage = hasActiveUserConflict
+            ? "Hay contactos que ya pertenecen a cuentas activas."
+            : "Hay contactos repetidos en la reserva.";
+
+          return reply.code(409).send({
+            ok: false,
+            valido: false,
+            warnings: [],
+            errors: [
+              {
+                code: "CONTACTO_DUPLICADO",
+                message: errorMessage,
+              },
+            ],
+            error: {
+              code: errorCode,
+              message: errorMessage,
+              details: {
+                conflicts,
+              },
+            },
+            requestId: request.id,
+          });
+        }
+
+        return reply.code(200).send({
+          ok: true,
+          valido: true,
+          warnings: [],
+          errors: [],
+          requestId: request.id,
+        });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudieron validar los contactos publicos",
+          "PUBLIC_CITAS_VALIDATE_CONTACTS_ERROR"
+        );
+      }
+    }
+  );
+
   app.get(
     "/contexto",
     {
@@ -887,6 +1123,8 @@ export default async function publicCitasRoutes(app) {
 
         const groupRecord = groupInsert.rows[0];
         const bloquesResponse = [];
+        let subtotalGrupo = 0;
+        let descuentoGrupo = 0;
         let totalGrupo = 0;
         let titularResolved = null;
 
@@ -1046,7 +1284,15 @@ export default async function publicCitasRoutes(app) {
             [citaId, holdState, expiresAt.toISOString()]
           );
 
-          totalGrupo += Number(selection.serviceSelection.monto_total_hnl || 0);
+          const subtotalServiciosHnl = normalizeMoney(selection.serviceSelection.monto_total_hnl);
+          const descuentoHnl = normalizeMoney(selection.serviceSelection.descuento_hnl);
+          const totalPagarHnl = normalizeMoney(
+            selection.serviceSelection.total_pagar_hnl ?? (subtotalServiciosHnl - descuentoHnl)
+          );
+
+          subtotalGrupo += subtotalServiciosHnl;
+          descuentoGrupo += descuentoHnl;
+          totalGrupo += totalPagarHnl;
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
 
           bloquesResponse.push({
@@ -1059,7 +1305,9 @@ export default async function publicCitasRoutes(app) {
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
             estado_cita_codigo: targetAppointmentState,
-            monto_total_hnl: Number(selection.serviceSelection.monto_total_hnl || 0),
+            monto_total_hnl: subtotalServiciosHnl,
+            descuento_hnl: descuentoHnl,
+            total_pagar_hnl: totalPagarHnl,
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
           });
@@ -1074,6 +1322,11 @@ export default async function publicCitasRoutes(app) {
             estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
             expires_at: expiresAt.toISOString(),
             monto_total_hnl: totalGrupo,
+            subtotal_hnl: subtotalGrupo,
+            descuento_total_hnl: descuentoGrupo,
+            total_hnl: totalGrupo,
+            promociones_aplicadas: [],
+            promociones_descartadas: [],
             bloques: bloquesResponse,
           },
           { statusCode: 201 }

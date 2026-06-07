@@ -1244,6 +1244,7 @@ export default async function authRoutes(app) {
     },
     async (request, reply) => {
       const supabaseToken = extractSupabaseToken(request);
+      const replaceActiveSession = request.body?.replace_active_session === true;
       if (!supabaseToken) {
         return sendError(reply, 400, "Debes enviar el token de Supabase para realizar el exchange.", {
           code: "AUTH_MISSING_TOKEN",
@@ -1403,11 +1404,23 @@ export default async function authRoutes(app) {
           roles: claims.roles || [],
           branchIds: claims.branch_ids || [],
           remember: true,
+          replaceActiveSession,
         });
 
         const csrfToken = issueSessionCookies(app, reply, session.token, { remember: true });
         return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
+        if (error?.statusCode === 409 && error?.code === "AUTH_SESSION_LIMIT_REACHED") {
+          return reply.code(409).send({
+            ok: false,
+            error: {
+              code: "AUTH_SESSION_LIMIT_REACHED",
+              message: "Ya existe una sesion activa para esta cuenta. Puedes cerrar la sesion anterior y continuar.",
+            },
+            requires_session_replacement: error?.requires_session_replacement === true,
+            requestId: request.id,
+          });
+        }
         if (error?.statusCode && error?.code) {
           return sendError(reply, error.statusCode, error.message, {
             code: error.code,
