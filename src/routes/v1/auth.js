@@ -297,6 +297,28 @@ const meResponseSchema = {
   500: errorResponseSchema,
 };
 
+const csrfResponseSchema = {
+  200: {
+    type: "object",
+    properties: {
+      ok: { type: "boolean" },
+      data: {
+        type: "object",
+        properties: {
+          csrf_token: { type: "string" },
+        },
+        required: ["csrf_token"],
+        additionalProperties: false,
+      },
+      requestId: requestIdSchema,
+    },
+    required: ["ok", "data", "requestId"],
+    additionalProperties: true,
+  },
+  401: errorResponseSchema,
+  500: errorResponseSchema,
+};
+
 const RESET_MAX_ATTEMPTS = Number(process.env.RESET_MAX_ATTEMPTS || 3);
 const RESET_WINDOW_MS = Number(process.env.RESET_WINDOW_MS || 15 * 60_000);
 const RESET_BLOCK_MS = Number(process.env.RESET_BLOCK_MS || 30 * 60_000);
@@ -1192,6 +1214,37 @@ export default async function authRoutes(app) {
       { requestId: request.id }
     );
   });
+
+  app.get(
+    "/csrf",
+    {
+      preHandler: app.authenticate,
+      schema: {
+        response: csrfResponseSchema,
+      },
+    },
+    async (request, reply) => {
+      try {
+        let csrfToken = String(request.cookies?.[AUTH_CSRF_COOKIE] || "").trim();
+        if (!csrfToken) {
+          csrfToken = jwt.sign(
+            { type: "csrf", nonce: crypto.randomUUID() },
+            app.config?.csrfSecret || process.env.CSRF_SECRET,
+            { expiresIn: "12h" }
+          );
+          reply.setCookie(AUTH_CSRF_COOKIE, csrfToken, buildCsrfCookieOptions(app, { remember: false }));
+        }
+
+        return sendOk(reply, { csrf_token: csrfToken }, { requestId: request.id });
+      } catch (error) {
+        request.log.error({ err: error }, "Auth CSRF token error");
+        return sendError(reply, 500, "No se pudo obtener el token CSRF", {
+          code: "AUTH_CSRF_ERROR",
+          requestId: request.id,
+        });
+      }
+    }
+  );
 
   app.get(
     "/me",
