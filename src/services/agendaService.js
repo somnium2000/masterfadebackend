@@ -1179,6 +1179,66 @@ export async function getBookingSelectionDetails(client, {
 async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
   const targetDate = parseDateOnly(dateString, "fecha");
   const dayOfWeek = startOfDay(targetDate).getDay();
+  const branchSchedule = await client.query(
+    `
+      WITH target_branch AS (
+        SELECT e.id_sucursal
+        FROM public.empleados e
+        WHERE e.id_empleado = $1::uuid
+          AND e.deleted_at IS NULL
+          AND e.estado IS TRUE
+        LIMIT 1
+      ),
+      published_schedule AS (
+        SELECT hss.id_horario_sucursal
+        FROM public.horarios_semanales_sucursales hss
+        JOIN target_branch tb
+          ON tb.id_sucursal = hss.id_sucursal
+        WHERE hss.estado_horario_codigo = 'publicado'
+          AND hss.vigencia_desde <= $3::date
+          AND (hss.vigencia_hasta IS NULL OR hss.vigencia_hasta >= $3::date)
+        ORDER BY hss.vigencia_desde DESC, hss.created_at DESC, hss.id_horario_sucursal DESC
+        LIMIT 1
+      )
+      SELECT
+        b.hora_inicio,
+        b.hora_fin,
+        NULL::time AS almuerzo_inicio,
+        NULL::time AS almuerzo_fin
+      FROM public.horarios_semanales_sucursales_bloques b
+      WHERE b.id_horario_sucursal = (SELECT id_horario_sucursal FROM published_schedule)
+        AND b.dia_semana = $2::smallint
+      ORDER BY b.hora_inicio ASC, b.hora_fin ASC, b.id_bloque_horario ASC
+    `,
+    [empleadoId, dayOfWeek, targetDate]
+  );
+
+  if (branchSchedule.rows.length) {
+    return branchSchedule.rows;
+  }
+
+  const publishedSchedule = await client.query(
+    `
+      SELECT 1
+      FROM public.horarios_semanales_sucursales hss
+      JOIN public.empleados e
+        ON e.id_sucursal = hss.id_sucursal
+      WHERE e.id_empleado = $1::uuid
+        AND e.deleted_at IS NULL
+        AND e.estado IS TRUE
+        AND hss.estado_horario_codigo = 'publicado'
+        AND hss.vigencia_desde <= $2::date
+        AND (hss.vigencia_hasta IS NULL OR hss.vigencia_hasta >= $2::date)
+      LIMIT 1
+    `,
+    [empleadoId, targetDate]
+  );
+
+  // Una version publicada sin bloques para este dia representa una sucursal cerrada.
+  if (publishedSchedule.rows.length) {
+    return [];
+  }
+
   const direct = await client.query(
     `
       SELECT
