@@ -1105,8 +1105,7 @@ async function getCurrentPublishedBranchSchedule(client, idSucursal, { lock = fa
         vigencia_desde,
         vigencia_hasta,
         motivo_cambio,
-        publicado_at,
-        (vigencia_desde = CURRENT_DATE) AS inicia_hoy
+        publicado_at
       FROM public.horarios_semanales_sucursales
       WHERE id_sucursal = $1::uuid
         AND estado_horario_codigo = 'publicado'
@@ -2179,17 +2178,15 @@ export default async function adminCitasRoutes(app) {
       await dbClient.query("BEGIN");
       const sucursal = await getBranchInScope(dbClient, request.params.id_sucursal, branchIds, { lock: true });
       const currentSchedule = await getCurrentPublishedBranchSchedule(dbClient, sucursal.id_sucursal, { lock: true });
-      if (currentSchedule?.inicia_hoy) {
-        await dbClient.query(
-          `DELETE FROM public.horarios_semanales_sucursales WHERE id_horario_sucursal = $1::uuid`,
-          [currentSchedule.id_horario_sucursal]
-        );
-      } else if (currentSchedule) {
+      if (currentSchedule) {
         await dbClient.query(
           `
             UPDATE public.horarios_semanales_sucursales
             SET estado_horario_codigo = 'archivado',
-                vigencia_hasta = CURRENT_DATE - 1,
+                vigencia_hasta = CASE
+                  WHEN vigencia_desde = CURRENT_DATE THEN CURRENT_DATE
+                  ELSE CURRENT_DATE - 1
+                END,
                 updated_at = now()
             WHERE id_horario_sucursal = $1::uuid
           `,
