@@ -10,6 +10,7 @@ import {
 } from "../../../services/promociones/promocionesService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const MAX_PAYMENT_INTENTS_PER_HOLD = 3;
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
 const PUBLIC_POST_PAYMENT_CONFIRMABLE_APPOINTMENT_STATES = new Set(["en_espera", "pendiente_pago"]);
 const PUBLIC_POST_PAYMENT_BLOCKING_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
@@ -1000,6 +1001,25 @@ export default async function publicPagosRoutes(app) {
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
       const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
+      const completedGroupPayment = await dbClient.query(
+        `
+          SELECT 1
+          FROM public.payment_intents paid_intent
+          JOIN public.payments payment
+            ON payment.id_intent = paid_intent.id_intent
+           AND payment.estado_pago_codigo = 'capturado'
+          JOIN public.citas paid_cita
+            ON paid_cita.id_cita = paid_intent.id_cita
+          WHERE paid_cita.id_grupo_cita = $1::uuid
+          LIMIT 1
+        `,
+        [idGrupoCita]
+      );
+      if (completedGroupPayment.rows[0]) {
+        throw new AppError(409, "Este pago ya fue procesado.", {
+          code: "PAYMENT_ALREADY_COMPLETED",
+        });
+      }
       assertPublicGroupPayable(groupRows);
       const expiredHold = groupRows.some((row) => row.estado_hold_codigo !== "activo" || !row.expires_at || new Date(row.expires_at).getTime() <= Date.now());
       if (expiredHold) {
@@ -1007,10 +1027,31 @@ export default async function publicPagosRoutes(app) {
       }
       const provider = await ensureProvider(dbClient, providerCode);
       const anchor = groupRows[0];
+      await dbClient.query(
+        `SELECT id_hold FROM public.citas_holds WHERE id_hold = $1::uuid FOR UPDATE`,
+        [anchor.id_hold]
+      );
       const totalGroup = normalizeMoney(pricing.total_hnl);
       if (totalGroup <= 0) {
         throw new AppError(409, "La reserva no tiene saldo pendiente de pago", {
           code: "PUBLIC_PAGOS_GROUP_NO_PENDING_BALANCE",
+        });
+      }
+      const completedPayment = await dbClient.query(
+        `
+          SELECT 1
+          FROM public.payment_intents paid_intent
+          JOIN public.payments payment
+            ON payment.id_intent = paid_intent.id_intent
+           AND payment.estado_pago_codigo = 'capturado'
+          WHERE paid_intent.id_hold = $1::uuid
+          LIMIT 1
+        `,
+        [anchor.id_hold]
+      );
+      if (completedPayment.rows[0]) {
+        throw new AppError(409, "Este pago ya fue procesado.", {
+          code: "PAYMENT_ALREADY_COMPLETED",
         });
       }
       const existingIntent = await dbClient.query(
@@ -1055,6 +1096,22 @@ export default async function publicPagosRoutes(app) {
             WHERE id_intent = $1::uuid
           `,
           [existingIntent.rows[0].id_intent]
+        );
+      }
+
+      const intentSummary = await dbClient.query(
+        `
+          SELECT COUNT(*)::int AS intent_count
+          FROM public.payment_intents
+          WHERE id_hold = $1::uuid
+        `,
+        [anchor.id_hold]
+      );
+      if (Number(intentSummary.rows[0]?.intent_count || 0) >= MAX_PAYMENT_INTENTS_PER_HOLD) {
+        throw new AppError(
+          409,
+          "No pudimos procesar el pago despues de varios intentos. Puedes iniciar una nueva reserva o contactar a MasterFade.",
+          { code: "PAYMENT_RETRY_LIMIT_REACHED" }
         );
       }
 
@@ -1342,15 +1399,17 @@ export default async function publicPagosRoutes(app) {
           `UPDATE public.payment_intents SET estado_intent_codigo = $2::text, updated_at = now() WHERE id_intent = $1::uuid`,
           [idIntent, status === "failed" ? "fallido" : "expirado"]
         );
-        await dbClient.query(
-          `
-            UPDATE public.citas
-            SET estado_cita_codigo = 'expirada', updated_at = now()
-            WHERE id_grupo_cita = $1::uuid
-              AND estado_cita_codigo IN ('en_espera', 'pendiente_pago')
-          `,
-          [idGrupoCita]
-        );
+        if (status === "expired") {
+          await dbClient.query(
+            `
+              UPDATE public.citas
+              SET estado_cita_codigo = 'expirada', updated_at = now()
+              WHERE id_grupo_cita = $1::uuid
+                AND estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+            `,
+            [idGrupoCita]
+          );
+        }
       }
 
       await dbClient.query("COMMIT");

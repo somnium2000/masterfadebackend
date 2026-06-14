@@ -7,6 +7,7 @@ import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const MAX_PAYMENT_INTENTS_PER_HOLD = 3;
 
 const requestIdSchema = { type: "string" };
 
@@ -337,6 +338,24 @@ export default async function pagosRoutes(app) {
           });
         }
 
+        const completedAppointmentPayment = await dbClient.query(
+          `
+            SELECT 1
+            FROM public.payment_intents paid_intent
+            JOIN public.payments payment
+              ON payment.id_intent = paid_intent.id_intent
+             AND payment.estado_pago_codigo = 'capturado'
+            WHERE paid_intent.id_cita = $1::uuid
+            LIMIT 1
+          `,
+          [cita.id_cita]
+        );
+        if (completedAppointmentPayment.rows[0]) {
+          throw new AppError(409, "Este pago ya fue procesado.", {
+            code: "PAYMENT_ALREADY_COMPLETED",
+          });
+        }
+
         if (!["en_espera", "pendiente_pago"].includes(cita.estado_cita_codigo)) {
           throw new AppError(409, "La cita no esta disponible para iniciar pago", {
             code: "PAGOS_CITA_STATE_INVALID",
@@ -359,6 +378,29 @@ export default async function pagosRoutes(app) {
           throw new AppError(409, "El hold de la cita ya expiro", {
             code: "PAGOS_HOLD_EXPIRED",
             details: { id_cita: cita.id_cita },
+          });
+        }
+
+        await dbClient.query(
+          `SELECT id_hold FROM public.citas_holds WHERE id_hold = $1::uuid FOR UPDATE`,
+          [cita.id_hold]
+        );
+
+        const completedPayment = await dbClient.query(
+          `
+            SELECT 1
+            FROM public.payment_intents paid_intent
+            JOIN public.payments payment
+              ON payment.id_intent = paid_intent.id_intent
+             AND payment.estado_pago_codigo = 'capturado'
+            WHERE paid_intent.id_hold = $1::uuid
+            LIMIT 1
+          `,
+          [cita.id_hold]
+        );
+        if (completedPayment.rows[0]) {
+          throw new AppError(409, "Este pago ya fue procesado.", {
+            code: "PAYMENT_ALREADY_COMPLETED",
           });
         }
 
@@ -387,6 +429,22 @@ export default async function pagosRoutes(app) {
             moneda_codigo: existingIntent.rows[0].moneda_codigo,
             estado_intent_codigo: existingIntent.rows[0].estado_intent_codigo,
           });
+        }
+
+        const intentSummary = await dbClient.query(
+          `
+            SELECT COUNT(*)::int AS intent_count
+            FROM public.payment_intents
+            WHERE id_hold = $1::uuid
+          `,
+          [cita.id_hold]
+        );
+        if (Number(intentSummary.rows[0]?.intent_count || 0) >= MAX_PAYMENT_INTENTS_PER_HOLD) {
+          throw new AppError(
+            409,
+            "No pudimos procesar el pago despues de varios intentos. Puedes iniciar una nueva reserva o contactar a MasterFade.",
+            { code: "PAYMENT_RETRY_LIMIT_REACHED" }
+          );
         }
 
         const idempotencyKey = `mf_${cita.id_cita}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
