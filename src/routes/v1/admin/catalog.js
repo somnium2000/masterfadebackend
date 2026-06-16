@@ -109,6 +109,21 @@ const packageBodySchema = {
     // AM: Operacion multi-sucursal: alta y edicion de paquetes siempre debe poder fijar sucursal objetivo.
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     visible_publico: { type: "boolean" },
+    ofertas: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          id_sucursal: { type: "string", format: "uuid" },
+          precio_hnl: { type: "number", minimum: 0 },
+          visible_publico: { type: "boolean" },
+          orden_visual: { type: "integer", minimum: 0 },
+        },
+        required: ["id_sucursal", "precio_hnl"],
+        additionalProperties: false,
+      },
+    },
     items: {
       type: "array",
       minItems: 2,
@@ -123,7 +138,7 @@ const packageBodySchema = {
       },
     },
   },
-  required: ["nombre_paquete", "precio_hnl", "items"],
+  required: ["nombre_paquete", "items"],
   additionalProperties: false,
 };
 
@@ -1233,24 +1248,24 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
   });
 }
 
-async function ensureUniquePackageNameByBranch(client, packageId, branchId, nombrePaquete) {
+const PACKAGE_DUPLICATE_MESSAGE = "Ya existe un paquete con ese nombre. Usa el paquete existente o cambia el nombre.";
+
+async function ensureUniquePackageNameGlobal(client, packageId, nombrePaquete) {
   const { rows } = await client.query(
     `
       SELECT p.id_paquete
       FROM public.paquetes p
-      JOIN public.paquetes_sucursal ps
-        ON ps.id_paquete = p.id_paquete
-      WHERE UPPER(TRIM(p.nombre_paquete)) = UPPER(TRIM($1))
+      WHERE lower(regexp_replace(trim(p.nombre_paquete), '[^[:alnum:]]+', '', 'g')) =
+            lower(regexp_replace(trim($1), '[^[:alnum:]]+', '', 'g'))
         AND p.deleted_at IS NULL
-        AND ps.id_sucursal = $2::uuid
-        AND ($3::uuid IS NULL OR p.id_paquete <> $3::uuid)
+        AND ($2::uuid IS NULL OR p.id_paquete <> $2::uuid)
       LIMIT 1
     `,
-    [nombrePaquete, branchId, packageId ?? null]
+    [nombrePaquete, packageId ?? null]
   );
 
   if (rows[0]) {
-    throw new AppError(409, "Ya existe un paquete con ese nombre en la sucursal", {
+    throw new AppError(409, PACKAGE_DUPLICATE_MESSAGE, {
       code: "CATALOG_PACKAGE_DUPLICATE",
     });
   }
@@ -1294,6 +1309,60 @@ function normalizePackageItems(items) {
       cantidad,
     };
   });
+}
+
+async function normalizeInitialPackageOffers(client, claims, body = {}) {
+  const hasExplicitOffers = Array.isArray(body.ofertas);
+  const source = hasExplicitOffers
+    ? body.ofertas
+    : [{
+      id_sucursal: body.id_sucursal,
+      precio_hnl: body.precio_hnl,
+      visible_publico: body.visible_publico,
+      orden_visual: body.orden_visual,
+    }];
+
+  if (source.length === 0) {
+    throw new AppError(400, "Debe seleccionar al menos una sucursal para crear el paquete.", {
+      code: "CATALOG_PACKAGE_OFFER_REQUIRED",
+    });
+  }
+
+  const seen = new Set();
+  const offers = [];
+
+  for (const offer of source) {
+    const rawBranchId = String(offer?.id_sucursal || "").trim();
+    if (hasExplicitOffers && !rawBranchId) {
+      throw new AppError(400, "Cada oferta requiere id_sucursal", {
+        code: "CATALOG_PACKAGE_BRANCH_REQUIRED",
+      });
+    }
+
+    const branchId = await resolveBranchId(client, claims, rawBranchId || null);
+    if (seen.has(branchId)) {
+      throw new AppError(400, "No se permite repetir la misma sucursal en las ofertas del paquete.", {
+        code: "CATALOG_PACKAGE_BRANCH_DUPLICATE",
+      });
+    }
+    seen.add(branchId);
+
+    const precioHnl = Number(offer?.precio_hnl);
+    if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
+      throw new AppError(400, "El precio del paquete debe ser mayor a 0", {
+        code: "CATALOG_PACKAGE_PRICE_INVALID",
+      });
+    }
+
+    offers.push({
+      idSucursal: branchId,
+      precioHnl,
+      visiblePublico: normalizeBoolean(offer?.visible_publico, true),
+      ordenVisual: normalizeOrderVisual(offer?.orden_visual, 100),
+    });
+  }
+
+  return offers;
 }
 
 function normalizeServiceBranchTariffs(body = {}) {
@@ -1416,7 +1485,7 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
   if (rows.some((row) => !row.has_scoped_tariff)) {
     if (branchId) {
       // AM: Regla multi-sucursal: el paquete no puede depender de servicios no operativos en la sucursal objetivo.
-      throw new AppError(409, "Uno o mas servicios no estan disponibles en la sucursal indicada", {
+      throw new AppError(409, "Uno o más servicios del paquete no están disponibles en la sucursal seleccionada.", {
         code: "CATALOG_PACKAGE_SERVICE_OUT_OF_SCOPE",
       });
     }
@@ -2028,6 +2097,13 @@ function mapPostgresCatalogError(error) {
     });
   }
 
+  if (pgCode === "23505" && constraint === "uq_paquetes_nombre_normalizado_vivo") {
+    // AM: Fallback defensivo si el indice unico global gana la carrera al crear/editar paquete.
+    return new AppError(409, PACKAGE_DUPLICATE_MESSAGE, {
+      code: "CATALOG_PACKAGE_DUPLICATE",
+    });
+  }
+
   const looksLikeBusinessDbError = ["23502", "23514", "23503", "23P01", "P0001"].includes(pgCode);
   if (!looksLikeBusinessDbError) return null;
 
@@ -2337,6 +2413,25 @@ async function replacePackageItems(client, idPaquete, items) {
   }
 }
 
+async function getCurrentPackageItems(client, idPaquete) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        pd.id_servicio,
+        pd.cantidad
+      FROM public.paquetes_detalles pd
+      WHERE pd.id_paquete = $1::uuid
+      ORDER BY pd.id_servicio ASC
+    `,
+    [idPaquete]
+  );
+
+  return rows.map((row) => ({
+    id_servicio: row.id_servicio,
+    cantidad: Number(row.cantidad || 1),
+  }));
+}
+
 async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload = {}) {
   // AM: Mantiene una sola fila operativa por (paquete, sucursal) para precio/estado/visibilidad.
   const currentOfferResult = await client.query(GET_PACKAGE_OFFER_SQL, [idPaquete, idSucursal]);
@@ -2391,71 +2486,6 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
     `,
     [idPaquete, idSucursal, precioHnl, activo, visiblePublico, ordenVisual]
   );
-}
-
-async function hasPackageOffersInOtherBranches(client, idPaquete, branchId) {
-  const { rows } = await client.query(
-    `
-      SELECT 1
-      FROM public.paquetes_sucursal ps
-      WHERE ps.id_paquete = $1::uuid
-        AND ps.id_sucursal <> $2::uuid
-      LIMIT 1
-    `,
-    [idPaquete, branchId]
-  );
-  return rows.length > 0;
-}
-
-async function clonePackageForBranch(client, sourcePackage, branchId) {
-  const sourcePrice =
-    sourcePackage?.precio_hnl === undefined || sourcePackage?.precio_hnl === null
-      ? 0
-      : Number(sourcePackage.precio_hnl);
-  const sourceItems = Array.isArray(sourcePackage?.items)
-    ? sourcePackage.items.map((item) => ({
-      id_servicio: item.id_servicio,
-      cantidad: Number(item.cantidad ?? 1),
-    }))
-    : [];
-
-  const clonedPackageResult = await client.query(
-    `
-      INSERT INTO public.paquetes (
-        nombre_paquete,
-        descripcion,
-        precio_hnl,
-        activo
-      )
-      VALUES ($1, $2, $3::numeric, TRUE)
-      RETURNING id_paquete
-    `,
-    [sourcePackage.nombre_paquete, sourcePackage.descripcion ?? null, sourcePrice]
-  );
-  const clonedPackageId = clonedPackageResult.rows[0].id_paquete;
-
-  if (sourceItems.length > 0) {
-    await replacePackageItems(client, clonedPackageId, sourceItems);
-  }
-
-  // AM: Reasigna la oferta de la sucursal al clon para evitar contaminar otras sucursales.
-  const reassignedOffer = await client.query(
-    `
-      UPDATE public.paquetes_sucursal
-      SET
-        id_paquete = $1::uuid,
-        updated_at = NOW()
-      WHERE id_paquete = $2::uuid
-        AND id_sucursal = $3::uuid
-    `,
-    [clonedPackageId, sourcePackage.id_paquete, branchId]
-  );
-
-  if (!reassignedOffer.rowCount) {
-    await upsertPackageBranchOffer(client, clonedPackageId, branchId, {});
-  }
-
-  return clonedPackageId;
 }
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
@@ -3732,21 +3762,16 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const nombrePaquete = normalizeRequiredText(request.body.nombre_paquete);
         const descripcion = normalizeOptionalText(request.body.descripcion);
-        const precioHnl = Number(request.body.precio_hnl);
-        if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
-          throw new AppError(400, "El precio del paquete debe ser mayor a 0", {
-            code: "CATALOG_PACKAGE_PRICE_INVALID",
-          });
-        }
-        const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
-        const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const items = normalizePackageItems(request.body.items);
+        const offers = await normalizeInitialPackageOffers(client, request.claims, request.body);
+        const firstOffer = offers[0];
 
-        await ensureUniquePackageNameByBranch(client, null, branchId, nombrePaquete);
-        await ensurePackageItemsAccessible(client, request.claims, items, branchId);
+        await ensureUniquePackageNameGlobal(client, null, nombrePaquete);
+        for (const offer of offers) {
+          await ensurePackageItemsAccessible(client, request.claims, items, offer.idSucursal);
+        }
 
         await client.query("BEGIN");
 
@@ -3761,20 +3786,22 @@ export default async function adminCatalogRoutes(app) {
             VALUES ($1, $2, $3::numeric, TRUE)
             RETURNING id_paquete
           `,
-          [nombrePaquete, descripcion ?? null, precioHnl]
+          [nombrePaquete, descripcion ?? null, firstOffer.precioHnl]
         );
 
         const idPaquete = insertResult.rows[0].id_paquete;
         await replacePackageItems(client, idPaquete, items);
-        // AM: Crea oferta operativa del paquete en la sucursal seleccionada.
-        await upsertPackageBranchOffer(client, idPaquete, branchId, {
-          precioHnl,
-          activo: true,
-          visiblePublico,
-          ordenVisual,
-        });
+        for (const offer of offers) {
+          // AM: Crea ofertas operativas iniciales sin duplicar el paquete maestro.
+          await upsertPackageBranchOffer(client, idPaquete, offer.idSucursal, {
+            precioHnl: offer.precioHnl,
+            activo: true,
+            visiblePublico: offer.visiblePublico,
+            ordenVisual: offer.ordenVisual,
+          });
+        }
 
-        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [idPaquete, branchId]);
+        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [idPaquete, firstOffer.idSucursal]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapAdminPackageRow(finalResult.rows[0]), {
@@ -3852,14 +3879,6 @@ export default async function adminCatalogRoutes(app) {
           request.body.nombre_paquete !== undefined ||
           request.body.descripcion !== undefined ||
           request.body.items !== undefined;
-        let targetPackageId = request.params.id;
-
-        if (shouldMutatePackageBase) {
-          const packageSharedAcrossBranches = await hasPackageOffersInOtherBranches(client, request.params.id, branchId);
-          if (packageSharedAcrossBranches) {
-            targetPackageId = await clonePackageForBranch(client, basePackage, branchId);
-          }
-        }
 
         const nombrePaquete =
           request.body.nombre_paquete !== undefined
@@ -3891,10 +3910,11 @@ export default async function adminCatalogRoutes(app) {
         const nextActivo = normalizeBoolean(scopedPackage?.activo, true);
         const nextItems = request.body.items !== undefined ? normalizePackageItems(request.body.items) : null;
 
-        await ensureUniquePackageNameByBranch(client, targetPackageId, branchId, nombrePaquete);
+        await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
 
-        if (nextItems) {
-          await ensurePackageItemsAccessible(client, request.claims, nextItems, branchId);
+        const itemsForScopeValidation = nextItems ?? await getCurrentPackageItems(client, request.params.id);
+        if (itemsForScopeValidation.length > 0) {
+          await ensurePackageItemsAccessible(client, request.claims, itemsForScopeValidation, branchId);
         }
 
         if (shouldMutatePackageBase) {
@@ -3904,28 +3924,27 @@ export default async function adminCatalogRoutes(app) {
               SET
                 nombre_paquete = $2,
                 descripcion = $3,
-                activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_paquete = $1::uuid
             `,
-            [targetPackageId, nombrePaquete, descripcion ?? null]
+            [request.params.id, nombrePaquete, descripcion ?? null]
           );
         }
 
         if (nextItems) {
-          await replacePackageItems(client, targetPackageId, nextItems);
+          await replacePackageItems(client, request.params.id, nextItems);
         }
 
         // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
-        await upsertPackageBranchOffer(client, targetPackageId, branchId, {
+        await upsertPackageBranchOffer(client, request.params.id, branchId, {
           precioHnl,
           activo: nextActivo,
           visiblePublico,
           ordenVisual,
         });
 
-        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [targetPackageId, branchId]);
+        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [request.params.id, branchId]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapAdminPackageRow(finalResult.rows[0]), { requestId: request.id });
