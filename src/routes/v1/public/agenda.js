@@ -237,20 +237,20 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
     AND (
       (
         p.mecanica = 'porcentaje'
-        AND p.valor_descuento IS NOT NULL
-        AND p.valor_descuento > 0
-        AND p.valor_descuento <= 100
+        AND COALESCE(pra.valor_descuento, p.valor_descuento) IS NOT NULL
+        AND COALESCE(pra.valor_descuento, p.valor_descuento) > 0
+        AND COALESCE(pra.valor_descuento, p.valor_descuento) <= 100
       )
       OR (
         p.mecanica = 'monto_fijo'
-        AND p.valor_descuento IS NOT NULL
-        AND p.valor_descuento > 0
+        AND COALESCE(pra.valor_descuento, p.valor_descuento) IS NOT NULL
+        AND COALESCE(pra.valor_descuento, p.valor_descuento) > 0
       )
       OR (
         p.mecanica = 'dos_por_uno'
-        AND COALESCE(p.cantidad_requerida, 0) > 1
+        AND COALESCE(pia.cantidad_minima, p.cantidad_requerida, 0) > 1
         AND COALESCE(p.cantidad_bonificada, 0) > 0
-        AND COALESCE(p.cantidad_bonificada, 0) < COALESCE(p.cantidad_requerida, 0)
+        AND COALESCE(p.cantidad_bonificada, 0) < COALESCE(pia.cantidad_minima, p.cantidad_requerida, 0)
       )
     )
     AND (
