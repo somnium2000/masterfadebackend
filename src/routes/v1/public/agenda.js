@@ -235,9 +235,23 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
     AND p.aplica_a IN ('servicio', 'paquete')
     AND p.mecanica IN ('porcentaje', 'monto_fijo', 'dos_por_uno')
     AND (
-      (p.mecanica = 'porcentaje' AND p.valor_descuento IS NOT NULL AND p.valor_descuento > 0 AND p.valor_descuento <= 100)
-      OR (p.mecanica = 'monto_fijo' AND p.valor_descuento IS NOT NULL AND p.valor_descuento > 0)
-      OR (p.mecanica = 'dos_por_uno' AND COALESCE(p.cantidad_requerida, 0) > 0 AND COALESCE(p.cantidad_bonificada, 0) > 0)
+      (
+        p.mecanica = 'porcentaje'
+        AND p.valor_descuento IS NOT NULL
+        AND p.valor_descuento > 0
+        AND p.valor_descuento <= 100
+      )
+      OR (
+        p.mecanica = 'monto_fijo'
+        AND p.valor_descuento IS NOT NULL
+        AND p.valor_descuento > 0
+      )
+      OR (
+        p.mecanica = 'dos_por_uno'
+        AND COALESCE(p.cantidad_requerida, 0) > 1
+        AND COALESCE(p.cantidad_bonificada, 0) > 0
+        AND COALESCE(p.cantidad_bonificada, 0) < COALESCE(p.cantidad_requerida, 0)
+      )
     )
     AND (
       (
