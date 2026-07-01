@@ -146,13 +146,18 @@ mejor_scope AS (
   GROUP BY id_cita_detalle
 ),
 unicos AS (
-  SELECT c.id_cita_detalle, MIN(c.id_tarifa) AS id_tarifa
+  SELECT c.id_cita_detalle, c.id_tarifa
   FROM candidatos c
   JOIN mejor_scope ms
     ON ms.id_cita_detalle = c.id_cita_detalle
    AND ms.scope_rank = c.scope_rank
-  GROUP BY c.id_cita_detalle
-  HAVING COUNT(*) = 1
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM candidatos other
+    WHERE other.id_cita_detalle = c.id_cita_detalle
+      AND other.scope_rank = c.scope_rank
+      AND other.id_tarifa <> c.id_tarifa
+  )
 )
 UPDATE public.citas_detalles cd
 SET id_tarifa = u.id_tarifa
