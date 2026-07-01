@@ -23,10 +23,9 @@ import {
   resolvePromotionConflicts,
 } from "../../../services/promociones/promocionesEngine.js";
 import {
-  createAppointmentCore,
-  createAppointmentHold,
+  assertBookingSelectionCreationSupported,
   createBookingGroup,
-  insertAppointmentDetails,
+  createBookingReservation,
   updateBookingGroupTotal,
 } from "../../../services/bookingReservationService.js";
 
@@ -1389,6 +1388,7 @@ export default async function publicCitasRoutes(app) {
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
+          assertBookingSelectionCreationSupported(integrante.selection_type);
           const splitDateTime = parseIsoDateAndTime(integrante.fecha_inicio);
           if (index > 0 && splitDateTime.fecha !== titularDateTime.fecha) {
             throw new AppError(409, "Los acompañantes deben agendarse en la misma fecha del titular", {
@@ -1435,27 +1435,35 @@ export default async function publicCitasRoutes(app) {
           const descuentoHnl = normalizeMoney(promotionResult.descuento_hnl);
           const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
 
-          const appointment = await createAppointmentCore(dbClient, {
-            groupId: groupRecord.id_grupo_cita,
-            order: integrante.orden_integrante,
-            alias: integrante.alias,
-            branchId: branch.id_sucursal,
-            barberId: selection.barber.id_empleado,
-            personId: clientProfile.id_persona,
-            clientId: clientProfile.id_cliente,
-            createdByUserId: null,
-            autoAssigned: !integrante.id_barbero,
-            state: targetAppointmentState,
-            selection,
-            subtotalHnl: subtotalServiciosHnl,
-            descuentoHnl,
-            totalHnl: totalPagarHnl,
-            contactName: integrante.contacto?.nombre || integrante.alias,
-            contactEmail: integrante.contacto?.email || null,
-            contactPhone: integrante.contacto?.telefono || null,
-            notes: request.body?.notas ?? null,
+          const reservation = await createBookingReservation(dbClient, {
+            groupRecord,
+            appointment: {
+              groupId: groupRecord.id_grupo_cita,
+              order: integrante.orden_integrante,
+              alias: integrante.alias,
+              branchId: branch.id_sucursal,
+              barberId: selection.barber.id_empleado,
+              personId: clientProfile.id_persona,
+              clientId: clientProfile.id_cliente,
+              createdByUserId: null,
+              autoAssigned: !integrante.id_barbero,
+              state: targetAppointmentState,
+              selection,
+              subtotalHnl: subtotalServiciosHnl,
+              descuentoHnl,
+              totalHnl: totalPagarHnl,
+              contactName: integrante.contacto?.nombre || integrante.alias,
+              contactEmail: integrante.contacto?.email || null,
+              contactPhone: integrante.contacto?.telefono || null,
+              notes: request.body?.notas ?? null,
+            },
+            hold: {
+              userId: null,
+              state: holdState,
+              expiresAt: expiresAt.toISOString(),
+            },
           });
-          const citaId = appointment.id_cita;
+          const citaId = reservation.citaId;
           for (const appliedPromotion of promotionResult.aplicadas || []) {
             promocionesAplicadasGrupo.push({
               ...appliedPromotion,
@@ -1470,19 +1478,6 @@ export default async function publicCitasRoutes(app) {
               alias: integrante.alias,
             });
           }
-          await insertAppointmentDetails(dbClient, {
-            citaId,
-            serviceItems: selection.serviceSelection.items,
-            descuentoTotalHnl: descuentoHnl,
-          });
-
-          await createAppointmentHold(dbClient, {
-            citaId,
-            userId: null,
-            state: holdState,
-            expiresAt: expiresAt.toISOString(),
-          });
-
           subtotalGrupo += subtotalServiciosHnl;
           descuentoGrupo += descuentoHnl;
           totalGrupo += totalPagarHnl;

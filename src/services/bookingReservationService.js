@@ -1,9 +1,23 @@
 import { randomUUID } from "node:crypto";
+import { AppError } from "../utils/errors.js";
 
 function normalizeMoney(value) {
   const parsed = Number(value ?? 0);
   if (!Number.isFinite(parsed)) return 0;
   return Number(parsed.toFixed(2));
+}
+
+function normalizePercentage(value) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Number(parsed.toFixed(2));
+}
+
+function calculateLineIsv({ subtotalHnl, descuentoHnl, isvPorcentaje, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  const percentage = normalizePercentage(isvPorcentaje);
+  if (percentage <= 0 || incluyeIsv) return 0;
+  return normalizeMoney((taxableBase * percentage) / 100);
 }
 
 export function calculateReservationTiming(selection) {
@@ -28,6 +42,16 @@ export function calculateReservationTiming(selection) {
   };
 }
 
+export function assertBookingSelectionCreationSupported(selectionType) {
+  const normalized = String(selectionType || "services").trim().toLowerCase();
+  if (normalized === "package" || normalized === "mixed") {
+    throw new AppError(409, "El flujo de paquetes/mixed sera habilitado en Microfase 2B.", {
+      code: "BOOKING_PACKAGE_FLOW_PENDING_2B",
+    });
+  }
+  return normalized || "services";
+}
+
 export function buildAppointmentDetailRows(serviceItems = [], {
   descuentoTotalHnl = 0,
   origenItemCodigo = "servicio_manual",
@@ -46,6 +70,8 @@ export function buildAppointmentDetailRows(serviceItems = [], {
         nombre_servicio_snapshot: String(item?.nombre_servicio || "Servicio").trim() || "Servicio",
         precio_referencia_hnl: normalizeMoney(item?.precio_hnl),
         precio_unitario_hnl: normalizeMoney(item?.precio_hnl),
+        incluye_isv: item?.incluye_isv === true,
+        isv_porcentaje: normalizePercentage(item?.isv_porcentaje),
         subtotal_hnl: 0,
         descuento_hnl: 0,
         isv_hnl: 0,
@@ -67,6 +93,12 @@ export function buildAppointmentDetailRows(serviceItems = [], {
       : normalizeMoney(subtotal > 0 ? (normalizeMoney(descuentoTotalHnl) * row.subtotal_hnl) / subtotal : 0);
     row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
     remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+    row.isv_hnl = calculateLineIsv({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvPorcentaje: row.isv_porcentaje,
+      incluyeIsv: row.incluye_isv,
+    });
     row.total_linea_hnl = normalizeMoney(Math.max(0, row.subtotal_hnl - row.descuento_hnl + row.isv_hnl));
   });
 
@@ -223,6 +255,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
           precio_unitario_hnl,
           subtotal_hnl,
           descuento_hnl,
+          isv_porcentaje,
           isv_hnl,
           total_linea_hnl,
           origen_item_codigo
@@ -230,7 +263,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
         VALUES (
           $1::uuid, $2::uuid, $3::uuid, $4::int, $5::int, $6::int, $7::text,
           $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,
-          $13::numeric, $14::text
+          $13::numeric, $14::numeric, $15::text
         )
       `,
       [
@@ -245,6 +278,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
         row.precio_unitario_hnl,
         row.subtotal_hnl,
         row.descuento_hnl,
+        row.isv_porcentaje,
         row.isv_hnl,
         row.total_linea_hnl,
         row.origen_item_codigo,
@@ -275,4 +309,44 @@ export async function createAppointmentHold(client, {
     [citaId, userId, state, expiresAt]
   );
   return returning ? result.rows[0] : null;
+}
+
+export async function createBookingReservation(client, {
+  groupRecord = null,
+  appointment,
+  hold = null,
+  updateGroupTotalHnl = null,
+} = {}) {
+  if (!appointment?.selection) {
+    throw new TypeError("appointment.selection es obligatorio");
+  }
+
+  const createdAppointment = await createAppointmentCore(client, appointment);
+  const citaId = createdAppointment.id_cita;
+  const serviceItems = appointment.selection?.serviceSelection?.items || [];
+  const detailRows = await insertAppointmentDetails(client, {
+    citaId,
+    serviceItems,
+    descuentoTotalHnl: appointment.descuentoHnl || 0,
+  });
+  const holdRecord = hold
+    ? await createAppointmentHold(client, {
+        citaId,
+        ...hold,
+      })
+    : null;
+
+  if (groupRecord?.id_grupo_cita && updateGroupTotalHnl != null) {
+    await updateBookingGroupTotal(client, {
+      idGrupoCita: groupRecord.id_grupo_cita,
+      totalHnl: updateGroupTotalHnl,
+    });
+  }
+
+  return {
+    appointment: createdAppointment,
+    citaId,
+    detailRows,
+    hold: holdRecord,
+  };
 }

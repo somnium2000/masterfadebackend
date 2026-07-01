@@ -28,10 +28,9 @@ import {
   resolveRedeemContextForHold,
 } from "../../services/pointsService.js";
 import {
-  createAppointmentCore,
-  createAppointmentHold,
+  assertBookingSelectionCreationSupported,
   createBookingGroup,
-  insertAppointmentDetails,
+  createBookingReservation,
   updateBookingGroupTotal,
 } from "../../services/bookingReservationService.js";
 import {
@@ -1389,6 +1388,7 @@ export default async function citasRoutes(app) {
           );
         }
         const selectionType = String(request.body?.selection_type || "services").trim().toLowerCase();
+        assertBookingSelectionCreationSupported(selectionType);
         const serviceIds = Array.isArray(request.body?.servicios)
           ? request.body.servicios.map((item) => item.id_servicio)
           : [];
@@ -1404,31 +1404,26 @@ export default async function citasRoutes(app) {
 
         await dbClient.query("BEGIN");
 
-        const appointment = await createAppointmentCore(dbClient, {
-          branchId: selection.branch.id_sucursal,
-          barberId: selection.barber.id_empleado,
-          personId: personaId,
-          clientId: clienteId,
-          createdByUserId: usuarioId,
-          autoAssigned: !request.body.id_barbero,
-          selection,
-          subtotalHnl: selection.serviceSelection.monto_total_hnl,
-          totalHnl: selection.serviceSelection.monto_total_hnl,
-          notes: request.body?.notas ?? null,
+        const reservation = await createBookingReservation(dbClient, {
+          appointment: {
+            branchId: selection.branch.id_sucursal,
+            barberId: selection.barber.id_empleado,
+            personId: personaId,
+            clientId: clienteId,
+            createdByUserId: usuarioId,
+            autoAssigned: !request.body.id_barbero,
+            selection,
+            subtotalHnl: selection.serviceSelection.monto_total_hnl,
+            totalHnl: selection.serviceSelection.monto_total_hnl,
+            notes: request.body?.notas ?? null,
+          },
+          hold: {
+            userId: usuarioId,
+            expiresAt: selection.expiresAt.toISOString(),
+            returning: true,
+          },
         });
-        const citaId = appointment.id_cita;
-
-        await insertAppointmentDetails(dbClient, {
-          citaId,
-          serviceItems: selection.serviceSelection.items,
-        });
-
-        const holdInsert = await createAppointmentHold(dbClient, {
-          citaId,
-          userId: usuarioId,
-          expiresAt: selection.expiresAt.toISOString(),
-          returning: true,
-        });
+        const citaId = reservation.citaId;
 
         if (simulationNoPayment) {
           await confirmAppointmentWithoutPayment(dbClient, {
@@ -1447,7 +1442,7 @@ export default async function citasRoutes(app) {
             id_barbero: selection.barber.id_empleado,
             nombre_barbero: selection.barber.nombre_completo,
             asignada_automaticamente: !request.body.id_barbero,
-            expires_at: simulationNoPayment ? null : new Date(holdInsert.rows[0].expires_at).toISOString(),
+            expires_at: simulationNoPayment ? null : new Date(reservation.hold.expires_at).toISOString(),
             duracion_total_min: selection.serviceSelection.duracion_total_min,
             buffer_total_min: selection.serviceSelection.buffer_total_min,
             monto_total_hnl: selection.serviceSelection.monto_total_hnl,
@@ -1720,6 +1715,7 @@ export default async function citasRoutes(app) {
 
         for (let index = 0; index < integrantes.length; index += 1) {
           const integrante = integrantes[index];
+          assertBookingSelectionCreationSupported(integrante.selection_type);
           const isTitular = integrante.orden_integrante <= 1;
           const selectionBase = await resolveBookingSelection(dbClient, {
             id_sucursal: branch.id_sucursal,
@@ -1878,24 +1874,31 @@ export default async function citasRoutes(app) {
             }
           }
 
-          const appointment = await createAppointmentCore(dbClient, {
-            groupId: groupRecord.id_grupo_cita,
-            order: integrante.orden_integrante,
-            alias: integrante.alias,
-            branchId: branch.id_sucursal,
-            barberId: selection.barber.id_empleado,
-            personId: personaId,
-            clientId: clienteId,
-            createdByUserId: usuarioId,
-            autoAssigned: !integrante.id_barbero,
-            selection,
-            subtotalHnl: subtotalServicios,
-            descuentoHnl: descuentoTotal,
-            totalHnl: totalPagar,
-            isRewardRedeem: Boolean(isTitular && rewardRedeemContext),
-            notes: request.body?.notas ?? null,
+          const reservation = await createBookingReservation(dbClient, {
+            groupRecord,
+            appointment: {
+              groupId: groupRecord.id_grupo_cita,
+              order: integrante.orden_integrante,
+              alias: integrante.alias,
+              branchId: branch.id_sucursal,
+              barberId: selection.barber.id_empleado,
+              personId: personaId,
+              clientId: clienteId,
+              createdByUserId: usuarioId,
+              autoAssigned: !integrante.id_barbero,
+              selection,
+              subtotalHnl: subtotalServicios,
+              descuentoHnl: descuentoTotal,
+              totalHnl: totalPagar,
+              isRewardRedeem: Boolean(isTitular && rewardRedeemContext),
+              notes: request.body?.notas ?? null,
+            },
+            hold: {
+              userId: holdUserId,
+              expiresAt: holdExpiresAt.toISOString(),
+            },
           });
-          const citaId = appointment.id_cita;
+          const citaId = reservation.citaId;
           if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
             const promoSavepoint = `sp_promo_hold_${integrante.orden_integrante}`;
             try {
@@ -1939,18 +1942,6 @@ export default async function citasRoutes(app) {
             rewardLinkedCitaId = citaId;
             rewardCoveredTotalHnl += rewardCoveredInBlock;
           }
-
-          await insertAppointmentDetails(dbClient, {
-            citaId,
-            serviceItems: selection.serviceSelection.items,
-            descuentoTotalHnl: descuentoTotal,
-          });
-
-          await createAppointmentHold(dbClient, {
-            citaId,
-            userId: holdUserId,
-            expiresAt: holdExpiresAt.toISOString(),
-          });
 
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
           const coveredCount = coverage.items.filter((entry) =>

@@ -256,7 +256,7 @@ export async function grantCompanionPointsForConfirmedGroup(client, { idGrupoCit
       );
       cycleId = cycleResult.rows[0]?.id_cycle ?? null;
     } catch {
-      cycleId = null;
+      // Mantener null si no se puede resolver ciclo activo.
     }
     const insertResult = await client.query(
       `
@@ -345,7 +345,7 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
       );
       cycleId = cycleResult.rows[0]?.id_cycle ?? null;
     } catch {
-      cycleId = null;
+      // Mantener null si no se puede resolver ciclo activo.
     }
 
     const origenCodigo = isTitular ? "titular" : "integrante";

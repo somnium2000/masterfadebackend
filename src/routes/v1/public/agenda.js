@@ -13,7 +13,7 @@ import {
   getBarberScheduleBounds,
   getBookingSelectionDetails,
   getMinSellableServiceMinutes,
-  listAvailabilityByDateRange,
+  listAvailabilityByDateRangeForRequest,
   listBarbersForBranch,
   mapBarbersForResponse,
   mapDayAvailabilityForResponse,
@@ -23,8 +23,6 @@ import {
 } from "../../../services/agendaService.js";
 
 const requestIdSchema = { type: "string" };
-const BUSINESS_TIME_ZONE = "America/Tegucigalpa";
-
 const errorResponseSchema = {
   type: "object",
   properties: {
@@ -90,6 +88,16 @@ const availabilityDaySchema = {
         barberSchema,
         { type: "null" },
       ],
+    },
+    tiempos_efectivos: {
+      type: "object",
+      properties: {
+        duracion_total_min: { type: "integer" },
+        buffer_total_min: { type: "integer" },
+        fecha_operativa: { type: "string", format: "date" },
+      },
+      required: ["duracion_total_min", "buffer_total_min", "fecha_operativa"],
+      additionalProperties: false,
     },
   },
   required: ["fecha", "disponible", "barberos_disponibles", "primer_horario_disponible", "barbero_autoasignado"],
@@ -572,8 +580,8 @@ export default async function publicAgendaRoutes(app) {
                 type: "object",
                 properties: {
                   disponibilidad: { type: "array", items: availabilityDaySchema },
-                  duracion_total_min: { type: "integer" },
-                  buffer_total_min: { type: "integer" },
+                  duracion_total_min: { anyOf: [{ type: "integer" }, { type: "null" }] },
+                  buffer_total_min: { anyOf: [{ type: "integer" }, { type: "null" }] },
                 },
                 required: ["disponibilidad", "duracion_total_min", "buffer_total_min"],
                 additionalProperties: false,
@@ -609,27 +617,20 @@ export default async function publicAgendaRoutes(app) {
         if (diffDays > 60) {
           throw new AppError(400, "El rango de fechas no puede superar los 60 dias", { code: "PUBLIC_AGENDA_DATE_RANGE_TOO_LARGE" });
         }
-        const serviceSelection = await getBookingSelectionDetails(dbClient, {
+        const rangeResult = await listAvailabilityByDateRangeForRequest(dbClient, {
           id_sucursal: idSucursal,
           selection_type: request.query?.selection_type,
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
+          fecha_desde: fechaDesde,
+          fecha_hasta: fechaHasta,
           id_barbero: idBarbero,
-          fecha_operativa: fechaDesde,
         });
-        const disponibilidad = await listAvailabilityByDateRange(
-          dbClient,
-          idSucursal,
-          serviceSelection,
-          fechaDesde,
-          fechaHasta,
-          idBarbero
-        );
 
         return sendOk(reply, {
-          disponibilidad: mapDayAvailabilityForResponse(disponibilidad),
-          duracion_total_min: serviceSelection.duracion_total_min,
-          buffer_total_min: serviceSelection.buffer_total_min,
+          disponibilidad: mapDayAvailabilityForResponse(rangeResult.disponibilidad),
+          duracion_total_min: rangeResult.duracion_total_min,
+          buffer_total_min: rangeResult.buffer_total_min,
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo calcular disponibilidad", "PUBLIC_AGENDA_AVAILABILITY_ERROR");
