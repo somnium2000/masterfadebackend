@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { resolveBookingIsvEnabled } from "../config/bookingConfig.js";
+import {
+  buildCanonicalLineKey,
+  buildDiscountPlan,
+  normalizeMoney as normalizeDiscountMoney,
+} from "./bookingDiscounts.js";
 import { recordPromotionApplications } from "./promociones/promocionesService.js";
 import { AppError } from "../utils/errors.js";
 
@@ -64,18 +69,39 @@ export function assertBookingSelectionCreationSupported(selectionType) {
 
 export function buildAppointmentDetailRows(serviceItems = [], {
   descuentoTotalHnl = 0,
+  discountPlan = null,
   origenItemCodigo = "servicio_manual",
+  ordenIntegrante = 1,
   bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   const isvEnabled = bookingIsvEnabled === true;
   const grouped = new Map();
+  const occurrenceByGroup = new Map();
   for (const item of Array.isArray(serviceItems) ? serviceItems : []) {
     const serviceId = String(item?.id_servicio || "").trim();
     if (!serviceId) continue;
-    if (!grouped.has(serviceId)) {
-      grouped.set(serviceId, {
+    const tariffId = item?.id_tarifa || null;
+    const originCode = item?.origen_item_codigo || origenItemCodigo;
+    const groupKey = [serviceId, tariffId || "sin_tarifa", originCode].join("|");
+    if (!grouped.has(groupKey)) {
+      const occurrenceKey = [
+        Math.max(1, Math.trunc(Number(ordenIntegrante || 1))),
+        serviceId,
+        tariffId || "sin_tarifa",
+        originCode,
+      ].join("|");
+      const occurrence = (occurrenceByGroup.get(occurrenceKey) || 0) + 1;
+      occurrenceByGroup.set(occurrenceKey, occurrence);
+      grouped.set(groupKey, {
+        line_key: item?.line_key || buildCanonicalLineKey({
+          orden_integrante: ordenIntegrante,
+          id_servicio: serviceId,
+          id_tarifa: tariffId,
+          origen_item_codigo: originCode,
+          occurrence,
+        }),
         id_servicio: serviceId,
-        id_tarifa: item?.id_tarifa || null,
+        id_tarifa: tariffId,
         cantidad: 0,
         duracion_min: Math.max(1, Math.trunc(Number(item?.duracion_min || 0))),
         buffer_min: Math.max(0, Math.trunc(Number(item?.buffer_min || 0))),
@@ -88,23 +114,35 @@ export function buildAppointmentDetailRows(serviceItems = [], {
         descuento_hnl: 0,
         isv_hnl: 0,
         total_linea_hnl: 0,
-        origen_item_codigo: origenItemCodigo,
+        origen_item_codigo: originCode,
       });
     }
-    const row = grouped.get(serviceId);
+    const row = grouped.get(groupKey);
     row.cantidad += 1;
     row.subtotal_hnl = normalizeMoney(row.precio_unitario_hnl * row.cantidad);
   }
 
   const rows = [...grouped.values()];
   const subtotal = normalizeMoney(rows.reduce((sum, row) => sum + row.subtotal_hnl, 0));
+  const planByLine = discountPlan instanceof Map
+    ? discountPlan
+    : (discountPlan ? buildDiscountPlan(rows, Object.values(discountPlan).flatMap((entry) => entry.allocations || [])) : null);
   let remainingDiscount = Math.min(normalizeMoney(descuentoTotalHnl), subtotal);
   rows.forEach((row, index) => {
-    const discount = index === rows.length - 1
-      ? remainingDiscount
-      : normalizeMoney(subtotal > 0 ? (normalizeMoney(descuentoTotalHnl) * row.subtotal_hnl) / subtotal : 0);
-    row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
-    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+    if (planByLine) {
+      row.descuento_hnl = normalizeMoney(planByLine.get(row.line_key)?.descuento_total_hnl || 0);
+    } else {
+      const discount = index === rows.length - 1
+        ? remainingDiscount
+        : normalizeMoney(subtotal > 0 ? (normalizeMoney(descuentoTotalHnl) * row.subtotal_hnl) / subtotal : 0);
+      row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
+      remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+    }
+    if (row.descuento_hnl > row.subtotal_hnl) {
+      throw new AppError(409, "El descuento supera el subtotal de la linea", {
+        code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
+      });
+    }
     row.isv_hnl = calculateLineIsv({
       subtotalHnl: row.subtotal_hnl,
       descuentoHnl: row.descuento_hnl,
@@ -118,6 +156,16 @@ export function buildAppointmentDetailRows(serviceItems = [], {
       incluyeIsv: row.incluye_isv_snapshot,
     });
   });
+
+  if (planByLine) {
+    const assigned = normalizeMoney(rows.reduce((sum, row) => sum + Number(row.descuento_hnl || 0), 0));
+    const requested = normalizeDiscountMoney([...planByLine.values()].reduce((sum, row) => sum + Number(row.descuento_total_hnl || 0), 0));
+    if (assigned !== requested) {
+      throw new AppError(409, "La suma de descuentos por linea no coincide con el plan canonico", {
+        code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
+      });
+    }
+  }
 
   return rows;
 }
@@ -356,6 +404,7 @@ export async function createBookingReservation(client, {
   appointment,
   hold = null,
   promotions = null,
+  discountPlan = null,
   updateGroupTotalHnl = null,
   bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
@@ -366,6 +415,8 @@ export async function createBookingReservation(client, {
   const serviceItems = appointment.selection?.serviceSelection?.items || [];
   const preparedDetailRows = buildAppointmentDetailRows(serviceItems, {
     descuentoTotalHnl: appointment.descuentoHnl || 0,
+    discountPlan,
+    ordenIntegrante: appointment.order || 1,
     bookingIsvEnabled,
   });
   const detailTotals = summarizeAppointmentDetailRows(preparedDetailRows);
@@ -393,10 +444,11 @@ export async function createBookingReservation(client, {
         id_cliente: promotions.context?.id_cliente || appointment.clientId || null,
         id_persona: promotions.context?.id_persona || appointment.personId || null,
         detailRows,
+        discountPlan,
         serviceItems,
       },
       promotions.result,
-      { formal: promotions.formal === true }
+      { formal: promotions.formal === true, usageState: promotions.usageState || null }
     );
   }
   const holdRecord = hold

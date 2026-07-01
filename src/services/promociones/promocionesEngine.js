@@ -1,3 +1,9 @@
+import {
+  allocateDiscountAcrossLines,
+  buildCanonicalDiscountLines,
+  normalizeMoney,
+} from "../bookingDiscounts.js";
+
 function normalizeCode(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -35,6 +41,39 @@ function normalizeUnitPrice(entry = {}) {
   const subtotal = Number(entry?.subtotal_hnl ?? NaN);
   if (Number.isFinite(subtotal) && subtotal >= 0 && qty > 0) return subtotal / qty;
   return null;
+}
+
+function getContextDiscountLines(context = {}) {
+  if (Array.isArray(context.discount_lines) && context.discount_lines.length) {
+    return context.discount_lines.map((line) => ({
+      ...line,
+      base_disponible_hnl: normalizeMoney(line.base_disponible_hnl ?? (
+        Number(line.subtotal_hnl || 0) - Number(line.descuento_previo_hnl || 0)
+      )),
+    }));
+  }
+  return buildCanonicalDiscountLines(context.servicios || [], {
+    orden_integrante: context.orden_integrante || 1,
+  });
+}
+
+function getEligibleLines(context = {}, candidate = {}) {
+  const lines = getContextDiscountLines(context);
+  const applyCode = String(candidate.aplica_a_codigo || "reserva").trim().toLowerCase();
+  if (applyCode === "reserva") return lines;
+  if (applyCode === "titular") {
+    return lines.filter((line) => Number(line.orden_integrante || 1) === 1);
+  }
+  if (applyCode === "servicio") {
+    const targetServiceIds = new Set(
+      (Array.isArray(candidate.items) ? candidate.items : [])
+        .map((item) => String(item?.id_servicio || "").trim())
+        .filter(Boolean)
+    );
+    if (!targetServiceIds.size) return [];
+    return lines.filter((line) => targetServiceIds.has(String(line.id_servicio || "").trim()));
+  }
+  return [];
 }
 
 function getTargetItemStats(context = {}, candidate = {}) {
@@ -91,7 +130,8 @@ function getTargetItemStats(context = {}, candidate = {}) {
 }
 
 export function calculateDiscount(context = {}, candidate = {}) {
-  const subtotal = Number(context.subtotal_hnl || 0);
+  const eligibleLines = getEligibleLines(context, candidate);
+  const subtotal = normalizeMoney(eligibleLines.reduce((sum, line) => sum + Number(line.base_disponible_hnl || 0), 0));
   const value = Number(candidate.valor_descuento || 0);
   const maxDiscount = candidate.max_descuento_hnl == null ? null : Number(candidate.max_descuento_hnl);
   let discount = 0;
@@ -159,7 +199,9 @@ export function validatePromotionCandidate(context = {}, candidate = {}) {
     }
   }
 
-  if (candidate.min_subtotal_hnl != null && Number(context.subtotal_hnl || 0) < Number(candidate.min_subtotal_hnl || 0)) {
+  const eligibleLines = getEligibleLines(context, candidate);
+  const eligibleSubtotal = normalizeMoney(eligibleLines.reduce((sum, line) => sum + Number(line.base_disponible_hnl || 0), 0));
+  if (candidate.min_subtotal_hnl != null && eligibleSubtotal < Number(candidate.min_subtotal_hnl || 0)) {
     return { valid: false, reasonCode: "PROMOCION_MIN_SUBTOTAL", reason: "El subtotal no cumple el minimo de la promocion." };
   }
 
@@ -232,6 +274,9 @@ export function validatePromotionCandidate(context = {}, candidate = {}) {
     if (!matchedItem && ["servicio", "paquete"].includes(String(candidate.aplica_a_codigo || ""))) {
       return { valid: false, reasonCode: "PROMOCION_ITEM_NO_APLICA", reason: "La promocion no aplica a los items seleccionados." };
     }
+  }
+  if (["servicio", "titular", "reserva"].includes(String(candidate.aplica_a_codigo || "")) && eligibleSubtotal <= 0) {
+    return { valid: false, reasonCode: "PROMOCION_SIN_LINEAS_ELEGIBLES", reason: "La promocion no tiene lineas elegibles disponibles." };
   }
 
   if (
@@ -331,6 +376,10 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       es_acumulable: Boolean(row.es_acumulable),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
+      line_allocations: Array.isArray(row.line_allocations) ? row.line_allocations.map((allocation) => ({
+        line_key: allocation.line_key,
+        descuento_hnl: Number(allocation.descuento_hnl || 0),
+      })) : [],
       target_items: Array.isArray(row.items) ? row.items.map((item) => ({
         id_servicio: item.id_servicio || null,
         id_paquete: item.id_paquete || null,
@@ -349,6 +398,10 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       valor_descuento: Number(row.valor_descuento || 0),
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
+      line_allocations: Array.isArray(row.line_allocations) ? row.line_allocations.map((allocation) => ({
+        line_key: allocation.line_key,
+        descuento_hnl: Number(allocation.descuento_hnl || 0),
+      })) : [],
       target_items: Array.isArray(row.items) ? row.items.map((item) => ({
         id_servicio: item.id_servicio || null,
         id_paquete: item.id_paquete || null,
@@ -426,7 +479,12 @@ export function evaluatePromotions(context = {}, candidates = [], usageStats = {
       }
     }
 
+    const eligibleLines = getEligibleLines(context, candidate);
+    const eligibleBase = normalizeMoney(eligibleLines.reduce((sum, line) => sum + Number(line.base_disponible_hnl || 0), 0));
     const discount = isValid ? calculateDiscount(context, candidate) : 0;
+    const lineAllocations = isValid && discount > 0
+      ? allocateDiscountAcrossLines(eligibleLines, discount)
+      : [];
 
     const targetKeys = (() => {
       const keys = [];
@@ -450,9 +508,11 @@ export function evaluatePromotions(context = {}, candidates = [], usageStats = {
       isValid,
       reasonCode,
       reason,
-      base_calculo_hnl: Number(context.subtotal_hnl || 0),
+      base_calculo_hnl: eligibleBase,
       descuento_calculado_hnl: discount,
       targetKeys,
+      targetLineKeys: lineAllocations.map((row) => row.line_key),
+      line_allocations: lineAllocations,
     });
   }
 

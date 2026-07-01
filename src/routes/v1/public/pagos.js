@@ -97,16 +97,26 @@ function distributeDiscountByRemainingCapacity(detailRows = [], descuentoTotalHn
   });
 }
 
-function applyPersistedPromotionDiscounts(detailRows = [], promotionRows = []) {
-  const rows = (Array.isArray(detailRows) ? detailRows : []).map((row) => ({
+function assertCompleteAllocation(allocations = [], requestedDiscount = 0, code = "BOOKING_PROMOTION_ALLOCATION_MISMATCH") {
+  const assigned = normalizeMoney((Array.isArray(allocations) ? allocations : []).reduce((sum, amount) => sum + Number(amount || 0), 0));
+  if (assigned !== normalizeMoney(requestedDiscount)) {
+    throw new AppError(409, "No se pudo asignar completamente la promocion persistida", { code });
+  }
+}
+
+export function applyPersistedPromotionDiscounts(detailRows = [], promotionRows = []) {
+  const sourceRows = Array.isArray(detailRows) ? detailRows : [];
+  const rows = sourceRows.map((row) => ({
     ...row,
-    descuento_hnl: 0,
+    descuento_hnl: normalizeMoney(row?.descuento_hnl),
+    descuento_no_promocional_hnl: 0,
   }));
   const byDetailId = new Map(
     rows
       .map((row) => [String(row.id_cita_detalle || "").trim(), row])
       .filter(([detailId]) => detailId)
   );
+  const persistedPromoByDetail = new Map(rows.map((row) => [String(row.id_cita_detalle || "").trim(), 0]));
 
   for (const promotion of Array.isArray(promotionRows) ? promotionRows : []) {
     const discount = normalizeMoney(promotion?.descuento_calculado_hnl);
@@ -114,17 +124,45 @@ function applyPersistedPromotionDiscounts(detailRows = [], promotionRows = []) {
     const detailId = String(promotion?.id_cita_detalle || "").trim();
     if (detailId) {
       const row = byDetailId.get(detailId);
-      if (!row) continue;
-      const capacity = normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0)));
-      row.descuento_hnl = normalizeMoney(row.descuento_hnl + Math.min(discount, capacity));
+      if (!row) {
+        throw new AppError(409, "La promocion persistida apunta a un detalle inexistente", {
+          code: "BOOKING_PROMOTION_ALLOCATION_INVALID",
+        });
+      }
+      const capacity = normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0)));
+      if (discount > capacity) {
+        throw new AppError(409, "La promocion persistida supera la capacidad del detalle", {
+          code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+        });
+      }
+      persistedPromoByDetail.set(detailId, normalizeMoney((persistedPromoByDetail.get(detailId) || 0) + discount));
       continue;
     }
 
-    const allocations = distributeDiscountByRemainingCapacity(rows, discount);
+    const allocations = distributeDiscountByRemainingCapacity(
+      rows.map((row) => ({ ...row, descuento_hnl: persistedPromoByDetail.get(String(row.id_cita_detalle || "").trim()) || 0 })),
+      discount
+    );
+    assertCompleteAllocation(allocations, discount);
     rows.forEach((row, index) => {
-      row.descuento_hnl = normalizeMoney(Number(row.descuento_hnl || 0) + Number(allocations[index] || 0));
+      const key = String(row.id_cita_detalle || "").trim();
+      persistedPromoByDetail.set(key, normalizeMoney((persistedPromoByDetail.get(key) || 0) + Number(allocations[index] || 0)));
     });
   }
+
+  rows.forEach((row) => {
+    const key = String(row.id_cita_detalle || "").trim();
+    const persistedPromotionDiscount = normalizeMoney(persistedPromoByDetail.get(key) || 0);
+    const nonPromotionDiscount = normalizeMoney(Math.max(0, Number(row.descuento_hnl || 0) - persistedPromotionDiscount));
+    const finalDiscount = normalizeMoney(nonPromotionDiscount + persistedPromotionDiscount);
+    if (finalDiscount > normalizeMoney(row.subtotal_hnl)) {
+      throw new AppError(409, "El descuento final supera la capacidad del detalle", {
+        code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+      });
+    }
+    row.descuento_no_promocional_hnl = nonPromotionDiscount;
+    row.descuento_hnl = finalDiscount;
+  });
 
   return rows;
 }
@@ -1253,7 +1291,8 @@ export default async function publicPagosRoutes(app) {
         );
       }
 
-      const idempotencyKey = `mf_public_${idGrupoCita}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+      const idIntentLocal = crypto.randomUUID();
+      const idempotencyKey = `masterfade:booking-payment:${idIntentLocal}`;
       const providerAdapter = PaymentProviderFactory.create();
       const providerIntent = await providerAdapter.createIntent({
         idempotencyKey,
@@ -1270,6 +1309,7 @@ export default async function publicPagosRoutes(app) {
       const created = await dbClient.query(
         `
           INSERT INTO public.payment_intents (
+            id_intent,
             id_provider,
             id_cita,
             id_hold,
@@ -1287,19 +1327,21 @@ export default async function publicPagosRoutes(app) {
             $1::uuid,
             $2::uuid,
             $3::uuid,
+            $4::uuid,
             'link_generado',
-            $4::numeric,
+            $5::numeric,
             'HNL',
-            $5::text,
             $6::text,
             $7::text,
-            $8::timestamptz,
-            $9::uuid,
-            $10::uuid
+            $8::text,
+            $9::timestamptz,
+            $10::uuid,
+            $11::uuid
           )
           RETURNING id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
         `,
         [
+          idIntentLocal,
           provider.id_provider,
           anchor.id_cita,
           anchor.id_hold,

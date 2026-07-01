@@ -63,6 +63,13 @@ function getPromotionTargetServiceIds(item = {}) {
 
 function resolvePromotionDetailTargets(context = {}, item = {}) {
   const detailRows = Array.isArray(context.detailRows) ? context.detailRows : [];
+  const lineAllocations = Array.isArray(item.line_allocations) ? item.line_allocations : [];
+  if (lineAllocations.length) {
+    const byLineKey = new Map(detailRows.map((row) => [String(row?.line_key || "").trim(), row]));
+    return lineAllocations
+      .map((allocation) => byLineKey.get(String(allocation?.line_key || "").trim()))
+      .filter(Boolean);
+  }
   const directDetailId = String(item.id_cita_detalle || context.id_cita_detalle || "").trim();
   if (directDetailId) {
     return detailRows.filter((row) => String(row?.id_cita_detalle || "").trim() === directDetailId);
@@ -116,7 +123,15 @@ function buildScopedPromotionPayloads(base = {}, context = {}, item = {}) {
   }
   if (applyCode === "servicio") {
     const targetDetails = resolvePromotionDetailTargets(context, item);
-    const allocations = distributeDiscountAcrossDetails(targetDetails, base.descuento_calculado_hnl);
+    const explicitAllocations = Array.isArray(item.line_allocations) ? item.line_allocations : [];
+    const allocations = explicitAllocations.length
+      ? targetDetails.map((detail) => {
+          const match = explicitAllocations.find((allocation) => (
+            String(allocation?.line_key || "").trim() === String(detail?.line_key || "").trim()
+          ));
+          return normalizeMoney(match?.descuento_hnl);
+        })
+      : distributeDiscountAcrossDetails(targetDetails, base.descuento_calculado_hnl);
     return targetDetails
       .map((detail, index) => ({
         ...payload,
@@ -169,6 +184,7 @@ export async function previewPromotionsForAppointment(db, context = {}) {
 
 export async function recordPromotionApplications(db, context = {}, result = {}, options = {}) {
   const isFormal = options.formal === true;
+  const usageState = options.usageState || (isFormal ? "consumido" : null);
   const inserted = { aplicadas: [], descartadas: [], usos: [] };
 
   for (const applied of result.promociones_aplicadas || []) {
@@ -192,7 +208,7 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       const idCitaPromocion = await insertAppointmentPromotionApplication(db, appliedPayload);
       inserted.aplicadas.push(idCitaPromocion);
 
-      if (isFormal && idCitaPromocion) {
+      if (usageState && idCitaPromocion) {
         const idUso = await insertPromotionUsage(db, {
           id_cita_promocion: idCitaPromocion,
           id_promocion_regla: applied.id_promocion_regla,
@@ -202,7 +218,7 @@ export async function recordPromotionApplications(db, context = {}, result = {},
           id_persona: context.id_persona || null,
           id_promocion_sucursal: applied.id_promocion_sucursal || context.id_promocion_sucursal || null,
           fecha_operativa: normalizeDate(context.fecha_operativa || context.fecha),
-          estado_uso_codigo: "consumido",
+          estado_uso_codigo: usageState,
         });
         inserted.usos.push(idUso);
       }
@@ -287,6 +303,17 @@ export async function markPromotionUsagesForGroup(db, context = {}) {
   }
 
   const dateRef = normalizeDate(context.fecha_operativa || context.fecha);
+  await db.query(
+    `
+      UPDATE public.promociones_usos pu
+      SET estado_uso_codigo = 'consumido',
+          usado_at = now(),
+          updated_at = now()
+      WHERE pu.id_grupo_cita = $1::uuid
+        AND pu.estado_uso_codigo = 'reservado'
+    `,
+    [groupId]
+  );
   const rows = await db.query(
     `
       SELECT

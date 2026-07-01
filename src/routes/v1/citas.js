@@ -38,6 +38,7 @@ import {
   previewPromotionsForAppointment,
   markPromotionUsagesForGroup,
 } from "../../services/promociones/promocionesService.js";
+import { buildCanonicalDiscountLines, buildDiscountPlan } from "../../services/bookingDiscounts.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
@@ -112,22 +113,40 @@ const citaResumenSchema = {
 const citaDetalleItemSchema = {
   type: "object",
   properties: {
+    id_cita_detalle: { type: "string", format: "uuid" },
     id_servicio: { type: "string", format: "uuid" },
     nombre_servicio: { type: ["string", "null"] },
+    id_tarifa: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
     cantidad: { type: "integer" },
     duracion_min: { type: "integer" },
     buffer_min: { type: "integer" },
+    precio_referencia_hnl: { type: "number" },
     precio_unitario_hnl: { type: "number" },
     subtotal_hnl: { type: "number" },
+    descuento_hnl: { type: "number" },
+    incluye_isv_snapshot: { type: "boolean" },
+    isv_porcentaje: { type: "number" },
+    isv_hnl: { type: "number" },
+    total_linea_hnl: { type: "number" },
+    origen_item_codigo: { anyOf: [{ type: "string" }, { type: "null" }] },
   },
   required: [
+    "id_cita_detalle",
     "id_servicio",
     "nombre_servicio",
+    "id_tarifa",
     "cantidad",
     "duracion_min",
     "buffer_min",
+    "precio_referencia_hnl",
     "precio_unitario_hnl",
     "subtotal_hnl",
+    "descuento_hnl",
+    "incluye_isv_snapshot",
+    "isv_porcentaje",
+    "isv_hnl",
+    "total_linea_hnl",
+    "origen_item_codigo",
   ],
   additionalProperties: false,
 };
@@ -223,12 +242,12 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
     conditions.push(`c.estado_cita_codigo = $${params.length}`);
   }
   if (fechaDesde) {
-    params.push(`${fechaDesde}T00:00:00`);
-    conditions.push(`c.inicio_at >= $${params.length}::timestamptz`);
+    params.push(fechaDesde);
+    conditions.push(`c.inicio_at >= ($${params.length}::date::timestamp AT TIME ZONE 'America/Tegucigalpa')`);
   }
   if (fechaHasta) {
-    params.push(`${fechaHasta}T23:59:59.999`);
-    conditions.push(`c.inicio_at <= $${params.length}::timestamptz`);
+    params.push(fechaHasta);
+    conditions.push(`c.inicio_at < (($${params.length}::date + 1)::timestamp AT TIME ZONE 'America/Tegucigalpa')`);
   }
 
   const { rows } = await client.query(
@@ -360,6 +379,23 @@ async function getAppointmentDetails(client, citaId) {
     total_linea_hnl: Number(row.total_linea_hnl ?? row.subtotal_hnl ?? 0),
     origen_item_codigo: row.origen_item_codigo ?? null,
   }));
+}
+
+function buildPromotionDiscountPlan(context = {}, appliedPromotions = []) {
+  const allocations = [];
+  for (const promotion of Array.isArray(appliedPromotions) ? appliedPromotions : []) {
+    for (const allocation of Array.isArray(promotion.line_allocations) ? promotion.line_allocations : []) {
+      allocations.push({
+        line_key: allocation.line_key,
+        source_type: "promotion",
+        source_id: promotion.id_promocion_regla,
+        id_promocion: promotion.id_promocion,
+        id_promocion_regla: promotion.id_promocion_regla,
+        descuento_hnl: allocation.descuento_hnl,
+      });
+    }
+  }
+  return buildDiscountPlan(context.discount_lines || [], allocations);
 }
 
 function isPointsTriggerCompileError(error) {
@@ -1889,6 +1925,9 @@ export default async function citasRoutes(app) {
             hora: promoDateTime.hora_operativa,
             subtotal_hnl: totalPagar,
             servicios: selection.serviceSelection.items || [],
+            discount_lines: buildCanonicalDiscountLines(selection.serviceSelection.items || [], {
+              orden_integrante: integrante.orden_integrante || index + 1,
+            }),
             paquetes: selection.serviceSelection.id_paquete
               ? [{ id_paquete: selection.serviceSelection.id_paquete }]
               : [],
@@ -1926,6 +1965,9 @@ export default async function citasRoutes(app) {
             }
           }
 
+          const discountPlan = promocionesPreview && !promocionesPreview.usedFallbackLegacy && Number(descuento || 0) === 0
+            ? buildPromotionDiscountPlan(promocionesContext, promocionesPreview.promociones_aplicadas || [])
+            : null;
           const reservation = await createBookingReservation(dbClient, {
             groupRecord,
             appointment: {
@@ -1953,9 +1995,11 @@ export default async function citasRoutes(app) {
               ? {
                   context: promocionesContext,
                   result: promocionesPreview,
-                  formal: false,
+                  formal: true,
+                  usageState: "reservado",
                 }
               : null,
+            discountPlan,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           const citaId = reservation.citaId;

@@ -2464,9 +2464,17 @@ export async function resolveBookingSelection(client, {
         details: { fecha: dateKey, hora: timeKey, id_sucursal: branch.id_sucursal },
       });
     }
-    const randomIndex = Math.floor(Math.random() * candidates.length);
-    selectedBarber = candidates[randomIndex].barber;
-    finalSelection = candidates[randomIndex].selection;
+    const rankedCandidates = [...candidates].sort((left, right) => {
+      const leftOrder = Number(left.barber?.orden_visual ?? left.barber?.orden ?? Number.MAX_SAFE_INTEGER);
+      const rightOrder = Number(right.barber?.orden_visual ?? right.barber?.orden ?? Number.MAX_SAFE_INTEGER);
+      if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+      const leftSpecific = (left.selection?.items || []).some((item) => String(item?.id_empleado || "") === String(left.barber?.id_empleado || ""));
+      const rightSpecific = (right.selection?.items || []).some((item) => String(item?.id_empleado || "") === String(right.barber?.id_empleado || ""));
+      if (leftSpecific !== rightSpecific) return leftSpecific ? -1 : 1;
+      return String(left.barber?.id_empleado || "").localeCompare(String(right.barber?.id_empleado || ""));
+    });
+    selectedBarber = rankedCandidates[0].barber;
+    finalSelection = rankedCandidates[0].selection;
   }
 
   return {

@@ -61,32 +61,103 @@ SET precio_referencia_hnl = ROUND(COALESCE(precio_unitario_hnl, 0), 2)
 WHERE COALESCE(precio_referencia_hnl, 0) = 0
   AND COALESCE(precio_unitario_hnl, 0) > 0;
 
-UPDATE public.citas_detalles cd
-SET id_tarifa = (
-  SELECT st.id_tarifa
-  FROM public.servicios_tarifas st
-  WHERE st.id_servicio = cd.id_servicio
-    AND st.id_sucursal = c.id_sucursal
-    AND st.deleted_at IS NULL
-    AND st.activo IS TRUE
-    AND (st.id_empleado IS NULL OR st.id_empleado = c.id_empleado_barbero)
-    AND st.vigente_desde <= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
-    AND (
-      st.vigente_hasta IS NULL
-      OR st.vigente_hasta >= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+DO $$
+BEGIN
+  IF EXISTS (
+    WITH candidatos AS (
+      SELECT
+        cd.id_cita_detalle,
+        st.id_tarifa,
+        CASE WHEN st.id_empleado = c.id_empleado_barbero THEN 0 ELSE 1 END AS scope_rank
+      FROM public.citas_detalles cd
+      JOIN public.citas c
+        ON c.id_cita = cd.id_cita
+      JOIN public.servicios s
+        ON s.id_servicio = cd.id_servicio
+      JOIN public.servicios_tarifas st
+        ON st.id_servicio = cd.id_servicio
+       AND st.id_sucursal = c.id_sucursal
+       AND st.deleted_at IS NULL
+       AND st.activo IS TRUE
+       AND (st.id_empleado IS NULL OR st.id_empleado = c.id_empleado_barbero)
+       AND st.vigente_desde <= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+       AND (
+         st.vigente_hasta IS NULL
+         OR st.vigente_hasta >= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+       )
+       AND ROUND(st.precio_hnl, 2) = ROUND(COALESCE(cd.precio_unitario_hnl, 0), 2)
+       AND COALESCE(st.duracion_min, s.duracion_min) = cd.duracion_min
+       AND COALESCE(st.buffer_min, s.buffer_min, 0) = cd.buffer_min
+      WHERE cd.id_tarifa IS NULL
+    ),
+    mejor_scope AS (
+      SELECT id_cita_detalle, MIN(scope_rank) AS scope_rank
+      FROM candidatos
+      GROUP BY id_cita_detalle
+    ),
+    finales AS (
+      SELECT c.id_cita_detalle, COUNT(*) AS total
+      FROM candidatos c
+      JOIN mejor_scope ms
+        ON ms.id_cita_detalle = c.id_cita_detalle
+       AND ms.scope_rank = c.scope_rank
+      GROUP BY c.id_cita_detalle
     )
-    AND ROUND(st.precio_hnl, 2) = ROUND(COALESCE(cd.precio_unitario_hnl, 0), 2)
-    AND COALESCE(st.duracion_min, cd.duracion_min) = cd.duracion_min
-    AND COALESCE(st.buffer_min, cd.buffer_min) = cd.buffer_min
-  ORDER BY
-    CASE WHEN st.id_empleado = c.id_empleado_barbero THEN 0 ELSE 1 END,
-    st.vigente_desde DESC,
-    st.updated_at DESC,
-    st.id_tarifa DESC
-  LIMIT 1
+    SELECT 1
+    FROM public.citas_detalles cd
+    LEFT JOIN finales f
+      ON f.id_cita_detalle = cd.id_cita_detalle
+    WHERE cd.id_tarifa IS NULL
+      AND COALESCE(f.total, 0) <> 1
+  ) THEN
+    RAISE EXCEPTION 'MF2A2_BACKFILL_ID_TARIFA_AMBIGUO_O_INEXISTENTE';
+  END IF;
+END $$;
+
+WITH candidatos AS (
+  SELECT
+    cd.id_cita_detalle,
+    st.id_tarifa,
+    CASE WHEN st.id_empleado = c.id_empleado_barbero THEN 0 ELSE 1 END AS scope_rank
+  FROM public.citas_detalles cd
+  JOIN public.citas c
+    ON c.id_cita = cd.id_cita
+  JOIN public.servicios s
+    ON s.id_servicio = cd.id_servicio
+  JOIN public.servicios_tarifas st
+    ON st.id_servicio = cd.id_servicio
+   AND st.id_sucursal = c.id_sucursal
+   AND st.deleted_at IS NULL
+   AND st.activo IS TRUE
+   AND (st.id_empleado IS NULL OR st.id_empleado = c.id_empleado_barbero)
+   AND st.vigente_desde <= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+   AND (
+     st.vigente_hasta IS NULL
+     OR st.vigente_hasta >= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+   )
+   AND ROUND(st.precio_hnl, 2) = ROUND(COALESCE(cd.precio_unitario_hnl, 0), 2)
+   AND COALESCE(st.duracion_min, s.duracion_min) = cd.duracion_min
+   AND COALESCE(st.buffer_min, s.buffer_min, 0) = cd.buffer_min
+  WHERE cd.id_tarifa IS NULL
+),
+mejor_scope AS (
+  SELECT id_cita_detalle, MIN(scope_rank) AS scope_rank
+  FROM candidatos
+  GROUP BY id_cita_detalle
+),
+unicos AS (
+  SELECT c.id_cita_detalle, MIN(c.id_tarifa) AS id_tarifa
+  FROM candidatos c
+  JOIN mejor_scope ms
+    ON ms.id_cita_detalle = c.id_cita_detalle
+   AND ms.scope_rank = c.scope_rank
+  GROUP BY c.id_cita_detalle
+  HAVING COUNT(*) = 1
 )
-FROM public.citas c
-WHERE cd.id_cita = c.id_cita
+UPDATE public.citas_detalles cd
+SET id_tarifa = u.id_tarifa
+FROM unicos u
+WHERE u.id_cita_detalle = cd.id_cita_detalle
   AND cd.id_tarifa IS NULL;
 
 DO $$

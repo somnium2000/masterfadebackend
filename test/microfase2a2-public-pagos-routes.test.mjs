@@ -166,8 +166,10 @@ test("ruta real POST /v1/public/pagos/crear-intent conserva snapshots y crea int
 
   const intentInsert = client.calls.find((call) => call.sql.includes("INSERT INTO public.payment_intents"));
   assert.ok(intentInsert);
-  assert.equal(intentInsert.params[3], 115);
-  assert.equal(intentInsert.params[9], GROUP_A);
+  assert.match(intentInsert.params[0], /^[0-9a-f-]{36}$/i);
+  assert.equal(intentInsert.params[4], 115);
+  assert.equal(intentInsert.params[7], `masterfade:booking-payment:${intentInsert.params[0]}`);
+  assert.equal(intentInsert.params[10], GROUP_A);
   await app.close();
 });
 

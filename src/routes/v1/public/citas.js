@@ -22,6 +22,7 @@ import {
   evaluatePromotions,
   resolvePromotionConflicts,
 } from "../../../services/promociones/promocionesEngine.js";
+import { buildCanonicalDiscountLines, buildDiscountPlan } from "../../../services/bookingDiscounts.js";
 import {
   assertBookingSelectionCreationSupported,
   createBookingGroup,
@@ -830,6 +831,23 @@ function buildPromotionRequestKey(promotion) {
   return `${String(promotion?.id_promocion || "").trim()}:${String(promotion?.id_promocion_regla || "").trim()}`;
 }
 
+function buildPromotionDiscountPlan(context = {}, appliedPromotions = []) {
+  const allocations = [];
+  for (const promotion of Array.isArray(appliedPromotions) ? appliedPromotions : []) {
+    for (const allocation of Array.isArray(promotion.line_allocations) ? promotion.line_allocations : []) {
+      allocations.push({
+        line_key: allocation.line_key,
+        source_type: "promotion",
+        source_id: promotion.id_promocion_regla,
+        id_promocion: promotion.id_promocion,
+        id_promocion_regla: promotion.id_promocion_regla,
+        descuento_hnl: allocation.descuento_hnl,
+      });
+    }
+  }
+  return buildDiscountPlan(context.discount_lines || [], allocations);
+}
+
 async function resolveRequestedPromotionsForPublicHold(client, {
   branch,
   clientProfile,
@@ -857,6 +875,9 @@ async function resolveRequestedPromotionsForPublicHold(client, {
     hora: startDateTime.hora_operativa,
     subtotal_hnl: Number(selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl ?? 0),
     servicios: selection.serviceSelection.items || [],
+    discount_lines: buildCanonicalDiscountLines(selection.serviceSelection.items || [], {
+      orden_integrante: integrante.orden_integrante || index + 1,
+    }),
     paquetes: selection.serviceSelection.id_paquete
       ? [{ id_paquete: selection.serviceSelection.id_paquete }]
       : [],
@@ -1447,6 +1468,9 @@ export default async function publicCitasRoutes(app) {
             index,
           });
           const descuentoHnl = normalizeMoney(promotionResult.descuento_hnl);
+          const discountPlan = promotionResult.aplicadas?.length
+            ? buildPromotionDiscountPlan(promotionResult.context, promotionResult.aplicadas)
+            : null;
           const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
 
           const reservation = await createBookingReservation(dbClient, {
@@ -1483,9 +1507,11 @@ export default async function publicCitasRoutes(app) {
                     promociones_aplicadas: promotionResult.aplicadas,
                     promociones_descartadas: promotionResult.descartadas,
                   },
-                  formal: false,
+                  formal: true,
+                  usageState: "reservado",
                 }
               : null,
+            discountPlan,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           const citaId = reservation.citaId;
@@ -1764,6 +1790,16 @@ export default async function publicCitasRoutes(app) {
                 updated_at = now()
             WHERE id_grupo_cita = $1::uuid
               AND estado_grupo_codigo <> 'cancelado'
+          `,
+          [groupId]
+        );
+        await dbClient.query(
+          `
+            UPDATE public.promociones_usos
+            SET estado_uso_codigo = 'cancelado',
+                updated_at = now()
+            WHERE id_grupo_cita = $1::uuid
+              AND estado_uso_codigo = 'reservado'
           `,
           [groupId]
         );

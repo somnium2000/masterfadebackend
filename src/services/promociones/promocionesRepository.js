@@ -206,11 +206,13 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
   const idPersona = context.id_persona ? String(context.id_persona).trim() : null;
   const idPromocionSucursal = context.id_promocion_sucursal ? String(context.id_promocion_sucursal).trim() : null;
   const idBarbero = context.id_empleado_barbero ? String(context.id_empleado_barbero).trim() : null;
+  const idGrupoCita = context.id_grupo_cita ? String(context.id_grupo_cita).trim() : null;
 
   const result = await db.query(
     `
       SELECT
         pu.id_promocion_regla,
+        pu.id_grupo_cita,
         pu.id_cliente,
         pu.id_persona,
         pu.id_promocion_sucursal,
@@ -236,7 +238,9 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
 
   for (const row of result.rows || []) {
     const ruleId = row.id_promocion_regla;
-    byRule.set(ruleId, (byRule.get(ruleId) || 0) + 1);
+    if (idGrupoCita && String(row.id_grupo_cita || "") === idGrupoCita) {
+      byRule.set(ruleId, (byRule.get(ruleId) || 0) + 1);
+    }
 
     if (idCliente && String(row.id_cliente || "") === idCliente) {
       const key = `${ruleId}:${idCliente}`;
@@ -376,6 +380,46 @@ export async function insertPromotionUsage(db, data = {}) {
     throw new AppError(409, "Datos incompletos para registrar uso de promocion", {
       code: "PROMOTIONS_USAGE_DATA_REQUIRED",
     });
+  }
+
+  const lockKey = [
+    data.id_promocion_regla,
+    data.id_promocion_sucursal || "sin_sucursal",
+    data.id_cita || data.id_grupo_cita,
+    String(data.fecha_operativa || new Date().toISOString().slice(0, 10)).slice(0, 10),
+  ].join("|");
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [lockKey]);
+  await db.query(
+    `
+      SELECT id_cita_promocion
+      FROM public.citas_promociones
+      WHERE id_cita_promocion = $1::uuid
+      FOR UPDATE
+    `,
+    [data.id_cita_promocion]
+  );
+  const existing = await db.query(
+    `
+      SELECT id_promocion_uso
+      FROM public.promociones_usos
+      WHERE id_cita_promocion = $1::uuid
+        AND id_promocion_regla = $2::uuid
+        AND id_grupo_cita = $3::uuid
+        AND id_cita IS NOT DISTINCT FROM $4::uuid
+        AND estado_uso_codigo IN ('reservado', 'consumido')
+      ORDER BY created_at ASC
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [
+      data.id_cita_promocion,
+      data.id_promocion_regla,
+      data.id_grupo_cita,
+      data.id_cita || null,
+    ]
+  );
+  if (existing.rows[0]?.id_promocion_uso) {
+    return existing.rows[0].id_promocion_uso;
   }
 
   const result = await db.query(

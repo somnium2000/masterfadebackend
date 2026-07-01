@@ -18,7 +18,18 @@ import {
   calculateReservationTiming,
   createBookingReservation,
 } from "../src/services/bookingReservationService.js";
-import { buildPaymentDetailRows } from "../src/routes/v1/public/pagos.js";
+import {
+  buildCanonicalDiscountLines,
+  allocateDiscountAcrossLines,
+} from "../src/services/bookingDiscounts.js";
+import {
+  buildPromotionResult,
+  evaluatePromotions,
+} from "../src/services/promociones/promocionesEngine.js";
+import {
+  applyPersistedPromotionDiscounts,
+  buildPaymentDetailRows,
+} from "../src/routes/v1/public/pagos.js";
 
 const BRANCH_A = "11111111-1111-4111-8111-111111111111";
 const BRANCH_B = "22222222-2222-4222-8222-222222222222";
@@ -306,6 +317,82 @@ test("detalles consolidados persisten cantidad, descuento y total_linea completo
   assert.equal(rows[0].subtotal_hnl, 200);
   assert.equal(rows.reduce((sum, row) => sum + row.descuento_hnl, 0), 25);
   assert.equal(rows.reduce((sum, row) => sum + row.total_linea_hnl, 0), 225);
+});
+
+test("detalles no colapsan dos tarifas del mismo servicio", () => {
+  const rows = buildAppointmentDetailRows([
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, nombre_servicio: "Corte corto", duracion_min: 30, buffer_min: 5, precio_hnl: 100 },
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_B, nombre_servicio: "Corte largo", duracion_min: 45, buffer_min: 5, precio_hnl: 150 },
+  ]);
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].id_tarifa, TARIFF_A);
+  assert.equal(rows[1].id_tarifa, TARIFF_B);
+  assert.notEqual(rows[0].line_key, rows[1].line_key);
+});
+
+test("promocion de servicio calcula porcentaje solo sobre lineas elegibles", () => {
+  const discountLines = buildCanonicalDiscountLines([
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, precio_hnl: 100, cantidad: 1 },
+    { id_servicio: SERVICE_B, id_tarifa: TARIFF_B, precio_hnl: 400, cantidad: 1 },
+  ]);
+  const [evaluated] = evaluatePromotions({
+    id_grupo_cita: GROUP_A,
+    subtotal_hnl: 500,
+    servicios: [
+      { id_servicio: SERVICE_A, cantidad: 1, precio_unitario_hnl: 100, subtotal_hnl: 100 },
+      { id_servicio: SERVICE_B, cantidad: 1, precio_unitario_hnl: 400, subtotal_hnl: 400 },
+    ],
+    discount_lines: discountLines,
+    fecha_operativa: "2026-07-15",
+  }, [{
+    id_promocion: PROMO_A,
+    id_promocion_regla: PROMO_RULE_A,
+    estado_promocion: "publicada",
+    regla_activa: true,
+    aplica_a_codigo: "servicio",
+    tipo_descuento_codigo: "porcentaje",
+    valor_descuento: 10,
+    prioridad_aplicacion: 10,
+    es_acumulable: true,
+    items: [{ id_servicio: SERVICE_A }],
+  }]);
+
+  assert.equal(evaluated.base_calculo_hnl, 100);
+  assert.equal(evaluated.descuento_calculado_hnl, 10);
+  assert.deepEqual(evaluated.line_allocations, [{
+    line_key: discountLines[0].line_key,
+    descuento_hnl: 10,
+  }]);
+  const result = buildPromotionResult({ subtotal_hnl: 500 }, { applied: [evaluated], discarded: [] });
+  assert.equal(result.descuento_total_hnl, 10);
+});
+
+test("distribucion por lineas usa centavos exactos y no acepta remanentes", () => {
+  const lines = buildCanonicalDiscountLines([
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, precio_hnl: 33.33, cantidad: 1 },
+    { id_servicio: SERVICE_B, id_tarifa: TARIFF_B, precio_hnl: 66.67, cantidad: 1 },
+  ]);
+  const allocations = allocateDiscountAcrossLines(lines, 10);
+
+  assert.equal(Number(allocations.reduce((sum, row) => sum + row.descuento_hnl, 0).toFixed(2)), 10);
+  assert.deepEqual(allocations.map((row) => row.line_key), lines.map((line) => line.line_key));
+});
+
+test("pago preserva descuentos no promocionales al revalidar promocion persistida", () => {
+  const [source] = buildAppointmentDetailRows([
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, nombre_servicio: "Corte", duracion_min: 30, buffer_min: 5, precio_hnl: 100 },
+  ], { descuentoTotalHnl: 30 });
+  const [withPromotions] = applyPersistedPromotionDiscounts([
+    { ...source, id_cita_detalle: DETAIL_A, descuento_hnl: 30 },
+  ], [{
+    id_cita_promocion: PROMO_APP_A,
+    id_cita_detalle: DETAIL_A,
+    descuento_calculado_hnl: 10,
+  }]);
+
+  assert.equal(withPromotions.descuento_no_promocional_hnl, 20);
+  assert.equal(withPromotions.descuento_hnl, 30);
 });
 
 test("fecha-hora UTC se normaliza a fecha y hora operativa de Honduras", () => {
