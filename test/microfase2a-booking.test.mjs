@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assertBookingSelectionRuntimeSupported,
+  countDateKeyRangeDays,
   getServiceSelectionDetails,
+  mapDayAvailabilityForResponse,
   normalizeOperationalDateTime,
   OCCUPIED_APPOINTMENT_STATES,
 } from "../src/services/agendaService.js";
@@ -97,6 +100,46 @@ test("tarifa futura usa la fecha operativa de la cita y no CURRENT_DATE", async 
   assert.ok(!String(tariffCall.sql).includes("CURRENT_DATE"));
 });
 
+test("seleccion de servicios suma total pagable con ISV adicional", async () => {
+  const client = createTariffClient([{
+    id_servicio: SERVICE_A,
+    id_tarifa: TARIFF_A,
+    nombre_servicio: "Corte con ISV",
+    duracion_min: 30,
+    buffer_min: 5,
+    precio_hnl: "100.00",
+    incluye_isv: false,
+    isv_porcentaje: "15.00",
+  }]);
+
+  const selection = await getServiceSelectionDetails(client, BRANCH_A, [SERVICE_A], null, "2026-07-15T09:00:00-06:00");
+
+  assert.equal(selection.monto_subtotal_hnl, 100);
+  assert.equal(selection.monto_isv_hnl, 15);
+  assert.equal(selection.monto_total_hnl, 115);
+  assert.equal(selection.items[0].total_linea_hnl, 115);
+});
+
+test("seleccion de servicios mantiene ISV incluido como informativo sin duplicar total", async () => {
+  const client = createTariffClient([{
+    id_servicio: SERVICE_A,
+    id_tarifa: TARIFF_A,
+    nombre_servicio: "Corte con ISV incluido",
+    duracion_min: 30,
+    buffer_min: 5,
+    precio_hnl: "100.00",
+    incluye_isv: true,
+    isv_porcentaje: "15.00",
+  }]);
+
+  const selection = await getServiceSelectionDetails(client, BRANCH_A, [SERVICE_A], null, "2026-07-15T09:00:00-06:00");
+
+  assert.equal(selection.monto_subtotal_hnl, 100);
+  assert.equal(selection.monto_isv_hnl, 13.04);
+  assert.equal(selection.monto_total_hnl, 100);
+  assert.equal(selection.items[0].incluye_isv_snapshot, true);
+});
+
 test("tarifa especifica por barbero tiene precedencia sobre tarifa base", async () => {
   const client = createTariffClient([{
     id_servicio: SERVICE_A,
@@ -183,6 +226,7 @@ test("fecha-hora UTC se normaliza a fecha y hora operativa de Honduras", () => {
   assert.equal(normalized.fecha_operativa, "2026-07-15");
   assert.equal(normalized.hora_operativa, "09:00");
   assert.equal(normalized.utcDate.toISOString(), "2026-07-15T15:00:00.000Z");
+  assert.equal(normalized.iso_utc, "2026-07-15T15:00:00.000Z");
 });
 
 test("fecha-hora sin timezone se rechaza para no depender del servidor", () => {
@@ -194,15 +238,41 @@ test("fecha-hora sin timezone se rechaza para no depender del servidor", () => {
 
 test("creacion package y mixed queda bloqueada hasta Microfase 2B", () => {
   assert.equal(assertBookingSelectionCreationSupported("services"), "services");
+  assert.equal(assertBookingSelectionRuntimeSupported("services"), "services");
   for (const selectionType of ["package", "mixed"]) {
     assert.throws(
       () => assertBookingSelectionCreationSupported(selectionType),
       (error) => error?.statusCode === 409 && error?.code === "BOOKING_PACKAGE_FLOW_PENDING_2B"
     );
+    assert.throws(
+      () => assertBookingSelectionRuntimeSupported(selectionType),
+      (error) => error?.statusCode === 409 && error?.code === "BOOKING_PACKAGE_FLOW_PENDING_2B"
+    );
   }
 });
 
-test("detalles persisten porcentaje ISV y calculan ISV solo cuando no esta incluido", () => {
+test("conteo de rango usa fechas puras e incluye ambos extremos", () => {
+  assert.equal(countDateKeyRangeDays("2026-01-31", "2026-02-02"), 3);
+  assert.throws(
+    () => countDateKeyRangeDays("2026-02-02", "2026-01-31"),
+    (error) => error?.code === "AGENDA_DATE_RANGE_INVALID"
+  );
+});
+
+test("respuesta de disponibilidad conserva tiempos_efectivos null en dia sin tarifa", () => {
+  const [mapped] = mapDayAvailabilityForResponse([{
+    fecha: "2026-07-15",
+    disponible: false,
+    barberos_disponibles: 0,
+    primer_horario_disponible: null,
+    barbero_autoasignado: null,
+    effective_selection: null,
+  }]);
+
+  assert.equal(mapped.tiempos_efectivos, null);
+});
+
+test("detalles persisten porcentaje ISV y calculan ISV incluido como informativo", () => {
   const [taxed] = buildAppointmentDetailRows([
     {
       id_servicio: SERVICE_A,
@@ -231,8 +301,10 @@ test("detalles persisten porcentaje ISV y calculan ISV solo cuando no esta inclu
   assert.equal(taxed.isv_porcentaje, 15);
   assert.equal(taxed.isv_hnl, 15);
   assert.equal(taxed.total_linea_hnl, 115);
+  assert.equal(taxed.incluye_isv_snapshot, false);
   assert.equal(included.isv_porcentaje, 15);
-  assert.equal(included.isv_hnl, 0);
+  assert.equal(included.incluye_isv_snapshot, true);
+  assert.equal(included.isv_hnl, 13.04);
   assert.equal(included.total_linea_hnl, 100);
 });
 
@@ -294,4 +366,53 @@ test("createBookingReservation centraliza cita, detalles y hold con el resultado
   assert.match(calls[1].sql, /INSERT INTO public\.citas_detalles/);
   assert.match(calls[2].sql, /INSERT INTO public\.citas_holds/);
   assert.equal(calls[1].params[0], CITA_A);
+});
+
+test("createBookingReservation usa SUM(total_linea_hnl) para total de cita y persiste snapshot ISV", async () => {
+  const calls = [];
+  const client = {
+    async query(sql, params = []) {
+      calls.push({ sql, params });
+      if (String(sql).includes("INSERT INTO public.citas ")) {
+        return { rows: [{ id_cita: CITA_A }] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  const result = await createBookingReservation(client, {
+    appointment: {
+      branchId: BRANCH_A,
+      barberId: BARBER_A,
+      personId: "88888888-8888-4888-8888-888888888888",
+      autoAssigned: false,
+      selection: {
+        startDateTime: new Date("2026-07-15T15:00:00.000Z"),
+        serviceSelection: {
+          selection_type: "services",
+          duracion_total_min: 30,
+          buffer_total_min: 5,
+          items: [{
+            id_servicio: SERVICE_A,
+            id_tarifa: TARIFF_A,
+            nombre_servicio: "Corte",
+            duracion_min: 30,
+            buffer_min: 5,
+            precio_hnl: 100,
+            incluye_isv_snapshot: false,
+            isv_porcentaje: 15,
+          }],
+        },
+      },
+    },
+  });
+
+  assert.equal(result.totals.subtotalHnl, 100);
+  assert.equal(result.totals.isvHnl, 15);
+  assert.equal(result.totals.totalHnl, 115);
+  assert.equal(calls[0].params[14], 100);
+  assert.equal(calls[0].params[16], 115);
+  assert.equal(calls[1].params[11], false);
+  assert.equal(calls[1].params[13], 15);
+  assert.equal(calls[1].params[14], 115);
 });

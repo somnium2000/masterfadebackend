@@ -1,0 +1,49 @@
+name: Microfase 2A2 Postgres
+
+on:
+  push:
+    branches:
+      - codex/microfase-2a2-backend-hardening
+  workflow_dispatch:
+
+jobs:
+  postgres-17:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: masterfade_microfase_2a2
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d masterfade_microfase_2a2"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: masterfade_microfase_2a2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      - name: Load pre-2A2 schema and fixtures
+        run: |
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_fixture.sql
+      - name: Apply migration
+        run: psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
+      - name: Validate objects, backfill and triggers
+        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
+      - name: Apply migration again
+        run: psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
+      - name: Validate idempotency
+        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql

@@ -16,8 +16,16 @@ function normalizePercentage(value) {
 function calculateLineIsv({ subtotalHnl, descuentoHnl, isvPorcentaje, incluyeIsv }) {
   const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
   const percentage = normalizePercentage(isvPorcentaje);
-  if (percentage <= 0 || incluyeIsv) return 0;
+  if (percentage <= 0) return 0;
+  if (incluyeIsv) {
+    return normalizeMoney(taxableBase - (taxableBase / (1 + (percentage / 100))));
+  }
   return normalizeMoney((taxableBase * percentage) / 100);
+}
+
+function calculateLineTotal({ subtotalHnl, descuentoHnl, isvHnl, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  return normalizeMoney(Math.max(0, taxableBase + (incluyeIsv ? 0 : Number(isvHnl || 0))));
 }
 
 export function calculateReservationTiming(selection) {
@@ -70,7 +78,7 @@ export function buildAppointmentDetailRows(serviceItems = [], {
         nombre_servicio_snapshot: String(item?.nombre_servicio || "Servicio").trim() || "Servicio",
         precio_referencia_hnl: normalizeMoney(item?.precio_hnl),
         precio_unitario_hnl: normalizeMoney(item?.precio_hnl),
-        incluye_isv: item?.incluye_isv === true,
+        incluye_isv_snapshot: item?.incluye_isv_snapshot === true || item?.incluye_isv === true,
         isv_porcentaje: normalizePercentage(item?.isv_porcentaje),
         subtotal_hnl: 0,
         descuento_hnl: 0,
@@ -97,12 +105,27 @@ export function buildAppointmentDetailRows(serviceItems = [], {
       subtotalHnl: row.subtotal_hnl,
       descuentoHnl: row.descuento_hnl,
       isvPorcentaje: row.isv_porcentaje,
-      incluyeIsv: row.incluye_isv,
+      incluyeIsv: row.incluye_isv_snapshot,
     });
-    row.total_linea_hnl = normalizeMoney(Math.max(0, row.subtotal_hnl - row.descuento_hnl + row.isv_hnl));
+    row.total_linea_hnl = calculateLineTotal({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvHnl: row.isv_hnl,
+      incluyeIsv: row.incluye_isv_snapshot,
+    });
   });
 
   return rows;
+}
+
+export function summarizeAppointmentDetailRows(rows = []) {
+  const source = Array.isArray(rows) ? rows : [];
+  return {
+    subtotalHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0)),
+    descuentoHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.descuento_hnl || 0), 0)),
+    isvHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.isv_hnl || 0), 0)),
+    totalHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0)),
+  };
 }
 
 export async function createBookingGroup(client, {
@@ -238,8 +261,10 @@ export async function createAppointmentCore(client, {
   return { id_cita: result.rows[0].id_cita, timing };
 }
 
-export async function insertAppointmentDetails(client, { citaId, serviceItems, descuentoTotalHnl = 0 }) {
-  const rows = buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl });
+export async function insertAppointmentDetails(client, { citaId, serviceItems, descuentoTotalHnl = 0, detailRows = null }) {
+  const rows = Array.isArray(detailRows)
+    ? detailRows
+    : buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl });
   for (const row of rows) {
     await client.query(
       `
@@ -255,6 +280,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
           precio_unitario_hnl,
           subtotal_hnl,
           descuento_hnl,
+          incluye_isv_snapshot,
           isv_porcentaje,
           isv_hnl,
           total_linea_hnl,
@@ -263,7 +289,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
         VALUES (
           $1::uuid, $2::uuid, $3::uuid, $4::int, $5::int, $6::int, $7::text,
           $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,
-          $13::numeric, $14::numeric, $15::text
+          $13::numeric, $14::numeric, $15::numeric, $16::text
         )
       `,
       [
@@ -278,6 +304,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
         row.precio_unitario_hnl,
         row.subtotal_hnl,
         row.descuento_hnl,
+        row.incluye_isv_snapshot,
         row.isv_porcentaje,
         row.isv_hnl,
         row.total_linea_hnl,
@@ -321,13 +348,23 @@ export async function createBookingReservation(client, {
     throw new TypeError("appointment.selection es obligatorio");
   }
 
-  const createdAppointment = await createAppointmentCore(client, appointment);
-  const citaId = createdAppointment.id_cita;
   const serviceItems = appointment.selection?.serviceSelection?.items || [];
+  const preparedDetailRows = buildAppointmentDetailRows(serviceItems, {
+    descuentoTotalHnl: appointment.descuentoHnl || 0,
+  });
+  const detailTotals = summarizeAppointmentDetailRows(preparedDetailRows);
+  const createdAppointment = await createAppointmentCore(client, {
+    ...appointment,
+    subtotalHnl: detailTotals.subtotalHnl,
+    descuentoHnl: detailTotals.descuentoHnl,
+    totalHnl: detailTotals.totalHnl,
+  });
+  const citaId = createdAppointment.id_cita;
   const detailRows = await insertAppointmentDetails(client, {
     citaId,
     serviceItems,
     descuentoTotalHnl: appointment.descuentoHnl || 0,
+    detailRows: preparedDetailRows,
   });
   const holdRecord = hold
     ? await createAppointmentHold(client, {
@@ -347,6 +384,7 @@ export async function createBookingReservation(client, {
     appointment: createdAppointment,
     citaId,
     detailRows,
+    totals: detailTotals,
     hold: holdRecord,
   };
 }

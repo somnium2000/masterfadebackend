@@ -8,6 +8,7 @@ import {
   markPromotionUsagesForGroup,
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
+import { normalizeOperationalDateTime } from "../../../services/agendaService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
@@ -556,15 +557,16 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
     let totalCita = subtotalCita;
 
     try {
+      const operationalDateTime = normalizeOperationalDateTime(new Date(cita.inicio_at), "inicio_at");
       const preview = await previewPromotionsForAppointment(client, {
         id_sucursal: cita.id_sucursal,
         id_empleado_barbero: cita.id_empleado_barbero,
         id_grupo_cita: cita.id_grupo_cita,
         id_cita: cita.id_cita,
-        fecha_hora: cita.inicio_at,
-        fecha: new Date(cita.inicio_at).toISOString().slice(0, 10),
-        fecha_operativa: new Date(cita.inicio_at).toISOString().slice(0, 10),
-        hora: new Date(cita.inicio_at).toISOString().slice(11, 16),
+        fecha_hora: operationalDateTime.iso_utc,
+        fecha: operationalDateTime.fecha_operativa,
+        fecha_operativa: operationalDateTime.fecha_operativa,
+        hora: operationalDateTime.hora_operativa,
         subtotal_hnl: subtotalCita,
         servicios: (detallesResult.rows || []).map((row) => ({
           id_servicio: row.id_servicio,

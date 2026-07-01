@@ -8,7 +8,7 @@ import {
   getHoldDurationMinutes,
   getSystemParameters,
   parseSinglePackageId,
-  parseDateTime,
+  normalizeOperationalDateTime,
   resolveBookingSelection,
 } from "../../../services/agendaService.js";
 import {
@@ -462,11 +462,12 @@ async function collectExistingActiveEmailConflicts(client, contactos = []) {
 }
 
 function parseIsoDateAndTime(rawDateTime) {
-  const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
-  if (!match) {
+  try {
+    const normalized = normalizeOperationalDateTime(rawDateTime, "fecha_inicio");
+    return { fecha: normalized.fecha_operativa, hora: normalized.hora_operativa };
+  } catch {
     return { fecha: null, hora: null };
   }
-  return { fecha: match[1], hora: match[2] };
 }
 
 function getDateTimePartsInTimeZone(dateValue, timeZone = HONDURAS_TIME_ZONE) {
@@ -528,7 +529,16 @@ function compareDateTimeParts(left, right) {
 }
 
 function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
-  const parsed = parseDateTime(rawDateTime, field);
+  let normalized;
+  try {
+    normalized = normalizeOperationalDateTime(rawDateTime, field);
+  } catch (error) {
+    throw new AppError(400, `${field} no es valida`, {
+      code: error?.code || "PUBLIC_CITAS_INVALID_DATETIME",
+      details: { field, value: rawDateTime, time_zone: HONDURAS_TIME_ZONE },
+    });
+  }
+  const parsed = normalized.utcDate;
   const requestParts = getDateTimePartsInTimeZone(parsed, HONDURAS_TIME_ZONE);
   const nowParts = getDateTimePartsInTimeZone(new Date(), HONDURAS_TIME_ZONE);
 
@@ -834,17 +844,17 @@ async function resolveRequestedPromotionsForPublicHold(client, {
   }
 
   const requestedKeys = new Set(requestedPromotions.map(buildPromotionRequestKey));
-  const startIso = selection.startDateTime.toISOString();
+  const startDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
   const promoContext = {
     id_sucursal: branch.id_sucursal,
     id_empleado_barbero: selection.barber.id_empleado,
     id_cliente: clientProfile.id_cliente,
     id_persona: clientProfile.id_persona,
     id_grupo_cita: groupRecord.id_grupo_cita,
-    fecha_hora: startIso,
-    fecha: startIso.slice(0, 10),
-    fecha_operativa: startIso.slice(0, 10),
-    hora: startIso.slice(11, 16),
+    fecha_hora: startDateTime.iso_utc,
+    fecha: startDateTime.fecha_operativa,
+    fecha_operativa: startDateTime.fecha_operativa,
+    hora: startDateTime.hora_operativa,
     subtotal_hnl: selection.serviceSelection.monto_total_hnl,
     servicios: selection.serviceSelection.items || [],
     paquetes: selection.serviceSelection.id_paquete
@@ -1464,6 +1474,11 @@ export default async function publicCitasRoutes(app) {
             },
           });
           const citaId = reservation.citaId;
+          const persistedTotals = reservation.totals || {
+            subtotalHnl: subtotalServiciosHnl,
+            descuentoHnl,
+            totalHnl: totalPagarHnl,
+          };
           for (const appliedPromotion of promotionResult.aplicadas || []) {
             promocionesAplicadasGrupo.push({
               ...appliedPromotion,
@@ -1478,10 +1493,10 @@ export default async function publicCitasRoutes(app) {
               alias: integrante.alias,
             });
           }
-          subtotalGrupo += subtotalServiciosHnl;
-          descuentoGrupo += descuentoHnl;
-          totalGrupo += totalPagarHnl;
-          const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
+          subtotalGrupo += Number(persistedTotals.subtotalHnl || 0);
+          descuentoGrupo += Number(persistedTotals.descuentoHnl || 0);
+          totalGrupo += Number(persistedTotals.totalHnl || 0);
+          const { fecha, hora } = parseIsoDateAndTime(selection.startDateTime);
 
           bloquesResponse.push({
             id_cita: citaId,
@@ -1493,9 +1508,9 @@ export default async function publicCitasRoutes(app) {
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
             estado_cita_codigo: targetAppointmentState,
-            monto_total_hnl: subtotalServiciosHnl,
-            descuento_hnl: descuentoHnl,
-            total_pagar_hnl: totalPagarHnl,
+            monto_total_hnl: Number(persistedTotals.subtotalHnl || 0),
+            descuento_hnl: Number(persistedTotals.descuentoHnl || 0),
+            total_pagar_hnl: Number(persistedTotals.totalHnl || 0),
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
           });

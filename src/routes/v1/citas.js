@@ -9,6 +9,7 @@ import {
   getSystemParameters,
   parseSinglePackageId,
   parseDateOnly,
+  normalizeOperationalDateTime,
   resolveBookingSelection,
 } from "../../services/agendaService.js";
 import { confirmAppointmentsWithoutPayment, confirmAppointmentWithoutPayment } from "../../services/appointmentConfirmationService.js";
@@ -543,12 +544,13 @@ async function sendNoPaymentConfirmationEmails(app, logger, {
   return { emailEnviado: false, emailOmitido: "envio_fallido" };
 }
 
-async function getServicesWithActiveTariffByBranch(client, { idSucursal, serviceIds = [] }) {
+async function getServicesWithActiveTariffByBranch(client, { idSucursal, serviceIds = [], fechaOperativa = null }) {
   const safeBranchId = String(idSucursal || "").trim();
   const normalizedServiceIds = (Array.isArray(serviceIds) ? serviceIds : [])
     .map((serviceId) => String(serviceId || "").trim())
     .filter(Boolean);
   if (!safeBranchId || normalizedServiceIds.length === 0) return [];
+  const safeFechaOperativa = fechaOperativa ? parseDateOnly(fechaOperativa, "fecha_operativa") : null;
 
   const { rows } = await client.query(
     `
@@ -567,14 +569,14 @@ async function getServicesWithActiveTariffByBranch(client, { idSucursal, service
           AND st.id_servicio = ANY($2::uuid[])
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
-          AND st.vigente_desde <= NOW()
-          AND (st.vigente_hasta IS NULL OR st.vigente_hasta > NOW())
+          AND st.vigente_desde <= COALESCE($3::date, (now() AT TIME ZONE 'America/Tegucigalpa')::date)
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= COALESCE($3::date, (now() AT TIME ZONE 'America/Tegucigalpa')::date))
       )
       SELECT id_servicio
       FROM ranked_tariffs
       WHERE row_num = 1
     `,
-    [safeBranchId, normalizedServiceIds]
+    [safeBranchId, normalizedServiceIds, safeFechaOperativa]
   );
 
   return rows
@@ -587,9 +589,12 @@ function isConflictError(error) {
 }
 
 function parseIsoDateAndTime(rawDateTime) {
-  const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
-  if (!match) return { fecha: null, hora: null };
-  return { fecha: match[1], hora: match[2] };
+  try {
+    const normalized = normalizeOperationalDateTime(rawDateTime, "fecha_inicio");
+    return { fecha: normalized.fecha_operativa, hora: normalized.hora_operativa };
+  } catch {
+    return { fecha: null, hora: null };
+  }
 }
 
 function normalizePersonName(rawValue) {
@@ -1100,14 +1105,17 @@ function compareDateTimeParts(left, right) {
 }
 
 function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
-  const parsed = new Date(String(rawDateTime || "").trim());
-  if (Number.isNaN(parsed.getTime())) {
+  let normalized;
+  try {
+    normalized = normalizeOperationalDateTime(rawDateTime, field);
+  } catch (error) {
     throw new AppError(400, `${field} no es valida`, {
-      code: "CITAS_HOLD_INVALID_DATETIME",
-      details: { field, value: rawDateTime },
+      code: error?.code || "CITAS_HOLD_INVALID_DATETIME",
+      details: { field, value: rawDateTime, time_zone: HONDURAS_TIME_ZONE },
     });
   }
 
+  const parsed = normalized.utcDate;
   const requestParts = getDateTimePartsInTimeZone(parsed, HONDURAS_TIME_ZONE);
   const nowParts = getDateTimePartsInTimeZone(new Date(), HONDURAS_TIME_ZONE);
   if (!requestParts || !nowParts) return parsed;
@@ -1424,6 +1432,11 @@ export default async function citasRoutes(app) {
           },
         });
         const citaId = reservation.citaId;
+        const persistedTotals = reservation.totals || {
+          subtotalHnl: Number(selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl ?? 0),
+          descuentoHnl: 0,
+          totalHnl: Number(selection.serviceSelection.monto_total_hnl || 0),
+        };
 
         if (simulationNoPayment) {
           await confirmAppointmentWithoutPayment(dbClient, {
@@ -1445,7 +1458,7 @@ export default async function citasRoutes(app) {
             expires_at: simulationNoPayment ? null : new Date(reservation.hold.expires_at).toISOString(),
             duracion_total_min: selection.serviceSelection.duracion_total_min,
             buffer_total_min: selection.serviceSelection.buffer_total_min,
-            monto_total_hnl: selection.serviceSelection.monto_total_hnl,
+            monto_total_hnl: persistedTotals.totalHnl,
           },
           { statusCode: 201 }
         );
@@ -1600,6 +1613,7 @@ export default async function citasRoutes(app) {
           : null;
         const branch = await ensureActiveBranch(dbClient, idSucursal);
         const integrantes = normalizeHoldBlocksPayload(request.body);
+        const titularOperationalDateTime = normalizeOperationalDateTime(integrantes[0]?.fecha_inicio, "fecha_inicio");
 
         await dbClient.query("BEGIN");
         txStarted = true;
@@ -1671,6 +1685,7 @@ export default async function citasRoutes(app) {
           const servicesWithActiveTariff = await getServicesWithActiveTariffByBranch(dbClient, {
             idSucursal: branch.id_sucursal,
             serviceIds: coverageTracker.requiredServiceIds,
+            fechaOperativa: titularOperationalDateTime.fecha_operativa,
           });
           filterCoverageTrackerByTariffServices(coverageTracker, servicesWithActiveTariff);
         }
@@ -1813,16 +1828,17 @@ export default async function citasRoutes(app) {
           let promocionesPreview = null;
 
           try {
+            const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
             const promoContext = {
               id_sucursal: branch.id_sucursal,
               id_empleado_barbero: selection.barber.id_empleado,
               id_cliente: clienteId,
               id_persona: personaId,
               id_grupo_cita: groupRecord.id_grupo_cita,
-              fecha_hora: selection.startDateTime.toISOString(),
-              fecha: selection.startDateTime.toISOString().slice(0, 10),
-              fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
-              hora: selection.startDateTime.toISOString().slice(11, 16),
+              fecha_hora: promoDateTime.iso_utc,
+              fecha: promoDateTime.fecha_operativa,
+              fecha_operativa: promoDateTime.fecha_operativa,
+              hora: promoDateTime.hora_operativa,
               subtotal_hnl: totalPagar,
               servicios: selection.serviceSelection.items || [],
               paquetes: selection.serviceSelection.id_paquete
@@ -1899,9 +1915,15 @@ export default async function citasRoutes(app) {
             },
           });
           const citaId = reservation.citaId;
+          const persistedTotals = reservation.totals || {
+            subtotalHnl: subtotalServicios,
+            descuentoHnl: descuentoTotal,
+            totalHnl: totalPagar,
+          };
           if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
             const promoSavepoint = `sp_promo_hold_${integrante.orden_integrante}`;
             try {
+              const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
               await dbClient.query(`SAVEPOINT ${promoSavepoint}`);
               await recordPromotionApplications(
                 dbClient,
@@ -1911,7 +1933,7 @@ export default async function citasRoutes(app) {
                   id_cliente: clienteId,
                   id_persona: personaId,
                   id_sucursal: branch.id_sucursal,
-                  fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
+                  fecha_operativa: promoDateTime.fecha_operativa,
                   subtotal_hnl: Number(coverage.extraTotalHnl || 0),
                 },
                 promocionesPreview,
@@ -1943,17 +1965,17 @@ export default async function citasRoutes(app) {
             rewardCoveredTotalHnl += rewardCoveredInBlock;
           }
 
-          const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
+          const { fecha, hora } = parseIsoDateAndTime(selection.startDateTime);
           const coveredCount = coverage.items.filter((entry) =>
             entry.coverage_status === "cubierto_plan" || entry.coverage_status === "cubierto_recompensa"
           ).length;
           const extraCount = coverage.items.filter((entry) => entry.coverage_status === "extra_pendiente").length;
           coveredItemsCount += coveredCount;
           extraItemsCount += extraCount;
-          subtotalGrupo += subtotalServicios;
-          descuentoGrupo += descuentoTotal;
-          totalGrupo += totalPagar;
-          extrasPendientesGrupo += totalPagar;
+          subtotalGrupo += Number(persistedTotals.subtotalHnl || 0);
+          descuentoGrupo += Number(persistedTotals.descuentoHnl || 0);
+          totalGrupo += Number(persistedTotals.totalHnl || 0);
+          extrasPendientesGrupo += Number(persistedTotals.totalHnl || 0);
 
           bloquesResponse.push({
             id_cita: citaId,
@@ -1965,9 +1987,9 @@ export default async function citasRoutes(app) {
             hora: hora || "",
             fecha_inicio: selection.startDateTime.toISOString(),
             estado_cita_codigo: "en_espera",
-            monto_total_hnl: subtotalServicios,
-            descuento_hnl: descuentoTotal,
-            total_pagar_hnl: totalPagar,
+            monto_total_hnl: Number(persistedTotals.subtotalHnl || 0),
+            descuento_hnl: Number(persistedTotals.descuentoHnl || 0),
+            total_pagar_hnl: Number(persistedTotals.totalHnl || 0),
             duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
             cobertura: {
