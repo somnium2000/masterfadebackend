@@ -29,6 +29,37 @@ BEGIN
     RAISE EXCEPTION 'detail normalize trigger missing';
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'tr_recalc_cita_paquetes'
+      AND tgrelid = 'public.citas_paquetes'::regclass
+      AND NOT tgisinternal
+  ) THEN
+    RAISE EXCEPTION 'package recalc trigger missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'citas_detalles'
+      AND indexname = 'idx_citas_detalles_origen_item'
+  ) THEN
+    RAISE EXCEPTION 'origen item index missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'fn_citas_detalles_normalizar'
+      AND pg_get_functiondef(p.oid) LIKE '%MF2A3_CITA_DETALLE_SNAPSHOT_FISCAL_INMUTABLE%'
+  ) THEN
+    RAISE EXCEPTION 'MF2A3 fiscal snapshot guard missing';
+  END IF;
+
   IF (
     SELECT precio_referencia_hnl
     FROM public.citas_detalles
@@ -134,11 +165,18 @@ VALUES (
   300,
   300,
   0,
-  true,
+  false,
   15,
   'Corte fixture'
 )
 ON CONFLICT (id_cita_detalle) DO NOTHING;
+
+UPDATE public.citas_detalles
+SET descuento_hnl = 0
+WHERE id_cita_detalle IN (
+  'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+  'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+);
 
 DO $$
 DECLARE
@@ -166,8 +204,8 @@ BEGIN
   FROM public.citas_detalles
   WHERE id_cita_detalle = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 
-  IF v_taxed_detail.incluye_isv_snapshot IS DISTINCT FROM true THEN
-    RAISE EXCEPTION 'incluye_isv_snapshot true trigger mismatch';
+  IF v_taxed_detail.incluye_isv_snapshot IS DISTINCT FROM false THEN
+    RAISE EXCEPTION 'incluye_isv_snapshot additional trigger mismatch';
   END IF;
   IF v_taxed_detail.isv_porcentaje <> 15.00 OR v_taxed_detail.isv_hnl <> 45.00 OR v_taxed_detail.total_linea_hnl <> 345.00 THEN
     RAISE EXCEPTION 'ISV enabled trigger mismatch: %, %, %', v_taxed_detail.isv_porcentaje, v_taxed_detail.isv_hnl, v_taxed_detail.total_linea_hnl;
@@ -208,4 +246,42 @@ BEGIN
   IF v_grupo.total_hnl <> v_expected_group_total OR v_grupo.estado_grupo_codigo <> 'activo' THEN
     RAISE EXCEPTION 'grupo sync mismatch: %, %', v_grupo.total_hnl, v_grupo.estado_grupo_codigo;
   END IF;
+END $$;
+
+UPDATE public.citas_detalles
+SET descuento_hnl = 50
+WHERE id_cita_detalle = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+DO $$
+DECLARE
+  v_detail record;
+BEGIN
+  SELECT incluye_isv_snapshot, isv_porcentaje, isv_hnl, total_linea_hnl
+  INTO v_detail
+  FROM public.citas_detalles
+  WHERE id_cita_detalle = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+  IF v_detail.incluye_isv_snapshot IS DISTINCT FROM false
+     OR v_detail.isv_porcentaje <> 0.00
+     OR v_detail.isv_hnl <> 0.00
+     OR v_detail.total_linea_hnl <> 250.00 THEN
+    RAISE EXCEPTION 'false/0 snapshot was reactivated after discount update: %, %, %, %',
+      v_detail.incluye_isv_snapshot,
+      v_detail.isv_porcentaje,
+      v_detail.isv_hnl,
+      v_detail.total_linea_hnl;
+  END IF;
+
+  BEGIN
+    UPDATE public.citas_detalles
+    SET isv_porcentaje = 15
+    WHERE id_cita_detalle = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+    RAISE EXCEPTION 'snapshot fiscal immutability update did not fail';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM <> 'MF2A3_CITA_DETALLE_SNAPSHOT_FISCAL_INMUTABLE' THEN
+        RAISE;
+      END IF;
+  END;
 END $$;

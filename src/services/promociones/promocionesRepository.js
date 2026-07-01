@@ -273,6 +273,39 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
 }
 
 export async function insertAppointmentPromotionApplication(db, data = {}) {
+  const params = [
+    data.id_grupo_cita,
+    data.id_cita || null,
+    data.id_cita_integrante || null,
+    data.id_cita_paquete || null,
+    data.id_cita_detalle || null,
+    data.id_promocion,
+    data.id_promocion_regla,
+    data.aplica_a_codigo,
+    data.estado_aplicacion_codigo || "no_aplicada",
+  ];
+  const existing = await db.query(
+    `
+      SELECT id_cita_promocion
+      FROM public.citas_promociones
+      WHERE id_grupo_cita = $1::uuid
+        AND id_cita IS NOT DISTINCT FROM $2::uuid
+        AND id_cita_integrante IS NOT DISTINCT FROM $3::uuid
+        AND id_cita_paquete IS NOT DISTINCT FROM $4::uuid
+        AND id_cita_detalle IS NOT DISTINCT FROM $5::uuid
+        AND id_promocion = $6::uuid
+        AND id_promocion_regla = $7::uuid
+        AND aplica_a_codigo = $8::text
+        AND estado_aplicacion_codigo = $9::text
+      ORDER BY created_at ASC
+      LIMIT 1
+    `,
+    params
+  );
+  if (existing.rows[0]?.id_cita_promocion) {
+    return existing.rows[0].id_cita_promocion;
+  }
+
   const result = await db.query(
     `
       INSERT INTO public.citas_promociones (

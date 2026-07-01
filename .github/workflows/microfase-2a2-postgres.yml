@@ -31,19 +31,34 @@ jobs:
       PGDATABASE: masterfade_microfase_2a2
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Install PostgreSQL client
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client
+      - name: Install Node dependencies
+        run: npm ci
       - name: Load pre-2A2 schema and fixtures
         run: |
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_fixture.sql
-      - name: Apply migration
-        run: psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
-      - name: Validate objects, backfill and triggers
+      - name: Apply migrations 2A2 and 2A3
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
+      - name: Validate objects, backfill, triggers and fiscal guard
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
-      - name: Apply migration again
-        run: psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
+      - name: Apply migrations again
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
       - name: Validate idempotency
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
+      - name: Run tests
+        run: npm test
+      - name: Run lint
+        run: npm run lint
+      - name: Check whitespace
+        run: git diff --check

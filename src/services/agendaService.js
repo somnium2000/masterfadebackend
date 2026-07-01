@@ -2331,6 +2331,15 @@ function allEffectiveTimesEqual(entries, field) {
   return new Set(values).size === 1;
 }
 
+function getUniformEffectiveTime(entries, field) {
+  const effectiveEntries = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.effective_selection);
+  if (!effectiveEntries.length) return null;
+  return allEffectiveTimesEqual(effectiveEntries, field)
+    ? Number(effectiveEntries[0]?.effective_selection?.[field] || 0)
+    : null;
+}
+
 export async function listAvailabilityByDateRangeForRequest(client, {
   id_sucursal,
   selection_type = "services",
@@ -2370,12 +2379,8 @@ export async function listAvailabilityByDateRangeForRequest(client, {
 
   return {
     disponibilidad: availability,
-    duracion_total_min: allEffectiveTimesEqual(availability, "duracion_total_min")
-      ? Number(availability[0]?.effective_selection?.duracion_total_min || 0)
-      : null,
-    buffer_total_min: allEffectiveTimesEqual(availability, "buffer_total_min")
-      ? Number(availability[0]?.effective_selection?.buffer_total_min || 0)
-      : null,
+    duracion_total_min: getUniformEffectiveTime(availability, "duracion_total_min"),
+    buffer_total_min: getUniformEffectiveTime(availability, "buffer_total_min"),
   };
 }
 

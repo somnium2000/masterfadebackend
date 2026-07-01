@@ -258,7 +258,7 @@ export function validatePromotionCandidate(context = {}, candidate = {}) {
   return { valid: true, reasonCode: null, reason: null };
 }
 
-export function resolvePromotionConflicts(context = {}, evaluatedPromotions = [], compatibilityMap = new Map()) {
+export function resolvePromotionConflicts(_context = {}, evaluatedPromotions = [], compatibilityMap = new Map()) {
   const applied = [];
   const discarded = [];
   const itemLocks = new Map();
@@ -331,6 +331,12 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       es_acumulable: Boolean(row.es_acumulable),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
+      target_items: Array.isArray(row.items) ? row.items.map((item) => ({
+        id_servicio: item.id_servicio || null,
+        id_paquete: item.id_paquete || null,
+        cantidad_minima: item.cantidad_minima || null,
+      })) : [],
+      target_keys: Array.isArray(row.targetKeys) ? row.targetKeys : [],
     })),
     promociones_descartadas: discarded.map((row) => ({
       id_promocion: row.id_promocion,
@@ -343,6 +349,12 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       valor_descuento: Number(row.valor_descuento || 0),
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
+      target_items: Array.isArray(row.items) ? row.items.map((item) => ({
+        id_servicio: item.id_servicio || null,
+        id_paquete: item.id_paquete || null,
+        cantidad_minima: item.cantidad_minima || null,
+      })) : [],
+      target_keys: Array.isArray(row.targetKeys) ? row.targetKeys : [],
     })),
   };
 }

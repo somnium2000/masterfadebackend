@@ -36,7 +36,6 @@ import {
 } from "../../services/bookingReservationService.js";
 import {
   previewPromotionsForAppointment,
-  recordPromotionApplications,
   markPromotionUsagesForGroup,
 } from "../../services/promociones/promocionesService.js";
 
@@ -314,30 +313,52 @@ async function getAppointmentDetails(client, citaId) {
   const { rows } = await client.query(
     `
       SELECT
+        cd.id_cita_detalle,
         cd.id_servicio,
-        s.nombre_servicio,
+        COALESCE(
+          NULLIF(cd.nombre_servicio_snapshot, ''),
+          s.nombre_servicio,
+          'Servicio no disponible'
+        ) AS nombre_servicio,
+        cd.id_tarifa,
         cd.cantidad,
         cd.duracion_min,
         cd.buffer_min,
+        cd.precio_referencia_hnl,
         cd.precio_unitario_hnl,
-        cd.subtotal_hnl
+        cd.subtotal_hnl,
+        cd.descuento_hnl,
+        cd.incluye_isv_snapshot,
+        cd.isv_porcentaje,
+        cd.isv_hnl,
+        cd.total_linea_hnl,
+        cd.origen_item_codigo
       FROM public.citas_detalles cd
-      JOIN public.servicios s
+      LEFT JOIN public.servicios s
         ON s.id_servicio = cd.id_servicio
       WHERE cd.id_cita = $1::uuid
-      ORDER BY s.nombre_servicio ASC, cd.id_cita_detalle ASC
+      ORDER BY nombre_servicio ASC, cd.id_cita_detalle ASC
     `,
     [citaId]
   );
 
   return rows.map((row) => ({
+    id_cita_detalle: row.id_cita_detalle,
     id_servicio: row.id_servicio,
     nombre_servicio: row.nombre_servicio ?? null,
+    id_tarifa: row.id_tarifa ?? null,
     cantidad: Number(row.cantidad ?? 1),
     duracion_min: Number(row.duracion_min),
     buffer_min: Number(row.buffer_min ?? 0),
+    precio_referencia_hnl: Number(row.precio_referencia_hnl ?? 0),
     precio_unitario_hnl: Number(row.precio_unitario_hnl ?? 0),
     subtotal_hnl: Number(row.subtotal_hnl ?? 0),
+    descuento_hnl: Number(row.descuento_hnl ?? 0),
+    incluye_isv_snapshot: row.incluye_isv_snapshot === true,
+    isv_porcentaje: Number(row.isv_porcentaje ?? 0),
+    isv_hnl: Number(row.isv_hnl ?? 0),
+    total_linea_hnl: Number(row.total_linea_hnl ?? row.subtotal_hnl ?? 0),
+    origen_item_codigo: row.origen_item_codigo ?? null,
   }));
 }
 
@@ -704,15 +725,28 @@ async function getServicesByAppointmentIds(client, citaIds = []) {
     `
       SELECT
         cd.id_cita,
+        cd.id_cita_detalle,
         cd.id_servicio,
-        s.nombre_servicio,
+        COALESCE(
+          NULLIF(cd.nombre_servicio_snapshot, ''),
+          s.nombre_servicio,
+          'Servicio no disponible'
+        ) AS nombre_servicio,
+        cd.id_tarifa,
         cd.cantidad,
         cd.duracion_min,
         cd.buffer_min,
+        cd.precio_referencia_hnl,
         cd.precio_unitario_hnl,
-        cd.subtotal_hnl
+        cd.subtotal_hnl,
+        cd.descuento_hnl,
+        cd.incluye_isv_snapshot,
+        cd.isv_porcentaje,
+        cd.isv_hnl,
+        cd.total_linea_hnl,
+        cd.origen_item_codigo
       FROM public.citas_detalles cd
-      JOIN public.servicios s
+      LEFT JOIN public.servicios s
         ON s.id_servicio = cd.id_servicio
       WHERE cd.id_cita = ANY($1::uuid[])
       ORDER BY cd.created_at ASC, cd.id_cita_detalle ASC
@@ -726,13 +760,22 @@ async function getServicesByAppointmentIds(client, citaIds = []) {
     if (!citaId) continue;
     if (!mapped.has(citaId)) mapped.set(citaId, []);
     mapped.get(citaId).push({
+      id_cita_detalle: row.id_cita_detalle,
       id_servicio: row.id_servicio,
       nombre_servicio: row.nombre_servicio ?? null,
+      id_tarifa: row.id_tarifa ?? null,
       cantidad: Number(row.cantidad ?? 1),
       duracion_min: Number(row.duracion_min ?? 0),
       buffer_min: Number(row.buffer_min ?? 0),
+      precio_referencia_hnl: Number(row.precio_referencia_hnl ?? 0),
       precio_unitario_hnl: Number(row.precio_unitario_hnl ?? 0),
       subtotal_hnl: Number(row.subtotal_hnl ?? 0),
+      descuento_hnl: Number(row.descuento_hnl ?? 0),
+      incluye_isv_snapshot: row.incluye_isv_snapshot === true,
+      isv_porcentaje: Number(row.isv_porcentaje ?? 0),
+      isv_hnl: Number(row.isv_hnl ?? 0),
+      total_linea_hnl: Number(row.total_linea_hnl ?? row.subtotal_hnl ?? 0),
+      origen_item_codigo: row.origen_item_codigo ?? null,
     });
   }
   return mapped;
@@ -1832,45 +1875,32 @@ export default async function citasRoutes(app) {
           let totalPagar = Number(coverage.extraTotalHnl || 0);
           let descuentoPromociones = 0;
           let promocionesPreview = null;
-
-          try {
-            const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
-            const promoContext = {
-              id_sucursal: branch.id_sucursal,
-              id_empleado_barbero: selection.barber.id_empleado,
-              id_cliente: clienteId,
-              id_persona: personaId,
-              id_grupo_cita: groupRecord.id_grupo_cita,
-              fecha_hora: promoDateTime.iso_utc,
-              fecha: promoDateTime.fecha_operativa,
-              fecha_operativa: promoDateTime.fecha_operativa,
-              hora: promoDateTime.hora_operativa,
-              subtotal_hnl: totalPagar,
-              servicios: selection.serviceSelection.items || [],
-              paquetes: selection.serviceSelection.id_paquete
-                ? [{ id_paquete: selection.serviceSelection.id_paquete }]
-                : [],
-              codigo_promocional: request.body?.codigo_promocional || null,
-              canal: "privado",
-              es_cliente_autenticado: true,
-              es_titular: isTitular,
-            };
-            promocionesPreview = await previewPromotionsForAppointment(dbClient, promoContext);
-            if (!promocionesPreview.usedFallbackLegacy) {
-              descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
-              totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
-            }
-          } catch (promoError) {
-            request.log.warn(
-              {
-                requestId: request.id,
-                id_sucursal: branch.id_sucursal,
-                id_grupo_cita: groupRecord.id_grupo_cita,
-                code: promoError?.code || null,
-                message: promoError?.message || null,
-              },
-              "No se pudo evaluar promociones normalizadas; se mantiene fallback legacy"
-            );
+          let promocionesContext = null;
+          const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
+          promocionesContext = {
+            id_sucursal: branch.id_sucursal,
+            id_empleado_barbero: selection.barber.id_empleado,
+            id_cliente: clienteId,
+            id_persona: personaId,
+            id_grupo_cita: groupRecord.id_grupo_cita,
+            fecha_hora: promoDateTime.iso_utc,
+            fecha: promoDateTime.fecha_operativa,
+            fecha_operativa: promoDateTime.fecha_operativa,
+            hora: promoDateTime.hora_operativa,
+            subtotal_hnl: totalPagar,
+            servicios: selection.serviceSelection.items || [],
+            paquetes: selection.serviceSelection.id_paquete
+              ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+              : [],
+            codigo_promocional: request.body?.codigo_promocional || null,
+            canal: "privado",
+            es_cliente_autenticado: true,
+            es_titular: isTitular,
+          };
+          promocionesPreview = await previewPromotionsForAppointment(dbClient, promocionesContext);
+          if (!promocionesPreview.usedFallbackLegacy) {
+            descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
+            totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
           }
           const descuentoTotal = Number((descuento + descuentoPromociones).toFixed(2));
 
@@ -1919,6 +1949,13 @@ export default async function citasRoutes(app) {
               userId: holdUserId,
               expiresAt: holdExpiresAt.toISOString(),
             },
+            promotions: promocionesPreview && !promocionesPreview.usedFallbackLegacy
+              ? {
+                  context: promocionesContext,
+                  result: promocionesPreview,
+                  formal: false,
+                }
+              : null,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           const citaId = reservation.citaId;
@@ -1927,45 +1964,6 @@ export default async function citasRoutes(app) {
             descuentoHnl: descuentoTotal,
             totalHnl: totalPagar,
           };
-          if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
-            const promoSavepoint = `sp_promo_hold_${integrante.orden_integrante}`;
-            try {
-              const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
-              await dbClient.query(`SAVEPOINT ${promoSavepoint}`);
-              await recordPromotionApplications(
-                dbClient,
-                {
-                  id_grupo_cita: groupRecord.id_grupo_cita,
-                  id_cita: citaId,
-                  id_cliente: clienteId,
-                  id_persona: personaId,
-                  id_sucursal: branch.id_sucursal,
-                  fecha_operativa: promoDateTime.fecha_operativa,
-                  subtotal_hnl: Number(coverage.extraTotalHnl || 0),
-                },
-                promocionesPreview,
-                { formal: false }
-              );
-              await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
-            } catch (promoPersistError) {
-              try {
-                await dbClient.query(`ROLLBACK TO SAVEPOINT ${promoSavepoint}`);
-                await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
-              } catch {
-                // AM: Si el savepoint ya no existe, solo se registra el fallo original.
-              }
-              request.log.warn(
-                {
-                  requestId: request.id,
-                  id_cita: citaId,
-                  id_grupo_cita: groupRecord.id_grupo_cita,
-                  code: promoPersistError?.code || null,
-                  message: promoPersistError?.message || null,
-                },
-                "No se pudo registrar trazabilidad de promociones en hold; se continua"
-              );
-            }
-          }
           if (isTitular && rewardRedeemContext) {
             rewardAppliedInHold = true;
             rewardLinkedCitaId = citaId;

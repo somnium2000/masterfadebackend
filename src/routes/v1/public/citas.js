@@ -919,6 +919,7 @@ async function resolveRequestedPromotionsForPublicHold(client, {
     descuento_hnl: normalizeMoney(result.descuento_total_hnl),
     aplicadas: result.promociones_aplicadas || [],
     descartadas: result.promociones_descartadas || [],
+    context: promoContext,
   };
 }
 
@@ -1475,6 +1476,16 @@ export default async function publicCitasRoutes(app) {
               state: holdState,
               expiresAt: expiresAt.toISOString(),
             },
+            promotions: promotionResult.aplicadas?.length || promotionResult.descartadas?.length
+              ? {
+                  context: promotionResult.context,
+                  result: {
+                    promociones_aplicadas: promotionResult.aplicadas,
+                    promociones_descartadas: promotionResult.descartadas,
+                  },
+                  formal: false,
+                }
+              : null,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           const citaId = reservation.citaId;

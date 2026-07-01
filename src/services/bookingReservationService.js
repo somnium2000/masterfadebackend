@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolveBookingIsvEnabled } from "../config/bookingConfig.js";
+import { recordPromotionApplications } from "./promociones/promocionesService.js";
 import { AppError } from "../utils/errors.js";
 
 function normalizeMoney(value) {
@@ -271,8 +272,9 @@ export async function insertAppointmentDetails(
   const rows = Array.isArray(detailRows)
     ? detailRows
     : buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl, bookingIsvEnabled });
+  const insertedRows = [];
   for (const row of rows) {
-    await client.query(
+    const result = await client.query(
       `
         INSERT INTO public.citas_detalles (
           id_cita,
@@ -297,6 +299,7 @@ export async function insertAppointmentDetails(
           $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::boolean,
           $13::numeric, $14::numeric, $15::numeric, $16::text
         )
+        RETURNING id_cita_detalle
       `,
       [
         citaId,
@@ -317,8 +320,12 @@ export async function insertAppointmentDetails(
         row.origen_item_codigo,
       ]
     );
+    insertedRows.push({
+      ...row,
+      id_cita_detalle: result.rows?.[0]?.id_cita_detalle || row.id_cita_detalle || null,
+    });
   }
-  return rows;
+  return insertedRows;
 }
 
 export async function createAppointmentHold(client, {
@@ -348,6 +355,7 @@ export async function createBookingReservation(client, {
   groupRecord = null,
   appointment,
   hold = null,
+  promotions = null,
   updateGroupTotalHnl = null,
   bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
@@ -375,6 +383,22 @@ export async function createBookingReservation(client, {
     detailRows: preparedDetailRows,
     bookingIsvEnabled,
   });
+  if (promotions?.result) {
+    await recordPromotionApplications(
+      client,
+      {
+        ...(promotions.context || {}),
+        id_grupo_cita: promotions.context?.id_grupo_cita || groupRecord?.id_grupo_cita || appointment.groupId || null,
+        id_cita: promotions.context?.id_cita || citaId,
+        id_cliente: promotions.context?.id_cliente || appointment.clientId || null,
+        id_persona: promotions.context?.id_persona || appointment.personId || null,
+        detailRows,
+        serviceItems,
+      },
+      promotions.result,
+      { formal: promotions.formal === true }
+    );
+  }
   const holdRecord = hold
     ? await createAppointmentHold(client, {
         citaId,

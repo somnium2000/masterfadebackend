@@ -61,6 +61,45 @@ SET precio_referencia_hnl = ROUND(COALESCE(precio_unitario_hnl, 0), 2)
 WHERE COALESCE(precio_referencia_hnl, 0) = 0
   AND COALESCE(precio_unitario_hnl, 0) > 0;
 
+UPDATE public.citas_detalles cd
+SET id_tarifa = (
+  SELECT st.id_tarifa
+  FROM public.servicios_tarifas st
+  WHERE st.id_servicio = cd.id_servicio
+    AND st.id_sucursal = c.id_sucursal
+    AND st.deleted_at IS NULL
+    AND st.activo IS TRUE
+    AND (st.id_empleado IS NULL OR st.id_empleado = c.id_empleado_barbero)
+    AND st.vigente_desde <= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+    AND (
+      st.vigente_hasta IS NULL
+      OR st.vigente_hasta >= (c.inicio_at AT TIME ZONE 'America/Tegucigalpa')::date
+    )
+    AND ROUND(st.precio_hnl, 2) = ROUND(COALESCE(cd.precio_unitario_hnl, 0), 2)
+    AND COALESCE(st.duracion_min, cd.duracion_min) = cd.duracion_min
+    AND COALESCE(st.buffer_min, cd.buffer_min) = cd.buffer_min
+  ORDER BY
+    CASE WHEN st.id_empleado = c.id_empleado_barbero THEN 0 ELSE 1 END,
+    st.vigente_desde DESC,
+    st.updated_at DESC,
+    st.id_tarifa DESC
+  LIMIT 1
+)
+FROM public.citas c
+WHERE cd.id_cita = c.id_cita
+  AND cd.id_tarifa IS NULL;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.citas_detalles
+    WHERE id_tarifa IS NULL
+  ) THEN
+    RAISE EXCEPTION 'MF2A2_VALIDACION_BACKFILL_ID_TARIFA_INCOMPLETO';
+  END IF;
+END $$;
+
 UPDATE public.citas_detalles
 SET
   subtotal_hnl = ROUND(COALESCE(precio_unitario_hnl, 0) * COALESCE(cantidad, 1), 2),
@@ -214,6 +253,9 @@ CREATE INDEX IF NOT EXISTS idx_citas_detalles_id_tarifa
   ON public.citas_detalles (id_tarifa)
   WHERE id_tarifa IS NOT NULL;
 
+CREATE INDEX IF NOT EXISTS idx_citas_detalles_origen_item
+  ON public.citas_detalles (origen_item_codigo);
+
 CREATE INDEX IF NOT EXISTS idx_payment_intents_id_grupo_cita
   ON public.payment_intents (id_grupo_cita)
   WHERE id_grupo_cita IS NOT NULL;
@@ -363,11 +405,22 @@ AS $function$
 DECLARE
   v_inicio timestamptz;
   v_fin_actual timestamptz;
+  v_fin_calculado timestamptz;
   v_duracion integer;
   v_buffer integer;
-  v_subtotal numeric;
-  v_descuento numeric;
-  v_total numeric;
+  v_subtotal_detalles numeric;
+  v_descuento_detalles numeric;
+  v_total_detalles numeric;
+  v_subtotal_extras numeric;
+  v_descuento_extras numeric;
+  v_total_extras numeric;
+  v_cantidad_paquetes integer;
+  v_precio_lista_paquete numeric;
+  v_descuento_paquete numeric;
+  v_total_paquete numeric;
+  v_subtotal_final numeric;
+  v_descuento_final numeric;
+  v_total_final numeric;
 BEGIN
   SELECT c.inicio_at, c.fin_at
   INTO v_inicio, v_fin_actual
@@ -383,24 +436,71 @@ BEGIN
     COALESCE(MAX(cd.buffer_min), 0)::integer,
     COALESCE(SUM(cd.subtotal_hnl), 0),
     COALESCE(SUM(cd.descuento_hnl), 0),
-    COALESCE(SUM(cd.total_linea_hnl), 0)
-  INTO v_duracion, v_buffer, v_subtotal, v_descuento, v_total
+    COALESCE(SUM(cd.total_linea_hnl), 0),
+    COALESCE(SUM(cd.subtotal_hnl) FILTER (WHERE cd.origen_item_codigo <> 'paquete_incluido'), 0),
+    COALESCE(SUM(cd.descuento_hnl) FILTER (WHERE cd.origen_item_codigo <> 'paquete_incluido'), 0),
+    COALESCE(SUM(cd.total_linea_hnl) FILTER (WHERE cd.origen_item_codigo <> 'paquete_incluido'), 0)
+  INTO
+    v_duracion,
+    v_buffer,
+    v_subtotal_detalles,
+    v_descuento_detalles,
+    v_total_detalles,
+    v_subtotal_extras,
+    v_descuento_extras,
+    v_total_extras
   FROM public.citas_detalles cd
   WHERE cd.id_cita = p_cita_id;
+
+  SELECT
+    COUNT(*)::integer,
+    COALESCE(SUM(cp.precio_lista_hnl), 0),
+    COALESCE(SUM(cp.descuento_hnl), 0),
+    COALESCE(SUM(cp.total_hnl), 0)
+  INTO
+    v_cantidad_paquetes,
+    v_precio_lista_paquete,
+    v_descuento_paquete,
+    v_total_paquete
+  FROM public.citas_paquetes cp
+  WHERE cp.id_cita = p_cita_id;
+
+  IF v_cantidad_paquetes > 0 THEN
+    v_subtotal_final := v_precio_lista_paquete + v_subtotal_extras;
+    v_descuento_final := v_descuento_paquete + v_descuento_extras;
+    v_total_final := v_total_paquete + v_total_extras;
+  ELSE
+    v_subtotal_final := v_subtotal_detalles;
+    v_descuento_final := v_descuento_detalles;
+    v_total_final := v_total_detalles;
+  END IF;
+
+  v_subtotal_final := ROUND(COALESCE(v_subtotal_final, 0), 2);
+  v_descuento_final := ROUND(COALESCE(v_descuento_final, 0), 2);
+  v_total_final := ROUND(COALESCE(v_total_final, 0), 2);
+  v_fin_calculado := CASE
+    WHEN v_duracion > 0 THEN v_inicio + make_interval(mins => v_duracion + v_buffer)
+    ELSE v_fin_actual
+  END;
 
   UPDATE public.citas c
   SET
     duracion_total_min = v_duracion,
     buffer_total_min = v_buffer,
-    subtotal_servicios_hnl = ROUND(COALESCE(v_subtotal, 0), 2),
-    descuento_hnl = ROUND(COALESCE(v_descuento, 0), 2),
-    total_pagar_hnl = ROUND(COALESCE(v_total, 0), 2),
-    fin_at = CASE
-      WHEN v_duracion > 0 THEN v_inicio + make_interval(mins => v_duracion + v_buffer)
-      ELSE v_fin_actual
-    END,
+    subtotal_servicios_hnl = v_subtotal_final,
+    descuento_hnl = v_descuento_final,
+    total_pagar_hnl = v_total_final,
+    fin_at = v_fin_calculado,
     updated_at = now()
-  WHERE c.id_cita = p_cita_id;
+  WHERE c.id_cita = p_cita_id
+    AND (
+         c.duracion_total_min IS DISTINCT FROM v_duracion
+      OR c.buffer_total_min IS DISTINCT FROM v_buffer
+      OR c.subtotal_servicios_hnl IS DISTINCT FROM v_subtotal_final
+      OR c.descuento_hnl IS DISTINCT FROM v_descuento_final
+      OR c.total_pagar_hnl IS DISTINCT FROM v_total_final
+      OR c.fin_at IS DISTINCT FROM v_fin_calculado
+    );
 END;
 $function$;
 
@@ -527,6 +627,26 @@ BEGIN
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION public.fn_trg_recalcular_cita_paquete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM public.fn_recalcular_cita(OLD.id_cita);
+    RETURN OLD;
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND OLD.id_cita IS DISTINCT FROM NEW.id_cita THEN
+    PERFORM public.fn_recalcular_cita(OLD.id_cita);
+  END IF;
+
+  PERFORM public.fn_recalcular_cita(NEW.id_cita);
+  RETURN NEW;
+END;
+$function$;
+
 DROP TRIGGER IF EXISTS tr_citas_detalles_normalizar ON public.citas_detalles;
 CREATE TRIGGER tr_citas_detalles_normalizar
 BEFORE INSERT OR UPDATE ON public.citas_detalles
@@ -544,6 +664,12 @@ CREATE TRIGGER tr_citas_sync_grupo
 AFTER INSERT OR DELETE OR UPDATE ON public.citas
 FOR EACH ROW
 EXECUTE FUNCTION public.fn_trg_sincronizar_grupo_cita();
+
+DROP TRIGGER IF EXISTS tr_recalc_cita_paquetes ON public.citas_paquetes;
+CREATE TRIGGER tr_recalc_cita_paquetes
+AFTER INSERT OR DELETE OR UPDATE ON public.citas_paquetes
+FOR EACH ROW
+EXECUTE FUNCTION public.fn_trg_recalcular_cita_paquete();
 
 DROP TRIGGER IF EXISTS tr_payment_intents_set_group ON public.payment_intents;
 CREATE TRIGGER tr_payment_intents_set_group

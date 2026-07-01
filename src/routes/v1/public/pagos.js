@@ -9,7 +9,6 @@ import {
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
 import { normalizeOperationalDateTime } from "../../../services/agendaService.js";
-import { resolveBookingIsvEnabled } from "../../../config/bookingConfig.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
@@ -64,18 +63,87 @@ function calculateLineTotal({ subtotalHnl, descuentoHnl, isvHnl, incluyeIsv }) {
   return normalizeMoney(taxableBase + (incluyeIsv ? 0 : Number(isvHnl || 0)));
 }
 
-export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = 0, bookingIsvEnabled = false } = {}) {
-  const isvEnabled = bookingIsvEnabled === true;
-  const rows = (Array.isArray(detailRows) ? detailRows : []).map((row) => {
+function distributeDiscountBySubtotal(detailRows = [], descuentoTotalHnl = 0) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const subtotal = normalizeMoney(rows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
+  const requestedDiscount = Math.min(normalizeMoney(descuentoTotalHnl), subtotal);
+  let remainingDiscount = requestedDiscount;
+  return rows.map((row, index) => {
+    const discount = index === rows.length - 1
+      ? remainingDiscount
+      : normalizeMoney(subtotal > 0 ? (requestedDiscount * Number(row.subtotal_hnl || 0)) / subtotal : 0);
+    const safeDiscount = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, Number(row.subtotal_hnl || 0))));
+    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - safeDiscount));
+    return safeDiscount;
+  });
+}
+
+function distributeDiscountByRemainingCapacity(detailRows = [], descuentoTotalHnl = 0) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const capacities = rows.map((row) => normalizeMoney(
+    Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0))
+  ));
+  const available = normalizeMoney(capacities.reduce((sum, amount) => sum + amount, 0));
+  const requestedDiscount = Math.min(normalizeMoney(descuentoTotalHnl), available);
+  let remainingDiscount = requestedDiscount;
+  return rows.map((row, index) => {
+    const capacity = capacities[index] || 0;
+    const discount = index === rows.length - 1
+      ? remainingDiscount
+      : normalizeMoney(available > 0 ? (requestedDiscount * capacity) / available : 0);
+    const safeDiscount = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, capacity)));
+    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - safeDiscount));
+    return safeDiscount;
+  });
+}
+
+function applyPersistedPromotionDiscounts(detailRows = [], promotionRows = []) {
+  const rows = (Array.isArray(detailRows) ? detailRows : []).map((row) => ({
+    ...row,
+    descuento_hnl: 0,
+  }));
+  const byDetailId = new Map(
+    rows
+      .map((row) => [String(row.id_cita_detalle || "").trim(), row])
+      .filter(([detailId]) => detailId)
+  );
+
+  for (const promotion of Array.isArray(promotionRows) ? promotionRows : []) {
+    const discount = normalizeMoney(promotion?.descuento_calculado_hnl);
+    if (discount <= 0) continue;
+    const detailId = String(promotion?.id_cita_detalle || "").trim();
+    if (detailId) {
+      const row = byDetailId.get(detailId);
+      if (!row) continue;
+      const capacity = normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0)));
+      row.descuento_hnl = normalizeMoney(row.descuento_hnl + Math.min(discount, capacity));
+      continue;
+    }
+
+    const allocations = distributeDiscountByRemainingCapacity(rows, discount);
+    rows.forEach((row, index) => {
+      row.descuento_hnl = normalizeMoney(Number(row.descuento_hnl || 0) + Number(allocations[index] || 0));
+    });
+  }
+
+  return rows;
+}
+
+export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = null } = {}) {
+  const sourceRows = Array.isArray(detailRows) ? detailRows : [];
+  const overrideDiscounts = descuentoTotalHnl === null
+    ? null
+    : distributeDiscountBySubtotal(sourceRows, descuentoTotalHnl);
+  const rows = sourceRows.map((row, index) => {
     const quantity = Math.max(1, Math.trunc(Number(row?.cantidad || 1)));
     const unitPrice = normalizeMoney(row?.precio_unitario_hnl);
     const subtotalHnl = normalizeMoney(row?.subtotal_hnl ?? unitPrice * quantity);
-    const incluyeIsvSnapshot = isvEnabled && row?.incluye_isv_snapshot === true;
-    const isvPorcentaje = isvEnabled ? normalizePercentage(row?.isv_porcentaje) : 0;
+    const incluyeIsvSnapshot = row?.incluye_isv_snapshot === true;
+    const isvPorcentaje = normalizePercentage(row?.isv_porcentaje);
     return {
       id_cita_detalle: row?.id_cita_detalle,
       subtotal_hnl: subtotalHnl,
-      descuento_hnl: 0,
+      descuento_hnl: overrideDiscounts ? overrideDiscounts[index] : normalizeMoney(row?.descuento_hnl),
       incluye_isv_snapshot: incluyeIsvSnapshot,
       isv_porcentaje: isvPorcentaje,
       isv_hnl: 0,
@@ -83,15 +151,7 @@ export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = 0,
     };
   });
 
-  const subtotal = normalizeMoney(rows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
-  const requestedDiscount = Math.min(normalizeMoney(descuentoTotalHnl), subtotal);
-  let remainingDiscount = requestedDiscount;
-  rows.forEach((row, index) => {
-    const discount = index === rows.length - 1
-      ? remainingDiscount
-      : normalizeMoney(subtotal > 0 ? (requestedDiscount * row.subtotal_hnl) / subtotal : 0);
-    row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
-    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+  rows.forEach((row) => {
     row.isv_hnl = calculateLineIsv({
       subtotalHnl: row.subtotal_hnl,
       descuentoHnl: row.descuento_hnl,
@@ -106,6 +166,17 @@ export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = 0,
     });
   });
   return rows;
+}
+
+function classifyPromotionValidationError(error) {
+  if (error instanceof AppError && error.statusCode >= 400 && error.statusCode < 500) {
+    return new AppError(409, "La promocion aplicada ya no es valida para esta reserva.", {
+      code: "BOOKING_PROMOTION_NO_LONGER_APPLICABLE",
+    });
+  }
+  return new AppError(503, "No se pudo validar la promocion aplicada. Intenta nuevamente.", {
+    code: "BOOKING_PROMOTION_VALIDATION_UNAVAILABLE",
+  });
 }
 
 const PUBLIC_PAGOS_SAFE_DETAIL_KEYS = new Set(["field"]);
@@ -571,7 +642,7 @@ async function resolvePublicIntentCreatorUserId(client, { groupRows }) {
   return fallbackUserId;
 }
 
-async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, bookingIsvEnabled = false }) {
+async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, logger = null } = {}) {
   const citasResult = await client.query(
     `
       SELECT
@@ -596,6 +667,7 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, booki
   let subtotal = 0;
   let descuentoTotal = 0;
   let total = 0;
+  const appliedGroupPromotionIds = new Set();
 
   for (const cita of citasResult.rows || []) {
     const detallesResult = await client.query(
@@ -606,110 +678,125 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, booki
           cantidad,
           precio_unitario_hnl,
           subtotal_hnl,
+          descuento_hnl,
           incluye_isv_snapshot,
-          isv_porcentaje
+          isv_porcentaje,
+          isv_hnl,
+          total_linea_hnl
         FROM public.citas_detalles
         WHERE id_cita = $1::uuid
         ORDER BY id_cita_detalle ASC
       `,
       [cita.id_cita]
     );
-    const selectedPromoResult = await client.query(
+    const persistedPromoResult = await client.query(
       `
-        SELECT id_promocion, id_promocion_regla
+        SELECT
+          id_cita_promocion,
+          id_grupo_cita,
+          id_cita,
+          id_cita_detalle,
+          id_cita_paquete,
+          id_promocion,
+          id_promocion_regla,
+          aplica_a_codigo,
+          descuento_calculado_hnl,
+          prioridad_aplicacion,
+          es_acumulable,
+          estado_aplicacion_codigo
         FROM public.citas_promociones
-        WHERE id_cita = $1::uuid
+        WHERE id_grupo_cita = $1::uuid
+          AND (id_cita = $2::uuid OR id_cita IS NULL)
           AND estado_aplicacion_codigo = 'aplicada'
-        ORDER BY created_at ASC
-        LIMIT 1
+        ORDER BY prioridad_aplicacion ASC, created_at ASC, id_cita_promocion ASC
       `,
-      [cita.id_cita]
+      [idGrupoCita, cita.id_cita]
     );
-    const selectedPromo = selectedPromoResult.rows[0] || null;
+    const persistedPromotions = (persistedPromoResult.rows || []).filter((row) => {
+      if (row.id_cita) return true;
+      const promotionId = String(row.id_cita_promocion || "").trim();
+      if (!promotionId) return false;
+      if (appliedGroupPromotionIds.has(promotionId)) return false;
+      appliedGroupPromotionIds.add(promotionId);
+      return true;
+    });
     const detalleSubtotal = normalizeMoney(
       (detallesResult.rows || []).reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0)
     );
     const subtotalCita = detalleSubtotal || Number(cita.subtotal_servicios_hnl || 0);
-    let descuentoCita = 0;
 
-    try {
-      const operationalDateTime = normalizeOperationalDateTime(new Date(cita.inicio_at), "inicio_at");
-      const preview = await previewPromotionsForAppointment(client, {
-        id_sucursal: cita.id_sucursal,
-        id_empleado_barbero: cita.id_empleado_barbero,
-        id_grupo_cita: cita.id_grupo_cita,
-        id_cita: cita.id_cita,
-        fecha_hora: operationalDateTime.iso_utc,
-        fecha: operationalDateTime.fecha_operativa,
-        fecha_operativa: operationalDateTime.fecha_operativa,
-        hora: operationalDateTime.hora_operativa,
-        subtotal_hnl: subtotalCita,
-        servicios: (detallesResult.rows || []).map((row) => ({
-          id_servicio: row.id_servicio,
-          cantidad: Number(row.cantidad || 1),
-          precio_unitario_hnl: Number(row.precio_unitario_hnl || 0),
-          subtotal_hnl: Number(row.subtotal_hnl || 0),
-        })),
-        paquetes: cita.id_paquete ? [{ id_paquete: cita.id_paquete }] : [],
-        id_promocion: selectedPromo?.id_promocion || null,
-        id_promocion_regla: selectedPromo?.id_promocion_regla || null,
-        canal: "public",
-      });
-
-      if (!preview.usedFallbackLegacy) {
-        const selectedRuleId = String(selectedPromo?.id_promocion_regla || "").trim();
-        if (selectedRuleId) {
-          const candidatasAplicadas = Array.isArray(preview.promociones_aplicadas) ? preview.promociones_aplicadas : [];
-          const keepApplied = candidatasAplicadas.filter(
-            (row) => String(row.id_promocion_regla || "") === selectedRuleId
-          );
-          const movedToDiscarded = candidatasAplicadas
-            .filter((row) => String(row.id_promocion_regla || "") !== selectedRuleId)
-            .map((row) => ({
-              ...row,
-              motivo_codigo: "PROMOCION_NO_SELECCIONADA",
-              motivo: "Se aplico solo la promocion seleccionada por el cliente.",
-            }));
-          preview.promociones_aplicadas = keepApplied;
-          preview.promociones_descartadas = [...(preview.promociones_descartadas || []), ...movedToDiscarded];
-          descuentoCita = Number(
-            keepApplied.reduce((sum, row) => sum + Number(row.descuento_calculado_hnl || 0), 0).toFixed(2)
-          );
-        } else {
-          descuentoCita = Number(preview.descuento_total_hnl || 0);
+    if (persistedPromotions.length) {
+      try {
+        const operationalDateTime = normalizeOperationalDateTime(new Date(cita.inicio_at), "inicio_at");
+        const preview = await previewPromotionsForAppointment(client, {
+          id_sucursal: cita.id_sucursal,
+          id_empleado_barbero: cita.id_empleado_barbero,
+          id_grupo_cita: cita.id_grupo_cita,
+          id_cita: cita.id_cita,
+          fecha_hora: operationalDateTime.iso_utc,
+          fecha: operationalDateTime.fecha_operativa,
+          fecha_operativa: operationalDateTime.fecha_operativa,
+          hora: operationalDateTime.hora_operativa,
+          subtotal_hnl: subtotalCita,
+          servicios: (detallesResult.rows || []).map((row) => ({
+            id_servicio: row.id_servicio,
+            cantidad: Number(row.cantidad || 1),
+            precio_unitario_hnl: Number(row.precio_unitario_hnl || 0),
+            subtotal_hnl: Number(row.subtotal_hnl || 0),
+          })),
+          paquetes: cita.id_paquete ? [{ id_paquete: cita.id_paquete }] : [],
+          canal: "public",
+        });
+        const appliedRules = new Set(
+          (preview.promociones_aplicadas || []).map((row) => String(row.id_promocion_regla || "").trim())
+        );
+        const missingRule = persistedPromotions.find(
+          (row) => !appliedRules.has(String(row.id_promocion_regla || "").trim())
+        );
+        if (missingRule) {
+          throw new AppError(409, "La promocion aplicada ya no es valida para esta reserva.", {
+            code: "BOOKING_PROMOTION_NO_LONGER_APPLICABLE",
+          });
         }
         promocionesAplicadas.push(...(preview.promociones_aplicadas || []));
         promocionesDescartadas.push(...(preview.promociones_descartadas || []));
+      } catch (error) {
+        logger?.warn?.(
+          {
+            err: error,
+            id_grupo_cita: idGrupoCita,
+            id_cita: cita.id_cita,
+          },
+          "No se pudo validar promociones persistidas antes de crear intent publico"
+        );
+        throw classifyPromotionValidationError(error);
       }
-    } catch {
-      descuentoCita = 0;
     }
 
-    const normalizedDetails = buildPaymentDetailRows(detallesResult.rows, {
-      descuentoTotalHnl: descuentoCita,
-      bookingIsvEnabled,
-    });
+    const detailSource = persistedPromotions.length
+      ? applyPersistedPromotionDiscounts(detallesResult.rows, persistedPromotions)
+      : detallesResult.rows;
+    const normalizedDetails = buildPaymentDetailRows(detailSource);
     const totalCita = normalizedDetails.length
       ? normalizeMoney(normalizedDetails.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0))
-      : normalizeMoney(Math.max(0, subtotalCita - descuentoCita));
+      : normalizeMoney(Math.max(0, subtotalCita));
+    const descuentoCita = normalizedDetails.length
+      ? normalizeMoney(normalizedDetails.reduce((sum, row) => sum + Number(row.descuento_hnl || 0), 0))
+      : 0;
 
     for (const detail of normalizedDetails) {
       await client.query(
         `
           UPDATE public.citas_detalles
           SET descuento_hnl = $2::numeric,
-              incluye_isv_snapshot = $3::boolean,
-              isv_porcentaje = $4::numeric,
-              isv_hnl = $5::numeric,
-              total_linea_hnl = $6::numeric,
+              isv_hnl = $3::numeric,
+              total_linea_hnl = $4::numeric,
               updated_at = now()
           WHERE id_cita_detalle = $1::uuid
         `,
         [
           detail.id_cita_detalle,
           detail.descuento_hnl,
-          detail.incluye_isv_snapshot,
-          detail.isv_porcentaje,
           detail.isv_hnl,
           detail.total_linea_hnl,
         ]
@@ -1105,9 +1192,8 @@ export default async function publicPagosRoutes(app) {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const titularEmail = normalizeEmail(request.body?.titular_email);
       const providerCode = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
-      const bookingIsvEnabled = resolveBookingIsvEnabled(app.config);
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
-      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, bookingIsvEnabled });
+      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, logger: request.log });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       assertPublicGroupPayable(groupRows);
       const expiredHold = groupRows.some((row) => row.estado_hold_codigo !== "activo" || !row.expires_at || new Date(row.expires_at).getTime() <= Date.now());

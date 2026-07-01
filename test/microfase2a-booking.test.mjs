@@ -29,6 +29,11 @@ const TARIFF_A = "44444444-4444-4444-8444-444444444444";
 const TARIFF_B = "55555555-5555-4555-8555-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
 const HOLD_A = "77777777-7777-4777-8777-777777777777";
+const GROUP_A = "99999999-9999-4999-8999-999999999999";
+const DETAIL_A = "12121212-1212-4121-8121-121212121212";
+const PROMO_A = "13131313-1313-4131-8131-131313131313";
+const PROMO_RULE_A = "14141414-1414-4141-8141-141414141414";
+const PROMO_APP_A = "15151515-1515-4151-8151-151515151515";
 
 async function withBookingIsvEnv(value, callback) {
   const hadValue = Object.prototype.hasOwnProperty.call(process.env, "BOOKING_ISV_ENABLED");
@@ -466,6 +471,72 @@ test("detalle, cita, grupo e intent coinciden con ISV apagado y encendido", () =
   }
 });
 
+test("pago de reserva existente conserva snapshot fiscal aunque cambie BOOKING_ISV_ENABLED", async () => {
+  await withBookingIsvEnv("true", async () => {
+    const rows = buildPaymentDetailRows([{
+      id_cita_detalle: DETAIL_A,
+      cantidad: 1,
+      precio_unitario_hnl: 100,
+      subtotal_hnl: 100,
+      descuento_hnl: 0,
+      incluye_isv_snapshot: false,
+      isv_porcentaje: 0,
+      isv_hnl: 0,
+      total_linea_hnl: 100,
+    }]);
+
+    assert.equal(rows[0].incluye_isv_snapshot, false);
+    assert.equal(rows[0].isv_porcentaje, 0);
+    assert.equal(rows[0].isv_hnl, 0);
+    assert.equal(rows[0].total_linea_hnl, 100);
+  });
+
+  await withBookingIsvEnv("false", async () => {
+    const rows = buildPaymentDetailRows([{
+      id_cita_detalle: DETAIL_A,
+      cantidad: 1,
+      precio_unitario_hnl: 100,
+      subtotal_hnl: 100,
+      descuento_hnl: 0,
+      incluye_isv_snapshot: false,
+      isv_porcentaje: 15,
+      isv_hnl: 15,
+      total_linea_hnl: 115,
+    }]);
+
+    assert.equal(rows[0].incluye_isv_snapshot, false);
+    assert.equal(rows[0].isv_porcentaje, 15);
+    assert.equal(rows[0].isv_hnl, 15);
+    assert.equal(rows[0].total_linea_hnl, 115);
+  });
+});
+
+test("pago recalcula descuentos usando snapshots persistidos sin tocar entorno", () => {
+  const additional = buildPaymentDetailRows([{
+    id_cita_detalle: DETAIL_A,
+    cantidad: 1,
+    precio_unitario_hnl: 100,
+    subtotal_hnl: 100,
+    descuento_hnl: 10,
+    incluye_isv_snapshot: false,
+    isv_porcentaje: 15,
+  }]);
+  assert.equal(additional[0].isv_hnl, 13.5);
+  assert.equal(additional[0].total_linea_hnl, 103.5);
+
+  const included = buildPaymentDetailRows([{
+    id_cita_detalle: DETAIL_A,
+    cantidad: 1,
+    precio_unitario_hnl: 115,
+    subtotal_hnl: 115,
+    descuento_hnl: 15,
+    incluye_isv_snapshot: true,
+    isv_porcentaje: 15,
+  }]);
+  assert.equal(included[0].isv_hnl, 13.04);
+  assert.equal(included[0].total_linea_hnl, 100);
+});
+
 test("reinicio logico con BOOKING_ISV_ENABLED=true activa ISV sin nueva migracion", async () => {
   const tariffRow = {
     id_servicio: SERVICE_A,
@@ -610,4 +681,94 @@ test("createBookingReservation usa SUM(total_linea_hnl) para total de cita y per
   assert.equal(calls[1].params[11], false);
   assert.equal(calls[1].params[13], 15);
   assert.equal(calls[1].params[14], 115);
+});
+
+test("createBookingReservation persiste promocion de servicio con id_cita_detalle y sin duplicados", async () => {
+  const calls = [];
+  const client = {
+    async query(sql, params = []) {
+      const text = String(sql);
+      calls.push({ sql: text, params });
+      if (text.includes("INSERT INTO public.citas ")) {
+        return { rows: [{ id_cita: CITA_A }] };
+      }
+      if (text.includes("INSERT INTO public.citas_detalles")) {
+        return { rows: [{ id_cita_detalle: DETAIL_A }] };
+      }
+      if (text.includes("SELECT id_cita_promocion") && text.includes("FROM public.citas_promociones")) {
+        return { rows: [] };
+      }
+      if (text.includes("INSERT INTO public.citas_promociones")) {
+        return { rows: [{ id_cita_promocion: PROMO_APP_A }] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  const result = await createBookingReservation(client, {
+    groupRecord: { id_grupo_cita: GROUP_A },
+    appointment: {
+      groupId: GROUP_A,
+      branchId: BRANCH_A,
+      barberId: BARBER_A,
+      personId: "88888888-8888-4888-8888-888888888888",
+      autoAssigned: false,
+      selection: {
+        startDateTime: new Date("2026-07-15T15:00:00.000Z"),
+        serviceSelection: {
+          selection_type: "services",
+          duracion_total_min: 30,
+          buffer_total_min: 5,
+          items: [{
+            id_servicio: SERVICE_A,
+            id_tarifa: TARIFF_A,
+            nombre_servicio: "Corte",
+            duracion_min: 30,
+            buffer_min: 5,
+            precio_hnl: 100,
+          }],
+        },
+      },
+      descuentoHnl: 10,
+    },
+    promotions: {
+      context: {
+        id_grupo_cita: GROUP_A,
+        id_sucursal: BRANCH_A,
+        fecha_operativa: "2026-07-15",
+        subtotal_hnl: 100,
+      },
+      result: {
+        promociones_aplicadas: [{
+          id_promocion: PROMO_A,
+          id_promocion_regla: PROMO_RULE_A,
+          titulo: "Promo servicio",
+          aplica_a_codigo: "servicio",
+          tipo_descuento_codigo: "monto_fijo",
+          valor_descuento: 10,
+          base_calculo_hnl: 100,
+          descuento_calculado_hnl: 10,
+          prioridad_aplicacion: 10,
+          es_acumulable: true,
+          target_items: [{ id_servicio: SERVICE_A }],
+        }],
+        promociones_descartadas: [],
+      },
+    },
+  });
+
+  assert.equal(result.detailRows[0].id_cita_detalle, DETAIL_A);
+  const duplicateCheck = calls.find((call) =>
+    call.sql.includes("SELECT id_cita_promocion")
+    && call.sql.includes("id_cita_detalle IS NOT DISTINCT FROM")
+  );
+  assert.ok(duplicateCheck);
+  assert.equal(duplicateCheck.params[4], DETAIL_A);
+
+  const promoInsert = calls.find((call) => call.sql.includes("INSERT INTO public.citas_promociones"));
+  assert.ok(promoInsert);
+  assert.equal(promoInsert.params[0], GROUP_A);
+  assert.equal(promoInsert.params[1], CITA_A);
+  assert.equal(promoInsert.params[4], DETAIL_A);
+  assert.equal(promoInsert.params[12], 10);
 });
