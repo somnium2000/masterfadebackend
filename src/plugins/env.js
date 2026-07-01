@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
+import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
 
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -126,6 +127,10 @@ async function envPlugin(app) {
       process.env.SERVICE_BARBER_ASSIGNMENTS_ENABLED,
       false
     ),
+    bookingIsvEnabled: parseStrictBooleanEnv(process.env.BOOKING_ISV_ENABLED, {
+      name: "BOOKING_ISV_ENABLED",
+      defaultValue: false,
+    }),
   };
 
   if (!["strict", "lax", "none"].includes(config.cookieSameSite)) {

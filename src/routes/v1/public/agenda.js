@@ -639,6 +639,7 @@ export default async function publicAgendaRoutes(app) {
           fecha_desde: fechaDesde,
           fecha_hasta: fechaHasta,
           id_barbero: idBarbero,
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
 
         return sendOk(reply, {
@@ -785,6 +786,7 @@ export default async function publicAgendaRoutes(app) {
           fecha,
           minSellableDurationMin,
           includeDiscardReasons: Boolean(idBarbero && includeDebug),
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
         const serviceSelection = availability.service_selection || null;
         const effectiveSelection = availability.effective_selection || null;

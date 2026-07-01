@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolveBookingIsvEnabled } from "../config/bookingConfig.js";
 import { AppError } from "../utils/errors.js";
 
 function normalizeMoney(value) {
@@ -63,7 +64,9 @@ export function assertBookingSelectionCreationSupported(selectionType) {
 export function buildAppointmentDetailRows(serviceItems = [], {
   descuentoTotalHnl = 0,
   origenItemCodigo = "servicio_manual",
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
+  const isvEnabled = bookingIsvEnabled === true;
   const grouped = new Map();
   for (const item of Array.isArray(serviceItems) ? serviceItems : []) {
     const serviceId = String(item?.id_servicio || "").trim();
@@ -78,8 +81,8 @@ export function buildAppointmentDetailRows(serviceItems = [], {
         nombre_servicio_snapshot: String(item?.nombre_servicio || "Servicio").trim() || "Servicio",
         precio_referencia_hnl: normalizeMoney(item?.precio_hnl),
         precio_unitario_hnl: normalizeMoney(item?.precio_hnl),
-        incluye_isv_snapshot: item?.incluye_isv_snapshot === true || item?.incluye_isv === true,
-        isv_porcentaje: normalizePercentage(item?.isv_porcentaje),
+        incluye_isv_snapshot: isvEnabled && (item?.incluye_isv_snapshot === true || item?.incluye_isv === true),
+        isv_porcentaje: isvEnabled ? normalizePercentage(item?.isv_porcentaje) : 0,
         subtotal_hnl: 0,
         descuento_hnl: 0,
         isv_hnl: 0,
@@ -261,10 +264,13 @@ export async function createAppointmentCore(client, {
   return { id_cita: result.rows[0].id_cita, timing };
 }
 
-export async function insertAppointmentDetails(client, { citaId, serviceItems, descuentoTotalHnl = 0, detailRows = null }) {
+export async function insertAppointmentDetails(
+  client,
+  { citaId, serviceItems, descuentoTotalHnl = 0, detailRows = null, bookingIsvEnabled = resolveBookingIsvEnabled() }
+) {
   const rows = Array.isArray(detailRows)
     ? detailRows
-    : buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl });
+    : buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl, bookingIsvEnabled });
   for (const row of rows) {
     await client.query(
       `
@@ -288,7 +294,7 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
         )
         VALUES (
           $1::uuid, $2::uuid, $3::uuid, $4::int, $5::int, $6::int, $7::text,
-          $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,
+          $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::boolean,
           $13::numeric, $14::numeric, $15::numeric, $16::text
         )
       `,
@@ -343,6 +349,7 @@ export async function createBookingReservation(client, {
   appointment,
   hold = null,
   updateGroupTotalHnl = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   if (!appointment?.selection) {
     throw new TypeError("appointment.selection es obligatorio");
@@ -351,6 +358,7 @@ export async function createBookingReservation(client, {
   const serviceItems = appointment.selection?.serviceSelection?.items || [];
   const preparedDetailRows = buildAppointmentDetailRows(serviceItems, {
     descuentoTotalHnl: appointment.descuentoHnl || 0,
+    bookingIsvEnabled,
   });
   const detailTotals = summarizeAppointmentDetailRows(preparedDetailRows);
   const createdAppointment = await createAppointmentCore(client, {
@@ -365,6 +373,7 @@ export async function createBookingReservation(client, {
     serviceItems,
     descuentoTotalHnl: appointment.descuentoHnl || 0,
     detailRows: preparedDetailRows,
+    bookingIsvEnabled,
   });
   const holdRecord = hold
     ? await createAppointmentHold(client, {

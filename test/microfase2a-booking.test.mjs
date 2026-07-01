@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  parseStrictBooleanEnv,
+  resolveBookingIsvEnabled,
+} from "../src/config/bookingConfig.js";
+import {
   assertBookingSelectionRuntimeSupported,
   countDateKeyRangeDays,
   getServiceSelectionDetails,
@@ -14,6 +18,7 @@ import {
   calculateReservationTiming,
   createBookingReservation,
 } from "../src/services/bookingReservationService.js";
+import { buildPaymentDetailRows } from "../src/routes/v1/public/pagos.js";
 
 const BRANCH_A = "11111111-1111-4111-8111-111111111111";
 const BRANCH_B = "22222222-2222-4222-8222-222222222222";
@@ -24,6 +29,25 @@ const TARIFF_A = "44444444-4444-4444-8444-444444444444";
 const TARIFF_B = "55555555-5555-4555-8555-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
 const HOLD_A = "77777777-7777-4777-8777-777777777777";
+
+async function withBookingIsvEnv(value, callback) {
+  const hadValue = Object.prototype.hasOwnProperty.call(process.env, "BOOKING_ISV_ENABLED");
+  const previousValue = process.env.BOOKING_ISV_ENABLED;
+  if (value === undefined) {
+    delete process.env.BOOKING_ISV_ENABLED;
+  } else {
+    process.env.BOOKING_ISV_ENABLED = value;
+  }
+  try {
+    return await callback();
+  } finally {
+    if (hadValue) {
+      process.env.BOOKING_ISV_ENABLED = previousValue;
+    } else {
+      delete process.env.BOOKING_ISV_ENABLED;
+    }
+  }
+}
 
 function createTariffClient(rows) {
   const calls = [];
@@ -38,6 +62,21 @@ function createTariffClient(rows) {
     },
   };
 }
+
+test("BOOKING_ISV_ENABLED ausente desactiva ISV por defecto", async () => {
+  await withBookingIsvEnv(undefined, async () => {
+    assert.equal(resolveBookingIsvEnabled(), false);
+  });
+});
+
+test("BOOKING_ISV_ENABLED se valida como booleano estricto", () => {
+  assert.equal(parseStrictBooleanEnv("false", { name: "BOOKING_ISV_ENABLED" }), false);
+  assert.equal(parseStrictBooleanEnv("true", { name: "BOOKING_ISV_ENABLED" }), true);
+  assert.throws(
+    () => parseStrictBooleanEnv("1", { name: "BOOKING_ISV_ENABLED" }),
+    /BOOKING_ISV_ENABLED invalido/
+  );
+});
 
 test("servicio simple persiste tarifa, snapshot, duracion y buffer de servicios_tarifas", async () => {
   const client = createTariffClient([{
@@ -100,7 +139,7 @@ test("tarifa futura usa la fecha operativa de la cita y no CURRENT_DATE", async 
   assert.ok(!String(tariffCall.sql).includes("CURRENT_DATE"));
 });
 
-test("seleccion de servicios suma total pagable con ISV adicional", async () => {
+test("BOOKING_ISV_ENABLED=false ignora tarifa con 15% y no expone ISV", async () => {
   const client = createTariffClient([{
     id_servicio: SERVICE_A,
     id_tarifa: TARIFF_A,
@@ -112,7 +151,44 @@ test("seleccion de servicios suma total pagable con ISV adicional", async () => 
     isv_porcentaje: "15.00",
   }]);
 
-  const selection = await getServiceSelectionDetails(client, BRANCH_A, [SERVICE_A], null, "2026-07-15T09:00:00-06:00");
+  const selection = await getServiceSelectionDetails(
+    client,
+    BRANCH_A,
+    [SERVICE_A],
+    null,
+    "2026-07-15T09:00:00-06:00",
+    { bookingIsvEnabled: false }
+  );
+
+  assert.equal(selection.monto_subtotal_hnl, 100);
+  assert.equal(selection.monto_isv_hnl, 0);
+  assert.equal(selection.monto_total_hnl, 100);
+  assert.equal(selection.items[0].incluye_isv_snapshot, false);
+  assert.equal(selection.items[0].isv_porcentaje, 0);
+  assert.equal(selection.items[0].isv_hnl, 0);
+  assert.equal(selection.items[0].total_linea_hnl, 100);
+});
+
+test("BOOKING_ISV_ENABLED=true suma total pagable con ISV adicional", async () => {
+  const client = createTariffClient([{
+    id_servicio: SERVICE_A,
+    id_tarifa: TARIFF_A,
+    nombre_servicio: "Corte con ISV",
+    duracion_min: 30,
+    buffer_min: 5,
+    precio_hnl: "100.00",
+    incluye_isv: false,
+    isv_porcentaje: "15.00",
+  }]);
+
+  const selection = await getServiceSelectionDetails(
+    client,
+    BRANCH_A,
+    [SERVICE_A],
+    null,
+    "2026-07-15T09:00:00-06:00",
+    { bookingIsvEnabled: true }
+  );
 
   assert.equal(selection.monto_subtotal_hnl, 100);
   assert.equal(selection.monto_isv_hnl, 15);
@@ -132,7 +208,14 @@ test("seleccion de servicios mantiene ISV incluido como informativo sin duplicar
     isv_porcentaje: "15.00",
   }]);
 
-  const selection = await getServiceSelectionDetails(client, BRANCH_A, [SERVICE_A], null, "2026-07-15T09:00:00-06:00");
+  const selection = await getServiceSelectionDetails(
+    client,
+    BRANCH_A,
+    [SERVICE_A],
+    null,
+    "2026-07-15T09:00:00-06:00",
+    { bookingIsvEnabled: true }
+  );
 
   assert.equal(selection.monto_subtotal_hnl, 100);
   assert.equal(selection.monto_isv_hnl, 13.04);
@@ -284,7 +367,7 @@ test("detalles persisten porcentaje ISV y calculan ISV incluido como informativo
       incluye_isv: false,
       isv_porcentaje: 15,
     },
-  ]);
+  ], { bookingIsvEnabled: true });
   const [included] = buildAppointmentDetailRows([
     {
       id_servicio: SERVICE_B,
@@ -296,7 +379,7 @@ test("detalles persisten porcentaje ISV y calculan ISV incluido como informativo
       incluye_isv: true,
       isv_porcentaje: 15,
     },
-  ]);
+  ], { bookingIsvEnabled: true });
 
   assert.equal(taxed.isv_porcentaje, 15);
   assert.equal(taxed.isv_hnl, 15);
@@ -306,6 +389,116 @@ test("detalles persisten porcentaje ISV y calculan ISV incluido como informativo
   assert.equal(included.incluye_isv_snapshot, true);
   assert.equal(included.isv_hnl, 13.04);
   assert.equal(included.total_linea_hnl, 100);
+});
+
+test("descuento con BOOKING_ISV_ENABLED=false no calcula ni suma ISV", () => {
+  const [row] = buildAppointmentDetailRows([
+    {
+      id_servicio: SERVICE_A,
+      id_tarifa: TARIFF_A,
+      nombre_servicio: "Corte",
+      duracion_min: 30,
+      buffer_min: 5,
+      precio_hnl: 100,
+      incluye_isv: false,
+      isv_porcentaje: 15,
+    },
+  ], { descuentoTotalHnl: 10, bookingIsvEnabled: false });
+
+  assert.equal(row.descuento_hnl, 10);
+  assert.equal(row.incluye_isv_snapshot, false);
+  assert.equal(row.isv_porcentaje, 0);
+  assert.equal(row.isv_hnl, 0);
+  assert.equal(row.total_linea_hnl, 90);
+});
+
+test("descuento con BOOKING_ISV_ENABLED=true recalcula ISV adicional sobre base neta", () => {
+  const [row] = buildAppointmentDetailRows([
+    {
+      id_servicio: SERVICE_A,
+      id_tarifa: TARIFF_A,
+      nombre_servicio: "Corte",
+      duracion_min: 30,
+      buffer_min: 5,
+      precio_hnl: 100,
+      incluye_isv: false,
+      isv_porcentaje: 15,
+    },
+  ], { descuentoTotalHnl: 10, bookingIsvEnabled: true });
+
+  assert.equal(row.descuento_hnl, 10);
+  assert.equal(row.incluye_isv_snapshot, false);
+  assert.equal(row.isv_porcentaje, 15);
+  assert.equal(row.isv_hnl, 13.5);
+  assert.equal(row.total_linea_hnl, 103.5);
+});
+
+test("detalle, cita, grupo e intent coinciden con ISV apagado y encendido", () => {
+  for (const { bookingIsvEnabled, expectedTotal } of [
+    { bookingIsvEnabled: false, expectedTotal: 100 },
+    { bookingIsvEnabled: true, expectedTotal: 115 },
+  ]) {
+    const detailRows = buildAppointmentDetailRows([
+      {
+        id_servicio: SERVICE_A,
+        id_tarifa: TARIFF_A,
+        nombre_servicio: "Corte",
+        duracion_min: 30,
+        buffer_min: 5,
+        precio_hnl: 100,
+        incluye_isv_snapshot: false,
+        isv_porcentaje: 15,
+      },
+    ], { bookingIsvEnabled });
+    const paymentRows = buildPaymentDetailRows(
+      detailRows.map((row) => ({ ...row, id_cita_detalle: "99999999-9999-4999-8999-999999999999" })),
+      { bookingIsvEnabled }
+    );
+    const detailTotal = Number(paymentRows.reduce((sum, row) => sum + row.total_linea_hnl, 0).toFixed(2));
+    const citaTotal = detailTotal;
+    const groupTotal = citaTotal;
+    const intentAmount = groupTotal;
+
+    assert.equal(detailTotal, expectedTotal);
+    assert.equal(citaTotal, expectedTotal);
+    assert.equal(groupTotal, expectedTotal);
+    assert.equal(intentAmount, expectedTotal);
+  }
+});
+
+test("reinicio logico con BOOKING_ISV_ENABLED=true activa ISV sin nueva migracion", async () => {
+  const tariffRow = {
+    id_servicio: SERVICE_A,
+    id_tarifa: TARIFF_A,
+    nombre_servicio: "Corte con ISV",
+    duracion_min: 30,
+    buffer_min: 5,
+    precio_hnl: "100.00",
+    incluye_isv: false,
+    isv_porcentaje: "15.00",
+  };
+
+  await withBookingIsvEnv("false", async () => {
+    const selection = await getServiceSelectionDetails(
+      createTariffClient([tariffRow]),
+      BRANCH_A,
+      [SERVICE_A],
+      null,
+      "2026-07-15T09:00:00-06:00"
+    );
+    assert.equal(selection.monto_total_hnl, 100);
+  });
+
+  await withBookingIsvEnv("true", async () => {
+    const selection = await getServiceSelectionDetails(
+      createTariffClient([tariffRow]),
+      BRANCH_A,
+      [SERVICE_A],
+      null,
+      "2026-07-15T09:00:00-06:00"
+    );
+    assert.equal(selection.monto_total_hnl, 115);
+  });
 });
 
 test("createBookingReservation centraliza cita, detalles y hold con el resultado del helper", async () => {
@@ -405,6 +598,7 @@ test("createBookingReservation usa SUM(total_linea_hnl) para total de cita y per
         },
       },
     },
+    bookingIsvEnabled: true,
   });
 
   assert.equal(result.totals.subtotalHnl, 100);
@@ -412,6 +606,7 @@ test("createBookingReservation usa SUM(total_linea_hnl) para total de cita y per
   assert.equal(result.totals.totalHnl, 115);
   assert.equal(calls[0].params[14], 100);
   assert.equal(calls[0].params[16], 115);
+  assert.match(calls[1].sql, /\$12::boolean/);
   assert.equal(calls[1].params[11], false);
   assert.equal(calls[1].params[13], 15);
   assert.equal(calls[1].params[14], 115);

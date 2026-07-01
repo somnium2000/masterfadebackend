@@ -332,8 +332,8 @@ BEGIN
 
   NEW.id_tarifa := v_tarifa.id_tarifa;
   NEW.precio_referencia_hnl := COALESCE(NULLIF(NEW.precio_referencia_hnl, 0), v_tarifa.precio_hnl, NEW.precio_unitario_hnl, 0);
-  NEW.incluye_isv_snapshot := COALESCE(v_tarifa.incluye_isv, false);
-  NEW.isv_porcentaje := COALESCE(v_tarifa.isv_porcentaje, 0);
+  NEW.incluye_isv_snapshot := COALESCE(NEW.incluye_isv_snapshot, false);
+  NEW.isv_porcentaje := LEAST(GREATEST(COALESCE(NEW.isv_porcentaje, 0), 0), 100);
   NEW.subtotal_hnl := ROUND(NEW.precio_unitario_hnl * NEW.cantidad, 2);
 
   IF NEW.descuento_hnl < 0 OR NEW.descuento_hnl > NEW.subtotal_hnl THEN

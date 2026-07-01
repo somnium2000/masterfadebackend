@@ -9,6 +9,7 @@ import {
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
 import { normalizeOperationalDateTime } from "../../../services/agendaService.js";
+import { resolveBookingIsvEnabled } from "../../../config/bookingConfig.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
@@ -40,6 +41,71 @@ function normalizeMoney(value) {
 
 function amountsMatch(left, right) {
   return Math.abs(normalizeMoney(left) - normalizeMoney(right)) < 0.01;
+}
+
+function normalizePercentage(value) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Number(Math.min(parsed, 100).toFixed(2));
+}
+
+function calculateLineIsv({ subtotalHnl, descuentoHnl, isvPorcentaje, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  const percentage = normalizePercentage(isvPorcentaje);
+  if (percentage <= 0) return 0;
+  if (incluyeIsv) {
+    return normalizeMoney(taxableBase - (taxableBase / (1 + (percentage / 100))));
+  }
+  return normalizeMoney((taxableBase * percentage) / 100);
+}
+
+function calculateLineTotal({ subtotalHnl, descuentoHnl, isvHnl, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  return normalizeMoney(taxableBase + (incluyeIsv ? 0 : Number(isvHnl || 0)));
+}
+
+export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = 0, bookingIsvEnabled = false } = {}) {
+  const isvEnabled = bookingIsvEnabled === true;
+  const rows = (Array.isArray(detailRows) ? detailRows : []).map((row) => {
+    const quantity = Math.max(1, Math.trunc(Number(row?.cantidad || 1)));
+    const unitPrice = normalizeMoney(row?.precio_unitario_hnl);
+    const subtotalHnl = normalizeMoney(row?.subtotal_hnl ?? unitPrice * quantity);
+    const incluyeIsvSnapshot = isvEnabled && row?.incluye_isv_snapshot === true;
+    const isvPorcentaje = isvEnabled ? normalizePercentage(row?.isv_porcentaje) : 0;
+    return {
+      id_cita_detalle: row?.id_cita_detalle,
+      subtotal_hnl: subtotalHnl,
+      descuento_hnl: 0,
+      incluye_isv_snapshot: incluyeIsvSnapshot,
+      isv_porcentaje: isvPorcentaje,
+      isv_hnl: 0,
+      total_linea_hnl: subtotalHnl,
+    };
+  });
+
+  const subtotal = normalizeMoney(rows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
+  const requestedDiscount = Math.min(normalizeMoney(descuentoTotalHnl), subtotal);
+  let remainingDiscount = requestedDiscount;
+  rows.forEach((row, index) => {
+    const discount = index === rows.length - 1
+      ? remainingDiscount
+      : normalizeMoney(subtotal > 0 ? (requestedDiscount * row.subtotal_hnl) / subtotal : 0);
+    row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
+    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+    row.isv_hnl = calculateLineIsv({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvPorcentaje: row.isv_porcentaje,
+      incluyeIsv: row.incluye_isv_snapshot,
+    });
+    row.total_linea_hnl = calculateLineTotal({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvHnl: row.isv_hnl,
+      incluyeIsv: row.incluye_isv_snapshot,
+    });
+  });
+  return rows;
 }
 
 const PUBLIC_PAGOS_SAFE_DETAIL_KEYS = new Set(["field"]);
@@ -505,7 +571,7 @@ async function resolvePublicIntentCreatorUserId(client, { groupRows }) {
   return fallbackUserId;
 }
 
-async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
+async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, bookingIsvEnabled = false }) {
   const citasResult = await client.query(
     `
       SELECT
@@ -534,9 +600,17 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
   for (const cita of citasResult.rows || []) {
     const detallesResult = await client.query(
       `
-        SELECT id_servicio, cantidad, precio_unitario_hnl, subtotal_hnl
+        SELECT
+          id_cita_detalle,
+          id_servicio,
+          cantidad,
+          precio_unitario_hnl,
+          subtotal_hnl,
+          incluye_isv_snapshot,
+          isv_porcentaje
         FROM public.citas_detalles
         WHERE id_cita = $1::uuid
+        ORDER BY id_cita_detalle ASC
       `,
       [cita.id_cita]
     );
@@ -552,9 +626,11 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
       [cita.id_cita]
     );
     const selectedPromo = selectedPromoResult.rows[0] || null;
-    const subtotalCita = Number(cita.subtotal_servicios_hnl || 0);
+    const detalleSubtotal = normalizeMoney(
+      (detallesResult.rows || []).reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0)
+    );
+    const subtotalCita = detalleSubtotal || Number(cita.subtotal_servicios_hnl || 0);
     let descuentoCita = 0;
-    let totalCita = subtotalCita;
 
     try {
       const operationalDateTime = normalizeOperationalDateTime(new Date(cita.inicio_at), "inicio_at");
@@ -602,24 +678,54 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
         } else {
           descuentoCita = Number(preview.descuento_total_hnl || 0);
         }
-        totalCita = Math.max(0, Number((subtotalCita - descuentoCita).toFixed(2)));
         promocionesAplicadas.push(...(preview.promociones_aplicadas || []));
         promocionesDescartadas.push(...(preview.promociones_descartadas || []));
       }
     } catch {
       descuentoCita = 0;
-      totalCita = subtotalCita;
+    }
+
+    const normalizedDetails = buildPaymentDetailRows(detallesResult.rows, {
+      descuentoTotalHnl: descuentoCita,
+      bookingIsvEnabled,
+    });
+    const totalCita = normalizedDetails.length
+      ? normalizeMoney(normalizedDetails.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0))
+      : normalizeMoney(Math.max(0, subtotalCita - descuentoCita));
+
+    for (const detail of normalizedDetails) {
+      await client.query(
+        `
+          UPDATE public.citas_detalles
+          SET descuento_hnl = $2::numeric,
+              incluye_isv_snapshot = $3::boolean,
+              isv_porcentaje = $4::numeric,
+              isv_hnl = $5::numeric,
+              total_linea_hnl = $6::numeric,
+              updated_at = now()
+          WHERE id_cita_detalle = $1::uuid
+        `,
+        [
+          detail.id_cita_detalle,
+          detail.descuento_hnl,
+          detail.incluye_isv_snapshot,
+          detail.isv_porcentaje,
+          detail.isv_hnl,
+          detail.total_linea_hnl,
+        ]
+      );
     }
 
     await client.query(
       `
         UPDATE public.citas
-        SET descuento_hnl = $2::numeric,
-            total_pagar_hnl = $3::numeric,
+        SET subtotal_servicios_hnl = $2::numeric,
+            descuento_hnl = $3::numeric,
+            total_pagar_hnl = $4::numeric,
             updated_at = now()
         WHERE id_cita = $1::uuid
       `,
-      [cita.id_cita, descuentoCita, totalCita]
+      [cita.id_cita, subtotalCita, descuentoCita, totalCita]
     );
 
     subtotal += subtotalCita;
@@ -999,8 +1105,9 @@ export default async function publicPagosRoutes(app) {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const titularEmail = normalizeEmail(request.body?.titular_email);
       const providerCode = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+      const bookingIsvEnabled = resolveBookingIsvEnabled(app.config);
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
-      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita });
+      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, bookingIsvEnabled });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       assertPublicGroupPayable(groupRows);
       const expiredHold = groupRows.some((row) => row.estado_hold_codigo !== "activo" || !row.expires_at || new Date(row.expires_at).getTime() <= Date.now());

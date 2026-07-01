@@ -1408,6 +1408,7 @@ export default async function citasRoutes(app) {
           id_paquete: request.body?.id_paquete ?? null,
           fecha_inicio: request.body.fecha_inicio,
           id_barbero: request.body.id_barbero ?? null,
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
 
         await dbClient.query("BEGIN");
@@ -1430,6 +1431,7 @@ export default async function citasRoutes(app) {
             expiresAt: selection.expiresAt.toISOString(),
             returning: true,
           },
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
         const citaId = reservation.citaId;
         const persistedTotals = reservation.totals || {
@@ -1739,6 +1741,7 @@ export default async function citasRoutes(app) {
             id_paquete: integrante.id_paquete,
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
+            bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           let selection = selectionBase;
           let forcedServiceIdsApplied = [];
@@ -1770,6 +1773,7 @@ export default async function citasRoutes(app) {
                   id_paquete: integrante.id_paquete,
                   fecha_inicio: integrante.fecha_inicio,
                   id_barbero: integrante.id_barbero,
+                  bookingIsvEnabled: app.config?.bookingIsvEnabled,
                 });
                 selection = forcedSelection;
                 const forcedSelectedServiceIds = new Set(
@@ -1802,7 +1806,9 @@ export default async function citasRoutes(app) {
             selection.serviceSelection.items,
             { isTitular, forcedServiceIds: forcedServiceIdsApplied }
           );
-          const subtotalServicios = Number(selection.serviceSelection.monto_total_hnl || 0);
+          const subtotalServicios = Number(
+            selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl ?? 0
+          );
           let rewardCoveredInBlock = 0;
           if (isTitular && rewardRedeemContext) {
             const rewardServiceId = String(rewardRedeemContext.id_servicio_canje || "").trim();
@@ -1913,6 +1919,7 @@ export default async function citasRoutes(app) {
               userId: holdUserId,
               expiresAt: holdExpiresAt.toISOString(),
             },
+            bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           const citaId = reservation.citaId;
           const persistedTotals = reservation.totals || {

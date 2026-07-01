@@ -1,4 +1,5 @@
 import { AppError } from "../utils/errors.js";
+import { resolveBookingIsvEnabled } from "../config/bookingConfig.js";
 import { MockPaymentProvider } from "./payments/MockPaymentProvider.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
 
@@ -1005,10 +1006,11 @@ function calculateLineTaxSnapshot({ subtotalHnl, descuentoHnl = 0, isvPorcentaje
   };
 }
 
-function enrichSelectionItem(row) {
+function enrichSelectionItem(row, { bookingIsvEnabled = resolveBookingIsvEnabled() } = {}) {
   const precioHnl = normalizeMoney(row.precio_hnl);
-  const incluyeIsv = row.incluye_isv === true;
-  const isvPorcentaje = normalizePercentage(row.isv_porcentaje);
+  const isvEnabled = bookingIsvEnabled === true;
+  const incluyeIsv = isvEnabled && row.incluye_isv === true;
+  const isvPorcentaje = isvEnabled ? normalizePercentage(row.isv_porcentaje) : 0;
   const taxSnapshot = calculateLineTaxSnapshot({
     subtotalHnl: precioHnl,
     descuentoHnl: 0,
@@ -1051,7 +1053,14 @@ export function assertBookingSelectionRuntimeSupported(selectionType) {
   return normalized;
 }
 
-export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null, fechaInicio = null) {
+export async function getServiceSelectionDetails(
+  client,
+  branchId,
+  serviceIds,
+  barberId = null,
+  fechaInicio = null,
+  { bookingIsvEnabled = resolveBookingIsvEnabled() } = {}
+) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
@@ -1132,7 +1141,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         details: { id_servicio: row.id_servicio, id_sucursal: safeBranchId, id_barbero: safeBarberId },
       });
     }
-    byId.set(row.id_servicio, enrichSelectionItem(row));
+    byId.set(row.id_servicio, enrichSelectionItem(row, { bookingIsvEnabled }));
   }
 
   const details = requestedIds.map((idServicio) => byId.get(idServicio)).filter(Boolean);
@@ -1155,7 +1164,14 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
   };
 }
 
-export async function getPackageSelectionDetails(client, branchId, packageId, barberId = null, fechaInicio = null) {
+export async function getPackageSelectionDetails(
+  client,
+  branchId,
+  packageId,
+  barberId = null,
+  fechaInicio = null,
+  { bookingIsvEnabled = resolveBookingIsvEnabled() } = {}
+) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safePackageId = parseSinglePackageId(packageId, { required: true, field: "id_paquete" });
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
@@ -1246,7 +1262,14 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
     }
   }
 
-  const serviceSelection = await getServiceSelectionDetails(client, safeBranchId, expandedServiceIds, safeBarberId, fechaInicio);
+  const serviceSelection = await getServiceSelectionDetails(
+    client,
+    safeBranchId,
+    expandedServiceIds,
+    safeBarberId,
+    fechaInicio,
+    { bookingIsvEnabled }
+  );
   const packagePrice = packageRow.precio_hnl == null
     ? Number(serviceSelection.monto_total_hnl || 0)
     : Number(packageRow.precio_hnl);
@@ -1273,18 +1296,23 @@ export async function getBookingSelectionDetails(client, {
   id_barbero = null,
   fecha_inicio = null,
   fecha_operativa = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   const normalizedSelectionType = normalizeBookingSelectionType(selection_type, { required: true });
   const tariffDateSource = fecha_inicio || fecha_operativa || null;
 
   if (normalizedSelectionType === "package") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource);
+    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource, {
+      bookingIsvEnabled,
+    });
   }
 
   if (normalizedSelectionType === "mixed") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource);
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource, {
+      bookingIsvEnabled,
+    });
     const extraServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: true });
     if (!extraServiceIds.length) {
       return {
@@ -1308,7 +1336,9 @@ export async function getBookingSelectionDetails(client, {
       });
     }
 
-    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero, tariffDateSource);
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero, tariffDateSource, {
+      bookingIsvEnabled,
+    });
     const mergedItems = [
       ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
       ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
@@ -1331,7 +1361,9 @@ export async function getBookingSelectionDetails(client, {
     };
   }
 
-  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero, tariffDateSource);
+  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero, tariffDateSource, {
+    bookingIsvEnabled,
+  });
   return {
     ...servicesSelection,
     selection_type: "services",
@@ -1870,6 +1902,7 @@ export async function findFirstAvailableBarber(client, branchId, dateString, ser
       fecha: dateString,
       id_barbero: null,
       minSellableDurationMin: options?.minSellableDurationMin,
+      bookingIsvEnabled: options?.bookingIsvEnabled,
     });
     return resolved?.barbero_autoasignado
       ? {
@@ -1934,6 +1967,7 @@ async function resolveSelectionForBarberOnDate(client, {
   id_paquete = null,
   id_barbero = null,
   fecha,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 }) {
   return getBookingSelectionDetails(client, {
     id_sucursal,
@@ -1942,6 +1976,7 @@ async function resolveSelectionForBarberOnDate(client, {
     id_paquete,
     id_barbero,
     fecha_operativa: fecha,
+    bookingIsvEnabled,
   });
 }
 
@@ -1954,6 +1989,7 @@ async function evaluateBarberAvailabilityWithFinalSelection(client, {
   barber,
   minSellableDurationMin,
   includeDiscardReasons = false,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 }) {
   const selection = await resolveSelectionForBarberOnDate(client, {
     id_sucursal,
@@ -1962,6 +1998,7 @@ async function evaluateBarberAvailabilityWithFinalSelection(client, {
     id_paquete,
     id_barbero: barber.id_empleado,
     fecha,
+    bookingIsvEnabled,
   });
   const serviceTotalMinutes = Number(selection.duracion_total_min || 0) + Number(selection.buffer_total_min || 0);
   const slotsResult = await getAvailableSlotsForBarber(client, barber.id_empleado, fecha, serviceTotalMinutes, {
@@ -1990,6 +2027,7 @@ export async function resolveEffectiveDayAvailability(client, {
   minSellableDurationMin = null,
   includeDiscardReasons = false,
   barbers = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   const safeBranchId = assertUuid(id_sucursal, "id_sucursal");
   const safeDate = parseDateOnly(fecha, "fecha");
@@ -2017,6 +2055,7 @@ export async function resolveEffectiveDayAvailability(client, {
       barber,
       minSellableDurationMin: resolvedMinSellableDurationMin,
       includeDiscardReasons,
+      bookingIsvEnabled,
     });
     const discardedReasonCodes = includeDiscardReasons
       ? Array.from(new Set(evaluated.discarded.map((entry) => String(entry?.reason || "").trim()).filter(Boolean)))
@@ -2054,6 +2093,7 @@ export async function resolveEffectiveDayAvailability(client, {
         barber,
         minSellableDurationMin: resolvedMinSellableDurationMin,
         includeDiscardReasons: false,
+        bookingIsvEnabled,
       });
     } catch (error) {
       if (isTariffMissingForSelection(error)) {
@@ -2299,6 +2339,7 @@ export async function listAvailabilityByDateRangeForRequest(client, {
   fecha_desde,
   fecha_hasta,
   id_barbero = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   const safeFrom = parseDateOnly(fecha_desde, "fecha_desde");
   const safeTo = parseDateOnly(fecha_hasta, "fecha_hasta");
@@ -2315,6 +2356,7 @@ export async function listAvailabilityByDateRangeForRequest(client, {
         id_paquete,
         fecha: dateKey,
         id_barbero,
+        bookingIsvEnabled,
       });
     } catch (error) {
       if (isTariffMissingForSelection(error)) {
@@ -2344,6 +2386,7 @@ export async function resolveBookingSelection(client, {
   id_barbero = null,
   selection_type = "services",
   id_paquete = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 }) {
   const branch = await ensureActiveBranch(client, id_sucursal);
   const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
@@ -2370,6 +2413,7 @@ export async function resolveBookingSelection(client, {
       id_paquete,
       id_barbero: barber.id_empleado,
       fecha_operativa: dateKey,
+      bookingIsvEnabled,
     });
     const finalTotalMinutes = Number(finalSelection.duracion_total_min || 0) + Number(finalSelection.buffer_total_min || 0);
     const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, finalTotalMinutes, {
@@ -2395,6 +2439,7 @@ export async function resolveBookingSelection(client, {
           id_paquete,
           id_barbero: barber.id_empleado,
           fecha_operativa: dateKey,
+          bookingIsvEnabled,
         });
         const finalTotalMinutes = Number(selection.duracion_total_min || 0) + Number(selection.buffer_total_min || 0);
         const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, finalTotalMinutes, {

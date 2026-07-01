@@ -855,7 +855,7 @@ async function resolveRequestedPromotionsForPublicHold(client, {
     fecha: startDateTime.fecha_operativa,
     fecha_operativa: startDateTime.fecha_operativa,
     hora: startDateTime.hora_operativa,
-    subtotal_hnl: selection.serviceSelection.monto_total_hnl,
+    subtotal_hnl: Number(selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl ?? 0),
     servicios: selection.serviceSelection.items || [],
     paquetes: selection.serviceSelection.id_paquete
       ? [{ id_paquete: selection.serviceSelection.id_paquete }]
@@ -1413,6 +1413,7 @@ export default async function publicCitasRoutes(app) {
             id_paquete: integrante.id_paquete,
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
+            bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           if (
             index > 0
@@ -1433,7 +1434,9 @@ export default async function publicCitasRoutes(app) {
             };
           }
 
-          const subtotalServiciosHnl = normalizeMoney(selection.serviceSelection.monto_total_hnl);
+          const subtotalServiciosHnl = normalizeMoney(
+            selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl
+          );
           const promotionResult = await resolveRequestedPromotionsForPublicHold(dbClient, {
             branch,
             clientProfile,
@@ -1472,6 +1475,7 @@ export default async function publicCitasRoutes(app) {
               state: holdState,
               expiresAt: expiresAt.toISOString(),
             },
+            bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           const citaId = reservation.citaId;
           const persistedTotals = reservation.totals || {

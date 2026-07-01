@@ -60,8 +60,9 @@ function buildSelection(rawDateTime = "2026-07-15T09:00:00-06:00") {
   };
 }
 
-async function createHarnessApp(client) {
+async function createHarnessApp(client, { bookingIsvEnabled = false } = {}) {
   const app = Fastify({ logger: false });
+  app.decorate("config", { bookingIsvEnabled });
   app.post("/hold", async (request, reply) => {
     try {
       const selectionType = assertBookingSelectionCreationSupported(request.body?.selection_type || "services");
@@ -86,6 +87,7 @@ async function createHarnessApp(client) {
           expiresAt: "2026-07-15T16:00:00.000Z",
           returning: true,
         },
+        bookingIsvEnabled: app.config.bookingIsvEnabled,
       });
       await client.query("COMMIT");
       return reply.code(201).send({
@@ -113,7 +115,7 @@ async function createHarnessApp(client) {
   return app;
 }
 
-test("Fastify inject crea hold con BEGIN, inserts centralizados y COMMIT", async () => {
+test("Fastify inject crea hold con ISV apagado, BEGIN, inserts centralizados y COMMIT", async () => {
   const client = createMockClient();
   const app = await createHarnessApp(client);
 
@@ -127,13 +129,31 @@ test("Fastify inject crea hold con BEGIN, inserts centralizados y COMMIT", async
   });
 
   assert.equal(response.statusCode, 201);
-  assert.equal(response.json().total_pagar_hnl, 115);
+  assert.equal(response.json().total_pagar_hnl, 100);
   const order = client.calls.map((call) => (
     call.sql === "BEGIN" || call.sql === "COMMIT" || call.sql === "ROLLBACK"
       ? call.sql
       : call.sql.match(/INSERT INTO public\.([a-z_]+)/)?.[1]
   )).filter(Boolean);
   assert.deepEqual(order, ["BEGIN", "citas", "citas_detalles", "citas_holds", "COMMIT"]);
+  await app.close();
+});
+
+test("Fastify inject con BOOKING_ISV_ENABLED=true suma ISV adicional", async () => {
+  const client = createMockClient();
+  const app = await createHarnessApp(client, { bookingIsvEnabled: true });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/hold",
+    payload: {
+      selection_type: "services",
+      fecha_inicio: "2026-07-15T09:00:00-06:00",
+    },
+  });
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(response.json().total_pagar_hnl, 115);
   await app.close();
 });
 

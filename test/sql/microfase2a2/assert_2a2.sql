@@ -58,6 +58,8 @@ INSERT INTO public.citas_detalles (
   precio_unitario_hnl,
   subtotal_hnl,
   descuento_hnl,
+  incluye_isv_snapshot,
+  isv_porcentaje,
   nombre_servicio_snapshot
 )
 VALUES (
@@ -72,6 +74,68 @@ VALUES (
   300,
   300,
   0,
+  false,
+  0,
+  'Corte fixture'
+)
+ON CONFLICT (id_cita_detalle) DO NOTHING;
+
+INSERT INTO public.citas (
+  id_cita,
+  id_grupo_cita,
+  id_sucursal,
+  id_empleado_barbero,
+  inicio_at,
+  fin_at,
+  duracion_total_min,
+  buffer_total_min,
+  subtotal_servicios_hnl,
+  total_pagar_hnl
+)
+VALUES (
+  'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  '99999999-9999-4999-8999-999999999999',
+  '11111111-1111-4111-8111-111111111111',
+  '33333333-3333-4333-8333-333333333333',
+  '2026-07-15T17:00:00Z',
+  '2026-07-15T17:35:00Z',
+  30,
+  5,
+  0,
+  0
+)
+ON CONFLICT (id_cita) DO NOTHING;
+
+INSERT INTO public.citas_detalles (
+  id_cita_detalle,
+  id_cita,
+  id_servicio,
+  id_tarifa,
+  cantidad,
+  duracion_min,
+  buffer_min,
+  precio_referencia_hnl,
+  precio_unitario_hnl,
+  subtotal_hnl,
+  descuento_hnl,
+  incluye_isv_snapshot,
+  isv_porcentaje,
+  nombre_servicio_snapshot
+)
+VALUES (
+  'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+  'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  '44444444-4444-4444-8444-444444444444',
+  1,
+  30,
+  5,
+  300,
+  300,
+  300,
+  0,
+  true,
+  15,
   'Corte fixture'
 )
 ON CONFLICT (id_cita_detalle) DO NOTHING;
@@ -79,7 +143,9 @@ ON CONFLICT (id_cita_detalle) DO NOTHING;
 DO $$
 DECLARE
   v_detail record;
+  v_taxed_detail record;
   v_cita record;
+  v_taxed_cita record;
   v_grupo record;
   v_expected_group_total numeric;
 BEGIN
@@ -91,8 +157,20 @@ BEGIN
   IF v_detail.incluye_isv_snapshot IS DISTINCT FROM false THEN
     RAISE EXCEPTION 'incluye_isv_snapshot trigger mismatch';
   END IF;
-  IF v_detail.isv_hnl <> 45.00 OR v_detail.total_linea_hnl <> 345.00 THEN
-    RAISE EXCEPTION 'ISV trigger mismatch: %, %', v_detail.isv_hnl, v_detail.total_linea_hnl;
+  IF v_detail.isv_porcentaje <> 0.00 OR v_detail.isv_hnl <> 0.00 OR v_detail.total_linea_hnl <> 300.00 THEN
+    RAISE EXCEPTION 'ISV disabled trigger mismatch: %, %, %', v_detail.isv_porcentaje, v_detail.isv_hnl, v_detail.total_linea_hnl;
+  END IF;
+
+  SELECT *
+  INTO v_taxed_detail
+  FROM public.citas_detalles
+  WHERE id_cita_detalle = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+  IF v_taxed_detail.incluye_isv_snapshot IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'incluye_isv_snapshot true trigger mismatch';
+  END IF;
+  IF v_taxed_detail.isv_porcentaje <> 15.00 OR v_taxed_detail.isv_hnl <> 45.00 OR v_taxed_detail.total_linea_hnl <> 345.00 THEN
+    RAISE EXCEPTION 'ISV enabled trigger mismatch: %, %, %', v_taxed_detail.isv_porcentaje, v_taxed_detail.isv_hnl, v_taxed_detail.total_linea_hnl;
   END IF;
 
   SELECT subtotal_servicios_hnl, total_pagar_hnl, duracion_total_min, buffer_total_min
@@ -100,11 +178,20 @@ BEGIN
   FROM public.citas
   WHERE id_cita = '77777777-7777-4777-8777-777777777777';
 
-  IF v_cita.subtotal_servicios_hnl <> 300.00 OR v_cita.total_pagar_hnl <> 345.00 THEN
+  IF v_cita.subtotal_servicios_hnl <> 300.00 OR v_cita.total_pagar_hnl <> 300.00 THEN
     RAISE EXCEPTION 'cita recalculation mismatch: %, %', v_cita.subtotal_servicios_hnl, v_cita.total_pagar_hnl;
   END IF;
   IF v_cita.duracion_total_min <> 30 OR v_cita.buffer_total_min <> 5 THEN
     RAISE EXCEPTION 'cita timing recalculation mismatch';
+  END IF;
+
+  SELECT subtotal_servicios_hnl, total_pagar_hnl
+  INTO v_taxed_cita
+  FROM public.citas
+  WHERE id_cita = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+
+  IF v_taxed_cita.subtotal_servicios_hnl <> 300.00 OR v_taxed_cita.total_pagar_hnl <> 345.00 THEN
+    RAISE EXCEPTION 'taxed cita recalculation mismatch: %, %', v_taxed_cita.subtotal_servicios_hnl, v_taxed_cita.total_pagar_hnl;
   END IF;
 
   SELECT total_hnl, estado_grupo_codigo
