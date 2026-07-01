@@ -22,6 +22,13 @@ import {
   evaluatePromotions,
   resolvePromotionConflicts,
 } from "../../../services/promociones/promocionesEngine.js";
+import {
+  createAppointmentCore,
+  createAppointmentHold,
+  createBookingGroup,
+  insertAppointmentDetails,
+  updateBookingGroupTotal,
+} from "../../../services/bookingReservationService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -1350,27 +1357,14 @@ export default async function publicCitasRoutes(app) {
         const targetAppointmentState = "en_espera";
         const holdState = "activo";
 
-        const groupInsert = await dbClient.query(
-          `
-            INSERT INTO public.citas_grupos (
-              id_sucursal,
-              id_persona_titular,
-              id_cliente_titular,
-              estado_grupo_codigo,
-              notas
-            )
-            VALUES ($1::uuid, $2::uuid, $3::uuid, 'activo', $4)
-            RETURNING id_grupo_cita, estado_grupo_codigo
-          `,
-          [
-            branch.id_sucursal,
-            clientProfile.id_persona,
-            clientProfile.id_cliente,
-            request.body?.notas ?? null,
-          ]
-        );
-
-        const groupRecord = groupInsert.rows[0];
+        const groupRecord = await createBookingGroup(dbClient, {
+          idSucursal: branch.id_sucursal,
+          idPersonaTitular: clientProfile.id_persona,
+          idClienteTitular: clientProfile.id_cliente,
+          idUsuarioTitular: null,
+          origenCodigo: "publico",
+          notas: request.body?.notas ?? null,
+        });
         const releaseTokenSupport = await getPublicHoldReleaseTokenSupport(dbClient);
         const releaseToken = releaseTokenSupport.supported ? generatePublicReleaseToken() : null;
         if (releaseToken) {
@@ -1429,7 +1423,6 @@ export default async function publicCitasRoutes(app) {
             };
           }
 
-          const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
           const subtotalServiciosHnl = normalizeMoney(selection.serviceSelection.monto_total_hnl);
           const promotionResult = await resolveRequestedPromotionsForPublicHold(dbClient, {
             branch,
@@ -1442,87 +1435,27 @@ export default async function publicCitasRoutes(app) {
           const descuentoHnl = normalizeMoney(promotionResult.descuento_hnl);
           const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
 
-          const citaInsert = await dbClient.query(
-            `
-              INSERT INTO public.citas (
-                id_grupo_cita,
-                orden_integrante,
-                alias_integrante,
-                id_sucursal,
-                id_empleado_barbero,
-                id_persona_cliente,
-                id_cliente,
-                creada_por_usuario_id,
-                asignada_automaticamente,
-                estado_cita_codigo,
-                inicio_at,
-                fin_at,
-                duracion_total_min,
-                buffer_total_min,
-                subtotal_servicios_hnl,
-                descuento_hnl,
-                total_pagar_hnl,
-                selection_type,
-                id_paquete,
-                contacto_nombre,
-                contacto_email,
-                contacto_telefono,
-                notas
-              )
-              VALUES (
-                $1::uuid,
-                $2::int,
-                $3,
-                $4::uuid,
-                $5::uuid,
-                $6::uuid,
-                $7::uuid,
-                NULL,
-                $8::boolean,
-                $9::text,
-                $10::timestamptz,
-                $11::timestamptz,
-                $12::int,
-                $13::int,
-                $14::numeric,
-                $15::numeric,
-                $16::numeric,
-                $17::text,
-                $18::uuid,
-                $19,
-                $20,
-                $21,
-                $22
-              )
-              RETURNING id_cita
-            `,
-            [
-              groupRecord.id_grupo_cita,
-              integrante.orden_integrante,
-              integrante.alias,
-              branch.id_sucursal,
-              selection.barber.id_empleado,
-              clientProfile.id_persona,
-              clientProfile.id_cliente,
-              !integrante.id_barbero,
-              targetAppointmentState,
-              selection.startDateTime.toISOString(),
-              finAt.toISOString(),
-              selection.serviceSelection.duracion_total_min,
-              selection.serviceSelection.buffer_total_min,
-              subtotalServiciosHnl,
-              descuentoHnl,
-              totalPagarHnl,
-              selection.serviceSelection.selection_type || integrante.selection_type || "services",
-              selection.serviceSelection.id_paquete || integrante.id_paquete || null,
-              integrante.contacto?.nombre || integrante.alias,
-              integrante.contacto?.email || null,
-              integrante.contacto?.telefono || null,
-              request.body?.notas ?? null,
-            ]
-          );
-
-          const citaId = citaInsert.rows[0].id_cita;
+          const appointment = await createAppointmentCore(dbClient, {
+            groupId: groupRecord.id_grupo_cita,
+            order: integrante.orden_integrante,
+            alias: integrante.alias,
+            branchId: branch.id_sucursal,
+            barberId: selection.barber.id_empleado,
+            personId: clientProfile.id_persona,
+            clientId: clientProfile.id_cliente,
+            createdByUserId: null,
+            autoAssigned: !integrante.id_barbero,
+            state: targetAppointmentState,
+            selection,
+            subtotalHnl: subtotalServiciosHnl,
+            descuentoHnl,
+            totalHnl: totalPagarHnl,
+            contactName: integrante.contacto?.nombre || integrante.alias,
+            contactEmail: integrante.contacto?.email || null,
+            contactPhone: integrante.contacto?.telefono || null,
+            notes: request.body?.notas ?? null,
+          });
+          const citaId = appointment.id_cita;
           for (const appliedPromotion of promotionResult.aplicadas || []) {
             promocionesAplicadasGrupo.push({
               ...appliedPromotion,
@@ -1537,43 +1470,18 @@ export default async function publicCitasRoutes(app) {
               alias: integrante.alias,
             });
           }
-          for (const serviceItem of selection.serviceSelection.items) {
-            await dbClient.query(
-              `
-                INSERT INTO public.citas_detalles (
-                  id_cita,
-                  id_servicio,
-                  cantidad,
-                  duracion_min,
-                  buffer_min,
-                  precio_unitario_hnl,
-                  subtotal_hnl
-                )
-                VALUES ($1::uuid, $2::uuid, 1, $3::int, $4::int, $5::numeric, $6::numeric)
-              `,
-              [
-                citaId,
-                serviceItem.id_servicio,
-                serviceItem.duracion_min,
-                serviceItem.buffer_min,
-                serviceItem.precio_hnl,
-                serviceItem.precio_hnl,
-              ]
-            );
-          }
+          await insertAppointmentDetails(dbClient, {
+            citaId,
+            serviceItems: selection.serviceSelection.items,
+            descuentoTotalHnl: descuentoHnl,
+          });
 
-          await dbClient.query(
-            `
-              INSERT INTO public.citas_holds (
-                id_cita,
-                id_usuario,
-                estado_hold_codigo,
-                expires_at
-              )
-              VALUES ($1::uuid, NULL, $2::text, $3::timestamptz)
-            `,
-            [citaId, holdState, expiresAt.toISOString()]
-          );
+          await createAppointmentHold(dbClient, {
+            citaId,
+            userId: null,
+            state: holdState,
+            expiresAt: expiresAt.toISOString(),
+          });
 
           subtotalGrupo += subtotalServiciosHnl;
           descuentoGrupo += descuentoHnl;
@@ -1597,6 +1505,11 @@ export default async function publicCitasRoutes(app) {
             buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
           });
         }
+
+        await updateBookingGroupTotal(dbClient, {
+          idGrupoCita: groupRecord.id_grupo_cita,
+          totalHnl: totalGrupo,
+        });
 
         await dbClient.query("COMMIT");
 
@@ -1829,7 +1742,6 @@ export default async function publicCitasRoutes(app) {
           `,
           [groupId]
         );
-
         await dbClient.query("COMMIT");
         transactionStarted = false;
 

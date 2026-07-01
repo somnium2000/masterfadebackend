@@ -344,6 +344,15 @@ function formatDateOnlyInTimeZone(dateValue, timeZone) {
   return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
+export function resolveTariffOperationalDate(value, { timeZone = AGENDA_DEFAULT_TIME_ZONE } = {}) {
+  if (!value) return formatDateOnlyInTimeZone(new Date(), timeZone) || formatDateOnly(new Date());
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.trim())) {
+    return parseDateOnly(value.trim(), "fecha_operativa");
+  }
+  const parsed = value instanceof Date ? value : parseDateTime(value, "fecha_inicio");
+  return formatDateOnlyInTimeZone(parsed, timeZone) || formatDateOnly(parsed);
+}
+
 function getTimeZoneOffsetMs(dateValue, timeZone) {
   const parts = getDateTimePartsInTimeZone(dateValue, timeZone);
   if (!parts) return 0;
@@ -903,12 +912,12 @@ function normalizeBookingSelectionType(rawValue, { required = false } = {}) {
   return normalized;
 }
 
-export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
+export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null, fechaInicio = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
-  const enforceBarberServiceAssignments = SERVICE_BARBER_ASSIGNMENTS_ENABLED && Boolean(safeBarberId);
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
   const uniqueIds = Array.from(new Set(requestedIds));
+  const operationalDate = resolveTariffOperationalDate(fechaInicio);
 
   const [servicesResult, globalBufferMin] = await Promise.all([
     client.query(
@@ -916,12 +925,19 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
       WITH active_tariffs AS (
         SELECT
           st.id_servicio,
+          st.id_tarifa,
           st.precio_hnl,
+          st.duracion_min AS tarifa_duracion_min,
+          st.buffer_min AS tarifa_buffer_min,
           COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
           ROW_NUMBER() OVER (
             PARTITION BY st.id_servicio
             ORDER BY 
-              (CASE WHEN st.id_empleado IS NULL THEN 1 ELSE 2 END) ASC,
+              CASE
+                WHEN $3::uuid IS NOT NULL AND st.id_empleado = $3::uuid THEN 0
+                WHEN st.id_empleado IS NULL THEN 1
+                ELSE 2
+              END ASC,
               st.vigente_desde DESC, 
               st.updated_at DESC, 
               st.id_tarifa DESC
@@ -930,19 +946,16 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         WHERE st.id_sucursal = $1::uuid
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
-          AND (
-            st.id_empleado IS NULL
-            OR ($4::boolean IS TRUE AND st.id_empleado = $3::uuid)
-            OR ($4::boolean IS FALSE)
-          )
-          AND st.vigente_desde <= CURRENT_DATE
-          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+          AND (st.id_empleado IS NULL OR ($3::uuid IS NOT NULL AND st.id_empleado = $3::uuid))
+          AND st.vigente_desde <= $4::date
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= $4::date)
       )
       SELECT
         s.id_servicio,
         s.nombre_servicio,
-        s.duracion_min,
-        s.buffer_min,
+        at.id_tarifa,
+        COALESCE(at.tarifa_duracion_min, s.duracion_min) AS duracion_min,
+        COALESCE(at.tarifa_buffer_min, s.buffer_min) AS buffer_min,
         at.precio_hnl
       FROM public.servicios s
       LEFT JOIN active_tariffs at
@@ -955,7 +968,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
-      [safeBranchId, uniqueIds, safeBarberId, enforceBarberServiceAssignments]
+      [safeBranchId, uniqueIds, safeBarberId, operationalDate]
     ),
     getGlobalBufferMinutes(client),
   ]);
@@ -978,6 +991,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
     }
     byId.set(row.id_servicio, {
       id_servicio: row.id_servicio,
+      id_tarifa: row.id_tarifa,
       nombre_servicio: row.nombre_servicio,
       duracion_min: Number(row.duracion_min),
       buffer_min: Number(row.buffer_min ?? 0),
@@ -986,18 +1000,23 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
   }
 
   const details = requestedIds.map((idServicio) => byId.get(idServicio)).filter(Boolean);
+  const resolvedBuffers = details
+    .map((item) => Number(item.buffer_min))
+    .filter((value) => Number.isFinite(value) && value >= 0);
 
   return {
     branchId: safeBranchId,
+    fecha_operativa: operationalDate,
     items: details,
     duracion_total_min: details.reduce((total, item) => total + item.duracion_min, 0),
-    // El buffer se configura globalmente y se aplica una sola vez por cita.
-    buffer_total_min: details.length > 0 ? Number(globalBufferMin || 0) : 0,
+    buffer_total_min: details.length > 0
+      ? (resolvedBuffers.length ? Math.max(...resolvedBuffers) : Number(globalBufferMin || 0))
+      : 0,
     monto_total_hnl: details.reduce((total, item) => total + item.precio_hnl, 0),
   };
 }
 
-export async function getPackageSelectionDetails(client, branchId, packageId, barberId = null) {
+export async function getPackageSelectionDetails(client, branchId, packageId, barberId = null, fechaInicio = null) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safePackageId = parseSinglePackageId(packageId, { required: true, field: "id_paquete" });
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
@@ -1088,7 +1107,7 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
     }
   }
 
-  const serviceSelection = await getServiceSelectionDetails(client, safeBranchId, expandedServiceIds, safeBarberId);
+  const serviceSelection = await getServiceSelectionDetails(client, safeBranchId, expandedServiceIds, safeBarberId, fechaInicio);
   const packagePrice = packageRow.precio_hnl == null
     ? Number(serviceSelection.monto_total_hnl || 0)
     : Number(packageRow.precio_hnl);
@@ -1113,17 +1132,20 @@ export async function getBookingSelectionDetails(client, {
   servicios = null,
   id_paquete = null,
   id_barbero = null,
+  fecha_inicio = null,
+  fecha_operativa = null,
 } = {}) {
   const normalizedSelectionType = normalizeBookingSelectionType(selection_type, { required: true });
+  const tariffDateSource = fecha_inicio || fecha_operativa || null;
 
   if (normalizedSelectionType === "package") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource);
   }
 
   if (normalizedSelectionType === "mixed") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource);
     const extraServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: true });
     if (!extraServiceIds.length) {
       return {
@@ -1147,14 +1169,17 @@ export async function getBookingSelectionDetails(client, {
       });
     }
 
-    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero);
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero, tariffDateSource);
     const mergedItems = [
       ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
       ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
     ];
     const totalDuracion = Number(packageSelection.duracion_total_min || 0) + Number(extraSelection.duracion_total_min || 0);
     const totalMonto = Number(packageSelection.monto_total_hnl || 0) + Number(extraSelection.monto_total_hnl || 0);
-    const globalBuffer = Number(extraSelection.buffer_total_min || packageSelection.buffer_total_min || 0);
+    const totalBuffer = Math.max(
+      Number(packageSelection.buffer_total_min || 0),
+      Number(extraSelection.buffer_total_min || 0)
+    );
 
     return {
       ...packageSelection,
@@ -1162,12 +1187,12 @@ export async function getBookingSelectionDetails(client, {
       items: mergedItems,
       servicios_extra: extraSelection.items,
       duracion_total_min: totalDuracion,
-      buffer_total_min: mergedItems.length > 0 ? globalBuffer : 0,
+      buffer_total_min: mergedItems.length > 0 ? totalBuffer : 0,
       monto_total_hnl: totalMonto,
     };
   }
 
-  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero);
+  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero, tariffDateSource);
   return {
     ...servicesSelection,
     selection_type: "services",
@@ -1923,6 +1948,7 @@ export async function resolveBookingSelection(client, {
     servicios,
     id_paquete,
     id_barbero,
+    fecha_inicio,
   });
   const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
   const { dateKey, timeKey } = extractDateAndTimeKeyFromDateTime(fecha_inicio, "fecha_inicio");

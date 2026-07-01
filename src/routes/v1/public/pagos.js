@@ -1085,7 +1085,8 @@ export default async function publicPagosRoutes(app) {
             referencia_externa,
             idempotency_key,
             expires_at,
-            created_by_usuario_id
+            created_by_usuario_id,
+            id_grupo_cita
           )
           VALUES (
             $1::uuid,
@@ -1098,7 +1099,8 @@ export default async function publicPagosRoutes(app) {
             $6::text,
             $7::text,
             $8::timestamptz,
-            $9::uuid
+            $9::uuid,
+            $10::uuid
           )
           RETURNING id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
         `,
@@ -1112,6 +1114,7 @@ export default async function publicPagosRoutes(app) {
           idempotencyKey,
           new Date(anchor.expires_at).toISOString(),
           createdByUserId,
+          idGrupoCita,
         ]
       );
 

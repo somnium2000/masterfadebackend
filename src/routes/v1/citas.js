@@ -28,6 +28,13 @@ import {
   resolveRedeemContextForHold,
 } from "../../services/pointsService.js";
 import {
+  createAppointmentCore,
+  createAppointmentHold,
+  createBookingGroup,
+  insertAppointmentDetails,
+  updateBookingGroupTotal,
+} from "../../services/bookingReservationService.js";
+import {
   previewPromotionsForAppointment,
   recordPromotionApplications,
   markPromotionUsagesForGroup,
@@ -1397,107 +1404,31 @@ export default async function citasRoutes(app) {
 
         await dbClient.query("BEGIN");
 
-        const citaInsert = await dbClient.query(
-          `
-            INSERT INTO public.citas (
-              id_sucursal,
-              id_empleado_barbero,
-              id_persona_cliente,
-              id_cliente,
-              creada_por_usuario_id,
-              asignada_automaticamente,
-              estado_cita_codigo,
-              inicio_at,
-              fin_at,
-              duracion_total_min,
-              buffer_total_min,
-              subtotal_servicios_hnl,
-              descuento_hnl,
-              total_pagar_hnl,
-              selection_type,
-              id_paquete,
-              notas
-            )
-            VALUES (
-              $1::uuid,
-              $2::uuid,
-              $3::uuid,
-              $4::uuid,
-              $5::uuid,
-              $6::boolean,
-              'en_espera',
-              $7::timestamptz,
-              $8::timestamptz,
-              $9::int,
-              $10::int,
-              $11::numeric,
-              0,
-              $12::numeric,
-              $13::text,
-              $14::uuid,
-              $15
-            )
-            RETURNING id_cita
-          `,
-          [
-            selection.branch.id_sucursal,
-            selection.barber.id_empleado,
-            personaId,
-            clienteId,
-            usuarioId,
-            !request.body.id_barbero,
-            selection.startDateTime.toISOString(),
-            new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000).toISOString(),
-            selection.serviceSelection.duracion_total_min,
-            selection.serviceSelection.buffer_total_min,
-            selection.serviceSelection.monto_total_hnl,
-            selection.serviceSelection.monto_total_hnl,
-            selection.serviceSelection.selection_type || selectionType,
-            selection.serviceSelection.id_paquete || request.body?.id_paquete || null,
-            request.body?.notas ?? null,
-          ]
-        );
+        const appointment = await createAppointmentCore(dbClient, {
+          branchId: selection.branch.id_sucursal,
+          barberId: selection.barber.id_empleado,
+          personId: personaId,
+          clientId: clienteId,
+          createdByUserId: usuarioId,
+          autoAssigned: !request.body.id_barbero,
+          selection,
+          subtotalHnl: selection.serviceSelection.monto_total_hnl,
+          totalHnl: selection.serviceSelection.monto_total_hnl,
+          notes: request.body?.notas ?? null,
+        });
+        const citaId = appointment.id_cita;
 
-        const citaId = citaInsert.rows[0].id_cita;
+        await insertAppointmentDetails(dbClient, {
+          citaId,
+          serviceItems: selection.serviceSelection.items,
+        });
 
-        for (const item of selection.serviceSelection.items) {
-          await dbClient.query(
-            `
-              INSERT INTO public.citas_detalles (
-                id_cita,
-                id_servicio,
-                cantidad,
-                duracion_min,
-                buffer_min,
-                precio_unitario_hnl,
-                subtotal_hnl
-              )
-              VALUES ($1::uuid, $2::uuid, 1, $3::int, $4::int, $5::numeric, $6::numeric)
-            `,
-            [
-              citaId,
-              item.id_servicio,
-              item.duracion_min,
-              item.buffer_min,
-              item.precio_hnl,
-              item.precio_hnl,
-            ]
-          );
-        }
-
-        const holdInsert = await dbClient.query(
-          `
-            INSERT INTO public.citas_holds (
-              id_cita,
-              id_usuario,
-              estado_hold_codigo,
-              expires_at
-            )
-            VALUES ($1::uuid, $2::uuid, 'activo', $3::timestamptz)
-            RETURNING id_hold, expires_at
-          `,
-          [citaId, usuarioId, selection.expiresAt.toISOString()]
-        );
+        const holdInsert = await createAppointmentHold(dbClient, {
+          citaId,
+          userId: usuarioId,
+          expiresAt: selection.expiresAt.toISOString(),
+          returning: true,
+        });
 
         if (simulationNoPayment) {
           await confirmAppointmentWithoutPayment(dbClient, {
@@ -1760,27 +1691,14 @@ export default async function citasRoutes(app) {
         }
         const hasMembership = Boolean(coverageTracker.hasPlan && coverageTracker.idSuscripcion);
 
-        const groupInsert = await dbClient.query(
-          `
-            INSERT INTO public.citas_grupos (
-              id_sucursal,
-              id_persona_titular,
-              id_cliente_titular,
-              estado_grupo_codigo,
-              notas
-            )
-            VALUES ($1::uuid, $2::uuid, $3::uuid, 'activo', $4)
-            RETURNING id_grupo_cita, estado_grupo_codigo
-          `,
-          [
-            branch.id_sucursal,
-            personaId,
-            clienteId,
-            request.body?.notas ?? null,
-          ]
-        );
-
-        const groupRecord = groupInsert.rows[0];
+        const groupRecord = await createBookingGroup(dbClient, {
+          idSucursal: branch.id_sucursal,
+          idPersonaTitular: personaId,
+          idClienteTitular: clienteId,
+          idUsuarioTitular: usuarioId,
+          origenCodigo: "cliente_autenticado",
+          notas: request.body?.notas ?? null,
+        });
         const holdDurationMin = await getHoldDurationMinutes(dbClient);
         const holdExpiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
         const holdUserId = integrantes.length > 1 ? null : usuarioId;
@@ -1960,83 +1878,24 @@ export default async function citasRoutes(app) {
             }
           }
 
-          const finAt = new Date(selection.startDateTime.getTime() + selection.serviceSelection.duracion_total_min * 60 * 1000);
-
-          const citaInsert = await dbClient.query(
-            `
-              INSERT INTO public.citas (
-                id_grupo_cita,
-                orden_integrante,
-                alias_integrante,
-                id_sucursal,
-                id_empleado_barbero,
-                id_persona_cliente,
-                id_cliente,
-                creada_por_usuario_id,
-                asignada_automaticamente,
-                estado_cita_codigo,
-                inicio_at,
-                fin_at,
-                duracion_total_min,
-                buffer_total_min,
-                subtotal_servicios_hnl,
-                descuento_hnl,
-                total_pagar_hnl,
-                es_canje_recompensa,
-                selection_type,
-                id_paquete,
-                notas
-              )
-              VALUES (
-                $1::uuid,
-                $2::int,
-                $3,
-                $4::uuid,
-                $5::uuid,
-                $6::uuid,
-                $7::uuid,
-                $8::uuid,
-                $9::boolean,
-                'en_espera',
-                $10::timestamptz,
-                $11::timestamptz,
-                $12::int,
-                $13::int,
-                $14::numeric,
-                $15::numeric,
-                $16::numeric,
-                $17::boolean,
-                $18::text,
-                $19::uuid,
-                $20
-              )
-              RETURNING id_cita
-            `,
-            [
-              groupRecord.id_grupo_cita,
-              integrante.orden_integrante,
-              integrante.alias,
-              branch.id_sucursal,
-              selection.barber.id_empleado,
-              personaId,
-              clienteId,
-              usuarioId,
-              !integrante.id_barbero,
-              selection.startDateTime.toISOString(),
-              finAt.toISOString(),
-              selection.serviceSelection.duracion_total_min,
-              selection.serviceSelection.buffer_total_min,
-              subtotalServicios,
-              descuentoTotal,
-              totalPagar,
-              Boolean(isTitular && rewardRedeemContext),
-              selection.serviceSelection.selection_type || integrante.selection_type || "services",
-              selection.serviceSelection.id_paquete || integrante.id_paquete || null,
-              request.body?.notas ?? null,
-            ]
-          );
-
-          const citaId = citaInsert.rows[0].id_cita;
+          const appointment = await createAppointmentCore(dbClient, {
+            groupId: groupRecord.id_grupo_cita,
+            order: integrante.orden_integrante,
+            alias: integrante.alias,
+            branchId: branch.id_sucursal,
+            barberId: selection.barber.id_empleado,
+            personId: personaId,
+            clientId: clienteId,
+            createdByUserId: usuarioId,
+            autoAssigned: !integrante.id_barbero,
+            selection,
+            subtotalHnl: subtotalServicios,
+            descuentoHnl: descuentoTotal,
+            totalHnl: totalPagar,
+            isRewardRedeem: Boolean(isTitular && rewardRedeemContext),
+            notes: request.body?.notas ?? null,
+          });
+          const citaId = appointment.id_cita;
           if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
             const promoSavepoint = `sp_promo_hold_${integrante.orden_integrante}`;
             try {
@@ -2060,7 +1919,9 @@ export default async function citasRoutes(app) {
               try {
                 await dbClient.query(`ROLLBACK TO SAVEPOINT ${promoSavepoint}`);
                 await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
-              } catch {}
+              } catch {
+                // AM: Si el savepoint ya no existe, solo se registra el fallo original.
+              }
               request.log.warn(
                 {
                   requestId: request.id,
@@ -2079,43 +1940,17 @@ export default async function citasRoutes(app) {
             rewardCoveredTotalHnl += rewardCoveredInBlock;
           }
 
-          for (const serviceItem of selection.serviceSelection.items) {
-            await dbClient.query(
-              `
-                INSERT INTO public.citas_detalles (
-                  id_cita,
-                  id_servicio,
-                  cantidad,
-                  duracion_min,
-                  buffer_min,
-                  precio_unitario_hnl,
-                  subtotal_hnl
-                )
-                VALUES ($1::uuid, $2::uuid, 1, $3::int, $4::int, $5::numeric, $6::numeric)
-              `,
-              [
-                citaId,
-                serviceItem.id_servicio,
-                serviceItem.duracion_min,
-                serviceItem.buffer_min,
-                serviceItem.precio_hnl,
-                serviceItem.precio_hnl,
-              ]
-            );
-          }
+          await insertAppointmentDetails(dbClient, {
+            citaId,
+            serviceItems: selection.serviceSelection.items,
+            descuentoTotalHnl: descuentoTotal,
+          });
 
-          await dbClient.query(
-            `
-              INSERT INTO public.citas_holds (
-                id_cita,
-                id_usuario,
-                estado_hold_codigo,
-                expires_at
-              )
-              VALUES ($1::uuid, $2::uuid, 'activo', $3::timestamptz)
-            `,
-            [citaId, holdUserId, holdExpiresAt.toISOString()]
-          );
+          await createAppointmentHold(dbClient, {
+            citaId,
+            userId: holdUserId,
+            expiresAt: holdExpiresAt.toISOString(),
+          });
 
           const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
           const coveredCount = coverage.items.filter((entry) =>
@@ -2198,6 +2033,10 @@ export default async function citasRoutes(app) {
         } else if (!hasMembership) {
           membershipReasonNoAplica = "SIN_PLAN";
         }
+        await updateBookingGroupTotal(dbClient, {
+          idGrupoCita: groupRecord.id_grupo_cita,
+          totalHnl: totalGrupo,
+        });
         const coveredServicesList = [...coveredServicesByPlan.values()];
         const forcedServicesList = [...forcedServicesByPlan.values()];
         await dbClient.query("COMMIT");
@@ -2769,7 +2608,9 @@ export default async function citasRoutes(app) {
         }
         return sendOk(reply, { pendiente: payload });
       } catch (error) {
-        try { await dbClient.query("ROLLBACK"); } catch {}
+        try { await dbClient.query("ROLLBACK"); } catch {
+          // AM: Rollback defensivo; el error original determina la respuesta.
+        }
         return sendHandled(reply, request, error, "No se pudo consultar la reserva pendiente", "CITAS_PENDING_GET_ERROR");
       } finally {
         dbClient.release();
@@ -2850,7 +2691,9 @@ export default async function citasRoutes(app) {
           total_pendiente_hnl: payload.total_pendiente_hnl,
         });
       } catch (error) {
-        try { await dbClient.query("ROLLBACK"); } catch {}
+        try { await dbClient.query("ROLLBACK"); } catch {
+          // AM: Rollback defensivo; el error original determina la respuesta.
+        }
         return sendHandled(reply, request, error, "No se pudo retomar la reserva pendiente", "CITAS_PENDING_RESUME_ERROR");
       } finally {
         dbClient.release();
@@ -2959,7 +2802,9 @@ export default async function citasRoutes(app) {
           idempotent: false,
         });
       } catch (error) {
-        try { await dbClient.query("ROLLBACK"); } catch {}
+        try { await dbClient.query("ROLLBACK"); } catch {
+          // AM: Rollback defensivo; el error original determina la respuesta.
+        }
         return sendHandled(reply, request, error, "No se pudo descartar la reserva pendiente", "CITAS_PENDING_DISCARD_ERROR");
       } finally {
         dbClient.release();

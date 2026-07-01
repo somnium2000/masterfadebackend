@@ -615,6 +615,7 @@ export default async function publicAgendaRoutes(app) {
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
           id_barbero: idBarbero,
+          fecha_operativa: fechaDesde,
         });
         const disponibilidad = await listAvailabilityByDateRange(
           dbClient,
@@ -733,6 +734,7 @@ export default async function publicAgendaRoutes(app) {
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
           id_barbero: idBarbero,
+          fecha_operativa: fecha,
         });
         const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
 
