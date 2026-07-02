@@ -5,7 +5,6 @@ import {
   assertUuid,
   ensureActiveBranch,
   expireStaleAppointmentReservations,
-  getHoldDurationMinutes,
   getSystemParameters,
   parseSinglePackageId,
   normalizeOperationalDateTime,
@@ -25,10 +24,16 @@ import {
 import { buildCanonicalDiscountLines, buildDiscountPlan } from "../../../services/bookingDiscounts.js";
 import {
   assertBookingSelectionCreationSupported,
-  createBookingGroup,
-  createBookingReservation,
-  updateBookingGroupTotal,
+  buildAppointmentDetailRows,
 } from "../../../services/bookingReservationService.js";
+import {
+  assertCanonicalTotalsMatch,
+  buildCanonicalReservationPayload,
+  createCanonicalReservation,
+  loadCanonicalPromotionDetailRows,
+  mapCanonicalReservationError,
+} from "../../../services/bookingCanonicalReservationService.js";
+import { recordPromotionApplications } from "../../../services/promociones/promocionesService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -1383,34 +1388,11 @@ export default async function publicCitasRoutes(app) {
           idSucursal: branch.id_sucursal,
         });
 
-        const holdDurationMin = await getHoldDurationMinutes(dbClient);
-        const expiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
         const targetAppointmentState = "en_espera";
-        const holdState = "activo";
-
-        const groupRecord = await createBookingGroup(dbClient, {
-          idSucursal: branch.id_sucursal,
-          idPersonaTitular: clientProfile.id_persona,
-          idClienteTitular: clientProfile.id_cliente,
-          idUsuarioTitular: null,
-          origenCodigo: "publico",
-          notas: request.body?.notas ?? null,
-        });
         const releaseTokenSupport = await getPublicHoldReleaseTokenSupport(dbClient);
         const releaseToken = releaseTokenSupport.supported ? generatePublicReleaseToken() : null;
-        if (releaseToken) {
-          await dbClient.query(
-            `
-              UPDATE public.citas_grupos
-              SET release_token_hash = $2::text,
-                  release_token_created_at = now(),
-                  updated_at = now()
-              WHERE id_grupo_cita = $1::uuid
-            `,
-            [groupRecord.id_grupo_cita, hashPublicReleaseToken(releaseToken)]
-          );
-        }
-        const bloquesResponse = [];
+        const canonicalIntegrantes = [];
+        const pendingPromotionRecords = [];
         let subtotalGrupo = 0;
         let descuentoGrupo = 0;
         let totalGrupo = 0;
@@ -1462,7 +1444,7 @@ export default async function publicCitasRoutes(app) {
           const promotionResult = await resolveRequestedPromotionsForPublicHold(dbClient, {
             branch,
             clientProfile,
-            groupRecord,
+            groupRecord: { id_grupo_cita: null },
             integrante,
             selection,
             index,
@@ -1472,50 +1454,44 @@ export default async function publicCitasRoutes(app) {
             ? buildPromotionDiscountPlan(promotionResult.context, promotionResult.aplicadas)
             : null;
           const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
-
-          const reservation = await createBookingReservation(dbClient, {
-            groupRecord,
-            appointment: {
-              groupId: groupRecord.id_grupo_cita,
-              order: integrante.orden_integrante,
-              alias: integrante.alias,
-              branchId: branch.id_sucursal,
-              barberId: selection.barber.id_empleado,
-              personId: clientProfile.id_persona,
-              clientId: clientProfile.id_cliente,
-              createdByUserId: null,
-              autoAssigned: !integrante.id_barbero,
-              state: targetAppointmentState,
-              selection,
-              subtotalHnl: subtotalServiciosHnl,
-              descuentoHnl,
-              totalHnl: totalPagarHnl,
-              contactName: integrante.contacto?.nombre || integrante.alias,
-              contactEmail: integrante.contacto?.email || null,
-              contactPhone: integrante.contacto?.telefono || null,
-              notes: request.body?.notas ?? null,
-            },
-            hold: {
-              userId: null,
-              state: holdState,
-              expiresAt: expiresAt.toISOString(),
-            },
-            promotions: promotionResult.aplicadas?.length || promotionResult.descartadas?.length
-              ? {
-                  context: promotionResult.context,
-                  result: {
-                    promociones_aplicadas: promotionResult.aplicadas,
-                    promociones_descartadas: promotionResult.descartadas,
-                  },
-                  formal: true,
-                  usageState: "reservado",
-                }
-              : null,
+          const detailRows = buildAppointmentDetailRows(selection.serviceSelection.items || [], {
+            descuentoTotalHnl: descuentoHnl,
             discountPlan,
+            ordenIntegrante: integrante.orden_integrante,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
-          const citaId = reservation.citaId;
-          const persistedTotals = reservation.totals || {
+          canonicalIntegrantes.push({
+            orden_integrante: integrante.orden_integrante,
+            alias: integrante.alias,
+            id_persona: clientProfile.id_persona,
+            id_cliente: clientProfile.id_cliente,
+            id_usuario: null,
+            tipo_cliente_codigo: "invitado",
+            contacto_nombre: integrante.contacto?.nombre || integrante.alias,
+            contacto_email: integrante.contacto?.email || null,
+            contacto_telefono: integrante.contacto?.telefono || null,
+            id_empleado_barbero: integrante.id_barbero ? selection.barber.id_empleado : null,
+            barber_candidate_ids: selection.barber_candidate_ids || [selection.barber.id_empleado],
+            asignada_automaticamente: !integrante.id_barbero,
+            selection,
+            detailRows,
+            descuentoHnl,
+            discountPlan,
+            inicio_at: selection.startDateTime.toISOString(),
+            notas: request.body?.notas ?? null,
+          });
+          if (promotionResult.aplicadas?.length || promotionResult.descartadas?.length) {
+            pendingPromotionRecords.push({
+              order: integrante.orden_integrante,
+              context: promotionResult.context,
+              result: {
+                promociones_aplicadas: promotionResult.aplicadas,
+                promociones_descartadas: promotionResult.descartadas,
+              },
+              detailRows,
+            });
+          }
+          const persistedTotals = {
             subtotalHnl: subtotalServiciosHnl,
             descuentoHnl,
             totalHnl: totalPagarHnl,
@@ -1537,29 +1513,68 @@ export default async function publicCitasRoutes(app) {
           subtotalGrupo += Number(persistedTotals.subtotalHnl || 0);
           descuentoGrupo += Number(persistedTotals.descuentoHnl || 0);
           totalGrupo += Number(persistedTotals.totalHnl || 0);
-          const { fecha, hora } = parseIsoDateAndTime(selection.startDateTime);
-
-          bloquesResponse.push({
-            id_cita: citaId,
-            orden_integrante: integrante.orden_integrante,
-            alias: integrante.alias,
-            id_barbero: selection.barber.id_empleado,
-            nombre_barbero: selection.barber.nombre_completo,
-            fecha: fecha || "",
-            hora: hora || "",
-            fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: targetAppointmentState,
-            monto_total_hnl: Number(persistedTotals.subtotalHnl || 0),
-            descuento_hnl: Number(persistedTotals.descuentoHnl || 0),
-            total_pagar_hnl: Number(persistedTotals.totalHnl || 0),
-            duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
-            buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
-          });
         }
 
-        await updateBookingGroupTotal(dbClient, {
-          idGrupoCita: groupRecord.id_grupo_cita,
-          totalHnl: totalGrupo,
+        const canonicalPayload = buildCanonicalReservationPayload({
+          requestId: request.headers?.["x-idempotency-key"],
+          idSucursal: branch.id_sucursal,
+          idPersonaTitular: clientProfile.id_persona,
+          idClienteTitular: clientProfile.id_cliente,
+          idUsuarioTitular: null,
+          origenCodigo: "publico",
+          notas: request.body?.notas ?? null,
+          releaseTokenHash: releaseToken ? hashPublicReleaseToken(releaseToken) : null,
+          integrantes: canonicalIntegrantes,
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
+        });
+        const canonicalResult = await createCanonicalReservation(dbClient, canonicalPayload);
+        assertCanonicalTotalsMatch({
+          expected: canonicalPayload._totals,
+          result: canonicalResult,
+          context: { route: "public_citas_hold" },
+        });
+        const bloquesByOrder = new Map((canonicalResult?.bloques || []).map((block) => [
+          Number(block.orden_integrante || 0),
+          block,
+        ]));
+        for (const promotionRecord of pendingPromotionRecords) {
+          const block = bloquesByOrder.get(Number(promotionRecord.order || 0));
+          if (!block?.id_cita) continue;
+          const detailRows = await loadCanonicalPromotionDetailRows(dbClient, {
+            idCita: block.id_cita,
+            detailRows: promotionRecord.detailRows,
+          });
+          await recordPromotionApplications(
+            dbClient,
+            {
+              ...promotionRecord.context,
+              id_grupo_cita: canonicalResult.id_grupo_cita,
+              id_cita: block.id_cita,
+              detailRows,
+            },
+            promotionRecord.result,
+            { formal: true, usageState: "reservado" }
+          );
+        }
+        const bloquesResponse = canonicalIntegrantes.map((integrante) => {
+          const block = bloquesByOrder.get(Number(integrante.orden_integrante || 0)) || {};
+          const { fecha, hora } = parseIsoDateAndTime(integrante.selection.startDateTime);
+          return {
+            id_cita: block.id_cita || null,
+            orden_integrante: integrante.orden_integrante,
+            alias: integrante.alias,
+            id_barbero: block.id_empleado_barbero || integrante.selection.barber.id_empleado,
+            nombre_barbero: integrante.selection.barber.nombre_completo,
+            fecha: fecha || "",
+            hora: hora || "",
+            fecha_inicio: integrante.selection.startDateTime.toISOString(),
+            estado_cita_codigo: block.estado_cita_codigo || targetAppointmentState,
+            monto_total_hnl: Number(block.monto_total_hnl ?? block.subtotal_hnl ?? 0),
+            descuento_hnl: Number(block.descuento_hnl ?? 0),
+            total_pagar_hnl: Number(block.total_pagar_hnl ?? block.total_hnl ?? 0),
+            duracion_total_min: Number(integrante.selection.serviceSelection.duracion_total_min || 0),
+            buffer_total_min: Number(integrante.selection.serviceSelection.buffer_total_min || 0),
+          };
         });
 
         await dbClient.query("COMMIT");
@@ -1567,9 +1582,9 @@ export default async function publicCitasRoutes(app) {
         return sendOk(
           reply,
           {
-            id_grupo_cita: groupRecord.id_grupo_cita,
-            estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
-            expires_at: expiresAt.toISOString(),
+            id_grupo_cita: canonicalResult.id_grupo_cita,
+            estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
+            expires_at: canonicalResult.expires_at,
             monto_total_hnl: subtotalGrupo,
             subtotal_hnl: subtotalGrupo,
             descuento_total_hnl: descuentoGrupo,
@@ -1590,13 +1605,17 @@ export default async function publicCitasRoutes(app) {
           // no-op
         }
 
-        if (isAvailabilityConflictError(error)) {
-          const reason = resolveSafeConflictReason(error);
+        const mappedError = mapCanonicalReservationError(error, {
+          publicRoute: true,
+          safeMessage: "No se pudo crear el hold publico",
+        });
+        if (isAvailabilityConflictError(mappedError)) {
+          const reason = resolveSafeConflictReason(mappedError);
           request.log.warn(
             {
               requestId: request.id,
               reason,
-              sourceCode: error instanceof AppError ? String(error.code || "") : null,
+              sourceCode: mappedError instanceof AppError ? String(mappedError.code || "") : null,
             },
             "Public hold rejected by agenda conflict"
           );
@@ -1607,7 +1626,7 @@ export default async function publicCitasRoutes(app) {
           });
         }
 
-        return sendHandled(reply, request, error, "No se pudo crear el hold publico", "PUBLIC_CITAS_HOLD_CREATE_ERROR");
+        return sendHandled(reply, request, mappedError, "No se pudo crear el hold publico", "PUBLIC_CITAS_HOLD_CREATE_ERROR");
       } finally {
         dbClient.release();
       }

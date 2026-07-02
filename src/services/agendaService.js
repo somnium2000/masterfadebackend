@@ -2403,6 +2403,7 @@ export async function resolveBookingSelection(client, {
 
   let selectedBarber;
   let finalSelection;
+  let barberCandidateIds;
   if (id_barbero) {
     const barber = await getBarberById(client, id_barbero);
     if (barber.id_sucursal !== branch.id_sucursal) {
@@ -2432,6 +2433,7 @@ export async function resolveBookingSelection(client, {
       });
     }
     selectedBarber = barber;
+    barberCandidateIds = [barber.id_empleado];
   } else {
     const barbers = await listBarbersForBranch(client, branch.id_sucursal);
     const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
@@ -2475,11 +2477,15 @@ export async function resolveBookingSelection(client, {
     });
     selectedBarber = rankedCandidates[0].barber;
     finalSelection = rankedCandidates[0].selection;
+    barberCandidateIds = rankedCandidates
+      .map((candidate) => candidate?.barber?.id_empleado)
+      .filter(Boolean);
   }
 
   return {
     branch,
     barber: selectedBarber,
+    barber_candidate_ids: barberCandidateIds,
     serviceSelection: finalSelection,
     startDateTime,
     expiresAt: addMinutes(new Date(), await getHoldDurationMinutes(client)),

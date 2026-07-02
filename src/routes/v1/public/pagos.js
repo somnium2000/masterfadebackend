@@ -12,6 +12,7 @@ import { normalizeOperationalDateTime } from "../../../services/agendaService.js
 import {
   confirmCanonicalPaidReservation,
   mapCanonicalReservationError,
+  toCents,
 } from "../../../services/bookingCanonicalReservationService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
@@ -41,7 +42,7 @@ function normalizeMoney(value) {
 }
 
 function amountsMatch(left, right) {
-  return Math.abs(normalizeMoney(left) - normalizeMoney(right)) < 0.01;
+  return toCents(left) === toCents(right);
 }
 
 function normalizePercentage(value) {
@@ -817,8 +818,8 @@ async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
   }
 }
 
-async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }) {
-  const queued = await client.query(
+async function dispatchPostPaymentEmails(db, { idGrupoCita, mailer, logger }) {
+  const queued = await db.query(
     `
       SELECT
         ne.id_notificacion,
@@ -848,7 +849,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
     return { pending: queued.rows.length, sent: 0, failed: 0 };
   }
 
-  const groupRows = await client.query(
+  const groupRows = await db.query(
     `
       SELECT
         c.alias_integrante,
@@ -892,7 +893,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
     const to = normalizeEmail(row?.correo_destino);
     if (!to) {
       failed += 1;
-      await client.query(
+      await db.query(
         `
           UPDATE public.notificaciones_email
           SET estado_notificacion_codigo = 'fallida',
@@ -924,7 +925,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
 
     if (delivery?.sent) {
       sent += 1;
-      await client.query(
+      await db.query(
         `
           UPDATE public.notificaciones_email
           SET estado_notificacion_codigo = 'enviada',
@@ -940,7 +941,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
 
     failed += 1;
     const errorText = safeText(delivery?.message) || "No se pudo enviar por SMTP";
-    await client.query(
+    await db.query(
       `
         UPDATE public.notificaciones_email
         SET estado_notificacion_codigo = 'fallida',
@@ -1083,7 +1084,7 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
-    const dbClient = await app.db.connect();
+    let dbClient = await app.db.connect();
     let inTransaction = false;
     let phaseAIntent = null;
     let phaseAPricing = null;
@@ -1222,6 +1223,8 @@ export default async function publicPagosRoutes(app) {
         phaseAPricing = pricing;
       }
 
+      dbClient.release();
+      dbClient = null;
       const providerAdapter = PaymentProviderFactory.create();
       const providerIntent = await providerAdapter.createIntent({
         idempotencyKey: phaseAIntent.idempotency_key,
@@ -1235,6 +1238,7 @@ export default async function publicPagosRoutes(app) {
         },
       });
 
+      dbClient = await app.db.connect();
       await dbClient.query("BEGIN");
       inTransaction = true;
       const updated = await dbClient.query(
@@ -1304,7 +1308,7 @@ export default async function publicPagosRoutes(app) {
       request.log.error({ err: error }, "No se pudo crear intent publico");
       return sendError(reply, 500, "No se pudo iniciar el pago", { code: "PUBLIC_PAGOS_CREATE_INTENT_ERROR", requestId: request.id });
     } finally {
-      dbClient.release();
+      if (dbClient) dbClient.release();
     }
   });
 
@@ -1393,7 +1397,7 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
-    const dbClient = await app.db.connect();
+    let dbClient = await app.db.connect();
     try {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
@@ -1460,6 +1464,9 @@ export default async function publicPagosRoutes(app) {
           [idIntent, providerTxId, Number(intent.monto_hnl || 0), safeText(intent.moneda_codigo) || "HNL", paidAt]
         );
         await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
+        dbClient = await app.db.connect();
         await dbClient.query("BEGIN");
         const confirm = await confirmGroupAfterPaid(dbClient, {
           idCitaAnchor: intent.id_cita,
@@ -1469,6 +1476,8 @@ export default async function publicPagosRoutes(app) {
           pagadoAt: paidAt,
         });
         await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
         let emailDelivery = { pending: 0, sent: 0, failed: 0 };
         try {
           emailDelivery = await dispatchPostPaymentEmails(app.db, {
@@ -1528,7 +1537,7 @@ export default async function publicPagosRoutes(app) {
       request.log.error({ err: error }, "No se pudo completar pago mock");
       return sendError(reply, 500, "No se pudo completar el pago", { code: "PUBLIC_PAGOS_MOCK_COMPLETE_ERROR", requestId: request.id });
     } finally {
-      dbClient.release();
+      if (dbClient) dbClient.release();
     }
   });
 
@@ -1548,7 +1557,7 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
-    const dbClient = await app.db.connect();
+    let dbClient = await app.db.connect();
     try {
       if (!isTodoPagoSimulationEnabled(app)) {
         throw new AppError(409, "El simulador de TodoPago no esta disponible en este entorno", {
@@ -1647,6 +1656,9 @@ export default async function publicPagosRoutes(app) {
           ]
         );
         await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
+        dbClient = await app.db.connect();
         await dbClient.query("BEGIN");
         const confirm = await confirmGroupAfterPaid(dbClient, {
           idCitaAnchor: intent.id_cita,
@@ -1656,6 +1668,8 @@ export default async function publicPagosRoutes(app) {
           pagadoAt: paidAt,
         });
         await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
 
         let emailDelivery = { pending: 0, sent: 0, failed: 0 };
         try {
@@ -1730,7 +1744,7 @@ export default async function publicPagosRoutes(app) {
         requestId: request.id,
       });
     } finally {
-      dbClient.release();
+      if (dbClient) dbClient.release();
     }
   });
 }

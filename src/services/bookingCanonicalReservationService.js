@@ -8,12 +8,21 @@ export function toCents(value) {
   return Math.round(parsed * 100);
 }
 
-export function resolveReservationRequestId(value = null) {
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function parseReservationIdempotencyKey(value = null) {
   const text = String(value || "").trim();
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)) {
-    return text;
+  if (!text) return null;
+  if (!UUID_PATTERN.test(text)) {
+    throw new AppError(400, "x-idempotency-key debe ser un UUID valido", {
+      code: "BOOKING_IDEMPOTENCY_KEY_INVALID",
+    });
   }
-  return crypto.randomUUID();
+  return text;
+}
+
+export function resolveReservationRequestId(value = null) {
+  return parseReservationIdempotencyKey(value) || crypto.randomUUID();
 }
 
 function normalizeMoney(value) {
@@ -70,12 +79,15 @@ export function buildCanonicalReservationPayload({
       id_persona: integrante.id_persona || null,
       id_cliente: integrante.id_cliente || null,
       id_usuario: integrante.id_usuario || null,
-      tipo_cliente_codigo: integrante.tipo_cliente_codigo || (integrante.id_usuario ? "autenticado" : "publico"),
+      tipo_cliente_codigo: integrante.tipo_cliente_codigo || (integrante.id_usuario ? "autenticado" : "invitado"),
       alias: integrante.alias || null,
       contacto_nombre: integrante.contacto_nombre || null,
       contacto_email: integrante.contacto_email || null,
       contacto_telefono: integrante.contacto_telefono || null,
-      id_empleado_barbero: integrante.id_empleado_barbero,
+      id_empleado_barbero: integrante.id_empleado_barbero || null,
+      barber_candidate_ids: Array.isArray(integrante.barber_candidate_ids)
+        ? integrante.barber_candidate_ids.filter((id) => UUID_PATTERN.test(String(id || "").trim()))
+        : [],
       asignada_automaticamente: integrante.asignada_automaticamente === true,
       es_canje_recompensa: integrante.es_canje_recompensa === true,
       selection_type: "services",
@@ -112,14 +124,39 @@ export async function createCanonicalReservation(client, payload) {
   return result.rows?.[0]?.resultado || null;
 }
 
+export async function loadCanonicalPromotionDetailRows(client, { idCita, detailRows = [] } = {}) {
+  const sourceRows = Array.isArray(detailRows) ? detailRows : [];
+  if (!idCita || !sourceRows.length) return sourceRows;
+  const result = await client.query(
+    `
+      SELECT id_cita_detalle
+      FROM public.citas_detalles
+      WHERE id_cita = $1::uuid
+        AND deleted_at IS NULL
+      ORDER BY created_at ASC, id_cita_detalle ASC
+    `,
+    [idCita]
+  );
+  return sourceRows.map((row, index) => ({
+    ...row,
+    id_cita: idCita,
+    id_cita_detalle: result.rows?.[index]?.id_cita_detalle || row.id_cita_detalle || null,
+  }));
+}
+
 export async function confirmCanonicalPaidReservation(client, {
   idIntent,
   referenciaExterna = null,
   pagadoAt = null,
 } = {}) {
+  if (!pagadoAt) {
+    throw new AppError(409, "paid_at es obligatorio para confirmar el pago de una reserva", {
+      code: "PAYMENT_PAID_AT_REQUIRED",
+    });
+  }
   const result = await client.query(
     "SELECT app_private.confirmar_reserva_pagada_v1($1::uuid,$2::text,$3::timestamptz) AS resultado",
-    [idIntent, referenciaExterna || null, pagadoAt || new Date().toISOString()]
+    [idIntent, referenciaExterna || null, pagadoAt]
   );
   return result.rows?.[0]?.resultado || null;
 }
@@ -159,17 +196,26 @@ const ERROR_MAP = new Map([
   ["MF_RESERVA_PENDIENTE_EXISTENTE", { statusCode: 409, code: "CLIENT_PENDING_APPOINTMENT_EXISTS" }],
   ["MF_RESERVA_IDEMPOTENCY_PAYLOAD_MISMATCH", { statusCode: 409, code: "BOOKING_IDEMPOTENCY_PAYLOAD_MISMATCH" }],
   ["MF_RESERVA_IDEMPOTENCY_INCOMPLETE", { statusCode: 409, code: "BOOKING_IDEMPOTENCY_INCOMPLETE" }],
+  ["BOOKING_IDEMPOTENCY_KEY_INVALID", { statusCode: 400, code: "BOOKING_IDEMPOTENCY_KEY_INVALID" }],
   ["MF_RESERVA_COMPANION_DATE_MISMATCH", { statusCode: 409, code: "MF_RESERVA_COMPANION_DATE_MISMATCH" }],
   ["AGENDA_DATETIME_TIMEZONE_REQUIRED", { statusCode: 400, code: "AGENDA_DATETIME_TIMEZONE_REQUIRED" }],
   ["MF_PAYMENT_AFTER_HOLD_EXPIRY", { statusCode: 409, code: "PAYMENT_HOLD_EXPIRED" }],
   ["MF_PAYMENT_SLOT_ALREADY_RELEASED", { statusCode: 409, code: "PAYMENT_SLOT_ALREADY_RELEASED" }],
   ["MF_PAYMENT_AMOUNT_MISMATCH", { statusCode: 409, code: "PAYMENT_AMOUNT_MISMATCH" }],
+  ["PAYMENT_PAID_AT_REQUIRED", { statusCode: 409, code: "PAYMENT_PAID_AT_REQUIRED" }],
+  ["BOOKING_CANONICAL_TOTAL_MISMATCH", { statusCode: 409, code: "BOOKING_CANONICAL_TOTAL_MISMATCH" }],
+  ["BOOKING_PROMOTION_ALLOCATION_MISMATCH", { statusCode: 409, code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH" }],
 ]);
 
 export function mapCanonicalReservationError(error, context = {}) {
   if (error instanceof AppError) return error;
-  const message = String(error?.message || "").trim();
-  const pgMessage = message.split("\n")[0];
+  const haystack = [
+    error?.message,
+    error?.detail,
+    error?.hint,
+    error?.cause?.message,
+  ].map((value) => String(value || "")).join("\n");
+  const pgMessage = [...ERROR_MAP.keys()].find((code) => haystack.includes(code));
   const mapped = ERROR_MAP.get(pgMessage);
   if (!mapped) return error;
   const code = mapped.code || (context.publicRoute ? mapped.publicCode : mapped.privateCode);

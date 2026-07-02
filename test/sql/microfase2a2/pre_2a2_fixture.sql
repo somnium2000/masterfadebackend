@@ -4,7 +4,8 @@ VALUES ('11111111-1111-4111-8111-111111111111', 'Sucursal fixture');
 INSERT INTO public.personas (id_persona, nombres, apellidos)
 VALUES
   ('22222222-2222-4222-8222-222222222222', 'Cliente', 'Fixture'),
-  ('23232323-2323-4323-8323-232323232323', 'Barbero', 'Fixture');
+  ('23232323-2323-4323-8323-232323232323', 'Barbero', 'Fixture'),
+  ('24242424-2424-4424-8424-242424242424', 'Barbero Dos', 'Fixture');
 
 INSERT INTO public.clientes (id_cliente, id_persona)
 VALUES ('12121212-1212-4212-8212-121212121212', '22222222-2222-4222-8222-222222222222');
@@ -13,12 +14,19 @@ INSERT INTO public.usuarios (id_usuario, id_persona)
 VALUES ('13131313-1313-4313-8313-131313131313', '22222222-2222-4222-8222-222222222222');
 
 INSERT INTO public.empleados (id_empleado, id_sucursal, id_persona, es_barbero)
-VALUES (
-  '33333333-3333-4333-8333-333333333333',
-  '11111111-1111-4111-8111-111111111111',
-  '23232323-2323-4323-8323-232323232323',
-  true
-);
+VALUES
+  (
+    '33333333-3333-4333-8333-333333333333',
+    '11111111-1111-4111-8111-111111111111',
+    '23232323-2323-4323-8323-232323232323',
+    true
+  ),
+  (
+    '34343434-3434-4434-8434-343434343434',
+    '11111111-1111-4111-8111-111111111111',
+    '24242424-2424-4424-8424-242424242424',
+    true
+  );
 
 INSERT INTO public.horarios_semanales_sucursales (
   id_horario_sucursal,

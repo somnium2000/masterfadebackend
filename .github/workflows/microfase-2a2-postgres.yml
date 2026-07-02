@@ -51,6 +51,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b_reserva_canonica_hardening.sql
       - name: Validate objects, backfill, triggers and fiscal guard
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
       - name: Apply migrations again
@@ -59,6 +60,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b_reserva_canonica_hardening.sql
       - name: Validate idempotency
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
       - name: Run tests

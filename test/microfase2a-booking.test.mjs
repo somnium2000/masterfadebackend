@@ -902,9 +902,9 @@ test("createBookingReservation persiste promocion de servicio con id_cita_detall
   assert.equal(promoInsert.params[0], GROUP_A);
   assert.equal(promoInsert.params[1], CITA_A);
   assert.equal(promoInsert.params[4], DETAIL_A);
-  assert.equal(promoInsert.params[8], PROMO_BRANCH_A);
-  assert.equal(promoInsert.params[9], PROMO_CODE_A);
-  assert.equal(promoInsert.params[10], "CORTE10");
+  assert.equal(promoInsert.params[7], PROMO_BRANCH_A);
+  assert.equal(promoInsert.params[8], PROMO_CODE_A);
+  assert.equal(promoInsert.params[9], "CORTE10");
   assert.equal(promoInsert.params[15], 10);
 
   const usageInsert = calls.find((call) => call.sql.includes("INSERT INTO public.promociones_usos"));
