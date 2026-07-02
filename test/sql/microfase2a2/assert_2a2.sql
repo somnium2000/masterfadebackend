@@ -269,23 +269,26 @@ DECLARE
 BEGIN
   INSERT INTO public.personas (id_persona, nombres, apellidos)
   VALUES
-    ('25252525-2525-4525-8525-252525252525', 'Cliente Dos', 'Fixture'),
-    ('26262626-2626-4626-8626-262626262626', 'Cliente Tres', 'Fixture'),
-    ('27272727-2727-4727-8727-272727272727', 'Cliente Cuatro', 'Fixture')
+	    ('25252525-2525-4525-8525-252525252525', 'Cliente Dos', 'Fixture'),
+	    ('26262626-2626-4626-8626-262626262626', 'Cliente Tres', 'Fixture'),
+	    ('27272727-2727-4727-8727-272727272727', 'Cliente Cuatro', 'Fixture'),
+	    ('28282828-2828-4828-8828-282828282828', 'Cliente Cinco', 'Fixture')
   ON CONFLICT (id_persona) DO NOTHING;
 
   INSERT INTO public.clientes (id_cliente, id_persona)
   VALUES
-    ('15151515-1515-4515-8515-151515151515', '25252525-2525-4525-8525-252525252525'),
-    ('16161616-1616-4616-8616-161616161616', '26262626-2626-4626-8626-262626262626'),
-    ('17171717-1717-4717-8717-171717171717', '27272727-2727-4727-8727-272727272727')
+	    ('15151515-1515-4515-8515-151515151515', '25252525-2525-4525-8525-252525252525'),
+	    ('16161616-1616-4616-8616-161616161616', '26262626-2626-4626-8626-262626262626'),
+	    ('17171717-1717-4717-8717-171717171717', '27272727-2727-4727-8727-272727272727'),
+	    ('18181818-1818-4818-8818-282828282828', '28282828-2828-4828-8828-282828282828')
   ON CONFLICT (id_cliente) DO NOTHING;
 
   INSERT INTO public.usuarios (id_usuario, id_persona)
   VALUES
-    ('18181818-1818-4818-8818-181818181818', '25252525-2525-4525-8525-252525252525'),
-    ('19191919-1919-4919-8919-191919191919', '26262626-2626-4626-8626-262626262626'),
-    ('1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a', '27272727-2727-4727-8727-272727272727')
+	    ('18181818-1818-4818-8818-181818181818', '25252525-2525-4525-8525-252525252525'),
+	    ('19191919-1919-4919-8919-191919191919', '26262626-2626-4626-8626-262626262626'),
+	    ('1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a', '27272727-2727-4727-8727-272727272727'),
+	    ('1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b', '28282828-2828-4828-8828-282828282828')
   ON CONFLICT (id_usuario) DO NOTHING;
 
   SELECT app_private.crear_reserva_canonica_v1(
@@ -534,25 +537,62 @@ BEGIN
     RAISE EXCEPTION 'autoassign did not select second available barber: %', v_second;
   END IF;
 
-  BEGIN
-    PERFORM app_private.crear_reserva_canonica_v1(
-      jsonb_build_object(
-        'request_id', 'dbdbdbdb-dbdb-4bdb-8bdb-dbdbdbdbdbdb',
-        'id_sucursal', '11111111-1111-4111-8111-111111111111',
-        'id_persona_titular', '27272727-2727-4727-8727-272727272727',
-        'id_cliente_titular', '17171717-1717-4717-8717-171717171717',
-        'id_usuario_titular', '1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a',
-        'origen_codigo', 'cliente_autenticado',
-        'integrantes', jsonb_build_array(jsonb_build_object(
-          'orden_integrante', 1,
-          'id_persona', '27272727-2727-4727-8727-272727272727',
-          'id_cliente', '17171717-1717-4717-8717-171717171717',
-          'id_usuario', '1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a',
-          'tipo_cliente_codigo', 'autenticado',
-          'alias', 'Titular',
-          'id_empleado_barbero', '34343434-3434-4434-8434-343434343434',
-          'selection_type', 'services',
-          'inicio_at', '2027-07-18T15:00:00Z',
+	  PERFORM app_private.crear_reserva_canonica_v1(
+	    jsonb_build_object(
+	      'request_id', 'eaeaeaea-eaea-4aea-8aea-eaeaeaeaeaea',
+	      'id_sucursal', '11111111-1111-4111-8111-111111111111',
+	      'id_persona_titular', '28282828-2828-4828-8828-282828282828',
+	      'id_cliente_titular', '18181818-1818-4818-8818-282828282828',
+	      'id_usuario_titular', '1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b',
+	      'origen_codigo', 'cliente_autenticado',
+	      'integrantes', jsonb_build_array(jsonb_build_object(
+	        'orden_integrante', 1,
+	        'id_persona', '28282828-2828-4828-8828-282828282828',
+	        'id_cliente', '18181818-1818-4818-8818-282828282828',
+	        'id_usuario', '1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b',
+	        'tipo_cliente_codigo', 'autenticado',
+	        'alias', 'Titular',
+	        'id_empleado_barbero', '34343434-3434-4434-8434-343434343434',
+	        'selection_type', 'services',
+	        'inicio_at', '2027-07-19T15:00:00Z',
+	        'detalles', jsonb_build_array(jsonb_build_object(
+	          'id_servicio', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+	          'id_tarifa', '44444444-4444-4444-8444-444444444444',
+	          'cantidad', 1,
+	          'duracion_min', 30,
+	          'buffer_min', 5,
+	          'nombre_servicio_snapshot', 'Corte fixture',
+	          'precio_referencia_hnl', 300,
+	          'precio_unitario_hnl', 300,
+	          'descuento_hnl', 0,
+	          'incluye_isv_snapshot', false,
+	          'isv_porcentaje', 0,
+	          'origen_item_codigo', 'servicio_manual'
+	        ))
+	      ))
+	    )
+	  );
+
+	  v_reject_message := NULL;
+	  BEGIN
+	    PERFORM app_private.crear_reserva_canonica_v1(
+	      jsonb_build_object(
+	        'request_id', 'ebebebeb-ebeb-4beb-8beb-ebebebebebeb',
+	        'id_sucursal', '11111111-1111-4111-8111-111111111111',
+	        'id_persona_titular', '28282828-2828-4828-8828-282828282828',
+	        'id_cliente_titular', '18181818-1818-4818-8818-282828282828',
+	        'id_usuario_titular', '1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b',
+	        'origen_codigo', 'cliente_autenticado',
+	        'integrantes', jsonb_build_array(jsonb_build_object(
+	          'orden_integrante', 1,
+	          'id_persona', '28282828-2828-4828-8828-282828282828',
+	          'id_cliente', '18181818-1818-4818-8818-282828282828',
+	          'id_usuario', '1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b',
+	          'tipo_cliente_codigo', 'autenticado',
+	          'alias', 'Titular',
+	          'id_empleado_barbero', '34343434-3434-4434-8434-343434343434',
+	          'selection_type', 'services',
+	          'inicio_at', '2027-07-20T15:00:00Z',
           'detalles', jsonb_build_array(jsonb_build_object(
             'id_servicio', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
             'id_tarifa', '44444444-4444-4444-8444-444444444444',
