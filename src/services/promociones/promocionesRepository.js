@@ -216,6 +216,8 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
         pu.id_cliente,
         pu.id_persona,
         pu.id_promocion_sucursal,
+        pu.id_promocion_codigo,
+        pu.id_empleado_barbero,
         pu.fecha_operativa,
         pu.estado_uso_codigo
       FROM public.promociones_usos pu
@@ -266,7 +268,7 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
         const k = `${ruleId}:${suffix}:sucursal:${idPromocionSucursal}`;
         byRulePeriod.set(k, (byRulePeriod.get(k) || 0) + 1);
       }
-      if (idBarbero && String(context.id_empleado_barbero || "") === idBarbero) {
+      if (idBarbero && String(row.id_empleado_barbero || "") === idBarbero) {
         const k = `${ruleId}:${suffix}:barbero:${idBarbero}`;
         byRulePeriod.set(k, (byRulePeriod.get(k) || 0) + 1);
       }
@@ -320,6 +322,9 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
         id_cita_detalle,
         id_promocion,
         id_promocion_regla,
+        id_promocion_sucursal,
+        id_promocion_codigo,
+        codigo_promocional_snapshot,
         aplica_a_codigo,
         nombre_promocion_snapshot,
         tipo_descuento_codigo,
@@ -340,15 +345,18 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
         $6::uuid,
         $7::uuid,
         $8::text,
-        $9::text,
-        $10::text,
-        $11::numeric,
-        $12::numeric,
-        $13::numeric,
-        $14::int,
-        $15::boolean,
-        $16::text,
-        $17::text
+        $9::uuid,
+        $10::uuid,
+        $11::text,
+        $12::text,
+        $13::text,
+        $14::numeric,
+        $15::numeric,
+        $16::numeric,
+        $17::int,
+        $18::boolean,
+        $19::text,
+        $20::text
       )
       RETURNING id_cita_promocion
     `,
@@ -361,6 +369,9 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
       data.id_promocion,
       data.id_promocion_regla,
       data.aplica_a_codigo,
+      data.id_promocion_sucursal || null,
+      data.id_promocion_codigo || null,
+      data.codigo_promocional_snapshot || null,
       data.nombre_promocion_snapshot || "Promocion",
       data.tipo_descuento_codigo,
       Number(data.valor_descuento || 0),
@@ -385,7 +396,7 @@ export async function insertPromotionUsage(db, data = {}) {
   const lockKey = [
     data.id_promocion_regla,
     data.id_promocion_sucursal || "sin_sucursal",
-    data.id_cita || data.id_grupo_cita,
+    data.id_empleado_barbero || "sin_barbero",
     String(data.fecha_operativa || new Date().toISOString().slice(0, 10)).slice(0, 10),
   ].join("|");
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [lockKey]);
@@ -432,6 +443,8 @@ export async function insertPromotionUsage(db, data = {}) {
         id_cliente,
         id_persona,
         id_promocion_sucursal,
+        id_promocion_codigo,
+        id_empleado_barbero,
         fecha_operativa,
         estado_uso_codigo,
         usado_at
@@ -444,8 +457,10 @@ export async function insertPromotionUsage(db, data = {}) {
         $5::uuid,
         $6::uuid,
         $7::uuid,
-        $8::date,
-        $9::text,
+        $8::uuid,
+        $9::uuid,
+        $10::date,
+        $11::text,
         NOW()
       )
       RETURNING id_promocion_uso
@@ -458,6 +473,8 @@ export async function insertPromotionUsage(db, data = {}) {
       data.id_cliente || null,
       data.id_persona || null,
       data.id_promocion_sucursal || null,
+      data.id_promocion_codigo || null,
+      data.id_empleado_barbero || null,
       String(data.fecha_operativa || new Date().toISOString().slice(0, 10)).slice(0, 10),
       data.estado_uso_codigo || "consumido",
     ]

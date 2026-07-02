@@ -1225,11 +1225,19 @@ export default async function publicPagosRoutes(app) {
     },
   }, async (request, reply) => {
     const dbClient = await app.db.connect();
+    let inTransaction = false;
+    let phaseAIntent = null;
+    let phaseAPricing = null;
     try {
       await dbClient.query("BEGIN");
+      inTransaction = true;
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const titularEmail = normalizeEmail(request.body?.titular_email);
       const providerCode = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+      await dbClient.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        [`public-payment-intent:${idGrupoCita}`]
+      );
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
       const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, logger: request.log });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
@@ -1248,7 +1256,7 @@ export default async function publicPagosRoutes(app) {
       }
       const existingIntent = await dbClient.query(
         `
-          SELECT id_intent, id_hold, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
+          SELECT id_intent, id_hold, link_pago_url, referencia_externa, idempotency_key, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
             FROM public.payment_intents
             WHERE id_cita = $1::uuid
               AND id_provider = $2::uuid
@@ -1265,6 +1273,8 @@ export default async function publicPagosRoutes(app) {
         const existingAmount = Number(existingIntent.rows[0].monto_hnl || 0);
         if (amountsMatch(existingAmount, totalGroup)) {
           await dbClient.query("COMMIT");
+          inTransaction = false;
+          if (existingIntent.rows[0].link_pago_url) {
           return sendOk(reply, {
             id_intent: existingIntent.rows[0].id_intent,
             payment_url: existingIntent.rows[0].link_pago_url ?? null,
@@ -1278,82 +1288,117 @@ export default async function publicPagosRoutes(app) {
             promociones_aplicadas: pricing.promociones_aplicadas,
             promociones_descartadas: pricing.promociones_descartadas,
           });
+          }
+          phaseAIntent = {
+            ...existingIntent.rows[0],
+            id_provider: provider.id_provider,
+            id_cita: anchor.id_cita,
+            id_hold: anchor.id_hold,
+            id_grupo_cita: idGrupoCita,
+            idempotency_key: existingIntent.rows[0].idempotency_key || `masterfade:booking-payment:${existingIntent.rows[0].id_intent}`,
+          };
+          phaseAPricing = pricing;
+        } else {
+          await dbClient.query(
+            `
+              UPDATE public.payment_intents
+              SET estado_intent_codigo = 'expirado',
+                  updated_at = now()
+              WHERE id_intent = $1::uuid
+            `,
+            [existingIntent.rows[0].id_intent]
+          );
         }
-
-        await dbClient.query(
-          `
-            UPDATE public.payment_intents
-            SET estado_intent_codigo = 'expirado',
-                updated_at = now()
-            WHERE id_intent = $1::uuid
-          `,
-          [existingIntent.rows[0].id_intent]
-        );
       }
 
-      const idIntentLocal = crypto.randomUUID();
-      const idempotencyKey = `masterfade:booking-payment:${idIntentLocal}`;
+      if (!phaseAIntent) {
+        const idIntentLocal = crypto.randomUUID();
+        const idempotencyKey = `masterfade:booking-payment:${idIntentLocal}`;
+        const created = await dbClient.query(
+          `
+            INSERT INTO public.payment_intents (
+              id_intent,
+              id_provider,
+              id_cita,
+              id_hold,
+              estado_intent_codigo,
+              monto_hnl,
+              moneda_codigo,
+              idempotency_key,
+              expires_at,
+              created_by_usuario_id,
+              id_grupo_cita
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              $3::uuid,
+              $4::uuid,
+              'creado',
+              $5::numeric,
+              'HNL',
+              $6::text,
+              $7::timestamptz,
+              $8::uuid,
+              $9::uuid
+            )
+            RETURNING id_intent, id_provider, id_cita, id_hold, link_pago_url, referencia_externa,
+              idempotency_key, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo, id_grupo_cita
+          `,
+          [
+            idIntentLocal,
+            provider.id_provider,
+            anchor.id_cita,
+            anchor.id_hold,
+            totalGroup,
+            idempotencyKey,
+            new Date(anchor.expires_at).toISOString(),
+            createdByUserId,
+            idGrupoCita,
+          ]
+        );
+        await dbClient.query("COMMIT");
+        inTransaction = false;
+        phaseAIntent = created.rows[0];
+        phaseAPricing = pricing;
+      }
+
       const providerAdapter = PaymentProviderFactory.create();
       const providerIntent = await providerAdapter.createIntent({
-        idempotencyKey,
-        montoHnl: totalGroup,
+        idempotencyKey: phaseAIntent.idempotency_key,
+        montoHnl: normalizeMoney(phaseAIntent.monto_hnl),
         moneda: "HNL",
         descripcion: `Reserva publica ${idGrupoCita}`,
         callbackUrl: buildCallbackUrl(idGrupoCita),
         metadata: {
           id_grupo_cita: idGrupoCita,
-          id_cita_anchor: anchor.id_cita,
+          id_cita_anchor: phaseAIntent.id_cita,
         },
       });
 
-      const created = await dbClient.query(
+      await dbClient.query("BEGIN");
+      inTransaction = true;
+      const updated = await dbClient.query(
         `
-          INSERT INTO public.payment_intents (
-            id_intent,
-            id_provider,
-            id_cita,
-            id_hold,
-            estado_intent_codigo,
-            monto_hnl,
-            moneda_codigo,
-            link_pago_url,
-            referencia_externa,
-            idempotency_key,
-            expires_at,
-            created_by_usuario_id,
-            id_grupo_cita
-          )
-          VALUES (
-            $1::uuid,
-            $2::uuid,
-            $3::uuid,
-            $4::uuid,
-            'link_generado',
-            $5::numeric,
-            'HNL',
-            $6::text,
-            $7::text,
-            $8::text,
-            $9::timestamptz,
-            $10::uuid,
-            $11::uuid
-          )
+          UPDATE public.payment_intents
+          SET estado_intent_codigo = 'link_generado',
+              link_pago_url = $2::text,
+              referencia_externa = $3::text,
+              updated_at = now()
+          WHERE id_intent = $1::uuid
           RETURNING id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
         `,
         [
-          idIntentLocal,
-          provider.id_provider,
-          anchor.id_cita,
-          anchor.id_hold,
-          totalGroup,
+          phaseAIntent.id_intent,
           providerIntent.paymentUrl ?? null,
           providerIntent.providerIntentId ?? null,
-          idempotencyKey,
-          new Date(anchor.expires_at).toISOString(),
-          createdByUserId,
-          idGrupoCita,
         ]
       );
+      if (!updated.rows[0]) {
+        throw new AppError(409, "No se pudo actualizar el intent local luego del proveedor", {
+          code: "PUBLIC_PAGOS_INTENT_UPDATE_MISSING",
+        });
+      }
 
       await dbClient.query(
         `
@@ -1367,21 +1412,24 @@ export default async function publicPagosRoutes(app) {
         [idGrupoCita]
       );
       await dbClient.query("COMMIT");
+      inTransaction = false;
       return sendOk(reply, {
-        id_intent: created.rows[0].id_intent,
-        payment_url: created.rows[0].link_pago_url ?? null,
-        expires_at: new Date(created.rows[0].expires_at).toISOString(),
-        monto_hnl: Number(created.rows[0].monto_hnl || 0),
-        moneda_codigo: created.rows[0].moneda_codigo || "HNL",
-        estado_intent_codigo: created.rows[0].estado_intent_codigo,
-        subtotal_hnl: pricing.subtotal_hnl,
-        descuento_total_hnl: pricing.descuento_total_hnl,
-        total_hnl: pricing.total_hnl,
-        promociones_aplicadas: pricing.promociones_aplicadas,
-        promociones_descartadas: pricing.promociones_descartadas,
+        id_intent: updated.rows[0].id_intent,
+        payment_url: updated.rows[0].link_pago_url ?? null,
+        expires_at: new Date(updated.rows[0].expires_at).toISOString(),
+        monto_hnl: Number(updated.rows[0].monto_hnl || 0),
+        moneda_codigo: updated.rows[0].moneda_codigo || "HNL",
+        estado_intent_codigo: updated.rows[0].estado_intent_codigo,
+        subtotal_hnl: phaseAPricing.subtotal_hnl,
+        descuento_total_hnl: phaseAPricing.descuento_total_hnl,
+        total_hnl: phaseAPricing.total_hnl,
+        promociones_aplicadas: phaseAPricing.promociones_aplicadas,
+        promociones_descartadas: phaseAPricing.promociones_descartadas,
       }, { statusCode: 201 });
     } catch (error) {
-      try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
+      if (inTransaction) {
+        try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
+      }
       if (error instanceof AppError) {
         request.log.warn(
           { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },

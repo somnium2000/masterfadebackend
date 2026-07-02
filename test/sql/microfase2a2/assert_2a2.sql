@@ -60,6 +60,46 @@ BEGIN
     RAISE EXCEPTION 'MF2A3 fiscal snapshot guard missing';
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'citas_promociones'
+      AND column_name = 'id_promocion_codigo'
+  ) THEN
+    RAISE EXCEPTION 'MF2A4 citas_promociones id_promocion_codigo missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'citas_promociones'
+      AND column_name = 'codigo_promocional_snapshot'
+  ) THEN
+    RAISE EXCEPTION 'MF2A4 citas_promociones codigo snapshot missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'promociones_usos'
+      AND column_name = 'id_empleado_barbero'
+  ) THEN
+    RAISE EXCEPTION 'MF2A4 promociones_usos id_empleado_barbero missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'promociones_usos'
+      AND indexname = 'idx_promociones_usos_barbero_periodo'
+  ) THEN
+    RAISE EXCEPTION 'MF2A4 promociones_usos barbero period index missing';
+  END IF;
+
   IF (
     SELECT precio_referencia_hnl
     FROM public.citas_detalles

@@ -48,12 +48,14 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
       - name: Validate objects, backfill, triggers and fiscal guard
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
       - name: Apply migrations again
         run: |
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
       - name: Validate idempotency
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
       - name: Run tests

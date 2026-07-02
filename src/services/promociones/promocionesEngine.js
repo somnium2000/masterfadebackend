@@ -43,6 +43,33 @@ function normalizeUnitPrice(entry = {}) {
   return null;
 }
 
+function findApplicablePromotionCode(context = {}, candidate = {}) {
+  const currentCode = normalizeCode(context.codigo_promocional);
+  if (!currentCode) return null;
+  for (const code of Array.isArray(candidate.codes) ? candidate.codes : []) {
+    if (!code.activo) continue;
+    const codeValue = normalizeCode(code.codigo);
+    if (!codeValue || codeValue !== currentCode) continue;
+    const from = code.vigencia_desde ? new Date(code.vigencia_desde) : null;
+    const to = code.vigencia_hasta ? new Date(code.vigencia_hasta) : null;
+    const now = context.fecha_hora ? new Date(context.fecha_hora) : new Date();
+    if (from && now < from) continue;
+    if (to && now > to) continue;
+    return {
+      id_promocion_codigo: code.id_promocion_codigo || null,
+      codigo_promocional_snapshot: code.codigo || null,
+    };
+  }
+  const legacy = normalizeCode(candidate.codigo_promocional);
+  if (legacy && legacy === currentCode) {
+    return {
+      id_promocion_codigo: null,
+      codigo_promocional_snapshot: candidate.codigo_promocional || context.codigo_promocional || null,
+    };
+  }
+  return null;
+}
+
 function getContextDiscountLines(context = {}) {
   if (Array.isArray(context.discount_lines) && context.discount_lines.length) {
     return context.discount_lines.map((line) => ({
@@ -172,7 +199,6 @@ export function validatePromotionCandidate(context = {}, candidate = {}) {
   const barbero = context.id_empleado_barbero ? String(context.id_empleado_barbero).trim() : null;
   const isClientAuthenticated = Boolean(context.es_cliente_autenticado);
   const hasClient = Boolean(context.id_cliente || context.id_persona);
-  const currentCode = normalizeCode(context.codigo_promocional);
 
   if (String(candidate.estado_promocion || "").toLowerCase() !== "publicada" && context.canal === "public") {
     return { valid: false, reasonCode: "PROMOCION_NO_PUBLICADA", reason: "La promocion no esta publicada." };
@@ -206,31 +232,7 @@ export function validatePromotionCandidate(context = {}, candidate = {}) {
   }
 
   if (candidate.requiere_codigo || String(candidate.modo_aplicacion_codigo || "").toLowerCase() === "codigo") {
-    const codes = Array.isArray(candidate.codes) ? candidate.codes : [];
-    const hasCodes = codes.length > 0;
-    let matched = false;
-
-    if (hasCodes) {
-      for (const code of codes) {
-        if (!code.activo) continue;
-        const codeValue = normalizeCode(code.codigo);
-        if (!codeValue || codeValue !== currentCode) continue;
-        const from = code.vigencia_desde ? new Date(code.vigencia_desde) : null;
-        const to = code.vigencia_hasta ? new Date(code.vigencia_hasta) : null;
-        const now = context.fecha_hora ? new Date(context.fecha_hora) : new Date();
-        if (from && now < from) continue;
-        if (to && now > to) continue;
-        matched = true;
-        break;
-      }
-    }
-
-    if (!matched) {
-      const legacy = normalizeCode(candidate.codigo_promocional);
-      matched = Boolean(legacy && currentCode && legacy === currentCode);
-    }
-
-    if (!matched) {
+    if (!findApplicablePromotionCode(context, candidate)) {
       return { valid: false, reasonCode: "PROMOCION_CODIGO_INVALIDO", reason: "El codigo promocional no aplica para esta regla." };
     }
   }
@@ -376,6 +378,8 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       es_acumulable: Boolean(row.es_acumulable),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
+      id_promocion_codigo: row.id_promocion_codigo || null,
+      codigo_promocional_snapshot: row.codigo_promocional_snapshot || null,
       line_allocations: Array.isArray(row.line_allocations) ? row.line_allocations.map((allocation) => ({
         line_key: allocation.line_key,
         descuento_hnl: Number(allocation.descuento_hnl || 0),
@@ -398,6 +402,8 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       valor_descuento: Number(row.valor_descuento || 0),
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
+      id_promocion_codigo: row.id_promocion_codigo || null,
+      codigo_promocional_snapshot: row.codigo_promocional_snapshot || null,
       line_allocations: Array.isArray(row.line_allocations) ? row.line_allocations.map((allocation) => ({
         line_key: allocation.line_key,
         descuento_hnl: Number(allocation.descuento_hnl || 0),
@@ -481,6 +487,7 @@ export function evaluatePromotions(context = {}, candidates = [], usageStats = {
 
     const eligibleLines = getEligibleLines(context, candidate);
     const eligibleBase = normalizeMoney(eligibleLines.reduce((sum, line) => sum + Number(line.base_disponible_hnl || 0), 0));
+    const applicableCode = findApplicablePromotionCode(context, candidate);
     const discount = isValid ? calculateDiscount(context, candidate) : 0;
     const lineAllocations = isValid && discount > 0
       ? allocateDiscountAcrossLines(eligibleLines, discount)
@@ -513,6 +520,8 @@ export function evaluatePromotions(context = {}, candidates = [], usageStats = {
       targetKeys,
       targetLineKeys: lineAllocations.map((row) => row.line_key),
       line_allocations: lineAllocations,
+      id_promocion_codigo: applicableCode?.id_promocion_codigo || null,
+      codigo_promocional_snapshot: applicableCode?.codigo_promocional_snapshot || null,
     });
   }
 

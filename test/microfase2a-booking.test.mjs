@@ -45,6 +45,8 @@ const DETAIL_A = "12121212-1212-4121-8121-121212121212";
 const PROMO_A = "13131313-1313-4131-8131-131313131313";
 const PROMO_RULE_A = "14141414-1414-4141-8141-141414141414";
 const PROMO_APP_A = "15151515-1515-4151-8151-151515151515";
+const PROMO_BRANCH_A = "16161616-1616-4161-8161-161616161616";
+const PROMO_CODE_A = "17171717-1717-4171-8171-171717171717";
 
 async function withBookingIsvEnv(value, callback) {
   const hadValue = Object.prototype.hasOwnProperty.call(process.env, "BOOKING_ISV_ENABLED");
@@ -837,10 +839,14 @@ test("createBookingReservation persiste promocion de servicio con id_cita_detall
           descuento_calculado_hnl: 10,
           prioridad_aplicacion: 10,
           es_acumulable: true,
+          id_promocion_sucursal: PROMO_BRANCH_A,
+          id_promocion_codigo: PROMO_CODE_A,
+          codigo_promocional_snapshot: "CORTE10",
           target_items: [{ id_servicio: SERVICE_A }],
         }],
         promociones_descartadas: [],
       },
+      usageState: "reservado",
     },
   });
 
@@ -857,5 +863,15 @@ test("createBookingReservation persiste promocion de servicio con id_cita_detall
   assert.equal(promoInsert.params[0], GROUP_A);
   assert.equal(promoInsert.params[1], CITA_A);
   assert.equal(promoInsert.params[4], DETAIL_A);
-  assert.equal(promoInsert.params[12], 10);
+  assert.equal(promoInsert.params[8], PROMO_BRANCH_A);
+  assert.equal(promoInsert.params[9], PROMO_CODE_A);
+  assert.equal(promoInsert.params[10], "CORTE10");
+  assert.equal(promoInsert.params[15], 10);
+
+  const usageInsert = calls.find((call) => call.sql.includes("INSERT INTO public.promociones_usos"));
+  assert.ok(usageInsert);
+  assert.equal(usageInsert.params[6], PROMO_BRANCH_A);
+  assert.equal(usageInsert.params[7], PROMO_CODE_A);
+  assert.equal(usageInsert.params[8], null);
+  assert.equal(usageInsert.params[10], "reservado");
 });

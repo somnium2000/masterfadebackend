@@ -192,6 +192,9 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       id_grupo_cita: context.id_grupo_cita,
       id_promocion: applied.id_promocion,
       id_promocion_regla: applied.id_promocion_regla,
+      id_promocion_sucursal: applied.id_promocion_sucursal || context.id_promocion_sucursal || null,
+      id_promocion_codigo: applied.id_promocion_codigo || null,
+      codigo_promocional_snapshot: applied.codigo_promocional_snapshot || null,
       aplica_a_codigo: applied.aplica_a_codigo,
       nombre_promocion_snapshot: applied.titulo,
       tipo_descuento_codigo: applied.tipo_descuento_codigo,
@@ -217,6 +220,8 @@ export async function recordPromotionApplications(db, context = {}, result = {},
           id_cliente: context.id_cliente || null,
           id_persona: context.id_persona || null,
           id_promocion_sucursal: applied.id_promocion_sucursal || context.id_promocion_sucursal || null,
+          id_promocion_codigo: applied.id_promocion_codigo || null,
+          id_empleado_barbero: context.id_empleado_barbero || null,
           fecha_operativa: normalizeDate(context.fecha_operativa || context.fecha),
           estado_uso_codigo: usageState,
         });
@@ -234,6 +239,9 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       id_grupo_cita: context.id_grupo_cita,
       id_promocion: discarded.id_promocion,
       id_promocion_regla: discarded.id_promocion_regla,
+      id_promocion_sucursal: discarded.id_promocion_sucursal || context.id_promocion_sucursal || null,
+      id_promocion_codigo: discarded.id_promocion_codigo || null,
+      codigo_promocional_snapshot: discarded.codigo_promocional_snapshot || null,
       aplica_a_codigo: discarded.aplica_a_codigo || "reserva",
       nombre_promocion_snapshot: discarded.titulo,
       tipo_descuento_codigo: discarded.tipo_descuento_codigo || "monto_fijo",
@@ -319,8 +327,13 @@ export async function markPromotionUsagesForGroup(db, context = {}) {
       SELECT
         cp.id_cita_promocion,
         cp.id_promocion_regla,
-        cp.id_cita
+        cp.id_cita,
+        cp.id_promocion_sucursal,
+        cp.id_promocion_codigo,
+        c.id_empleado_barbero
       FROM public.citas_promociones cp
+      LEFT JOIN public.citas c
+        ON c.id_cita = cp.id_cita
       WHERE cp.id_grupo_cita = $1::uuid
         AND cp.estado_aplicacion_codigo = 'aplicada'
     `,
@@ -346,7 +359,9 @@ export async function markPromotionUsagesForGroup(db, context = {}) {
       id_cita: row.id_cita || null,
       id_cliente: context.id_cliente || null,
       id_persona: context.id_persona || null,
-      id_promocion_sucursal: null,
+      id_promocion_sucursal: row.id_promocion_sucursal || null,
+      id_promocion_codigo: row.id_promocion_codigo || null,
+      id_empleado_barbero: row.id_empleado_barbero || context.id_empleado_barbero || null,
       fecha_operativa: dateRef,
       estado_uso_codigo: "consumido",
     });

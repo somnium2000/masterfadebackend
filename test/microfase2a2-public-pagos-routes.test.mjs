@@ -34,7 +34,7 @@ function makeGroupRow() {
   };
 }
 
-function createPagosClient({ existingIntent = null, persistedPromotion = false } = {}) {
+function createPagosClient({ existingIntent = null, persistedPromotion = false, failProviderUpdate = false } = {}) {
   const calls = [];
   const client = {
     calls,
@@ -107,10 +107,30 @@ function createPagosClient({ existingIntent = null, persistedPromotion = false }
         return { rows: existingIntent ? [existingIntent] : [] };
       }
       if (text.includes("INSERT INTO public.payment_intents")) {
+        const idIntent = params[0];
         return {
           rows: [{
-            id_intent: INTENT_A,
-            link_pago_url: "http://localhost:5173/agendar/exito?id_grupo_cita=1",
+            id_intent: idIntent,
+            id_provider: PROVIDER_A,
+            id_cita: CITA_A,
+            id_hold: HOLD_A,
+            link_pago_url: null,
+            referencia_externa: null,
+            idempotency_key: params[5],
+            expires_at: "2099-01-01T16:00:00.000Z",
+            monto_hnl: "115.00",
+            moneda_codigo: "HNL",
+            estado_intent_codigo: "creado",
+            id_grupo_cita: GROUP_A,
+          }],
+        };
+      }
+      if (text.includes("UPDATE public.payment_intents") && text.includes("link_pago_url = $2::text")) {
+        if (failProviderUpdate) return { rows: [] };
+        return {
+          rows: [{
+            id_intent: params[0],
+            link_pago_url: params[1],
             expires_at: "2099-01-01T16:00:00.000Z",
             monto_hnl: "115.00",
             moneda_codigo: "HNL",
@@ -168,8 +188,14 @@ test("ruta real POST /v1/public/pagos/crear-intent conserva snapshots y crea int
   assert.ok(intentInsert);
   assert.match(intentInsert.params[0], /^[0-9a-f-]{36}$/i);
   assert.equal(intentInsert.params[4], 115);
-  assert.equal(intentInsert.params[7], `masterfade:booking-payment:${intentInsert.params[0]}`);
-  assert.equal(intentInsert.params[10], GROUP_A);
+  assert.equal(intentInsert.params[5], `masterfade:booking-payment:${intentInsert.params[0]}`);
+  assert.equal(intentInsert.params[8], GROUP_A);
+  const providerUpdate = client.calls.find((call) =>
+    call.sql.includes("UPDATE public.payment_intents")
+    && call.sql.includes("link_pago_url = $2::text")
+  );
+  assert.ok(providerUpdate);
+  assert.equal(providerUpdate.params[0], intentInsert.params[0]);
   await app.close();
 });
 
@@ -221,5 +247,28 @@ test("ruta real POST /v1/public/pagos/crear-intent hace rollback si no puede val
   assert.ok(client.calls.some((call) => call.sql === "ROLLBACK"));
   assert.ok(!client.calls.some((call) => call.sql === "COMMIT"));
   assert.ok(!client.calls.some((call) => call.sql.includes("INSERT INTO public.payment_intents")));
+  await app.close();
+});
+
+test("ruta real POST /v1/public/pagos/crear-intent conserva intent local si falla update post proveedor", async () => {
+  const client = createPagosClient({ failProviderUpdate: true });
+  const app = await createPagosApp(client);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      titular_email: "cliente@example.com",
+    },
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "PUBLIC_PAGOS_INTENT_UPDATE_MISSING");
+  const intentInsert = client.calls.find((call) => call.sql.includes("INSERT INTO public.payment_intents"));
+  assert.ok(intentInsert);
+  const commits = client.calls.filter((call) => call.sql === "COMMIT").length;
+  assert.equal(commits, 1);
+  assert.ok(client.calls.some((call) => call.sql === "ROLLBACK"));
   await app.close();
 });
