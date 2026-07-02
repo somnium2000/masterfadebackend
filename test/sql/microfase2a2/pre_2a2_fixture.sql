@@ -1,3 +1,51 @@
+INSERT INTO public.sucursales (id_sucursal, nombre_sucursal)
+VALUES ('11111111-1111-4111-8111-111111111111', 'Sucursal fixture');
+
+INSERT INTO public.personas (id_persona, nombres, apellidos)
+VALUES
+  ('22222222-2222-4222-8222-222222222222', 'Cliente', 'Fixture'),
+  ('23232323-2323-4323-8323-232323232323', 'Barbero', 'Fixture');
+
+INSERT INTO public.clientes (id_cliente, id_persona)
+VALUES ('12121212-1212-4212-8212-121212121212', '22222222-2222-4222-8222-222222222222');
+
+INSERT INTO public.usuarios (id_usuario, id_persona)
+VALUES ('13131313-1313-4313-8313-131313131313', '22222222-2222-4222-8222-222222222222');
+
+INSERT INTO public.empleados (id_empleado, id_sucursal, id_persona, es_barbero)
+VALUES (
+  '33333333-3333-4333-8333-333333333333',
+  '11111111-1111-4111-8111-111111111111',
+  '23232323-2323-4323-8323-232323232323',
+  true
+);
+
+INSERT INTO public.horarios_semanales_sucursales (
+  id_horario_sucursal,
+  id_sucursal,
+  estado_horario_codigo,
+  vigencia_desde
+)
+VALUES (
+  '14141414-1414-4414-8414-141414141414',
+  '11111111-1111-4111-8111-111111111111',
+  'publicado',
+  '2026-01-01'
+);
+
+INSERT INTO public.horarios_semanales_sucursales_bloques (
+  id_horario_sucursal,
+  dia_semana,
+  hora_inicio,
+  hora_fin
+)
+SELECT
+  '14141414-1414-4414-8414-141414141414',
+  day_number,
+  time '08:00',
+  time '19:00'
+FROM generate_series(1, 6) AS day_number;
+
 INSERT INTO public.servicios (id_servicio, nombre_servicio, duracion_min, buffer_min)
 VALUES
   ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Corte fixture', 30, 5);

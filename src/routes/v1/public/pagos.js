@@ -9,11 +9,13 @@ import {
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
 import { normalizeOperationalDateTime } from "../../../services/agendaService.js";
+import {
+  confirmCanonicalPaidReservation,
+  mapCanonicalReservationError,
+} from "../../../services/bookingCanonicalReservationService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
-const PUBLIC_POST_PAYMENT_CONFIRMABLE_APPOINTMENT_STATES = new Set(["en_espera", "pendiente_pago"]);
-const PUBLIC_POST_PAYMENT_BLOCKING_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
 
 function safeText(value) {
   const normalized = String(value || "").trim();
@@ -527,121 +529,6 @@ async function loadPublicIntentForGroup(client, {
   return { groupRows, intent };
 }
 
-async function loadPostPaymentConfirmableGroup(client, { groupId }) {
-  const result = await client.query(
-    `
-      SELECT
-        cg.id_grupo_cita,
-        cg.estado_grupo_codigo,
-        cg.id_cliente_titular,
-        c.id_cita,
-        c.id_empleado_barbero,
-        c.estado_cita_codigo,
-        c.inicio_at,
-        c.fin_at,
-        hold.id_hold,
-        hold.estado_hold_codigo,
-        hold.expires_at
-      FROM public.citas_grupos cg
-      JOIN public.citas c
-        ON c.id_grupo_cita = cg.id_grupo_cita
-       AND c.deleted_at IS NULL
-      LEFT JOIN LATERAL (
-        SELECT h.id_hold, h.estado_hold_codigo, h.expires_at
-        FROM public.citas_holds h
-        WHERE h.id_cita = c.id_cita
-        ORDER BY h.created_at DESC
-        LIMIT 1
-      ) hold ON TRUE
-      WHERE cg.id_grupo_cita = $1::uuid
-      ORDER BY c.orden_integrante ASC, c.created_at ASC
-      FOR UPDATE OF cg, c
-    `,
-    [groupId]
-  );
-  if (!result.rows.length) {
-    throw new AppError(404, "La reserva indicada no existe", { code: "PUBLIC_PAGOS_GROUP_NOT_FOUND" });
-  }
-  return result.rows;
-}
-
-function assertPostPaymentGroupConfirmable(groupRows) {
-  const groupState = safeText(groupRows?.[0]?.estado_grupo_codigo)?.toLowerCase() || "";
-  if (groupState && groupState !== "activo") {
-    throw new AppError(409, "La reserva no se puede confirmar en su estado actual", {
-      code: "PUBLIC_PAGOS_BOOKING_NOT_CONFIRMABLE",
-    });
-  }
-
-  const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "").trim().toLowerCase() === "confirmada");
-  if (allConfirmed) return { alreadyConfirmed: true };
-
-  const invalidAppointment = groupRows.find((row) => (
-    !PUBLIC_POST_PAYMENT_CONFIRMABLE_APPOINTMENT_STATES.has(String(row.estado_cita_codigo || "").trim().toLowerCase())
-  ));
-  if (invalidAppointment) {
-    throw new AppError(409, "La reserva no se puede confirmar en su estado actual", {
-      code: "PUBLIC_PAGOS_BOOKING_NOT_CONFIRMABLE",
-    });
-  }
-
-  const nowMs = Date.now();
-  const invalidHold = groupRows.find((row) => {
-    const holdState = String(row.estado_hold_codigo || "").trim().toLowerCase();
-    const holdExpiresMs = row.expires_at ? new Date(row.expires_at).getTime() : NaN;
-    return !row.id_hold
-      || holdState !== "activo"
-      || !Number.isFinite(holdExpiresMs)
-      || holdExpiresMs <= nowMs;
-  });
-  if (invalidHold) {
-    throw new AppError(409, "El hold de la reserva ya no esta activo", {
-      code: "PUBLIC_PAGOS_HOLD_EXPIRED",
-    });
-  }
-
-  return { alreadyConfirmed: false };
-}
-
-async function assertNoPostPaymentAvailabilityConflict(client, { groupId, groupRows }) {
-  for (const row of groupRows) {
-    const blockConflict = await client.query(
-      `
-        SELECT 1
-        FROM public.bloqueos_agenda b
-        WHERE b.id_empleado = $1::uuid
-          AND b.rango && tstzrange($2::timestamptz, $3::timestamptz, '[)')
-        LIMIT 1
-      `,
-      [row.id_empleado_barbero, row.inicio_at, row.fin_at]
-    );
-    if (blockConflict.rows[0]) {
-      throw new AppError(409, "El horario de la reserva ya no esta disponible", {
-        code: "PUBLIC_PAGOS_AVAILABILITY_CONFLICT",
-      });
-    }
-
-    const appointmentConflict = await client.query(
-      `
-        SELECT 1
-        FROM public.citas c
-        WHERE c.id_empleado_barbero = $1::uuid
-          AND c.deleted_at IS NULL
-          AND c.id_grupo_cita <> $2::uuid
-          AND c.estado_cita_codigo = ANY($3::text[])
-          AND tstzrange(c.inicio_at, c.fin_at, '[)') && tstzrange($4::timestamptz, $5::timestamptz, '[)')
-        LIMIT 1
-      `,
-      [row.id_empleado_barbero, groupId, PUBLIC_POST_PAYMENT_BLOCKING_APPOINTMENT_STATES, row.inicio_at, row.fin_at]
-    );
-    if (appointmentConflict.rows[0]) {
-      throw new AppError(409, "El horario de la reserva ya no esta disponible", {
-        code: "PUBLIC_PAGOS_AVAILABILITY_CONFLICT",
-      });
-    }
-  }
-}
-
 async function resolvePublicIntentCreatorUserId(client, { groupRows }) {
   const titularClientId = groupRows?.[0]?.id_cliente_titular ?? null;
   if (titularClientId) {
@@ -1068,7 +955,13 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
   return { pending: queued.rows.length, sent, failed };
 }
 
-async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = null, expectedIntentId = null }) {
+async function confirmGroupAfterPaid(client, {
+  idCitaAnchor,
+  expectedGroupId = null,
+  expectedIntentId = null,
+  referenciaExterna = null,
+  pagadoAt = null,
+}) {
   const groupResult = await client.query(
     `
       SELECT
@@ -1125,29 +1018,12 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
         code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH",
       });
     }
-    if (String(intent.estado_intent_codigo || "").trim().toLowerCase() !== "confirmado" || intent.has_captured_payment !== true) {
+    if (intent.has_captured_payment !== true) {
       throw new AppError(409, "El pago no esta confirmado para esta reserva", {
         code: "PUBLIC_PAGOS_PAYMENT_NOT_CONFIRMED",
       });
     }
   }
-
-  const groupRows = await loadPostPaymentConfirmableGroup(client, { groupId: idGrupoCita });
-  const confirmability = assertPostPaymentGroupConfirmable(groupRows);
-  if (confirmability.alreadyConfirmed) {
-    return {
-      id_grupo_cita: idGrupoCita,
-      total_hnl: calculateGroupTotalFromRows(groupRows),
-      ya_confirmada: true,
-      recompensa_utilizada: {
-        aplicada: false,
-        ya_aplicada: true,
-        puntos_descontados: 0,
-        saldo_actual: null,
-      },
-    };
-  }
-  await assertNoPostPaymentAvailabilityConflict(client, { groupId: idGrupoCita, groupRows });
 
   const totalResult = await client.query(
     `SELECT COALESCE(SUM(total_pagar_hnl),0)::numeric AS total FROM public.citas WHERE id_grupo_cita = $1::uuid AND deleted_at IS NULL`,
@@ -1155,29 +1031,11 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
   );
   const totalGrupo = Number(totalResult.rows[0]?.total ?? 0);
 
-  await client.query(
-    `
-      UPDATE public.citas
-      SET estado_cita_codigo = 'confirmada',
-          updated_at = now()
-      WHERE id_grupo_cita = $1::uuid
-        AND deleted_at IS NULL
-        AND estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada')
-    `,
-    [idGrupoCita]
-  );
-  await client.query(
-    `
-      UPDATE public.citas_holds h
-      SET estado_hold_codigo = 'consumido',
-          updated_at = now()
-      FROM public.citas c
-      WHERE c.id_grupo_cita = $1::uuid
-        AND c.id_cita = h.id_cita
-        AND h.estado_hold_codigo = 'activo'
-    `,
-    [idGrupoCita]
-  );
+  const canonicalConfirmation = await confirmCanonicalPaidReservation(client, {
+    idIntent: expectedIntentId,
+    referenciaExterna,
+    pagadoAt,
+  });
 
   let rewardRedemption = {
     aplicada: false,
@@ -1202,6 +1060,7 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
   return {
     id_grupo_cita: idGrupoCita,
     total_hnl: totalGrupo,
+    confirmacion_canonica: canonicalConfirmation,
     recompensa_utilizada: rewardRedemption,
   };
 }
@@ -1588,25 +1447,26 @@ export default async function publicPagosRoutes(app) {
 
       if (status === "paid") {
         const providerTxId = `tx_mock_${idIntent}`;
+        const paidAt = new Date().toISOString();
         await dbClient.query(
           `
             INSERT INTO public.payments (
               id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
             )
-            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, now(), FALSE)
+            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, $5::timestamptz, FALSE)
             ON CONFLICT (provider_tx_id) DO UPDATE SET updated_at = now()
             RETURNING id_payment
           `,
-          [idIntent, providerTxId, Number(intent.monto_hnl || 0), safeText(intent.moneda_codigo) || "HNL"]
+          [idIntent, providerTxId, Number(intent.monto_hnl || 0), safeText(intent.moneda_codigo) || "HNL", paidAt]
         );
-        await dbClient.query(
-          `UPDATE public.payment_intents SET estado_intent_codigo = 'confirmado', updated_at = now() WHERE id_intent = $1::uuid`,
-          [idIntent]
-        );
+        await dbClient.query("COMMIT");
+        await dbClient.query("BEGIN");
         const confirm = await confirmGroupAfterPaid(dbClient, {
           idCitaAnchor: intent.id_cita,
           expectedGroupId: idGrupoCita,
           expectedIntentId: idIntent,
+          referenciaExterna: providerTxId,
+          pagadoAt: paidAt,
         });
         await dbClient.query("COMMIT");
         let emailDelivery = { pending: 0, sent: 0, failed: 0 };
@@ -1645,14 +1505,22 @@ export default async function publicPagosRoutes(app) {
       return sendOk(reply, { processed: true, duplicate: false, status });
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
-      if (error instanceof AppError) {
+      const handledError = mapCanonicalReservationError(error, {
+        publicRoute: true,
+        safeMessage: "No se pudo confirmar el pago de la reserva",
+        details: {
+          id_intent: request.body?.id_intent || null,
+          id_grupo_cita: request.body?.id_grupo_cita || null,
+        },
+      });
+      if (handledError instanceof AppError) {
         request.log.warn(
-          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          { requestId: request.id, statusCode: handledError.statusCode, code: handledError.code, details: handledError.details },
           "Public pagos mock complete handled AppError"
         );
-        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
-        return sendError(reply, error.statusCode, error.message, {
-          code: error.code,
+        const safeDetails = sanitizePublicPagosErrorDetails(handledError.details);
+        return sendError(reply, handledError.statusCode, handledError.message, {
+          code: handledError.code,
           ...(safeDetails ? { details: safeDetails } : {}),
           requestId: request.id,
         });
@@ -1760,29 +1628,32 @@ export default async function publicPagosRoutes(app) {
       );
 
       if (simulation.normalizedStatus === "PAID") {
+        const paidAt = new Date().toISOString();
+        const providerTxId = `todopago_sim_${idIntent}_${simulation.responseCode}`;
         await dbClient.query(
           `
             INSERT INTO public.payments (
               id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
             )
-            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, now(), FALSE)
+            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, $5::timestamptz, FALSE)
             ON CONFLICT (provider_tx_id) DO UPDATE SET updated_at = now()
           `,
           [
             idIntent,
-            `todopago_sim_${idIntent}_${simulation.responseCode}`,
+            providerTxId,
             Number(intent.monto_hnl || 0),
             safeText(intent.moneda_codigo) || "HNL",
+            paidAt,
           ]
         );
-        await dbClient.query(
-          `UPDATE public.payment_intents SET estado_intent_codigo = 'confirmado', updated_at = now() WHERE id_intent = $1::uuid`,
-          [idIntent]
-        );
+        await dbClient.query("COMMIT");
+        await dbClient.query("BEGIN");
         const confirm = await confirmGroupAfterPaid(dbClient, {
           idCitaAnchor: intent.id_cita,
           expectedGroupId: idGrupoCita,
           expectedIntentId: idIntent,
+          referenciaExterna: providerTxId,
+          pagadoAt: paidAt,
         });
         await dbClient.query("COMMIT");
 
@@ -1833,14 +1704,22 @@ export default async function publicPagosRoutes(app) {
       });
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
-      if (error instanceof AppError) {
+      const handledError = mapCanonicalReservationError(error, {
+        publicRoute: true,
+        safeMessage: "No se pudo confirmar el pago de la reserva",
+        details: {
+          id_intent: request.body?.id_intent || null,
+          id_grupo_cita: request.body?.id_grupo_cita || null,
+        },
+      });
+      if (handledError instanceof AppError) {
         request.log.warn(
-          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          { requestId: request.id, statusCode: handledError.statusCode, code: handledError.code, details: handledError.details },
           "Public pagos simulator handled AppError"
         );
-        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
-        return sendError(reply, error.statusCode, error.message, {
-          code: error.code,
+        const safeDetails = sanitizePublicPagosErrorDetails(handledError.details);
+        return sendError(reply, handledError.statusCode, handledError.message, {
+          code: handledError.code,
           ...(safeDetails ? { details: safeDetails } : {}),
           requestId: request.id,
         });

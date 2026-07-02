@@ -117,6 +117,145 @@ BEGIN
   END IF;
 END $$;
 
+DO $$
+BEGIN
+  IF to_regclass('app_private.reserva_idempotencia') IS NULL THEN
+    RAISE EXCEPTION 'canonical idempotency table missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'app_private'
+      AND p.proname = 'crear_reserva_canonica_v1'
+  ) THEN
+    RAISE EXCEPTION 'canonical create RPC missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'app_private'
+      AND p.proname = 'confirmar_reserva_pagada_v1'
+  ) THEN
+    RAISE EXCEPTION 'canonical paid confirmation RPC missing';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'payment_intents'
+      AND column_name = 'paid_at'
+  ) THEN
+    RAISE EXCEPTION 'payment_intents.paid_at missing';
+  END IF;
+END $$;
+
+DO $$
+DECLARE
+  v_result jsonb;
+  v_confirm jsonb;
+  v_id_grupo uuid;
+BEGIN
+  SELECT app_private.crear_reserva_canonica_v1(
+    jsonb_build_object(
+      'request_id', 'abababab-abab-4bab-8bab-abababababab',
+      'id_sucursal', '11111111-1111-4111-8111-111111111111',
+      'id_persona_titular', '22222222-2222-4222-8222-222222222222',
+      'id_cliente_titular', '12121212-1212-4212-8212-121212121212',
+      'id_usuario_titular', '13131313-1313-4313-8313-131313131313',
+      'origen_codigo', 'cliente_autenticado',
+      'integrantes', jsonb_build_array(
+        jsonb_build_object(
+          'orden_integrante', 1,
+          'id_persona', '22222222-2222-4222-8222-222222222222',
+          'id_cliente', '12121212-1212-4212-8212-121212121212',
+          'id_usuario', '13131313-1313-4313-8313-131313131313',
+          'tipo_cliente_codigo', 'autenticado',
+          'alias', 'Titular',
+          'id_empleado_barbero', '33333333-3333-4333-8333-333333333333',
+          'selection_type', 'services',
+          'inicio_at', '2027-07-15T15:00:00Z',
+          'detalles', jsonb_build_array(
+            jsonb_build_object(
+              'id_servicio', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+              'id_tarifa', '44444444-4444-4444-8444-444444444444',
+              'cantidad', 1,
+              'duracion_min', 30,
+              'buffer_min', 5,
+              'nombre_servicio_snapshot', 'Corte fixture',
+              'precio_referencia_hnl', 300,
+              'precio_unitario_hnl', 300,
+              'descuento_hnl', 0,
+              'incluye_isv_snapshot', false,
+              'isv_porcentaje', 0,
+              'origen_item_codigo', 'servicio_manual'
+            )
+          )
+        )
+      )
+    )
+  )
+  INTO v_result;
+
+  IF (v_result->>'request_id') <> 'abababab-abab-4bab-8bab-abababababab'
+     OR (v_result->>'total_pagar_hnl')::numeric <> 300.00 THEN
+    RAISE EXCEPTION 'canonical create RPC result mismatch: %', v_result;
+  END IF;
+
+  v_id_grupo := (v_result->>'id_grupo_cita')::uuid;
+
+  INSERT INTO public.payment_intents (
+    id_intent,
+    id_grupo_cita,
+    origen_pago_codigo,
+    estado_intent_codigo,
+    monto_hnl
+  )
+  VALUES (
+    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    v_id_grupo,
+    'cita',
+    'creado',
+    300.00
+  )
+  ON CONFLICT (id_intent) DO UPDATE
+  SET id_grupo_cita = EXCLUDED.id_grupo_cita,
+      origen_pago_codigo = EXCLUDED.origen_pago_codigo,
+      estado_intent_codigo = EXCLUDED.estado_intent_codigo,
+      monto_hnl = EXCLUDED.monto_hnl;
+
+  SELECT app_private.confirmar_reserva_pagada_v1(
+    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    'ci-canonical-paid',
+    clock_timestamp()
+  )
+  INTO v_confirm;
+
+  IF (v_confirm->>'estado_intent_codigo') <> 'confirmado'
+     OR (v_confirm->>'id_grupo_cita')::uuid <> v_id_grupo THEN
+    RAISE EXCEPTION 'canonical confirm RPC result mismatch: %', v_confirm;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.citas_detalles cd
+    JOIN public.citas c ON c.id_cita = cd.id_cita
+    WHERE c.id_grupo_cita = v_id_grupo
+      AND (
+        cd.incluye_isv_snapshot IS DISTINCT FROM false
+        OR cd.isv_porcentaje <> 0
+        OR cd.isv_hnl <> 0
+        OR cd.total_linea_hnl <> 300
+      )
+  ) THEN
+    RAISE EXCEPTION 'canonical RPC reactivated disabled ISV';
+  END IF;
+END $$;
+
 INSERT INTO public.citas_detalles (
   id_cita_detalle,
   id_cita,

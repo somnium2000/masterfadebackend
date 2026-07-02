@@ -42,6 +42,7 @@ jobs:
         run: npm ci
       - name: Load pre-2A2 schema and fixtures
         run: |
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_fixture.sql
       - name: Apply migrations 2A2 and 2A3
@@ -49,6 +50,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
       - name: Validate objects, backfill, triggers and fiscal guard
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
       - name: Apply migrations again
@@ -56,6 +58,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
       - name: Validate idempotency
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
       - name: Run tests
