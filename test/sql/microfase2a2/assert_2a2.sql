@@ -378,9 +378,12 @@ BEGIN
     '25252525-2525-4525-8525-252525252525',
     '2027-07-16',
     'reservado'
-  )
-  ON CONFLICT (id_promocion_uso) DO UPDATE
-  SET estado_uso_codigo = 'reservado';
+	  )
+	  ON CONFLICT (id_promocion_uso) DO UPDATE
+	  SET estado_uso_codigo = CASE
+	    WHEN public.promociones_usos.estado_uso_codigo = 'revertido' THEN 'revertido'
+	    ELSE 'reservado'
+	  END;
 
   UPDATE public.citas_holds
   SET expires_at = clock_timestamp() - interval '1 minute'
