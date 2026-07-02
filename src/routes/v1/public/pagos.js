@@ -523,7 +523,7 @@ async function loadPublicIntentForGroup(client, {
   }
   if (expectedAmountHnl !== null && !amountsMatch(intent.monto_hnl, expectedAmountHnl)) {
     throw new AppError(409, "El monto del intent no coincide con la reserva vigente", {
-      code: "PUBLIC_PAGOS_INTENT_AMOUNT_MISMATCH",
+      code: "PAYMENT_AMOUNT_MISMATCH",
     });
   }
 
@@ -756,6 +756,10 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, logge
 }
 
 async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+    [`post_payment_emails:${idGrupoCita}`]
+  );
   const rows = await client.query(
     `
       SELECT
@@ -811,9 +815,19 @@ async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
           estado_notificacion_codigo,
           id_cita
         )
-        VALUES ('cita_confirmada_post_pago', $1::text, $2::text, $3::text, 'pendiente', $4::uuid)
+        SELECT 'cita_confirmada_post_pago', $1::text, $2::text, $3::text, 'pendiente', $4::uuid
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.notificaciones_email ne
+          JOIN public.citas c
+            ON c.id_cita = ne.id_cita
+          WHERE c.id_grupo_cita = $5::uuid
+            AND ne.evento = 'cita_confirmada_post_pago'
+            AND lower(trim(ne.correo_destino)) = lower(trim($1::text))
+          LIMIT 1
+        )
       `,
-      [to, subject, body, block.id_cita]
+      [to, subject, body, block.id_cita, idGrupoCita]
     );
   }
 }

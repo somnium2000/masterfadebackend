@@ -2355,6 +2355,52 @@ export async function listAvailabilityByDateRangeForRequest(client, {
   const dateKeys = buildDateKeyRange(safeFrom, safeTo);
   const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
 
+  if (id_barbero) {
+    try {
+      const serviceSelection = await getBookingSelectionDetails(client, {
+        id_sucursal,
+        selection_type: normalizedSelectionType,
+        servicios,
+        id_paquete,
+        id_barbero,
+        fecha_operativa: safeFrom,
+        bookingIsvEnabled,
+      });
+      const availability = await listAvailabilityByDateRange(
+        client,
+        id_sucursal,
+        serviceSelection,
+        safeFrom,
+        safeTo,
+        id_barbero
+      );
+      const duracionTotalMin = Number(serviceSelection.duracion_total_min || 0);
+      const bufferTotalMin = Number(serviceSelection.buffer_total_min || 0);
+      return {
+        disponibilidad: availability.map((entry) => ({
+          ...entry,
+          effective_selection: {
+            duracion_total_min: duracionTotalMin,
+            buffer_total_min: bufferTotalMin,
+          },
+        })),
+        duracion_total_min: duracionTotalMin,
+        buffer_total_min: bufferTotalMin,
+      };
+    } catch (error) {
+      if (isTariffMissingForSelection(error)) {
+        return {
+          disponibilidad: dateKeys.map((dateKey) => buildUnavailableAvailability(dateKey, null, null, {
+            unavailable_reason: error?.code || "AGENDA_SELECTION_UNAVAILABLE",
+          })),
+          duracion_total_min: null,
+          buffer_total_min: null,
+        };
+      }
+      throw error;
+    }
+  }
+
   const rangeConcurrency = isPoolLikeClient(client) ? 1 : 4;
   const availability = await mapWithConcurrency(dateKeys, rangeConcurrency, async (dateKey) => {
     try {

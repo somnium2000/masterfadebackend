@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { AppError, sendError } from "../../../utils/errors.js";
+import { AppError, sendError, toDatabaseSchemaOutdatedError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
   assertUuid,
@@ -199,19 +199,20 @@ function sanitizePublicCitasErrorDetails(rawDetails) {
 }
 
 function sendHandled(reply, request, error, message, code) {
-  if (error instanceof AppError) {
+  const normalizedError = toDatabaseSchemaOutdatedError(error);
+  if (normalizedError instanceof AppError) {
     request.log.warn(
       {
         requestId: request.id,
-        statusCode: error.statusCode,
-        code: error.code,
-        details: error.details,
+        statusCode: normalizedError.statusCode,
+        code: normalizedError.code,
+        details: normalizedError.details,
       },
       "Public citas handled AppError"
     );
-    const safeDetails = sanitizePublicCitasErrorDetails(error.details);
-    return sendError(reply, error.statusCode, error.message, {
-      code: error.code,
+    const safeDetails = sanitizePublicCitasErrorDetails(normalizedError.details);
+    return sendError(reply, normalizedError.statusCode, normalizedError.message, {
+      code: normalizedError.code,
       ...(safeDetails ? { details: safeDetails } : {}),
       requestId: request.id,
     });
@@ -1477,6 +1478,7 @@ export default async function publicCitasRoutes(app) {
               data: {
                 type: "object",
                 properties: {
+                  request_id: { type: "string", format: "uuid" },
                   id_grupo_cita: { type: "string", format: "uuid" },
                   estado_grupo_codigo: { type: "string" },
                   expires_at: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
@@ -1657,6 +1659,7 @@ export default async function publicCitasRoutes(app) {
           const detailRows = await loadCanonicalPromotionDetailRows(dbClient, {
             idCita: block.id_cita,
             detailRows: promotionRecord.detailRows,
+            canonicalBlock: block,
           });
           await recordPromotionApplications(
             dbClient,
@@ -1664,6 +1667,7 @@ export default async function publicCitasRoutes(app) {
               ...promotionRecord.context,
               id_grupo_cita: canonicalResult.id_grupo_cita,
               id_cita: block.id_cita,
+              id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
               detailRows,
             },
             promotionRecord.result,

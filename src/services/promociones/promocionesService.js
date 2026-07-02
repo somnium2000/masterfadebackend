@@ -120,9 +120,13 @@ function buildScopedPromotionPayloads(base = {}, context = {}, item = {}) {
     return [payload];
   }
   if (applyCode === "titular") {
-    payload.id_cita = null;
-    payload.id_cita_integrante = context.id_cita_integrante || null;
-    return payload.id_cita_integrante ? [payload] : [];
+    payload.id_cita_integrante = context.id_cita_integrante || item.id_cita_integrante || null;
+    if (!payload.id_cita_integrante) {
+      throw new AppError(409, "No se pudo persistir una promocion del titular con identidad canonica", {
+        code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+      });
+    }
+    return [payload];
   }
   if (applyCode === "paquete") {
     payload.id_cita_paquete = context.id_cita_paquete || item.id_cita_paquete || null;

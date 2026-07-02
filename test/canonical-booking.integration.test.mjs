@@ -101,7 +101,7 @@ async function createIdempotencyApp(pool) {
   return app;
 }
 
-test("canonical booking integration: idempotencia temprana y token estable con app.inject y PostgreSQL", { skip: !SHOULD_RUN }, async () => {
+if (SHOULD_RUN) test("canonical booking integration: idempotencia temprana y token estable con app.inject y PostgreSQL", async () => {
   const pool = createPool();
   const app = await createIdempotencyApp(pool);
   await pool.query(
@@ -165,7 +165,7 @@ test("canonical booking integration: idempotencia temprana y token estable con a
   await pool.end();
 });
 
-test("canonical booking integration: dos conexiones reales y line_key transaccional", { skip: !SHOULD_RUN }, async () => {
+if (SHOULD_RUN) test("canonical booking integration: dos conexiones reales y line_key transaccional", async () => {
   const pool = createPool();
   const clientA = await pool.connect();
   const clientB = await pool.connect();

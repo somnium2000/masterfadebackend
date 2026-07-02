@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { AppError } from "../utils/errors.js";
+import { AppError, toDatabaseSchemaOutdatedError } from "../utils/errors.js";
 import { buildAppointmentDetailRows, summarizeAppointmentDetailRows } from "./bookingReservationService.js";
 
 export function toCents(value) {
@@ -367,21 +367,41 @@ export async function createCanonicalReservation(client, payload) {
   return result.rows?.[0]?.resultado || null;
 }
 
-export async function loadCanonicalPromotionDetailRows(client, { idCita, detailRows = [] } = {}) {
+function extractCanonicalDetailRows(canonicalBlock = {}) {
+  const candidates = [
+    canonicalBlock?.detalles,
+    canonicalBlock?.detalles_canonicos,
+    canonicalBlock?.details,
+  ];
+  return candidates.find((rows) => Array.isArray(rows)) || [];
+}
+
+export async function loadCanonicalPromotionDetailRows(client, { idCita, detailRows = [], canonicalBlock = null } = {}) {
   const sourceRows = Array.isArray(detailRows) ? detailRows : [];
   if (!idCita || !sourceRows.length) return sourceRows;
-  const result = await client.query(
-    `
-      SELECT id_cita_detalle, line_key
-      FROM public.citas_detalles
-      WHERE id_cita = $1::uuid
-      ORDER BY orden_linea ASC, line_key ASC
-    `,
-    [idCita]
-  );
-  const byLineKey = new Map(
-    (result.rows || []).map((row) => [String(row.line_key || "").trim(), row.id_cita_detalle])
-  );
+  const returnedRows = extractCanonicalDetailRows(canonicalBlock || {});
+  const byLineKey = new Map(returnedRows
+    .map((row) => [String(row?.line_key || "").trim(), row?.id_cita_detalle])
+    .filter(([lineKey, detailId]) => Boolean(lineKey && detailId)));
+  const missingReturnedLine = sourceRows.some((row) => {
+    const lineKey = String(row.line_key || "").trim();
+    return lineKey && !byLineKey.has(lineKey);
+  });
+  if (missingReturnedLine || byLineKey.size === 0) {
+    const result = await client.query(
+      `
+        SELECT id_cita_detalle, line_key
+        FROM public.citas_detalles
+        WHERE id_cita = $1::uuid
+        ORDER BY orden_linea ASC, line_key ASC
+      `,
+      [idCita]
+    );
+    for (const row of result.rows || []) {
+      const lineKey = String(row.line_key || "").trim();
+      if (lineKey && row.id_cita_detalle) byLineKey.set(lineKey, row.id_cita_detalle);
+    }
+  }
   return sourceRows.map((row) => {
     const lineKey = String(row.line_key || "").trim();
     const detailId = lineKey ? byLineKey.get(lineKey) : null;
@@ -464,6 +484,8 @@ const ERROR_MAP = new Map([
 ]);
 
 export function mapCanonicalReservationError(error, context = {}) {
+  const schemaError = toDatabaseSchemaOutdatedError(error);
+  if (schemaError instanceof AppError && schemaError !== error) return schemaError;
   if (error instanceof AppError) return error;
   const haystack = [
     error?.code,

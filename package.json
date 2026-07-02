@@ -7,7 +7,8 @@
     "start": "node app.js",
     "dev": "node --watch app.js",
     "lint": "eslint .",
-    "test": "node --test"
+    "test": "node --test",
+    "db:preflight": "node scripts/db-preflight.js"
   },
   "author": "",
   "license": "ISC",

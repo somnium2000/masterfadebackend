@@ -3,6 +3,7 @@ import "dotenv/config"; // NUEVO:
 // IMPACTO: Evita inconsistencias si algún plugin lee env al iniciar.
 
 import { buildApp } from "./app.js";
+import { runDatabaseSchemaPreflight } from "./services/databaseSchemaPreflight.js";
 
 const app = await buildApp();
 const port = Number(process.env.PORT || 3002);
@@ -50,6 +51,7 @@ process.on("unhandledRejection", (reason) =>
 );
 
 try {
+  await runDatabaseSchemaPreflight(app.db, app.log);
   await app.listen({ port, host });
 
   // NUEVO:
