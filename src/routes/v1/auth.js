@@ -363,11 +363,6 @@ async function resolvePasswordRecipientFullNameByEmail(app, email) {
   return fullName || null;
 }
 
-function normalizeOptionalUuid(value) {
-  const raw = String(value || "").trim();
-  return raw || null;
-}
-
 function isSupabaseDuplicateError(error) {
   const code = String(error?.code || "").toLowerCase();
   const message = String(error?.message || "").toLowerCase();
@@ -863,92 +858,6 @@ function isUserIdConflictError(error) {
   return detail.includes("(id_usuario)") || constraint.includes("usuarios_pkey");
 }
 
-async function resolveRegisterBranchId(client, preferredBranchId) {
-  const preferred = normalizeOptionalUuid(preferredBranchId);
-
-  if (preferred) {
-    const preferredResult = await client.query(
-      `
-        SELECT id_sucursal
-        FROM public.sucursales
-        WHERE id_sucursal = $1::uuid
-          AND deleted_at IS NULL
-          AND estado IS TRUE
-        LIMIT 1
-      `,
-      [preferred]
-    );
-    if (preferredResult.rowCount) {
-      return preferredResult.rows[0].id_sucursal;
-    }
-  }
-
-  const fallbackResult = await client.query(
-    `
-      SELECT id_sucursal
-      FROM public.sucursales
-      WHERE deleted_at IS NULL
-        AND estado IS TRUE
-      ORDER BY id_sucursal ASC
-      LIMIT 1
-    `
-  );
-
-  if (!fallbackResult.rowCount) {
-    throw {
-      statusCode: 500,
-      message: "No hay sucursales activas disponibles para completar el flujo.",
-      code: "AUTH_EXCHANGE_BRANCH_NOT_AVAILABLE",
-    };
-  }
-
-  return fallbackResult.rows[0].id_sucursal;
-}
-
-async function resolveRegisterBranchIdOrFail(client, requestedBranchId) {
-  const requested = normalizeOptionalUuid(requestedBranchId);
-  if (requested) {
-    const scopedResult = await client.query(
-      `
-        SELECT id_sucursal
-        FROM public.sucursales
-        WHERE id_sucursal = $1::uuid
-          AND deleted_at IS NULL
-          AND estado IS TRUE
-        LIMIT 1
-      `,
-      [requested]
-    );
-    if (!scopedResult.rowCount) {
-      throw {
-        statusCode: 400,
-        message: "La sucursal de origen indicada no existe o no esta activa.",
-        code: "AUTH_REGISTER_BRANCH_INVALID",
-      };
-    }
-    return scopedResult.rows[0].id_sucursal;
-  }
-
-  return resolveRegisterBranchId(client, null);
-}
-
-async function resolveExchangeBranchId(client) {
-  const preferredBranchId = normalizeOptionalUuid(process.env.AUTH_EXCHANGE_DEFAULT_BRANCH_ID);
-
-  if (preferredBranchId) {
-    if (!UUID_REGEX.test(preferredBranchId)) {
-      throw {
-        statusCode: 500,
-        message: "AUTH_EXCHANGE_DEFAULT_BRANCH_ID no tiene formato UUID valido.",
-        code: "AUTH_EXCHANGE_BRANCH_CONFIG_INVALID",
-      };
-    }
-    return resolveRegisterBranchId(client, preferredBranchId);
-  }
-
-  return resolveRegisterBranchId(client, null);
-}
-
 function buildSocialPersonaNames(supabaseUser) {
   const metadata = supabaseUser?.user_metadata || {};
   const givenName = normalizeRequiredText(metadata.given_name);
@@ -1054,7 +963,6 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
   let transactionStarted = false;
 
   try {
-    const branchId = await resolveExchangeBranchId(client);
     const clienteRoleId = await getClienteRoleId(client);
     await ensureExchangeEmailAvailability(client, email, authUserId);
 
@@ -1104,13 +1012,13 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
         )
         VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE)
       `,
-      [clienteRoleId, authUserId, branchId]
+      [clienteRoleId, authUserId, null]
     );
 
     await insertClientWithConsents(client, {
       idPersona,
       authUserId,
-      branchId,
+      branchId: null,
       consentimientoMarketing: true,
       aceptaTerminos: true,
       aceptaTerminosAt: new Date().toISOString(),
@@ -1670,7 +1578,6 @@ export default async function authRoutes(app) {
       const email = normalizeEmail(body.email);
       const contrasena = String(body.contrasena || "");
       const confirmarContrasena = String(body.confirmar_contrasena || "");
-      const requestedBranchId = normalizeOptionalUuid(body.id_sucursal_origen);
       const consentimientoMarketing = Boolean(body.consentimiento_marketing);
       const aceptaTerminos = body.acepta_terminos === true;
       const aceptaTerminosAt = new Date().toISOString();
@@ -1718,7 +1625,6 @@ export default async function authRoutes(app) {
       let transactionStarted = false;
 
       try {
-        const branchId = await resolveRegisterBranchIdOrFail(client, requestedBranchId);
         await ensureRegisterEmailAvailability(client, email);
         const clienteRoleId = await getClienteRoleId(client);
 
@@ -1792,13 +1698,13 @@ export default async function authRoutes(app) {
             )
             VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE)
           `,
-          [clienteRoleId, authUserId, branchId]
+          [clienteRoleId, authUserId, null]
         );
 
         const idCliente = await insertClientWithConsents(client, {
           idPersona,
           authUserId,
-          branchId,
+          branchId: null,
           consentimientoMarketing,
           aceptaTerminos,
           aceptaTerminosAt,
@@ -1840,7 +1746,7 @@ export default async function authRoutes(app) {
             },
             cliente: {
               id_cliente: idCliente,
-              id_sucursal_origen: branchId,
+              id_sucursal_origen: null,
               estado: true,
             },
             consentimientos: {
