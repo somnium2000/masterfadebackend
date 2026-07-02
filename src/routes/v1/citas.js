@@ -40,10 +40,16 @@ import {
 import { buildCanonicalDiscountLines, buildDiscountPlan } from "../../services/bookingDiscounts.js";
 import {
   assertCanonicalTotalsMatch,
+  assertKnownIdempotencyState,
+  buildAssignmentAttemptsFromIntegrantes,
   buildCanonicalReservationPayload,
+  buildReservationRequestFingerprint,
   createCanonicalReservation,
+  finalizeReservationIdempotency,
+  getReservationIdempotencyState,
   loadCanonicalPromotionDetailRows,
   mapCanonicalReservationError,
+  resolveReservationRequestId,
 } from "../../services/bookingCanonicalReservationService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
@@ -52,6 +58,7 @@ const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PENDING_EXPIRED_MESSAGE = "Esta reserva ya expiro. Agenda nuevamente.";
+const AUTH_HOLD_IDEMPOTENCY_SCOPE = "auth:citas:hold";
 
 const errorResponseSchema = {
   type: "object",
@@ -400,30 +407,31 @@ function buildCoverageDiscountAllocations(discountLines = [], coverage = {}, {
     const status = String(item?.coverage_status || "").trim().toLowerCase();
     if (status !== "cubierto_plan" && status !== "cubierto_recompensa") continue;
     const serviceId = String(item?.id_servicio || "").trim();
-    let remaining = Number(Number(item?.total_hnl ?? item?.precio_unitario_hnl ?? 0).toFixed(2));
-    if (!serviceId || remaining <= 0) continue;
+    const tariffId = item?.id_tarifa ? String(item.id_tarifa).trim() : null;
+    const originCode = String(item?.origen_item_codigo || "servicio_manual").trim();
+    const discount = Number(Number(item?.total_hnl ?? item?.precio_unitario_hnl ?? 0).toFixed(2));
+    if (!serviceId || discount <= 0) continue;
     const sourceType = status === "cubierto_recompensa" ? "reward" : "membership";
     const sourceId = sourceType === "reward" ? rewardSourceId : idSuscripcion;
-    for (const line of lines) {
-      if (remaining <= 0) break;
-      if (String(line.id_servicio || "").trim() !== serviceId) continue;
-      const capacity = Number(Number(line.remaining_hnl || 0).toFixed(2));
-      if (capacity <= 0) continue;
-      const discount = Number(Math.min(capacity, remaining).toFixed(2));
-      allocations.push({
-        line_key: line.line_key,
-        source_type: sourceType,
-        source_id: sourceId || null,
-        descuento_hnl: discount,
-      });
-      line.remaining_hnl = Number((capacity - discount).toFixed(2));
-      remaining = Number((remaining - discount).toFixed(2));
-    }
-    if (remaining > 0) {
+    const target = lines.find((line) => (
+      Number(line.orden_integrante || 1) === 1
+      && String(line.id_servicio || "").trim() === serviceId
+      && (line.id_tarifa ? String(line.id_tarifa).trim() : null) === tariffId
+      && String(line.origen_item_codigo || "servicio_manual").trim() === originCode
+      && Number(Number(line.remaining_hnl || 0).toFixed(2)) >= discount
+    ));
+    if (!target?.line_key) {
       throw new AppError(409, "No se pudo asignar la cobertura a las lineas de la cita", {
         code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
       });
     }
+    allocations.push({
+      line_key: target.line_key,
+      source_type: sourceType,
+      source_id: sourceId || null,
+      descuento_hnl: discount,
+    });
+    target.remaining_hnl = Number((Number(target.remaining_hnl || 0) - discount).toFixed(2));
   }
   return allocations;
 }
@@ -1600,7 +1608,7 @@ export default async function citasRoutes(app) {
 
         return sendHandled(reply, request, error, "No se pudo crear la cita", "CITAS_CREATE_ERROR");
       } finally {
-        dbClient.release();
+        if (dbClient) dbClient.release();
       }
     }
   );
@@ -1695,47 +1703,47 @@ export default async function citasRoutes(app) {
       },
     },
     async (request, reply) => {
-      const dbClient = await app.db.connect();
+      let dbClient;
       let txStarted = false;
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
-        await expireReservationsBestEffort(dbClient, request, "citas_hold_create");
-        const pendingResolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
-        if (pendingResolved.primary?.vigente) {
-          const pendingRows = pendingResolved.primary.groupRows;
-          const servicesByCita = await getServicesByAppointmentIds(
-            dbClient,
-            pendingRows.map((row) => row.id_cita)
-          );
-          const pendingPayload = buildPendingGroupPayload(pendingRows, servicesByCita, {
-            multiplePendingDetected: pendingResolved.groups.length > 1,
-          });
-          throw new AppError(
-            409,
-            "Tienes una reserva pendiente de pago. Completa o descarta esa reserva antes de agendar una nueva cita.",
-            {
-              code: "CLIENT_PENDING_APPOINTMENT_EXISTS",
-              details: {
-                id_grupo_cita: pendingPayload?.id_grupo_cita || null,
-                fecha_hora: pendingPayload?.fecha_hora_referencia || null,
-                id_sucursal: pendingPayload?.sucursal?.id_sucursal || null,
-                sucursal: pendingPayload?.sucursal?.nombre_sucursal || null,
-                total_pendiente_hnl: Number(pendingPayload?.total_pendiente_hnl || 0),
-                expires_at: pendingPayload?.expires_at || null,
-                multiple_pending_detected: pendingPayload?.multiple_pending_detected === true,
-              },
-            }
-          );
-        }
-
+        const requestId = resolveReservationRequestId(request.headers?.["x-idempotency-key"]);
+        reply.header("x-idempotency-key", requestId);
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const canjeContextTokenRaw = request.body?.canje_context_token ?? request.body?.id_points_tx_canje;
         const canjeContextToken = canjeContextTokenRaw
           ? normalizeRedeemContextToken(canjeContextTokenRaw)
           : null;
-        const branch = await ensureActiveBranch(dbClient, idSucursal);
         const integrantes = normalizeHoldBlocksPayload(request.body);
         const titularOperationalDateTime = normalizeOperationalDateTime(integrantes[0]?.fecha_inicio, "fecha_inicio");
+        const requestFingerprint = buildReservationRequestFingerprint({
+          scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
+          actor: {
+            tipo: "autenticado",
+            id_cliente: clienteId,
+            id_persona: personaId,
+            id_usuario: usuarioId,
+          },
+          body: request.body,
+        });
+
+        dbClient = await app.db.connect();
+        const idempotencyState = await getReservationIdempotencyState(dbClient, {
+          requestId,
+          scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
+          requestFingerprint,
+        });
+        const idempotencyStatus = assertKnownIdempotencyState(idempotencyState);
+        if (idempotencyStatus === "completed") {
+          return sendOk(reply, {
+            ...idempotencyState.data,
+            request_id: idempotencyState.data?.request_id || requestId,
+          }, {
+            statusCode: idempotencyState.statusCode || 201,
+            requestId: request.id,
+          });
+        }
+        const branch = await ensureActiveBranch(dbClient, idSucursal);
 
         await dbClient.query("BEGIN");
         txStarted = true;
@@ -2150,7 +2158,7 @@ export default async function citasRoutes(app) {
           membershipReasonNoAplica = "SIN_PLAN";
         }
         const canonicalPayload = buildCanonicalReservationPayload({
-          requestId: request.headers?.["x-idempotency-key"],
+          requestId,
           idSucursal: branch.id_sucursal,
           idPersonaTitular: personaId,
           idClienteTitular: clienteId,
@@ -2158,6 +2166,7 @@ export default async function citasRoutes(app) {
           origenCodigo: "cliente_autenticado",
           notas: request.body?.notas ?? null,
           integrantes: canonicalIntegrantes,
+          assignmentAttempts: buildAssignmentAttemptsFromIntegrantes(canonicalIntegrantes),
           bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
         const canonicalResult = await createCanonicalReservation(dbClient, canonicalPayload);
@@ -2201,10 +2210,8 @@ export default async function citasRoutes(app) {
         });
         const coveredServicesList = [...coveredServicesByPlan.values()];
         const forcedServicesList = [...forcedServicesByPlan.values()];
-        await dbClient.query("COMMIT");
-        txStarted = false;
-
-        return sendOk(reply, {
+        const responsePayload = {
+          request_id: requestId,
           id_grupo_cita: canonicalResult.id_grupo_cita,
           estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
           expires_at: canonicalResult.expires_at,
@@ -2278,7 +2285,18 @@ export default async function citasRoutes(app) {
               extras_a_pagar_hnl: totalGrupo,
             },
           bloques: bloquesResponse,
-        }, {
+        };
+        await finalizeReservationIdempotency(dbClient, {
+          requestId,
+          scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
+          requestFingerprint,
+          responsePayload,
+          statusCode: 201,
+        });
+        await dbClient.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, responsePayload, {
           statusCode: 201,
           requestId: request.id,
         });

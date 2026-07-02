@@ -40,6 +40,10 @@ function assertSecureProductionConfig(config) {
   if (!config.cookieSecure) {
     throw new Error("AUTH_COOKIE_SECURE debe estar activo en produccion/staging.");
   }
+
+  if (!config.bookingReleaseTokenSecret || config.bookingReleaseTokenSecret.length < 32) {
+    throw new Error("BOOKING_RELEASE_TOKEN_SECRET es obligatorio en produccion/staging.");
+  }
 }
 
 function parseCorsOrigins(rawValue, fallback = "http://localhost:5173") {
@@ -105,6 +109,10 @@ async function envPlugin(app) {
     jwtSecret,
     cookieSecret,
     csrfSecret,
+    bookingReleaseTokenSecret: String(
+      process.env.BOOKING_RELEASE_TOKEN_SECRET
+        || (nodeEnv === "test" ? "masterfade-test-release-token-secret-32" : "")
+    ).trim(),
     paymentProvider,
     todoPago: {
       mode: todoPagoMode,

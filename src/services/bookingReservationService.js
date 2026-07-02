@@ -326,6 +326,8 @@ export async function insertAppointmentDetails(
       `
         INSERT INTO public.citas_detalles (
           id_cita,
+          line_key,
+          orden_linea,
           id_servicio,
           id_tarifa,
           cantidad,
@@ -343,14 +345,16 @@ export async function insertAppointmentDetails(
           origen_item_codigo
         )
         VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::int, $5::int, $6::int, $7::text,
-          $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::boolean,
-          $13::numeric, $14::numeric, $15::numeric, $16::text
+          $1::uuid, $2::text, $3::int, $4::uuid, $5::uuid, $6::int, $7::int, $8::int, $9::text,
+          $10::numeric, $11::numeric, $12::numeric, $13::numeric, $14::boolean,
+          $15::numeric, $16::numeric, $17::numeric, $18::text
         )
         RETURNING id_cita_detalle
       `,
       [
         citaId,
+        row.line_key || null,
+        row.orden_linea || insertedRows.length + 1,
         row.id_servicio,
         row.id_tarifa,
         row.cantidad,

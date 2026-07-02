@@ -40,31 +40,33 @@ jobs:
           sudo apt-get install -y postgresql-client
       - name: Install Node dependencies
         run: npm ci
-      - name: Load pre-2A2 schema and fixtures
+      - name: Bootstrap CI
+        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
+      - name: Load schema and fixtures
         run: |
-          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_fixture.sql
-      - name: Apply migrations 2A2 and 2A3
+      - name: Apply previous migrations, Phase 1, Phase 1B and Phase 1B.1
         run: |
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b_reserva_canonica_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
       - name: Validate objects, backfill, triggers and fiscal guard
-        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
-      - name: Apply migrations again
         run: |
-          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
-          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
-          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
-          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
-          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b_reserva_canonica_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
+      - name: Apply Phase 1B.1 again
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
       - name: Validate idempotency
-        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
+        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
       - name: Run tests
         run: npm test
+      - name: Run app.inject PostgreSQL integration
+        run: RUN_CANONICAL_BOOKING_INTEGRATION=true node --test test/canonical-booking.integration.test.mjs
       - name: Run lint
         run: npm run lint
       - name: Check whitespace

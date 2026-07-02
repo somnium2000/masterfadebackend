@@ -264,7 +264,7 @@ test("ruta real POST /v1/public/pagos/crear-intent conserva intent local si fall
   });
 
   assert.equal(response.statusCode, 409);
-  assert.equal(response.json().error.code, "PUBLIC_PAGOS_INTENT_UPDATE_MISSING");
+  assert.equal(response.json().error.code, "PUBLIC_PAGOS_HOLD_EXPIRED");
   const intentInsert = client.calls.find((call) => call.sql.includes("INSERT INTO public.payment_intents"));
   assert.ok(intentInsert);
   const commits = client.calls.filter((call) => call.sql === "COMMIT").length;

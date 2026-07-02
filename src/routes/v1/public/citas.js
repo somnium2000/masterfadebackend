@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
@@ -28,10 +28,17 @@ import {
 } from "../../../services/bookingReservationService.js";
 import {
   assertCanonicalTotalsMatch,
+  assertKnownIdempotencyState,
+  buildAssignmentAttemptsFromIntegrantes,
+  buildDeterministicPublicReleaseToken,
   buildCanonicalReservationPayload,
+  buildReservationRequestFingerprint,
   createCanonicalReservation,
+  finalizeReservationIdempotency,
+  getReservationIdempotencyState,
   loadCanonicalPromotionDetailRows,
   mapCanonicalReservationError,
+  resolveReservationRequestId,
 } from "../../../services/bookingCanonicalReservationService.js";
 import { recordPromotionApplications } from "../../../services/promociones/promocionesService.js";
 
@@ -39,6 +46,7 @@ const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
 const MAX_PUBLIC_PROMOTIONS_PER_BOOKING = 5;
+const PUBLIC_HOLD_IDEMPOTENCY_SCOPE = "public:citas:hold";
 const PUBLIC_RELEASE_TOKEN_COLUMNS = new Set(["release_token_hash", "release_token_created_at"]);
 const PUBLIC_RELEASE_REJECTED_APPOINTMENT_STATES = new Set([
   "confirmada",
@@ -253,12 +261,12 @@ async function getPublicHoldReleaseTokenSupport(client) {
   };
 }
 
-function generatePublicReleaseToken() {
-  return randomBytes(32).toString("hex");
-}
-
 function hashPublicReleaseToken(token) {
   return createHash("sha256").update(String(token || ""), "utf8").digest("hex");
+}
+
+function resolvePublicReleaseTokenSecret(app) {
+  return String(app.config?.bookingReleaseTokenSecret || process.env.BOOKING_RELEASE_TOKEN_SECRET || "").trim();
 }
 
 function isPublicReleaseTokenValid(token, expectedHash) {
@@ -1344,7 +1352,7 @@ export default async function publicCitasRoutes(app) {
                   promociones_descartadas: { type: "array", items: { type: "object", additionalProperties: true } },
                   bloques: { type: "array", items: holdBlockSchema },
                 },
-                required: ["id_grupo_cita", "estado_grupo_codigo", "expires_at", "monto_total_hnl", "bloques"],
+                required: ["request_id", "id_grupo_cita", "estado_grupo_codigo", "expires_at", "monto_total_hnl", "bloques"],
                 additionalProperties: false,
               },
               requestId: requestIdSchema,
@@ -1366,9 +1374,10 @@ export default async function publicCitasRoutes(app) {
         });
       }
 
-      const dbClient = await app.db.connect();
+      let dbClient;
       try {
-        await expireStaleAppointmentReservations(dbClient, { logger: request.log });
+        const requestId = resolveReservationRequestId(request.headers?.["x-idempotency-key"]);
+        reply.header("x-idempotency-key", requestId);
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const titularPayload = validateClientPayload(request.body?.titular);
         const integrantes = normalizeBlocksPayload(request.body, titularPayload);
@@ -1379,6 +1388,29 @@ export default async function publicCitasRoutes(app) {
           });
         }
         const titularDateTime = parseIsoDateAndTime(integrantes[0]?.fecha_inicio || "");
+        const requestFingerprint = buildReservationRequestFingerprint({
+          scope: PUBLIC_HOLD_IDEMPOTENCY_SCOPE,
+          actor: {
+            tipo: "publico",
+            email: titularPayload.email,
+            telefono: titularPayload.telefono,
+          },
+          body: request.body,
+        });
+
+        dbClient = await app.db.connect();
+        const idempotencyState = await getReservationIdempotencyState(dbClient, {
+          requestId,
+          scope: PUBLIC_HOLD_IDEMPOTENCY_SCOPE,
+          requestFingerprint,
+        });
+        const idempotencyStatus = assertKnownIdempotencyState(idempotencyState);
+        if (idempotencyStatus === "completed") {
+          return sendOk(reply, {
+            ...idempotencyState.data,
+            request_id: idempotencyState.data?.request_id || requestId,
+          }, { statusCode: idempotencyState.statusCode || 201 });
+        }
         const branch = await ensureActiveBranch(dbClient, idSucursal);
 
         await dbClient.query("BEGIN");
@@ -1390,7 +1422,9 @@ export default async function publicCitasRoutes(app) {
 
         const targetAppointmentState = "en_espera";
         const releaseTokenSupport = await getPublicHoldReleaseTokenSupport(dbClient);
-        const releaseToken = releaseTokenSupport.supported ? generatePublicReleaseToken() : null;
+        const releaseToken = releaseTokenSupport.supported
+          ? buildDeterministicPublicReleaseToken(requestId, resolvePublicReleaseTokenSecret(app))
+          : null;
         const canonicalIntegrantes = [];
         const pendingPromotionRecords = [];
         let subtotalGrupo = 0;
@@ -1460,11 +1494,12 @@ export default async function publicCitasRoutes(app) {
             ordenIntegrante: integrante.orden_integrante,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
+          const isTitular = index === 0;
           canonicalIntegrantes.push({
             orden_integrante: integrante.orden_integrante,
             alias: integrante.alias,
-            id_persona: clientProfile.id_persona,
-            id_cliente: clientProfile.id_cliente,
+            id_persona: isTitular ? clientProfile.id_persona : null,
+            id_cliente: isTitular ? clientProfile.id_cliente : null,
             id_usuario: null,
             tipo_cliente_codigo: "invitado",
             contacto_nombre: integrante.contacto?.nombre || integrante.alias,
@@ -1516,7 +1551,7 @@ export default async function publicCitasRoutes(app) {
         }
 
         const canonicalPayload = buildCanonicalReservationPayload({
-          requestId: request.headers?.["x-idempotency-key"],
+          requestId,
           idSucursal: branch.id_sucursal,
           idPersonaTitular: clientProfile.id_persona,
           idClienteTitular: clientProfile.id_cliente,
@@ -1525,6 +1560,7 @@ export default async function publicCitasRoutes(app) {
           notas: request.body?.notas ?? null,
           releaseTokenHash: releaseToken ? hashPublicReleaseToken(releaseToken) : null,
           integrantes: canonicalIntegrantes,
+          assignmentAttempts: buildAssignmentAttemptsFromIntegrantes(canonicalIntegrantes),
           bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
         const canonicalResult = await createCanonicalReservation(dbClient, canonicalPayload);
@@ -1577,27 +1613,32 @@ export default async function publicCitasRoutes(app) {
           };
         });
 
+        const responsePayload = {
+          request_id: requestId,
+          id_grupo_cita: canonicalResult.id_grupo_cita,
+          estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
+          expires_at: canonicalResult.expires_at,
+          monto_total_hnl: subtotalGrupo,
+          subtotal_hnl: subtotalGrupo,
+          descuento_total_hnl: descuentoGrupo,
+          total_pagar_hnl: totalGrupo,
+          extras_a_pagar_hnl: totalGrupo,
+          total_hnl: totalGrupo,
+          ...(releaseToken ? { release_token: releaseToken } : {}),
+          promociones_aplicadas: promocionesAplicadasGrupo,
+          promociones_descartadas: promocionesDescartadasGrupo,
+          bloques: bloquesResponse,
+        };
+        await finalizeReservationIdempotency(dbClient, {
+          requestId,
+          scope: PUBLIC_HOLD_IDEMPOTENCY_SCOPE,
+          requestFingerprint,
+          responsePayload,
+          statusCode: 201,
+        });
         await dbClient.query("COMMIT");
 
-        return sendOk(
-          reply,
-          {
-            id_grupo_cita: canonicalResult.id_grupo_cita,
-            estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
-            expires_at: canonicalResult.expires_at,
-            monto_total_hnl: subtotalGrupo,
-            subtotal_hnl: subtotalGrupo,
-            descuento_total_hnl: descuentoGrupo,
-            total_pagar_hnl: totalGrupo,
-            extras_a_pagar_hnl: totalGrupo,
-            total_hnl: totalGrupo,
-            ...(releaseToken ? { release_token: releaseToken } : {}),
-            promociones_aplicadas: promocionesAplicadasGrupo,
-            promociones_descartadas: promocionesDescartadasGrupo,
-            bloques: bloquesResponse,
-          },
-          { statusCode: 201 }
-        );
+        return sendOk(reply, responsePayload, { statusCode: 201 });
       } catch (error) {
         try {
           await dbClient.query("ROLLBACK");
@@ -1628,7 +1669,7 @@ export default async function publicCitasRoutes(app) {
 
         return sendHandled(reply, request, mappedError, "No se pudo crear el hold publico", "PUBLIC_CITAS_HOLD_CREATE_ERROR");
       } finally {
-        dbClient.release();
+        if (dbClient) dbClient.release();
       }
     }
   );
@@ -1661,6 +1702,7 @@ export default async function publicCitasRoutes(app) {
               data: {
                 type: "object",
                 properties: {
+                  request_id: { type: "string", format: "uuid" },
                   id_grupo_cita: { type: "string", format: "uuid" },
                   estado_final: { type: "string" },
                   liberado: { type: "boolean" },
@@ -1845,7 +1887,7 @@ export default async function publicCitasRoutes(app) {
         }
         return sendHandled(reply, request, error, "No se pudo liberar el hold publico", "PUBLIC_CITAS_HOLD_RELEASE_ERROR");
       } finally {
-        dbClient.release();
+        if (dbClient) dbClient.release();
       }
     }
   );

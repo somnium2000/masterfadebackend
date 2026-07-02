@@ -821,18 +821,33 @@ async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
 async function dispatchPostPaymentEmails(db, { idGrupoCita, mailer, logger }) {
   const queued = await db.query(
     `
+      WITH claimed AS (
+        UPDATE public.notificaciones_email ne
+        SET estado_notificacion_codigo = 'procesando',
+            updated_at = now()
+        WHERE ne.id_notificacion IN (
+          SELECT ne2.id_notificacion
+          FROM public.notificaciones_email ne2
+          JOIN public.citas c2
+            ON c2.id_cita = ne2.id_cita
+          WHERE c2.id_grupo_cita = $1::uuid
+            AND ne2.evento = 'cita_confirmada_post_pago'
+            AND ne2.estado_notificacion_codigo = 'pendiente'
+          ORDER BY ne2.created_at ASC
+          FOR UPDATE OF ne2 SKIP LOCKED
+        )
+        RETURNING
+          ne.id_notificacion,
+          ne.correo_destino,
+          ne.asunto,
+          ne.cuerpo
+      )
       SELECT
         ne.id_notificacion,
         ne.correo_destino,
         ne.asunto,
         ne.cuerpo
-      FROM public.notificaciones_email ne
-      JOIN public.citas c
-        ON c.id_cita = ne.id_cita
-      WHERE c.id_grupo_cita = $1::uuid
-        AND ne.evento = 'cita_confirmada_post_pago'
-        AND ne.estado_notificacion_codigo = 'pendiente'
-      ORDER BY ne.created_at ASC
+      FROM claimed ne
     `,
     [idGrupoCita]
   );
@@ -844,9 +859,19 @@ async function dispatchPostPaymentEmails(db, { idGrupoCita, mailer, logger }) {
   if (!mailer?.configured) {
     logger?.warn?.(
       { idGrupoCita, pending: queued.rows.length },
-      "SMTP no configurado: notificaciones post-pago quedan en pendiente"
+      "SMTP no configurado: notificaciones post-pago marcadas como fallidas"
     );
-    return { pending: queued.rows.length, sent: 0, failed: 0 };
+    await db.query(
+      `
+        UPDATE public.notificaciones_email
+        SET estado_notificacion_codigo = 'fallida',
+            ultimo_error = 'SMTP no configurado',
+            updated_at = now()
+        WHERE id_notificacion = ANY($1::uuid[])
+      `,
+      [queued.rows.map((row) => row.id_notificacion)]
+    );
+    return { pending: 0, sent: 0, failed: queued.rows.length };
   }
 
   const groupRows = await db.query(
@@ -1243,23 +1268,51 @@ export default async function publicPagosRoutes(app) {
       inTransaction = true;
       const updated = await dbClient.query(
         `
-          UPDATE public.payment_intents
+          UPDATE public.payment_intents pi
           SET estado_intent_codigo = 'link_generado',
               link_pago_url = $2::text,
               referencia_externa = $3::text,
               updated_at = now()
-          WHERE id_intent = $1::uuid
-          RETURNING id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
+          FROM public.citas_holds h
+          JOIN public.citas c
+            ON c.id_cita = h.id_cita
+          WHERE pi.id_intent = $1::uuid
+            AND pi.id_hold = h.id_hold
+            AND pi.id_cita = c.id_cita
+            AND pi.estado_intent_codigo = 'creado'
+            AND pi.expires_at > now()
+            AND h.estado_hold_codigo = 'activo'
+            AND h.expires_at > now()
+            AND c.id_grupo_cita = $4::uuid
+            AND c.deleted_at IS NULL
+            AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+          RETURNING pi.id_intent, pi.link_pago_url, pi.expires_at, pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
         `,
         [
           phaseAIntent.id_intent,
           providerIntent.paymentUrl ?? null,
           providerIntent.providerIntentId ?? null,
+          idGrupoCita,
         ]
       );
       if (!updated.rows[0]) {
-        throw new AppError(409, "No se pudo actualizar el intent local luego del proveedor", {
-          code: "PUBLIC_PAGOS_INTENT_UPDATE_MISSING",
+        await dbClient.query("ROLLBACK");
+        inTransaction = false;
+        dbClient.release();
+        dbClient = null;
+        try {
+          if (providerIntent.providerIntentId && typeof providerAdapter.cancelIntent === "function") {
+            await providerAdapter.cancelIntent(providerIntent.providerIntentId);
+          }
+        } catch (cancelError) {
+          request.log.warn(
+            { err: cancelError, id_intent: phaseAIntent.id_intent },
+            "No se pudo cancelar intent externo luego de hold vencido"
+          );
+        }
+        return sendError(reply, 409, "El hold de la reserva ya expiro", {
+          code: "PUBLIC_PAGOS_HOLD_EXPIRED",
+          requestId: request.id,
         });
       }
 

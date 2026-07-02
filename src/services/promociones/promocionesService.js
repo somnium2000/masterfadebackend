@@ -66,9 +66,16 @@ function resolvePromotionDetailTargets(context = {}, item = {}) {
   const lineAllocations = Array.isArray(item.line_allocations) ? item.line_allocations : [];
   if (lineAllocations.length) {
     const byLineKey = new Map(detailRows.map((row) => [String(row?.line_key || "").trim(), row]));
-    return lineAllocations
-      .map((allocation) => byLineKey.get(String(allocation?.line_key || "").trim()))
-      .filter(Boolean);
+    return lineAllocations.map((allocation) => {
+      const lineKey = String(allocation?.line_key || "").trim();
+      const detail = byLineKey.get(lineKey);
+      if (!detail) {
+        throw new AppError(409, "La promocion apunta a una linea canonica inexistente", {
+          code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+        });
+      }
+      return detail;
+    });
   }
   const directDetailId = String(item.id_cita_detalle || context.id_cita_detalle || "").trim();
   if (directDetailId) {
@@ -133,13 +140,20 @@ function buildScopedPromotionPayloads(base = {}, context = {}, item = {}) {
         })
       : distributeDiscountAcrossDetails(targetDetails, base.descuento_calculado_hnl);
     return targetDetails
-      .map((detail, index) => ({
+      .map((detail, index) => {
+        if (!detail?.id_cita_detalle || !payload.id_cita) {
+          throw new AppError(409, "No se pudo persistir una asignacion promocional exacta", {
+            code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+          });
+        }
+        return ({
         ...payload,
         id_cita_detalle: detail.id_cita_detalle || null,
+        line_key: detail.line_key || null,
         base_calculo_hnl: normalizeMoney(detail.subtotal_hnl),
         descuento_calculado_hnl: allocations[index] || 0,
-      }))
-      .filter((row) => row.id_cita && row.id_cita_detalle);
+      });
+      });
   }
   return [];
 }

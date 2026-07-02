@@ -805,10 +805,10 @@ test("createBookingReservation usa SUM(total_linea_hnl) para total de cita y per
   assert.equal(result.totals.totalHnl, 115);
   assert.equal(calls[0].params[14], 100);
   assert.equal(calls[0].params[16], 115);
-  assert.match(calls[1].sql, /\$12::boolean/);
-  assert.equal(calls[1].params[11], false);
-  assert.equal(calls[1].params[13], 15);
-  assert.equal(calls[1].params[14], 115);
+  assert.match(calls[1].sql, /\$14::boolean/);
+  assert.equal(calls[1].params[13], false);
+  assert.equal(calls[1].params[15], 15);
+  assert.equal(calls[1].params[16], 115);
 });
 
 test("createBookingReservation persiste promocion de servicio con id_cita_detalle y sin duplicados", async () => {
@@ -902,10 +902,11 @@ test("createBookingReservation persiste promocion de servicio con id_cita_detall
   assert.equal(promoInsert.params[0], GROUP_A);
   assert.equal(promoInsert.params[1], CITA_A);
   assert.equal(promoInsert.params[4], DETAIL_A);
-  assert.equal(promoInsert.params[7], PROMO_BRANCH_A);
-  assert.equal(promoInsert.params[8], PROMO_CODE_A);
-  assert.equal(promoInsert.params[9], "CORTE10");
-  assert.equal(promoInsert.params[15], 10);
+  assert.equal(promoInsert.params[5], result.detailRows[0].line_key);
+  assert.equal(promoInsert.params[8], PROMO_BRANCH_A);
+  assert.equal(promoInsert.params[9], PROMO_CODE_A);
+  assert.equal(promoInsert.params[10], "CORTE10");
+  assert.equal(promoInsert.params[16], 10);
 
   const usageInsert = calls.find((call) => call.sql.includes("INSERT INTO public.promociones_usos"));
   assert.ok(usageInsert);
