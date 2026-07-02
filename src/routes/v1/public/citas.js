@@ -39,6 +39,8 @@ import {
   loadCanonicalPromotionDetailRows,
   mapCanonicalReservationError,
   resolveReservationRequestId,
+  selectCanonicalIntegrantesForResult,
+  summarizeCanonicalIntegrantes,
 } from "../../../services/bookingCanonicalReservationService.js";
 import { recordPromotionApplications } from "../../../services/promociones/promocionesService.js";
 
@@ -275,6 +277,143 @@ function isPublicReleaseTokenValid(token, expectedHash) {
   const actual = Buffer.from(hashPublicReleaseToken(token), "hex");
   const expected = Buffer.from(normalizedHash, "hex");
   return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function getDeterministicCandidateIds(selection, explicitBarberId = null) {
+  const explicit = String(explicitBarberId || "").trim();
+  if (explicit) return [explicit];
+  return Array.from(new Set(
+    (Array.isArray(selection?.barber_candidate_ids) ? selection.barber_candidate_ids : [selection?.barber?.id_empleado])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  )).slice(0, 6);
+}
+
+function buildPromotionRecordForOption({ integrante, promotionResult, detailRows }) {
+  if (!promotionResult?.aplicadas?.length && !promotionResult?.descartadas?.length) return null;
+  return {
+    order: integrante.orden_integrante,
+    context: promotionResult.context,
+    result: {
+      promociones_aplicadas: promotionResult.aplicadas || [],
+      promociones_descartadas: promotionResult.descartadas || [],
+    },
+    detailRows,
+  };
+}
+
+async function buildPublicCanonicalOption(dbClient, {
+  branch,
+  clientProfile,
+  integrante,
+  index,
+  selection,
+  request,
+  app,
+}) {
+  const subtotalServiciosHnl = normalizeMoney(
+    selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl
+  );
+  const promotionResult = await resolveRequestedPromotionsForPublicHold(dbClient, {
+    branch,
+    clientProfile,
+    groupRecord: { id_grupo_cita: null },
+    integrante,
+    selection,
+    index,
+  });
+  const descuentoHnl = normalizeMoney(promotionResult.descuento_hnl);
+  const discountPlan = promotionResult.aplicadas?.length
+    ? buildPromotionDiscountPlan(promotionResult.context, promotionResult.aplicadas)
+    : null;
+  const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
+  const detailRows = buildAppointmentDetailRows(selection.serviceSelection.items || [], {
+    descuentoTotalHnl: descuentoHnl,
+    discountPlan,
+    ordenIntegrante: integrante.orden_integrante,
+    bookingIsvEnabled: app.config?.bookingIsvEnabled,
+  });
+  const isTitular = index === 0;
+  const canonicalIntegrante = {
+    orden_integrante: integrante.orden_integrante,
+    alias: integrante.alias,
+    id_persona: isTitular ? clientProfile.id_persona : null,
+    id_cliente: isTitular ? clientProfile.id_cliente : null,
+    id_usuario: null,
+    tipo_cliente_codigo: "invitado",
+    contacto_nombre: integrante.contacto?.nombre || integrante.alias,
+    contacto_email: integrante.contacto?.email || null,
+    contacto_telefono: integrante.contacto?.telefono || null,
+    id_empleado_barbero: selection.barber.id_empleado,
+    barber_candidate_ids: [],
+    asignada_automaticamente: !integrante.id_barbero,
+    selection,
+    detailRows,
+    descuentoHnl,
+    discountPlan,
+    inicio_at: selection.startDateTime.toISOString(),
+    notas: request.body?.notas ?? null,
+    _response_totals: {
+      subtotalHnl: subtotalServiciosHnl,
+      descuentoHnl,
+      totalHnl: totalPagarHnl,
+    },
+  };
+  canonicalIntegrante._promotion_record = buildPromotionRecordForOption({
+    integrante,
+    promotionResult,
+    detailRows,
+  });
+  canonicalIntegrante._promotion_result = promotionResult;
+  return canonicalIntegrante;
+}
+
+async function buildPublicCanonicalIntegranteWithAttempts(dbClient, {
+  branch,
+  clientProfile,
+  integrante,
+  index,
+  selection,
+  request,
+  app,
+}) {
+  const candidateIds = getDeterministicCandidateIds(selection, integrante.id_barbero);
+  const options = [];
+  for (const candidateId of candidateIds) {
+    const candidateSelection = String(candidateId) === String(selection.barber.id_empleado)
+      ? selection
+      : await resolveBookingSelection(dbClient, {
+          id_sucursal: branch.id_sucursal,
+          selection_type: integrante.selection_type,
+          servicios: integrante.serviceIds,
+          id_paquete: integrante.id_paquete,
+          fecha_inicio: integrante.fecha_inicio,
+          id_barbero: candidateId,
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
+        });
+    options.push(await buildPublicCanonicalOption(dbClient, {
+      branch,
+      clientProfile,
+      integrante,
+      index,
+      selection: candidateSelection,
+      request,
+      app,
+    }));
+  }
+  const primary = options[0] || await buildPublicCanonicalOption(dbClient, {
+    branch,
+    clientProfile,
+    integrante,
+    index,
+    selection,
+    request,
+    app,
+  });
+  return {
+    ...primary,
+    assignment_options: integrante.id_barbero ? [] : options,
+  };
 }
 
 function splitFullName(rawName) {
@@ -1430,7 +1569,6 @@ export default async function publicCitasRoutes(app) {
         let subtotalGrupo = 0;
         let descuentoGrupo = 0;
         let totalGrupo = 0;
-        let titularResolved = null;
         const promocionesAplicadasGrupo = [];
         const promocionesDescartadasGrupo = [];
 
@@ -1453,101 +1591,16 @@ export default async function publicCitasRoutes(app) {
             id_barbero: integrante.id_barbero,
             bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
-          if (
-            index > 0
-            && titularResolved
-            && splitDateTime.hora
-            && splitDateTime.hora === titularResolved.hora
-            && selection.barber.id_empleado === titularResolved.id_barbero
-          ) {
-            throw new AppError(409, "Un acompañante no puede tomar la misma hora del titular con el mismo barbero", {
-              code: "PUBLIC_CITAS_COMPANION_SAME_HOUR_SAME_BARBER",
-              details: { field: "fecha_inicio", alias: integrante.alias, blockIndex: index },
-            });
-          }
-          if (index === 0) {
-            titularResolved = {
-              hora: splitDateTime.hora,
-              id_barbero: selection.barber.id_empleado,
-            };
-          }
-
-          const subtotalServiciosHnl = normalizeMoney(
-            selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl
-          );
-          const promotionResult = await resolveRequestedPromotionsForPublicHold(dbClient, {
+          const canonicalIntegrante = await buildPublicCanonicalIntegranteWithAttempts(dbClient, {
             branch,
             clientProfile,
-            groupRecord: { id_grupo_cita: null },
             integrante,
-            selection,
             index,
-          });
-          const descuentoHnl = normalizeMoney(promotionResult.descuento_hnl);
-          const discountPlan = promotionResult.aplicadas?.length
-            ? buildPromotionDiscountPlan(promotionResult.context, promotionResult.aplicadas)
-            : null;
-          const totalPagarHnl = normalizeMoney(Math.max(0, subtotalServiciosHnl - descuentoHnl));
-          const detailRows = buildAppointmentDetailRows(selection.serviceSelection.items || [], {
-            descuentoTotalHnl: descuentoHnl,
-            discountPlan,
-            ordenIntegrante: integrante.orden_integrante,
-            bookingIsvEnabled: app.config?.bookingIsvEnabled,
-          });
-          const isTitular = index === 0;
-          canonicalIntegrantes.push({
-            orden_integrante: integrante.orden_integrante,
-            alias: integrante.alias,
-            id_persona: isTitular ? clientProfile.id_persona : null,
-            id_cliente: isTitular ? clientProfile.id_cliente : null,
-            id_usuario: null,
-            tipo_cliente_codigo: "invitado",
-            contacto_nombre: integrante.contacto?.nombre || integrante.alias,
-            contacto_email: integrante.contacto?.email || null,
-            contacto_telefono: integrante.contacto?.telefono || null,
-            id_empleado_barbero: integrante.id_barbero ? selection.barber.id_empleado : null,
-            barber_candidate_ids: selection.barber_candidate_ids || [selection.barber.id_empleado],
-            asignada_automaticamente: !integrante.id_barbero,
             selection,
-            detailRows,
-            descuentoHnl,
-            discountPlan,
-            inicio_at: selection.startDateTime.toISOString(),
-            notas: request.body?.notas ?? null,
+            request,
+            app,
           });
-          if (promotionResult.aplicadas?.length || promotionResult.descartadas?.length) {
-            pendingPromotionRecords.push({
-              order: integrante.orden_integrante,
-              context: promotionResult.context,
-              result: {
-                promociones_aplicadas: promotionResult.aplicadas,
-                promociones_descartadas: promotionResult.descartadas,
-              },
-              detailRows,
-            });
-          }
-          const persistedTotals = {
-            subtotalHnl: subtotalServiciosHnl,
-            descuentoHnl,
-            totalHnl: totalPagarHnl,
-          };
-          for (const appliedPromotion of promotionResult.aplicadas || []) {
-            promocionesAplicadasGrupo.push({
-              ...appliedPromotion,
-              orden_integrante: integrante.orden_integrante,
-              alias: integrante.alias,
-            });
-          }
-          for (const discardedPromotion of promotionResult.descartadas || []) {
-            promocionesDescartadasGrupo.push({
-              ...discardedPromotion,
-              orden_integrante: integrante.orden_integrante,
-              alias: integrante.alias,
-            });
-          }
-          subtotalGrupo += Number(persistedTotals.subtotalHnl || 0);
-          descuentoGrupo += Number(persistedTotals.descuentoHnl || 0);
-          totalGrupo += Number(persistedTotals.totalHnl || 0);
+          canonicalIntegrantes.push(canonicalIntegrante);
         }
 
         const canonicalPayload = buildCanonicalReservationPayload({
@@ -1564,8 +1617,10 @@ export default async function publicCitasRoutes(app) {
           bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
         const canonicalResult = await createCanonicalReservation(dbClient, canonicalPayload);
+        const selectedIntegrantes = selectCanonicalIntegrantesForResult(canonicalIntegrantes, canonicalResult);
+        const selectedTotals = summarizeCanonicalIntegrantes(selectedIntegrantes);
         assertCanonicalTotalsMatch({
-          expected: canonicalPayload._totals,
+          expected: selectedTotals,
           result: canonicalResult,
           context: { route: "public_citas_hold" },
         });
@@ -1573,6 +1628,29 @@ export default async function publicCitasRoutes(app) {
           Number(block.orden_integrante || 0),
           block,
         ]));
+        pendingPromotionRecords.length = 0;
+        promocionesAplicadasGrupo.length = 0;
+        promocionesDescartadasGrupo.length = 0;
+        subtotalGrupo = selectedTotals.subtotal_hnl;
+        descuentoGrupo = selectedTotals.descuento_hnl;
+        totalGrupo = selectedTotals.total_hnl;
+        for (const integrante of selectedIntegrantes) {
+          if (integrante._promotion_record) pendingPromotionRecords.push(integrante._promotion_record);
+          for (const appliedPromotion of integrante._promotion_result?.aplicadas || []) {
+            promocionesAplicadasGrupo.push({
+              ...appliedPromotion,
+              orden_integrante: integrante.orden_integrante,
+              alias: integrante.alias,
+            });
+          }
+          for (const discardedPromotion of integrante._promotion_result?.descartadas || []) {
+            promocionesDescartadasGrupo.push({
+              ...discardedPromotion,
+              orden_integrante: integrante.orden_integrante,
+              alias: integrante.alias,
+            });
+          }
+        }
         for (const promotionRecord of pendingPromotionRecords) {
           const block = bloquesByOrder.get(Number(promotionRecord.order || 0));
           if (!block?.id_cita) continue;
@@ -1592,7 +1670,7 @@ export default async function publicCitasRoutes(app) {
             { formal: true, usageState: "reservado" }
           );
         }
-        const bloquesResponse = canonicalIntegrantes.map((integrante) => {
+        const bloquesResponse = selectedIntegrantes.map((integrante) => {
           const block = bloquesByOrder.get(Number(integrante.orden_integrante || 0)) || {};
           const { fecha, hora } = parseIsoDateAndTime(integrante.selection.startDateTime);
           return {

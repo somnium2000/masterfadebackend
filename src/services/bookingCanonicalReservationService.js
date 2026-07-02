@@ -160,6 +160,16 @@ export function buildDeterministicPublicReleaseToken(requestId, secret) {
 export function buildAssignmentAttemptsFromIntegrantes(integrantes = [], { maxAttempts = 64 } = {}) {
   const source = Array.isArray(integrantes) ? integrantes : [];
   const optionGroups = source.map((integrante) => {
+    const computedOptions = Array.isArray(integrante?.assignment_options)
+      ? integrante.assignment_options
+          .filter((option) => option && typeof option === "object")
+          .map((option) => ({
+            ...option,
+            assignment_options: [],
+            barber_candidate_ids: [],
+          }))
+      : [];
+    if (computedOptions.length) return computedOptions;
     const explicitBarber = String(integrante?.id_empleado_barbero || "").trim();
     if (explicitBarber) return [{ ...integrante, barber_candidate_ids: [], id_empleado_barbero: explicitBarber }];
     const candidateIds = Array.from(new Set(
@@ -177,6 +187,7 @@ export function buildAssignmentAttemptsFromIntegrantes(integrantes = [], { maxAt
   });
 
   const attempts = [];
+  const seenAttempts = new Set();
   const walk = (index, selected) => {
     if (attempts.length > maxAttempts) return;
     if (index >= optionGroups.length) {
@@ -188,6 +199,15 @@ export function buildAssignmentAttemptsFromIntegrantes(integrantes = [], { maxAt
         if (barberId && start && occupied.has(key)) return;
         occupied.add(key);
       }
+      const signature = selected
+        .map((integrante) => [
+          Number(integrante?.orden_integrante || 0),
+          String(integrante?.id_empleado_barbero || "").trim(),
+          String(integrante?.inicio_at || "").trim(),
+        ].join(":"))
+        .join("|");
+      if (seenAttempts.has(signature)) return;
+      seenAttempts.add(signature);
       attempts.push({ integrantes: selected });
       return;
     }
@@ -202,6 +222,37 @@ export function buildAssignmentAttemptsFromIntegrantes(integrantes = [], { maxAt
     });
   }
   return attempts;
+}
+
+export function selectCanonicalIntegrantesForResult(integrantes = [], canonicalResult = {}) {
+  const blocksByOrder = new Map((Array.isArray(canonicalResult?.bloques) ? canonicalResult.bloques : []).map((block) => [
+    Number(block?.orden_integrante || 0),
+    block,
+  ]));
+  return (Array.isArray(integrantes) ? integrantes : []).map((integrante) => {
+    const order = Number(integrante?.orden_integrante || 0);
+    const block = blocksByOrder.get(order);
+    const selectedBarberId = String(block?.id_empleado_barbero || "").trim();
+    const options = Array.isArray(integrante?.assignment_options) && integrante.assignment_options.length
+      ? integrante.assignment_options
+      : [integrante];
+    const selected = selectedBarberId
+      ? options.find((option) => String(option?.id_empleado_barbero || "").trim() === selectedBarberId)
+      : null;
+    return selected || integrante;
+  });
+}
+
+export function summarizeCanonicalIntegrantes(integrantes = []) {
+  const totals = { subtotal_hnl: 0, descuento_hnl: 0, total_hnl: 0 };
+  for (const integrante of Array.isArray(integrantes) ? integrantes : []) {
+    for (const row of Array.isArray(integrante?.detailRows) ? integrante.detailRows : []) {
+      totals.subtotal_hnl = normalizeMoney(totals.subtotal_hnl + Number(row?.subtotal_hnl || 0));
+      totals.descuento_hnl = normalizeMoney(totals.descuento_hnl + Number(row?.descuento_hnl || 0));
+      totals.total_hnl = normalizeMoney(totals.total_hnl + Number(row?.total_linea_hnl || 0));
+    }
+  }
+  return totals;
 }
 
 function normalizeMoney(value) {
