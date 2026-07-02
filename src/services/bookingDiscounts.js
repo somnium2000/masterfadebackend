@@ -43,19 +43,18 @@ export function buildCanonicalDiscountLines(items = [], {
   origenItemCodigo = "servicio_manual",
 } = {}) {
   const occurrences = new Map();
-  return (Array.isArray(items) ? items : [])
-    .map((item) => {
-      const idServicio = String(item?.id_servicio || "").trim();
-      if (!idServicio) return null;
-      const idTarifa = item?.id_tarifa ? String(item.id_tarifa).trim() : null;
-      const origen = String(item?.origen_item_codigo || origenItemCodigo || "servicio_manual").trim();
+  const grouped = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const idServicio = String(item?.id_servicio || "").trim();
+    if (!idServicio) continue;
+    const idTarifa = item?.id_tarifa ? String(item.id_tarifa).trim() : null;
+    const origen = String(item?.origen_item_codigo || origenItemCodigo || "servicio_manual").trim();
+    const groupKey = [idServicio, idTarifa || "sin_tarifa", origen].join("|");
+    if (!grouped.has(groupKey)) {
       const occurrenceKey = [orden_integrante, idServicio, idTarifa || "sin_tarifa", origen].join("|");
       const occurrence = (occurrences.get(occurrenceKey) || 0) + 1;
       occurrences.set(occurrenceKey, occurrence);
-      const quantity = Math.max(1, Math.trunc(Number(item?.cantidad || 1)));
-      const unitPrice = normalizeMoney(item?.precio_unitario_hnl ?? item?.precio_hnl);
-      const subtotal = normalizeMoney(item?.subtotal_hnl ?? unitPrice * quantity);
-      return {
+      grouped.set(groupKey, {
         line_key: buildCanonicalLineKey({
           orden_integrante,
           id_servicio: idServicio,
@@ -69,14 +68,24 @@ export function buildCanonicalDiscountLines(items = [], {
         id_servicio: idServicio,
         id_tarifa: idTarifa,
         origen_item_codigo: origen,
-        cantidad: quantity,
-        precio_unitario_hnl: unitPrice,
-        subtotal_hnl: subtotal,
-        descuento_previo_hnl: normalizeMoney(item?.descuento_hnl),
-        base_disponible_hnl: normalizeMoney(Math.max(0, subtotal - normalizeMoney(item?.descuento_hnl))),
-      };
-    })
-    .filter(Boolean);
+        cantidad: 0,
+        precio_unitario_hnl: normalizeMoney(item?.precio_unitario_hnl ?? item?.precio_hnl),
+        subtotal_hnl: 0,
+        descuento_previo_hnl: 0,
+        base_disponible_hnl: 0,
+      });
+    }
+    const line = grouped.get(groupKey);
+    const quantity = Math.max(1, Math.trunc(Number(item?.cantidad || 1)));
+    const unitPrice = normalizeMoney(item?.precio_unitario_hnl ?? item?.precio_hnl ?? line.precio_unitario_hnl);
+    const subtotal = normalizeMoney(item?.subtotal_hnl ?? unitPrice * quantity);
+    line.cantidad += quantity;
+    line.precio_unitario_hnl = unitPrice;
+    line.subtotal_hnl = normalizeMoney(line.subtotal_hnl + subtotal);
+    line.descuento_previo_hnl = normalizeMoney(line.descuento_previo_hnl + normalizeMoney(item?.descuento_hnl));
+    line.base_disponible_hnl = normalizeMoney(Math.max(0, line.subtotal_hnl - line.descuento_previo_hnl));
+  }
+  return [...grouped.values()];
 }
 
 export function allocateDiscountAcrossLines(lines = [], discountHnl = 0) {

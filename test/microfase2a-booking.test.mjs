@@ -21,6 +21,7 @@ import {
 import {
   buildCanonicalDiscountLines,
   allocateDiscountAcrossLines,
+  buildDiscountPlan,
 } from "../src/services/bookingDiscounts.js";
 import {
   buildPromotionResult,
@@ -331,6 +332,44 @@ test("detalles no colapsan dos tarifas del mismo servicio", () => {
   assert.equal(rows[0].id_tarifa, TARIFF_A);
   assert.equal(rows[1].id_tarifa, TARIFF_B);
   assert.notEqual(rows[0].line_key, rows[1].line_key);
+});
+
+test("lineas canonicas consolidadas coinciden con detalles para cantidad repetida", () => {
+  const items = [
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, nombre_servicio: "Corte", duracion_min: 30, buffer_min: 5, precio_hnl: 100 },
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, nombre_servicio: "Corte", duracion_min: 30, buffer_min: 5, precio_hnl: 100 },
+    { id_servicio: SERVICE_B, id_tarifa: TARIFF_B, nombre_servicio: "Barba", duracion_min: 20, buffer_min: 5, precio_hnl: 50 },
+  ];
+  const lines = buildCanonicalDiscountLines(items);
+  const rows = buildAppointmentDetailRows(items);
+
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].line_key, rows[0].line_key);
+  assert.equal(lines[0].cantidad, 2);
+  assert.equal(lines[0].subtotal_hnl, 200);
+  assert.equal(lines[1].line_key, rows[1].line_key);
+});
+
+test("plan canonico de membresia y recompensa no se distribuye a extras", () => {
+  const items = [
+    { id_servicio: SERVICE_A, id_tarifa: TARIFF_A, nombre_servicio: "Corte", duracion_min: 30, buffer_min: 5, precio_hnl: 100 },
+    { id_servicio: SERVICE_B, id_tarifa: TARIFF_B, nombre_servicio: "Barba", duracion_min: 20, buffer_min: 5, precio_hnl: 50 },
+  ];
+  const lines = buildCanonicalDiscountLines(items);
+  const discountPlan = buildDiscountPlan(lines, [
+    {
+      line_key: lines[0].line_key,
+      source_type: "membership",
+      source_id: "sub-1",
+      descuento_hnl: 100,
+    },
+  ]);
+  const rows = buildAppointmentDetailRows(items, { descuentoTotalHnl: 100, discountPlan });
+
+  assert.equal(rows[0].descuento_hnl, 100);
+  assert.equal(rows[0].total_linea_hnl, 0);
+  assert.equal(rows[1].descuento_hnl, 0);
+  assert.equal(rows[1].total_linea_hnl, 50);
 });
 
 test("promocion de servicio calcula porcentaje solo sobre lineas elegibles", () => {

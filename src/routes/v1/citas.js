@@ -381,21 +381,56 @@ async function getAppointmentDetails(client, citaId) {
   }));
 }
 
-function buildPromotionDiscountPlan(context = {}, appliedPromotions = []) {
+function buildCoverageDiscountAllocations(discountLines = [], coverage = {}, {
+  idSuscripcion = null,
+  rewardSourceId = null,
+} = {}) {
+  const lines = (Array.isArray(discountLines) ? discountLines : []).map((line) => ({
+    ...line,
+    remaining_hnl: Number(line.base_disponible_hnl ?? line.subtotal_hnl ?? 0),
+  }));
   const allocations = [];
-  for (const promotion of Array.isArray(appliedPromotions) ? appliedPromotions : []) {
-    for (const allocation of Array.isArray(promotion.line_allocations) ? promotion.line_allocations : []) {
+  for (const item of Array.isArray(coverage?.items) ? coverage.items : []) {
+    const status = String(item?.coverage_status || "").trim().toLowerCase();
+    if (status !== "cubierto_plan" && status !== "cubierto_recompensa") continue;
+    const serviceId = String(item?.id_servicio || "").trim();
+    let remaining = Number(Number(item?.total_hnl ?? item?.precio_unitario_hnl ?? 0).toFixed(2));
+    if (!serviceId || remaining <= 0) continue;
+    const sourceType = status === "cubierto_recompensa" ? "reward" : "membership";
+    const sourceId = sourceType === "reward" ? rewardSourceId : idSuscripcion;
+    for (const line of lines) {
+      if (remaining <= 0) break;
+      if (String(line.id_servicio || "").trim() !== serviceId) continue;
+      const capacity = Number(Number(line.remaining_hnl || 0).toFixed(2));
+      if (capacity <= 0) continue;
+      const discount = Number(Math.min(capacity, remaining).toFixed(2));
       allocations.push({
-        line_key: allocation.line_key,
-        source_type: "promotion",
-        source_id: promotion.id_promocion_regla,
-        id_promocion: promotion.id_promocion,
-        id_promocion_regla: promotion.id_promocion_regla,
-        descuento_hnl: allocation.descuento_hnl,
+        line_key: line.line_key,
+        source_type: sourceType,
+        source_id: sourceId || null,
+        descuento_hnl: discount,
+      });
+      line.remaining_hnl = Number((capacity - discount).toFixed(2));
+      remaining = Number((remaining - discount).toFixed(2));
+    }
+    if (remaining > 0) {
+      throw new AppError(409, "No se pudo asignar la cobertura a las lineas de la cita", {
+        code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
       });
     }
   }
-  return buildDiscountPlan(context.discount_lines || [], allocations);
+  return allocations;
+}
+
+function applyPlanAsPreviousDiscount(discountLines = [], discountPlan = new Map()) {
+  return (Array.isArray(discountLines) ? discountLines : []).map((line) => {
+    const previous = Number(discountPlan.get(line.line_key)?.descuento_total_hnl || 0);
+    return {
+      ...line,
+      descuento_previo_hnl: previous,
+      base_disponible_hnl: Number(Math.max(0, Number(line.subtotal_hnl || 0) - previous).toFixed(2)),
+    };
+  });
 }
 
 function isPointsTriggerCompileError(error) {
@@ -1912,6 +1947,15 @@ export default async function citasRoutes(app) {
           let descuentoPromociones = 0;
           let promocionesPreview = null;
           let promocionesContext = null;
+          const baseDiscountLines = buildCanonicalDiscountLines(selection.serviceSelection.items || [], {
+            orden_integrante: integrante.orden_integrante || index + 1,
+          });
+          const coverageAllocations = buildCoverageDiscountAllocations(baseDiscountLines, coverage, {
+            idSuscripcion: coverageTracker?.idSuscripcion || null,
+            rewardSourceId: rewardRedeemContext?.canje_context_token || null,
+          });
+          const coveragePlan = buildDiscountPlan(baseDiscountLines, coverageAllocations);
+          const promotionDiscountLines = applyPlanAsPreviousDiscount(baseDiscountLines, coveragePlan);
           const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
           promocionesContext = {
             id_sucursal: branch.id_sucursal,
@@ -1925,9 +1969,7 @@ export default async function citasRoutes(app) {
             hora: promoDateTime.hora_operativa,
             subtotal_hnl: totalPagar,
             servicios: selection.serviceSelection.items || [],
-            discount_lines: buildCanonicalDiscountLines(selection.serviceSelection.items || [], {
-              orden_integrante: integrante.orden_integrante || index + 1,
-            }),
+            discount_lines: promotionDiscountLines,
             paquetes: selection.serviceSelection.id_paquete
               ? [{ id_paquete: selection.serviceSelection.id_paquete }]
               : [],
@@ -1965,8 +2007,24 @@ export default async function citasRoutes(app) {
             }
           }
 
-          const discountPlan = promocionesPreview && !promocionesPreview.usedFallbackLegacy && Number(descuento || 0) === 0
-            ? buildPromotionDiscountPlan(promocionesContext, promocionesPreview.promociones_aplicadas || [])
+          const promotionAllocations = [];
+          if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
+            for (const promotion of promocionesPreview.promociones_aplicadas || []) {
+              for (const allocation of promotion.line_allocations || []) {
+                promotionAllocations.push({
+                  line_key: allocation.line_key,
+                  source_type: "promotion",
+                  source_id: promotion.id_promocion_regla,
+                  id_promocion: promotion.id_promocion,
+                  id_promocion_regla: promotion.id_promocion_regla,
+                  descuento_hnl: allocation.descuento_hnl,
+                });
+              }
+            }
+          }
+          const combinedAllocations = [...coverageAllocations, ...promotionAllocations];
+          const discountPlan = combinedAllocations.length
+            ? buildDiscountPlan(baseDiscountLines, combinedAllocations)
             : null;
           const reservation = await createBookingReservation(dbClient, {
             groupRecord,
