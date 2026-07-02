@@ -206,14 +206,18 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
   const idPersona = context.id_persona ? String(context.id_persona).trim() : null;
   const idPromocionSucursal = context.id_promocion_sucursal ? String(context.id_promocion_sucursal).trim() : null;
   const idBarbero = context.id_empleado_barbero ? String(context.id_empleado_barbero).trim() : null;
+  const idGrupoCita = context.id_grupo_cita ? String(context.id_grupo_cita).trim() : null;
 
   const result = await db.query(
     `
       SELECT
         pu.id_promocion_regla,
+        pu.id_grupo_cita,
         pu.id_cliente,
         pu.id_persona,
         pu.id_promocion_sucursal,
+        pu.id_promocion_codigo,
+        pu.id_empleado_barbero,
         pu.fecha_operativa,
         pu.estado_uso_codigo
       FROM public.promociones_usos pu
@@ -236,7 +240,9 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
 
   for (const row of result.rows || []) {
     const ruleId = row.id_promocion_regla;
-    byRule.set(ruleId, (byRule.get(ruleId) || 0) + 1);
+    if (idGrupoCita && String(row.id_grupo_cita || "") === idGrupoCita) {
+      byRule.set(ruleId, (byRule.get(ruleId) || 0) + 1);
+    }
 
     if (idCliente && String(row.id_cliente || "") === idCliente) {
       const key = `${ruleId}:${idCliente}`;
@@ -262,7 +268,7 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
         const k = `${ruleId}:${suffix}:sucursal:${idPromocionSucursal}`;
         byRulePeriod.set(k, (byRulePeriod.get(k) || 0) + 1);
       }
-      if (idBarbero && String(context.id_empleado_barbero || "") === idBarbero) {
+      if (idBarbero && String(row.id_empleado_barbero || "") === idBarbero) {
         const k = `${ruleId}:${suffix}:barbero:${idBarbero}`;
         byRulePeriod.set(k, (byRulePeriod.get(k) || 0) + 1);
       }
@@ -273,6 +279,41 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
 }
 
 export async function insertAppointmentPromotionApplication(db, data = {}) {
+  const params = [
+    data.id_grupo_cita,
+    data.id_cita || null,
+    data.id_cita_integrante || null,
+    data.id_cita_paquete || null,
+    data.id_cita_detalle || null,
+    data.line_key || null,
+    data.id_promocion,
+    data.id_promocion_regla,
+    data.aplica_a_codigo,
+    data.estado_aplicacion_codigo || "no_aplicada",
+  ];
+  const existing = await db.query(
+    `
+      SELECT id_cita_promocion
+      FROM public.citas_promociones
+      WHERE id_grupo_cita = $1::uuid
+        AND id_cita IS NOT DISTINCT FROM $2::uuid
+        AND id_cita_integrante IS NOT DISTINCT FROM $3::uuid
+        AND id_cita_paquete IS NOT DISTINCT FROM $4::uuid
+        AND id_cita_detalle IS NOT DISTINCT FROM $5::uuid
+        AND line_key IS NOT DISTINCT FROM $6::text
+        AND id_promocion = $7::uuid
+        AND id_promocion_regla = $8::uuid
+        AND aplica_a_codigo = $9::text
+        AND estado_aplicacion_codigo = $10::text
+      ORDER BY created_at ASC
+      LIMIT 1
+    `,
+    params
+  );
+  if (existing.rows[0]?.id_cita_promocion) {
+    return existing.rows[0].id_cita_promocion;
+  }
+
   const result = await db.query(
     `
       INSERT INTO public.citas_promociones (
@@ -281,8 +322,12 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
         id_cita_integrante,
         id_cita_paquete,
         id_cita_detalle,
+        line_key,
         id_promocion,
         id_promocion_regla,
+        id_promocion_sucursal,
+        id_promocion_codigo,
+        codigo_promocional_snapshot,
         aplica_a_codigo,
         nombre_promocion_snapshot,
         tipo_descuento_codigo,
@@ -300,18 +345,22 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
         $3::uuid,
         $4::uuid,
         $5::uuid,
-        $6::uuid,
+        $6::text,
         $7::uuid,
-        $8::text,
-        $9::text,
-        $10::text,
-        $11::numeric,
-        $12::numeric,
-        $13::numeric,
-        $14::int,
-        $15::boolean,
-        $16::text,
-        $17::text
+        $8::uuid,
+        $9::uuid,
+        $10::uuid,
+        $11::text,
+        $12::text,
+        $13::text,
+        $14::text,
+        $15::numeric,
+        $16::numeric,
+        $17::numeric,
+        $18::int,
+        $19::boolean,
+        $20::text,
+        $21::text
       )
       RETURNING id_cita_promocion
     `,
@@ -321,8 +370,12 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
       data.id_cita_integrante || null,
       data.id_cita_paquete || null,
       data.id_cita_detalle || null,
+      data.line_key || null,
       data.id_promocion,
       data.id_promocion_regla,
+      data.id_promocion_sucursal || null,
+      data.id_promocion_codigo || null,
+      data.codigo_promocional_snapshot || null,
       data.aplica_a_codigo,
       data.nombre_promocion_snapshot || "Promocion",
       data.tipo_descuento_codigo,
@@ -345,6 +398,44 @@ export async function insertPromotionUsage(db, data = {}) {
     });
   }
 
+  const lockKey = [
+    data.id_promocion_regla,
+    data.id_promocion_sucursal || "sin_sucursal",
+    data.id_empleado_barbero || "sin_barbero",
+    String(data.fecha_operativa || new Date().toISOString().slice(0, 10)).slice(0, 10),
+  ].join("|");
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [lockKey]);
+  await db.query(
+    `
+      SELECT id_cita_promocion
+      FROM public.citas_promociones
+      WHERE id_cita_promocion = $1::uuid
+      FOR UPDATE
+    `,
+    [data.id_cita_promocion]
+  );
+  const existing = await db.query(
+    `
+      SELECT id_promocion_uso
+      FROM public.promociones_usos
+      WHERE id_grupo_cita = $1::uuid
+        AND id_promocion_regla = $2::uuid
+        AND id_promocion_codigo IS NOT DISTINCT FROM $3::uuid
+        AND estado_uso_codigo IN ('reservado', 'consumido')
+      ORDER BY created_at ASC
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [
+      data.id_grupo_cita,
+      data.id_promocion_regla,
+      data.id_promocion_codigo || null,
+    ]
+  );
+  if (existing.rows[0]?.id_promocion_uso) {
+    return existing.rows[0].id_promocion_uso;
+  }
+
   const result = await db.query(
     `
       INSERT INTO public.promociones_usos (
@@ -355,6 +446,8 @@ export async function insertPromotionUsage(db, data = {}) {
         id_cliente,
         id_persona,
         id_promocion_sucursal,
+        id_promocion_codigo,
+        id_empleado_barbero,
         fecha_operativa,
         estado_uso_codigo,
         usado_at
@@ -367,8 +460,10 @@ export async function insertPromotionUsage(db, data = {}) {
         $5::uuid,
         $6::uuid,
         $7::uuid,
-        $8::date,
-        $9::text,
+        $8::uuid,
+        $9::uuid,
+        $10::date,
+        $11::text,
         NOW()
       )
       RETURNING id_promocion_uso
@@ -381,6 +476,8 @@ export async function insertPromotionUsage(db, data = {}) {
       data.id_cliente || null,
       data.id_persona || null,
       data.id_promocion_sucursal || null,
+      data.id_promocion_codigo || null,
+      data.id_empleado_barbero || null,
       String(data.fecha_operativa || new Date().toISOString().slice(0, 10)).slice(0, 10),
       data.estado_uso_codigo || "consumido",
     ]

@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
+import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
 
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -38,6 +39,10 @@ function assertSecureProductionConfig(config) {
 
   if (!config.cookieSecure) {
     throw new Error("AUTH_COOKIE_SECURE debe estar activo en produccion/staging.");
+  }
+
+  if (!config.bookingReleaseTokenSecret || config.bookingReleaseTokenSecret.length < 32) {
+    throw new Error("BOOKING_RELEASE_TOKEN_SECRET es obligatorio en produccion/staging.");
   }
 }
 
@@ -104,6 +109,10 @@ async function envPlugin(app) {
     jwtSecret,
     cookieSecret,
     csrfSecret,
+    bookingReleaseTokenSecret: String(
+      process.env.BOOKING_RELEASE_TOKEN_SECRET
+        || (nodeEnv === "test" ? "masterfade-test-release-token-secret-32" : "")
+    ).trim(),
     paymentProvider,
     todoPago: {
       mode: todoPagoMode,
@@ -126,6 +135,10 @@ async function envPlugin(app) {
       process.env.SERVICE_BARBER_ASSIGNMENTS_ENABLED,
       false
     ),
+    bookingIsvEnabled: parseStrictBooleanEnv(process.env.BOOKING_ISV_ENABLED, {
+      name: "BOOKING_ISV_ENABLED",
+      defaultValue: false,
+    }),
   };
 
   if (!["strict", "lax", "none"].includes(config.cookieSameSite)) {

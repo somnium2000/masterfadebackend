@@ -40,7 +40,71 @@ function buildCodesByRule(codeRows = []) {
   return map;
 }
 
-function buildScopedPromotionPayload(base = {}, context = {}, item = {}) {
+function normalizeMoney(value) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount)) return 0;
+  return Number(amount.toFixed(2));
+}
+
+function getPromotionTargetServiceIds(item = {}) {
+  const ids = new Set();
+  for (const target of Array.isArray(item.target_items) ? item.target_items : []) {
+    const serviceId = String(target?.id_servicio || "").trim();
+    if (serviceId) ids.add(serviceId);
+  }
+  for (const key of Array.isArray(item.target_keys) ? item.target_keys : []) {
+    const text = String(key || "").trim();
+    if (text.startsWith("servicio:")) ids.add(text.slice("servicio:".length));
+  }
+  const directServiceId = String(item.id_servicio || "").trim();
+  if (directServiceId) ids.add(directServiceId);
+  return ids;
+}
+
+function resolvePromotionDetailTargets(context = {}, item = {}) {
+  const detailRows = Array.isArray(context.detailRows) ? context.detailRows : [];
+  const lineAllocations = Array.isArray(item.line_allocations) ? item.line_allocations : [];
+  if (lineAllocations.length) {
+    const byLineKey = new Map(detailRows.map((row) => [String(row?.line_key || "").trim(), row]));
+    return lineAllocations.map((allocation) => {
+      const lineKey = String(allocation?.line_key || "").trim();
+      const detail = byLineKey.get(lineKey);
+      if (!detail) {
+        throw new AppError(409, "La promocion apunta a una linea canonica inexistente", {
+          code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+        });
+      }
+      return detail;
+    });
+  }
+  const directDetailId = String(item.id_cita_detalle || context.id_cita_detalle || "").trim();
+  if (directDetailId) {
+    return detailRows.filter((row) => String(row?.id_cita_detalle || "").trim() === directDetailId);
+  }
+
+  const serviceIds = getPromotionTargetServiceIds(item);
+  if (!serviceIds.size) return [];
+  return detailRows.filter((row) => serviceIds.has(String(row?.id_servicio || "").trim()));
+}
+
+function distributeDiscountAcrossDetails(detailRows = [], descuentoHnl = 0) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const capacities = rows.map((row) => normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0))));
+  const available = normalizeMoney(capacities.reduce((sum, amount) => sum + amount, 0));
+  const targetDiscount = Math.min(normalizeMoney(descuentoHnl), available);
+  let remaining = targetDiscount;
+  return rows.map((row, index) => {
+    const capacity = capacities[index] || 0;
+    const rawDiscount = index === rows.length - 1
+      ? remaining
+      : normalizeMoney(available > 0 ? (targetDiscount * capacity) / available : 0);
+    const discount = normalizeMoney(Math.max(0, Math.min(rawDiscount, remaining, capacity)));
+    remaining = normalizeMoney(Math.max(0, remaining - discount));
+    return discount;
+  });
+}
+
+function buildScopedPromotionPayloads(base = {}, context = {}, item = {}) {
   const applyCode = String(item.aplica_a_codigo || base.aplica_a_codigo || "").trim().toLowerCase();
   const payload = {
     ...base,
@@ -53,22 +117,49 @@ function buildScopedPromotionPayload(base = {}, context = {}, item = {}) {
 
   if (applyCode === "reserva") {
     payload.id_cita = null;
-    return payload;
+    return [payload];
   }
   if (applyCode === "titular") {
-    payload.id_cita = null;
-    payload.id_cita_integrante = context.id_cita_integrante || null;
-    return payload.id_cita_integrante ? payload : null;
+    payload.id_cita_integrante = context.id_cita_integrante || item.id_cita_integrante || null;
+    if (!payload.id_cita_integrante) {
+      throw new AppError(409, "No se pudo persistir una promocion del titular con identidad canonica", {
+        code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+      });
+    }
+    return [payload];
   }
   if (applyCode === "paquete") {
     payload.id_cita_paquete = context.id_cita_paquete || item.id_cita_paquete || null;
-    return payload.id_cita && payload.id_cita_paquete ? payload : null;
+    return payload.id_cita && payload.id_cita_paquete ? [payload] : [];
   }
   if (applyCode === "servicio") {
-    payload.id_cita_detalle = context.id_cita_detalle || item.id_cita_detalle || null;
-    return payload.id_cita && payload.id_cita_detalle ? payload : null;
+    const targetDetails = resolvePromotionDetailTargets(context, item);
+    const explicitAllocations = Array.isArray(item.line_allocations) ? item.line_allocations : [];
+    const allocations = explicitAllocations.length
+      ? targetDetails.map((detail) => {
+          const match = explicitAllocations.find((allocation) => (
+            String(allocation?.line_key || "").trim() === String(detail?.line_key || "").trim()
+          ));
+          return normalizeMoney(match?.descuento_hnl);
+        })
+      : distributeDiscountAcrossDetails(targetDetails, base.descuento_calculado_hnl);
+    return targetDetails
+      .map((detail, index) => {
+        if (!detail?.id_cita_detalle || !payload.id_cita) {
+          throw new AppError(409, "No se pudo persistir una asignacion promocional exacta", {
+            code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+          });
+        }
+        return ({
+        ...payload,
+        id_cita_detalle: detail.id_cita_detalle || null,
+        line_key: detail.line_key || null,
+        base_calculo_hnl: normalizeMoney(detail.subtotal_hnl),
+        descuento_calculado_hnl: allocations[index] || 0,
+      });
+      });
   }
-  return null;
+  return [];
 }
 
 export async function previewPromotionsForAppointment(db, context = {}) {
@@ -111,13 +202,17 @@ export async function previewPromotionsForAppointment(db, context = {}) {
 
 export async function recordPromotionApplications(db, context = {}, result = {}, options = {}) {
   const isFormal = options.formal === true;
+  const usageState = options.usageState || (isFormal ? "consumido" : null);
   const inserted = { aplicadas: [], descartadas: [], usos: [] };
 
   for (const applied of result.promociones_aplicadas || []) {
-    const appliedPayload = buildScopedPromotionPayload({
+    const appliedPayloads = buildScopedPromotionPayloads({
       id_grupo_cita: context.id_grupo_cita,
       id_promocion: applied.id_promocion,
       id_promocion_regla: applied.id_promocion_regla,
+      id_promocion_sucursal: applied.id_promocion_sucursal || context.id_promocion_sucursal || null,
+      id_promocion_codigo: applied.id_promocion_codigo || null,
+      codigo_promocional_snapshot: applied.codigo_promocional_snapshot || null,
       aplica_a_codigo: applied.aplica_a_codigo,
       nombre_promocion_snapshot: applied.titulo,
       tipo_descuento_codigo: applied.tipo_descuento_codigo,
@@ -130,24 +225,26 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       motivo_no_aplicada: null,
     }, context, applied);
 
-    if (!appliedPayload) continue;
+    for (const appliedPayload of appliedPayloads) {
+      const idCitaPromocion = await insertAppointmentPromotionApplication(db, appliedPayload);
+      inserted.aplicadas.push(idCitaPromocion);
 
-    const idCitaPromocion = await insertAppointmentPromotionApplication(db, appliedPayload);
-    inserted.aplicadas.push(idCitaPromocion);
-
-    if (isFormal && idCitaPromocion) {
-      const idUso = await insertPromotionUsage(db, {
-        id_cita_promocion: idCitaPromocion,
-        id_promocion_regla: applied.id_promocion_regla,
-        id_grupo_cita: context.id_grupo_cita,
-        id_cita: context.id_cita || null,
-        id_cliente: context.id_cliente || null,
-        id_persona: context.id_persona || null,
-        id_promocion_sucursal: applied.id_promocion_sucursal || context.id_promocion_sucursal || null,
-        fecha_operativa: normalizeDate(context.fecha_operativa || context.fecha),
-        estado_uso_codigo: "consumido",
-      });
-      inserted.usos.push(idUso);
+      if (usageState && idCitaPromocion) {
+        const idUso = await insertPromotionUsage(db, {
+          id_cita_promocion: idCitaPromocion,
+          id_promocion_regla: applied.id_promocion_regla,
+          id_grupo_cita: context.id_grupo_cita,
+          id_cita: appliedPayload.id_cita || context.id_cita || null,
+          id_cliente: context.id_cliente || null,
+          id_persona: context.id_persona || null,
+          id_promocion_sucursal: applied.id_promocion_sucursal || context.id_promocion_sucursal || null,
+          id_promocion_codigo: applied.id_promocion_codigo || null,
+          id_empleado_barbero: context.id_empleado_barbero || null,
+          fecha_operativa: normalizeDate(context.fecha_operativa || context.fecha),
+          estado_uso_codigo: usageState,
+        });
+        inserted.usos.push(idUso);
+      }
     }
   }
 
@@ -156,10 +253,13 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       ? "descartada_por_conflicto"
       : "no_aplicada";
 
-    const discardedPayload = buildScopedPromotionPayload({
+    const discardedPayloads = buildScopedPromotionPayloads({
       id_grupo_cita: context.id_grupo_cita,
       id_promocion: discarded.id_promocion,
       id_promocion_regla: discarded.id_promocion_regla,
+      id_promocion_sucursal: discarded.id_promocion_sucursal || context.id_promocion_sucursal || null,
+      id_promocion_codigo: discarded.id_promocion_codigo || null,
+      codigo_promocional_snapshot: discarded.codigo_promocional_snapshot || null,
       aplica_a_codigo: discarded.aplica_a_codigo || "reserva",
       nombre_promocion_snapshot: discarded.titulo,
       tipo_descuento_codigo: discarded.tipo_descuento_codigo || "monto_fijo",
@@ -172,10 +272,10 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       motivo_no_aplicada: discarded.motivo || "No elegible",
     }, context, discarded);
 
-    if (!discardedPayload) continue;
-
-    const idCitaPromocion = await insertAppointmentPromotionApplication(db, discardedPayload);
-    inserted.descartadas.push(idCitaPromocion);
+    for (const discardedPayload of discardedPayloads) {
+      const idCitaPromocion = await insertAppointmentPromotionApplication(db, discardedPayload);
+      inserted.descartadas.push(idCitaPromocion);
+    }
   }
 
   return inserted;
@@ -229,13 +329,29 @@ export async function markPromotionUsagesForGroup(db, context = {}) {
   }
 
   const dateRef = normalizeDate(context.fecha_operativa || context.fecha);
+  await db.query(
+    `
+      UPDATE public.promociones_usos pu
+      SET estado_uso_codigo = 'consumido',
+          usado_at = now(),
+          updated_at = now()
+      WHERE pu.id_grupo_cita = $1::uuid
+        AND pu.estado_uso_codigo = 'reservado'
+    `,
+    [groupId]
+  );
   const rows = await db.query(
     `
       SELECT
         cp.id_cita_promocion,
         cp.id_promocion_regla,
-        cp.id_cita
+        cp.id_cita,
+        cp.id_promocion_sucursal,
+        cp.id_promocion_codigo,
+        c.id_empleado_barbero
       FROM public.citas_promociones cp
+      LEFT JOIN public.citas c
+        ON c.id_cita = cp.id_cita
       WHERE cp.id_grupo_cita = $1::uuid
         AND cp.estado_aplicacion_codigo = 'aplicada'
     `,
@@ -261,7 +377,9 @@ export async function markPromotionUsagesForGroup(db, context = {}) {
       id_cita: row.id_cita || null,
       id_cliente: context.id_cliente || null,
       id_persona: context.id_persona || null,
-      id_promocion_sucursal: null,
+      id_promocion_sucursal: row.id_promocion_sucursal || null,
+      id_promocion_codigo: row.id_promocion_codigo || null,
+      id_empleado_barbero: row.id_empleado_barbero || context.id_empleado_barbero || null,
       fecha_operativa: dateRef,
       estado_uso_codigo: "consumido",
     });

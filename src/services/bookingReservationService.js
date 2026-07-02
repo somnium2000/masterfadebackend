@@ -1,4 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { resolveBookingIsvEnabled } from "../config/bookingConfig.js";
+import {
+  buildCanonicalLineKey,
+  buildDiscountPlan,
+  normalizeMoney as normalizeDiscountMoney,
+} from "./bookingDiscounts.js";
+import { recordPromotionApplications } from "./promociones/promocionesService.js";
 import { AppError } from "../utils/errors.js";
 
 function normalizeMoney(value) {
@@ -16,8 +23,16 @@ function normalizePercentage(value) {
 function calculateLineIsv({ subtotalHnl, descuentoHnl, isvPorcentaje, incluyeIsv }) {
   const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
   const percentage = normalizePercentage(isvPorcentaje);
-  if (percentage <= 0 || incluyeIsv) return 0;
+  if (percentage <= 0) return 0;
+  if (incluyeIsv) {
+    return normalizeMoney(taxableBase - (taxableBase / (1 + (percentage / 100))));
+  }
   return normalizeMoney((taxableBase * percentage) / 100);
+}
+
+function calculateLineTotal({ subtotalHnl, descuentoHnl, isvHnl, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  return normalizeMoney(Math.max(0, taxableBase + (incluyeIsv ? 0 : Number(isvHnl || 0))));
 }
 
 export function calculateReservationTiming(selection) {
@@ -54,55 +69,115 @@ export function assertBookingSelectionCreationSupported(selectionType) {
 
 export function buildAppointmentDetailRows(serviceItems = [], {
   descuentoTotalHnl = 0,
+  discountPlan = null,
   origenItemCodigo = "servicio_manual",
+  ordenIntegrante = 1,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
+  const isvEnabled = bookingIsvEnabled === true;
   const grouped = new Map();
+  const occurrenceByGroup = new Map();
   for (const item of Array.isArray(serviceItems) ? serviceItems : []) {
     const serviceId = String(item?.id_servicio || "").trim();
     if (!serviceId) continue;
-    if (!grouped.has(serviceId)) {
-      grouped.set(serviceId, {
+    const tariffId = item?.id_tarifa || null;
+    const originCode = item?.origen_item_codigo || origenItemCodigo;
+    const groupKey = [serviceId, tariffId || "sin_tarifa", originCode].join("|");
+    if (!grouped.has(groupKey)) {
+      const occurrenceKey = [
+        Math.max(1, Math.trunc(Number(ordenIntegrante || 1))),
+        serviceId,
+        tariffId || "sin_tarifa",
+        originCode,
+      ].join("|");
+      const occurrence = (occurrenceByGroup.get(occurrenceKey) || 0) + 1;
+      occurrenceByGroup.set(occurrenceKey, occurrence);
+      grouped.set(groupKey, {
+        line_key: item?.line_key || buildCanonicalLineKey({
+          orden_integrante: ordenIntegrante,
+          id_servicio: serviceId,
+          id_tarifa: tariffId,
+          origen_item_codigo: originCode,
+          occurrence,
+        }),
         id_servicio: serviceId,
-        id_tarifa: item?.id_tarifa || null,
+        id_tarifa: tariffId,
         cantidad: 0,
         duracion_min: Math.max(1, Math.trunc(Number(item?.duracion_min || 0))),
         buffer_min: Math.max(0, Math.trunc(Number(item?.buffer_min || 0))),
         nombre_servicio_snapshot: String(item?.nombre_servicio || "Servicio").trim() || "Servicio",
         precio_referencia_hnl: normalizeMoney(item?.precio_hnl),
         precio_unitario_hnl: normalizeMoney(item?.precio_hnl),
-        incluye_isv: item?.incluye_isv === true,
-        isv_porcentaje: normalizePercentage(item?.isv_porcentaje),
+        incluye_isv_snapshot: isvEnabled && (item?.incluye_isv_snapshot === true || item?.incluye_isv === true),
+        isv_porcentaje: isvEnabled ? normalizePercentage(item?.isv_porcentaje) : 0,
         subtotal_hnl: 0,
         descuento_hnl: 0,
         isv_hnl: 0,
         total_linea_hnl: 0,
-        origen_item_codigo: origenItemCodigo,
+        origen_item_codigo: originCode,
       });
     }
-    const row = grouped.get(serviceId);
+    const row = grouped.get(groupKey);
     row.cantidad += 1;
     row.subtotal_hnl = normalizeMoney(row.precio_unitario_hnl * row.cantidad);
   }
 
   const rows = [...grouped.values()];
   const subtotal = normalizeMoney(rows.reduce((sum, row) => sum + row.subtotal_hnl, 0));
+  const planByLine = discountPlan instanceof Map
+    ? discountPlan
+    : (discountPlan ? buildDiscountPlan(rows, Object.values(discountPlan).flatMap((entry) => entry.allocations || [])) : null);
   let remainingDiscount = Math.min(normalizeMoney(descuentoTotalHnl), subtotal);
   rows.forEach((row, index) => {
-    const discount = index === rows.length - 1
-      ? remainingDiscount
-      : normalizeMoney(subtotal > 0 ? (normalizeMoney(descuentoTotalHnl) * row.subtotal_hnl) / subtotal : 0);
-    row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
-    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+    if (planByLine) {
+      row.descuento_hnl = normalizeMoney(planByLine.get(row.line_key)?.descuento_total_hnl || 0);
+    } else {
+      const discount = index === rows.length - 1
+        ? remainingDiscount
+        : normalizeMoney(subtotal > 0 ? (normalizeMoney(descuentoTotalHnl) * row.subtotal_hnl) / subtotal : 0);
+      row.descuento_hnl = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, row.subtotal_hnl)));
+      remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - row.descuento_hnl));
+    }
+    if (row.descuento_hnl > row.subtotal_hnl) {
+      throw new AppError(409, "El descuento supera el subtotal de la linea", {
+        code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
+      });
+    }
     row.isv_hnl = calculateLineIsv({
       subtotalHnl: row.subtotal_hnl,
       descuentoHnl: row.descuento_hnl,
       isvPorcentaje: row.isv_porcentaje,
-      incluyeIsv: row.incluye_isv,
+      incluyeIsv: row.incluye_isv_snapshot,
     });
-    row.total_linea_hnl = normalizeMoney(Math.max(0, row.subtotal_hnl - row.descuento_hnl + row.isv_hnl));
+    row.total_linea_hnl = calculateLineTotal({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvHnl: row.isv_hnl,
+      incluyeIsv: row.incluye_isv_snapshot,
+    });
   });
 
+  if (planByLine) {
+    const assigned = normalizeMoney(rows.reduce((sum, row) => sum + Number(row.descuento_hnl || 0), 0));
+    const requested = normalizeDiscountMoney([...planByLine.values()].reduce((sum, row) => sum + Number(row.descuento_total_hnl || 0), 0));
+    if (assigned !== requested) {
+      throw new AppError(409, "La suma de descuentos por linea no coincide con el plan canonico", {
+        code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
+      });
+    }
+  }
+
   return rows;
+}
+
+export function summarizeAppointmentDetailRows(rows = []) {
+  const source = Array.isArray(rows) ? rows : [];
+  return {
+    subtotalHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0)),
+    descuentoHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.descuento_hnl || 0), 0)),
+    isvHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.isv_hnl || 0), 0)),
+    totalHnl: normalizeMoney(source.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0)),
+  };
 }
 
 export async function createBookingGroup(client, {
@@ -238,13 +313,21 @@ export async function createAppointmentCore(client, {
   return { id_cita: result.rows[0].id_cita, timing };
 }
 
-export async function insertAppointmentDetails(client, { citaId, serviceItems, descuentoTotalHnl = 0 }) {
-  const rows = buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl });
+export async function insertAppointmentDetails(
+  client,
+  { citaId, serviceItems, descuentoTotalHnl = 0, detailRows = null, bookingIsvEnabled = resolveBookingIsvEnabled() }
+) {
+  const rows = Array.isArray(detailRows)
+    ? detailRows
+    : buildAppointmentDetailRows(serviceItems, { descuentoTotalHnl, bookingIsvEnabled });
+  const insertedRows = [];
   for (const row of rows) {
-    await client.query(
+    const result = await client.query(
       `
         INSERT INTO public.citas_detalles (
           id_cita,
+          line_key,
+          orden_linea,
           id_servicio,
           id_tarifa,
           cantidad,
@@ -255,19 +338,23 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
           precio_unitario_hnl,
           subtotal_hnl,
           descuento_hnl,
+          incluye_isv_snapshot,
           isv_porcentaje,
           isv_hnl,
           total_linea_hnl,
           origen_item_codigo
         )
         VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::int, $5::int, $6::int, $7::text,
-          $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,
-          $13::numeric, $14::numeric, $15::text
+          $1::uuid, $2::text, $3::int, $4::uuid, $5::uuid, $6::int, $7::int, $8::int, $9::text,
+          $10::numeric, $11::numeric, $12::numeric, $13::numeric, $14::boolean,
+          $15::numeric, $16::numeric, $17::numeric, $18::text
         )
+        RETURNING id_cita_detalle
       `,
       [
         citaId,
+        row.line_key || null,
+        row.orden_linea || insertedRows.length + 1,
         row.id_servicio,
         row.id_tarifa,
         row.cantidad,
@@ -278,14 +365,19 @@ export async function insertAppointmentDetails(client, { citaId, serviceItems, d
         row.precio_unitario_hnl,
         row.subtotal_hnl,
         row.descuento_hnl,
+        row.incluye_isv_snapshot,
         row.isv_porcentaje,
         row.isv_hnl,
         row.total_linea_hnl,
         row.origen_item_codigo,
       ]
     );
+    insertedRows.push({
+      ...row,
+      id_cita_detalle: result.rows?.[0]?.id_cita_detalle || row.id_cita_detalle || null,
+    });
   }
-  return rows;
+  return insertedRows;
 }
 
 export async function createAppointmentHold(client, {
@@ -315,20 +407,54 @@ export async function createBookingReservation(client, {
   groupRecord = null,
   appointment,
   hold = null,
+  promotions = null,
+  discountPlan = null,
   updateGroupTotalHnl = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   if (!appointment?.selection) {
     throw new TypeError("appointment.selection es obligatorio");
   }
 
-  const createdAppointment = await createAppointmentCore(client, appointment);
-  const citaId = createdAppointment.id_cita;
   const serviceItems = appointment.selection?.serviceSelection?.items || [];
+  const preparedDetailRows = buildAppointmentDetailRows(serviceItems, {
+    descuentoTotalHnl: appointment.descuentoHnl || 0,
+    discountPlan,
+    ordenIntegrante: appointment.order || 1,
+    bookingIsvEnabled,
+  });
+  const detailTotals = summarizeAppointmentDetailRows(preparedDetailRows);
+  const createdAppointment = await createAppointmentCore(client, {
+    ...appointment,
+    subtotalHnl: detailTotals.subtotalHnl,
+    descuentoHnl: detailTotals.descuentoHnl,
+    totalHnl: detailTotals.totalHnl,
+  });
+  const citaId = createdAppointment.id_cita;
   const detailRows = await insertAppointmentDetails(client, {
     citaId,
     serviceItems,
     descuentoTotalHnl: appointment.descuentoHnl || 0,
+    detailRows: preparedDetailRows,
+    bookingIsvEnabled,
   });
+  if (promotions?.result) {
+    await recordPromotionApplications(
+      client,
+      {
+        ...(promotions.context || {}),
+        id_grupo_cita: promotions.context?.id_grupo_cita || groupRecord?.id_grupo_cita || appointment.groupId || null,
+        id_cita: promotions.context?.id_cita || citaId,
+        id_cliente: promotions.context?.id_cliente || appointment.clientId || null,
+        id_persona: promotions.context?.id_persona || appointment.personId || null,
+        detailRows,
+        discountPlan,
+        serviceItems,
+      },
+      promotions.result,
+      { formal: promotions.formal === true, usageState: promotions.usageState || null }
+    );
+  }
   const holdRecord = hold
     ? await createAppointmentHold(client, {
         citaId,
@@ -347,6 +473,7 @@ export async function createBookingReservation(client, {
     appointment: createdAppointment,
     citaId,
     detailRows,
+    totals: detailTotals,
     hold: holdRecord,
   };
 }

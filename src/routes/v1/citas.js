@@ -1,17 +1,16 @@
-import { AppError, sendError } from "../../utils/errors.js";
+import { AppError, sendError, toDatabaseSchemaOutdatedError } from "../../utils/errors.js";
 import { sendOk } from "../../utils/response.js";
 import {
   ensureActiveBranch,
   expireStaleAppointmentReservations,
   OCCUPIED_APPOINTMENT_STATES,
   assertUuid,
-  getHoldDurationMinutes,
-  getSystemParameters,
   parseSinglePackageId,
   parseDateOnly,
+  normalizeOperationalDateTime,
   resolveBookingSelection,
 } from "../../services/agendaService.js";
-import { confirmAppointmentsWithoutPayment, confirmAppointmentWithoutPayment } from "../../services/appointmentConfirmationService.js";
+import { confirmAppointmentsWithoutPayment } from "../../services/appointmentConfirmationService.js";
 import {
   createCoverageTracker,
   consumeMembershipForCompletedAppointment,
@@ -29,15 +28,29 @@ import {
 } from "../../services/pointsService.js";
 import {
   assertBookingSelectionCreationSupported,
-  createBookingGroup,
-  createBookingReservation,
-  updateBookingGroupTotal,
+  buildAppointmentDetailRows,
 } from "../../services/bookingReservationService.js";
 import {
   previewPromotionsForAppointment,
-  recordPromotionApplications,
   markPromotionUsagesForGroup,
+  recordPromotionApplications,
 } from "../../services/promociones/promocionesService.js";
+import { buildCanonicalDiscountLines, buildDiscountPlan } from "../../services/bookingDiscounts.js";
+import {
+  assertCanonicalTotalsMatch,
+  assertKnownIdempotencyState,
+  buildAssignmentAttemptsFromIntegrantes,
+  buildCanonicalReservationPayload,
+  buildReservationRequestFingerprint,
+  createCanonicalReservation,
+  finalizeReservationIdempotency,
+  getReservationIdempotencyState,
+  loadCanonicalPromotionDetailRows,
+  mapCanonicalReservationError,
+  resolveReservationRequestId,
+  selectCanonicalIntegrantesForResult,
+  summarizeCanonicalIntegrantes,
+} from "../../services/bookingCanonicalReservationService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
@@ -45,6 +58,7 @@ const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PENDING_EXPIRED_MESSAGE = "Esta reserva ya expiro. Agenda nuevamente.";
+const AUTH_HOLD_IDEMPOTENCY_SCOPE = "auth:citas:hold";
 
 const errorResponseSchema = {
   type: "object",
@@ -112,31 +126,50 @@ const citaResumenSchema = {
 const citaDetalleItemSchema = {
   type: "object",
   properties: {
+    id_cita_detalle: { type: "string", format: "uuid" },
     id_servicio: { type: "string", format: "uuid" },
     nombre_servicio: { type: ["string", "null"] },
+    id_tarifa: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
     cantidad: { type: "integer" },
     duracion_min: { type: "integer" },
     buffer_min: { type: "integer" },
+    precio_referencia_hnl: { type: "number" },
     precio_unitario_hnl: { type: "number" },
     subtotal_hnl: { type: "number" },
+    descuento_hnl: { type: "number" },
+    incluye_isv_snapshot: { type: "boolean" },
+    isv_porcentaje: { type: "number" },
+    isv_hnl: { type: "number" },
+    total_linea_hnl: { type: "number" },
+    origen_item_codigo: { anyOf: [{ type: "string" }, { type: "null" }] },
   },
   required: [
+    "id_cita_detalle",
     "id_servicio",
     "nombre_servicio",
+    "id_tarifa",
     "cantidad",
     "duracion_min",
     "buffer_min",
+    "precio_referencia_hnl",
     "precio_unitario_hnl",
     "subtotal_hnl",
+    "descuento_hnl",
+    "incluye_isv_snapshot",
+    "isv_porcentaje",
+    "isv_hnl",
+    "total_linea_hnl",
+    "origen_item_codigo",
   ],
   additionalProperties: false,
 };
 
 function sendHandled(reply, request, error, message, code) {
-  if (error instanceof AppError) {
-    return sendError(reply, error.statusCode, error.message, {
-      code: error.code,
-      details: error.details,
+  const normalizedError = toDatabaseSchemaOutdatedError(error);
+  if (normalizedError instanceof AppError) {
+    return sendError(reply, normalizedError.statusCode, normalizedError.message, {
+      code: normalizedError.code,
+      details: normalizedError.details,
       requestId: request.id,
     });
   }
@@ -223,12 +256,12 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
     conditions.push(`c.estado_cita_codigo = $${params.length}`);
   }
   if (fechaDesde) {
-    params.push(`${fechaDesde}T00:00:00`);
-    conditions.push(`c.inicio_at >= $${params.length}::timestamptz`);
+    params.push(fechaDesde);
+    conditions.push(`c.inicio_at >= ($${params.length}::date::timestamp AT TIME ZONE 'America/Tegucigalpa')`);
   }
   if (fechaHasta) {
-    params.push(`${fechaHasta}T23:59:59.999`);
-    conditions.push(`c.inicio_at <= $${params.length}::timestamptz`);
+    params.push(fechaHasta);
+    conditions.push(`c.inicio_at < (($${params.length}::date + 1)::timestamp AT TIME ZONE 'America/Tegucigalpa')`);
   }
 
   const { rows } = await client.query(
@@ -313,31 +346,106 @@ async function getAppointmentDetails(client, citaId) {
   const { rows } = await client.query(
     `
       SELECT
+        cd.id_cita_detalle,
         cd.id_servicio,
-        s.nombre_servicio,
+        COALESCE(
+          NULLIF(cd.nombre_servicio_snapshot, ''),
+          s.nombre_servicio,
+          'Servicio no disponible'
+        ) AS nombre_servicio,
+        cd.id_tarifa,
         cd.cantidad,
         cd.duracion_min,
         cd.buffer_min,
+        cd.precio_referencia_hnl,
         cd.precio_unitario_hnl,
-        cd.subtotal_hnl
+        cd.subtotal_hnl,
+        cd.descuento_hnl,
+        cd.incluye_isv_snapshot,
+        cd.isv_porcentaje,
+        cd.isv_hnl,
+        cd.total_linea_hnl,
+        cd.origen_item_codigo
       FROM public.citas_detalles cd
-      JOIN public.servicios s
+      LEFT JOIN public.servicios s
         ON s.id_servicio = cd.id_servicio
       WHERE cd.id_cita = $1::uuid
-      ORDER BY s.nombre_servicio ASC, cd.id_cita_detalle ASC
+      ORDER BY nombre_servicio ASC, cd.id_cita_detalle ASC
     `,
     [citaId]
   );
 
   return rows.map((row) => ({
+    id_cita_detalle: row.id_cita_detalle,
     id_servicio: row.id_servicio,
     nombre_servicio: row.nombre_servicio ?? null,
+    id_tarifa: row.id_tarifa ?? null,
     cantidad: Number(row.cantidad ?? 1),
     duracion_min: Number(row.duracion_min),
     buffer_min: Number(row.buffer_min ?? 0),
+    precio_referencia_hnl: Number(row.precio_referencia_hnl ?? 0),
     precio_unitario_hnl: Number(row.precio_unitario_hnl ?? 0),
     subtotal_hnl: Number(row.subtotal_hnl ?? 0),
+    descuento_hnl: Number(row.descuento_hnl ?? 0),
+    incluye_isv_snapshot: row.incluye_isv_snapshot === true,
+    isv_porcentaje: Number(row.isv_porcentaje ?? 0),
+    isv_hnl: Number(row.isv_hnl ?? 0),
+    total_linea_hnl: Number(row.total_linea_hnl ?? row.subtotal_hnl ?? 0),
+    origen_item_codigo: row.origen_item_codigo ?? null,
   }));
+}
+
+function buildCoverageDiscountAllocations(discountLines = [], coverage = {}, {
+  idSuscripcion = null,
+  rewardSourceId = null,
+} = {}) {
+  const lines = (Array.isArray(discountLines) ? discountLines : []).map((line) => ({
+    ...line,
+    remaining_hnl: Number(line.base_disponible_hnl ?? line.subtotal_hnl ?? 0),
+  }));
+  const allocations = [];
+  for (const item of Array.isArray(coverage?.items) ? coverage.items : []) {
+    const status = String(item?.coverage_status || "").trim().toLowerCase();
+    if (status !== "cubierto_plan" && status !== "cubierto_recompensa") continue;
+    const serviceId = String(item?.id_servicio || "").trim();
+    const tariffId = item?.id_tarifa ? String(item.id_tarifa).trim() : null;
+    const originCode = String(item?.origen_item_codigo || "servicio_manual").trim();
+    const discount = Number(Number(item?.total_hnl ?? item?.precio_unitario_hnl ?? 0).toFixed(2));
+    if (!serviceId || discount <= 0) continue;
+    const sourceType = status === "cubierto_recompensa" ? "reward" : "membership";
+    const sourceId = sourceType === "reward" ? rewardSourceId : idSuscripcion;
+    const target = lines.find((line) => (
+      Number(line.orden_integrante || 1) === 1
+      && String(line.id_servicio || "").trim() === serviceId
+      && (line.id_tarifa ? String(line.id_tarifa).trim() : null) === tariffId
+      && String(line.origen_item_codigo || "servicio_manual").trim() === originCode
+      && Number(Number(line.remaining_hnl || 0).toFixed(2)) >= discount
+    ));
+    if (!target?.line_key) {
+      throw new AppError(409, "No se pudo asignar la cobertura a las lineas de la cita", {
+        code: "BOOKING_DISCOUNT_ALLOCATION_INCOMPLETE",
+      });
+    }
+    allocations.push({
+      line_key: target.line_key,
+      source_type: sourceType,
+      source_id: sourceId || null,
+      descuento_hnl: discount,
+    });
+    target.remaining_hnl = Number((Number(target.remaining_hnl || 0) - discount).toFixed(2));
+  }
+  return allocations;
+}
+
+function applyPlanAsPreviousDiscount(discountLines = [], discountPlan = new Map()) {
+  return (Array.isArray(discountLines) ? discountLines : []).map((line) => {
+    const previous = Number(discountPlan.get(line.line_key)?.descuento_total_hnl || 0);
+    return {
+      ...line,
+      descuento_previo_hnl: previous,
+      base_disponible_hnl: Number(Math.max(0, Number(line.subtotal_hnl || 0) - previous).toFixed(2)),
+    };
+  });
 }
 
 function isPointsTriggerCompileError(error) {
@@ -543,12 +651,13 @@ async function sendNoPaymentConfirmationEmails(app, logger, {
   return { emailEnviado: false, emailOmitido: "envio_fallido" };
 }
 
-async function getServicesWithActiveTariffByBranch(client, { idSucursal, serviceIds = [] }) {
+async function getServicesWithActiveTariffByBranch(client, { idSucursal, serviceIds = [], fechaOperativa = null }) {
   const safeBranchId = String(idSucursal || "").trim();
   const normalizedServiceIds = (Array.isArray(serviceIds) ? serviceIds : [])
     .map((serviceId) => String(serviceId || "").trim())
     .filter(Boolean);
   if (!safeBranchId || normalizedServiceIds.length === 0) return [];
+  const safeFechaOperativa = fechaOperativa ? parseDateOnly(fechaOperativa, "fecha_operativa") : null;
 
   const { rows } = await client.query(
     `
@@ -567,14 +676,14 @@ async function getServicesWithActiveTariffByBranch(client, { idSucursal, service
           AND st.id_servicio = ANY($2::uuid[])
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
-          AND st.vigente_desde <= NOW()
-          AND (st.vigente_hasta IS NULL OR st.vigente_hasta > NOW())
+          AND st.vigente_desde <= COALESCE($3::date, (now() AT TIME ZONE 'America/Tegucigalpa')::date)
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= COALESCE($3::date, (now() AT TIME ZONE 'America/Tegucigalpa')::date))
       )
       SELECT id_servicio
       FROM ranked_tariffs
       WHERE row_num = 1
     `,
-    [safeBranchId, normalizedServiceIds]
+    [safeBranchId, normalizedServiceIds, safeFechaOperativa]
   );
 
   return rows
@@ -587,9 +696,12 @@ function isConflictError(error) {
 }
 
 function parseIsoDateAndTime(rawDateTime) {
-  const match = String(rawDateTime || "").trim().match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
-  if (!match) return { fecha: null, hora: null };
-  return { fecha: match[1], hora: match[2] };
+  try {
+    const normalized = normalizeOperationalDateTime(rawDateTime, "fecha_inicio");
+    return { fecha: normalized.fecha_operativa, hora: normalized.hora_operativa };
+  } catch {
+    return { fecha: null, hora: null };
+  }
 }
 
 function normalizePersonName(rawValue) {
@@ -699,15 +811,28 @@ async function getServicesByAppointmentIds(client, citaIds = []) {
     `
       SELECT
         cd.id_cita,
+        cd.id_cita_detalle,
         cd.id_servicio,
-        s.nombre_servicio,
+        COALESCE(
+          NULLIF(cd.nombre_servicio_snapshot, ''),
+          s.nombre_servicio,
+          'Servicio no disponible'
+        ) AS nombre_servicio,
+        cd.id_tarifa,
         cd.cantidad,
         cd.duracion_min,
         cd.buffer_min,
+        cd.precio_referencia_hnl,
         cd.precio_unitario_hnl,
-        cd.subtotal_hnl
+        cd.subtotal_hnl,
+        cd.descuento_hnl,
+        cd.incluye_isv_snapshot,
+        cd.isv_porcentaje,
+        cd.isv_hnl,
+        cd.total_linea_hnl,
+        cd.origen_item_codigo
       FROM public.citas_detalles cd
-      JOIN public.servicios s
+      LEFT JOIN public.servicios s
         ON s.id_servicio = cd.id_servicio
       WHERE cd.id_cita = ANY($1::uuid[])
       ORDER BY cd.created_at ASC, cd.id_cita_detalle ASC
@@ -721,13 +846,22 @@ async function getServicesByAppointmentIds(client, citaIds = []) {
     if (!citaId) continue;
     if (!mapped.has(citaId)) mapped.set(citaId, []);
     mapped.get(citaId).push({
+      id_cita_detalle: row.id_cita_detalle,
       id_servicio: row.id_servicio,
       nombre_servicio: row.nombre_servicio ?? null,
+      id_tarifa: row.id_tarifa ?? null,
       cantidad: Number(row.cantidad ?? 1),
       duracion_min: Number(row.duracion_min ?? 0),
       buffer_min: Number(row.buffer_min ?? 0),
+      precio_referencia_hnl: Number(row.precio_referencia_hnl ?? 0),
       precio_unitario_hnl: Number(row.precio_unitario_hnl ?? 0),
       subtotal_hnl: Number(row.subtotal_hnl ?? 0),
+      descuento_hnl: Number(row.descuento_hnl ?? 0),
+      incluye_isv_snapshot: row.incluye_isv_snapshot === true,
+      isv_porcentaje: Number(row.isv_porcentaje ?? 0),
+      isv_hnl: Number(row.isv_hnl ?? 0),
+      total_linea_hnl: Number(row.total_linea_hnl ?? row.subtotal_hnl ?? 0),
+      origen_item_codigo: row.origen_item_codigo ?? null,
     });
   }
   return mapped;
@@ -1100,14 +1234,17 @@ function compareDateTimeParts(left, right) {
 }
 
 function assertDateTimeNotPastInHonduras(rawDateTime, field = "fecha_inicio") {
-  const parsed = new Date(String(rawDateTime || "").trim());
-  if (Number.isNaN(parsed.getTime())) {
+  let normalized;
+  try {
+    normalized = normalizeOperationalDateTime(rawDateTime, field);
+  } catch (error) {
     throw new AppError(400, `${field} no es valida`, {
-      code: "CITAS_HOLD_INVALID_DATETIME",
-      details: { field, value: rawDateTime },
+      code: error?.code || "CITAS_HOLD_INVALID_DATETIME",
+      details: { field, value: rawDateTime, time_zone: HONDURAS_TIME_ZONE },
     });
   }
 
+  const parsed = normalized.utcDate;
   const requestParts = getDateTimePartsInTimeZone(parsed, HONDURAS_TIME_ZONE);
   const nowParts = getDateTimePartsInTimeZone(new Date(), HONDURAS_TIME_ZONE);
   if (!requestParts || !nowParts) return parsed;
@@ -1189,6 +1326,15 @@ function normalizeHoldBlocksPayload(body) {
       id_paquete: packageId,
       fecha_inicio: fechaInicio,
       serviceIds,
+      contacto: {
+        nombre: String(item?.contacto?.nombre || item?.contacto_nombre || alias).trim().slice(0, 160) || alias,
+        email: item?.contacto?.email || item?.contacto_email
+          ? normalizeEmail(item?.contacto?.email || item?.contacto_email)
+          : null,
+        telefono: item?.contacto?.telefono || item?.contacto_telefono
+          ? String(item?.contacto?.telefono || item?.contacto_telefono).trim().slice(0, 40)
+          : null,
+      },
     };
   });
 }
@@ -1216,6 +1362,181 @@ function mapServicesById(serviceItems = []) {
     });
   }
   return map;
+}
+
+function cloneCoverageTracker(tracker) {
+  if (!tracker || typeof tracker !== "object") return tracker;
+  return {
+    ...tracker,
+    serviceRemaining: tracker.serviceRemaining instanceof Map
+      ? new Map(tracker.serviceRemaining)
+      : new Map(),
+    requiredServiceIds: Array.isArray(tracker.requiredServiceIds) ? [...tracker.requiredServiceIds] : [],
+    requiredServices: Array.isArray(tracker.requiredServices)
+      ? tracker.requiredServices.map((service) => ({ ...service }))
+      : [],
+  };
+}
+
+function getDeterministicCandidateIds(selection, explicitBarberId = null) {
+  const explicit = String(explicitBarberId || "").trim();
+  if (explicit) return [explicit];
+  return Array.from(new Set(
+    (Array.isArray(selection?.barber_candidate_ids) ? selection.barber_candidate_ids : [selection?.barber?.id_empleado])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  )).slice(0, 6);
+}
+
+async function buildAuthenticatedCanonicalOption(dbClient, {
+  branch,
+  integrante,
+  index,
+  isTitular,
+  selection,
+  coverageTracker,
+  forcedServiceIdsApplied,
+  rewardRedeemContext,
+  clienteId,
+  personaId,
+  usuarioId,
+  titularContact,
+  request,
+  app,
+}) {
+  const coverage = consumeCoverageForServices(
+    coverageTracker,
+    selection.serviceSelection.items,
+    { isTitular, forcedServiceIds: forcedServiceIdsApplied }
+  );
+  const subtotalServicios = Number(
+    selection.serviceSelection.monto_subtotal_hnl ?? selection.serviceSelection.monto_total_hnl ?? 0
+  );
+  let rewardCoveredInBlock = 0;
+  if (isTitular && rewardRedeemContext) {
+    const rewardServiceId = String(rewardRedeemContext.id_servicio_canje || "").trim();
+    const rewardCoverageItem = coverage.items.find((item) => String(item?.id_servicio || "").trim() === rewardServiceId);
+    if (!rewardCoverageItem) {
+      throw new AppError(409, "El canje no corresponde al servicio seleccionado para el titular", {
+        code: "POINTS_REDEEM_SERVICE_MISMATCH",
+        details: {
+          canje_context_token: rewardRedeemContext.canje_context_token,
+          id_servicio_canje: rewardRedeemContext.id_servicio_canje,
+        },
+      });
+    }
+    rewardCoveredInBlock = Math.max(0, Number(rewardCoverageItem.total_hnl ?? rewardCoverageItem.precio_unitario_hnl ?? 0));
+    rewardCoverageItem.coverage_status = "cubierto_recompensa";
+    rewardCoverageItem.forced_by_membership = false;
+    coverage.coveredTotalHnl += rewardCoveredInBlock;
+    coverage.extraTotalHnl = Math.max(0, coverage.extraTotalHnl - rewardCoveredInBlock);
+  }
+
+  const descuento = Number(coverage.coveredTotalHnl || 0);
+  let totalPagar = Number(coverage.extraTotalHnl || 0);
+  let descuentoPromociones = 0;
+  const baseDiscountLines = buildCanonicalDiscountLines(selection.serviceSelection.items || [], {
+    orden_integrante: integrante.orden_integrante || index + 1,
+  });
+  const coverageAllocations = buildCoverageDiscountAllocations(baseDiscountLines, coverage, {
+    idSuscripcion: coverageTracker?.idSuscripcion || null,
+    rewardSourceId: rewardRedeemContext?.canje_context_token || null,
+  });
+  const coveragePlan = buildDiscountPlan(baseDiscountLines, coverageAllocations);
+  const promotionDiscountLines = applyPlanAsPreviousDiscount(baseDiscountLines, coveragePlan);
+  const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
+  const promocionesContext = {
+    id_sucursal: branch.id_sucursal,
+    id_empleado_barbero: selection.barber.id_empleado,
+    id_cliente: clienteId,
+    id_persona: personaId,
+    id_grupo_cita: null,
+    fecha_hora: promoDateTime.iso_utc,
+    fecha: promoDateTime.fecha_operativa,
+    fecha_operativa: promoDateTime.fecha_operativa,
+    hora: promoDateTime.hora_operativa,
+    subtotal_hnl: totalPagar,
+    servicios: selection.serviceSelection.items || [],
+    discount_lines: promotionDiscountLines,
+    paquetes: selection.serviceSelection.id_paquete
+      ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+      : [],
+    codigo_promocional: request.body?.codigo_promocional || null,
+    canal: "privado",
+    es_cliente_autenticado: true,
+    es_titular: isTitular,
+  };
+  const promocionesPreview = await previewPromotionsForAppointment(dbClient, promocionesContext);
+  if (!promocionesPreview.usedFallbackLegacy) {
+    descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
+    totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
+  }
+  const descuentoTotal = Number((descuento + descuentoPromociones).toFixed(2));
+  const promotionAllocations = [];
+  if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
+    for (const promotion of promocionesPreview.promociones_aplicadas || []) {
+      for (const allocation of promotion.line_allocations || []) {
+        promotionAllocations.push({
+          line_key: allocation.line_key,
+          source_type: "promotion",
+          source_id: promotion.id_promocion_regla,
+          id_promocion: promotion.id_promocion,
+          id_promocion_regla: promotion.id_promocion_regla,
+          descuento_hnl: allocation.descuento_hnl,
+        });
+      }
+    }
+  }
+  const combinedAllocations = [...coverageAllocations, ...promotionAllocations];
+  const discountPlan = combinedAllocations.length
+    ? buildDiscountPlan(baseDiscountLines, combinedAllocations)
+    : null;
+  const detailRows = buildAppointmentDetailRows(selection.serviceSelection.items || [], {
+    descuentoTotalHnl: descuentoTotal,
+    discountPlan,
+    ordenIntegrante: integrante.orden_integrante,
+    bookingIsvEnabled: app.config?.bookingIsvEnabled,
+  });
+  const coveredCount = coverage.items.filter((entry) =>
+    entry.coverage_status === "cubierto_plan" || entry.coverage_status === "cubierto_recompensa"
+  ).length;
+  const extraCount = coverage.items.filter((entry) => entry.coverage_status === "extra_pendiente").length;
+  const selectedServiceMap = mapServicesById(selection.serviceSelection.items);
+  return {
+    orden_integrante: integrante.orden_integrante,
+    alias: integrante.alias,
+    id_persona: isTitular ? personaId : null,
+    id_cliente: isTitular ? clienteId : null,
+    id_usuario: isTitular ? usuarioId : null,
+    tipo_cliente_codigo: isTitular ? "autenticado" : "invitado",
+    contacto_nombre: isTitular ? (titularContact.fullName || integrante.alias) : (integrante.contacto?.nombre || integrante.alias),
+    contacto_email: isTitular ? (titularContact.email || null) : (integrante.contacto?.email || null),
+    contacto_telefono: isTitular ? (titularContact.telefono || null) : (integrante.contacto?.telefono || null),
+    id_empleado_barbero: selection.barber.id_empleado,
+    barber_candidate_ids: [],
+    asignada_automaticamente: !integrante.id_barbero,
+    es_canje_recompensa: Boolean(isTitular && rewardRedeemContext),
+    selection,
+    detailRows,
+    descuentoHnl: descuentoTotal,
+    discountPlan,
+    inicio_at: selection.startDateTime.toISOString(),
+    notas: request.body?.notas ?? null,
+    _coverage: coverage,
+    _coverage_plan: coveragePlan,
+    _coverage_allocations: coverageAllocations,
+    _promociones_context: promocionesContext,
+    _promociones_preview: promocionesPreview,
+    _reward_covered_hnl: rewardCoveredInBlock,
+    _selected_service_map: selectedServiceMap,
+    _covered_count: coveredCount,
+    _extra_count: extraCount,
+    _response_totals: {
+      subtotalHnl: subtotalServicios,
+      descuentoHnl: descuentoTotal,
+      totalHnl: totalPagar,
+    },
+  };
 }
 
 async function resolveAuthenticatedTitularContact(client, { personaId, claimsUser }) {
@@ -1275,10 +1596,6 @@ async function resolveAuthenticatedTitularContact(client, { personaId, claimsUse
     email: profileEmail,
     telefono: profilePhone,
   };
-}
-
-function isSimulationNoPaymentEnabled(paramsMap) {
-  return Boolean(paramsMap?.simulacion_sin_pago?.valor_booleano);
 }
 
 export default async function citasRoutes(app) {
@@ -1352,121 +1669,16 @@ export default async function citasRoutes(app) {
           403: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          410: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
-      const dbClient = await app.db.connect();
-      try {
-        const { clienteId, personaId, usuarioId } = ensureClientContext(request);
-        const pendingResolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
-        if (pendingResolved.primary?.vigente) {
-          const pendingRows = pendingResolved.primary.groupRows;
-          const servicesByCita = await getServicesByAppointmentIds(
-            dbClient,
-            pendingRows.map((row) => row.id_cita)
-          );
-          const pendingPayload = buildPendingGroupPayload(pendingRows, servicesByCita, {
-            multiplePendingDetected: pendingResolved.groups.length > 1,
-          });
-          throw new AppError(
-            409,
-            "Tienes una reserva pendiente de pago. Completa o descarta esa reserva antes de agendar una nueva cita.",
-            {
-              code: "CLIENT_PENDING_APPOINTMENT_EXISTS",
-              details: {
-                id_grupo_cita: pendingPayload?.id_grupo_cita || null,
-                fecha_hora: pendingPayload?.fecha_hora_referencia || null,
-                id_sucursal: pendingPayload?.sucursal?.id_sucursal || null,
-                sucursal: pendingPayload?.sucursal?.nombre_sucursal || null,
-                total_pendiente_hnl: Number(pendingPayload?.total_pendiente_hnl || 0),
-                expires_at: pendingPayload?.expires_at || null,
-                multiple_pending_detected: pendingPayload?.multiple_pending_detected === true,
-              },
-            }
-          );
-        }
-        const selectionType = String(request.body?.selection_type || "services").trim().toLowerCase();
-        assertBookingSelectionCreationSupported(selectionType);
-        const serviceIds = Array.isArray(request.body?.servicios)
-          ? request.body.servicios.map((item) => item.id_servicio)
-          : [];
-        const simulationNoPayment = isSimulationNoPaymentEnabled(await getSystemParameters(dbClient));
-        const selection = await resolveBookingSelection(dbClient, {
-          id_sucursal: request.body.id_sucursal,
-          selection_type: selectionType,
-          servicios: serviceIds,
-          id_paquete: request.body?.id_paquete ?? null,
-          fecha_inicio: request.body.fecha_inicio,
-          id_barbero: request.body.id_barbero ?? null,
-        });
-
-        await dbClient.query("BEGIN");
-
-        const reservation = await createBookingReservation(dbClient, {
-          appointment: {
-            branchId: selection.branch.id_sucursal,
-            barberId: selection.barber.id_empleado,
-            personId: personaId,
-            clientId: clienteId,
-            createdByUserId: usuarioId,
-            autoAssigned: !request.body.id_barbero,
-            selection,
-            subtotalHnl: selection.serviceSelection.monto_total_hnl,
-            totalHnl: selection.serviceSelection.monto_total_hnl,
-            notes: request.body?.notas ?? null,
-          },
-          hold: {
-            userId: usuarioId,
-            expiresAt: selection.expiresAt.toISOString(),
-            returning: true,
-          },
-        });
-        const citaId = reservation.citaId;
-
-        if (simulationNoPayment) {
-          await confirmAppointmentWithoutPayment(dbClient, {
-            id_cita: citaId,
-            motivo_confirmacion: "simulacion_sin_pago_cliente_simple",
-          });
-        }
-
-        await dbClient.query("COMMIT");
-
-        return sendOk(
-          reply,
-          {
-            id_cita: citaId,
-            estado_cita_codigo: simulationNoPayment ? "confirmada" : "en_espera",
-            id_barbero: selection.barber.id_empleado,
-            nombre_barbero: selection.barber.nombre_completo,
-            asignada_automaticamente: !request.body.id_barbero,
-            expires_at: simulationNoPayment ? null : new Date(reservation.hold.expires_at).toISOString(),
-            duracion_total_min: selection.serviceSelection.duracion_total_min,
-            buffer_total_min: selection.serviceSelection.buffer_total_min,
-            monto_total_hnl: selection.serviceSelection.monto_total_hnl,
-          },
-          { statusCode: 201 }
-        );
-      } catch (error) {
-        try {
-          await dbClient.query("ROLLBACK");
-        } catch {
-          // no-op
-        }
-
-        if (isConflictError(error)) {
-          return sendError(reply, 409, "Ya existe un hold activo o el horario solicitado no esta disponible", {
-            code: "CITA_HOLD_CONFLICTO",
-            requestId: request.id,
-          });
-        }
-
-        return sendHandled(reply, request, error, "No se pudo crear la cita", "CITAS_CREATE_ERROR");
-      } finally {
-        dbClient.release();
-      }
+      return sendError(reply, 410, "Este flujo fue reemplazado por la reserva canonica.", {
+        code: "BOOKING_LEGACY_ENDPOINT_RETIRED",
+        requestId: request.id,
+      });
     }
   );
 
@@ -1502,6 +1714,18 @@ export default async function citasRoutes(app) {
                 properties: {
                   orden_integrante: { type: "integer" },
                   alias: { type: "string", maxLength: 80 },
+                  contacto_nombre: { anyOf: [{ type: "string", minLength: 1, maxLength: 160 }, { type: "null" }] },
+                  contacto_email: { anyOf: [{ type: "string", format: "email", maxLength: 254 }, { type: "null" }] },
+                  contacto_telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 40 }, { type: "null" }] },
+                  contacto: {
+                    type: "object",
+                    properties: {
+                      nombre: { anyOf: [{ type: "string", minLength: 1, maxLength: 160 }, { type: "null" }] },
+                      email: { anyOf: [{ type: "string", format: "email", maxLength: 254 }, { type: "null" }] },
+                      telefono: { anyOf: [{ type: "string", minLength: 8, maxLength: 40 }, { type: "null" }] },
+                    },
+                    additionalProperties: false,
+                  },
                   id_barbero: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
                   selection_type: { type: "string", enum: ["services", "package", "mixed"] },
                   id_paquete: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
@@ -1513,6 +1737,19 @@ export default async function citasRoutes(app) {
                       required: ["id_servicio"],
                       properties: {
                         id_servicio: { type: "string", format: "uuid" },
+                      },
+                      additionalProperties: true,
+                    },
+                  },
+                  id_promocion: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  id_promocion_regla: { anyOf: [{ type: "string", format: "uuid" }, { type: "null" }] },
+                  promociones: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        id_promocion: { type: "string", format: "uuid" },
+                        id_promocion_regla: { type: "string", format: "uuid" },
                       },
                       additionalProperties: true,
                     },
@@ -1560,46 +1797,47 @@ export default async function citasRoutes(app) {
       },
     },
     async (request, reply) => {
-      const dbClient = await app.db.connect();
+      let dbClient;
       let txStarted = false;
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
-        await expireReservationsBestEffort(dbClient, request, "citas_hold_create");
-        const pendingResolved = await resolveClientPendingGroup(dbClient, { clienteId, personaId });
-        if (pendingResolved.primary?.vigente) {
-          const pendingRows = pendingResolved.primary.groupRows;
-          const servicesByCita = await getServicesByAppointmentIds(
-            dbClient,
-            pendingRows.map((row) => row.id_cita)
-          );
-          const pendingPayload = buildPendingGroupPayload(pendingRows, servicesByCita, {
-            multiplePendingDetected: pendingResolved.groups.length > 1,
-          });
-          throw new AppError(
-            409,
-            "Tienes una reserva pendiente de pago. Completa o descarta esa reserva antes de agendar una nueva cita.",
-            {
-              code: "CLIENT_PENDING_APPOINTMENT_EXISTS",
-              details: {
-                id_grupo_cita: pendingPayload?.id_grupo_cita || null,
-                fecha_hora: pendingPayload?.fecha_hora_referencia || null,
-                id_sucursal: pendingPayload?.sucursal?.id_sucursal || null,
-                sucursal: pendingPayload?.sucursal?.nombre_sucursal || null,
-                total_pendiente_hnl: Number(pendingPayload?.total_pendiente_hnl || 0),
-                expires_at: pendingPayload?.expires_at || null,
-                multiple_pending_detected: pendingPayload?.multiple_pending_detected === true,
-              },
-            }
-          );
-        }
-
+        const requestId = resolveReservationRequestId(request.headers?.["x-idempotency-key"]);
+        reply.header("x-idempotency-key", requestId);
         const idSucursal = assertUuid(request.body?.id_sucursal, "id_sucursal");
         const canjeContextTokenRaw = request.body?.canje_context_token ?? request.body?.id_points_tx_canje;
         const canjeContextToken = canjeContextTokenRaw
           ? normalizeRedeemContextToken(canjeContextTokenRaw)
           : null;
-        const branch = await ensureActiveBranch(dbClient, idSucursal);
         const integrantes = normalizeHoldBlocksPayload(request.body);
+        const titularOperationalDateTime = normalizeOperationalDateTime(integrantes[0]?.fecha_inicio, "fecha_inicio");
+        const requestFingerprint = buildReservationRequestFingerprint({
+          scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
+          actor: {
+            tipo: "autenticado",
+            id_cliente: clienteId,
+            id_persona: personaId,
+            id_usuario: usuarioId,
+          },
+          body: request.body,
+        });
+
+        dbClient = await app.db.connect();
+        const idempotencyState = await getReservationIdempotencyState(dbClient, {
+          requestId,
+          scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
+          requestFingerprint,
+        });
+        const idempotencyStatus = assertKnownIdempotencyState(idempotencyState);
+        if (idempotencyStatus === "completed") {
+          return sendOk(reply, {
+            ...idempotencyState.data,
+            request_id: idempotencyState.data?.request_id || requestId,
+          }, {
+            statusCode: idempotencyState.statusCode || 201,
+            requestId: request.id,
+          });
+        }
+        const branch = await ensureActiveBranch(dbClient, idSucursal);
 
         await dbClient.query("BEGIN");
         txStarted = true;
@@ -1671,6 +1909,7 @@ export default async function citasRoutes(app) {
           const servicesWithActiveTariff = await getServicesWithActiveTariffByBranch(dbClient, {
             idSucursal: branch.id_sucursal,
             serviceIds: coverageTracker.requiredServiceIds,
+            fechaOperativa: titularOperationalDateTime.fecha_operativa,
           });
           filterCoverageTrackerByTariffServices(coverageTracker, servicesWithActiveTariff);
         }
@@ -1686,18 +1925,9 @@ export default async function citasRoutes(app) {
         }
         const hasMembership = Boolean(coverageTracker.hasPlan && coverageTracker.idSuscripcion);
 
-        const groupRecord = await createBookingGroup(dbClient, {
-          idSucursal: branch.id_sucursal,
-          idPersonaTitular: personaId,
-          idClienteTitular: clienteId,
-          idUsuarioTitular: usuarioId,
-          origenCodigo: "cliente_autenticado",
-          notas: request.body?.notas ?? null,
-        });
-        const holdDurationMin = await getHoldDurationMinutes(dbClient);
-        const holdExpiresAt = new Date(Date.now() + holdDurationMin * 60 * 1000);
-        const holdUserId = integrantes.length > 1 ? null : usuarioId;
         const bloquesResponse = [];
+        const canonicalIntegrantes = [];
+        const pendingPromotionRecords = [];
         let subtotalGrupo = 0;
         let descuentoGrupo = 0;
         let totalGrupo = 0;
@@ -1724,9 +1954,12 @@ export default async function citasRoutes(app) {
             id_paquete: integrante.id_paquete,
             fecha_inicio: integrante.fecha_inicio,
             id_barbero: integrante.id_barbero,
+            bookingIsvEnabled: app.config?.bookingIsvEnabled,
           });
           let selection = selectionBase;
           let forcedServiceIdsApplied = [];
+          let effectiveSelectionType = integrante.selection_type;
+          let effectiveServiceIds = integrante.serviceIds;
 
           const requiredServiceIds = (
             isTitular
@@ -1755,8 +1988,11 @@ export default async function citasRoutes(app) {
                   id_paquete: integrante.id_paquete,
                   fecha_inicio: integrante.fecha_inicio,
                   id_barbero: integrante.id_barbero,
+                  bookingIsvEnabled: app.config?.bookingIsvEnabled,
                 });
                 selection = forcedSelection;
+                effectiveSelectionType = forcedSelectionType;
+                effectiveServiceIds = mergedServiceIds;
                 const forcedSelectedServiceIds = new Set(
                   (Array.isArray(forcedSelection?.serviceSelection?.items) ? forcedSelection.serviceSelection.items : [])
                     .map((item) => String(item?.id_servicio || "").trim())
@@ -1778,201 +2014,166 @@ export default async function citasRoutes(app) {
                 coverageTracker.coverageDisabledMessage = "No pudimos aplicar tu plan en este momento; calculamos la cita con tarifa normal.";
                 forcedServiceIdsApplied = [];
                 selection = selectionBase;
+                effectiveSelectionType = integrante.selection_type;
+                effectiveServiceIds = integrante.serviceIds;
               }
             }
           }
 
-          const coverage = consumeCoverageForServices(
-            coverageTracker,
-            selection.serviceSelection.items,
-            { isTitular, forcedServiceIds: forcedServiceIdsApplied }
-          );
-          const subtotalServicios = Number(selection.serviceSelection.monto_total_hnl || 0);
-          let rewardCoveredInBlock = 0;
-          if (isTitular && rewardRedeemContext) {
-            const rewardServiceId = String(rewardRedeemContext.id_servicio_canje || "").trim();
-            const rewardCoverageItem = coverage.items.find((item) => String(item?.id_servicio || "").trim() === rewardServiceId);
-            if (!rewardCoverageItem) {
-              throw new AppError(409, "El canje no corresponde al servicio seleccionado para el titular", {
-                code: "POINTS_REDEEM_SERVICE_MISMATCH",
-                details: {
-                  canje_context_token: rewardRedeemContext.canje_context_token,
-                  id_servicio_canje: rewardRedeemContext.id_servicio_canje,
-                },
-              });
-            }
-            rewardCoveredInBlock = Math.max(0, Number(rewardCoverageItem.total_hnl ?? rewardCoverageItem.precio_unitario_hnl ?? 0));
-            rewardCoverageItem.coverage_status = "cubierto_recompensa";
-            rewardCoverageItem.forced_by_membership = false;
-            coverage.coveredTotalHnl += rewardCoveredInBlock;
-            coverage.extraTotalHnl = Math.max(0, coverage.extraTotalHnl - rewardCoveredInBlock);
+          const trackerSnapshot = cloneCoverageTracker(coverageTracker);
+          const candidateIds = getDeterministicCandidateIds(selection, integrante.id_barbero);
+          const assignmentOptions = [];
+          for (const candidateId of candidateIds) {
+            const candidateSelection = String(candidateId) === String(selection.barber.id_empleado)
+              ? selection
+              : await resolveBookingSelection(dbClient, {
+                  id_sucursal: branch.id_sucursal,
+                  selection_type: effectiveSelectionType,
+                  servicios: effectiveServiceIds,
+                  id_paquete: integrante.id_paquete,
+                  fecha_inicio: integrante.fecha_inicio,
+                  id_barbero: candidateId,
+                  bookingIsvEnabled: app.config?.bookingIsvEnabled,
+                });
+            assignmentOptions.push(await buildAuthenticatedCanonicalOption(dbClient, {
+              branch,
+              integrante,
+              index,
+              isTitular,
+              selection: candidateSelection,
+              coverageTracker: cloneCoverageTracker(trackerSnapshot),
+              forcedServiceIdsApplied,
+              rewardRedeemContext,
+              clienteId,
+              personaId,
+              usuarioId,
+              titularContact,
+              request,
+              app,
+            }));
           }
-          const descuento = Number(coverage.coveredTotalHnl || 0);
-          let totalPagar = Number(coverage.extraTotalHnl || 0);
-          let descuentoPromociones = 0;
-          let promocionesPreview = null;
-
-          try {
-            const promoContext = {
-              id_sucursal: branch.id_sucursal,
-              id_empleado_barbero: selection.barber.id_empleado,
-              id_cliente: clienteId,
-              id_persona: personaId,
-              id_grupo_cita: groupRecord.id_grupo_cita,
-              fecha_hora: selection.startDateTime.toISOString(),
-              fecha: selection.startDateTime.toISOString().slice(0, 10),
-              fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
-              hora: selection.startDateTime.toISOString().slice(11, 16),
-              subtotal_hnl: totalPagar,
-              servicios: selection.serviceSelection.items || [],
-              paquetes: selection.serviceSelection.id_paquete
-                ? [{ id_paquete: selection.serviceSelection.id_paquete }]
-                : [],
-              codigo_promocional: request.body?.codigo_promocional || null,
-              canal: "privado",
-              es_cliente_autenticado: true,
-              es_titular: isTitular,
-            };
-            promocionesPreview = await previewPromotionsForAppointment(dbClient, promoContext);
-            if (!promocionesPreview.usedFallbackLegacy) {
-              descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
-              totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
-            }
-          } catch (promoError) {
-            request.log.warn(
-              {
-                requestId: request.id,
-                id_sucursal: branch.id_sucursal,
-                id_grupo_cita: groupRecord.id_grupo_cita,
-                code: promoError?.code || null,
-                message: promoError?.message || null,
-              },
-              "No se pudo evaluar promociones normalizadas; se mantiene fallback legacy"
-            );
+          const primaryOption = assignmentOptions[0] || await buildAuthenticatedCanonicalOption(dbClient, {
+            branch,
+            integrante,
+            index,
+            isTitular,
+            selection,
+            coverageTracker: cloneCoverageTracker(trackerSnapshot),
+            forcedServiceIdsApplied,
+            rewardRedeemContext,
+            clienteId,
+            personaId,
+            usuarioId,
+            titularContact,
+            request,
+            app,
+          });
+          canonicalIntegrantes.push({
+            ...primaryOption,
+            assignment_options: integrante.id_barbero ? [] : assignmentOptions,
+          });
+        }
+        const membershipState = await getClienteMembershipState(dbClient, clienteId);
+        let membershipMessage = null;
+        let membershipCoverageActive = false;
+        // AM: Señales explícitas de contrato para UX de membresía en hold autenticado.
+        const membershipBranchMismatch = Boolean(hasMembership && coverageTracker.coverageDisabledReason === "branch_mismatch");
+        const membershipStateCode = String(membershipState?.estado_plan || "").trim().toLowerCase();
+        const hasMembershipHistory = membershipState?.tiene_historial === true;
+        let membershipReasonNoAplica = null;
+        const canonicalPayload = buildCanonicalReservationPayload({
+          requestId,
+          idSucursal: branch.id_sucursal,
+          idPersonaTitular: personaId,
+          idClienteTitular: clienteId,
+          idUsuarioTitular: usuarioId,
+          origenCodigo: "cliente_autenticado",
+          notas: request.body?.notas ?? null,
+          integrantes: canonicalIntegrantes,
+          assignmentAttempts: buildAssignmentAttemptsFromIntegrantes(canonicalIntegrantes),
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
+        });
+        const canonicalResult = await createCanonicalReservation(dbClient, canonicalPayload);
+        const selectedIntegrantes = selectCanonicalIntegrantesForResult(canonicalIntegrantes, canonicalResult);
+        const selectedTotals = summarizeCanonicalIntegrantes(selectedIntegrantes);
+        assertCanonicalTotalsMatch({
+          expected: selectedTotals,
+          result: canonicalResult,
+          context: { route: "citas_hold" },
+        });
+        const bloquesByOrder = new Map((canonicalResult?.bloques || []).map((block) => [
+          Number(block.orden_integrante || 0),
+          block,
+        ]));
+        pendingPromotionRecords.length = 0;
+        bloquesResponse.length = 0;
+        coveredServicesByPlan.clear();
+        forcedServicesByPlan.clear();
+        subtotalGrupo = selectedTotals.subtotal_hnl;
+        descuentoGrupo = selectedTotals.descuento_hnl;
+        totalGrupo = selectedTotals.total_hnl;
+        extrasPendientesGrupo = selectedTotals.total_hnl;
+        coveredItemsCount = 0;
+        extraItemsCount = 0;
+        let membershipCoveredTotalHnl = 0;
+        rewardAppliedInHold = false;
+        rewardCoveredTotalHnl = 0;
+        for (const integrante of selectedIntegrantes) {
+          if (integrante._promociones_preview && !integrante._promociones_preview.usedFallbackLegacy) {
+            pendingPromotionRecords.push({
+              order: integrante.orden_integrante,
+              context: integrante._promociones_context,
+              result: integrante._promociones_preview,
+              detailRows: integrante.detailRows,
+            });
           }
-          const descuentoTotal = Number((descuento + descuentoPromociones).toFixed(2));
-
-          if (isTitular && hasMembership) {
-            const selectedServiceMap = mapServicesById(selection.serviceSelection.items);
-            for (const coveredServiceId of Array.isArray(coverage.coveredServiceIds) ? coverage.coveredServiceIds : []) {
-              const mapped = selectedServiceMap.get(coveredServiceId) || {
+          if (Number(integrante.orden_integrante || 0) === 1 && rewardRedeemContext && integrante._reward_covered_hnl > 0) {
+            rewardAppliedInHold = true;
+            rewardCoveredTotalHnl += Number(integrante._reward_covered_hnl || 0);
+          }
+          for (const allocation of Array.isArray(integrante._coverage_allocations) ? integrante._coverage_allocations : []) {
+            if (String(allocation?.source_type || "").trim() === "membership") {
+              membershipCoveredTotalHnl += Number(allocation?.descuento_hnl || 0);
+            }
+          }
+          if (Number(integrante.orden_integrante || 0) === 1 && hasMembership) {
+            for (const coveredServiceId of Array.isArray(integrante._coverage?.coveredServiceIds) ? integrante._coverage.coveredServiceIds : []) {
+              const mapped = integrante._selected_service_map?.get(coveredServiceId) || {
                 id_servicio: coveredServiceId,
                 nombre_servicio: "Servicio",
               };
-              if (!coveredServicesByPlan.has(mapped.id_servicio)) {
-                coveredServicesByPlan.set(mapped.id_servicio, mapped);
-              }
+              if (!coveredServicesByPlan.has(mapped.id_servicio)) coveredServicesByPlan.set(mapped.id_servicio, mapped);
             }
-            for (const forcedServiceId of Array.isArray(coverage.forcedCoveredServiceIds) ? coverage.forcedCoveredServiceIds : []) {
-              const mapped = selectedServiceMap.get(forcedServiceId) || {
+            for (const forcedServiceId of Array.isArray(integrante._coverage?.forcedCoveredServiceIds) ? integrante._coverage.forcedCoveredServiceIds : []) {
+              const mapped = integrante._selected_service_map?.get(forcedServiceId) || {
                 id_servicio: forcedServiceId,
                 nombre_servicio: "Servicio",
               };
-              if (!forcedServicesByPlan.has(mapped.id_servicio)) {
-                forcedServicesByPlan.set(mapped.id_servicio, mapped);
-              }
+              if (!forcedServicesByPlan.has(mapped.id_servicio)) forcedServicesByPlan.set(mapped.id_servicio, mapped);
             }
           }
-
-          const reservation = await createBookingReservation(dbClient, {
-            groupRecord,
-            appointment: {
-              groupId: groupRecord.id_grupo_cita,
-              order: integrante.orden_integrante,
-              alias: integrante.alias,
-              branchId: branch.id_sucursal,
-              barberId: selection.barber.id_empleado,
-              personId: personaId,
-              clientId: clienteId,
-              createdByUserId: usuarioId,
-              autoAssigned: !integrante.id_barbero,
-              selection,
-              subtotalHnl: subtotalServicios,
-              descuentoHnl: descuentoTotal,
-              totalHnl: totalPagar,
-              isRewardRedeem: Boolean(isTitular && rewardRedeemContext),
-              notes: request.body?.notas ?? null,
-            },
-            hold: {
-              userId: holdUserId,
-              expiresAt: holdExpiresAt.toISOString(),
-            },
-          });
-          const citaId = reservation.citaId;
-          if (promocionesPreview && !promocionesPreview.usedFallbackLegacy) {
-            const promoSavepoint = `sp_promo_hold_${integrante.orden_integrante}`;
-            try {
-              await dbClient.query(`SAVEPOINT ${promoSavepoint}`);
-              await recordPromotionApplications(
-                dbClient,
-                {
-                  id_grupo_cita: groupRecord.id_grupo_cita,
-                  id_cita: citaId,
-                  id_cliente: clienteId,
-                  id_persona: personaId,
-                  id_sucursal: branch.id_sucursal,
-                  fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
-                  subtotal_hnl: Number(coverage.extraTotalHnl || 0),
-                },
-                promocionesPreview,
-                { formal: false }
-              );
-              await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
-            } catch (promoPersistError) {
-              try {
-                await dbClient.query(`ROLLBACK TO SAVEPOINT ${promoSavepoint}`);
-                await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
-              } catch {
-                // AM: Si el savepoint ya no existe, solo se registra el fallo original.
-              }
-              request.log.warn(
-                {
-                  requestId: request.id,
-                  id_cita: citaId,
-                  id_grupo_cita: groupRecord.id_grupo_cita,
-                  code: promoPersistError?.code || null,
-                  message: promoPersistError?.message || null,
-                },
-                "No se pudo registrar trazabilidad de promociones en hold; se continua"
-              );
-            }
-          }
-          if (isTitular && rewardRedeemContext) {
-            rewardAppliedInHold = true;
-            rewardLinkedCitaId = citaId;
-            rewardCoveredTotalHnl += rewardCoveredInBlock;
-          }
-
-          const { fecha, hora } = parseIsoDateAndTime(integrante.fecha_inicio);
-          const coveredCount = coverage.items.filter((entry) =>
-            entry.coverage_status === "cubierto_plan" || entry.coverage_status === "cubierto_recompensa"
-          ).length;
-          const extraCount = coverage.items.filter((entry) => entry.coverage_status === "extra_pendiente").length;
-          coveredItemsCount += coveredCount;
-          extraItemsCount += extraCount;
-          subtotalGrupo += subtotalServicios;
-          descuentoGrupo += descuentoTotal;
-          totalGrupo += totalPagar;
-          extrasPendientesGrupo += totalPagar;
-
+          coveredItemsCount += Number(integrante._covered_count || 0);
+          extraItemsCount += Number(integrante._extra_count || 0);
+          const block = bloquesByOrder.get(Number(integrante.orden_integrante || 0)) || {};
+          const { fecha, hora } = parseIsoDateAndTime(integrante.selection.startDateTime);
           bloquesResponse.push({
-            id_cita: citaId,
+            id_cita: block.id_cita || null,
             orden_integrante: integrante.orden_integrante,
             alias: integrante.alias,
-            id_barbero: selection.barber.id_empleado,
-            nombre_barbero: selection.barber.nombre_completo,
+            id_barbero: block.id_empleado_barbero || integrante.selection.barber.id_empleado,
+            nombre_barbero: integrante.selection.barber.nombre_completo,
             fecha: fecha || "",
             hora: hora || "",
-            fecha_inicio: selection.startDateTime.toISOString(),
-            estado_cita_codigo: "en_espera",
-            monto_total_hnl: subtotalServicios,
-            descuento_hnl: descuentoTotal,
-            total_pagar_hnl: totalPagar,
-            duracion_total_min: Number(selection.serviceSelection.duracion_total_min || 0),
-            buffer_total_min: Number(selection.serviceSelection.buffer_total_min || 0),
+            fecha_inicio: integrante.selection.startDateTime.toISOString(),
+            estado_cita_codigo: block.estado_cita_codigo || "en_espera",
+            monto_total_hnl: Number(integrante._response_totals?.subtotalHnl || 0),
+            descuento_hnl: Number(integrante._response_totals?.descuentoHnl || 0),
+            total_pagar_hnl: Number(integrante._response_totals?.totalHnl || 0),
+            duracion_total_min: Number(integrante.selection.serviceSelection.duracion_total_min || 0),
+            buffer_total_min: Number(integrante.selection.serviceSelection.buffer_total_min || 0),
             cobertura: {
-              items_cubiertos: coveredCount,
-              items_extra: extraCount,
+              items_cubiertos: Number(integrante._covered_count || 0),
+              items_extra: Number(integrante._extra_count || 0),
             },
           });
         }
@@ -1984,11 +2185,15 @@ export default async function citasRoutes(app) {
             },
           });
         }
-
-        const membershipState = await getClienteMembershipState(dbClient, clienteId);
-        const planCoveredTotalHnl = rewardRedeemContext ? 0 : descuentoGrupo;
+        membershipCoveredTotalHnl = Number(membershipCoveredTotalHnl.toFixed(2));
+        rewardCoveredTotalHnl = Number(rewardCoveredTotalHnl.toFixed(2));
+        const promotionCoveredTotalHnl = Number(Math.max(
+          0,
+          Number(descuentoGrupo || 0) - membershipCoveredTotalHnl - rewardCoveredTotalHnl
+        ).toFixed(2));
+        const planCoveredTotalHnl = rewardRedeemContext ? 0 : membershipCoveredTotalHnl;
         const hasCoveredAmount = planCoveredTotalHnl > 0;
-        let membershipMessage = null;
+        membershipCoverageActive = Boolean(hasMembership && coverageTracker.branchMatch && hasCoveredAmount);
         if (rewardRedeemContext && rewardAppliedInHold) {
           membershipMessage = "Se aplico tu recompensa de cortesia al servicio seleccionado del titular.";
         } else if (hasMembership && coverageTracker.coverageDisabledReason === "branch_mismatch") {
@@ -2007,12 +2212,6 @@ export default async function citasRoutes(app) {
         } else if (!hasMembership && membershipComputationFailed) {
           membershipMessage = "No pudimos validar beneficios de plan en este momento; calculamos la cita con tarifa normal.";
         }
-        const membershipCoverageActive = Boolean(hasMembership && coverageTracker.branchMatch && hasCoveredAmount);
-        // AM: Señales explícitas de contrato para UX de membresía en hold autenticado.
-        const membershipBranchMismatch = Boolean(hasMembership && coverageTracker.coverageDisabledReason === "branch_mismatch");
-        const membershipStateCode = String(membershipState?.estado_plan || "").trim().toLowerCase();
-        const hasMembershipHistory = membershipState?.tiene_historial === true;
-        let membershipReasonNoAplica = null;
         if (membershipComputationFailed) {
           membershipReasonNoAplica = "ERROR_MEMBRESIA";
         } else if (membershipBranchMismatch) {
@@ -2024,22 +2223,52 @@ export default async function citasRoutes(app) {
         } else if (!hasMembership) {
           membershipReasonNoAplica = "SIN_PLAN";
         }
-        await updateBookingGroupTotal(dbClient, {
-          idGrupoCita: groupRecord.id_grupo_cita,
-          totalHnl: totalGrupo,
+        for (const promotionRecord of pendingPromotionRecords) {
+          const block = bloquesByOrder.get(Number(promotionRecord.order || 0));
+          if (!block?.id_cita) continue;
+          const detailRows = await loadCanonicalPromotionDetailRows(dbClient, {
+            idCita: block.id_cita,
+            detailRows: promotionRecord.detailRows,
+            canonicalBlock: block,
+          });
+          await recordPromotionApplications(
+            dbClient,
+            {
+              ...promotionRecord.context,
+              id_grupo_cita: canonicalResult.id_grupo_cita,
+              id_cita: block.id_cita,
+              id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
+              detailRows,
+            },
+            promotionRecord.result,
+            { formal: true, usageState: "reservado" }
+          );
+        }
+        bloquesResponse.forEach((block) => {
+          const persisted = bloquesByOrder.get(Number(block.orden_integrante || 0));
+          if (!persisted) return;
+          block.id_cita = persisted.id_cita || block.id_cita;
+          block.id_barbero = persisted.id_empleado_barbero || block.id_barbero;
+          block.estado_cita_codigo = persisted.estado_cita_codigo || block.estado_cita_codigo;
+          if (Number(block.orden_integrante || 0) === 1 && rewardRedeemContext) {
+            rewardLinkedCitaId = block.id_cita;
+          }
         });
         const coveredServicesList = [...coveredServicesByPlan.values()];
         const forcedServicesList = [...forcedServicesByPlan.values()];
-        await dbClient.query("COMMIT");
-        txStarted = false;
-
-        return sendOk(reply, {
-          id_grupo_cita: groupRecord.id_grupo_cita,
-          estado_grupo_codigo: groupRecord.estado_grupo_codigo || "activo",
-          expires_at: holdExpiresAt.toISOString(),
+        const responsePayload = {
+          request_id: requestId,
+          id_grupo_cita: canonicalResult.id_grupo_cita,
+          estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
+          expires_at: canonicalResult.expires_at,
           subtotal_hnl: subtotalGrupo,
           monto_total_hnl: subtotalGrupo,
           descuento_total_hnl: descuentoGrupo,
+          descuento_membresia_hnl: membershipCoveredTotalHnl,
+          descuento_recompensa_hnl: rewardCoveredTotalHnl,
+          descuento_promocion_hnl: promotionCoveredTotalHnl,
+          cubierto_por_plan_hnl: planCoveredTotalHnl,
+          cubierto_por_recompensa_hnl: rewardCoveredTotalHnl,
           total_pagar_hnl: totalGrupo,
           extras_pendientes_hnl: extrasPendientesGrupo,
           resumen_cobertura: {
@@ -2107,7 +2336,18 @@ export default async function citasRoutes(app) {
               extras_a_pagar_hnl: totalGrupo,
             },
           bloques: bloquesResponse,
-        }, {
+        };
+        await finalizeReservationIdempotency(dbClient, {
+          requestId,
+          scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
+          requestFingerprint,
+          responsePayload,
+          statusCode: 201,
+        });
+        await dbClient.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, responsePayload, {
           statusCode: 201,
           requestId: request.id,
         });
@@ -2120,21 +2360,25 @@ export default async function citasRoutes(app) {
           // no-op
         }
 
-        if (isConflictError(error)) {
+        const mappedError = mapCanonicalReservationError(error, {
+          safeMessage: "No se pudo crear el hold de citas",
+        });
+
+        if (isConflictError(mappedError)) {
           return sendError(reply, 409, "Ya existe un conflicto de disponibilidad para uno de los bloques", {
             code: "CITAS_HOLD_CONFLICT",
             requestId: request.id,
           });
         }
 
-        if (isPointsTriggerCompileError(error)) {
+        if (isPointsTriggerCompileError(mappedError)) {
           return sendError(reply, 409, "No pudimos procesar la reserva en este momento. Intenta nuevamente en unos minutos.", {
             code: "CITAS_HOLD_POINTS_ENGINE_UNAVAILABLE",
             requestId: request.id,
           });
         }
 
-        return sendHandled(reply, request, error, "No se pudo crear el hold de citas", "CITAS_HOLD_CREATE_ERROR");
+        return sendHandled(reply, request, mappedError, "No se pudo crear el hold de citas", "CITAS_HOLD_CREATE_ERROR");
       } finally {
         dbClient.release();
       }

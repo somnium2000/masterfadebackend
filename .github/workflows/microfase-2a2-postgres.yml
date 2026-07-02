@@ -1,0 +1,73 @@
+name: Microfase 2A2 Postgres
+
+on:
+  push:
+    branches:
+      - codex/microfase-2a2-backend-hardening
+  workflow_dispatch:
+
+jobs:
+  postgres-17:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: masterfade_microfase_2a2
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d masterfade_microfase_2a2"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: masterfade_microfase_2a2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Bootstrap CI
+        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
+      - name: Load schema and fixtures
+        run: |
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_fixture.sql
+      - name: Apply previous migrations, Phase 1, Phase 1B and Phase 1B.1
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a3_guardia_snapshot_fiscal.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_microfase_2a4_promociones_trazabilidad_cupos.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b_reserva_canonica_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
+      - name: Validate objects, backfill, triggers and fiscal guard
+        run: |
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
+      - name: Apply Phase 1B.1 again
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
+      - name: Validate idempotency
+        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
+      - name: Run tests
+        run: npm test
+      - name: Run app.inject PostgreSQL integration
+        run: RUN_CANONICAL_BOOKING_INTEGRATION=true node --test test/canonical-booking.integration.test.mjs
+      - name: Run lint
+        run: npm run lint
+      - name: Check whitespace
+        run: git diff --check

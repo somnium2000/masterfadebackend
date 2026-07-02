@@ -2927,6 +2927,8 @@ export function consumeCoverageForServices(tracker, serviceItems = [], { isTitul
     result.items.push({
       item_tipo: "servicio",
       id_servicio: idServicio || null,
+      id_tarifa: item?.id_tarifa || null,
+      origen_item_codigo: item?.origen_item_codigo || "servicio_manual",
       item_codigo: null,
       item_nombre: nombre,
       cantidad: quantity,

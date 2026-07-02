@@ -8,11 +8,15 @@ import {
   markPromotionUsagesForGroup,
   previewPromotionsForAppointment,
 } from "../../../services/promociones/promocionesService.js";
+import { normalizeOperationalDateTime } from "../../../services/agendaService.js";
+import {
+  confirmCanonicalPaidReservation,
+  mapCanonicalReservationError,
+  toCents,
+} from "../../../services/bookingCanonicalReservationService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
-const PUBLIC_POST_PAYMENT_CONFIRMABLE_APPOINTMENT_STATES = new Set(["en_espera", "pendiente_pago"]);
-const PUBLIC_POST_PAYMENT_BLOCKING_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"];
 
 function safeText(value) {
   const normalized = String(value || "").trim();
@@ -38,7 +42,182 @@ function normalizeMoney(value) {
 }
 
 function amountsMatch(left, right) {
-  return Math.abs(normalizeMoney(left) - normalizeMoney(right)) < 0.01;
+  return toCents(left) === toCents(right);
+}
+
+function normalizePercentage(value) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Number(Math.min(parsed, 100).toFixed(2));
+}
+
+function calculateLineIsv({ subtotalHnl, descuentoHnl, isvPorcentaje, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  const percentage = normalizePercentage(isvPorcentaje);
+  if (percentage <= 0) return 0;
+  if (incluyeIsv) {
+    return normalizeMoney(taxableBase - (taxableBase / (1 + (percentage / 100))));
+  }
+  return normalizeMoney((taxableBase * percentage) / 100);
+}
+
+function calculateLineTotal({ subtotalHnl, descuentoHnl, isvHnl, incluyeIsv }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  return normalizeMoney(taxableBase + (incluyeIsv ? 0 : Number(isvHnl || 0)));
+}
+
+function distributeDiscountBySubtotal(detailRows = [], descuentoTotalHnl = 0) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const subtotal = normalizeMoney(rows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
+  const requestedDiscount = Math.min(normalizeMoney(descuentoTotalHnl), subtotal);
+  let remainingDiscount = requestedDiscount;
+  return rows.map((row, index) => {
+    const discount = index === rows.length - 1
+      ? remainingDiscount
+      : normalizeMoney(subtotal > 0 ? (requestedDiscount * Number(row.subtotal_hnl || 0)) / subtotal : 0);
+    const safeDiscount = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, Number(row.subtotal_hnl || 0))));
+    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - safeDiscount));
+    return safeDiscount;
+  });
+}
+
+function distributeDiscountByRemainingCapacity(detailRows = [], descuentoTotalHnl = 0) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const capacities = rows.map((row) => normalizeMoney(
+    Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0))
+  ));
+  const available = normalizeMoney(capacities.reduce((sum, amount) => sum + amount, 0));
+  const requestedDiscount = Math.min(normalizeMoney(descuentoTotalHnl), available);
+  let remainingDiscount = requestedDiscount;
+  return rows.map((row, index) => {
+    const capacity = capacities[index] || 0;
+    const discount = index === rows.length - 1
+      ? remainingDiscount
+      : normalizeMoney(available > 0 ? (requestedDiscount * capacity) / available : 0);
+    const safeDiscount = normalizeMoney(Math.max(0, Math.min(discount, remainingDiscount, capacity)));
+    remainingDiscount = normalizeMoney(Math.max(0, remainingDiscount - safeDiscount));
+    return safeDiscount;
+  });
+}
+
+function assertCompleteAllocation(allocations = [], requestedDiscount = 0, code = "BOOKING_PROMOTION_ALLOCATION_MISMATCH") {
+  const assigned = normalizeMoney((Array.isArray(allocations) ? allocations : []).reduce((sum, amount) => sum + Number(amount || 0), 0));
+  if (assigned !== normalizeMoney(requestedDiscount)) {
+    throw new AppError(409, "No se pudo asignar completamente la promocion persistida", { code });
+  }
+}
+
+export function applyPersistedPromotionDiscounts(detailRows = [], promotionRows = []) {
+  const sourceRows = Array.isArray(detailRows) ? detailRows : [];
+  const rows = sourceRows.map((row) => ({
+    ...row,
+    descuento_hnl: normalizeMoney(row?.descuento_hnl),
+    descuento_no_promocional_hnl: 0,
+  }));
+  const byDetailId = new Map(
+    rows
+      .map((row) => [String(row.id_cita_detalle || "").trim(), row])
+      .filter(([detailId]) => detailId)
+  );
+  const persistedPromoByDetail = new Map(rows.map((row) => [String(row.id_cita_detalle || "").trim(), 0]));
+
+  for (const promotion of Array.isArray(promotionRows) ? promotionRows : []) {
+    const discount = normalizeMoney(promotion?.descuento_calculado_hnl);
+    if (discount <= 0) continue;
+    const detailId = String(promotion?.id_cita_detalle || "").trim();
+    if (detailId) {
+      const row = byDetailId.get(detailId);
+      if (!row) {
+        throw new AppError(409, "La promocion persistida apunta a un detalle inexistente", {
+          code: "BOOKING_PROMOTION_ALLOCATION_INVALID",
+        });
+      }
+      const capacity = normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0)));
+      if (discount > capacity) {
+        throw new AppError(409, "La promocion persistida supera la capacidad del detalle", {
+          code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+        });
+      }
+      persistedPromoByDetail.set(detailId, normalizeMoney((persistedPromoByDetail.get(detailId) || 0) + discount));
+      continue;
+    }
+
+    const allocations = distributeDiscountByRemainingCapacity(
+      rows.map((row) => ({ ...row, descuento_hnl: persistedPromoByDetail.get(String(row.id_cita_detalle || "").trim()) || 0 })),
+      discount
+    );
+    assertCompleteAllocation(allocations, discount);
+    rows.forEach((row, index) => {
+      const key = String(row.id_cita_detalle || "").trim();
+      persistedPromoByDetail.set(key, normalizeMoney((persistedPromoByDetail.get(key) || 0) + Number(allocations[index] || 0)));
+    });
+  }
+
+  rows.forEach((row) => {
+    const key = String(row.id_cita_detalle || "").trim();
+    const persistedPromotionDiscount = normalizeMoney(persistedPromoByDetail.get(key) || 0);
+    const nonPromotionDiscount = normalizeMoney(Math.max(0, Number(row.descuento_hnl || 0) - persistedPromotionDiscount));
+    const finalDiscount = normalizeMoney(nonPromotionDiscount + persistedPromotionDiscount);
+    if (finalDiscount > normalizeMoney(row.subtotal_hnl)) {
+      throw new AppError(409, "El descuento final supera la capacidad del detalle", {
+        code: "BOOKING_PROMOTION_ALLOCATION_MISMATCH",
+      });
+    }
+    row.descuento_no_promocional_hnl = nonPromotionDiscount;
+    row.descuento_hnl = finalDiscount;
+  });
+
+  return rows;
+}
+
+export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = null } = {}) {
+  const sourceRows = Array.isArray(detailRows) ? detailRows : [];
+  const overrideDiscounts = descuentoTotalHnl === null
+    ? null
+    : distributeDiscountBySubtotal(sourceRows, descuentoTotalHnl);
+  const rows = sourceRows.map((row, index) => {
+    const quantity = Math.max(1, Math.trunc(Number(row?.cantidad || 1)));
+    const unitPrice = normalizeMoney(row?.precio_unitario_hnl);
+    const subtotalHnl = normalizeMoney(row?.subtotal_hnl ?? unitPrice * quantity);
+    const incluyeIsvSnapshot = row?.incluye_isv_snapshot === true;
+    const isvPorcentaje = normalizePercentage(row?.isv_porcentaje);
+    return {
+      id_cita_detalle: row?.id_cita_detalle,
+      subtotal_hnl: subtotalHnl,
+      descuento_hnl: overrideDiscounts ? overrideDiscounts[index] : normalizeMoney(row?.descuento_hnl),
+      incluye_isv_snapshot: incluyeIsvSnapshot,
+      isv_porcentaje: isvPorcentaje,
+      isv_hnl: 0,
+      total_linea_hnl: subtotalHnl,
+    };
+  });
+
+  rows.forEach((row) => {
+    row.isv_hnl = calculateLineIsv({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvPorcentaje: row.isv_porcentaje,
+      incluyeIsv: row.incluye_isv_snapshot,
+    });
+    row.total_linea_hnl = calculateLineTotal({
+      subtotalHnl: row.subtotal_hnl,
+      descuentoHnl: row.descuento_hnl,
+      isvHnl: row.isv_hnl,
+      incluyeIsv: row.incluye_isv_snapshot,
+    });
+  });
+  return rows;
+}
+
+function classifyPromotionValidationError(error) {
+  if (error instanceof AppError && error.statusCode >= 400 && error.statusCode < 500) {
+    return new AppError(409, "La promocion aplicada ya no es valida para esta reserva.", {
+      code: "BOOKING_PROMOTION_NO_LONGER_APPLICABLE",
+    });
+  }
+  return new AppError(503, "No se pudo validar la promocion aplicada. Intenta nuevamente.", {
+    code: "BOOKING_PROMOTION_VALIDATION_UNAVAILABLE",
+  });
 }
 
 const PUBLIC_PAGOS_SAFE_DETAIL_KEYS = new Set(["field"]);
@@ -344,126 +523,11 @@ async function loadPublicIntentForGroup(client, {
   }
   if (expectedAmountHnl !== null && !amountsMatch(intent.monto_hnl, expectedAmountHnl)) {
     throw new AppError(409, "El monto del intent no coincide con la reserva vigente", {
-      code: "PUBLIC_PAGOS_INTENT_AMOUNT_MISMATCH",
+      code: "PAYMENT_AMOUNT_MISMATCH",
     });
   }
 
   return { groupRows, intent };
-}
-
-async function loadPostPaymentConfirmableGroup(client, { groupId }) {
-  const result = await client.query(
-    `
-      SELECT
-        cg.id_grupo_cita,
-        cg.estado_grupo_codigo,
-        cg.id_cliente_titular,
-        c.id_cita,
-        c.id_empleado_barbero,
-        c.estado_cita_codigo,
-        c.inicio_at,
-        c.fin_at,
-        hold.id_hold,
-        hold.estado_hold_codigo,
-        hold.expires_at
-      FROM public.citas_grupos cg
-      JOIN public.citas c
-        ON c.id_grupo_cita = cg.id_grupo_cita
-       AND c.deleted_at IS NULL
-      LEFT JOIN LATERAL (
-        SELECT h.id_hold, h.estado_hold_codigo, h.expires_at
-        FROM public.citas_holds h
-        WHERE h.id_cita = c.id_cita
-        ORDER BY h.created_at DESC
-        LIMIT 1
-      ) hold ON TRUE
-      WHERE cg.id_grupo_cita = $1::uuid
-      ORDER BY c.orden_integrante ASC, c.created_at ASC
-      FOR UPDATE OF cg, c
-    `,
-    [groupId]
-  );
-  if (!result.rows.length) {
-    throw new AppError(404, "La reserva indicada no existe", { code: "PUBLIC_PAGOS_GROUP_NOT_FOUND" });
-  }
-  return result.rows;
-}
-
-function assertPostPaymentGroupConfirmable(groupRows) {
-  const groupState = safeText(groupRows?.[0]?.estado_grupo_codigo)?.toLowerCase() || "";
-  if (groupState && groupState !== "activo") {
-    throw new AppError(409, "La reserva no se puede confirmar en su estado actual", {
-      code: "PUBLIC_PAGOS_BOOKING_NOT_CONFIRMABLE",
-    });
-  }
-
-  const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "").trim().toLowerCase() === "confirmada");
-  if (allConfirmed) return { alreadyConfirmed: true };
-
-  const invalidAppointment = groupRows.find((row) => (
-    !PUBLIC_POST_PAYMENT_CONFIRMABLE_APPOINTMENT_STATES.has(String(row.estado_cita_codigo || "").trim().toLowerCase())
-  ));
-  if (invalidAppointment) {
-    throw new AppError(409, "La reserva no se puede confirmar en su estado actual", {
-      code: "PUBLIC_PAGOS_BOOKING_NOT_CONFIRMABLE",
-    });
-  }
-
-  const nowMs = Date.now();
-  const invalidHold = groupRows.find((row) => {
-    const holdState = String(row.estado_hold_codigo || "").trim().toLowerCase();
-    const holdExpiresMs = row.expires_at ? new Date(row.expires_at).getTime() : NaN;
-    return !row.id_hold
-      || holdState !== "activo"
-      || !Number.isFinite(holdExpiresMs)
-      || holdExpiresMs <= nowMs;
-  });
-  if (invalidHold) {
-    throw new AppError(409, "El hold de la reserva ya no esta activo", {
-      code: "PUBLIC_PAGOS_HOLD_EXPIRED",
-    });
-  }
-
-  return { alreadyConfirmed: false };
-}
-
-async function assertNoPostPaymentAvailabilityConflict(client, { groupId, groupRows }) {
-  for (const row of groupRows) {
-    const blockConflict = await client.query(
-      `
-        SELECT 1
-        FROM public.bloqueos_agenda b
-        WHERE b.id_empleado = $1::uuid
-          AND b.rango && tstzrange($2::timestamptz, $3::timestamptz, '[)')
-        LIMIT 1
-      `,
-      [row.id_empleado_barbero, row.inicio_at, row.fin_at]
-    );
-    if (blockConflict.rows[0]) {
-      throw new AppError(409, "El horario de la reserva ya no esta disponible", {
-        code: "PUBLIC_PAGOS_AVAILABILITY_CONFLICT",
-      });
-    }
-
-    const appointmentConflict = await client.query(
-      `
-        SELECT 1
-        FROM public.citas c
-        WHERE c.id_empleado_barbero = $1::uuid
-          AND c.deleted_at IS NULL
-          AND c.id_grupo_cita <> $2::uuid
-          AND c.estado_cita_codigo = ANY($3::text[])
-          AND tstzrange(c.inicio_at, c.fin_at, '[)') && tstzrange($4::timestamptz, $5::timestamptz, '[)')
-        LIMIT 1
-      `,
-      [row.id_empleado_barbero, groupId, PUBLIC_POST_PAYMENT_BLOCKING_APPOINTMENT_STATES, row.inicio_at, row.fin_at]
-    );
-    if (appointmentConflict.rows[0]) {
-      throw new AppError(409, "El horario de la reserva ya no esta disponible", {
-        code: "PUBLIC_PAGOS_AVAILABILITY_CONFLICT",
-      });
-    }
-  }
 }
 
 async function resolvePublicIntentCreatorUserId(client, { groupRows }) {
@@ -504,7 +568,7 @@ async function resolvePublicIntentCreatorUserId(client, { groupRows }) {
   return fallbackUserId;
 }
 
-async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
+async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, logger = null } = {}) {
   const citasResult = await client.query(
     `
       SELECT
@@ -529,95 +593,152 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
   let subtotal = 0;
   let descuentoTotal = 0;
   let total = 0;
+  const appliedGroupPromotionIds = new Set();
 
   for (const cita of citasResult.rows || []) {
     const detallesResult = await client.query(
       `
-        SELECT id_servicio, cantidad, precio_unitario_hnl, subtotal_hnl
+        SELECT
+          id_cita_detalle,
+          id_servicio,
+          cantidad,
+          precio_unitario_hnl,
+          subtotal_hnl,
+          descuento_hnl,
+          incluye_isv_snapshot,
+          isv_porcentaje,
+          isv_hnl,
+          total_linea_hnl
         FROM public.citas_detalles
         WHERE id_cita = $1::uuid
+        ORDER BY id_cita_detalle ASC
       `,
       [cita.id_cita]
     );
-    const selectedPromoResult = await client.query(
+    const persistedPromoResult = await client.query(
       `
-        SELECT id_promocion, id_promocion_regla
+        SELECT
+          id_cita_promocion,
+          id_grupo_cita,
+          id_cita,
+          id_cita_detalle,
+          id_cita_paquete,
+          id_promocion,
+          id_promocion_regla,
+          aplica_a_codigo,
+          descuento_calculado_hnl,
+          prioridad_aplicacion,
+          es_acumulable,
+          estado_aplicacion_codigo
         FROM public.citas_promociones
-        WHERE id_cita = $1::uuid
+        WHERE id_grupo_cita = $1::uuid
+          AND (id_cita = $2::uuid OR id_cita IS NULL)
           AND estado_aplicacion_codigo = 'aplicada'
-        ORDER BY created_at ASC
-        LIMIT 1
+        ORDER BY prioridad_aplicacion ASC, created_at ASC, id_cita_promocion ASC
       `,
-      [cita.id_cita]
+      [idGrupoCita, cita.id_cita]
     );
-    const selectedPromo = selectedPromoResult.rows[0] || null;
-    const subtotalCita = Number(cita.subtotal_servicios_hnl || 0);
-    let descuentoCita = 0;
-    let totalCita = subtotalCita;
+    const persistedPromotions = (persistedPromoResult.rows || []).filter((row) => {
+      if (row.id_cita) return true;
+      const promotionId = String(row.id_cita_promocion || "").trim();
+      if (!promotionId) return false;
+      if (appliedGroupPromotionIds.has(promotionId)) return false;
+      appliedGroupPromotionIds.add(promotionId);
+      return true;
+    });
+    const detalleSubtotal = normalizeMoney(
+      (detallesResult.rows || []).reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0)
+    );
+    const subtotalCita = detalleSubtotal || Number(cita.subtotal_servicios_hnl || 0);
 
-    try {
-      const preview = await previewPromotionsForAppointment(client, {
-        id_sucursal: cita.id_sucursal,
-        id_empleado_barbero: cita.id_empleado_barbero,
-        id_grupo_cita: cita.id_grupo_cita,
-        id_cita: cita.id_cita,
-        fecha_hora: cita.inicio_at,
-        fecha: new Date(cita.inicio_at).toISOString().slice(0, 10),
-        fecha_operativa: new Date(cita.inicio_at).toISOString().slice(0, 10),
-        hora: new Date(cita.inicio_at).toISOString().slice(11, 16),
-        subtotal_hnl: subtotalCita,
-        servicios: (detallesResult.rows || []).map((row) => ({
-          id_servicio: row.id_servicio,
-          cantidad: Number(row.cantidad || 1),
-          precio_unitario_hnl: Number(row.precio_unitario_hnl || 0),
-          subtotal_hnl: Number(row.subtotal_hnl || 0),
-        })),
-        paquetes: cita.id_paquete ? [{ id_paquete: cita.id_paquete }] : [],
-        id_promocion: selectedPromo?.id_promocion || null,
-        id_promocion_regla: selectedPromo?.id_promocion_regla || null,
-        canal: "public",
-      });
-
-      if (!preview.usedFallbackLegacy) {
-        const selectedRuleId = String(selectedPromo?.id_promocion_regla || "").trim();
-        if (selectedRuleId) {
-          const candidatasAplicadas = Array.isArray(preview.promociones_aplicadas) ? preview.promociones_aplicadas : [];
-          const keepApplied = candidatasAplicadas.filter(
-            (row) => String(row.id_promocion_regla || "") === selectedRuleId
-          );
-          const movedToDiscarded = candidatasAplicadas
-            .filter((row) => String(row.id_promocion_regla || "") !== selectedRuleId)
-            .map((row) => ({
-              ...row,
-              motivo_codigo: "PROMOCION_NO_SELECCIONADA",
-              motivo: "Se aplico solo la promocion seleccionada por el cliente.",
-            }));
-          preview.promociones_aplicadas = keepApplied;
-          preview.promociones_descartadas = [...(preview.promociones_descartadas || []), ...movedToDiscarded];
-          descuentoCita = Number(
-            keepApplied.reduce((sum, row) => sum + Number(row.descuento_calculado_hnl || 0), 0).toFixed(2)
-          );
-        } else {
-          descuentoCita = Number(preview.descuento_total_hnl || 0);
+    if (persistedPromotions.length) {
+      try {
+        const operationalDateTime = normalizeOperationalDateTime(new Date(cita.inicio_at), "inicio_at");
+        const preview = await previewPromotionsForAppointment(client, {
+          id_sucursal: cita.id_sucursal,
+          id_empleado_barbero: cita.id_empleado_barbero,
+          id_grupo_cita: cita.id_grupo_cita,
+          id_cita: cita.id_cita,
+          fecha_hora: operationalDateTime.iso_utc,
+          fecha: operationalDateTime.fecha_operativa,
+          fecha_operativa: operationalDateTime.fecha_operativa,
+          hora: operationalDateTime.hora_operativa,
+          subtotal_hnl: subtotalCita,
+          servicios: (detallesResult.rows || []).map((row) => ({
+            id_servicio: row.id_servicio,
+            cantidad: Number(row.cantidad || 1),
+            precio_unitario_hnl: Number(row.precio_unitario_hnl || 0),
+            subtotal_hnl: Number(row.subtotal_hnl || 0),
+          })),
+          paquetes: cita.id_paquete ? [{ id_paquete: cita.id_paquete }] : [],
+          canal: "public",
+        });
+        const appliedRules = new Set(
+          (preview.promociones_aplicadas || []).map((row) => String(row.id_promocion_regla || "").trim())
+        );
+        const missingRule = persistedPromotions.find(
+          (row) => !appliedRules.has(String(row.id_promocion_regla || "").trim())
+        );
+        if (missingRule) {
+          throw new AppError(409, "La promocion aplicada ya no es valida para esta reserva.", {
+            code: "BOOKING_PROMOTION_NO_LONGER_APPLICABLE",
+          });
         }
-        totalCita = Math.max(0, Number((subtotalCita - descuentoCita).toFixed(2)));
         promocionesAplicadas.push(...(preview.promociones_aplicadas || []));
         promocionesDescartadas.push(...(preview.promociones_descartadas || []));
+      } catch (error) {
+        logger?.warn?.(
+          {
+            err: error,
+            id_grupo_cita: idGrupoCita,
+            id_cita: cita.id_cita,
+          },
+          "No se pudo validar promociones persistidas antes de crear intent publico"
+        );
+        throw classifyPromotionValidationError(error);
       }
-    } catch {
-      descuentoCita = 0;
-      totalCita = subtotalCita;
+    }
+
+    const detailSource = persistedPromotions.length
+      ? applyPersistedPromotionDiscounts(detallesResult.rows, persistedPromotions)
+      : detallesResult.rows;
+    const normalizedDetails = buildPaymentDetailRows(detailSource);
+    const totalCita = normalizedDetails.length
+      ? normalizeMoney(normalizedDetails.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0))
+      : normalizeMoney(Math.max(0, subtotalCita));
+    const descuentoCita = normalizedDetails.length
+      ? normalizeMoney(normalizedDetails.reduce((sum, row) => sum + Number(row.descuento_hnl || 0), 0))
+      : 0;
+
+    for (const detail of normalizedDetails) {
+      await client.query(
+        `
+          UPDATE public.citas_detalles
+          SET descuento_hnl = $2::numeric,
+              isv_hnl = $3::numeric,
+              total_linea_hnl = $4::numeric,
+              updated_at = now()
+          WHERE id_cita_detalle = $1::uuid
+        `,
+        [
+          detail.id_cita_detalle,
+          detail.descuento_hnl,
+          detail.isv_hnl,
+          detail.total_linea_hnl,
+        ]
+      );
     }
 
     await client.query(
       `
         UPDATE public.citas
-        SET descuento_hnl = $2::numeric,
-            total_pagar_hnl = $3::numeric,
+        SET subtotal_servicios_hnl = $2::numeric,
+            descuento_hnl = $3::numeric,
+            total_pagar_hnl = $4::numeric,
             updated_at = now()
         WHERE id_cita = $1::uuid
       `,
-      [cita.id_cita, descuentoCita, totalCita]
+      [cita.id_cita, subtotalCita, descuentoCita, totalCita]
     );
 
     subtotal += subtotalCita;
@@ -635,6 +756,10 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita }) {
 }
 
 async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+    [`post_payment_emails:${idGrupoCita}`]
+  );
   const rows = await client.query(
     `
       SELECT
@@ -690,28 +815,53 @@ async function queuePostPaymentEmails(client, { idGrupoCita, totalGrupo }) {
           estado_notificacion_codigo,
           id_cita
         )
-        VALUES ('cita_confirmada_post_pago', $1::text, $2::text, $3::text, 'pendiente', $4::uuid)
+        SELECT 'cita_confirmada_post_pago', $1::text, $2::text, $3::text, 'pendiente', $4::uuid
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.notificaciones_email ne
+          JOIN public.citas c
+            ON c.id_cita = ne.id_cita
+          WHERE c.id_grupo_cita = $5::uuid
+            AND ne.evento = 'cita_confirmada_post_pago'
+            AND lower(trim(ne.correo_destino)) = lower(trim($1::text))
+          LIMIT 1
+        )
       `,
-      [to, subject, body, block.id_cita]
+      [to, subject, body, block.id_cita, idGrupoCita]
     );
   }
 }
 
-async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }) {
-  const queued = await client.query(
+async function dispatchPostPaymentEmails(db, { idGrupoCita, mailer, logger }) {
+  const queued = await db.query(
     `
+      WITH claimed AS (
+        UPDATE public.notificaciones_email ne
+        SET estado_notificacion_codigo = 'procesando',
+            updated_at = now()
+        WHERE ne.id_notificacion IN (
+          SELECT ne2.id_notificacion
+          FROM public.notificaciones_email ne2
+          JOIN public.citas c2
+            ON c2.id_cita = ne2.id_cita
+          WHERE c2.id_grupo_cita = $1::uuid
+            AND ne2.evento = 'cita_confirmada_post_pago'
+            AND ne2.estado_notificacion_codigo = 'pendiente'
+          ORDER BY ne2.created_at ASC
+          FOR UPDATE OF ne2 SKIP LOCKED
+        )
+        RETURNING
+          ne.id_notificacion,
+          ne.correo_destino,
+          ne.asunto,
+          ne.cuerpo
+      )
       SELECT
         ne.id_notificacion,
         ne.correo_destino,
         ne.asunto,
         ne.cuerpo
-      FROM public.notificaciones_email ne
-      JOIN public.citas c
-        ON c.id_cita = ne.id_cita
-      WHERE c.id_grupo_cita = $1::uuid
-        AND ne.evento = 'cita_confirmada_post_pago'
-        AND ne.estado_notificacion_codigo = 'pendiente'
-      ORDER BY ne.created_at ASC
+      FROM claimed ne
     `,
     [idGrupoCita]
   );
@@ -723,12 +873,22 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
   if (!mailer?.configured) {
     logger?.warn?.(
       { idGrupoCita, pending: queued.rows.length },
-      "SMTP no configurado: notificaciones post-pago quedan en pendiente"
+      "SMTP no configurado: notificaciones post-pago marcadas como fallidas"
     );
-    return { pending: queued.rows.length, sent: 0, failed: 0 };
+    await db.query(
+      `
+        UPDATE public.notificaciones_email
+        SET estado_notificacion_codigo = 'fallida',
+            ultimo_error = 'SMTP no configurado',
+            updated_at = now()
+        WHERE id_notificacion = ANY($1::uuid[])
+      `,
+      [queued.rows.map((row) => row.id_notificacion)]
+    );
+    return { pending: 0, sent: 0, failed: queued.rows.length };
   }
 
-  const groupRows = await client.query(
+  const groupRows = await db.query(
     `
       SELECT
         c.alias_integrante,
@@ -772,7 +932,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
     const to = normalizeEmail(row?.correo_destino);
     if (!to) {
       failed += 1;
-      await client.query(
+      await db.query(
         `
           UPDATE public.notificaciones_email
           SET estado_notificacion_codigo = 'fallida',
@@ -804,7 +964,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
 
     if (delivery?.sent) {
       sent += 1;
-      await client.query(
+      await db.query(
         `
           UPDATE public.notificaciones_email
           SET estado_notificacion_codigo = 'enviada',
@@ -820,7 +980,7 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
 
     failed += 1;
     const errorText = safeText(delivery?.message) || "No se pudo enviar por SMTP";
-    await client.query(
+    await db.query(
       `
         UPDATE public.notificaciones_email
         SET estado_notificacion_codigo = 'fallida',
@@ -835,7 +995,13 @@ async function dispatchPostPaymentEmails(client, { idGrupoCita, mailer, logger }
   return { pending: queued.rows.length, sent, failed };
 }
 
-async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = null, expectedIntentId = null }) {
+async function confirmGroupAfterPaid(client, {
+  idCitaAnchor,
+  expectedGroupId = null,
+  expectedIntentId = null,
+  referenciaExterna = null,
+  pagadoAt = null,
+}) {
   const groupResult = await client.query(
     `
       SELECT
@@ -892,29 +1058,12 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
         code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH",
       });
     }
-    if (String(intent.estado_intent_codigo || "").trim().toLowerCase() !== "confirmado" || intent.has_captured_payment !== true) {
+    if (intent.has_captured_payment !== true) {
       throw new AppError(409, "El pago no esta confirmado para esta reserva", {
         code: "PUBLIC_PAGOS_PAYMENT_NOT_CONFIRMED",
       });
     }
   }
-
-  const groupRows = await loadPostPaymentConfirmableGroup(client, { groupId: idGrupoCita });
-  const confirmability = assertPostPaymentGroupConfirmable(groupRows);
-  if (confirmability.alreadyConfirmed) {
-    return {
-      id_grupo_cita: idGrupoCita,
-      total_hnl: calculateGroupTotalFromRows(groupRows),
-      ya_confirmada: true,
-      recompensa_utilizada: {
-        aplicada: false,
-        ya_aplicada: true,
-        puntos_descontados: 0,
-        saldo_actual: null,
-      },
-    };
-  }
-  await assertNoPostPaymentAvailabilityConflict(client, { groupId: idGrupoCita, groupRows });
 
   const totalResult = await client.query(
     `SELECT COALESCE(SUM(total_pagar_hnl),0)::numeric AS total FROM public.citas WHERE id_grupo_cita = $1::uuid AND deleted_at IS NULL`,
@@ -922,29 +1071,11 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
   );
   const totalGrupo = Number(totalResult.rows[0]?.total ?? 0);
 
-  await client.query(
-    `
-      UPDATE public.citas
-      SET estado_cita_codigo = 'confirmada',
-          updated_at = now()
-      WHERE id_grupo_cita = $1::uuid
-        AND deleted_at IS NULL
-        AND estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada')
-    `,
-    [idGrupoCita]
-  );
-  await client.query(
-    `
-      UPDATE public.citas_holds h
-      SET estado_hold_codigo = 'consumido',
-          updated_at = now()
-      FROM public.citas c
-      WHERE c.id_grupo_cita = $1::uuid
-        AND c.id_cita = h.id_cita
-        AND h.estado_hold_codigo = 'activo'
-    `,
-    [idGrupoCita]
-  );
+  const canonicalConfirmation = await confirmCanonicalPaidReservation(client, {
+    idIntent: expectedIntentId,
+    referenciaExterna,
+    pagadoAt,
+  });
 
   let rewardRedemption = {
     aplicada: false,
@@ -969,6 +1100,7 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
   return {
     id_grupo_cita: idGrupoCita,
     total_hnl: totalGrupo,
+    confirmacion_canonica: canonicalConfirmation,
     recompensa_utilizada: rewardRedemption,
   };
 }
@@ -991,14 +1123,22 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
-    const dbClient = await app.db.connect();
+    let dbClient = await app.db.connect();
+    let inTransaction = false;
+    let phaseAIntent = null;
+    let phaseAPricing = null;
     try {
       await dbClient.query("BEGIN");
+      inTransaction = true;
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const titularEmail = normalizeEmail(request.body?.titular_email);
       const providerCode = safeText(app.config?.paymentProvider || process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+      await dbClient.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        [`public-payment-intent:${idGrupoCita}`]
+      );
       const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
-      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita });
+      const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, logger: request.log });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       assertPublicGroupPayable(groupRows);
       const expiredHold = groupRows.some((row) => row.estado_hold_codigo !== "activo" || !row.expires_at || new Date(row.expires_at).getTime() <= Date.now());
@@ -1015,7 +1155,7 @@ export default async function publicPagosRoutes(app) {
       }
       const existingIntent = await dbClient.query(
         `
-          SELECT id_intent, id_hold, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
+          SELECT id_intent, id_hold, link_pago_url, referencia_externa, idempotency_key, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
             FROM public.payment_intents
             WHERE id_cita = $1::uuid
               AND id_provider = $2::uuid
@@ -1032,6 +1172,8 @@ export default async function publicPagosRoutes(app) {
         const existingAmount = Number(existingIntent.rows[0].monto_hnl || 0);
         if (amountsMatch(existingAmount, totalGroup)) {
           await dbClient.query("COMMIT");
+          inTransaction = false;
+          if (existingIntent.rows[0].link_pago_url) {
           return sendOk(reply, {
             id_intent: existingIntent.rows[0].id_intent,
             payment_url: existingIntent.rows[0].link_pago_url ?? null,
@@ -1045,78 +1187,148 @@ export default async function publicPagosRoutes(app) {
             promociones_aplicadas: pricing.promociones_aplicadas,
             promociones_descartadas: pricing.promociones_descartadas,
           });
+          }
+          phaseAIntent = {
+            ...existingIntent.rows[0],
+            id_provider: provider.id_provider,
+            id_cita: anchor.id_cita,
+            id_hold: anchor.id_hold,
+            id_grupo_cita: idGrupoCita,
+            idempotency_key: existingIntent.rows[0].idempotency_key || `masterfade:booking-payment:${existingIntent.rows[0].id_intent}`,
+          };
+          phaseAPricing = pricing;
+        } else {
+          await dbClient.query(
+            `
+              UPDATE public.payment_intents
+              SET estado_intent_codigo = 'expirado',
+                  updated_at = now()
+              WHERE id_intent = $1::uuid
+            `,
+            [existingIntent.rows[0].id_intent]
+          );
         }
-
-        await dbClient.query(
-          `
-            UPDATE public.payment_intents
-            SET estado_intent_codigo = 'expirado',
-                updated_at = now()
-            WHERE id_intent = $1::uuid
-          `,
-          [existingIntent.rows[0].id_intent]
-        );
       }
 
-      const idempotencyKey = `mf_public_${idGrupoCita}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+      if (!phaseAIntent) {
+        const idIntentLocal = crypto.randomUUID();
+        const idempotencyKey = `masterfade:booking-payment:${idIntentLocal}`;
+        const created = await dbClient.query(
+          `
+            INSERT INTO public.payment_intents (
+              id_intent,
+              id_provider,
+              id_cita,
+              id_hold,
+              estado_intent_codigo,
+              monto_hnl,
+              moneda_codigo,
+              idempotency_key,
+              expires_at,
+              created_by_usuario_id,
+              id_grupo_cita
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              $3::uuid,
+              $4::uuid,
+              'creado',
+              $5::numeric,
+              'HNL',
+              $6::text,
+              $7::timestamptz,
+              $8::uuid,
+              $9::uuid
+            )
+            RETURNING id_intent, id_provider, id_cita, id_hold, link_pago_url, referencia_externa,
+              idempotency_key, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo, id_grupo_cita
+          `,
+          [
+            idIntentLocal,
+            provider.id_provider,
+            anchor.id_cita,
+            anchor.id_hold,
+            totalGroup,
+            idempotencyKey,
+            new Date(anchor.expires_at).toISOString(),
+            createdByUserId,
+            idGrupoCita,
+          ]
+        );
+        await dbClient.query("COMMIT");
+        inTransaction = false;
+        phaseAIntent = created.rows[0];
+        phaseAPricing = pricing;
+      }
+
+      dbClient.release();
+      dbClient = null;
       const providerAdapter = PaymentProviderFactory.create();
       const providerIntent = await providerAdapter.createIntent({
-        idempotencyKey,
-        montoHnl: totalGroup,
+        idempotencyKey: phaseAIntent.idempotency_key,
+        montoHnl: normalizeMoney(phaseAIntent.monto_hnl),
         moneda: "HNL",
         descripcion: `Reserva publica ${idGrupoCita}`,
         callbackUrl: buildCallbackUrl(idGrupoCita),
         metadata: {
           id_grupo_cita: idGrupoCita,
-          id_cita_anchor: anchor.id_cita,
+          id_cita_anchor: phaseAIntent.id_cita,
         },
       });
 
-      const created = await dbClient.query(
+      dbClient = await app.db.connect();
+      await dbClient.query("BEGIN");
+      inTransaction = true;
+      const updated = await dbClient.query(
         `
-          INSERT INTO public.payment_intents (
-            id_provider,
-            id_cita,
-            id_hold,
-            estado_intent_codigo,
-            monto_hnl,
-            moneda_codigo,
-            link_pago_url,
-            referencia_externa,
-            idempotency_key,
-            expires_at,
-            created_by_usuario_id,
-            id_grupo_cita
-          )
-          VALUES (
-            $1::uuid,
-            $2::uuid,
-            $3::uuid,
-            'link_generado',
-            $4::numeric,
-            'HNL',
-            $5::text,
-            $6::text,
-            $7::text,
-            $8::timestamptz,
-            $9::uuid,
-            $10::uuid
-          )
-          RETURNING id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
+          UPDATE public.payment_intents pi
+          SET estado_intent_codigo = 'link_generado',
+              link_pago_url = $2::text,
+              referencia_externa = $3::text,
+              updated_at = now()
+          FROM public.citas_holds h
+          JOIN public.citas c
+            ON c.id_cita = h.id_cita
+          WHERE pi.id_intent = $1::uuid
+            AND pi.id_hold = h.id_hold
+            AND pi.id_cita = c.id_cita
+            AND pi.estado_intent_codigo = 'creado'
+            AND pi.expires_at > now()
+            AND h.estado_hold_codigo = 'activo'
+            AND h.expires_at > now()
+            AND c.id_grupo_cita = $4::uuid
+            AND c.deleted_at IS NULL
+            AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+          RETURNING pi.id_intent, pi.link_pago_url, pi.expires_at, pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
         `,
         [
-          provider.id_provider,
-          anchor.id_cita,
-          anchor.id_hold,
-          totalGroup,
+          phaseAIntent.id_intent,
           providerIntent.paymentUrl ?? null,
           providerIntent.providerIntentId ?? null,
-          idempotencyKey,
-          new Date(anchor.expires_at).toISOString(),
-          createdByUserId,
           idGrupoCita,
         ]
       );
+      if (!updated.rows[0]) {
+        await dbClient.query("ROLLBACK");
+        inTransaction = false;
+        dbClient.release();
+        dbClient = null;
+        try {
+          if (providerIntent.providerIntentId && typeof providerAdapter.cancelIntent === "function") {
+            await providerAdapter.cancelIntent(providerIntent.providerIntentId);
+          }
+        } catch (cancelError) {
+          request.log.warn(
+            { err: cancelError, id_intent: phaseAIntent.id_intent },
+            "No se pudo cancelar intent externo luego de hold vencido"
+          );
+        }
+        return sendError(reply, 409, "El hold de la reserva ya expiro", {
+          code: "PUBLIC_PAGOS_HOLD_EXPIRED",
+          requestId: request.id,
+        });
+      }
 
       await dbClient.query(
         `
@@ -1130,21 +1342,24 @@ export default async function publicPagosRoutes(app) {
         [idGrupoCita]
       );
       await dbClient.query("COMMIT");
+      inTransaction = false;
       return sendOk(reply, {
-        id_intent: created.rows[0].id_intent,
-        payment_url: created.rows[0].link_pago_url ?? null,
-        expires_at: new Date(created.rows[0].expires_at).toISOString(),
-        monto_hnl: Number(created.rows[0].monto_hnl || 0),
-        moneda_codigo: created.rows[0].moneda_codigo || "HNL",
-        estado_intent_codigo: created.rows[0].estado_intent_codigo,
-        subtotal_hnl: pricing.subtotal_hnl,
-        descuento_total_hnl: pricing.descuento_total_hnl,
-        total_hnl: pricing.total_hnl,
-        promociones_aplicadas: pricing.promociones_aplicadas,
-        promociones_descartadas: pricing.promociones_descartadas,
+        id_intent: updated.rows[0].id_intent,
+        payment_url: updated.rows[0].link_pago_url ?? null,
+        expires_at: new Date(updated.rows[0].expires_at).toISOString(),
+        monto_hnl: Number(updated.rows[0].monto_hnl || 0),
+        moneda_codigo: updated.rows[0].moneda_codigo || "HNL",
+        estado_intent_codigo: updated.rows[0].estado_intent_codigo,
+        subtotal_hnl: phaseAPricing.subtotal_hnl,
+        descuento_total_hnl: phaseAPricing.descuento_total_hnl,
+        total_hnl: phaseAPricing.total_hnl,
+        promociones_aplicadas: phaseAPricing.promociones_aplicadas,
+        promociones_descartadas: phaseAPricing.promociones_descartadas,
       }, { statusCode: 201 });
     } catch (error) {
-      try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
+      if (inTransaction) {
+        try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
+      }
       if (error instanceof AppError) {
         request.log.warn(
           { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
@@ -1160,7 +1375,7 @@ export default async function publicPagosRoutes(app) {
       request.log.error({ err: error }, "No se pudo crear intent publico");
       return sendError(reply, 500, "No se pudo iniciar el pago", { code: "PUBLIC_PAGOS_CREATE_INTENT_ERROR", requestId: request.id });
     } finally {
-      dbClient.release();
+      if (dbClient) dbClient.release();
     }
   });
 
@@ -1249,7 +1464,7 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
-    const dbClient = await app.db.connect();
+    let dbClient = await app.db.connect();
     try {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
@@ -1303,27 +1518,33 @@ export default async function publicPagosRoutes(app) {
 
       if (status === "paid") {
         const providerTxId = `tx_mock_${idIntent}`;
+        const paidAt = new Date().toISOString();
         await dbClient.query(
           `
             INSERT INTO public.payments (
               id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
             )
-            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, now(), FALSE)
+            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, $5::timestamptz, FALSE)
             ON CONFLICT (provider_tx_id) DO UPDATE SET updated_at = now()
             RETURNING id_payment
           `,
-          [idIntent, providerTxId, Number(intent.monto_hnl || 0), safeText(intent.moneda_codigo) || "HNL"]
+          [idIntent, providerTxId, Number(intent.monto_hnl || 0), safeText(intent.moneda_codigo) || "HNL", paidAt]
         );
-        await dbClient.query(
-          `UPDATE public.payment_intents SET estado_intent_codigo = 'confirmado', updated_at = now() WHERE id_intent = $1::uuid`,
-          [idIntent]
-        );
+        await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
+        dbClient = await app.db.connect();
+        await dbClient.query("BEGIN");
         const confirm = await confirmGroupAfterPaid(dbClient, {
           idCitaAnchor: intent.id_cita,
           expectedGroupId: idGrupoCita,
           expectedIntentId: idIntent,
+          referenciaExterna: providerTxId,
+          pagadoAt: paidAt,
         });
         await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
         let emailDelivery = { pending: 0, sent: 0, failed: 0 };
         try {
           emailDelivery = await dispatchPostPaymentEmails(app.db, {
@@ -1360,14 +1581,22 @@ export default async function publicPagosRoutes(app) {
       return sendOk(reply, { processed: true, duplicate: false, status });
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
-      if (error instanceof AppError) {
+      const handledError = mapCanonicalReservationError(error, {
+        publicRoute: true,
+        safeMessage: "No se pudo confirmar el pago de la reserva",
+        details: {
+          id_intent: request.body?.id_intent || null,
+          id_grupo_cita: request.body?.id_grupo_cita || null,
+        },
+      });
+      if (handledError instanceof AppError) {
         request.log.warn(
-          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          { requestId: request.id, statusCode: handledError.statusCode, code: handledError.code, details: handledError.details },
           "Public pagos mock complete handled AppError"
         );
-        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
-        return sendError(reply, error.statusCode, error.message, {
-          code: error.code,
+        const safeDetails = sanitizePublicPagosErrorDetails(handledError.details);
+        return sendError(reply, handledError.statusCode, handledError.message, {
+          code: handledError.code,
           ...(safeDetails ? { details: safeDetails } : {}),
           requestId: request.id,
         });
@@ -1375,7 +1604,7 @@ export default async function publicPagosRoutes(app) {
       request.log.error({ err: error }, "No se pudo completar pago mock");
       return sendError(reply, 500, "No se pudo completar el pago", { code: "PUBLIC_PAGOS_MOCK_COMPLETE_ERROR", requestId: request.id });
     } finally {
-      dbClient.release();
+      if (dbClient) dbClient.release();
     }
   });
 
@@ -1395,7 +1624,7 @@ export default async function publicPagosRoutes(app) {
       },
     },
   }, async (request, reply) => {
-    const dbClient = await app.db.connect();
+    let dbClient = await app.db.connect();
     try {
       if (!isTodoPagoSimulationEnabled(app)) {
         throw new AppError(409, "El simulador de TodoPago no esta disponible en este entorno", {
@@ -1475,31 +1704,39 @@ export default async function publicPagosRoutes(app) {
       );
 
       if (simulation.normalizedStatus === "PAID") {
+        const paidAt = new Date().toISOString();
+        const providerTxId = `todopago_sim_${idIntent}_${simulation.responseCode}`;
         await dbClient.query(
           `
             INSERT INTO public.payments (
               id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
             )
-            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, now(), FALSE)
+            VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, $5::timestamptz, FALSE)
             ON CONFLICT (provider_tx_id) DO UPDATE SET updated_at = now()
           `,
           [
             idIntent,
-            `todopago_sim_${idIntent}_${simulation.responseCode}`,
+            providerTxId,
             Number(intent.monto_hnl || 0),
             safeText(intent.moneda_codigo) || "HNL",
+            paidAt,
           ]
         );
-        await dbClient.query(
-          `UPDATE public.payment_intents SET estado_intent_codigo = 'confirmado', updated_at = now() WHERE id_intent = $1::uuid`,
-          [idIntent]
-        );
+        await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
+        dbClient = await app.db.connect();
+        await dbClient.query("BEGIN");
         const confirm = await confirmGroupAfterPaid(dbClient, {
           idCitaAnchor: intent.id_cita,
           expectedGroupId: idGrupoCita,
           expectedIntentId: idIntent,
+          referenciaExterna: providerTxId,
+          pagadoAt: paidAt,
         });
         await dbClient.query("COMMIT");
+        dbClient.release();
+        dbClient = null;
 
         let emailDelivery = { pending: 0, sent: 0, failed: 0 };
         try {
@@ -1548,14 +1785,22 @@ export default async function publicPagosRoutes(app) {
       });
     } catch (error) {
       try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
-      if (error instanceof AppError) {
+      const handledError = mapCanonicalReservationError(error, {
+        publicRoute: true,
+        safeMessage: "No se pudo confirmar el pago de la reserva",
+        details: {
+          id_intent: request.body?.id_intent || null,
+          id_grupo_cita: request.body?.id_grupo_cita || null,
+        },
+      });
+      if (handledError instanceof AppError) {
         request.log.warn(
-          { requestId: request.id, statusCode: error.statusCode, code: error.code, details: error.details },
+          { requestId: request.id, statusCode: handledError.statusCode, code: handledError.code, details: handledError.details },
           "Public pagos simulator handled AppError"
         );
-        const safeDetails = sanitizePublicPagosErrorDetails(error.details);
-        return sendError(reply, error.statusCode, error.message, {
-          code: error.code,
+        const safeDetails = sanitizePublicPagosErrorDetails(handledError.details);
+        return sendError(reply, handledError.statusCode, handledError.message, {
+          code: handledError.code,
           ...(safeDetails ? { details: safeDetails } : {}),
           requestId: request.id,
         });
@@ -1566,7 +1811,7 @@ export default async function publicPagosRoutes(app) {
         requestId: request.id,
       });
     } finally {
-      dbClient.release();
+      if (dbClient) dbClient.release();
     }
   });
 }
