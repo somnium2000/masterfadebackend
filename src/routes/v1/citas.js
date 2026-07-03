@@ -1187,6 +1187,29 @@ function normalizeHoldBlocksPayload(body) {
   });
 }
 
+function assertRewardRedeemExclusiveHold({ rewardRedeemContext, integrantes, codigoPromocional }) {
+  if (!rewardRedeemContext) return;
+  if (Array.isArray(integrantes) && integrantes.length > 1) {
+    throw new AppError(409, "La recompensa aplica solo al titular y no combina con acompanantes.", {
+      code: "POINTS_REDEEM_COMPANIONS_NOT_ALLOWED",
+    });
+  }
+
+  const titular = Array.isArray(integrantes) ? integrantes[0] : null;
+  const selectionType = String(titular?.selection_type || "services").trim().toLowerCase();
+  if (selectionType !== "services" || titular?.id_paquete) {
+    throw new AppError(409, "La recompensa no combina con paquetes.", {
+      code: "POINTS_REDEEM_PACKAGE_NOT_ALLOWED",
+    });
+  }
+
+  if (safeText(codigoPromocional)) {
+    throw new AppError(409, "La recompensa no combina con promociones.", {
+      code: "POINTS_REDEEM_PROMOTION_NOT_ALLOWED",
+    });
+  }
+}
+
 function buildUniqueServiceIds(...sources) {
   const set = new Set();
   for (const source of sources) {
@@ -1708,6 +1731,11 @@ export default async function citasRoutes(app) {
             );
           }
         }
+        assertRewardRedeemExclusiveHold({
+          rewardRedeemContext,
+          integrantes,
+          codigoPromocional: request.body?.codigo_promocional,
+        });
         let rewardAppliedInHold = false;
         let rewardCoveredTotalHnl = 0;
         let rewardLinkedCitaId = null;
@@ -1898,43 +1926,45 @@ export default async function citasRoutes(app) {
           let descuentoPromociones = 0;
           let promocionesPreview = null;
 
-          try {
-            const promoContext = {
-              id_sucursal: branch.id_sucursal,
-              id_empleado_barbero: selection.barber.id_empleado,
-              id_cliente: clienteId,
-              id_persona: personaId,
-              id_grupo_cita: groupRecord.id_grupo_cita,
-              fecha_hora: selection.startDateTime.toISOString(),
-              fecha: selection.startDateTime.toISOString().slice(0, 10),
-              fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
-              hora: selection.startDateTime.toISOString().slice(11, 16),
-              subtotal_hnl: totalPagar,
-              servicios: selection.serviceSelection.items || [],
-              paquetes: selection.serviceSelection.id_paquete
-                ? [{ id_paquete: selection.serviceSelection.id_paquete }]
-                : [],
-              codigo_promocional: request.body?.codigo_promocional || null,
-              canal: "privado",
-              es_cliente_autenticado: true,
-              es_titular: isTitular,
-            };
-            promocionesPreview = await previewPromotionsForAppointment(dbClient, promoContext);
-            if (!promocionesPreview.usedFallbackLegacy) {
-              descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
-              totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
-            }
-          } catch (promoError) {
-            request.log.warn(
-              {
-                requestId: request.id,
+          if (!rewardRedeemContext) {
+            try {
+              const promoContext = {
                 id_sucursal: branch.id_sucursal,
+                id_empleado_barbero: selection.barber.id_empleado,
+                id_cliente: clienteId,
+                id_persona: personaId,
                 id_grupo_cita: groupRecord.id_grupo_cita,
-                code: promoError?.code || null,
-                message: promoError?.message || null,
-              },
-              "No se pudo evaluar promociones normalizadas; se mantiene fallback legacy"
-            );
+                fecha_hora: selection.startDateTime.toISOString(),
+                fecha: selection.startDateTime.toISOString().slice(0, 10),
+                fecha_operativa: selection.startDateTime.toISOString().slice(0, 10),
+                hora: selection.startDateTime.toISOString().slice(11, 16),
+                subtotal_hnl: totalPagar,
+                servicios: selection.serviceSelection.items || [],
+                paquetes: selection.serviceSelection.id_paquete
+                  ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+                  : [],
+                codigo_promocional: request.body?.codigo_promocional || null,
+                canal: "privado",
+                es_cliente_autenticado: true,
+                es_titular: isTitular,
+              };
+              promocionesPreview = await previewPromotionsForAppointment(dbClient, promoContext);
+              if (!promocionesPreview.usedFallbackLegacy) {
+                descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
+                totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
+              }
+            } catch (promoError) {
+              request.log.warn(
+                {
+                  requestId: request.id,
+                  id_sucursal: branch.id_sucursal,
+                  id_grupo_cita: groupRecord.id_grupo_cita,
+                  code: promoError?.code || null,
+                  message: promoError?.message || null,
+                },
+                "No se pudo evaluar promociones normalizadas; se mantiene fallback legacy"
+              );
+            }
           }
           const descuentoTotal = Number((descuento + descuentoPromociones).toFixed(2));
 
@@ -2060,7 +2090,9 @@ export default async function citasRoutes(app) {
               try {
                 await dbClient.query(`ROLLBACK TO SAVEPOINT ${promoSavepoint}`);
                 await dbClient.query(`RELEASE SAVEPOINT ${promoSavepoint}`);
-              } catch {}
+              } catch {
+                // Se conserva el warning original del fallo de promociones.
+              }
               request.log.warn(
                 {
                   requestId: request.id,
@@ -2769,7 +2801,9 @@ export default async function citasRoutes(app) {
         }
         return sendOk(reply, { pendiente: payload });
       } catch (error) {
-        try { await dbClient.query("ROLLBACK"); } catch {}
+        try { await dbClient.query("ROLLBACK"); } catch {
+          // La respuesta debe reportar el error original.
+        }
         return sendHandled(reply, request, error, "No se pudo consultar la reserva pendiente", "CITAS_PENDING_GET_ERROR");
       } finally {
         dbClient.release();
@@ -2850,7 +2884,9 @@ export default async function citasRoutes(app) {
           total_pendiente_hnl: payload.total_pendiente_hnl,
         });
       } catch (error) {
-        try { await dbClient.query("ROLLBACK"); } catch {}
+        try { await dbClient.query("ROLLBACK"); } catch {
+          // La respuesta debe reportar el error original.
+        }
         return sendHandled(reply, request, error, "No se pudo retomar la reserva pendiente", "CITAS_PENDING_RESUME_ERROR");
       } finally {
         dbClient.release();
@@ -2959,7 +2995,9 @@ export default async function citasRoutes(app) {
           idempotent: false,
         });
       } catch (error) {
-        try { await dbClient.query("ROLLBACK"); } catch {}
+        try { await dbClient.query("ROLLBACK"); } catch {
+          // La respuesta debe reportar el error original.
+        }
         return sendHandled(reply, request, error, "No se pudo descartar la reserva pendiente", "CITAS_PENDING_DISCARD_ERROR");
       } finally {
         dbClient.release();

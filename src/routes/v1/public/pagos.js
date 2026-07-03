@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
-import { applyRewardRedeemForConfirmedGroup, grantCompanionPointsForConfirmedGroup } from "../../../services/pointsService.js";
+import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
   markPromotionUsagesForGroup,
@@ -965,7 +965,7 @@ async function confirmGroupAfterPaid(client, { idCitaAnchor, expectedGroupId = n
   });
 
   await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
-  await grantCompanionPointsForConfirmedGroup(client, { idGrupoCita });
+  await grantEngagementPointsForConfirmedGroup(client, { idGrupoCita });
   return {
     id_grupo_cita: idGrupoCita,
     total_hnl: totalGrupo,

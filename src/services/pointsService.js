@@ -11,8 +11,8 @@ const CLIENT_SEARCH_DEFAULT_LIMIT = 10;
 const CLIENT_SEARCH_MAX_LIMIT = 20;
 const MANUAL_ADJUST_TYPE_ADD = "ajustar";
 const MANUAL_ADJUST_TYPE_SUBTRACT = "ajuste_resta";
-const REWARD_SERVICE_NAMES_NO_PLAN = ["corte de cabello", "corte de barba"];
-const REWARD_SERVICE_NAMES_WITH_PLAN = ["facial express"];
+const CLIENT_CONDITION_NO_MEMBERSHIP = "sin_membresia";
+const CLIENT_CONDITION_WITH_MEMBERSHIP = "con_membresia";
 const REDEEM_CONTEXT_TOKEN_PREFIX = "mf_reward_ctx_v1";
 const REDEEM_CONTEXT_TOKEN_VERSION = 1;
 const REDEEM_CONTEXT_TTL_SECONDS = Math.max(
@@ -24,14 +24,6 @@ const SQL_COMPATIBLE_ERROR_CODES = new Set(["42P01", "42703", "42883"]);
 
 function normalizeText(value) {
   return String(value || "").trim();
-}
-
-function normalizeServiceName(value) {
-  return normalizeText(value)
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .toLowerCase();
 }
 
 function encodeBase64Url(value) {
@@ -256,7 +248,7 @@ export async function grantCompanionPointsForConfirmedGroup(client, { idGrupoCit
       );
       cycleId = cycleResult.rows[0]?.id_cycle ?? null;
     } catch {
-      cycleId = null;
+      // Mantiene cycleId en null si la funcion auxiliar no esta disponible.
     }
     const insertResult = await client.query(
       `
@@ -331,8 +323,6 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
 
   let grantedTitular = 0;
   let grantedCompanions = 0;
-  const finalStateResult = await client.query(`SELECT public.fn_points_estado_final_cita() AS estado_final`);
-  const finalState = String(finalStateResult.rows[0]?.estado_final || "").trim().toLowerCase();
   for (const cita of citasResult.rows || []) {
     const isTitular = Number(cita.orden_integrante || 1) <= 1;
     if (isTitular && cita.es_canje_recompensa === true) continue;
@@ -345,13 +335,12 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
       );
       cycleId = cycleResult.rows[0]?.id_cycle ?? null;
     } catch {
-      cycleId = null;
+      // Mantiene cycleId en null si la funcion auxiliar no esta disponible.
     }
 
     const origenCodigo = isTitular ? "titular" : "integrante";
-    const supportsCitaLink = String(cita.estado_cita_codigo || "").trim().toLowerCase() === finalState;
     const motivoBase = isTitular ? "Punto por cita titular confirmada" : "Punto por acompanante confirmado";
-    const motivo = supportsCitaLink ? motivoBase : `${motivoBase} [cita:${String(cita.id_cita || "").trim()}]`;
+    const motivo = motivoBase;
     const insertResult = await client.query(
       `
         INSERT INTO public.points_transactions (
@@ -390,7 +379,7 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
         )
         RETURNING id_points_tx
       `,
-      [titular.id_cliente, supportsCitaLink ? cita.id_cita : null, cycleId, cita.id_sucursal, origenCodigo, motivo, titular.id_usuario || null]
+      [titular.id_cliente, cita.id_cita, cycleId, cita.id_sucursal, origenCodigo, motivo, titular.id_usuario || null]
     );
     if (insertResult.rowCount > 0) {
       if (isTitular) grantedTitular += 1;
@@ -527,46 +516,81 @@ async function hasActivePlan(client, idCliente) {
   return Boolean(rows[0]?.has_active_plan);
 }
 
+function resolveClientConditionCode(hasPlanActivo) {
+  return hasPlanActivo ? CLIENT_CONDITION_WITH_MEMBERSHIP : CLIENT_CONDITION_NO_MEMBERSHIP;
+}
+
+function mapRewardServiceRow(row) {
+  return {
+    id_rule_service: row.id_rule_service ?? null,
+    id_rule: row.id_rule ?? null,
+    id_sucursal: row.id_sucursal ?? null,
+    cliente_condicion_codigo: row.cliente_condicion_codigo ?? null,
+    id_servicio: row.id_servicio,
+    nombre_servicio: row.nombre_servicio,
+    puntos_requeridos: Number(row.puntos_requeridos || DEFAULT_PUNTOS_PARA_PREMIO),
+    orden_visual: row.orden_visual == null ? null : Number(row.orden_visual),
+  };
+}
+
+async function listServiciosCanjeablesActivos(client, {
+  idSucursal = null,
+  hasPlanActivo = false,
+} = {}) {
+  const conditionCode = resolveClientConditionCode(hasPlanActivo);
+  try {
+    const { rows } = await client.query(
+      `
+        SELECT
+          id_rule_service,
+          id_rule,
+          id_sucursal,
+          cliente_condicion_codigo,
+          id_servicio,
+          nombre_servicio,
+          puntos_requeridos,
+          orden_visual
+        FROM public.vw_prs_active
+        WHERE cliente_condicion_codigo = $1::text
+          AND (
+            $2::uuid IS NULL
+            OR id_sucursal = $2::uuid
+            OR id_sucursal IS NULL
+          )
+        ORDER BY
+          CASE WHEN id_sucursal = $2::uuid THEN 0 ELSE 1 END,
+          orden_visual ASC NULLS LAST,
+          nombre_servicio ASC,
+          id_servicio ASC
+      `,
+      [conditionCode, idSucursal || null]
+    );
+    return rows.map(mapRewardServiceRow);
+  } catch (error) {
+    if (SQL_COMPATIBLE_ERROR_CODES.has(String(error?.code || ""))) {
+      return [];
+    }
+    throw error;
+  }
+}
+
 async function resolveServicioCanjeValido(client, {
   idServicioCanje,
   idSucursal,
   hasPlanActivo,
 }) {
-  const allowedNames = hasPlanActivo
-    ? REWARD_SERVICE_NAMES_WITH_PLAN
-    : REWARD_SERVICE_NAMES_NO_PLAN;
-  const normalizedAllowed = new Set(allowedNames.map((entry) => normalizeServiceName(entry)));
-
-  const { rows } = await client.query(
-    `
-      SELECT
-        s.id_servicio,
-        s.nombre_servicio
-      FROM public.servicios s
-      WHERE s.id_servicio = $1::uuid
-        AND s.deleted_at IS NULL
-        AND s.activo IS TRUE
-      LIMIT 1
-    `,
-    [idServicioCanje]
-  );
-
-  const service = rows[0] ?? null;
+  const allowedServices = await listServiciosCanjeablesActivos(client, {
+    idSucursal,
+    hasPlanActivo,
+  });
+  const service = allowedServices.find((entry) => String(entry.id_servicio || "") === String(idServicioCanje || ""));
   if (!service) {
-    throw new AppError(404, "Servicio no encontrado o inactivo", {
-      code: "POINTS_REDEEM_SERVICE_NOT_FOUND",
-      details: { id_servicio: idServicioCanje },
-    });
-  }
-
-  const normalizedName = normalizeServiceName(service.nombre_servicio);
-  if (!normalizedAllowed.has(normalizedName)) {
     throw new AppError(409, "El servicio no esta permitido para este tipo de cliente", {
       code: "POINTS_REDEEM_SERVICE_FORBIDDEN",
       details: {
         id_servicio: idServicioCanje,
-        servicio_nombre: service.nombre_servicio,
-        permitidos: allowedNames,
+        cliente_condicion_codigo: resolveClientConditionCode(hasPlanActivo),
+        permitidos: allowedServices.map((entry) => entry.id_servicio),
         requiere_plan_activo: hasPlanActivo,
       },
     });
@@ -598,7 +622,11 @@ async function resolveServicioCanjeValido(client, {
   return {
     id_servicio: service.id_servicio,
     nombre_servicio: service.nombre_servicio,
-    permitidos: allowedNames,
+    id_rule_service: service.id_rule_service,
+    id_rule: service.id_rule,
+    cliente_condicion_codigo: service.cliente_condicion_codigo,
+    puntos_requeridos: service.puntos_requeridos,
+    permitidos: allowedServices.map((entry) => entry.id_servicio),
   };
 }
 
@@ -1216,6 +1244,11 @@ export async function getClientePointsSummary(app, idCliente, { historyLimit = H
     const saldo = Number(agregados.saldo_total || 0);
     const recompensasDisponibles = Math.floor(Math.max(0, saldo) / safeRequired);
     const progresoActual = ((saldo % safeRequired) + safeRequired) % safeRequired;
+    const planActivo = await hasActivePlan(client, safeClienteId);
+    const serviciosRedimibles = await listServiciosCanjeablesActivos(client, {
+      idSucursal: cliente.id_sucursal_origen || null,
+      hasPlanActivo: planActivo,
+    });
     const historial = await listMovimientosCompactos(client, safeClienteId, { limit: historyLimit });
 
     return {
@@ -1228,6 +1261,8 @@ export async function getClientePointsSummary(app, idCliente, { historyLimit = H
       recompensas_disponibles: recompensasDisponibles,
       progreso_actual: progresoActual,
       puede_canjear: saldo >= safeRequired,
+      cliente_condicion_codigo: resolveClientConditionCode(planActivo),
+      servicios_redimibles: serviciosRedimibles,
       historial,
     };
   } finally {
