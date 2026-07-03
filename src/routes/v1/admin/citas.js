@@ -13,6 +13,12 @@ import {
   resolveBranchIdsForClaims,
 } from "../../../services/agendaService.js";
 import { consumeMembershipForCompletedAppointment } from "../../../services/membershipService.js";
+import {
+  confirmAdminBookingHold,
+  createAdminBookingHold,
+  createAdminBookingPaymentLink,
+  releaseAdminBookingHold,
+} from "../../../services/booking/adminBookingService.js";
 
 const CONFIG_ALLOWED_ROLES = ["admin", "super_admin"];
 const OPERATIONAL_ALLOWED_ROLES = ["admin", "super_admin", "barbero"];
@@ -1299,6 +1305,207 @@ async function getDayOffType(client) {
 }
 
 export default async function adminCitasRoutes(app) {
+  app.post(
+    "/hold",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        headers: {
+          type: "object",
+          properties: {
+            "x-idempotency-key": { type: "string", format: "uuid" },
+          },
+          additionalProperties: true,
+        },
+        body: {
+          type: "object",
+          required: ["id_sucursal"],
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+            id_cliente: { type: ["string", "null"], format: "uuid" },
+            cliente_nuevo: { type: ["object", "null"], additionalProperties: true },
+            integrantes: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", additionalProperties: true } },
+            bloques: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", additionalProperties: true } },
+            metodo_pago_codigo: { type: ["string", "null"], maxLength: 60 },
+            notas: { type: ["string", "null"], maxLength: 1000 },
+            motivo: { type: ["string", "null"], maxLength: 500 },
+          },
+          additionalProperties: true,
+          anyOf: [
+            { required: ["integrantes"] },
+            { required: ["bloques"] },
+          ],
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: { type: "string" },
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          404: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const result = await createAdminBookingHold(app, request);
+        reply.header("x-idempotency-key", result.requestId);
+        return sendOk(reply, result.data, {
+          statusCode: result.statusCode,
+          requestId: request.id,
+        });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear el hold administrativo de citas",
+          "ADMIN_CITAS_HOLD_CREATE_ERROR"
+        );
+      }
+    }
+  );
+
+  app.delete(
+    "/hold/:idGrupoCita",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["idGrupoCita"],
+          properties: { idGrupoCita: { type: "string", format: "uuid" } },
+        },
+        response: {
+          200: { type: "object", additionalProperties: true },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          404: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await releaseAdminBookingHold(app, request);
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo liberar el hold administrativo",
+          "ADMIN_CITAS_HOLD_RELEASE_ERROR"
+        );
+      }
+    }
+  );
+
+  app.post(
+    "/hold/:idGrupoCita/confirmar",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["idGrupoCita"],
+          properties: { idGrupoCita: { type: "string", format: "uuid" } },
+        },
+        body: {
+          type: "object",
+          properties: {
+            metodo_pago_codigo: { type: "string", maxLength: 60 },
+            motivo: { type: ["string", "null"], maxLength: 500 },
+            consentimiento: { type: ["object", "null"], additionalProperties: true },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: { type: "object", additionalProperties: true },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          404: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          422: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await confirmAdminBookingHold(app, request);
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar el hold administrativo",
+          "ADMIN_CITAS_HOLD_CONFIRM_ERROR"
+        );
+      }
+    }
+  );
+
+  app.post(
+    "/hold/:idGrupoCita/payment-link",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["idGrupoCita"],
+          properties: { idGrupoCita: { type: "string", format: "uuid" } },
+        },
+        body: {
+          type: "object",
+          properties: {
+            canal: { type: ["string", "null"], maxLength: 30 },
+            correo: { type: ["string", "null"], maxLength: 255 },
+            telefono: { type: ["string", "null"], maxLength: 50 },
+            expires_at: { type: ["string", "null"] },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: { type: "object", additionalProperties: true },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await createAdminBookingPaymentLink(app, request);
+        return sendOk(reply, data, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear el enlace de pago administrativo",
+          "ADMIN_CITAS_HOLD_PAYMENT_LINK_ERROR"
+        );
+      }
+    }
+  );
+
   app.get("/operativas/contexto", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       await expireStaleAppointmentReservations(app.db, { logger: request.log });
