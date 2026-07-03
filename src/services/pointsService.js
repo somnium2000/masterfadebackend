@@ -331,8 +331,6 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
 
   let grantedTitular = 0;
   let grantedCompanions = 0;
-  const finalStateResult = await client.query(`SELECT public.fn_points_estado_final_cita() AS estado_final`);
-  const finalState = String(finalStateResult.rows[0]?.estado_final || "").trim().toLowerCase();
   for (const cita of citasResult.rows || []) {
     const isTitular = Number(cita.orden_integrante || 1) <= 1;
     if (isTitular && cita.es_canje_recompensa === true) continue;
@@ -349,9 +347,8 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
     }
 
     const origenCodigo = isTitular ? "titular" : "integrante";
-    const supportsCitaLink = String(cita.estado_cita_codigo || "").trim().toLowerCase() === finalState;
     const motivoBase = isTitular ? "Punto por cita titular confirmada" : "Punto por acompanante confirmado";
-    const motivo = supportsCitaLink ? motivoBase : `${motivoBase} [cita:${String(cita.id_cita || "").trim()}]`;
+    const motivo = motivoBase;
     const insertResult = await client.query(
       `
         INSERT INTO public.points_transactions (
@@ -390,7 +387,7 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
         )
         RETURNING id_points_tx
       `,
-      [titular.id_cliente, supportsCitaLink ? cita.id_cita : null, cycleId, cita.id_sucursal, origenCodigo, motivo, titular.id_usuario || null]
+      [titular.id_cliente, cita.id_cita, cycleId, cita.id_sucursal, origenCodigo, motivo, titular.id_usuario || null]
     );
     if (insertResult.rowCount > 0) {
       if (isTitular) grantedTitular += 1;

@@ -6,6 +6,7 @@ import {
 } from "../utils/securityHash.js";
 import { getRequestMeta, maskIpAddress } from "../utils/requestMeta.js";
 import { buildDeviceSummary } from "../utils/deviceInfo.js";
+import { isProtectedIdentifier, isProtectedUserId } from "./protectedUsersService.js";
 
 const RESULT_SET = new Set(["success", "failed", "blocked", "error", "session_limit"]);
 const REASON_SET = new Set([
@@ -788,6 +789,7 @@ export async function getLoginProtectionState(app, request, { identifier }) {
   const safeIdentifier = normalizeIdentifier(identifier);
   const meta = getRequestMeta(request);
   const { hash: identifierHash } = buildIdentifierHash(safeIdentifier, request?.log);
+  const protectedIdentifier = await isProtectedIdentifier(app, safeIdentifier);
 
   let ipAttempts = 0;
   let identifierFailures = 0;
@@ -838,6 +840,22 @@ export async function getLoginProtectionState(app, request, { identifier }) {
     const blockedByIp = ipAttempts >= LOGIN_RATE_LIMIT_IP_MAX;
     const blockedByIdentifier = identifierFailures >= LOGIN_RATE_LIMIT_IDENTIFIER_MAX;
     const blockedByIpIdentifier = ipIdentifierAttempts >= LOGIN_RATE_LIMIT_IP_IDENTIFIER_MAX;
+
+    if (protectedIdentifier) {
+      return {
+        ok: true,
+        blocked: false,
+        code: null,
+        delayMs: 0,
+        bypassed: true,
+        bypassCode: "ROOT_LOGIN_LOCK_BYPASSED",
+        counts: {
+          ipAttempts,
+          identifierFailures,
+          ipIdentifierAttempts,
+        },
+      };
+    }
 
     if (blockedByIp && meta.ip) {
       const client = await app.db.connect();
@@ -934,6 +952,10 @@ export async function checkUserTemporaryLock(app, { idUsuario }) {
   }
 
   try {
+    if (await isProtectedUserId(app, idUsuario)) {
+      return { ok: true, blocked: false, lockedUntil: null, bypassed: true, bypassCode: "ROOT_LOGIN_LOCK_BYPASSED" };
+    }
+
     const result = await app.db.query(
       `
         SELECT locked_until_at
@@ -973,6 +995,11 @@ export async function registerFailedLoginAttempt(app, request, payload) {
 
     if (!user?.id_usuario || !isValidUuid(user.id_usuario)) {
       return { ok: true, blockedNow: false };
+    }
+
+    const protectedUser = await isProtectedUserId(app, user.id_usuario);
+    if (protectedUser) {
+      return { ok: true, blockedNow: false, bypassed: true, code: "ROOT_LOGIN_LOCK_BYPASSED" };
     }
 
     const client = await app.db.connect();
@@ -1844,6 +1871,7 @@ export async function updateAdminUserAccessState(app, request, {
 
   const nextState = String(estadoAcceso || "").trim().toLowerCase();
   const disableStates = new Set(["bloqueado", "inactivo"]);
+  const protectedAccessStates = new Set(["bloqueado", "inactivo", "pendiente_password"]);
   const isDisabling = disableStates.has(nextState);
   const client = await app.db.connect();
   try {
@@ -1885,6 +1913,22 @@ export async function updateAdminUserAccessState(app, request, {
     if (!target) {
       await client.query("ROLLBACK");
       return { ok: false, code: "SECURITY_USER_NOT_FOUND" };
+    }
+
+    if (protectedAccessStates.has(nextState)) {
+      try {
+        const protectedUser = await isProtectedUserId(app, idUsuario, {
+          client,
+          failClosed: true,
+        });
+        if (protectedUser) {
+          await client.query("ROLLBACK");
+          return { ok: false, code: "ROOT_USER_PROTECTED" };
+        }
+      } catch {
+        await client.query("ROLLBACK");
+        return { ok: false, code: "ROOT_USER_PROTECTION_CHECK_FAILED" };
+      }
     }
 
     if (String(actorUserId) === String(idUsuario) && isDisabling && target.is_critical_access) {

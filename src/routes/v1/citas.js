@@ -1343,6 +1343,29 @@ function normalizeHoldBlocksPayload(body) {
   });
 }
 
+function assertRewardRedeemExclusiveHold({ rewardRedeemContext, integrantes, codigoPromocional }) {
+  if (!rewardRedeemContext) return;
+  if (Array.isArray(integrantes) && integrantes.length > 1) {
+    throw new AppError(409, "La recompensa aplica solo al titular y no combina con acompanantes.", {
+      code: "POINTS_REDEEM_COMPANIONS_NOT_ALLOWED",
+    });
+  }
+
+  const titular = Array.isArray(integrantes) ? integrantes[0] : null;
+  const selectionType = String(titular?.selection_type || "services").trim().toLowerCase();
+  if (selectionType !== "services" || titular?.id_paquete) {
+    throw new AppError(409, "La recompensa no combina con paquetes.", {
+      code: "POINTS_REDEEM_PACKAGE_NOT_ALLOWED",
+    });
+  }
+
+  if (safeText(codigoPromocional)) {
+    throw new AppError(409, "La recompensa no combina con promociones.", {
+      code: "POINTS_REDEEM_PROMOTION_NOT_ALLOWED",
+    });
+  }
+}
+
 function buildUniqueServiceIds(...sources) {
   const set = new Set();
   for (const source of sources) {
@@ -1448,32 +1471,36 @@ async function buildAuthenticatedCanonicalOption(dbClient, {
   });
   const coveragePlan = buildDiscountPlan(baseDiscountLines, coverageAllocations);
   const promotionDiscountLines = applyPlanAsPreviousDiscount(baseDiscountLines, coveragePlan);
-  const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
-  const promocionesContext = {
-    id_sucursal: branch.id_sucursal,
-    id_empleado_barbero: selection.barber.id_empleado,
-    id_cliente: clienteId,
-    id_persona: personaId,
-    id_grupo_cita: null,
-    fecha_hora: promoDateTime.iso_utc,
-    fecha: promoDateTime.fecha_operativa,
-    fecha_operativa: promoDateTime.fecha_operativa,
-    hora: promoDateTime.hora_operativa,
-    subtotal_hnl: totalPagar,
-    servicios: selection.serviceSelection.items || [],
-    discount_lines: promotionDiscountLines,
-    paquetes: selection.serviceSelection.id_paquete
-      ? [{ id_paquete: selection.serviceSelection.id_paquete }]
-      : [],
-    codigo_promocional: request.body?.codigo_promocional || null,
-    canal: "privado",
-    es_cliente_autenticado: true,
-    es_titular: isTitular,
-  };
-  const promocionesPreview = await previewPromotionsForAppointment(dbClient, promocionesContext);
-  if (!promocionesPreview.usedFallbackLegacy) {
-    descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
-    totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
+  let promocionesContext = null;
+  let promocionesPreview = null;
+  if (!rewardRedeemContext) {
+    const promoDateTime = normalizeOperationalDateTime(selection.startDateTime, "fecha_inicio");
+    promocionesContext = {
+      id_sucursal: branch.id_sucursal,
+      id_empleado_barbero: selection.barber.id_empleado,
+      id_cliente: clienteId,
+      id_persona: personaId,
+      id_grupo_cita: null,
+      fecha_hora: promoDateTime.iso_utc,
+      fecha: promoDateTime.fecha_operativa,
+      fecha_operativa: promoDateTime.fecha_operativa,
+      hora: promoDateTime.hora_operativa,
+      subtotal_hnl: totalPagar,
+      servicios: selection.serviceSelection.items || [],
+      discount_lines: promotionDiscountLines,
+      paquetes: selection.serviceSelection.id_paquete
+        ? [{ id_paquete: selection.serviceSelection.id_paquete }]
+        : [],
+      codigo_promocional: request.body?.codigo_promocional || null,
+      canal: "privado",
+      es_cliente_autenticado: true,
+      es_titular: isTitular,
+    };
+    promocionesPreview = await previewPromotionsForAppointment(dbClient, promocionesContext);
+    if (!promocionesPreview.usedFallbackLegacy) {
+      descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
+      totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
+    }
   }
   const descuentoTotal = Number((descuento + descuentoPromociones).toFixed(2));
   const promotionAllocations = [];
@@ -1876,6 +1903,11 @@ export default async function citasRoutes(app) {
             );
           }
         }
+        assertRewardRedeemExclusiveHold({
+          rewardRedeemContext,
+          integrantes,
+          codigoPromocional: request.body?.codigo_promocional,
+        });
         let rewardAppliedInHold;
         let rewardCoveredTotalHnl;
         let rewardLinkedCitaId;
