@@ -26,6 +26,21 @@ function readRequired(name, { minLength = 1 } = {}) {
   return value;
 }
 
+export function resolveBookingReleaseTokenSecret(nodeEnv) {
+  const normalizedNodeEnv = normalizeNodeEnv(nodeEnv);
+  const configured = String(process.env.BOOKING_RELEASE_TOKEN_SECRET || "").trim();
+
+  if (normalizedNodeEnv === "test" && !configured) {
+    return "masterfade-test-release-token-secret-32";
+  }
+
+  if (configured.length < 32) {
+    throw new Error("BOOKING_RELEASE_TOKEN_SECRET debe contener al menos 32 caracteres.");
+  }
+
+  return configured;
+}
+
 function assertSecureProductionConfig(config) {
   if (config.nodeEnv !== "production" && config.nodeEnv !== "staging") return;
 
@@ -42,7 +57,7 @@ function assertSecureProductionConfig(config) {
   }
 
   if (!config.bookingReleaseTokenSecret || config.bookingReleaseTokenSecret.length < 32) {
-    throw new Error("BOOKING_RELEASE_TOKEN_SECRET es obligatorio en produccion/staging.");
+    throw new Error("BOOKING_RELEASE_TOKEN_SECRET debe contener al menos 32 caracteres.");
   }
 }
 
@@ -109,10 +124,7 @@ async function envPlugin(app) {
     jwtSecret,
     cookieSecret,
     csrfSecret,
-    bookingReleaseTokenSecret: String(
-      process.env.BOOKING_RELEASE_TOKEN_SECRET
-        || (nodeEnv === "test" ? "masterfade-test-release-token-secret-32" : "")
-    ).trim(),
+    bookingReleaseTokenSecret: resolveBookingReleaseTokenSecret(nodeEnv),
     paymentProvider,
     todoPago: {
       mode: todoPagoMode,

@@ -146,7 +146,7 @@ export function assertKnownIdempotencyState(state = {}) {
 export function buildDeterministicPublicReleaseToken(requestId, secret) {
   const normalizedRequestId = parseReservationIdempotencyKey(requestId);
   const normalizedSecret = String(secret || "").trim();
-  if (!normalizedSecret) {
+  if (normalizedSecret.length < 32) {
     throw new AppError(500, "BOOKING_RELEASE_TOKEN_SECRET no esta configurado", {
       code: "BOOKING_RELEASE_TOKEN_SECRET_REQUIRED",
     });
