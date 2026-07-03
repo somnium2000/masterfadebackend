@@ -53,6 +53,7 @@ import {
 } from "../../services/bookingCanonicalReservationService.js";
 import {
   buildCanonicalHoldResponse,
+  createBookingHold,
 } from "../../services/booking/bookingHoldOrchestrationService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
@@ -1801,7 +1802,6 @@ export default async function citasRoutes(app) {
     },
     async (request, reply) => {
       let dbClient;
-      let txStarted = false;
       try {
         const { clienteId, personaId, usuarioId } = ensureClientContext(request);
         const requestId = resolveReservationRequestId(request.headers?.["x-idempotency-key"]);
@@ -1842,8 +1842,9 @@ export default async function citasRoutes(app) {
         }
         const branch = await ensureActiveBranch(dbClient, idSucursal);
 
-        await dbClient.query("BEGIN");
-        txStarted = true;
+        const responsePayload = await createBookingHold({
+          dbClient,
+          operation: async () => {
         const titularContact = await resolveAuthenticatedTitularContact(dbClient, {
           personaId,
           claimsUser: request.claims?.user,
@@ -1875,11 +1876,11 @@ export default async function citasRoutes(app) {
             );
           }
         }
-        let rewardAppliedInHold = false;
-        let rewardCoveredTotalHnl = 0;
-        let rewardLinkedCitaId = null;
+        let rewardAppliedInHold;
+        let rewardCoveredTotalHnl;
+        let rewardLinkedCitaId;
 
-        let activeMembership = null;
+        let activeMembership;
         let membershipComputationFailed = false;
         try {
           activeMembership = await ensureSubscriptionLifecycle(dbClient, clienteId, { forUpdate: true });
@@ -1931,12 +1932,12 @@ export default async function citasRoutes(app) {
         const bloquesResponse = [];
         const canonicalIntegrantes = [];
         const pendingPromotionRecords = [];
-        let subtotalGrupo = 0;
-        let descuentoGrupo = 0;
-        let totalGrupo = 0;
-        let extrasPendientesGrupo = 0;
-        let coveredItemsCount = 0;
-        let extraItemsCount = 0;
+        let subtotalGrupo;
+        let descuentoGrupo;
+        let totalGrupo;
+        let extrasPendientesGrupo;
+        let coveredItemsCount;
+        let extraItemsCount;
         const coveredServicesByPlan = new Map();
         const forcedServicesByPlan = new Map();
         if (integrantes[0]) {
@@ -2078,7 +2079,7 @@ export default async function citasRoutes(app) {
         }
         const membershipState = await getClienteMembershipState(dbClient, clienteId);
         let membershipMessage = null;
-        let membershipCoverageActive = false;
+        let membershipCoverageActive;
         // AM: Señales explícitas de contrato para UX de membresía en hold autenticado.
         const membershipBranchMismatch = Boolean(hasMembership && coverageTracker.coverageDisabledReason === "branch_mismatch");
         const membershipStateCode = String(membershipState?.estado_plan || "").trim().toLowerCase();
@@ -2259,7 +2260,7 @@ export default async function citasRoutes(app) {
         });
         const coveredServicesList = [...coveredServicesByPlan.values()];
         const forcedServicesList = [...forcedServicesByPlan.values()];
-        const responsePayload = buildCanonicalHoldResponse({
+        const holdResponsePayload = buildCanonicalHoldResponse({
           requestId,
           canonicalResult,
           totals: selectedTotals,
@@ -2291,7 +2292,7 @@ export default async function citasRoutes(app) {
                 mensaje: rewardAppliedInHold
                   ? "Recompensa aplicada correctamente. Los extras y acompanantes se cobran aparte."
                   : "No se aplico la recompensa en este hold.",
-                id_cita_asociada: rewardLinkedCitaId,
+                id_cita_asociada: rewardLinkedCitaId || null,
               }
               : {
                 aplicada: false,
@@ -2345,25 +2346,18 @@ export default async function citasRoutes(app) {
           requestId,
           scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,
           requestFingerprint,
-          responsePayload,
+          responsePayload: holdResponsePayload,
           statusCode: 201,
         });
-        await dbClient.query("COMMIT");
-        txStarted = false;
+        return holdResponsePayload;
+          },
+        });
 
         return sendOk(reply, responsePayload, {
           statusCode: 201,
           requestId: request.id,
         });
       } catch (error) {
-        try {
-          if (txStarted) {
-            await dbClient.query("ROLLBACK");
-          }
-        } catch {
-          // no-op
-        }
-
         const mappedError = mapCanonicalReservationError(error, {
           safeMessage: "No se pudo crear el hold de citas",
         });

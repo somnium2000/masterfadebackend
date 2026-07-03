@@ -44,6 +44,7 @@ import {
 } from "../../../services/bookingCanonicalReservationService.js";
 import {
   buildCanonicalHoldResponse,
+  createBookingHold,
 } from "../../../services/booking/bookingHoldOrchestrationService.js";
 import { recordPromotionApplications } from "../../../services/promociones/promocionesService.js";
 
@@ -1557,8 +1558,9 @@ export default async function publicCitasRoutes(app) {
         }
         const branch = await ensureActiveBranch(dbClient, idSucursal);
 
-        await dbClient.query("BEGIN");
-
+        const responsePayload = await createBookingHold({
+          dbClient,
+          operation: async () => {
         const clientProfile = await resolveOrCreatePublicClient(dbClient, {
           ...titularPayload,
           idSucursal: branch.id_sucursal,
@@ -1571,9 +1573,9 @@ export default async function publicCitasRoutes(app) {
           : null;
         const canonicalIntegrantes = [];
         const pendingPromotionRecords = [];
-        let subtotalGrupo = 0;
-        let descuentoGrupo = 0;
-        let totalGrupo = 0;
+        let subtotalGrupo;
+        let descuentoGrupo;
+        let totalGrupo;
         const promocionesAplicadasGrupo = [];
         const promocionesDescartadasGrupo = [];
 
@@ -1698,7 +1700,7 @@ export default async function publicCitasRoutes(app) {
           };
         });
 
-        const responsePayload = buildCanonicalHoldResponse({
+        const holdResponsePayload = buildCanonicalHoldResponse({
           requestId,
           canonicalResult,
           totals: selectedTotals,
@@ -1719,19 +1721,15 @@ export default async function publicCitasRoutes(app) {
           requestId,
           scope: PUBLIC_HOLD_IDEMPOTENCY_SCOPE,
           requestFingerprint,
-          responsePayload,
+          responsePayload: holdResponsePayload,
           statusCode: 201,
         });
-        await dbClient.query("COMMIT");
+        return holdResponsePayload;
+          },
+        });
 
         return sendOk(reply, responsePayload, { statusCode: 201 });
       } catch (error) {
-        try {
-          await dbClient.query("ROLLBACK");
-        } catch {
-          // no-op
-        }
-
         const mappedError = mapCanonicalReservationError(error, {
           publicRoute: true,
           safeMessage: "No se pudo crear el hold publico",

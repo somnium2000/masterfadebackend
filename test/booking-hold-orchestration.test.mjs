@@ -32,6 +32,8 @@ test("buildCanonicalHoldResponse normaliza respuesta comun y conserva extensione
   assert.equal(response.total_pagar_hnl, 225);
   assert.equal(response.extras_a_pagar_hnl, 225);
   assert.equal(response.release_token, "release-token");
+  assert.equal(Object.hasOwn(response, "membresia"), false);
+  assert.equal(Object.hasOwn(response, "recompensa"), false);
   assert.deepEqual(response.bloques, [{ orden_integrante: 1 }]);
 });
 
@@ -53,6 +55,7 @@ test("buildCanonicalHoldResponse conserva campos autenticados especificos", () =
   assert.equal(response.descuento_recompensa_hnl, 30);
   assert.equal(response.extras_pendientes_hnl, 20);
   assert.equal(response.extras_a_pagar_hnl, 20);
+  assert.equal(Object.hasOwn(response, "release_token"), false);
   assert.deepEqual(response.membresia, { cobertura_activa: true });
   assert.deepEqual(response.recompensa, { aplicada: true });
 });
@@ -71,6 +74,27 @@ test("createBookingHold controla BEGIN y COMMIT", async () => {
   });
   assert.equal(result, "ok");
   assert.deepEqual(calls, ["BEGIN", "COMMIT"]);
+});
+
+test("createBookingHold no anida transacciones internas de la operacion", async () => {
+  const calls = [];
+  const dbClient = {
+    async query(sql) {
+      calls.push(sql);
+      return { rows: [] };
+    },
+  };
+  await createBookingHold({
+    dbClient,
+    operation: async () => {
+      await dbClient.query("SELECT 1");
+      return "ok";
+    },
+  });
+  assert.deepEqual(calls, ["BEGIN", "SELECT 1", "COMMIT"]);
+  assert.equal(calls.filter((sql) => sql === "BEGIN").length, 1);
+  assert.equal(calls.filter((sql) => sql === "COMMIT").length, 1);
+  assert.equal(calls.filter((sql) => sql === "ROLLBACK").length, 0);
 });
 
 test("createBookingHold ejecuta ROLLBACK ante error", async () => {
