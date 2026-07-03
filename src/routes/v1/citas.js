@@ -51,6 +51,9 @@ import {
   selectCanonicalIntegrantesForResult,
   summarizeCanonicalIntegrantes,
 } from "../../services/bookingCanonicalReservationService.js";
+import {
+  buildCanonicalHoldResponse,
+} from "../../services/booking/bookingHoldOrchestrationService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
@@ -2256,87 +2259,88 @@ export default async function citasRoutes(app) {
         });
         const coveredServicesList = [...coveredServicesByPlan.values()];
         const forcedServicesList = [...forcedServicesByPlan.values()];
-        const responsePayload = {
-          request_id: requestId,
-          id_grupo_cita: canonicalResult.id_grupo_cita,
-          estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
-          expires_at: canonicalResult.expires_at,
-          subtotal_hnl: subtotalGrupo,
-          monto_total_hnl: subtotalGrupo,
-          descuento_total_hnl: descuentoGrupo,
-          descuento_membresia_hnl: membershipCoveredTotalHnl,
-          descuento_recompensa_hnl: rewardCoveredTotalHnl,
-          descuento_promocion_hnl: promotionCoveredTotalHnl,
-          cubierto_por_plan_hnl: planCoveredTotalHnl,
-          cubierto_por_recompensa_hnl: rewardCoveredTotalHnl,
-          total_pagar_hnl: totalGrupo,
-          extras_pendientes_hnl: extrasPendientesGrupo,
-          resumen_cobertura: {
-            items_cubiertos: coveredItemsCount,
-            items_extra: extraItemsCount,
+        const responsePayload = buildCanonicalHoldResponse({
+          requestId,
+          canonicalResult,
+          totals: selectedTotals,
+          blocks: bloquesResponse,
+          extensions: {
+            subtotal_hnl: subtotalGrupo,
+            monto_total_hnl: subtotalGrupo,
+            descuento_total_hnl: descuentoGrupo,
+            descuento_membresia_hnl: membershipCoveredTotalHnl,
+            descuento_recompensa_hnl: rewardCoveredTotalHnl,
+            descuento_promocion_hnl: promotionCoveredTotalHnl,
+            cubierto_por_plan_hnl: planCoveredTotalHnl,
+            cubierto_por_recompensa_hnl: rewardCoveredTotalHnl,
+            total_pagar_hnl: totalGrupo,
+            extras_pendientes_hnl: extrasPendientesGrupo,
+            resumen_cobertura: {
+              items_cubiertos: coveredItemsCount,
+              items_extra: extraItemsCount,
+            },
+            recompensa: rewardRedeemContext
+              ? {
+                aplicada: rewardAppliedInHold,
+                id_points_tx_canje: rewardRedeemContext.canje_context_token,
+                canje_context_token: rewardRedeemContext.canje_context_token,
+                servicio_nombre: rewardRedeemContext.servicio_nombre,
+                puntos_requeridos: rewardRedeemContext.puntos_requeridos,
+                cubierto_hnl: rewardCoveredTotalHnl,
+                extras_a_pagar_hnl: totalGrupo,
+                mensaje: rewardAppliedInHold
+                  ? "Recompensa aplicada correctamente. Los extras y acompanantes se cobran aparte."
+                  : "No se aplico la recompensa en este hold.",
+                id_cita_asociada: rewardLinkedCitaId,
+              }
+              : {
+                aplicada: false,
+                id_points_tx_canje: null,
+                canje_context_token: null,
+                servicio_nombre: null,
+                puntos_requeridos: 0,
+                cubierto_hnl: 0,
+                extras_a_pagar_hnl: totalGrupo,
+                mensaje: null,
+                id_cita_asociada: null,
+              },
+            membresia: hasMembership
+              ? {
+                cobertura_activa: membershipCoverageActive,
+                id_suscripcion: coverageTracker.idSuscripcion,
+                id_sucursal_contratada: coverageTracker.idSucursalContratada || null,
+                sucursal_plan_nombre: coverageTracker.sucursalPlanNombre || null,
+                nombre_plan: coverageTracker.planName || null,
+                estado_plan: membershipState?.estado_plan || "sin_plan_activo",
+                aplica_en_cita: membershipCoverageActive,
+                branch_mismatch: membershipBranchMismatch,
+                motivo_no_aplica: membershipReasonNoAplica,
+                acompanantes_cubiertos: false,
+                mensaje: membershipMessage,
+                servicios_cubiertos: coveredServicesList,
+                servicios_forzados: forcedServicesList,
+                cubierto_por_plan_hnl: planCoveredTotalHnl,
+                extras_a_pagar_hnl: totalGrupo,
+              }
+              : {
+                cobertura_activa: false,
+                id_suscripcion: null,
+                id_sucursal_contratada: null,
+                sucursal_plan_nombre: null,
+                nombre_plan: null,
+                estado_plan: "sin_plan_activo",
+                aplica_en_cita: false,
+                branch_mismatch: membershipBranchMismatch,
+                motivo_no_aplica: membershipReasonNoAplica,
+                acompanantes_cubiertos: false,
+                mensaje: membershipMessage,
+                servicios_cubiertos: [],
+                servicios_forzados: [],
+                cubierto_por_plan_hnl: 0,
+                extras_a_pagar_hnl: totalGrupo,
+              },
           },
-          recompensa: rewardRedeemContext
-            ? {
-              aplicada: rewardAppliedInHold,
-              id_points_tx_canje: rewardRedeemContext.canje_context_token,
-              canje_context_token: rewardRedeemContext.canje_context_token,
-              servicio_nombre: rewardRedeemContext.servicio_nombre,
-              puntos_requeridos: rewardRedeemContext.puntos_requeridos,
-              cubierto_hnl: rewardCoveredTotalHnl,
-              extras_a_pagar_hnl: totalGrupo,
-              mensaje: rewardAppliedInHold
-                ? "Recompensa aplicada correctamente. Los extras y acompanantes se cobran aparte."
-                : "No se aplico la recompensa en este hold.",
-              id_cita_asociada: rewardLinkedCitaId,
-            }
-            : {
-              aplicada: false,
-              id_points_tx_canje: null,
-              canje_context_token: null,
-              servicio_nombre: null,
-              puntos_requeridos: 0,
-              cubierto_hnl: 0,
-              extras_a_pagar_hnl: totalGrupo,
-              mensaje: null,
-              id_cita_asociada: null,
-            },
-          membresia: hasMembership
-            ? {
-              cobertura_activa: membershipCoverageActive,
-              id_suscripcion: coverageTracker.idSuscripcion,
-              id_sucursal_contratada: coverageTracker.idSucursalContratada || null,
-              sucursal_plan_nombre: coverageTracker.sucursalPlanNombre || null,
-              nombre_plan: coverageTracker.planName || null,
-              estado_plan: membershipState?.estado_plan || "sin_plan_activo",
-              aplica_en_cita: membershipCoverageActive,
-              branch_mismatch: membershipBranchMismatch,
-              motivo_no_aplica: membershipReasonNoAplica,
-              acompanantes_cubiertos: false,
-              mensaje: membershipMessage,
-              servicios_cubiertos: coveredServicesList,
-              servicios_forzados: forcedServicesList,
-              cubierto_por_plan_hnl: planCoveredTotalHnl,
-              extras_a_pagar_hnl: totalGrupo,
-            }
-            : {
-              cobertura_activa: false,
-              id_suscripcion: null,
-              id_sucursal_contratada: null,
-              sucursal_plan_nombre: null,
-              nombre_plan: null,
-              estado_plan: "sin_plan_activo",
-              aplica_en_cita: false,
-              branch_mismatch: membershipBranchMismatch,
-              motivo_no_aplica: membershipReasonNoAplica,
-              acompanantes_cubiertos: false,
-              mensaje: membershipMessage,
-              servicios_cubiertos: [],
-              servicios_forzados: [],
-              cubierto_por_plan_hnl: 0,
-              extras_a_pagar_hnl: totalGrupo,
-            },
-          bloques: bloquesResponse,
-        };
+        });
         await finalizeReservationIdempotency(dbClient, {
           requestId,
           scope: AUTH_HOLD_IDEMPOTENCY_SCOPE,

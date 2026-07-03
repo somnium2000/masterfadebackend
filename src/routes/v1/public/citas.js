@@ -42,6 +42,9 @@ import {
   selectCanonicalIntegrantesForResult,
   summarizeCanonicalIntegrantes,
 } from "../../../services/bookingCanonicalReservationService.js";
+import {
+  buildCanonicalHoldResponse,
+} from "../../../services/booking/bookingHoldOrchestrationService.js";
 import { recordPromotionApplications } from "../../../services/promociones/promocionesService.js";
 
 const requestIdSchema = { type: "string" };
@@ -1695,22 +1698,23 @@ export default async function publicCitasRoutes(app) {
           };
         });
 
-        const responsePayload = {
-          request_id: requestId,
-          id_grupo_cita: canonicalResult.id_grupo_cita,
-          estado_grupo_codigo: canonicalResult.estado_grupo_codigo || "activo",
-          expires_at: canonicalResult.expires_at,
-          monto_total_hnl: subtotalGrupo,
-          subtotal_hnl: subtotalGrupo,
-          descuento_total_hnl: descuentoGrupo,
-          total_pagar_hnl: totalGrupo,
-          extras_a_pagar_hnl: totalGrupo,
-          total_hnl: totalGrupo,
-          ...(releaseToken ? { release_token: releaseToken } : {}),
-          promociones_aplicadas: promocionesAplicadasGrupo,
-          promociones_descartadas: promocionesDescartadasGrupo,
-          bloques: bloquesResponse,
-        };
+        const responsePayload = buildCanonicalHoldResponse({
+          requestId,
+          canonicalResult,
+          totals: selectedTotals,
+          blocks: bloquesResponse,
+          extensions: {
+            monto_total_hnl: subtotalGrupo,
+            subtotal_hnl: subtotalGrupo,
+            descuento_total_hnl: descuentoGrupo,
+            total_pagar_hnl: totalGrupo,
+            extras_a_pagar_hnl: totalGrupo,
+            total_hnl: totalGrupo,
+            ...(releaseToken ? { release_token: releaseToken } : {}),
+            promociones_aplicadas: promocionesAplicadasGrupo,
+            promociones_descartadas: promocionesDescartadasGrupo,
+          },
+        });
         await finalizeReservationIdempotency(dbClient, {
           requestId,
           scope: PUBLIC_HOLD_IDEMPOTENCY_SCOPE,
