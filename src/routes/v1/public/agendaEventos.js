@@ -3,6 +3,30 @@ import { isDecimalEventId } from "../../../services/agendaEventDispatcher.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function normalizeOrigin(value) {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return raw;
+  }
+}
+
+function setSseCorsHeaders(app, request, reply) {
+  const originHeader = String(request.headers?.origin || "").trim();
+  if (!originHeader) return;
+  const allowedOrigins = Array.isArray(app.config?.corsOrigins) && app.config.corsOrigins.length > 0
+    ? app.config.corsOrigins
+    : ["http://localhost:5173"];
+  const allowedOriginSet = new Set(allowedOrigins.map(normalizeOrigin).filter(Boolean));
+  if (!allowedOriginSet.has(normalizeOrigin(originHeader))) return;
+  reply.raw.setHeader("Access-Control-Allow-Origin", originHeader);
+  reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
+  reply.raw.setHeader("Vary", "Origin");
+}
+
 function resolveLastEventId(request) {
   const queryValue = request.query?.last_event_id;
   if (queryValue !== undefined && queryValue !== null && String(queryValue).trim() !== "") {
@@ -86,6 +110,7 @@ export default async function agendaEventosRoutes(app) {
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.setHeader("X-Accel-Buffering", "no");
     reply.raw.setHeader("Content-Encoding", "identity");
+    setSseCorsHeaders(app, request, reply);
 
     if (typeof reply.hijack === "function") reply.hijack();
     if (typeof reply.raw.flushHeaders === "function") reply.raw.flushHeaders();

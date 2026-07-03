@@ -27,6 +27,7 @@ async function createApp({ enabled = true, connectionLimit = false, branchState 
       retryMs: 5000,
       heartbeatMs: 10000,
     },
+    corsOrigins: ["http://localhost:5173"],
   });
   app.decorate("db", {
     async query(sql, params) {
@@ -85,12 +86,16 @@ test("GET /v1/public/agenda/eventos abre stream SSE real con retry, connected y 
   const { app, subscriptions } = await createApp();
   await app.listen({ port: 0, host: "127.0.0.1" });
   const baseUrl = `http://127.0.0.1:${app.server.address().port}`;
-  const response = await fetch(`${baseUrl}/v1/public/agenda/eventos?id_sucursal=${BRANCH_A}`);
+  const response = await fetch(`${baseUrl}/v1/public/agenda/eventos?id_sucursal=${BRANCH_A}`, {
+    headers: { Origin: "http://localhost:5173" },
+  });
 
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
   assert.equal(response.headers.get("cache-control"), "no-cache, no-transform");
   assert.equal(response.headers.get("x-accel-buffering"), "no");
+  assert.equal(response.headers.get("access-control-allow-origin"), "http://localhost:5173");
+  assert.equal(response.headers.get("access-control-allow-credentials"), "true");
 
   const body = await readUntil(response, "agenda.availability.changed");
   assert.match(body, /retry: 5000/);
