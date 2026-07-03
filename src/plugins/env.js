@@ -18,6 +18,22 @@ function parseBoolean(value, fallback = false) {
   return fallback;
 }
 
+function parseRequiredBoolean(value, name, fallback) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["true", "false"].includes(raw)) return raw === "true";
+  throw new Error(`${name} invalido. Usa true o false.`);
+}
+
+function parseIntegerInRange(value, name, { fallback, min, max }) {
+  const raw = String(value ?? "").trim();
+  const parsed = raw ? Number(raw) : fallback;
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} invalido. Debe ser un entero entre ${min} y ${max}.`);
+  }
+  return parsed;
+}
+
 function readRequired(name, { minLength = 1 } = {}) {
   const value = String(process.env[name] || "").trim();
   if (!value || value.length < minLength) {
@@ -151,6 +167,54 @@ async function envPlugin(app) {
       name: "BOOKING_ISV_ENABLED",
       defaultValue: false,
     }),
+    agendaSse: {
+      enabled: parseRequiredBoolean(process.env.AGENDA_SSE_ENABLED, "AGENDA_SSE_ENABLED", true),
+      heartbeatMs: parseIntegerInRange(process.env.AGENDA_SSE_HEARTBEAT_MS, "AGENDA_SSE_HEARTBEAT_MS", {
+        fallback: 20000,
+        min: 10000,
+        max: 60000,
+      }),
+      pollMs: parseIntegerInRange(process.env.AGENDA_EVENTS_POLL_MS, "AGENDA_EVENTS_POLL_MS", {
+        fallback: 750,
+        min: 250,
+        max: 5000,
+      }),
+      batchSize: parseIntegerInRange(process.env.AGENDA_EVENTS_BATCH_SIZE, "AGENDA_EVENTS_BATCH_SIZE", {
+        fallback: 500,
+        min: 1,
+        max: 1000,
+      }),
+      maxConnectionsPerIp: parseIntegerInRange(
+        process.env.AGENDA_SSE_MAX_CONNECTIONS_PER_IP,
+        "AGENDA_SSE_MAX_CONNECTIONS_PER_IP",
+        { fallback: 3, min: 1, max: 20 }
+      ),
+      maxConnectionsGlobal: parseIntegerInRange(
+        process.env.AGENDA_SSE_MAX_CONNECTIONS_GLOBAL,
+        "AGENDA_SSE_MAX_CONNECTIONS_GLOBAL",
+        { fallback: 1000, min: 1, max: 10000 }
+      ),
+      retryMs: parseIntegerInRange(process.env.AGENDA_SSE_RETRY_MS, "AGENDA_SSE_RETRY_MS", {
+        fallback: 5000,
+        min: 1000,
+        max: 30000,
+      }),
+      clientBufferMax: parseIntegerInRange(
+        process.env.AGENDA_SSE_CLIENT_BUFFER_MAX,
+        "AGENDA_SSE_CLIENT_BUFFER_MAX",
+        { fallback: 100, min: 10, max: 1000 }
+      ),
+      replayBatchSize: parseIntegerInRange(
+        process.env.AGENDA_SSE_REPLAY_BATCH_SIZE,
+        "AGENDA_SSE_REPLAY_BATCH_SIZE",
+        { fallback: 500, min: 1, max: 1000 }
+      ),
+      replayMaxEvents: parseIntegerInRange(
+        process.env.AGENDA_SSE_REPLAY_MAX_EVENTS,
+        "AGENDA_SSE_REPLAY_MAX_EVENTS",
+        { fallback: 5000, min: 100, max: 50000 }
+      ),
+    },
   };
 
   if (!["strict", "lax", "none"].includes(config.cookieSameSite)) {

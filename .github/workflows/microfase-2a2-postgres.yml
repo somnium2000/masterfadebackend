@@ -3,7 +3,11 @@ name: Microfase 2A2 Postgres
 on:
   push:
     branches:
+      - dev
       - codex/microfase-2a2-backend-hardening
+  pull_request:
+    branches:
+      - dev
   workflow_dispatch:
 
 jobs:
@@ -11,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        image: supabase/postgres:17.4.1.075
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -40,8 +44,10 @@ jobs:
           sudo apt-get install -y postgresql-client
       - name: Install Node dependencies
         run: npm ci
-      - name: Bootstrap CI
-        run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
+      - name: Bootstrap CI roles and extensions
+        run: |
+          psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
       - name: Load schema and fixtures
         run: |
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
@@ -54,6 +60,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260701_fase_1_rpc_reserva_atomica_holds.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b_reserva_canonica_hardening.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
+      - name: Apply agenda outbox migrations
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260703010000_fase_2a_agenda_eventos_outbox_v1.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260703020000_fase_2a2_agenda_outbox_fuentes_disponibilidad_v1.sql
       - name: Validate objects, backfill, triggers and fiscal guard
         run: |
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql
@@ -65,6 +75,11 @@ jobs:
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
       - name: Run tests
         run: npm test
+      - name: Run database preflight
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/masterfade_microfase_2a2
+          DB_SSL: "false"
+        run: npm run db:preflight
       - name: Run app.inject PostgreSQL integration
         run: RUN_CANONICAL_BOOKING_INTEGRATION=true node --test test/canonical-booking.integration.test.mjs
       - name: Run lint
