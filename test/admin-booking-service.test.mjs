@@ -92,16 +92,10 @@ test("normalizeAdminHoldCloseBody valida intencion, consentimiento y motivo", ()
     /intencion administrativa/
   );
   assert.throws(
-    () => normalizeAdminHoldCloseBody({ metodo_pago_codigo: "cortesia" }, { requireReason: true }),
-    /motivo/
+    () => normalizeAdminHoldCloseBody({ metodo_pago_codigo: "membresia" }),
+    /intencion administrativa/
   );
-  assert.deepEqual(
-    normalizeAdminHoldCloseBody({
-      metodo_pago_codigo: "recompensa",
-      consentimiento: { metodo: "WhatsApp", referencia: "ok cliente", confirmado: true },
-    }).consentimiento,
-    { metodo: "whatsapp", referencia: "ok cliente", confirmado: true }
-  );
+  assert.equal(normalizeAdminHoldCloseBody({ metodo_pago_codigo: "sin_pago" }).metodoPagoCodigo, "sin_pago");
 });
 
 test("assertAdminBenefitRequestAllowed protege promocion manual, recompensa y cortesia por rol", () => {
@@ -144,8 +138,22 @@ test("assertAdminBenefitRequestAllowed protege promocion manual, recompensa y co
   }, superContext));
 });
 
-function createAdminConfirmClient({ failOnGroupComplete = false } = {}) {
+function createAdminConfirmClient({ failOnGroupComplete = false, benefitSummary = {} } = {}) {
   const calls = [];
+  const summary = {
+    resumen_beneficios: {},
+    descuento_membresia_hnl: 0,
+    descuento_recompensa_hnl: 0,
+    descuento_promocion_hnl: 0,
+    descuento_cortesia_hnl: 0,
+    total_pagar_hnl: 150,
+    recompensa_context_token: null,
+    cortesia_aplicada: false,
+    membresia_aplicada: false,
+    recompensa_aplicada: false,
+    promocion_aplicada: false,
+    ...benefitSummary,
+  };
   const client = {
     calls,
     released: false,
@@ -179,6 +187,9 @@ function createAdminConfirmClient({ failOnGroupComplete = false } = {}) {
       }
       if (text.startsWith("SELECT id_cita")) {
         return { rows: [{ id_cita: "88888888-8888-4888-8888-888888888888" }], rowCount: 1 };
+      }
+      if (text.includes("FROM public.citas_admin_beneficios_resumen")) {
+        return { rows: [summary], rowCount: 1 };
       }
       if (text.startsWith("UPDATE public.citas") && text.includes("SET estado_cita_codigo = 'confirmada'")) {
         return { rows: [{ id_cita: "88888888-8888-4888-8888-888888888888", estado_cita_codigo: "confirmada" }], rowCount: 1 };
@@ -247,17 +258,56 @@ test("confirmAdminBookingHold efectivo confirma cita sin inventar estado de pago
   assert.equal(metadata.rol, "super_admin");
 });
 
-test("confirmAdminBookingHold cobertura registra fuente sin crear pago", async () => {
-  const client = createAdminConfirmClient();
+test("confirmAdminBookingHold deriva cobertura total desde resumen persistido", async () => {
+  const client = createAdminConfirmClient({
+    benefitSummary: {
+      resumen_beneficios: { cobertura: { fuente_cobertura_codigo: "membresia" } },
+      descuento_membresia_hnl: 150,
+      total_pagar_hnl: 0,
+      membresia_aplicada: true,
+    },
+  });
   const result = await confirmAdminBookingHold(
     createAdminConfirmApp(client),
-    adminConfirmRequest({ metodo_pago_codigo: "membresia" })
+    adminConfirmRequest({ metodo_pago_codigo: "sin_pago" })
   );
 
   assert.equal(result.estado_cita_codigo, "confirmada");
   assert.equal(result.estado_pago_codigo, null);
   assert.equal(result.fuente_cobertura_codigo, "membresia");
+  assert.deepEqual(result.fuentes_cobertura, ["membresia"]);
   assert.equal(result.pago_registrado, false);
+});
+
+test("confirmAdminBookingHold no permite declarar membresia, recompensa ni cortesia desde payload", async () => {
+  for (const metodo of ["membresia", "recompensa", "cortesia", "tarjeta"]) {
+    await assert.rejects(
+      () => confirmAdminBookingHold(
+        createAdminConfirmApp(createAdminConfirmClient()),
+        adminConfirmRequest({ metodo_pago_codigo: metodo })
+      ),
+      /intencion administrativa/
+    );
+  }
+});
+
+test("confirmAdminBookingHold preserva deuda cuando queda saldo pendiente", async () => {
+  const client = createAdminConfirmClient({
+    benefitSummary: {
+      descuento_membresia_hnl: 100,
+      total_pagar_hnl: 50,
+      membresia_aplicada: true,
+    },
+  });
+  const result = await confirmAdminBookingHold(
+    createAdminConfirmApp(client),
+    adminConfirmRequest({ metodo_pago_codigo: "sin_pago" })
+  );
+
+  assert.equal(result.fuente_cobertura_codigo, null);
+  assert.deepEqual(result.fuentes_cobertura, ["membresia"]);
+  assert.equal(result.total_pagar_hnl, 50);
+  assert.equal(result.estado_pago_codigo, null);
 });
 
 test("confirmAdminBookingHold ejecuta rollback ante fallo transaccional", async () => {

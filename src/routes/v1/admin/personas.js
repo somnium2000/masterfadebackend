@@ -426,6 +426,48 @@ const LIST_CLIENTES_SQL = `${CLIENTE_BASE_SQL}
   ORDER BY p.nombres ASC, p.apellidos ASC, c.id_cliente ASC
 `;
 
+const SEARCH_CLIENTES_SQL = `${CLIENTE_BASE_SQL}
+  AND (
+    $1::text IS NULL
+    OR lower(
+      concat_ws(' ',
+        p.nombres,
+        p.apellidos,
+        p.dni,
+        p.rtn,
+        p.telefono_principal,
+        COALESCE(cp.email, ''),
+        c.id_cliente::text,
+        p.id_persona::text
+      )
+    ) LIKE '%' || lower($1::text) || '%'
+  )
+  ORDER BY p.nombres ASC, p.apellidos ASC, c.id_cliente ASC
+  LIMIT $2::int
+  OFFSET $3::int
+`;
+
+const COUNT_CLIENTES_SQL = `
+  SELECT COUNT(*)::int AS total
+  FROM (${CLIENTE_BASE_SQL}
+    AND (
+      $1::text IS NULL
+      OR lower(
+        concat_ws(' ',
+          p.nombres,
+          p.apellidos,
+          p.dni,
+          p.rtn,
+          p.telefono_principal,
+          COALESCE(cp.email, ''),
+          c.id_cliente::text,
+          p.id_persona::text
+        )
+      ) LIKE '%' || lower($1::text) || '%'
+    )
+  ) clientes_scope
+`;
+
 const CLIENTE_BY_ID_SQL = `${CLIENTE_BASE_SQL}
   AND c.id_cliente = $1::uuid
   LIMIT 1
@@ -3898,8 +3940,26 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/clientes", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_CLIENTES_SQL);
-      return sendOk(reply, { clientes: rows.map(mapCliente) });
+      const rawQ = normalizeOptional(request.query?.q);
+      const q = rawQ && rawQ.length >= 2 ? rawQ : null;
+      const limit = Math.min(50, Math.max(1, Number.parseInt(request.query?.limit, 10) || 20));
+      const page = Math.max(1, Number.parseInt(request.query?.page, 10) || 1);
+      const offset = (page - 1) * limit;
+      const [{ rows }, totalResult] = await Promise.all([
+        app.db.query(q || request.query?.limit || request.query?.page ? SEARCH_CLIENTES_SQL : LIST_CLIENTES_SQL, q || request.query?.limit || request.query?.page ? [q, limit, offset] : []),
+        q || request.query?.limit || request.query?.page
+          ? app.db.query(COUNT_CLIENTES_SQL, [q])
+          : Promise.resolve({ rows: [{ total: 0 }] }),
+      ]);
+      return sendOk(reply, {
+        clientes: rows.map(mapCliente),
+        pagination: {
+          q,
+          page,
+          limit: q || request.query?.limit || request.query?.page ? limit : rows.length,
+          total: q || request.query?.limit || request.query?.page ? Number(totalResult.rows[0]?.total || 0) : rows.length,
+        },
+      });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar clientes", "PERSONAS_CLIENTS_LIST_ERROR");
     }

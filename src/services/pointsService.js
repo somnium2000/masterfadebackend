@@ -1254,6 +1254,61 @@ export async function resolveRewardRedeemGateForCliente(dbClient, {
   };
 }
 
+export async function prepareRewardRedeemContextForHold(dbClient, {
+  idCliente,
+  idSucursal,
+  idServicioCanje,
+} = {}) {
+  const safeClienteId = assertUuid(idCliente, "id_cliente");
+  const safeSucursalId = assertUuid(idSucursal, "id_sucursal");
+  const safeServicioId = assertUuid(idServicioCanje, "id_servicio");
+
+  await lockClientePointsScope(dbClient, safeClienteId);
+  await materializeCyclesIfAvailable(dbClient, safeClienteId);
+  const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: false });
+  await validateSucursalActiva(dbClient, safeSucursalId);
+  const puntosParaPremio = await resolvePuntosParaPremio(dbClient, cliente.id_sucursal_origen || safeSucursalId);
+  const safeRequired = Math.max(1, Number(puntosParaPremio || DEFAULT_PUNTOS_PARA_PREMIO));
+  const saldoActual = await getSaldoActual(dbClient, safeClienteId);
+  if (saldoActual < safeRequired) {
+    throw new AppError(409, "No hay puntos suficientes para canjear", {
+      code: "POINTS_REDEEM_INSUFFICIENT_BALANCE",
+      details: {
+        saldo_actual: saldoActual,
+        puntos_requeridos: safeRequired,
+      },
+    });
+  }
+
+  const planActivo = await hasActivePlan(dbClient, safeClienteId);
+  const servicio = await resolveServicioCanjeValido(dbClient, {
+    idServicioCanje: safeServicioId,
+    idSucursal: safeSucursalId,
+    hasPlanActivo: planActivo,
+  });
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresAt = nowSeconds + REDEEM_CONTEXT_TTL_SECONDS;
+  const canjeContextToken = buildRedeemContextToken({
+    v: REDEEM_CONTEXT_TOKEN_VERSION,
+    id_cliente: safeClienteId,
+    id_servicio_canje: safeServicioId,
+    id_sucursal: safeSucursalId,
+    puntos_requeridos: safeRequired,
+    iat: nowSeconds,
+    exp: expiresAt,
+  });
+
+  return {
+    canje_context_token: canjeContextToken,
+    id_cliente: safeClienteId,
+    id_servicio_canje: servicio.id_servicio,
+    id_sucursal_origen: safeSucursalId,
+    servicio_nombre: servicio.nombre_servicio,
+    puntos_requeridos: safeRequired,
+    saldo_actual: saldoActual,
+  };
+}
+
 export async function addManualPointsAdjustment(app, {
   idCliente,
   accion,

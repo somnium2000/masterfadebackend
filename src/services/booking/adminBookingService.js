@@ -32,9 +32,8 @@ import {
 } from "../membershipService.js";
 import {
   applyRewardRedeemForConfirmedGroup,
-  normalizeRedeemContextToken,
+  prepareRewardRedeemContextForHold,
   resolveRewardRedeemGateForCliente,
-  resolveRedeemContextForHold,
 } from "../pointsService.js";
 import {
   previewPromotionsForAppointment,
@@ -51,7 +50,7 @@ export const ADMIN_BOOKING_ORIGIN_CODE = "admin";
 export const ADMIN_BOOKING_UNPAID_PAYMENT_STATE = null;
 const ASSISTED_BOOKING_ROLES = new Set(["admin", "super_admin"]);
 const MAX_ADMIN_BOOKING_BLOCKS = 5;
-const ADMIN_CLOSE_METHODS = new Set(["sin_pago", "efectivo", "membresia", "recompensa", "cortesia"]);
+const ADMIN_CLOSE_METHODS = new Set(["sin_pago", "efectivo"]);
 const REWARD_CONSENT_METHODS = new Set(["presencial", "llamada", "whatsapp", "otro"]);
 const FORBIDDEN_PAYMENT_FIELDS = new Set([
   "card_number",
@@ -212,7 +211,6 @@ export function normalizeAdminHoldCloseBody(body = {}, { requireReason = false }
   return {
     metodoPagoCodigo,
     motivo,
-    canjeContextToken: cleanText(body.canje_context_token ?? body.id_points_tx_canje),
     consentimiento: consentimiento
       ? {
         metodo: cleanText(consentimiento.metodo ?? consentimiento.medio)?.toLowerCase(),
@@ -265,9 +263,13 @@ function normalizeRewardRequest(reward = {}, adminContext = {}) {
       });
     }
   }
+  if (cleanText(reward.canje_context_token ?? reward.id_points_tx_canje)) {
+    throw new AppError(422, "El contexto de canje administrativo se resuelve internamente", {
+      code: "ADMIN_BOOKING_REWARD_CONTEXT_TOKEN_FORBIDDEN",
+    });
+  }
   return {
     aplicar: true,
-    canjeContextToken: cleanText(reward.canje_context_token ?? reward.id_points_tx_canje),
     consentimiento: {
       confirmado: true,
       medio: method,
@@ -898,6 +900,13 @@ async function createCanonicalAdminReservation(app, dbClient, {
     },
   });
 
+  await persistAdminBenefitSummary(dbClient, {
+    groupId: canonicalResult.id_grupo_cita,
+    responsePayload,
+    benefitContext,
+    totalsByBenefit,
+    selectedTotals,
+  });
   await auditAdminBooking(dbClient, {
     request,
     requestId,
@@ -917,25 +926,41 @@ async function resolveAdminBenefitContext(dbClient, {
 }) {
   const benefits = normalized.beneficios || {};
   let rewardRedeemContext = null;
-  let rewardGate = null;
   const rewardRequest = benefits.recompensa?.aplicar
     ? normalizeRewardRequest(benefits.recompensa, adminContext)
     : null;
-  if (rewardRequest?.canjeContextToken) {
-    rewardRedeemContext = await resolveRedeemContextForHold(dbClient, {
-      idCliente: customer.id_cliente,
-      canjeContextToken: normalizeRedeemContextToken(rewardRequest.canjeContextToken),
-      idSucursal: branch.id_sucursal,
+  const rewardGate = await resolveRewardRedeemGateForCliente(dbClient, {
+    idCliente: customer.id_cliente,
+    idSucursal: branch.id_sucursal,
+  });
+  if (rewardRequest?.aplicar && Number(rewardGate.recompensas_disponibles || 0) < 1) {
+    throw new AppError(409, "El cliente no tiene recompensas disponibles", {
+      code: "ADMIN_BOOKING_REWARD_NOT_AVAILABLE",
+      details: rewardGate,
     });
-  } else {
-    rewardGate = await resolveRewardRedeemGateForCliente(dbClient, {
-      idCliente: customer.id_cliente,
-      idSucursal: branch.id_sucursal,
-    });
-    if (rewardRequest?.aplicar && Number(rewardGate.recompensas_disponibles || 0) < 1) {
-      throw new AppError(409, "El cliente no tiene recompensas disponibles", {
-        code: "ADMIN_BOOKING_REWARD_NOT_AVAILABLE",
-        details: rewardGate,
+  }
+  if (rewardRequest?.aplicar) {
+    const candidateServiceIds = [
+      ...new Set((normalized.integrantes || []).flatMap((integrante) => integrante.serviceIds || []).filter(Boolean)),
+    ];
+    for (const candidateServiceId of candidateServiceIds) {
+      try {
+        rewardRedeemContext = await prepareRewardRedeemContextForHold(dbClient, {
+          idCliente: customer.id_cliente,
+          idSucursal: branch.id_sucursal,
+          idServicioCanje: candidateServiceId,
+        });
+        break;
+      } catch (error) {
+        if (!(error instanceof AppError)) throw error;
+        if (!["POINTS_REDEEM_SERVICE_FORBIDDEN", "POINTS_REDEEM_SERVICE_BRANCH_MISSING"].includes(error.code)) {
+          throw error;
+        }
+      }
+    }
+    if (!rewardRedeemContext) {
+      throw new AppError(409, "No hay un servicio compatible para canjear la recompensa", {
+        code: "ADMIN_BOOKING_REWARD_NO_COMPATIBLE_SERVICE",
       });
     }
   }
@@ -1023,6 +1048,184 @@ function buildCourtesyResponse(selectedIntegrantes = [], discountHnl = 0) {
     cubierto_hnl: normalizeMoney(discountHnl),
     tipo: courtesy?.tipo || null,
     motivo: courtesy?.motivo || null,
+  };
+}
+
+function buildCoverageSources(summary = {}) {
+  const sources = [];
+  if (normalizeMoney(summary.membresia_cubierto_hnl) > 0) sources.push("membresia");
+  if (normalizeMoney(summary.recompensa_cubierto_hnl) > 0) sources.push("recompensa");
+  if (normalizeMoney(summary.promocion_descuento_hnl) > 0) sources.push("promocion");
+  if (normalizeMoney(summary.cortesia_cubierto_hnl) > 0) sources.push("cortesia");
+  return sources;
+}
+
+function resolveFullCoverageSource(summary = {}) {
+  if (normalizeMoney(summary.total_pagar_hnl) > 0) return null;
+  const sources = buildCoverageSources(summary);
+  if (!sources.length) return null;
+  return sources.length === 1 ? sources[0] : "mixta";
+}
+
+function buildAdminBenefitSummary({
+  responsePayload,
+  benefitContext,
+  totalsByBenefit,
+  selectedTotals,
+}) {
+  const beneficios = responsePayload?.beneficios || {};
+  const summary = {
+    version: 1,
+    id_grupo_cita: responsePayload?.id_grupo_cita || null,
+    descuentos: {
+      membresia_hnl: normalizeMoney(totalsByBenefit.membership),
+      recompensa_hnl: normalizeMoney(totalsByBenefit.reward),
+      promocion_hnl: normalizeMoney(totalsByBenefit.promotion),
+      cortesia_hnl: normalizeMoney(totalsByBenefit.courtesy),
+      total_hnl: normalizeMoney(selectedTotals.descuento_hnl),
+    },
+    cobertura: {
+      fuentes: buildCoverageSources({
+        membresia_cubierto_hnl: totalsByBenefit.membership,
+        recompensa_cubierto_hnl: totalsByBenefit.reward,
+        promocion_descuento_hnl: totalsByBenefit.promotion,
+        cortesia_cubierto_hnl: totalsByBenefit.courtesy,
+      }),
+      fuente_cobertura_codigo: resolveFullCoverageSource({
+        total_pagar_hnl: selectedTotals.total_hnl,
+        membresia_cubierto_hnl: totalsByBenefit.membership,
+        recompensa_cubierto_hnl: totalsByBenefit.reward,
+        promocion_descuento_hnl: totalsByBenefit.promotion,
+        cortesia_cubierto_hnl: totalsByBenefit.courtesy,
+      }),
+    },
+    total_pagar_hnl: normalizeMoney(selectedTotals.total_hnl),
+    subtotal_hnl: normalizeMoney(selectedTotals.subtotal_hnl),
+    recompensa_context_token: benefitContext.rewardRedeemContext?.canje_context_token || null,
+    cortesia_aplicada: Boolean(beneficios.cortesia?.aplicada),
+    membresia_aplicada: Boolean(beneficios.membresia?.aplicada),
+    recompensa_aplicada: Boolean(beneficios.recompensa?.aplicada),
+    promocion_aplicada: normalizeMoney(totalsByBenefit.promotion) > 0,
+    beneficios,
+  };
+  return summary;
+}
+
+async function persistAdminBenefitSummary(dbClient, {
+  groupId,
+  responsePayload,
+  benefitContext,
+  totalsByBenefit,
+  selectedTotals,
+}) {
+  const summary = buildAdminBenefitSummary({
+    responsePayload,
+    benefitContext,
+    totalsByBenefit,
+    selectedTotals,
+  });
+  await dbClient.query(
+    `
+      INSERT INTO public.citas_admin_beneficios_resumen (
+        id_grupo_cita,
+        resumen_beneficios,
+        descuento_membresia_hnl,
+        descuento_recompensa_hnl,
+        descuento_promocion_hnl,
+        descuento_cortesia_hnl,
+        total_pagar_hnl,
+        recompensa_context_token,
+        cortesia_aplicada,
+        membresia_aplicada,
+        recompensa_aplicada,
+        promocion_aplicada
+      )
+      VALUES (
+        $1::uuid,
+        $2::jsonb,
+        $3::numeric,
+        $4::numeric,
+        $5::numeric,
+        $6::numeric,
+        $7::numeric,
+        $8::text,
+        $9::boolean,
+        $10::boolean,
+        $11::boolean,
+        $12::boolean
+      )
+      ON CONFLICT (id_grupo_cita) DO UPDATE
+      SET resumen_beneficios = EXCLUDED.resumen_beneficios,
+          descuento_membresia_hnl = EXCLUDED.descuento_membresia_hnl,
+          descuento_recompensa_hnl = EXCLUDED.descuento_recompensa_hnl,
+          descuento_promocion_hnl = EXCLUDED.descuento_promocion_hnl,
+          descuento_cortesia_hnl = EXCLUDED.descuento_cortesia_hnl,
+          total_pagar_hnl = EXCLUDED.total_pagar_hnl,
+          recompensa_context_token = EXCLUDED.recompensa_context_token,
+          cortesia_aplicada = EXCLUDED.cortesia_aplicada,
+          membresia_aplicada = EXCLUDED.membresia_aplicada,
+          recompensa_aplicada = EXCLUDED.recompensa_aplicada,
+          promocion_aplicada = EXCLUDED.promocion_aplicada,
+          updated_at = now()
+    `,
+    [
+      groupId,
+      JSON.stringify(summary),
+      summary.descuentos.membresia_hnl,
+      summary.descuentos.recompensa_hnl,
+      summary.descuentos.promocion_hnl,
+      summary.descuentos.cortesia_hnl,
+      summary.total_pagar_hnl,
+      summary.recompensa_context_token,
+      summary.cortesia_aplicada,
+      summary.membresia_aplicada,
+      summary.recompensa_aplicada,
+      summary.promocion_aplicada,
+    ]
+  );
+  return summary;
+}
+
+async function loadAdminHoldBenefitSummary(client, groupId) {
+  const result = await client.query(
+    `
+      SELECT
+        resumen_beneficios,
+        COALESCE(descuento_membresia_hnl, 0)::numeric AS descuento_membresia_hnl,
+        COALESCE(descuento_recompensa_hnl, 0)::numeric AS descuento_recompensa_hnl,
+        COALESCE(descuento_promocion_hnl, 0)::numeric AS descuento_promocion_hnl,
+        COALESCE(descuento_cortesia_hnl, 0)::numeric AS descuento_cortesia_hnl,
+        COALESCE(total_pagar_hnl, 0)::numeric AS total_pagar_hnl,
+        recompensa_context_token,
+        COALESCE(cortesia_aplicada, FALSE) AS cortesia_aplicada,
+        COALESCE(membresia_aplicada, FALSE) AS membresia_aplicada,
+        COALESCE(recompensa_aplicada, FALSE) AS recompensa_aplicada,
+        COALESCE(promocion_aplicada, FALSE) AS promocion_aplicada
+      FROM public.citas_admin_beneficios_resumen
+      WHERE id_grupo_cita = $1::uuid
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [groupId]
+  );
+  const row = result.rows[0] || null;
+  if (!row) {
+    throw new AppError(409, "El hold administrativo no tiene resumen financiero persistido", {
+      code: "ADMIN_BOOKING_BENEFIT_SUMMARY_MISSING",
+    });
+  }
+  return {
+    resumen_beneficios: row.resumen_beneficios || {},
+    membresia_cubierto_hnl: normalizeMoney(row.descuento_membresia_hnl),
+    recompensa_cubierto_hnl: normalizeMoney(row.descuento_recompensa_hnl),
+    promocion_descuento_hnl: normalizeMoney(row.descuento_promocion_hnl),
+    cortesia_cubierto_hnl: normalizeMoney(row.descuento_cortesia_hnl),
+    total_pagar_hnl: normalizeMoney(row.total_pagar_hnl),
+    recompensa_context_token: cleanText(row.recompensa_context_token),
+    cortesia_aplicada: row.cortesia_aplicada === true,
+    membresia_aplicada: row.membresia_aplicada === true,
+    recompensa_aplicada: row.recompensa_aplicada === true,
+    promocion_aplicada: row.promocion_aplicada === true,
   };
 }
 
@@ -1359,22 +1562,7 @@ export async function confirmAdminBookingHold(app, request) {
   }
   const adminContext = assertAdminBookingRole(request.claims);
   const groupId = assertUuid(request.params?.idGrupoCita || request.params?.id_grupo_cita, "id_grupo_cita");
-  const normalized = normalizeAdminHoldCloseBody(request.body, {
-    requireReason: ["cortesia", "recompensa"].includes(String(request.body?.metodo_pago_codigo || request.body?.metodo || "").toLowerCase()),
-  });
-  if (adminContext.role === "admin" && normalized.metodoPagoCodigo === "cortesia") {
-    throw new AppError(403, "Admin no puede aplicar cortesias ni descuentos excepcionales", {
-      code: "ADMIN_BOOKING_COURTESY_FORBIDDEN",
-    });
-  }
-  if (
-    normalized.metodoPagoCodigo === "recompensa"
-    && (normalized.consentimiento?.confirmado !== true || !REWARD_CONSENT_METHODS.has(normalized.consentimiento?.metodo))
-  ) {
-    throw new AppError(422, "El consentimiento es obligatorio para aplicar recompensas", {
-      code: "ADMIN_BOOKING_REWARD_CONSENT_REQUIRED",
-    });
-  }
+  const normalized = normalizeAdminHoldCloseBody(request.body);
 
   const dbClient = await app.db.connect();
   try {
@@ -1392,44 +1580,35 @@ export async function confirmAdminBookingHold(app, request) {
       });
     }
 
-    let estadoPagoCodigo = ADMIN_BOOKING_UNPAID_PAYMENT_STATE;
-    let fuenteCoberturaCodigo = null;
+    const benefitSummary = await loadAdminHoldBenefitSummary(dbClient, groupId);
+    const estadoPagoCodigo = ADMIN_BOOKING_UNPAID_PAYMENT_STATE;
+    const fuenteCoberturaCodigo = resolveFullCoverageSource(benefitSummary);
+    const fuentesCobertura = buildCoverageSources(benefitSummary);
     let rewardFinalization = null;
     if (normalized.metodoPagoCodigo === "efectivo") {
       await confirmAppointmentsWithoutPayment(dbClient, {
         citas: appointmentIds,
         motivo_confirmacion: "admin_efectivo_pendiente",
       });
-    } else if (normalized.metodoPagoCodigo === "sin_pago") {
+    } else {
       await confirmAppointmentsWithoutPayment(dbClient, {
         citas: appointmentIds,
         motivo_confirmacion: "admin_confirmacion_sin_pago",
       });
-    } else if (normalized.metodoPagoCodigo === "membresia") {
-      await confirmAppointmentsWithoutPayment(dbClient, {
-        citas: appointmentIds,
-        motivo_confirmacion: "admin_cobertura_membresia",
-      });
-      fuenteCoberturaCodigo = "membresia";
-    } else if (normalized.metodoPagoCodigo === "recompensa") {
-      await confirmAppointmentsWithoutPayment(dbClient, {
-        citas: appointmentIds,
-        motivo_confirmacion: "admin_cobertura_recompensa",
-      });
+    }
+    if (benefitSummary.recompensa_aplicada) {
+      if (!benefitSummary.recompensa_context_token) {
+        throw new AppError(409, "El hold administrativo no tiene contexto de recompensa persistido", {
+          code: "ADMIN_BOOKING_REWARD_CONTEXT_MISSING",
+        });
+      }
       rewardFinalization = await applyRewardRedeemForConfirmedGroup(dbClient, {
         idGrupoCita: groupId,
         idCliente: group.id_cliente,
-        canjeContextToken: normalized.canjeContextToken,
+        canjeContextToken: benefitSummary.recompensa_context_token,
         motivo: normalized.motivo || "Canje administrativo con consentimiento",
         createdByUserId: adminContext.userId,
       });
-      fuenteCoberturaCodigo = "recompensa";
-    } else if (normalized.metodoPagoCodigo === "cortesia") {
-      await confirmAppointmentsWithoutPayment(dbClient, {
-        citas: appointmentIds,
-        motivo_confirmacion: "admin_cortesia",
-      });
-      fuenteCoberturaCodigo = "cortesia";
     }
     await dbClient.query(
       `
@@ -1455,9 +1634,11 @@ export async function confirmAdminBookingHold(app, request) {
         metodo_pago_codigo: normalized.metodoPagoCodigo,
         estado_pago_codigo: estadoPagoCodigo,
         fuente_cobertura_codigo: fuenteCoberturaCodigo,
+        fuentes_cobertura: fuentesCobertura,
         consentimiento: normalized.consentimiento,
         recompensa_utilizada: rewardFinalization,
-        total_pagar_hnl: Number(group.total_pagar_hnl || 0),
+        beneficios_resumen: benefitSummary.resumen_beneficios,
+        total_pagar_hnl: Number(benefitSummary.total_pagar_hnl || group.total_pagar_hnl || 0),
       },
     });
     await dbClient.query("COMMIT");
@@ -1468,6 +1649,9 @@ export async function confirmAdminBookingHold(app, request) {
       metodo_pago_codigo: normalized.metodoPagoCodigo,
       estado_hold_codigo: "consumido",
       fuente_cobertura_codigo: fuenteCoberturaCodigo,
+      fuentes_cobertura: fuentesCobertura,
+      beneficios_resumen: benefitSummary.resumen_beneficios,
+      total_pagar_hnl: Number(benefitSummary.total_pagar_hnl || group.total_pagar_hnl || 0),
       recompensa_utilizada: rewardFinalization,
       confirmado: true,
       pago_registrado: false,
