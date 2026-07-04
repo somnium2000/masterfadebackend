@@ -5,6 +5,7 @@ const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
 const requestIdSchema = { type: "string" };
 const MAX_NOMBRE_LENGTH = 140;
 const MAX_DESCRIPCION_LENGTH = 500;
+const CORTESIA_NAME_DUPLICATE_MESSAGE = "Ya existe una cortesía con ese nombre. Usa la cortesía existente o cambia el nombre.";
 
 const errorResponseSchema = {
   type: "object",
@@ -412,50 +413,64 @@ async function normalizePayloadSucursales(client, claims, payloadSucursales) {
   return branchIds.map((idSucursal) => dedup.get(idSucursal));
 }
 
-async function ensureUniqueCourtesyNameByBranch(client, cortesiaId, nombre, branchIds) {
+function createCourtesyNameDuplicateError() {
+  return new AppError(409, CORTESIA_NAME_DUPLICATE_MESSAGE, {
+    code: "CORTESIA_NAME_DUPLICATE",
+  });
+}
+
+async function ensureUniqueCourtesyNameGlobal(client, cortesiaId, nombre) {
   const { rowCount } = await client.query(
     `
       SELECT 1
       FROM public.cortesias c
-      JOIN public.cortesias_sucursales cs
-        ON cs.cortesia_id = c.id
-      WHERE LOWER(TRIM(c.nombre)) = LOWER(TRIM($1::text))
-        AND cs.id_sucursal = ANY($2::uuid[])
-        AND ($3::uuid IS NULL OR c.id <> $3::uuid)
+      WHERE LOWER(regexp_replace(TRIM(c.nombre), '[^[:alnum:]]+', '', 'g')) =
+            LOWER(regexp_replace(TRIM($1::text), '[^[:alnum:]]+', '', 'g'))
+        AND ($2::uuid IS NULL OR c.id <> $2::uuid)
       LIMIT 1
     `,
-    [nombre, branchIds, cortesiaId]
+    [nombre, cortesiaId]
   );
 
   if (rowCount) {
-    throw new AppError(409, "Ya existe una cortesia con ese nombre en al menos una sucursal seleccionada", {
-      code: "CORTESIAS_DUPLICATE_NAME",
-    });
+    throw createCourtesyNameDuplicateError();
   }
 }
 
-async function replaceCourtesyBranches(client, cortesiaId, sucursales) {
-  await client.query(
-    `
-      DELETE FROM public.cortesias_sucursales
-      WHERE cortesia_id = $1::uuid
-    `,
-    [cortesiaId]
-  );
+async function syncCourtesyBranches(client, cortesiaId, sucursales) {
+  const branchIds = sucursales.map((sucursal) => sucursal.id_sucursal);
 
   for (const sucursal of sucursales) {
+    // AM: Mantiene la relacion por sucursal sin borrado fisico.
     await client.query(
       `
         INSERT INTO public.cortesias_sucursales (
           cortesia_id,
           id_sucursal,
-          activa
+          activa,
+          updated_at
         )
-        VALUES ($1::uuid, $2::uuid, $3::boolean)
+        VALUES ($1::uuid, $2::uuid, $3::boolean, NOW())
+        ON CONFLICT (cortesia_id, id_sucursal)
+        DO UPDATE SET
+          activa = EXCLUDED.activa,
+          updated_at = NOW()
       `,
       [cortesiaId, sucursal.id_sucursal, sucursal.activa]
     );
   }
+
+  await client.query(
+    `
+      UPDATE public.cortesias_sucursales
+      SET
+        activa = FALSE,
+        updated_at = NOW()
+      WHERE cortesia_id = $1::uuid
+        AND NOT (id_sucursal = ANY($2::uuid[]))
+    `,
+    [cortesiaId, branchIds]
+  );
 }
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
@@ -467,9 +482,9 @@ function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) 
     });
   }
 
-  if (error?.code === "23505") {
-    return sendError(reply, 409, "Conflicto de unicidad al guardar cortesias", {
-      code: "CORTESIAS_CONFLICT",
+  if (error?.code === "23505" && error?.constraint === "uq_cortesias_nombre_normalizado_global") {
+    return sendError(reply, 409, CORTESIA_NAME_DUPLICATE_MESSAGE, {
+      code: "CORTESIA_NAME_DUPLICATE",
       details: error.detail || error.message,
       requestId: request.id,
     });
@@ -576,7 +591,7 @@ export default async function adminCortesiasRoutes(app) {
         const nombre = normalizeRequiredText(request.body?.nombre, "nombre");
         const descripcion = normalizeOptionalText(request.body?.descripcion);
         const sucursales = await normalizePayloadSucursales(client, request.claims, request.body?.sucursales);
-        await ensureUniqueCourtesyNameByBranch(client, null, nombre, sucursales.map((item) => item.id_sucursal));
+        await ensureUniqueCourtesyNameGlobal(client, null, nombre);
 
         await client.query("BEGIN");
 
@@ -590,7 +605,7 @@ export default async function adminCortesiasRoutes(app) {
         );
 
         const cortesiaId = insertResult.rows[0].id;
-        await replaceCourtesyBranches(client, cortesiaId, sucursales);
+        await syncCourtesyBranches(client, cortesiaId, sucursales);
 
         const finalResult = await client.query(GET_CORTESIA_SQL, [cortesiaId, null]);
         await client.query("COMMIT");
@@ -674,21 +689,9 @@ export default async function adminCortesiasRoutes(app) {
         let nextSucursales = null;
         if (request.body?.sucursales !== undefined) {
           nextSucursales = await normalizePayloadSucursales(client, request.claims, request.body.sucursales);
-        } else {
-          const scoped = await client.query(GET_CORTESIA_SQL, [request.params.id, null]);
-          const existing = mapCortesiaRow(scoped.rows[0]);
-          nextSucursales = existing.sucursales.map((item) => ({
-            id_sucursal: item.id_sucursal,
-            activa: Boolean(item.activa),
-          }));
         }
 
-        await ensureUniqueCourtesyNameByBranch(
-          client,
-          request.params.id,
-          nextNombre,
-          nextSucursales.map((item) => item.id_sucursal)
-        );
+        await ensureUniqueCourtesyNameGlobal(client, request.params.id, nextNombre);
 
         await client.query(
           `
@@ -702,7 +705,9 @@ export default async function adminCortesiasRoutes(app) {
           [request.params.id, nextNombre, nextDescripcion ?? null]
         );
 
-        await replaceCourtesyBranches(client, request.params.id, nextSucursales);
+        if (nextSucursales) {
+          await syncCourtesyBranches(client, request.params.id, nextSucursales);
+        }
 
         const finalResult = await client.query(GET_CORTESIA_SQL, [request.params.id, null]);
         await client.query("COMMIT");

@@ -26,16 +26,54 @@ export class AppError extends Error {
   }
 }
 
+export const DB_SCHEMA_OUTDATED_CODE = "DB_SCHEMA_OUTDATED";
+export const DB_SCHEMA_OUTDATED_MESSAGE = "El servicio de reservas está temporalmente en mantenimiento.";
+
+const OUTDATED_SCHEMA_SQLSTATES = new Set([
+  "42883",
+  "42703",
+  "42P01",
+  "42704",
+]);
+
+export function isDatabaseSchemaOutdatedError(error) {
+  const code = String(error?.code || error?.cause?.code || "").trim().toUpperCase();
+  if (code === DB_SCHEMA_OUTDATED_CODE || OUTDATED_SCHEMA_SQLSTATES.has(code)) return true;
+
+  const haystack = [
+    error?.message,
+    error?.detail,
+    error?.hint,
+    error?.where,
+    error?.cause?.message,
+  ].map((value) => String(value || "")).join("\n");
+
+  return /function .* does not exist|column .* does not exist|relation .* does not exist|no existe la funci[oó]n|no existe la columna|no existe la relaci[oó]n/i.test(haystack);
+}
+
+export function toDatabaseSchemaOutdatedError(error) {
+  if (!isDatabaseSchemaOutdatedError(error)) return error;
+  if (error instanceof AppError && error.code === DB_SCHEMA_OUTDATED_CODE) return error;
+  return new AppError(503, DB_SCHEMA_OUTDATED_MESSAGE, {
+    code: DB_SCHEMA_OUTDATED_CODE,
+  });
+}
+
 function shouldExposeDetails(statusCode, code, exposeDetails) {
   if (exposeDetails === true) return true;
   if (statusCode === 429) return true;
   if (code === "VALIDATION_ERROR") return true;
+  if (String(code || "").trim().toUpperCase() === DB_SCHEMA_OUTDATED_CODE) return false;
   return false;
 }
 
 function sanitizeClientMessage(statusCode, code, message) {
   const normalizedCode = String(code || "").trim().toUpperCase();
   const normalizedMessage = String(message || "").trim();
+
+  if (normalizedCode === DB_SCHEMA_OUTDATED_CODE) {
+    return DB_SCHEMA_OUTDATED_MESSAGE;
+  }
 
   const sensitiveCodes = new Set([
     "DB_NOT_CONFIGURED",
@@ -100,6 +138,16 @@ export function sendError(reply, statusCode, message, { code, details, requestId
  * Registrar con: app.setErrorHandler(globalErrorHandler)
  */
 export function globalErrorHandler(error, request, reply) {
+  const normalizedError = toDatabaseSchemaOutdatedError(error);
+  if (normalizedError instanceof AppError) {
+    return sendError(reply, normalizedError.statusCode, normalizedError.message, {
+      code: normalizedError.code,
+      details: normalizedError.details,
+      requestId: request.id,
+      exposeDetails: false,
+    });
+  }
+
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,

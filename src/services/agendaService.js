@@ -1,4 +1,5 @@
 import { AppError } from "../utils/errors.js";
+import { resolveBookingIsvEnabled } from "../config/bookingConfig.js";
 import { MockPaymentProvider } from "./payments/MockPaymentProvider.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
 
@@ -222,7 +223,11 @@ export function parseDateTime(value, field = "fecha_inicio") {
   return parsed;
 }
 
-function extractDateAndTimeKeyFromDateTime(value, field = "fecha_inicio") {
+function hasExplicitTimezoneOffset(value) {
+  return /(?:Z|[+-]\d{2}:\d{2})$/i.test(String(value || "").trim());
+}
+
+export function normalizeOperationalDateTime(value, field = "fecha_inicio") {
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) {
       throw new AppError(400, `${field} debe ser una fecha-hora valida`, {
@@ -230,26 +235,35 @@ function extractDateAndTimeKeyFromDateTime(value, field = "fecha_inicio") {
         details: { field, value: null },
       });
     }
+    const parts = getDateTimePartsInTimeZone(value, AGENDA_DEFAULT_TIME_ZONE);
     return {
-      dateKey: formatDateOnly(value),
-      timeKey: toTimeLabel(value),
+      fecha_operativa: `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`,
+      hora_operativa: `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`,
+      utcDate: value,
+      iso_utc: value.toISOString(),
     };
   }
 
   const raw = String(value || "").trim();
-  const match = raw.match(
-    /^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/
-  );
-  if (!match) {
+  if (!raw || !hasExplicitTimezoneOffset(raw)) {
+    throw new AppError(400, `${field} debe ser una fecha-hora valida`, {
+      code: "AGENDA_DATETIME_TIMEZONE_REQUIRED",
+      details: { field, value: raw || null, time_zone: AGENDA_DEFAULT_TIME_ZONE },
+    });
+  }
+  const parsed = parseDateTime(raw, field);
+  const parts = getDateTimePartsInTimeZone(parsed, AGENDA_DEFAULT_TIME_ZONE);
+  if (!parts) {
     throw new AppError(400, `${field} debe ser una fecha-hora valida`, {
       code: "AGENDA_DATETIME_INVALID",
       details: { field, value: raw || null },
     });
   }
-
   return {
-    dateKey: parseDateOnly(match[1], field),
-    timeKey: match[2],
+    fecha_operativa: `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`,
+    hora_operativa: `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`,
+    utcDate: parsed,
+    iso_utc: parsed.toISOString(),
   };
 }
 
@@ -287,18 +301,64 @@ function isPoolLikeClient(client) {
 }
 
 function startOfDay(dateString) {
-  return new Date(`${dateString}T00:00:00`);
+  return buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 0, 0, 0, AGENDA_DEFAULT_TIME_ZONE);
 }
 
 function endOfDay(dateString) {
-  return new Date(`${dateString}T23:59:59.999`);
+  const endAt = buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 23, 59, 59, AGENDA_DEFAULT_TIME_ZONE);
+  if (endAt) endAt.setMilliseconds(999);
+  return endAt;
 }
 
 function formatDateOnly(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function parseDateKeyParts(dateString, field = "fecha") {
+  const safeDate = parseDateOnly(dateString, field);
+  const [year, month, day] = safeDate.split("-").map(Number);
+  return { safeDate, year, month, day };
+}
+
+function dateKeyToUtcMs(dateString, field = "fecha") {
+  const { year, month, day } = parseDateKeyParts(dateString, field);
+  return Date.UTC(year, month - 1, day);
+}
+
+function buildDateKeyRange(fromDate, toDate) {
+  const safeFrom = parseDateOnly(fromDate, "fecha_desde");
+  const safeTo = parseDateOnly(toDate, "fecha_hasta");
+  const fromMs = dateKeyToUtcMs(safeFrom, "fecha_desde");
+  const toMs = dateKeyToUtcMs(safeTo, "fecha_hasta");
+  if (toMs < fromMs) {
+    throw new AppError(400, "fecha_hasta no puede ser menor que fecha_desde", {
+      code: "AGENDA_DATE_RANGE_INVALID",
+      details: { fecha_desde: safeFrom, fecha_hasta: safeTo },
+    });
+  }
+
+  const dateKeys = [];
+  for (let cursorMs = fromMs; cursorMs <= toMs; cursorMs += 24 * 60 * 60 * 1000) {
+    dateKeys.push(formatDateOnly(new Date(cursorMs)));
+  }
+  return dateKeys;
+}
+
+export function countDateKeyRangeDays(fromDate, toDate) {
+  const safeFrom = parseDateOnly(fromDate, "fecha_desde");
+  const safeTo = parseDateOnly(toDate, "fecha_hasta");
+  const fromMs = dateKeyToUtcMs(safeFrom, "fecha_desde");
+  const toMs = dateKeyToUtcMs(safeTo, "fecha_hasta");
+  if (toMs < fromMs) {
+    throw new AppError(400, "fecha_hasta no puede ser menor que fecha_desde", {
+      code: "AGENDA_DATE_RANGE_INVALID",
+      details: { fecha_desde: safeFrom, fecha_hasta: safeTo },
+    });
+  }
+  return Math.floor((toMs - fromMs) / (24 * 60 * 60 * 1000)) + 1;
 }
 
 function getDateTimePartsInTimeZone(dateValue, timeZone) {
@@ -342,6 +402,15 @@ function formatDateOnlyInTimeZone(dateValue, timeZone) {
   const parts = getDateTimePartsInTimeZone(dateValue, timeZone);
   if (!parts) return null;
   return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+export function resolveTariffOperationalDate(value, { timeZone = AGENDA_DEFAULT_TIME_ZONE } = {}) {
+  if (!value) return formatDateOnlyInTimeZone(new Date(), timeZone) || formatDateOnly(new Date());
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.trim())) {
+    return parseDateOnly(value.trim(), "fecha_operativa");
+  }
+  const parsed = value instanceof Date ? value : parseDateTime(value, "fecha_inicio");
+  return formatDateOnlyInTimeZone(parsed, timeZone) || formatDateOnly(parsed);
 }
 
 function getTimeZoneOffsetMs(dateValue, timeZone) {
@@ -418,7 +487,13 @@ function trimIntervalsByMinimumStart(intervals, minimumStartAt) {
 }
 
 function combineDateAndTime(dateString, timeString) {
-  return new Date(`${dateString}T${String(timeString).slice(0, 8)}`);
+  const safeDate = parseDateOnly(dateString, "fecha");
+  const [hourRaw, minuteRaw, secondRaw = "0"] = String(timeString || "").slice(0, 8).split(":");
+  const hour = Number(hourRaw);
+  const minute = Number(minuteRaw);
+  const second = Number(secondRaw);
+  const built = buildDateInTimeZone(safeDate, hour, minute, second, AGENDA_DEFAULT_TIME_ZONE);
+  return built || new Date(NaN);
 }
 
 function normalizeInterval(start, end) {
@@ -487,8 +562,9 @@ function subtractIntervals(baseIntervals, busyIntervals) {
 }
 
 function toTimeLabel(date) {
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const parts = getDateTimePartsInTimeZone(date, AGENDA_DEFAULT_TIME_ZONE);
+  const hours = String(parts?.hour ?? 0).padStart(2, "0");
+  const minutes = String(parts?.minute ?? 0).padStart(2, "0");
   return `${hours}:${minutes}`;
 }
 
@@ -903,12 +979,93 @@ function normalizeBookingSelectionType(rawValue, { required = false } = {}) {
   return normalized;
 }
 
-export async function getServiceSelectionDetails(client, branchId, serviceIds, barberId = null) {
+function normalizeMoney(value) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(2));
+}
+
+function normalizePercentage(value) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Number(Math.min(parsed, 100).toFixed(2));
+}
+
+function calculateLineTaxSnapshot({ subtotalHnl, descuentoHnl = 0, isvPorcentaje = 0, incluyeIsv = false }) {
+  const taxableBase = normalizeMoney(Math.max(0, Number(subtotalHnl || 0) - Number(descuentoHnl || 0)));
+  const percentage = normalizePercentage(isvPorcentaje);
+  if (percentage <= 0) return { isv_hnl: 0, total_linea_hnl: taxableBase };
+
+  const isvHnl = incluyeIsv
+    ? normalizeMoney(taxableBase - (taxableBase / (1 + (percentage / 100))))
+    : normalizeMoney((taxableBase * percentage) / 100);
+  const totalLineaHnl = normalizeMoney(taxableBase + (incluyeIsv ? 0 : isvHnl));
+  return {
+    isv_hnl: isvHnl,
+    total_linea_hnl: totalLineaHnl,
+  };
+}
+
+function enrichSelectionItem(row, { bookingIsvEnabled = resolveBookingIsvEnabled() } = {}) {
+  const precioHnl = normalizeMoney(row.precio_hnl);
+  const isvEnabled = bookingIsvEnabled === true;
+  const incluyeIsv = isvEnabled && row.incluye_isv === true;
+  const isvPorcentaje = isvEnabled ? normalizePercentage(row.isv_porcentaje) : 0;
+  const taxSnapshot = calculateLineTaxSnapshot({
+    subtotalHnl: precioHnl,
+    descuentoHnl: 0,
+    isvPorcentaje,
+    incluyeIsv,
+  });
+
+  return {
+    id_servicio: row.id_servicio,
+    id_tarifa: row.id_tarifa,
+    nombre_servicio: row.nombre_servicio,
+    duracion_min: Number(row.duracion_min),
+    buffer_min: Number(row.buffer_min ?? 0),
+    precio_hnl: precioHnl,
+    precio_total_hnl: taxSnapshot.total_linea_hnl,
+    incluye_isv: incluyeIsv,
+    incluye_isv_snapshot: incluyeIsv,
+    isv_porcentaje: isvPorcentaje,
+    isv_hnl: taxSnapshot.isv_hnl,
+    total_linea_hnl: taxSnapshot.total_linea_hnl,
+  };
+}
+
+function summarizeSelectionItems(items) {
+  const list = Array.isArray(items) ? items : [];
+  return {
+    monto_subtotal_hnl: normalizeMoney(list.reduce((total, item) => total + Number(item.precio_hnl || 0), 0)),
+    monto_isv_hnl: normalizeMoney(list.reduce((total, item) => total + Number(item.isv_hnl || 0), 0)),
+    monto_total_hnl: normalizeMoney(list.reduce((total, item) => total + Number(item.total_linea_hnl ?? item.precio_hnl ?? 0), 0)),
+  };
+}
+
+export function assertBookingSelectionRuntimeSupported(selectionType) {
+  const normalized = normalizeBookingSelectionType(selectionType || "services", { required: true });
+  if (normalized === "package" || normalized === "mixed") {
+    throw new AppError(409, "El flujo de paquetes/mixed sera habilitado en Microfase 2B.", {
+      code: "BOOKING_PACKAGE_FLOW_PENDING_2B",
+    });
+  }
+  return normalized;
+}
+
+export async function getServiceSelectionDetails(
+  client,
+  branchId,
+  serviceIds,
+  barberId = null,
+  fechaInicio = null,
+  { bookingIsvEnabled = resolveBookingIsvEnabled() } = {}
+) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
-  const enforceBarberServiceAssignments = SERVICE_BARBER_ASSIGNMENTS_ENABLED && Boolean(safeBarberId);
   const requestedIds = parseUuidList(serviceIds, { required: true, field: "servicios", unique: false });
   const uniqueIds = Array.from(new Set(requestedIds));
+  const operationalDate = resolveTariffOperationalDate(fechaInicio);
 
   const [servicesResult, globalBufferMin] = await Promise.all([
     client.query(
@@ -916,12 +1073,21 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
       WITH active_tariffs AS (
         SELECT
           st.id_servicio,
+          st.id_tarifa,
           st.precio_hnl,
+          COALESCE(st.incluye_isv, FALSE) AS incluye_isv,
+          COALESCE(st.isv_porcentaje, 0) AS isv_porcentaje,
+          st.duracion_min AS tarifa_duracion_min,
+          st.buffer_min AS tarifa_buffer_min,
           COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
           ROW_NUMBER() OVER (
             PARTITION BY st.id_servicio
             ORDER BY 
-              (CASE WHEN st.id_empleado IS NULL THEN 1 ELSE 2 END) ASC,
+              CASE
+                WHEN $3::uuid IS NOT NULL AND st.id_empleado = $3::uuid THEN 0
+                WHEN st.id_empleado IS NULL THEN 1
+                ELSE 2
+              END ASC,
               st.vigente_desde DESC, 
               st.updated_at DESC, 
               st.id_tarifa DESC
@@ -930,20 +1096,19 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         WHERE st.id_sucursal = $1::uuid
           AND st.deleted_at IS NULL
           AND st.activo IS TRUE
-          AND (
-            st.id_empleado IS NULL
-            OR ($4::boolean IS TRUE AND st.id_empleado = $3::uuid)
-            OR ($4::boolean IS FALSE)
-          )
-          AND st.vigente_desde <= CURRENT_DATE
-          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+          AND (st.id_empleado IS NULL OR ($3::uuid IS NOT NULL AND st.id_empleado = $3::uuid))
+          AND st.vigente_desde <= $4::date
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= $4::date)
       )
       SELECT
         s.id_servicio,
         s.nombre_servicio,
-        s.duracion_min,
-        s.buffer_min,
+        at.id_tarifa,
+        COALESCE(at.tarifa_duracion_min, s.duracion_min) AS duracion_min,
+        COALESCE(at.tarifa_buffer_min, s.buffer_min) AS buffer_min,
         at.precio_hnl
+        , at.incluye_isv
+        , at.isv_porcentaje
       FROM public.servicios s
       LEFT JOIN active_tariffs at
         ON at.id_servicio = s.id_servicio
@@ -955,7 +1120,7 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         AND COALESCE(at.servicio_informativo, FALSE) IS FALSE
       ORDER BY s.nombre_servicio ASC
     `,
-      [safeBranchId, uniqueIds, safeBarberId, enforceBarberServiceAssignments]
+      [safeBranchId, uniqueIds, safeBarberId, operationalDate]
     ),
     getGlobalBufferMinutes(client),
   ]);
@@ -976,28 +1141,37 @@ export async function getServiceSelectionDetails(client, branchId, serviceIds, b
         details: { id_servicio: row.id_servicio, id_sucursal: safeBranchId, id_barbero: safeBarberId },
       });
     }
-    byId.set(row.id_servicio, {
-      id_servicio: row.id_servicio,
-      nombre_servicio: row.nombre_servicio,
-      duracion_min: Number(row.duracion_min),
-      buffer_min: Number(row.buffer_min ?? 0),
-      precio_hnl: Number(row.precio_hnl),
-    });
+    byId.set(row.id_servicio, enrichSelectionItem(row, { bookingIsvEnabled }));
   }
 
   const details = requestedIds.map((idServicio) => byId.get(idServicio)).filter(Boolean);
+  const resolvedBuffers = details
+    .map((item) => Number(item.buffer_min))
+    .filter((value) => Number.isFinite(value) && value >= 0);
 
+  const totals = summarizeSelectionItems(details);
   return {
     branchId: safeBranchId,
+    fecha_operativa: operationalDate,
     items: details,
     duracion_total_min: details.reduce((total, item) => total + item.duracion_min, 0),
-    // El buffer se configura globalmente y se aplica una sola vez por cita.
-    buffer_total_min: details.length > 0 ? Number(globalBufferMin || 0) : 0,
-    monto_total_hnl: details.reduce((total, item) => total + item.precio_hnl, 0),
+    buffer_total_min: details.length > 0
+      ? (resolvedBuffers.length ? Math.max(...resolvedBuffers) : Number(globalBufferMin || 0))
+      : 0,
+    monto_subtotal_hnl: totals.monto_subtotal_hnl,
+    monto_isv_hnl: totals.monto_isv_hnl,
+    monto_total_hnl: totals.monto_total_hnl,
   };
 }
 
-export async function getPackageSelectionDetails(client, branchId, packageId, barberId = null) {
+export async function getPackageSelectionDetails(
+  client,
+  branchId,
+  packageId,
+  barberId = null,
+  fechaInicio = null,
+  { bookingIsvEnabled = resolveBookingIsvEnabled() } = {}
+) {
   const safeBranchId = assertUuid(branchId, "id_sucursal");
   const safePackageId = parseSinglePackageId(packageId, { required: true, field: "id_paquete" });
   const safeBarberId = barberId ? assertUuid(barberId, "id_barbero") : null;
@@ -1088,7 +1262,14 @@ export async function getPackageSelectionDetails(client, branchId, packageId, ba
     }
   }
 
-  const serviceSelection = await getServiceSelectionDetails(client, safeBranchId, expandedServiceIds, safeBarberId);
+  const serviceSelection = await getServiceSelectionDetails(
+    client,
+    safeBranchId,
+    expandedServiceIds,
+    safeBarberId,
+    fechaInicio,
+    { bookingIsvEnabled }
+  );
   const packagePrice = packageRow.precio_hnl == null
     ? Number(serviceSelection.monto_total_hnl || 0)
     : Number(packageRow.precio_hnl);
@@ -1113,17 +1294,25 @@ export async function getBookingSelectionDetails(client, {
   servicios = null,
   id_paquete = null,
   id_barbero = null,
+  fecha_inicio = null,
+  fecha_operativa = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 } = {}) {
   const normalizedSelectionType = normalizeBookingSelectionType(selection_type, { required: true });
+  const tariffDateSource = fecha_inicio || fecha_operativa || null;
 
   if (normalizedSelectionType === "package") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    return getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource, {
+      bookingIsvEnabled,
+    });
   }
 
   if (normalizedSelectionType === "mixed") {
     const safePackageId = parseSinglePackageId(id_paquete, { required: true, field: "id_paquete" });
-    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero);
+    const packageSelection = await getPackageSelectionDetails(client, id_sucursal, safePackageId, id_barbero, tariffDateSource, {
+      bookingIsvEnabled,
+    });
     const extraServiceIds = parseUuidList(servicios, { required: false, field: "servicios", unique: true });
     if (!extraServiceIds.length) {
       return {
@@ -1147,14 +1336,19 @@ export async function getBookingSelectionDetails(client, {
       });
     }
 
-    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero);
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero, tariffDateSource, {
+      bookingIsvEnabled,
+    });
     const mergedItems = [
       ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
       ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
     ];
     const totalDuracion = Number(packageSelection.duracion_total_min || 0) + Number(extraSelection.duracion_total_min || 0);
     const totalMonto = Number(packageSelection.monto_total_hnl || 0) + Number(extraSelection.monto_total_hnl || 0);
-    const globalBuffer = Number(extraSelection.buffer_total_min || packageSelection.buffer_total_min || 0);
+    const totalBuffer = Math.max(
+      Number(packageSelection.buffer_total_min || 0),
+      Number(extraSelection.buffer_total_min || 0)
+    );
 
     return {
       ...packageSelection,
@@ -1162,12 +1356,14 @@ export async function getBookingSelectionDetails(client, {
       items: mergedItems,
       servicios_extra: extraSelection.items,
       duracion_total_min: totalDuracion,
-      buffer_total_min: mergedItems.length > 0 ? globalBuffer : 0,
+      buffer_total_min: mergedItems.length > 0 ? totalBuffer : 0,
       monto_total_hnl: totalMonto,
     };
   }
 
-  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero);
+  const servicesSelection = await getServiceSelectionDetails(client, id_sucursal, servicios, id_barbero, tariffDateSource, {
+    bookingIsvEnabled,
+  });
   return {
     ...servicesSelection,
     selection_type: "services",
@@ -1179,6 +1375,66 @@ export async function getBookingSelectionDetails(client, {
 async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
   const targetDate = parseDateOnly(dateString, "fecha");
   const dayOfWeek = startOfDay(targetDate).getDay();
+  const branchSchedule = await client.query(
+    `
+      WITH target_branch AS (
+        SELECT e.id_sucursal
+        FROM public.empleados e
+        WHERE e.id_empleado = $1::uuid
+          AND e.deleted_at IS NULL
+          AND e.estado IS TRUE
+        LIMIT 1
+      ),
+      published_schedule AS (
+        SELECT hss.id_horario_sucursal
+        FROM public.horarios_semanales_sucursales hss
+        JOIN target_branch tb
+          ON tb.id_sucursal = hss.id_sucursal
+        WHERE hss.estado_horario_codigo = 'publicado'
+          AND hss.vigencia_desde <= $3::date
+          AND (hss.vigencia_hasta IS NULL OR hss.vigencia_hasta >= $3::date)
+        ORDER BY hss.vigencia_desde DESC, hss.created_at DESC, hss.id_horario_sucursal DESC
+        LIMIT 1
+      )
+      SELECT
+        b.hora_inicio,
+        b.hora_fin,
+        NULL::time AS almuerzo_inicio,
+        NULL::time AS almuerzo_fin
+      FROM public.horarios_semanales_sucursales_bloques b
+      WHERE b.id_horario_sucursal = (SELECT id_horario_sucursal FROM published_schedule)
+        AND b.dia_semana = $2::smallint
+      ORDER BY b.hora_inicio ASC, b.hora_fin ASC, b.id_bloque_horario ASC
+    `,
+    [empleadoId, dayOfWeek, targetDate]
+  );
+
+  if (branchSchedule.rows.length) {
+    return branchSchedule.rows;
+  }
+
+  const publishedSchedule = await client.query(
+    `
+      SELECT 1
+      FROM public.horarios_semanales_sucursales hss
+      JOIN public.empleados e
+        ON e.id_sucursal = hss.id_sucursal
+      WHERE e.id_empleado = $1::uuid
+        AND e.deleted_at IS NULL
+        AND e.estado IS TRUE
+        AND hss.estado_horario_codigo = 'publicado'
+        AND hss.vigencia_desde <= $2::date
+        AND (hss.vigencia_hasta IS NULL OR hss.vigencia_hasta >= $2::date)
+      LIMIT 1
+    `,
+    [empleadoId, targetDate]
+  );
+
+  // Una version publicada sin bloques para este dia representa una sucursal cerrada.
+  if (publishedSchedule.rows.length) {
+    return [];
+  }
+
   const direct = await client.query(
     `
       SELECT
@@ -1639,6 +1895,24 @@ export async function getBarberScheduleBounds(client, empleadoId, dateString) {
 }
 
 export async function findFirstAvailableBarber(client, branchId, dateString, serviceTotalMinutes, options = {}) {
+  if (options?.selectionRequest) {
+    const resolved = await resolveEffectiveDayAvailability(client, {
+      ...options.selectionRequest,
+      id_sucursal: branchId,
+      fecha: dateString,
+      id_barbero: null,
+      minSellableDurationMin: options?.minSellableDurationMin,
+      bookingIsvEnabled: options?.bookingIsvEnabled,
+    });
+    return resolved?.barbero_autoasignado
+      ? {
+          barber: resolved.barbero_autoasignado,
+          slots: Array.isArray(resolved.slots) ? resolved.slots : [],
+          serviceSelection: resolved.effective_selection,
+        }
+      : null;
+  }
+
   const barbers = await listBarbersForBranch(client, branchId);
   const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
   const withSlots = await mapWithConcurrency(barbers, barberConcurrency, async (barber) => ({
@@ -1649,6 +1923,220 @@ export async function findFirstAvailableBarber(client, branchId, dateString, ser
   }));
   const first = withSlots.find((entry) => entry.slots.length > 0) ?? null;
   return first;
+}
+
+function isTariffMissingForSelection(error) {
+  return error?.code === "AGENDA_SERVICE_TARIFF_MISSING"
+    || error?.code === "AGENDA_SERVICE_NOT_FOUND"
+    || error?.code === "AGENDA_PACKAGE_NOT_FOUND"
+    || error?.code === "AGENDA_PACKAGE_SERVICES_INACTIVE"
+    || error?.code === "AGENDA_PACKAGE_SERVICES_MIN_REQUIRED";
+}
+
+function buildUnavailableAvailability(dateKey, barber = null, effectiveSelection = null, extras = {}) {
+  return {
+    fecha: dateKey,
+    disponible: false,
+    barberos_disponibles: 0,
+    primer_horario_disponible: null,
+    barbero_autoasignado: barber,
+    hora_inicio: null,
+    hora_fin: null,
+    slots: [],
+    effective_selection: effectiveSelection,
+    ...extras,
+  };
+}
+
+function selectionTimingSnapshot(selection, dateKey) {
+  if (!selection) return null;
+  return {
+    duracion_total_min: Number(selection.duracion_total_min || 0),
+    buffer_total_min: Number(selection.buffer_total_min || 0),
+    fecha_operativa: selection.fecha_operativa || dateKey,
+    monto_subtotal_hnl: Number(selection.monto_subtotal_hnl || 0),
+    monto_isv_hnl: Number(selection.monto_isv_hnl || 0),
+    monto_total_hnl: Number(selection.monto_total_hnl || 0),
+  };
+}
+
+async function resolveSelectionForBarberOnDate(client, {
+  id_sucursal,
+  selection_type = "services",
+  servicios = null,
+  id_paquete = null,
+  id_barbero = null,
+  fecha,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
+}) {
+  return getBookingSelectionDetails(client, {
+    id_sucursal,
+    selection_type,
+    servicios,
+    id_paquete,
+    id_barbero,
+    fecha_operativa: fecha,
+    bookingIsvEnabled,
+  });
+}
+
+async function evaluateBarberAvailabilityWithFinalSelection(client, {
+  id_sucursal,
+  selection_type = "services",
+  servicios = null,
+  id_paquete = null,
+  fecha,
+  barber,
+  minSellableDurationMin,
+  includeDiscardReasons = false,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
+}) {
+  const selection = await resolveSelectionForBarberOnDate(client, {
+    id_sucursal,
+    selection_type,
+    servicios,
+    id_paquete,
+    id_barbero: barber.id_empleado,
+    fecha,
+    bookingIsvEnabled,
+  });
+  const serviceTotalMinutes = Number(selection.duracion_total_min || 0) + Number(selection.buffer_total_min || 0);
+  const slotsResult = await getAvailableSlotsForBarber(client, barber.id_empleado, fecha, serviceTotalMinutes, {
+    minSellableDurationMin,
+    includeDiscardReasons,
+  });
+  const slots = Array.isArray(slotsResult) ? slotsResult : (slotsResult?.slots || []);
+  const discarded = Array.isArray(slotsResult?.discarded) ? slotsResult.discarded : [];
+  const bounds = await getBarberScheduleBounds(client, barber.id_empleado, fecha);
+  return {
+    barber,
+    selection,
+    slots,
+    discarded,
+    bounds,
+  };
+}
+
+export async function resolveEffectiveDayAvailability(client, {
+  id_sucursal,
+  selection_type = "services",
+  servicios = null,
+  id_paquete = null,
+  fecha,
+  id_barbero = null,
+  minSellableDurationMin = null,
+  includeDiscardReasons = false,
+  barbers = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
+} = {}) {
+  const safeBranchId = assertUuid(id_sucursal, "id_sucursal");
+  const safeDate = parseDateOnly(fecha, "fecha");
+  const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
+  const resolvedMinSellableDurationMin = Number.isFinite(Number(minSellableDurationMin))
+    ? Math.max(0, Math.trunc(Number(minSellableDurationMin)))
+    : await getMinSellableServiceMinutes(client);
+
+  if (id_barbero) {
+    const safeBarberId = assertUuid(id_barbero, "id_barbero");
+    const barber = await getBarberById(client, safeBarberId);
+    if (barber.id_sucursal !== safeBranchId) {
+      throw new AppError(409, "El barbero no pertenece a la sucursal solicitada", {
+        code: "AGENDA_BARBER_BRANCH_MISMATCH",
+        details: { id_barbero: safeBarberId, id_sucursal: safeBranchId },
+      });
+    }
+
+    const evaluated = await evaluateBarberAvailabilityWithFinalSelection(client, {
+      id_sucursal: safeBranchId,
+      selection_type: normalizedSelectionType,
+      servicios,
+      id_paquete,
+      fecha: safeDate,
+      barber,
+      minSellableDurationMin: resolvedMinSellableDurationMin,
+      includeDiscardReasons,
+      bookingIsvEnabled,
+    });
+    const discardedReasonCodes = includeDiscardReasons
+      ? Array.from(new Set(evaluated.discarded.map((entry) => String(entry?.reason || "").trim()).filter(Boolean)))
+      : [];
+    return {
+      fecha: safeDate,
+      disponible: evaluated.slots.length > 0,
+      barberos_disponibles: evaluated.slots.length > 0 ? 1 : 0,
+      primer_horario_disponible: evaluated.slots[0]?.hora ?? null,
+      barbero_autoasignado: barber,
+      hora_inicio: evaluated.bounds.hora_inicio,
+      hora_fin: evaluated.bounds.hora_fin,
+      slots: evaluated.slots,
+      discarded_slots: includeDiscardReasons ? evaluated.discarded : [],
+      discarded_reason_codes: discardedReasonCodes,
+      effective_selection: selectionTimingSnapshot(evaluated.selection, safeDate),
+      service_selection: evaluated.selection,
+    };
+  }
+
+  const candidateBarbers = Array.isArray(barbers) ? barbers : await listBarbersForBranch(client, safeBranchId);
+  if (!candidateBarbers.length) {
+    return buildUnavailableAvailability(safeDate, null, null);
+  }
+
+  const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
+  const evaluatedEntries = await mapWithConcurrency(candidateBarbers, barberConcurrency, async (barber) => {
+    try {
+      return await evaluateBarberAvailabilityWithFinalSelection(client, {
+        id_sucursal: safeBranchId,
+        selection_type: normalizedSelectionType,
+        servicios,
+        id_paquete,
+        fecha: safeDate,
+        barber,
+        minSellableDurationMin: resolvedMinSellableDurationMin,
+        includeDiscardReasons: false,
+        bookingIsvEnabled,
+      });
+    } catch (error) {
+      if (isTariffMissingForSelection(error)) {
+        return { barber, selection: null, slots: [], bounds: null, tariffMissing: true };
+      }
+      throw error;
+    }
+  });
+
+  let availableCount = 0;
+  let firstSlot = null;
+  let autoEntry = null;
+  let firstResolvedEntry = null;
+
+  for (const entry of evaluatedEntries) {
+    if (!entry?.selection) continue;
+    if (!firstResolvedEntry) firstResolvedEntry = entry;
+    if (entry.slots.length > 0) {
+      availableCount += 1;
+      if (!firstSlot || entry.slots[0].inicio_at.getTime() < firstSlot.inicio_at.getTime()) {
+        firstSlot = entry.slots[0];
+        autoEntry = entry;
+      }
+    }
+  }
+
+  const selectedEntry = autoEntry || firstResolvedEntry;
+  if (!selectedEntry) {
+    return buildUnavailableAvailability(safeDate, null, null);
+  }
+
+  return {
+    fecha: safeDate,
+    disponible: availableCount > 0,
+    barberos_disponibles: availableCount,
+    primer_horario_disponible: firstSlot?.hora ?? null,
+    barbero_autoasignado: selectedEntry.barber,
+    hora_inicio: selectedEntry.bounds?.hora_inicio ?? null,
+    hora_fin: selectedEntry.bounds?.hora_fin ?? null,
+    slots: autoEntry?.slots || [],
+    effective_selection: selectionTimingSnapshot(selectedEntry.selection, safeDate),
+    service_selection: selectedEntry.selection,
+  };
 }
 
 export async function buildDayAvailability(client, branchId, serviceSelection, dateString, barberId = null, options = {}) {
@@ -1744,21 +2232,8 @@ export async function buildDayAvailability(client, branchId, serviceSelection, d
 export async function listAvailabilityByDateRange(client, branchId, serviceSelection, fromDate, toDate, barberId = null) {
   const safeFrom = parseDateOnly(fromDate, "fecha_desde");
   const safeTo = parseDateOnly(toDate, "fecha_hasta");
-  const startDate = startOfDay(safeFrom);
-  const endDate = startOfDay(safeTo);
+  const dateKeys = buildDateKeyRange(safeFrom, safeTo);
   const minSellableDurationMin = await getMinSellableServiceMinutes(client);
-
-  if (endDate.getTime() < startDate.getTime()) {
-    throw new AppError(400, "fecha_hasta no puede ser menor que fecha_desde", {
-      code: "AGENDA_DATE_RANGE_INVALID",
-      details: { fecha_desde: safeFrom, fecha_hasta: safeTo },
-    });
-  }
-
-  const dateKeys = [];
-  for (let current = new Date(startDate); current.getTime() <= endDate.getTime(); current = addMinutes(current, 24 * 60)) {
-    dateKeys.push(formatDateOnly(current));
-  }
   const rangeConcurrency = isPoolLikeClient(client) ? 1 : 4;
 
   if (barberId) {
@@ -1848,6 +2323,113 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
   );
 }
 
+function allEffectiveTimesEqual(entries, field) {
+  const values = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.effective_selection)
+    .map((entry) => Number(entry.effective_selection?.[field] || 0));
+  if (!values.length) return false;
+  return new Set(values).size === 1;
+}
+
+function getUniformEffectiveTime(entries, field) {
+  const effectiveEntries = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry?.effective_selection);
+  if (!effectiveEntries.length) return null;
+  return allEffectiveTimesEqual(effectiveEntries, field)
+    ? Number(effectiveEntries[0]?.effective_selection?.[field] || 0)
+    : null;
+}
+
+export async function listAvailabilityByDateRangeForRequest(client, {
+  id_sucursal,
+  selection_type = "services",
+  servicios = null,
+  id_paquete = null,
+  fecha_desde,
+  fecha_hasta,
+  id_barbero = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
+} = {}) {
+  const safeFrom = parseDateOnly(fecha_desde, "fecha_desde");
+  const safeTo = parseDateOnly(fecha_hasta, "fecha_hasta");
+  const dateKeys = buildDateKeyRange(safeFrom, safeTo);
+  const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
+
+  if (id_barbero) {
+    try {
+      const serviceSelection = await getBookingSelectionDetails(client, {
+        id_sucursal,
+        selection_type: normalizedSelectionType,
+        servicios,
+        id_paquete,
+        id_barbero,
+        fecha_operativa: safeFrom,
+        bookingIsvEnabled,
+      });
+      const availability = await listAvailabilityByDateRange(
+        client,
+        id_sucursal,
+        serviceSelection,
+        safeFrom,
+        safeTo,
+        id_barbero
+      );
+      const duracionTotalMin = Number(serviceSelection.duracion_total_min || 0);
+      const bufferTotalMin = Number(serviceSelection.buffer_total_min || 0);
+      return {
+        disponibilidad: availability.map((entry) => ({
+          ...entry,
+          effective_selection: {
+            duracion_total_min: duracionTotalMin,
+            buffer_total_min: bufferTotalMin,
+          },
+        })),
+        duracion_total_min: duracionTotalMin,
+        buffer_total_min: bufferTotalMin,
+      };
+    } catch (error) {
+      if (isTariffMissingForSelection(error)) {
+        return {
+          disponibilidad: dateKeys.map((dateKey) => buildUnavailableAvailability(dateKey, null, null, {
+            unavailable_reason: error?.code || "AGENDA_SELECTION_UNAVAILABLE",
+          })),
+          duracion_total_min: null,
+          buffer_total_min: null,
+        };
+      }
+      throw error;
+    }
+  }
+
+  const rangeConcurrency = isPoolLikeClient(client) ? 1 : 4;
+  const availability = await mapWithConcurrency(dateKeys, rangeConcurrency, async (dateKey) => {
+    try {
+      return await resolveEffectiveDayAvailability(client, {
+        id_sucursal,
+        selection_type: normalizedSelectionType,
+        servicios,
+        id_paquete,
+        fecha: dateKey,
+        id_barbero,
+        bookingIsvEnabled,
+      });
+    } catch (error) {
+      if (isTariffMissingForSelection(error)) {
+        return buildUnavailableAvailability(dateKey, null, null, {
+          unavailable_reason: error?.code || "AGENDA_SELECTION_UNAVAILABLE",
+        });
+      }
+      throw error;
+    }
+  });
+
+  return {
+    disponibilidad: availability,
+    duracion_total_min: getUniformEffectiveTime(availability, "duracion_total_min"),
+    buffer_total_min: getUniformEffectiveTime(availability, "buffer_total_min"),
+  };
+}
+
 export async function resolveBookingSelection(client, {
   id_sucursal,
   servicios,
@@ -1855,21 +2437,19 @@ export async function resolveBookingSelection(client, {
   id_barbero = null,
   selection_type = "services",
   id_paquete = null,
+  bookingIsvEnabled = resolveBookingIsvEnabled(),
 }) {
   const branch = await ensureActiveBranch(client, id_sucursal);
-  const serviceSelection = await getBookingSelectionDetails(client, {
-    id_sucursal: branch.id_sucursal,
-    selection_type,
-    servicios,
-    id_paquete,
-    id_barbero,
-  });
-  const startDateTime = parseDateTime(fecha_inicio, "fecha_inicio");
-  const { dateKey, timeKey } = extractDateAndTimeKeyFromDateTime(fecha_inicio, "fecha_inicio");
-  const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
+  const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
+  const normalizedDateTime = normalizeOperationalDateTime(fecha_inicio, "fecha_inicio");
+  const startDateTime = normalizedDateTime.utcDate;
+  const dateKey = normalizedDateTime.fecha_operativa;
+  const timeKey = normalizedDateTime.hora_operativa;
   const minSellableDurationMin = await getMinSellableServiceMinutes(client);
 
   let selectedBarber;
+  let finalSelection;
+  let barberCandidateIds;
   if (id_barbero) {
     const barber = await getBarberById(client, id_barbero);
     if (barber.id_sucursal !== branch.id_sucursal) {
@@ -1878,7 +2458,17 @@ export async function resolveBookingSelection(client, {
         details: { id_barbero, id_sucursal: branch.id_sucursal },
       });
     }
-    const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes, {
+    finalSelection = await getBookingSelectionDetails(client, {
+      id_sucursal: branch.id_sucursal,
+      selection_type: normalizedSelectionType,
+      servicios,
+      id_paquete,
+      id_barbero: barber.id_empleado,
+      fecha_operativa: dateKey,
+      bookingIsvEnabled,
+    });
+    const finalTotalMinutes = Number(finalSelection.duracion_total_min || 0) + Number(finalSelection.buffer_total_min || 0);
+    const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, finalTotalMinutes, {
       minSellableDurationMin,
     });
     const matchingSlot = slots.find((slot) => slot.hora === timeKey);
@@ -1889,31 +2479,60 @@ export async function resolveBookingSelection(client, {
       });
     }
     selectedBarber = barber;
+    barberCandidateIds = [barber.id_empleado];
   } else {
     const barbers = await listBarbersForBranch(client, branch.id_sucursal);
-    const candidates = [];
-    for (const barber of barbers) {
-      const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, serviceTotalMinutes, {
-        minSellableDurationMin,
-      });
-      if (slots.some((slot) => slot.hora === timeKey)) {
-        candidates.push(barber);
+    const barberConcurrency = isPoolLikeClient(client) ? 1 : 4;
+    const evaluatedCandidates = await mapWithConcurrency(barbers, barberConcurrency, async (barber) => {
+      try {
+        const selection = await getBookingSelectionDetails(client, {
+          id_sucursal: branch.id_sucursal,
+          selection_type: normalizedSelectionType,
+          servicios,
+          id_paquete,
+          id_barbero: barber.id_empleado,
+          fecha_operativa: dateKey,
+          bookingIsvEnabled,
+        });
+        const finalTotalMinutes = Number(selection.duracion_total_min || 0) + Number(selection.buffer_total_min || 0);
+        const slots = await getAvailableSlotsForBarber(client, barber.id_empleado, dateKey, finalTotalMinutes, {
+          minSellableDurationMin,
+        });
+        const matchingSlot = slots.find((slot) => slot.hora === timeKey);
+        return matchingSlot ? { barber, selection, matchingSlot } : null;
+      } catch (error) {
+        if (isTariffMissingForSelection(error)) return null;
+        throw error;
       }
-    }
+    });
+    const candidates = evaluatedCandidates.filter(Boolean);
     if (!candidates.length) {
       throw new AppError(409, "No existe un barbero disponible para el horario solicitado", {
         code: "AGENDA_AUTOASSIGN_NOT_AVAILABLE",
         details: { fecha: dateKey, hora: timeKey, id_sucursal: branch.id_sucursal },
       });
     }
-    const randomIndex = Math.floor(Math.random() * candidates.length);
-    selectedBarber = candidates[randomIndex];
+    const rankedCandidates = [...candidates].sort((left, right) => {
+      const leftOrder = Number(left.barber?.orden_visual ?? left.barber?.orden ?? Number.MAX_SAFE_INTEGER);
+      const rightOrder = Number(right.barber?.orden_visual ?? right.barber?.orden ?? Number.MAX_SAFE_INTEGER);
+      if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+      const leftSpecific = (left.selection?.items || []).some((item) => String(item?.id_empleado || "") === String(left.barber?.id_empleado || ""));
+      const rightSpecific = (right.selection?.items || []).some((item) => String(item?.id_empleado || "") === String(right.barber?.id_empleado || ""));
+      if (leftSpecific !== rightSpecific) return leftSpecific ? -1 : 1;
+      return String(left.barber?.id_empleado || "").localeCompare(String(right.barber?.id_empleado || ""));
+    });
+    selectedBarber = rankedCandidates[0].barber;
+    finalSelection = rankedCandidates[0].selection;
+    barberCandidateIds = rankedCandidates
+      .map((candidate) => candidate?.barber?.id_empleado)
+      .filter(Boolean);
   }
 
   return {
     branch,
     barber: selectedBarber,
-    serviceSelection,
+    barber_candidate_ids: barberCandidateIds,
+    serviceSelection: finalSelection,
     startDateTime,
     expiresAt: addMinutes(new Date(), await getHoldDurationMinutes(client)),
   };
@@ -2344,6 +2963,16 @@ export function mapDayAvailabilityForResponse(entries) {
           visible_en_landing: Boolean(entry.barbero_autoasignado.visible_en_landing),
           foto_perfil_url: entry.barbero_autoasignado.foto_perfil_url ?? null,
           foto_perfil_updated_at: entry.barbero_autoasignado.foto_perfil_updated_at ?? null,
+      }
+      : null,
+    tiempos_efectivos: entry.effective_selection
+      ? {
+          duracion_total_min: Number(entry.effective_selection.duracion_total_min || 0),
+          buffer_total_min: Number(entry.effective_selection.buffer_total_min || 0),
+          fecha_operativa: entry.effective_selection.fecha_operativa || entry.fecha,
+          monto_subtotal_hnl: Number(entry.effective_selection.monto_subtotal_hnl || 0),
+          monto_isv_hnl: Number(entry.effective_selection.monto_isv_hnl || 0),
+          monto_total_hnl: Number(entry.effective_selection.monto_total_hnl || 0),
         }
       : null,
   }));

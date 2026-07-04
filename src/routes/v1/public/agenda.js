@@ -4,27 +4,24 @@ import {
 } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
+  assertBookingSelectionRuntimeSupported,
   assertUuid,
   buildCuratedSlotExposure,
   buildCuratedSlotExposureDebug,
-  buildDayAvailability,
+  countDateKeyRangeDays,
   expireStaleAppointmentReservations,
-  findFirstAvailableBarber,
-  getBarberScheduleBounds,
-  getBookingSelectionDetails,
   getMinSellableServiceMinutes,
-  listAvailabilityByDateRange,
+  listAvailabilityByDateRangeForRequest,
   listBarbersForBranch,
   mapBarbersForResponse,
   mapDayAvailabilityForResponse,
   mapSlotsForResponse,
   parseDateOnly,
+  resolveEffectiveDayAvailability,
   SLOT_INTERVAL_MINUTES,
 } from "../../../services/agendaService.js";
 
 const requestIdSchema = { type: "string" };
-const BUSINESS_TIME_ZONE = "America/Tegucigalpa";
-
 const errorResponseSchema = {
   type: "object",
   properties: {
@@ -91,8 +88,26 @@ const availabilityDaySchema = {
         { type: "null" },
       ],
     },
+    tiempos_efectivos: {
+      anyOf: [
+        {
+          type: "object",
+          properties: {
+            duracion_total_min: { type: "integer" },
+            buffer_total_min: { type: "integer" },
+            fecha_operativa: { type: "string", format: "date" },
+            monto_subtotal_hnl: { type: "number" },
+            monto_isv_hnl: { type: "number" },
+            monto_total_hnl: { type: "number" },
+          },
+          required: ["duracion_total_min", "buffer_total_min", "fecha_operativa"],
+          additionalProperties: false,
+        },
+        { type: "null" },
+      ],
+    },
   },
-  required: ["fecha", "disponible", "barberos_disponibles", "primer_horario_disponible", "barbero_autoasignado"],
+  required: ["fecha", "disponible", "barberos_disponibles", "primer_horario_disponible", "barbero_autoasignado", "tiempos_efectivos"],
   additionalProperties: false,
 };
 
@@ -164,7 +179,7 @@ const bookingPromotionSchema = {
 };
 
 const PUBLIC_BOOKING_PROMOTIONS_SQL = `
-  -- JK: Expone promociones públicas para agendamiento desde reglas normalizadas.
+  -- JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
   SELECT
     p.id_promocion,
     pra.id_promocion_regla,
@@ -438,6 +453,18 @@ function mapDiscardedReasonSummary(discarded) {
   return Array.from(counts.entries()).map(([code, count]) => ({ code, count }));
 }
 
+function mapTariffsForResponse(selection) {
+  return (Array.isArray(selection?.items) ? selection.items : []).map((item) => ({
+    id_servicio: item.id_servicio,
+    id_tarifa: item.id_tarifa ?? null,
+    precio_hnl: Number(item.precio_hnl || 0),
+    precio_total_hnl: Number(item.precio_total_hnl ?? item.total_linea_hnl ?? item.precio_hnl ?? 0),
+    incluye_isv_snapshot: item.incluye_isv_snapshot === true || item.incluye_isv === true,
+    isv_porcentaje: Number(item.isv_porcentaje || 0),
+    isv_hnl: Number(item.isv_hnl || 0),
+  }));
+}
+
 async function expireReservationsBestEffort(app, request, dbClient = null) {
   try {
     await expireStaleAppointmentReservations(dbClient || app.db, { logger: request.log });
@@ -586,8 +613,8 @@ export default async function publicAgendaRoutes(app) {
                 type: "object",
                 properties: {
                   disponibilidad: { type: "array", items: availabilityDaySchema },
-                  duracion_total_min: { type: "integer" },
-                  buffer_total_min: { type: "integer" },
+                  duracion_total_min: { anyOf: [{ type: "integer" }, { type: "null" }] },
+                  buffer_total_min: { anyOf: [{ type: "integer" }, { type: "null" }] },
                 },
                 required: ["disponibilidad", "duracion_total_min", "buffer_total_min"],
                 additionalProperties: false,
@@ -613,36 +640,26 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
         const fechaHasta = parseDateOnly(request.query?.fecha_hasta, "fecha_hasta");
-        const dateDesde = new Date(fechaDesde);
-        const dateHasta = new Date(fechaHasta);
-        if (dateHasta < dateDesde) {
-          throw new AppError(400, "fecha_hasta no puede ser menor a fecha_desde", { code: "PUBLIC_AGENDA_DATES_INVALID" });
-        }
-        const diffTime = Math.abs(dateHasta - dateDesde);
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        if (diffDays > 60) {
+        const selectionType = assertBookingSelectionRuntimeSupported(request.query?.selection_type || "services");
+        const rangeDays = countDateKeyRangeDays(fechaDesde, fechaHasta);
+        if (rangeDays > 60) {
           throw new AppError(400, "El rango de fechas no puede superar los 60 dias", { code: "PUBLIC_AGENDA_DATE_RANGE_TOO_LARGE" });
         }
-        const serviceSelection = await getBookingSelectionDetails(dbClient, {
+        const rangeResult = await listAvailabilityByDateRangeForRequest(dbClient, {
           id_sucursal: idSucursal,
-          selection_type: request.query?.selection_type,
+          selection_type: selectionType,
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
+          fecha_desde: fechaDesde,
+          fecha_hasta: fechaHasta,
           id_barbero: idBarbero,
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
-        const disponibilidad = await listAvailabilityByDateRange(
-          dbClient,
-          idSucursal,
-          serviceSelection,
-          fechaDesde,
-          fechaHasta,
-          idBarbero
-        );
 
         return sendOk(reply, {
-          disponibilidad: mapDayAvailabilityForResponse(disponibilidad),
-          duracion_total_min: serviceSelection.duracion_total_min,
-          buffer_total_min: serviceSelection.buffer_total_min,
+          disponibilidad: mapDayAvailabilityForResponse(rangeResult.disponibilidad),
+          duracion_total_min: rangeResult.duracion_total_min,
+          buffer_total_min: rangeResult.buffer_total_min,
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo calcular disponibilidad", "PUBLIC_AGENDA_AVAILABILITY_ERROR");
@@ -701,6 +718,34 @@ export default async function publicAgendaRoutes(app) {
                   hora_fin: { type: ["string", "null"] },
                   duracion_total_min: { type: "integer" },
                   buffer_total_min: { type: "integer" },
+                  monto_subtotal_hnl: { type: "number" },
+                  monto_isv_hnl: { type: "number" },
+                  monto_total_hnl: { type: "number" },
+                  tarifas: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        id_servicio: { type: "string", format: "uuid" },
+                        id_tarifa: { type: ["string", "null"], format: "uuid" },
+                        precio_hnl: { type: "number" },
+                        precio_total_hnl: { type: "number" },
+                        incluye_isv_snapshot: { type: "boolean" },
+                        isv_porcentaje: { type: "number" },
+                        isv_hnl: { type: "number" },
+                      },
+                      required: [
+                        "id_servicio",
+                        "id_tarifa",
+                        "precio_hnl",
+                        "precio_total_hnl",
+                        "incluye_isv_snapshot",
+                        "isv_porcentaje",
+                        "isv_hnl",
+                      ],
+                      additionalProperties: false,
+                    },
+                  },
                   slot_step_min: { type: "integer" },
                   debug: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
                 },
@@ -714,6 +759,10 @@ export default async function publicAgendaRoutes(app) {
                   "hora_fin",
                   "duracion_total_min",
                   "buffer_total_min",
+                  "monto_subtotal_hnl",
+                  "monto_isv_hnl",
+                  "monto_total_hnl",
+                  "tarifas",
                   "slot_step_min",
                   "debug",
                 ],
@@ -741,68 +790,32 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const minSellableDurationMin = await getMinSellableServiceMinutes(dbClient);
         const includeDebug = canExposeSlotDebug(request);
-        const serviceSelection = await getBookingSelectionDetails(dbClient, {
+        const selectionType = assertBookingSelectionRuntimeSupported(request.query?.selection_type || "services");
+        const availability = await resolveEffectiveDayAvailability(dbClient, {
           id_sucursal: idSucursal,
-          selection_type: request.query?.selection_type,
+          selection_type: selectionType,
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
           id_barbero: idBarbero,
-        });
-        const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
-
-        if (idBarbero) {
-          const availability = await buildDayAvailability(dbClient, idSucursal, serviceSelection, fecha, idBarbero, {
-            minSellableDurationMin,
-            includeDiscardReasons: includeDebug,
-          });
-          const horarios = mapSlotsForResponse(availability.slots, {
-            duracion_visible_min: serviceSelection.duracion_total_min,
-          });
-          const horariosCurados = buildCuratedSlotExposure(horarios, {
-            minSellableDurationMin,
-          });
-          const debugPayload = includeDebug
-            ? {
-                discarded_reason_codes: mapDiscardedReasonSummary(availability?.discarded_slots),
-                discarded_slots: Array.isArray(availability?.discarded_slots)
-                  ? availability.discarded_slots.slice(0, 120)
-                  : [],
-                curated_ranking: buildCuratedSlotExposureDebug(horarios, {
-                  minSellableDurationMin,
-                }),
-              }
-            : null;
-          return sendOk(reply, {
-            fecha,
-            id_barbero: idBarbero,
-            barbero: availability.barbero_autoasignado
-              ? mapBarbersForResponse([availability.barbero_autoasignado])[0]
-              : null,
-            horarios,
-            horarios_curados: horariosCurados,
-            hora_inicio: availability.hora_inicio ?? null,
-            hora_fin: availability.hora_fin ?? null,
-            duracion_total_min: serviceSelection.duracion_total_min,
-            buffer_total_min: serviceSelection.buffer_total_min,
-            slot_step_min: SLOT_INTERVAL_MINUTES,
-            debug: debugPayload,
-          });
-        }
-
-        const result = await findFirstAvailableBarber(dbClient, idSucursal, fecha, serviceTotalMinutes, {
+          fecha,
           minSellableDurationMin,
+          includeDiscardReasons: Boolean(idBarbero && includeDebug),
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
-        const bounds = result?.barber
-          ? await getBarberScheduleBounds(dbClient, result.barber.id_empleado, fecha)
-          : { hora_inicio: null, hora_fin: null };
-        const horarios = mapSlotsForResponse(result?.slots ?? [], {
-          duracion_visible_min: serviceSelection.duracion_total_min,
+        const serviceSelection = availability.service_selection || null;
+        const effectiveSelection = availability.effective_selection || null;
+        const horarios = mapSlotsForResponse(availability.slots ?? [], {
+          duracion_visible_min: Number(effectiveSelection?.duracion_total_min || 0),
         });
         const horariosCurados = buildCuratedSlotExposure(horarios, {
           minSellableDurationMin,
         });
         const debugPayload = includeDebug
           ? {
+              discarded_reason_codes: idBarbero ? mapDiscardedReasonSummary(availability?.discarded_slots) : [],
+              discarded_slots: idBarbero && Array.isArray(availability?.discarded_slots)
+                ? availability.discarded_slots.slice(0, 120)
+                : [],
               curated_ranking: buildCuratedSlotExposureDebug(horarios, {
                 minSellableDurationMin,
               }),
@@ -810,14 +823,18 @@ export default async function publicAgendaRoutes(app) {
           : null;
         return sendOk(reply, {
           fecha,
-          id_barbero: result?.barber?.id_empleado ?? null,
-          barbero: result?.barber ? mapBarbersForResponse([result.barber])[0] : null,
+          id_barbero: availability.barbero_autoasignado?.id_empleado ?? null,
+          barbero: availability.barbero_autoasignado ? mapBarbersForResponse([availability.barbero_autoasignado])[0] : null,
           horarios,
           horarios_curados: horariosCurados,
-          hora_inicio: bounds.hora_inicio ?? null,
-          hora_fin: bounds.hora_fin ?? null,
-          duracion_total_min: serviceSelection.duracion_total_min,
-          buffer_total_min: serviceSelection.buffer_total_min,
+          hora_inicio: availability.hora_inicio ?? null,
+          hora_fin: availability.hora_fin ?? null,
+          duracion_total_min: Number(effectiveSelection?.duracion_total_min || 0),
+          buffer_total_min: Number(effectiveSelection?.buffer_total_min || 0),
+          monto_subtotal_hnl: Number(effectiveSelection?.monto_subtotal_hnl || 0),
+          monto_isv_hnl: Number(effectiveSelection?.monto_isv_hnl || 0),
+          monto_total_hnl: Number(effectiveSelection?.monto_total_hnl || 0),
+          tarifas: mapTariffsForResponse(serviceSelection),
           slot_step_min: SLOT_INTERVAL_MINUTES,
           debug: debugPayload,
         });

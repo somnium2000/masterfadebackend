@@ -83,8 +83,8 @@ async function securityPlugin(app) {
     },
     // Declarar TODOS los metodos que la API utiliza para que el preflight (OPTIONS) los autorice
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id", "X-CSRF-Token"],
-    exposedHeaders: ["X-Request-Id", "Retry-After"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id", "X-CSRF-Token", "X-Idempotency-Key"],
+    exposedHeaders: ["X-Request-Id", "Retry-After", "X-Idempotency-Key"],
     credentials: true,
     // Permitir el preflight cacheado por 1 hora en el browser
     maxAge: 3600,

@@ -99,11 +99,6 @@ const DEPENDENCY_SUMMARY_SQL = `
        AND e.deleted_at IS NULL
        AND COALESCE(e.estado, TRUE) IS TRUE) AS empleados_activos,
     (SELECT COUNT(*)::int
-     FROM public.clientes c
-     WHERE c.id_sucursal_origen = $1::uuid
-       AND c.deleted_at IS NULL
-       AND COALESCE(c.estado, TRUE) IS TRUE) AS clientes_activos,
-    (SELECT COUNT(*)::int
      FROM public.roles_usuarios ru
      WHERE ru.id_sucursal = $1::uuid
        AND ru.activo IS TRUE) AS roles_activos,
@@ -203,6 +198,7 @@ function sendHandled(reply, request, error, message, code) {
       code: error.code,
       details: error.details,
       requestId: request.id,
+      exposeDetails: error.code === "SUCURSALES_HAS_ACTIVE_DEPENDENCIES",
     });
   }
 
@@ -272,7 +268,6 @@ function hasActiveDependencies(summary) {
 
   return [
     Number(summary.empleados_activos || 0),
-    Number(summary.clientes_activos || 0),
     Number(summary.roles_activos || 0),
     Number(summary.tarifas_activas || 0),
     Number(summary.citas_futuras_activas || 0),
@@ -290,7 +285,6 @@ async function assertCanDeactivateBranch(client, idSucursal) {
     code: "SUCURSALES_HAS_ACTIVE_DEPENDENCIES",
     details: {
       empleados_activos: Number(dependencySummary?.empleados_activos || 0),
-      clientes_activos: Number(dependencySummary?.clientes_activos || 0),
       roles_activos: Number(dependencySummary?.roles_activos || 0),
       tarifas_activas: Number(dependencySummary?.tarifas_activas || 0),
       citas_futuras_activas: Number(dependencySummary?.citas_futuras_activas || 0),

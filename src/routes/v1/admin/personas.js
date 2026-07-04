@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
+import { assertUserNotProtected } from "../../../services/protectedUsersService.js";
 import {
   activateAssetForEntity,
   buildAssetReadUrl,
@@ -247,6 +248,7 @@ const LIST_USUARIOS_SQL = `
     u.estado_acceso,
     u.credenciales_completadas_at,
     u.ultimo_login_at,
+    (apu.id_usuario IS NOT NULL) AS is_protected,
     COALESCE(
       jsonb_agg(jsonb_build_object('rol', r.nombre, 'id_sucursal', ru.id_sucursal) ORDER BY r.nombre, ru.id_sucursal)
       FILTER (WHERE r.nombre IS NOT NULL),
@@ -267,6 +269,9 @@ const LIST_USUARIOS_SQL = `
   ) cp ON TRUE
   LEFT JOIN public.roles_usuarios ru ON ru.id_usuario = u.id_usuario AND ru.activo IS TRUE
   LEFT JOIN public.roles r ON r.id_rol = ru.id_rol
+  LEFT JOIN public.app_protected_users apu
+    ON apu.id_usuario = u.id_usuario
+    AND apu.activo IS TRUE
   WHERE u.deleted_at IS NULL
     AND (
       EXISTS (
@@ -291,7 +296,7 @@ const LIST_USUARIOS_SQL = `
           AND r_sa.nombre = 'super_admin'
       )
     )
-  GROUP BY u.id_usuario, u.id_persona, p.nombres, p.apellidos, p.telefono_principal, cp.email, au.email, u.estado, u.estado_acceso, u.credenciales_completadas_at, u.ultimo_login_at
+  GROUP BY u.id_usuario, u.id_persona, p.nombres, p.apellidos, p.telefono_principal, cp.email, au.email, u.estado, u.estado_acceso, u.credenciales_completadas_at, u.ultimo_login_at, apu.id_usuario
   ORDER BY p.nombres ASC, p.apellidos ASC, u.id_usuario ASC
 `;
 
@@ -419,6 +424,48 @@ const CLIENTE_BASE_SQL = `
 
 const LIST_CLIENTES_SQL = `${CLIENTE_BASE_SQL}
   ORDER BY p.nombres ASC, p.apellidos ASC, c.id_cliente ASC
+`;
+
+const SEARCH_CLIENTES_SQL = `${CLIENTE_BASE_SQL}
+  AND (
+    $1::text IS NULL
+    OR lower(
+      concat_ws(' ',
+        p.nombres,
+        p.apellidos,
+        p.dni,
+        p.rtn,
+        p.telefono_principal,
+        COALESCE(cp.email, ''),
+        c.id_cliente::text,
+        p.id_persona::text
+      )
+    ) LIKE '%' || lower($1::text) || '%'
+  )
+  ORDER BY p.nombres ASC, p.apellidos ASC, c.id_cliente ASC
+  LIMIT $2::int
+  OFFSET $3::int
+`;
+
+const COUNT_CLIENTES_SQL = `
+  SELECT COUNT(*)::int AS total
+  FROM (${CLIENTE_BASE_SQL}
+    AND (
+      $1::text IS NULL
+      OR lower(
+        concat_ws(' ',
+          p.nombres,
+          p.apellidos,
+          p.dni,
+          p.rtn,
+          p.telefono_principal,
+          COALESCE(cp.email, ''),
+          c.id_cliente::text,
+          p.id_persona::text
+        )
+      ) LIKE '%' || lower($1::text) || '%'
+    )
+  ) clientes_scope
 `;
 
 const CLIENTE_BY_ID_SQL = `${CLIENTE_BASE_SQL}
@@ -595,6 +642,8 @@ function mapUsuario(row) {
     estado_acceso: row.estado_acceso ?? ACCESS_STATUS.PENDING_PASSWORD,
     credenciales_completadas_at: row.credenciales_completadas_at ?? null,
     ultimo_login_at: row.ultimo_login_at ?? null,
+    is_protected: Boolean(row.is_protected),
+    es_protegido: Boolean(row.is_protected),
     roles,
     tiene_empleado: tieneEmpleado,
     tiene_cliente: tieneCliente,
@@ -1341,7 +1390,9 @@ async function assertPersonaNotEmpleado(client, personaId) {
   }
 }
 
-async function setEmployeeRoleAssignments(client, { roleIdsByName, roleNames, userId, branchId, assignedBy }) {
+async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleNames, userId, branchId, assignedBy }) {
+  await assertUserNotProtected(app, userId, "ROLE_ASSIGNMENT_UPDATE", { client });
+
   const employeeRoleIds = [];
   for (const roleName of EMPLOYEE_ALLOWED_ROLES) {
     if (roleIdsByName.has(roleName)) employeeRoleIds.push(roleIdsByName.get(roleName));
@@ -1394,7 +1445,9 @@ async function setEmployeeRoleAssignments(client, { roleIdsByName, roleNames, us
   }
 }
 
-async function ensureClienteRoleAssignment(client, roleIdsByName, userId, branchId, assignedBy) {
+async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, branchId, assignedBy) {
+  await assertUserNotProtected(app, userId, "ROLE_CLIENT_ASSIGNMENT_UPDATE", { client });
+
   const roleId = roleIdsByName.get("cliente");
   if (!roleId) {
     throw new AppError(500, "Rol cliente no existe en catalogo", {
@@ -1643,7 +1696,7 @@ async function createEmpleado(app, request, payload) {
       [authUserId, idPersona, ACCESS_STATUS.PENDING_PASSWORD]
     );
 
-    await setEmployeeRoleAssignments(client, {
+    await setEmployeeRoleAssignments(app, client, {
       roleIdsByName,
       roleNames: roles,
       userId: authUserId,
@@ -1872,7 +1925,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
       ]
     );
 
-    await setEmployeeRoleAssignments(client, {
+    await setEmployeeRoleAssignments(app, client, {
       roleIdsByName,
       roleNames: roles,
       userId: currentRow.id_usuario,
@@ -2048,6 +2101,7 @@ async function createCliente(app, request, payload) {
     );
 
     await ensureClienteRoleAssignment(
+      app,
       client,
       roleIdsByName,
       authUserId,
@@ -2272,6 +2326,10 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
       throw new AppError(409, "El usuario no tiene correo principal", { code: "PERSONAS_USER_EMAIL_MISSING" });
     }
 
+    if (markPending) {
+      await assertUserNotProtected(app, userId, "ACCESS_STATUS_PENDING_PASSWORD", { client });
+    }
+
     await client.query("BEGIN");
     transactionStarted = true;
 
@@ -2342,8 +2400,9 @@ async function syncAuthUserEmail(app, userId, email) {
   }
 }
 
-async function deactivateUserRolesByNames(client, userId, roleNames) {
+async function deactivateUserRolesByNames(app, client, userId, roleNames) {
   if (!Array.isArray(roleNames) || !roleNames.length) return;
+  await assertUserNotProtected(app, userId, "ROLE_DEACTIVATE", { client });
 
   const roleIdsByName = await loadRoleIdByName(client);
   const roleIds = roleNames.map((name) => roleIdsByName.get(name)).filter(Boolean);
@@ -2362,8 +2421,9 @@ async function deactivateUserRolesByNames(client, userId, roleNames) {
   );
 }
 
-async function blockUserAccessByLifecycle(client, userId) {
+async function blockUserAccessByLifecycle(app, client, userId) {
   if (!userId) return;
+  await assertUserNotProtected(app, userId, "LIFECYCLE_BLOCK", { client });
   // AM: Regla de negocio: al inactivar empleado/cliente se bloquea su usuario relacionado.
   await client.query(
     `
@@ -2397,7 +2457,7 @@ async function restoreUserAccessByLifecycle(client, userId) {
   );
 }
 
-async function restoreEmployeeRolesByLifecycle(client, { userId, branchId, assignedBy, esBarbero }) {
+async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, assignedBy, esBarbero }) {
   if (!userId) return;
 
   const historicalRolesResult = await client.query(
@@ -2437,7 +2497,7 @@ async function restoreEmployeeRolesByLifecycle(client, { userId, branchId, assig
   }
 
   const roleIdsByName = await loadRoleIdByName(client);
-  await setEmployeeRoleAssignments(client, {
+  await setEmployeeRoleAssignments(app, client, {
     roleIdsByName,
     roleNames: normalizedRoles,
     userId,
@@ -2515,6 +2575,10 @@ async function updateUsuario(app, request, userId, payload) {
     }
 
     const roleIdsByName = hasNewRole || hasNewBranch ? await loadRoleIdByName(client) : null;
+
+    if (hasNewRole || hasNewBranch) {
+      await assertUserNotProtected(app, raw.id_usuario, "ROLE_UPDATE", { client });
+    }
 
     if (targetRoleName) {
       if (!roleIdsByName?.has(targetRoleName)) {
@@ -2673,6 +2737,9 @@ async function updateUsuarioAccessStatus(app, userId, status) {
 
   try {
     await getUsuarioOrThrow(client, userId);
+    if ([ACCESS_STATUS.PENDING_PASSWORD, ACCESS_STATUS.BLOCKED, ACCESS_STATUS.INACTIVE].includes(status)) {
+      await assertUserNotProtected(app, userId, "ACCESS_STATUS_UPDATE", { client });
+    }
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -2837,8 +2904,8 @@ async function inactivateEmpleado(app, idEmpleado) {
       [idEmpleado]
     );
 
-    await deactivateUserRolesByNames(client, row.id_usuario, [...EMPLOYEE_ALLOWED_ROLES]);
-    await blockUserAccessByLifecycle(client, row.id_usuario);
+    await deactivateUserRolesByNames(app, client, row.id_usuario, [...EMPLOYEE_ALLOWED_ROLES]);
+    await blockUserAccessByLifecycle(app, client, row.id_usuario);
 
     const detail = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
 
@@ -2888,7 +2955,7 @@ async function activateEmpleado(app, request, idEmpleado) {
       [idEmpleado]
     );
 
-    await restoreEmployeeRolesByLifecycle(client, {
+    await restoreEmployeeRolesByLifecycle(app, client, {
       userId: row.id_usuario,
       branchId: row.id_sucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
@@ -3111,6 +3178,7 @@ async function updateCliente(app, request, idCliente, payload) {
 
     if (habilitarAcceso && nextUserId) {
       await ensureClienteRoleAssignment(
+        app,
         client,
         roleIdsByName,
         nextUserId,
@@ -3310,8 +3378,8 @@ async function inactivateCliente(app, idCliente) {
       [idCliente]
     );
 
-    await deactivateUserRolesByNames(client, row.id_usuario, ["cliente"]);
-    await blockUserAccessByLifecycle(client, row.id_usuario);
+    await deactivateUserRolesByNames(app, client, row.id_usuario, ["cliente"]);
+    await blockUserAccessByLifecycle(app, client, row.id_usuario);
 
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 
@@ -3363,6 +3431,7 @@ async function activateCliente(app, request, idCliente) {
     const activeBranchId = normalizeOptional(row.id_sucursal_origen ?? null);
     const roleIdsByName = await loadRoleIdByName(client);
     await ensureClienteRoleAssignment(
+      app,
       client,
       roleIdsByName,
       row.id_usuario,
@@ -3537,6 +3606,10 @@ async function deletePersonaBundlePermanently(app, client, bundle) {
   try {
     await client.query("BEGIN");
     transactionStarted = true;
+
+    for (const idUsuario of usuarioIds) {
+      await assertUserNotProtected(app, idUsuario, "DELETE_USER", { client });
+    }
 
     const reassignmentSummary = await applyTemporaryEmployeeReassignments(client, empleadoIds);
 
@@ -3867,8 +3940,26 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/clientes", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_CLIENTES_SQL);
-      return sendOk(reply, { clientes: rows.map(mapCliente) });
+      const rawQ = normalizeOptional(request.query?.q);
+      const q = rawQ && rawQ.length >= 2 ? rawQ : null;
+      const limit = Math.min(50, Math.max(1, Number.parseInt(request.query?.limit, 10) || 20));
+      const page = Math.max(1, Number.parseInt(request.query?.page, 10) || 1);
+      const offset = (page - 1) * limit;
+      const [{ rows }, totalResult] = await Promise.all([
+        app.db.query(q || request.query?.limit || request.query?.page ? SEARCH_CLIENTES_SQL : LIST_CLIENTES_SQL, q || request.query?.limit || request.query?.page ? [q, limit, offset] : []),
+        q || request.query?.limit || request.query?.page
+          ? app.db.query(COUNT_CLIENTES_SQL, [q])
+          : Promise.resolve({ rows: [{ total: 0 }] }),
+      ]);
+      return sendOk(reply, {
+        clientes: rows.map(mapCliente),
+        pagination: {
+          q,
+          page,
+          limit: q || request.query?.limit || request.query?.page ? limit : rows.length,
+          total: q || request.query?.limit || request.query?.page ? Number(totalResult.rows[0]?.total || 0) : rows.length,
+        },
+      });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar clientes", "PERSONAS_CLIENTS_LIST_ERROR");
     }

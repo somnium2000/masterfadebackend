@@ -13,6 +13,12 @@ import {
   resolveBranchIdsForClaims,
 } from "../../../services/agendaService.js";
 import { consumeMembershipForCompletedAppointment } from "../../../services/membershipService.js";
+import {
+  confirmAdminBookingHold,
+  createAdminBookingHold,
+  createAdminBookingPaymentLink,
+  releaseAdminBookingHold,
+} from "../../../services/booking/adminBookingService.js";
 
 const CONFIG_ALLOWED_ROLES = ["admin", "super_admin"];
 const OPERATIONAL_ALLOWED_ROLES = ["admin", "super_admin", "barbero"];
@@ -104,6 +110,90 @@ function mapScheduleRow(row) {
     almuerzo_fin: row.almuerzo_fin ? String(row.almuerzo_fin).slice(0, 8) : null,
     activo: Boolean(row.activo),
   };
+}
+
+function mapBranchScheduleRow(row) {
+  if (!row) return null;
+  return {
+    id_horario_sucursal: row.id_horario_sucursal,
+    estado_horario_codigo: row.estado_horario_codigo,
+    vigencia_desde: row.vigencia_desde,
+    vigencia_hasta: row.vigencia_hasta,
+    motivo_cambio: row.motivo_cambio ?? null,
+    publicado_at: row.publicado_at ?? null,
+  };
+}
+
+function mapBranchScheduleBlockRow(row) {
+  return {
+    id_bloque_horario: row.id_bloque_horario,
+    dia_semana: Number(row.dia_semana),
+    hora_inicio: String(row.hora_inicio).slice(0, 8),
+    hora_fin: String(row.hora_fin).slice(0, 8),
+    orden_visual: Number(row.orden_visual),
+  };
+}
+
+function normalizeBranchScheduleBlocks(value) {
+  if (!Array.isArray(value)) {
+    throw new AppError(400, "bloques debe ser un arreglo", {
+      code: "ADMIN_CITAS_BRANCH_SCHEDULE_BLOCKS_INVALID",
+      details: { field: "bloques" },
+    });
+  }
+
+  const blocks = value.map((item, index) => {
+    const rawDiaSemana = item?.dia_semana;
+    const diaSemana = Number(rawDiaSemana);
+    if (rawDiaSemana == null || rawDiaSemana === "" || !Number.isInteger(diaSemana) || diaSemana < 0 || diaSemana > 6) {
+      throw new AppError(400, "dia_semana debe estar entre 0 y 6", {
+        code: "ADMIN_CITAS_BRANCH_SCHEDULE_DAY_INVALID",
+        details: { field: `bloques[${index}].dia_semana` },
+      });
+    }
+
+    const horaInicio = normalizeTime(item?.hora_inicio, `bloques[${index}].hora_inicio`);
+    const horaFin = normalizeTime(item?.hora_fin, `bloques[${index}].hora_fin`);
+    if (horaFin <= horaInicio) {
+      throw new AppError(400, "hora_fin debe ser mayor que hora_inicio", {
+        code: "ADMIN_CITAS_BRANCH_SCHEDULE_RANGE_INVALID",
+        details: { index },
+      });
+    }
+
+    const ordenVisual = item?.orden_visual == null ? 1 : Number(item.orden_visual);
+    if (!Number.isInteger(ordenVisual) || ordenVisual <= 0 || ordenVisual > 32767) {
+      throw new AppError(400, "orden_visual debe ser un entero positivo", {
+        code: "ADMIN_CITAS_BRANCH_SCHEDULE_ORDER_INVALID",
+        details: { field: `bloques[${index}].orden_visual` },
+      });
+    }
+
+    return {
+      dia_semana: diaSemana,
+      hora_inicio: horaInicio,
+      hora_fin: horaFin,
+      orden_visual: ordenVisual,
+    };
+  });
+
+  const sorted = [...blocks].sort((left, right) => (
+    left.dia_semana - right.dia_semana
+    || left.hora_inicio.localeCompare(right.hora_inicio)
+    || left.hora_fin.localeCompare(right.hora_fin)
+  ));
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    if (previous.dia_semana === current.dia_semana && current.hora_inicio < previous.hora_fin) {
+      throw new AppError(400, "Los bloques de un mismo dia no pueden duplicarse ni solaparse", {
+        code: "ADMIN_CITAS_BRANCH_SCHEDULE_OVERLAP",
+        details: { dia_semana: current.dia_semana },
+      });
+    }
+  }
+
+  return blocks;
 }
 
 function mapEmployeeRow(row) {
@@ -983,6 +1073,80 @@ async function getEmployeeInScope(client, idEmpleado, branchIds) {
   return mapEmployeeRow(rows[0]);
 }
 
+async function getBranchInScope(client, idSucursal, branchIds, { lock = false } = {}) {
+  const safeBranch = assertUuid(idSucursal, "id_sucursal");
+  if (!branchIds.includes(safeBranch)) {
+    throw new AppError(403, "Sucursal fuera de tu alcance", {
+      code: "ADMIN_CITAS_BRANCH_FORBIDDEN",
+      details: { id_sucursal: safeBranch },
+    });
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT id_sucursal, nombre_sucursal
+      FROM public.sucursales
+      WHERE id_sucursal = $1::uuid
+        AND deleted_at IS NULL
+      LIMIT 1
+      ${lock ? "FOR UPDATE" : ""}
+    `,
+    [safeBranch]
+  );
+  if (!rows[0]) {
+    throw new AppError(404, "Sucursal no encontrada", {
+      code: "ADMIN_CITAS_BRANCH_NOT_FOUND",
+      details: { id_sucursal: safeBranch },
+    });
+  }
+  return rows[0];
+}
+
+async function getCurrentPublishedBranchSchedule(client, idSucursal, { lock = false } = {}) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        id_horario_sucursal,
+        estado_horario_codigo,
+        vigencia_desde,
+        vigencia_hasta,
+        motivo_cambio,
+        publicado_at
+      FROM public.horarios_semanales_sucursales
+      WHERE id_sucursal = $1::uuid
+        AND estado_horario_codigo = 'publicado'
+        AND vigencia_desde <= CURRENT_DATE
+        AND (vigencia_hasta IS NULL OR vigencia_hasta >= CURRENT_DATE)
+      ORDER BY vigencia_desde DESC, created_at DESC, id_horario_sucursal DESC
+      LIMIT 1
+      ${lock ? "FOR UPDATE" : ""}
+    `,
+    [idSucursal]
+  );
+  return rows[0] ?? null;
+}
+
+async function buildBranchScheduleResponse(client, branch) {
+  const schedule = await getCurrentPublishedBranchSchedule(client, branch.id_sucursal);
+  const blocks = schedule
+    ? await client.query(
+      `
+        SELECT id_bloque_horario, dia_semana, hora_inicio, hora_fin, orden_visual
+        FROM public.horarios_semanales_sucursales_bloques
+        WHERE id_horario_sucursal = $1::uuid
+        ORDER BY dia_semana ASC, orden_visual ASC, hora_inicio ASC, id_bloque_horario ASC
+      `,
+      [schedule.id_horario_sucursal]
+    )
+    : { rows: [] };
+
+  return {
+    sucursal: branch,
+    horario: mapBranchScheduleRow(schedule),
+    bloques: blocks.rows.map(mapBranchScheduleBlockRow),
+  };
+}
+
 async function listBarbersByBranchInScope(client, branchIds, idSucursal) {
   const safeBranch = assertUuid(idSucursal, "id_sucursal");
   if (!branchIds.includes(safeBranch)) {
@@ -1141,6 +1305,207 @@ async function getDayOffType(client) {
 }
 
 export default async function adminCitasRoutes(app) {
+  app.post(
+    "/hold",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        headers: {
+          type: "object",
+          properties: {
+            "x-idempotency-key": { type: "string", format: "uuid" },
+          },
+          additionalProperties: true,
+        },
+        body: {
+          type: "object",
+          required: ["id_sucursal"],
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+            id_cliente: { type: ["string", "null"], format: "uuid" },
+            cliente_nuevo: { type: ["object", "null"], additionalProperties: true },
+            integrantes: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", additionalProperties: true } },
+            bloques: { type: "array", minItems: 1, maxItems: 5, items: { type: "object", additionalProperties: true } },
+            metodo_pago_codigo: { type: ["string", "null"], maxLength: 60 },
+            notas: { type: ["string", "null"], maxLength: 1000 },
+            motivo: { type: ["string", "null"], maxLength: 500 },
+          },
+          additionalProperties: true,
+          anyOf: [
+            { required: ["integrantes"] },
+            { required: ["bloques"] },
+          ],
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: { type: "string" },
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          404: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const result = await createAdminBookingHold(app, request);
+        reply.header("x-idempotency-key", result.requestId);
+        return sendOk(reply, result.data, {
+          statusCode: result.statusCode,
+          requestId: request.id,
+        });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear el hold administrativo de citas",
+          "ADMIN_CITAS_HOLD_CREATE_ERROR"
+        );
+      }
+    }
+  );
+
+  app.delete(
+    "/hold/:idGrupoCita",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["idGrupoCita"],
+          properties: { idGrupoCita: { type: "string", format: "uuid" } },
+        },
+        response: {
+          200: { type: "object", additionalProperties: true },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          404: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await releaseAdminBookingHold(app, request);
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo liberar el hold administrativo",
+          "ADMIN_CITAS_HOLD_RELEASE_ERROR"
+        );
+      }
+    }
+  );
+
+  app.post(
+    "/hold/:idGrupoCita/confirmar",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["idGrupoCita"],
+          properties: { idGrupoCita: { type: "string", format: "uuid" } },
+        },
+        body: {
+          type: "object",
+          properties: {
+            metodo_pago_codigo: { type: "string", maxLength: 60 },
+            motivo: { type: ["string", "null"], maxLength: 500 },
+            consentimiento: { type: ["object", "null"], additionalProperties: true },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: { type: "object", additionalProperties: true },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          404: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          422: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await confirmAdminBookingHold(app, request);
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar el hold administrativo",
+          "ADMIN_CITAS_HOLD_CONFIRM_ERROR"
+        );
+      }
+    }
+  );
+
+  app.post(
+    "/hold/:idGrupoCita/payment-link",
+    {
+      preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          required: ["idGrupoCita"],
+          properties: { idGrupoCita: { type: "string", format: "uuid" } },
+        },
+        body: {
+          type: "object",
+          properties: {
+            canal: { type: ["string", "null"], maxLength: 30 },
+            correo: { type: ["string", "null"], maxLength: 255 },
+            telefono: { type: ["string", "null"], maxLength: 50 },
+            expires_at: { type: ["string", "null"] },
+          },
+          additionalProperties: true,
+        },
+        response: {
+          200: { type: "object", additionalProperties: true },
+          400: { type: "object", additionalProperties: true },
+          401: { type: "object", additionalProperties: true },
+          403: { type: "object", additionalProperties: true },
+          409: { type: "object", additionalProperties: true },
+          500: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await createAdminBookingPaymentLink(app, request);
+        return sendOk(reply, data, { statusCode: 201, requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo crear el enlace de pago administrativo",
+          "ADMIN_CITAS_HOLD_PAYMENT_LINK_ERROR"
+        );
+      }
+    }
+  );
+
   app.get("/operativas/contexto", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       await expireStaleAppointmentReservations(app.db, { logger: request.log });
@@ -1990,6 +2355,104 @@ export default async function adminCitasRoutes(app) {
       return sendOk(reply, { empleado, horarios: rows.map(mapScheduleRow) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar el horario", "ADMIN_CITAS_HORARIOS_GET_ERROR");
+    }
+  });
+
+  app.get("/sucursales/:id_sucursal/horarios", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
+    try {
+      const branchIds = await getScopeBranches(app, request.claims);
+      const sucursal = await getBranchInScope(app.db, request.params.id_sucursal, branchIds);
+      return sendOk(reply, await buildBranchScheduleResponse(app.db, sucursal));
+    } catch (error) {
+      return sendHandled(
+        reply,
+        request,
+        error,
+        "No se pudo consultar el horario de la sucursal",
+        "ADMIN_CITAS_BRANCH_SCHEDULE_GET_ERROR"
+      );
+    }
+  });
+
+  app.put("/sucursales/:id_sucursal/horarios", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
+    const dbClient = await app.db.connect();
+    try {
+      const branchIds = await getScopeBranches(app, request.claims);
+      const blocks = normalizeBranchScheduleBlocks(request.body?.bloques);
+      const motivoCambio = cleanText(request.body?.motivo_cambio);
+      const actorUsuarioId = request.claims?.user?.id_usuario ?? null;
+
+      await dbClient.query("BEGIN");
+      const sucursal = await getBranchInScope(dbClient, request.params.id_sucursal, branchIds, { lock: true });
+      const currentSchedule = await getCurrentPublishedBranchSchedule(dbClient, sucursal.id_sucursal, { lock: true });
+      if (currentSchedule) {
+        await dbClient.query(
+          `
+            UPDATE public.horarios_semanales_sucursales
+            SET estado_horario_codigo = 'archivado',
+                vigencia_hasta = CASE
+                  WHEN vigencia_desde = CURRENT_DATE THEN CURRENT_DATE
+                  ELSE CURRENT_DATE - 1
+                END,
+                updated_at = now()
+            WHERE id_horario_sucursal = $1::uuid
+          `,
+          [currentSchedule.id_horario_sucursal]
+        );
+      }
+
+      const insertedSchedule = await dbClient.query(
+        `
+          INSERT INTO public.horarios_semanales_sucursales (
+            id_sucursal,
+            estado_horario_codigo,
+            vigencia_desde,
+            vigencia_hasta,
+            motivo_cambio,
+            creado_por,
+            publicado_por,
+            publicado_at
+          )
+          VALUES ($1::uuid, 'publicado', CURRENT_DATE, NULL, $2::text, $3::uuid, $3::uuid, now())
+          RETURNING id_horario_sucursal
+        `,
+        [sucursal.id_sucursal, motivoCambio, actorUsuarioId]
+      );
+      const scheduleId = insertedSchedule.rows[0].id_horario_sucursal;
+
+      for (const block of blocks) {
+        await dbClient.query(
+          `
+            INSERT INTO public.horarios_semanales_sucursales_bloques (
+              id_horario_sucursal,
+              dia_semana,
+              hora_inicio,
+              hora_fin,
+              orden_visual
+            )
+            VALUES ($1::uuid, $2::smallint, $3::time, $4::time, $5::smallint)
+          `,
+          [scheduleId, block.dia_semana, block.hora_inicio, block.hora_fin, block.orden_visual]
+        );
+      }
+
+      await dbClient.query("COMMIT");
+      return sendOk(reply, await buildBranchScheduleResponse(dbClient, sucursal));
+    } catch (error) {
+      try {
+        await dbClient.query("ROLLBACK");
+      } catch {
+        // no-op
+      }
+      return sendHandled(
+        reply,
+        request,
+        error,
+        "No se pudo actualizar el horario de la sucursal",
+        "ADMIN_CITAS_BRANCH_SCHEDULE_PUT_ERROR"
+      );
+    } finally {
+      dbClient.release();
     }
   });
 
