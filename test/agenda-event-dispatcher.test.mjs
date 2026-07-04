@@ -92,6 +92,51 @@ test("dispatcher aplica limites globales y por IP", async () => {
   await dispatcher.stop();
 });
 
+test("dispatcher permite tres conexiones, rechaza cuarta y libera contador al cerrar", async () => {
+  const dispatcher = createAgendaEventDispatcher({
+    pool: createPool(),
+    config: {
+      ...config,
+      maxConnectionsPerIp: 3,
+      maxConnectionsGlobal: 4,
+    },
+  });
+  await dispatcher.start();
+  const subscribers = [];
+  for (let index = 0; index < 3; index += 1) {
+    subscribers.push(await dispatcher.subscribe({
+      idSucursal: BRANCH_A,
+      ip: "127.0.0.1",
+      write() {
+        return true;
+      },
+      close() {},
+    }));
+  }
+
+  assert.deepEqual(dispatcher.canAcceptConnection("127.0.0.1"), { ok: false, reason: "ip" });
+  assert.equal(dispatcher.getStats().subscribers, 3);
+  assert.deepEqual(dispatcher.getStats().perIp, [["127.0.0.1", 3]]);
+
+  dispatcher.unsubscribe(subscribers[0].id);
+  assert.deepEqual(dispatcher.canAcceptConnection("127.0.0.1"), { ok: true, ip: "127.0.0.1" });
+  const replacement = await dispatcher.subscribe({
+    idSucursal: BRANCH_A,
+    ip: "127.0.0.1",
+    write() {
+      return true;
+    },
+    close() {},
+  });
+
+  for (const subscriber of [...subscribers.slice(1), replacement]) {
+    dispatcher.unsubscribe(subscriber.id);
+  }
+  assert.equal(dispatcher.getStats().subscribers, 0);
+  assert.deepEqual(dispatcher.getStats().perIp, []);
+  await dispatcher.stop();
+});
+
 test("dispatcher recupera despues de error temporal sin avanzar cursor", async () => {
   const dispatcher = createAgendaEventDispatcher({ pool: createPool({ failFirstPoll: true }), config });
   await dispatcher.start();
