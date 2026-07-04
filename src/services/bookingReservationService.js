@@ -107,7 +107,7 @@ export function buildAppointmentDetailRows(serviceItems = [], {
         duracion_min: Math.max(1, Math.trunc(Number(item?.duracion_min || 0))),
         buffer_min: Math.max(0, Math.trunc(Number(item?.buffer_min || 0))),
         nombre_servicio_snapshot: String(item?.nombre_servicio || "Servicio").trim() || "Servicio",
-        precio_referencia_hnl: normalizeMoney(item?.precio_hnl),
+        precio_referencia_hnl: normalizeMoney(item?.precio_referencia_hnl ?? item?.precio_hnl),
         precio_unitario_hnl: normalizeMoney(item?.precio_hnl),
         incluye_isv_snapshot: isvEnabled && (item?.incluye_isv_snapshot === true || item?.incluye_isv === true),
         isv_porcentaje: isvEnabled ? normalizePercentage(item?.isv_porcentaje) : 0,

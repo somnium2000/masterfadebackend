@@ -610,6 +610,40 @@ test("payload canonico conserva selection_type, id_paquete y origenes package", 
   assert.equal(integrante.detalles.reduce((sum, detalle) => sum + Number(detalle.precio_unitario_hnl), 0), 250);
 });
 
+test("payload package conserva precio_referencia de tarifa aunque distribuya precio de paquete", async () => {
+  const selection = await getBookingSelectionDetails(createPackageSelectionClient({
+    packageRow: {
+      id_paquete: PACKAGE_A,
+      nombre_paquete: "MasterPaquete Pro",
+      descripcion: "Paquete de prueba",
+      precio_hnl: 220,
+    },
+  }), {
+    id_sucursal: BRANCH_A,
+    selection_type: "package",
+    id_paquete: PACKAGE_A,
+    fecha_operativa: "2026-07-15",
+  });
+  const detailRows = buildAppointmentDetailRows(selection.items);
+  const payload = buildCanonicalReservationPayload({
+    requestId: "56565656-5656-4656-8656-565656565656",
+    idSucursal: BRANCH_A,
+    integrantes: [{
+      selection: { serviceSelection: selection },
+      detailRows,
+      inicio_at: "2026-07-15T15:00:00.000Z",
+    }],
+  });
+  const detalles = payload.integrantes[0].detalles;
+
+  assert.equal(payload._totals.total_hnl, 220);
+  assert.equal(detalles.reduce((sum, detalle) => sum + Number(detalle.precio_unitario_hnl), 0), 220);
+  assert.deepEqual(
+    detalles.map((detalle) => detalle.precio_referencia_hnl),
+    [100, 150]
+  );
+});
+
 test("payload canonico conserva selection_type, id_paquete y origenes mixed", async () => {
   const selection = await getBookingSelectionDetails(createPackageSelectionClient(), {
     id_sucursal: BRANCH_A,
