@@ -52,6 +52,30 @@ async function loadBranch(pool, idSucursal) {
   return result.rows?.[0] || null;
 }
 
+export async function subscribeAgendaRealtimeSafely({
+  app,
+  request,
+  idSucursal,
+  lastEventId,
+  write,
+  closeRaw,
+  isClosed,
+}) {
+  const createdSubscriber = await app.agendaRealtime.subscribe({
+    idSucursal,
+    ip: request.ip,
+    write,
+    close: closeRaw,
+    lastEventId,
+  });
+  if (isClosed()) {
+    app.agendaRealtime.unsubscribe(createdSubscriber.id);
+    closeRaw();
+    return null;
+  }
+  return createdSubscriber;
+}
+
 export default async function agendaEventosRoutes(app) {
   app.get("/eventos", async (request, reply) => {
     if (!app.agendaRealtime?.enabled) {
@@ -99,6 +123,15 @@ export default async function agendaEventosRoutes(app) {
 
     const connectionCheck = app.agendaRealtime.canAcceptConnection(request.ip);
     if (!connectionCheck.ok) {
+      const stats = typeof app.agendaRealtime.getStats === "function" ? app.agendaRealtime.getStats() : null;
+      request.log.warn({
+        request_id: request.id,
+        ip: request.ip,
+        reason: connectionCheck.reason,
+        subscribers: stats?.subscribers,
+        perIp: stats?.perIp,
+      }, "Agenda SSE connection rejected");
+      reply.header("Retry-After", "30");
       return sendError(reply, 429, "Demasiadas conexiones de agenda abiertas.", {
         code: "AGENDA_SSE_CONNECTION_LIMIT",
         requestId: request.id,
@@ -139,10 +172,11 @@ export default async function agendaEventosRoutes(app) {
       }
     };
 
-    request.raw.on("close", cleanup);
-    request.raw.on("aborted", cleanup);
-    reply.raw.on("close", cleanup);
-    reply.raw.on("error", cleanup);
+    request.raw.once("close", cleanup);
+    request.raw.once("aborted", cleanup);
+    reply.raw.once("close", cleanup);
+    reply.raw.once("finish", cleanup);
+    reply.raw.once("error", cleanup);
     reply.raw.on("drain", () => subscriber?.onDrain?.());
 
     const write = (frame) => {
@@ -158,12 +192,14 @@ export default async function agendaEventosRoutes(app) {
     heartbeat.unref?.();
 
     try {
-      subscriber = await app.agendaRealtime.subscribe({
+      subscriber = await subscribeAgendaRealtimeSafely({
+        app,
+        request,
         idSucursal,
-        ip: request.ip,
-        write,
-        close: closeRaw,
         lastEventId,
+        write,
+        closeRaw,
+        isClosed: () => closed,
       });
     } catch (error) {
       request.log.error({ err: { message: error?.message, code: error?.code } }, "Agenda SSE initialization failed");

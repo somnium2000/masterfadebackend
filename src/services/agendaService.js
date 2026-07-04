@@ -1026,6 +1026,7 @@ function enrichSelectionItem(row, { bookingIsvEnabled = resolveBookingIsvEnabled
     buffer_min: Number(row.buffer_min ?? 0),
     precio_hnl: precioHnl,
     precio_total_hnl: taxSnapshot.total_linea_hnl,
+    precio_referencia_hnl: precioHnl,
     incluye_isv: incluyeIsv,
     incluye_isv_snapshot: incluyeIsv,
     isv_porcentaje: isvPorcentaje,
@@ -1043,14 +1044,35 @@ function summarizeSelectionItems(items) {
   };
 }
 
+function allocateAmountAcrossSelectionItems(items = [], totalHnl = 0) {
+  const source = Array.isArray(items) ? items : [];
+  const total = normalizeMoney(totalHnl);
+  if (!source.length || total <= 0) return source;
+  const baseTotal = normalizeMoney(source.reduce((sum, item) => sum + Number(item.total_linea_hnl ?? item.precio_hnl ?? 0), 0));
+  let assigned = 0;
+  return source.map((item, index) => {
+    const amount = index === source.length - 1
+      ? normalizeMoney(total - assigned)
+      : normalizeMoney(baseTotal > 0 ? (total * Number(item.total_linea_hnl ?? item.precio_hnl ?? 0)) / baseTotal : total / source.length);
+    assigned = normalizeMoney(assigned + amount);
+    return {
+      ...item,
+      precio_hnl: amount,
+      precio_total_hnl: amount,
+      precio_referencia_hnl: normalizeMoney(item.precio_referencia_hnl ?? item.precio_hnl ?? amount),
+      precio_unitario_hnl: amount,
+      incluye_isv: false,
+      incluye_isv_snapshot: false,
+      isv_porcentaje: 0,
+      isv_hnl: 0,
+      total_linea_hnl: amount,
+      origen_item_codigo: "paquete_incluido",
+    };
+  });
+}
+
 export function assertBookingSelectionRuntimeSupported(selectionType) {
-  const normalized = normalizeBookingSelectionType(selectionType || "services", { required: true });
-  if (normalized === "package" || normalized === "mixed") {
-    throw new AppError(409, "El flujo de paquetes/mixed sera habilitado en Microfase 2B.", {
-      code: "BOOKING_PACKAGE_FLOW_PENDING_2B",
-    });
-  }
-  return normalized;
+  return normalizeBookingSelectionType(selectionType || "services", { required: true });
 }
 
 export async function getServiceSelectionDetails(
@@ -1225,6 +1247,7 @@ export async function getPackageSelectionDetails(
         pd.cantidad,
         s.nombre_servicio,
         COALESCE(s.activo, FALSE) AS servicio_activo,
+        COALESCE(s.agendable, TRUE) AS servicio_agendable,
         s.deleted_at
       FROM public.paquetes_detalles pd
       LEFT JOIN public.servicios s
@@ -1246,6 +1269,7 @@ export async function getPackageSelectionDetails(
     !row?.nombre_servicio
     || row?.deleted_at
     || !row?.servicio_activo
+    || !row?.servicio_agendable
   ));
   if (containsInactiveServices) {
     throw new AppError(409, "El paquete incluye servicios inactivos o no disponibles.", {
@@ -1270,20 +1294,28 @@ export async function getPackageSelectionDetails(
     fechaInicio,
     { bookingIsvEnabled }
   );
-  const packagePrice = packageRow.precio_hnl == null
-    ? Number(serviceSelection.monto_total_hnl || 0)
-    : Number(packageRow.precio_hnl);
+  const packagePrice = Number(packageRow.precio_hnl);
+  if (!Number.isFinite(packagePrice) || packagePrice <= 0) {
+    throw new AppError(409, "El paquete no tiene precio publico valido para la sucursal", {
+      code: "AGENDA_PACKAGE_PRICE_MISSING",
+      details: { id_paquete: safePackageId, id_sucursal: safeBranchId },
+    });
+  }
+  const packageItems = allocateAmountAcrossSelectionItems(serviceSelection.items, packagePrice);
 
   return {
     ...serviceSelection,
     selection_type: "package",
     id_paquete: safePackageId,
+    items: packageItems,
     paquete: {
       id_paquete: packageRow.id_paquete,
       nombre_paquete: packageRow.nombre_paquete,
       descripcion: packageRow.descripcion ?? null,
       precio_hnl: packagePrice,
     },
+    monto_subtotal_hnl: packagePrice,
+    monto_isv_hnl: 0,
     monto_total_hnl: packagePrice,
   };
 }
@@ -1319,6 +1351,7 @@ export async function getBookingSelectionDetails(client, {
         ...packageSelection,
         selection_type: "mixed",
         servicios_extra: [],
+        monto_subtotal_hnl: Number(packageSelection.monto_subtotal_hnl || packageSelection.monto_total_hnl || 0),
         monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
       };
     }
@@ -1328,23 +1361,32 @@ export async function getBookingSelectionDetails(client, {
         .map((item) => item?.id_servicio)
         .filter(Boolean)
     );
-    const conflictingServiceIds = extraServiceIds.filter((idServicio) => packageServiceIds.has(idServicio));
-    if (conflictingServiceIds.length > 0) {
-      throw new AppError(409, "Ese servicio ya lo incluye el paquete seleccionado", {
-        code: "SERVICE_ALREADY_INCLUDED_IN_PACKAGE",
-        details: { field: "servicios" },
-      });
+    const filteredExtraServiceIds = extraServiceIds.filter((idServicio) => !packageServiceIds.has(idServicio));
+    if (!filteredExtraServiceIds.length) {
+      return {
+        ...packageSelection,
+        selection_type: "mixed",
+        servicios_extra: [],
+        monto_subtotal_hnl: Number(packageSelection.monto_subtotal_hnl || packageSelection.monto_total_hnl || 0),
+        monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
+      };
     }
 
-    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero, tariffDateSource, {
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, filteredExtraServiceIds, id_barbero, tariffDateSource, {
       bookingIsvEnabled,
     });
+    const extraItems = (Array.isArray(extraSelection.items) ? extraSelection.items : []).map((item) => ({
+      ...item,
+      origen_item_codigo: "servicio_extra",
+    }));
     const mergedItems = [
       ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
-      ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
+      ...extraItems,
     ];
     const totalDuracion = Number(packageSelection.duracion_total_min || 0) + Number(extraSelection.duracion_total_min || 0);
     const totalMonto = Number(packageSelection.monto_total_hnl || 0) + Number(extraSelection.monto_total_hnl || 0);
+    const totalSubtotal = Number(packageSelection.monto_subtotal_hnl || packageSelection.monto_total_hnl || 0)
+      + Number(extraSelection.monto_subtotal_hnl || extraSelection.monto_total_hnl || 0);
     const totalBuffer = Math.max(
       Number(packageSelection.buffer_total_min || 0),
       Number(extraSelection.buffer_total_min || 0)
@@ -1354,9 +1396,11 @@ export async function getBookingSelectionDetails(client, {
       ...packageSelection,
       selection_type: "mixed",
       items: mergedItems,
-      servicios_extra: extraSelection.items,
+      servicios_extra: extraItems,
       duracion_total_min: totalDuracion,
       buffer_total_min: mergedItems.length > 0 ? totalBuffer : 0,
+      monto_subtotal_hnl: totalSubtotal,
+      monto_isv_hnl: Number(extraSelection.monto_isv_hnl || 0),
       monto_total_hnl: totalMonto,
     };
   }

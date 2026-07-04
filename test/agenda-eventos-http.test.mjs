@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Fastify from "fastify";
-import agendaEventosRoutes from "../src/routes/v1/public/agendaEventos.js";
+import agendaEventosRoutes, {
+  subscribeAgendaRealtimeSafely,
+} from "../src/routes/v1/public/agendaEventos.js";
 
 const BRANCH_A = "11111111-1111-4111-8111-111111111111";
 const BRANCH_B = "22222222-2222-4222-8222-222222222222";
@@ -19,9 +21,24 @@ async function readUntil(response, needle) {
   return text;
 }
 
-async function createApp({ enabled = true, connectionLimit = false, branchState = true } = {}) {
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function createApp({
+  enabled = true,
+  connectionLimit = false,
+  branchState = true,
+  maxConnectionsPerIp = 3,
+  subscribeDelayMs = 0,
+} = {}) {
   const app = Fastify({ logger: false });
   const subscriptions = [];
+  const activeSubscribers = new Map();
+  const perIp = new Map();
+  let unsubscribeCount = 0;
   app.decorate("config", {
     agendaSse: {
       retryMs: 5000,
@@ -40,18 +57,32 @@ async function createApp({ enabled = true, connectionLimit = false, branchState 
   });
   app.decorate("agendaRealtime", {
     enabled,
-    canAcceptConnection() {
-      return connectionLimit ? { ok: false, reason: "global" } : { ok: true };
+    canAcceptConnection(ip) {
+      if (connectionLimit) return { ok: false, reason: "global" };
+      const count = perIp.get(ip) || 0;
+      return count >= maxConnectionsPerIp ? { ok: false, reason: "ip" } : { ok: true };
+    },
+    getStats() {
+      return {
+        subscribers: activeSubscribers.size,
+        perIp: [...perIp.entries()],
+      };
     },
     async subscribe({ idSucursal, lastEventId, write, close }) {
       const subscriber = {
         id: `sub-${subscriptions.length + 1}`,
         idSucursal,
+        ip: "127.0.0.1",
         lastEventId,
         close,
         onDrain() {},
       };
       subscriptions.push(subscriber);
+      activeSubscribers.set(subscriber.id, subscriber);
+      perIp.set(subscriber.ip, (perIp.get(subscriber.ip) || 0) + 1);
+      if (subscribeDelayMs > 0) {
+        await sleep(subscribeDelayMs);
+      }
       setTimeout(() => {
         write([
           "id: 125",
@@ -74,12 +105,23 @@ async function createApp({ enabled = true, connectionLimit = false, branchState 
       return subscriber;
     },
     unsubscribe(id) {
-      const subscriber = subscriptions.find((item) => item.id === id);
+      unsubscribeCount += 1;
+      const subscriber = activeSubscribers.get(id);
+      if (!subscriber) return;
+      activeSubscribers.delete(id);
+      const current = perIp.get(subscriber.ip) || 0;
+      if (current <= 1) perIp.delete(subscriber.ip);
+      else perIp.set(subscriber.ip, current - 1);
       subscriber?.close?.();
     },
   });
   await app.register(agendaEventosRoutes, { prefix: "/v1/public/agenda" });
-  return { app, subscriptions };
+  return {
+    app,
+    subscriptions,
+    getStats: () => app.agendaRealtime.getStats(),
+    getUnsubscribeCount: () => unsubscribeCount,
+  };
 }
 
 test("GET /v1/public/agenda/eventos abre stream SSE real con retry, connected y evento live", async () => {
@@ -118,6 +160,9 @@ test("GET /v1/public/agenda/eventos valida feature flag, uuid, sucursal y limite
     const response = await app.inject({ method: "GET", url });
     assert.equal(response.statusCode, expectedStatus);
     assert.equal(response.json().error.code, expectedCode);
+    if (expectedStatus === 429) {
+      assert.equal(response.headers["retry-after"], "30");
+    }
     await app.close();
   }
 });
@@ -133,4 +178,37 @@ test("GET /v1/public/agenda/eventos prioriza last_event_id query sobre Last-Even
   await readUntil(response, ": connected");
   assert.equal(subscriptions[0].lastEventId, "7");
   await app.close();
+});
+
+test("subscribeAgendaRealtimeSafely libera suscriptor si el cliente cerro durante subscribe", async () => {
+  const events = [];
+  let closed = false;
+  const app = {
+    agendaRealtime: {
+      async subscribe() {
+        await sleep(20);
+        return { id: "sub-race" };
+      },
+      unsubscribe(id) {
+        events.push(["unsubscribe", id]);
+      },
+    },
+  };
+  const subscriberPromise = subscribeAgendaRealtimeSafely({
+    app,
+    request: { ip: "127.0.0.1" },
+    idSucursal: BRANCH_A,
+    lastEventId: null,
+    write() {},
+    closeRaw() {
+      events.push(["closeRaw"]);
+    },
+    isClosed: () => closed,
+  });
+
+  closed = true;
+  const subscriber = await subscriberPromise;
+
+  assert.equal(subscriber, null);
+  assert.deepEqual(events, [["unsubscribe", "sub-race"], ["closeRaw"]]);
 });

@@ -296,7 +296,9 @@ export function buildCanonicalReservationPayload({
   const request_id = resolveReservationRequestId(requestId);
   const normalizeIntegrantes = (sourceIntegrantes = []) => (Array.isArray(sourceIntegrantes) ? sourceIntegrantes : []).map((integrante, index) => {
     const selection = integrante.selection || {};
-    const serviceItems = selection.serviceSelection?.items || integrante.serviceItems || [];
+    const serviceSelection = selection.serviceSelection || {};
+    const serviceItems = serviceSelection.items || integrante.serviceItems || [];
+    const selectionType = String(serviceSelection.selection_type || integrante.selection_type || "services").trim().toLowerCase();
     const detailRows = Array.isArray(integrante.detailRows)
       ? integrante.detailRows
       : buildAppointmentDetailRows(serviceItems, {
@@ -323,7 +325,8 @@ export function buildCanonicalReservationPayload({
         : [],
       asignada_automaticamente: integrante.asignada_automaticamente === true,
       es_canje_recompensa: integrante.es_canje_recompensa === true,
-      selection_type: "services",
+      selection_type: ["services", "package", "mixed"].includes(selectionType) ? selectionType : "services",
+      id_paquete: serviceSelection.id_paquete || integrante.id_paquete || null,
       inicio_at: integrante.inicio_at instanceof Date ? integrante.inicio_at.toISOString() : integrante.inicio_at,
       notas: integrante.notas || null,
       detalles: normalizeDetails(detailRows),

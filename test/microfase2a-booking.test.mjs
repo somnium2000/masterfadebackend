@@ -7,6 +7,7 @@ import {
 import {
   assertBookingSelectionRuntimeSupported,
   countDateKeyRangeDays,
+  getBookingSelectionDetails,
   getServiceSelectionDetails,
   mapDayAvailabilityForResponse,
   normalizeOperationalDateTime,
@@ -31,14 +32,20 @@ import {
   applyPersistedPromotionDiscounts,
   buildPaymentDetailRows,
 } from "../src/routes/v1/public/pagos.js";
+import {
+  buildCanonicalReservationPayload,
+} from "../src/services/bookingCanonicalReservationService.js";
 
 const BRANCH_A = "11111111-1111-4111-8111-111111111111";
 const BRANCH_B = "22222222-2222-4222-8222-222222222222";
 const SERVICE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SERVICE_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const SERVICE_C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const BARBER_A = "33333333-3333-4333-8333-333333333333";
 const TARIFF_A = "44444444-4444-4444-8444-444444444444";
 const TARIFF_B = "55555555-5555-4555-8555-555555555555";
+const TARIFF_C = "56565656-5656-4565-8565-565656565656";
+const PACKAGE_A = "23232323-2323-4232-8232-232323232323";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
 const HOLD_A = "77777777-7777-4777-8777-777777777777";
 const GROUP_A = "99999999-9999-4999-8999-999999999999";
@@ -78,6 +85,74 @@ function createTariffClient(rows) {
         return { rows: [{ agenda_buffer_global_min: 7 }] };
       }
       return { rows };
+    },
+  };
+}
+
+function createPackageSelectionClient({
+  packageRow = {
+    id_paquete: PACKAGE_A,
+    nombre_paquete: "MasterPaquete Pro",
+    descripcion: "Paquete de prueba",
+    precio_hnl: 250,
+  },
+  packageDetails = [
+    { id_servicio: SERVICE_A, cantidad: 1, nombre_servicio: "Corte", servicio_activo: true, servicio_agendable: true, deleted_at: null },
+    { id_servicio: SERVICE_B, cantidad: 1, nombre_servicio: "Barba", servicio_activo: true, servicio_agendable: true, deleted_at: null },
+  ],
+} = {}) {
+  const rowsByService = new Map([
+    [SERVICE_A, {
+      id_servicio: SERVICE_A,
+      id_tarifa: TARIFF_A,
+      nombre_servicio: "Corte",
+      duracion_min: 30,
+      buffer_min: 5,
+      precio_hnl: 100,
+      incluye_isv: false,
+      isv_porcentaje: 0,
+    }],
+    [SERVICE_B, {
+      id_servicio: SERVICE_B,
+      id_tarifa: TARIFF_B,
+      nombre_servicio: "Barba",
+      duracion_min: 20,
+      buffer_min: 10,
+      precio_hnl: 150,
+      incluye_isv: false,
+      isv_porcentaje: 0,
+    }],
+    [SERVICE_C, {
+      id_servicio: SERVICE_C,
+      id_tarifa: TARIFF_C,
+      nombre_servicio: "Cejas",
+      duracion_min: 15,
+      buffer_min: 3,
+      precio_hnl: 80,
+      incluye_isv: false,
+      isv_porcentaje: 0,
+    }],
+  ]);
+  const calls = [];
+  return {
+    calls,
+    async query(sql, params = []) {
+      const text = String(sql);
+      calls.push({ sql: text, params });
+      if (text.includes("parametros_sistema")) {
+        return { rows: [{ agenda_buffer_global_min: 7 }] };
+      }
+      if (text.includes("FROM public.paquetes p") && text.includes("picked_offer")) {
+        return { rows: packageRow ? [packageRow] : [] };
+      }
+      if (text.includes("FROM public.paquetes_detalles pd")) {
+        return { rows: packageDetails };
+      }
+      if (text.includes("FROM public.servicios s") && text.includes("active_tariffs")) {
+        const ids = Array.isArray(params[1]) ? params[1] : [];
+        return { rows: Array.from(new Set(ids)).map((id) => rowsByService.get(id)).filter(Boolean) };
+      }
+      return { rows: [] };
     },
   };
 }
@@ -452,19 +527,191 @@ test("fecha-hora sin timezone se rechaza para no depender del servidor", () => {
   );
 });
 
-test("creacion package y mixed queda bloqueada hasta Microfase 2B", () => {
+test("selection_type services, package y mixed quedan habilitados en runtime y creacion", () => {
   assert.equal(assertBookingSelectionCreationSupported("services"), "services");
   assert.equal(assertBookingSelectionRuntimeSupported("services"), "services");
   for (const selectionType of ["package", "mixed"]) {
-    assert.throws(
-      () => assertBookingSelectionCreationSupported(selectionType),
-      (error) => error?.statusCode === 409 && error?.code === "BOOKING_PACKAGE_FLOW_PENDING_2B"
-    );
-    assert.throws(
-      () => assertBookingSelectionRuntimeSupported(selectionType),
-      (error) => error?.statusCode === 409 && error?.code === "BOOKING_PACKAGE_FLOW_PENDING_2B"
-    );
+    assert.equal(assertBookingSelectionCreationSupported(selectionType), selectionType);
+    assert.equal(assertBookingSelectionRuntimeSupported(selectionType), selectionType);
   }
+});
+
+test("seleccion package calcula duracion, buffer y total desde paquete publicado", async () => {
+  const client = createPackageSelectionClient();
+  const selection = await getBookingSelectionDetails(client, {
+    id_sucursal: BRANCH_A,
+    selection_type: "package",
+    id_paquete: PACKAGE_A,
+    fecha_operativa: "2026-07-15",
+  });
+
+  assert.equal(selection.selection_type, "package");
+  assert.equal(selection.id_paquete, PACKAGE_A);
+  assert.equal(selection.duracion_total_min, 50);
+  assert.equal(selection.buffer_total_min, 10);
+  assert.equal(selection.monto_total_hnl, 250);
+  assert.equal(selection.items.length, 2);
+  assert.equal(selection.items.reduce((sum, item) => sum + Number(item.precio_hnl), 0), 250);
+  assert.deepEqual(
+    selection.items.map((item) => item.origen_item_codigo),
+    ["paquete_incluido", "paquete_incluido"]
+  );
+});
+
+test("seleccion mixed filtra servicios incluidos en paquete y suma solo extras validos", async () => {
+  const client = createPackageSelectionClient();
+  const selection = await getBookingSelectionDetails(client, {
+    id_sucursal: BRANCH_A,
+    selection_type: "mixed",
+    id_paquete: PACKAGE_A,
+    servicios: [SERVICE_A, SERVICE_C].join(","),
+    fecha_operativa: "2026-07-15",
+  });
+
+  assert.equal(selection.selection_type, "mixed");
+  assert.equal(selection.items.length, 3);
+  assert.equal(selection.servicios_extra.length, 1);
+  assert.equal(selection.servicios_extra[0].id_servicio, SERVICE_C);
+  assert.deepEqual(
+    selection.items.map((item) => item.origen_item_codigo),
+    ["paquete_incluido", "paquete_incluido", "servicio_extra"]
+  );
+  assert.equal(selection.duracion_total_min, 65);
+  assert.equal(selection.buffer_total_min, 10);
+  assert.equal(selection.monto_total_hnl, 330);
+});
+
+test("payload canonico conserva selection_type, id_paquete y origenes package", async () => {
+  const selection = await getBookingSelectionDetails(createPackageSelectionClient(), {
+    id_sucursal: BRANCH_A,
+    selection_type: "package",
+    id_paquete: PACKAGE_A,
+    fecha_operativa: "2026-07-15",
+  });
+  const detailRows = buildAppointmentDetailRows(selection.items);
+  const payload = buildCanonicalReservationPayload({
+    requestId: "12121212-1212-4212-8212-121212121212",
+    idSucursal: BRANCH_A,
+    integrantes: [{
+      selection: { serviceSelection: selection },
+      detailRows,
+      inicio_at: "2026-07-15T15:00:00.000Z",
+    }],
+  });
+  const integrante = payload.integrantes[0];
+
+  assert.equal(integrante.selection_type, "package");
+  assert.equal(integrante.id_paquete, PACKAGE_A);
+  assert.deepEqual(
+    integrante.detalles.map((detalle) => detalle.origen_item_codigo),
+    ["paquete_incluido", "paquete_incluido"]
+  );
+  assert.equal(payload._totals.total_hnl, 250);
+  assert.equal(integrante.detalles.reduce((sum, detalle) => sum + Number(detalle.precio_unitario_hnl), 0), 250);
+});
+
+test("payload package conserva precio_referencia de tarifa aunque distribuya precio de paquete", async () => {
+  const selection = await getBookingSelectionDetails(createPackageSelectionClient({
+    packageRow: {
+      id_paquete: PACKAGE_A,
+      nombre_paquete: "MasterPaquete Pro",
+      descripcion: "Paquete de prueba",
+      precio_hnl: 220,
+    },
+  }), {
+    id_sucursal: BRANCH_A,
+    selection_type: "package",
+    id_paquete: PACKAGE_A,
+    fecha_operativa: "2026-07-15",
+  });
+  const detailRows = buildAppointmentDetailRows(selection.items);
+  const payload = buildCanonicalReservationPayload({
+    requestId: "56565656-5656-4656-8656-565656565656",
+    idSucursal: BRANCH_A,
+    integrantes: [{
+      selection: { serviceSelection: selection },
+      detailRows,
+      inicio_at: "2026-07-15T15:00:00.000Z",
+    }],
+  });
+  const detalles = payload.integrantes[0].detalles;
+
+  assert.equal(payload._totals.total_hnl, 220);
+  assert.equal(detalles.reduce((sum, detalle) => sum + Number(detalle.precio_unitario_hnl), 0), 220);
+  assert.deepEqual(
+    detalles.map((detalle) => detalle.precio_referencia_hnl),
+    [100, 150]
+  );
+});
+
+test("payload canonico conserva selection_type, id_paquete y origenes mixed", async () => {
+  const selection = await getBookingSelectionDetails(createPackageSelectionClient(), {
+    id_sucursal: BRANCH_A,
+    selection_type: "mixed",
+    id_paquete: PACKAGE_A,
+    servicios: [SERVICE_A, SERVICE_C].join(","),
+    fecha_operativa: "2026-07-15",
+  });
+  const detailRows = buildAppointmentDetailRows(selection.items);
+  const payload = buildCanonicalReservationPayload({
+    requestId: "34343434-3434-4434-8434-343434343434",
+    idSucursal: BRANCH_A,
+    integrantes: [{
+      selection: { serviceSelection: selection },
+      detailRows,
+      inicio_at: "2026-07-15T15:00:00.000Z",
+    }],
+  });
+  const integrante = payload.integrantes[0];
+
+  assert.equal(integrante.selection_type, "mixed");
+  assert.equal(integrante.id_paquete, PACKAGE_A);
+  assert.deepEqual(
+    integrante.detalles.map((detalle) => detalle.origen_item_codigo),
+    ["paquete_incluido", "paquete_incluido", "servicio_extra"]
+  );
+  assert.equal(payload._totals.total_hnl, 330);
+  assert.equal(integrante.detalles.reduce((sum, detalle) => sum + Number(detalle.precio_unitario_hnl), 0), 330);
+});
+
+test("package sin id_paquete conserva error estructurado", async () => {
+  await assert.rejects(
+    () => getBookingSelectionDetails(createPackageSelectionClient(), {
+      id_sucursal: BRANCH_A,
+      selection_type: "package",
+      fecha_operativa: "2026-07-15",
+    }),
+    (error) => error?.statusCode === 400 && error?.code === "AGENDA_PACKAGE_ID_REQUIRED"
+  );
+});
+
+test("paquete inactivo o no publicado conserva error estructurado", async () => {
+  await assert.rejects(
+    () => getBookingSelectionDetails(createPackageSelectionClient({ packageRow: null }), {
+      id_sucursal: BRANCH_A,
+      selection_type: "package",
+      id_paquete: PACKAGE_A,
+      fecha_operativa: "2026-07-15",
+    }),
+    (error) => error?.statusCode === 404 && error?.code === "AGENDA_PACKAGE_NOT_FOUND"
+  );
+});
+
+test("paquete con servicios inactivos devuelve AGENDA_PACKAGE_SERVICES_INACTIVE", async () => {
+  await assert.rejects(
+    () => getBookingSelectionDetails(createPackageSelectionClient({
+      packageDetails: [
+        { id_servicio: SERVICE_A, cantidad: 1, nombre_servicio: "Corte", servicio_activo: true, servicio_agendable: true, deleted_at: null },
+        { id_servicio: SERVICE_B, cantidad: 1, nombre_servicio: "Barba", servicio_activo: false, servicio_agendable: true, deleted_at: null },
+      ],
+    }), {
+      id_sucursal: BRANCH_A,
+      selection_type: "package",
+      id_paquete: PACKAGE_A,
+      fecha_operativa: "2026-07-15",
+    }),
+    (error) => error?.statusCode === 409 && error?.code === "AGENDA_PACKAGE_SERVICES_INACTIVE"
+  );
 });
 
 test("conteo de rango usa fechas puras e incluye ambos extremos", () => {
