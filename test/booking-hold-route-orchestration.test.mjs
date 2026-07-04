@@ -41,3 +41,16 @@ test("hold autenticado delega transaccion al orquestador sin BEGIN/COMMIT/ROLLBA
   assert.match(handler, /recompensa:/);
   assert.doesNotMatch(handler, /release_token/);
 });
+
+test("hold administrativo delega al servicio de agendamiento interno sin transacciones locales", async () => {
+  const source = await readRoute("src/routes/v1/admin/citas.js");
+  const handler = extractHoldHandler(source);
+  assert.match(handler, /createAdminBookingHold\(app, request\)/);
+  assert.doesNotMatch(handler, /dbClient\.query\("BEGIN"\)/);
+  assert.doesNotMatch(handler, /dbClient\.query\("COMMIT"\)/);
+  assert.doesNotMatch(handler, /dbClient\.query\("ROLLBACK"\)/);
+  assert.match(handler, /app\.requireRoles\(CONFIG_ALLOWED_ROLES\)/);
+  assert.doesNotMatch(handler, /release_token/);
+  assert.doesNotMatch(handler, /membresia:/);
+  assert.doesNotMatch(handler, /recompensa:/);
+});
