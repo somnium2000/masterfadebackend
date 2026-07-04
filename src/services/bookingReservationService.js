@@ -59,9 +59,10 @@ export function calculateReservationTiming(selection) {
 
 export function assertBookingSelectionCreationSupported(selectionType) {
   const normalized = String(selectionType || "services").trim().toLowerCase();
-  if (normalized === "package" || normalized === "mixed") {
-    throw new AppError(409, "El flujo de paquetes/mixed sera habilitado en Microfase 2B.", {
-      code: "BOOKING_PACKAGE_FLOW_PENDING_2B",
+  if (!["services", "package", "mixed"].includes(normalized || "services")) {
+    throw new AppError(400, "selection_type no es valido", {
+      code: "AGENDA_SELECTION_TYPE_INVALID",
+      details: { selection_type: selectionType },
     });
   }
   return normalized || "services";
