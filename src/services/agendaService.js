@@ -304,6 +304,17 @@ function startOfDay(dateString) {
   return buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 0, 0, 0, AGENDA_DEFAULT_TIME_ZONE);
 }
 
+export function buildOperationalDayRange(dateString) {
+  const fecha = parseDateOnly(dateString, "fecha");
+  const startAt = startOfDay(fecha);
+  const endAtExclusive = addMinutes(startAt, 24 * 60);
+  return {
+    fecha,
+    startAt,
+    endAtExclusive,
+  };
+}
+
 function endOfDay(dateString) {
   const endAt = buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 23, 59, 59, AGENDA_DEFAULT_TIME_ZONE);
   if (endAt) endAt.setMilliseconds(999);
@@ -600,11 +611,13 @@ function toHourMinute(value) {
 }
 
 function isFullDayInterval(start, end) {
-  const nextDayStart = startOfDay(formatDateOnly(addMinutes(start, 24 * 60)));
-  return start.getHours() === 0
-    && start.getMinutes() === 0
-    && start.getSeconds() === 0
-    && end.getTime() >= nextDayStart.getTime();
+  const operationalDate = formatDateOnlyInTimeZone(start, AGENDA_DEFAULT_TIME_ZONE);
+  if (!operationalDate) return false;
+  const expectedStart = startOfDay(operationalDate);
+  const expectedEnd = addMinutes(expectedStart, 24 * 60);
+  const toleranceMs = 1000;
+  return Math.abs(start.getTime() - expectedStart.getTime()) <= toleranceMs
+    && end.getTime() + toleranceMs >= expectedEnd.getTime();
 }
 
 export async function getHoldDurationMinutes(client) {
@@ -3042,6 +3055,7 @@ export function mapBarbersForResponse(barbers) {
 export function mapBlockRow(row) {
   const start = new Date(row.inicio_at);
   const end = new Date(row.fin_at);
+  const operationalDate = formatDateOnlyInTimeZone(start, AGENDA_DEFAULT_TIME_ZONE) || formatDateOnly(start);
   return {
     id_bloqueo: row.id_bloqueo,
     id_empleado: row.id_empleado,
@@ -3050,7 +3064,7 @@ export function mapBlockRow(row) {
     motivo: row.motivo ?? null,
     inicio_at: start.toISOString(),
     fin_at: end.toISOString(),
-    fecha: formatDateOnly(start),
+    fecha: operationalDate,
     es_dia_completo: isFullDayInterval(start, end),
     nombre_completo: row.nombre_completo ?? null,
     nombre_sucursal: row.nombre_sucursal ?? null,

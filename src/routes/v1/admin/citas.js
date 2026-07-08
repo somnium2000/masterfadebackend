@@ -4,6 +4,7 @@ import {
   ACTIVE_PAYMENT_INTENT_STATES,
   APPOINTMENT_STATE_TRANSITIONS,
   assertUuid,
+  buildOperationalDayRange,
   expireStaleAppointmentReservations,
   getSystemParameters,
   mapBlockRow,
@@ -1226,8 +1227,10 @@ async function listBlocks(client, branchIds, { idEmpleado, idSucursal, fechaDesd
   if (fechaDesde || fechaHasta) {
     const desde = parseDateOnly(fechaDesde || fechaHasta, "fecha_desde");
     const hasta = parseDateOnly(fechaHasta || fechaDesde, "fecha_hasta");
-    const from = new Date(`${desde}T00:00:00`).toISOString();
-    const to = new Date(new Date(`${hasta}T00:00:00`).getTime() + 24 * 60 * 60 * 1000).toISOString();
+    const { startAt } = buildOperationalDayRange(desde);
+    const { endAtExclusive } = buildOperationalDayRange(hasta);
+    const from = startAt.toISOString();
+    const to = endAtExclusive.toISOString();
     params.push(from);
     const fromI = params.length;
     params.push(to);
@@ -2625,8 +2628,7 @@ export default async function adminCitasRoutes(app) {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const fecha = parseDateOnly(request.body?.fecha, "fecha");
-      const start = new Date(`${fecha}T00:00:00`);
-      const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+      const { startAt, endAtExclusive } = buildOperationalDayRange(fecha);
       const motivo = cleanText(request.body?.motivo);
       const createdBy = request.claims?.user?.id_usuario ?? null;
       const typeCode = await getDayOffType(dbClient);
@@ -2658,8 +2660,8 @@ export default async function adminCitasRoutes(app) {
             empleado.id_empleado,
             empleado.id_sucursal,
             typeCode,
-            start.toISOString(),
-            end.toISOString(),
+            startAt.toISOString(),
+            endAtExclusive.toISOString(),
             motivo,
             createdBy,
           ]
@@ -2702,8 +2704,8 @@ export default async function adminCitasRoutes(app) {
           [
             barberos[0].id_sucursal,
             typeCode,
-            start.toISOString(),
-            end.toISOString(),
+            startAt.toISOString(),
+            endAtExclusive.toISOString(),
             motivo,
             createdBy,
           ]
