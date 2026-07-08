@@ -217,6 +217,190 @@ async function getSaldoActual(client, idCliente) {
   return Number(rows[0]?.saldo_total || 0);
 }
 
+export async function grantCompanionPointsForConfirmedGroup(client, { idGrupoCita } = {}) {
+  const safeGroupId = assertUuid(idGrupoCita, "id_grupo_cita");
+  const titularResult = await client.query(
+    `
+      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario
+      FROM public.citas_grupos cg
+      JOIN public.clientes c
+        ON c.id_cliente = cg.id_cliente_titular
+      WHERE cg.id_grupo_cita = $1::uuid
+      LIMIT 1
+    `,
+    [safeGroupId]
+  );
+  const titular = titularResult.rows[0] || null;
+  if (!titular?.id_cliente) return 0;
+
+  const companionsResult = await client.query(
+    `
+      SELECT id_cita, id_sucursal, inicio_at
+      FROM public.citas
+      WHERE id_grupo_cita = $1::uuid
+        AND deleted_at IS NULL
+        AND orden_integrante > 1
+        AND estado_cita_codigo = 'confirmada'
+      ORDER BY orden_integrante ASC
+    `,
+    [safeGroupId]
+  );
+
+  let granted = 0;
+  for (const companion of companionsResult.rows || []) {
+    let cycleId = null;
+    try {
+      const cycleResult = await client.query(
+        `SELECT * FROM public.fn_points_get_or_create_active_cycle($1::uuid, $2::int, $3::timestamptz) LIMIT 1`,
+        [titular.id_cliente, 12, companion.inicio_at || new Date().toISOString()]
+      );
+      cycleId = cycleResult.rows[0]?.id_cycle ?? null;
+    } catch {
+      // Mantener null si no se puede resolver ciclo activo.
+    }
+    const insertResult = await client.query(
+      `
+        INSERT INTO public.points_transactions (
+          id_cliente,
+          id_cita,
+          id_cycle,
+          id_sucursal_origen,
+          tipo_puntos_codigo,
+          origen_punto_codigo,
+          puntos,
+          vence_at,
+          motivo,
+          creado_por_usuario_id
+        )
+        VALUES (
+          $1::uuid,
+          $2::uuid,
+          $3::uuid,
+          $4::uuid,
+          'acumular',
+          'integrante',
+          1,
+          (SELECT vence_at FROM public.points_cycles WHERE id_cycle = $3::uuid),
+          'Punto por acompañante confirmado',
+          $5::uuid
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING id_points_tx
+      `,
+      [titular.id_cliente, companion.id_cita, cycleId, companion.id_sucursal, titular.id_usuario || null]
+    );
+    if (insertResult.rowCount > 0) granted += 1;
+  }
+
+  return granted;
+}
+
+export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCita } = {}) {
+  const safeGroupId = assertUuid(idGrupoCita, "id_grupo_cita");
+  const titularResult = await client.query(
+    `
+      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario
+      FROM public.citas_grupos cg
+      JOIN public.clientes c
+        ON c.id_cliente = cg.id_cliente_titular
+      WHERE cg.id_grupo_cita = $1::uuid
+      LIMIT 1
+    `,
+    [safeGroupId]
+  );
+  const titular = titularResult.rows[0] || null;
+  if (!titular?.id_cliente) return { titular: 0, acompanantes: 0 };
+
+  const citasResult = await client.query(
+    `
+      SELECT
+        id_cita,
+        id_sucursal,
+        inicio_at,
+        estado_cita_codigo,
+        orden_integrante,
+        COALESCE(es_canje_recompensa, FALSE) AS es_canje_recompensa
+      FROM public.citas
+      WHERE id_grupo_cita = $1::uuid
+        AND deleted_at IS NULL
+        AND estado_cita_codigo = 'confirmada'
+      ORDER BY orden_integrante ASC, created_at ASC
+    `,
+    [safeGroupId]
+  );
+
+  let grantedTitular = 0;
+  let grantedCompanions = 0;
+  for (const cita of citasResult.rows || []) {
+    const isTitular = Number(cita.orden_integrante || 1) <= 1;
+    if (isTitular && cita.es_canje_recompensa === true) continue;
+
+    let cycleId = null;
+    try {
+      const cycleResult = await client.query(
+        `SELECT * FROM public.fn_points_get_or_create_active_cycle($1::uuid, $2::int, $3::timestamptz) LIMIT 1`,
+        [titular.id_cliente, 12, cita.inicio_at || new Date().toISOString()]
+      );
+      cycleId = cycleResult.rows[0]?.id_cycle ?? null;
+    } catch {
+      // Mantener null si no se puede resolver ciclo activo.
+    }
+
+    const origenCodigo = isTitular ? "titular" : "integrante";
+    const motivoBase = isTitular ? "Punto por cita titular confirmada" : "Punto por acompanante confirmado";
+    const motivo = motivoBase;
+    const insertResult = await client.query(
+      `
+        INSERT INTO public.points_transactions (
+          id_cliente,
+          id_cita,
+          id_cycle,
+          id_sucursal_origen,
+          tipo_puntos_codigo,
+          origen_punto_codigo,
+          puntos,
+          vence_at,
+          motivo,
+          creado_por_usuario_id
+        )
+        SELECT
+          $1::uuid,
+          $2::uuid,
+          $3::uuid,
+          $4::uuid,
+          'acumular',
+          $5::text,
+          1,
+          (SELECT vence_at FROM public.points_cycles WHERE id_cycle = $3::uuid),
+          $6::text,
+          $7::uuid
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM public.points_transactions pt
+          WHERE pt.id_cliente = $1::uuid
+            AND pt.tipo_puntos_codigo = 'acumular'
+            AND COALESCE(pt.origen_punto_codigo, 'titular') = $5::text
+            AND (
+              (pt.id_cita = $2::uuid AND $2::uuid IS NOT NULL)
+              OR (pt.id_cita IS NULL AND pt.motivo = $6::text AND $2::uuid IS NULL)
+            )
+        )
+        RETURNING id_points_tx
+      `,
+      [titular.id_cliente, cita.id_cita, cycleId, cita.id_sucursal, origenCodigo, motivo, titular.id_usuario || null]
+    );
+    if (insertResult.rowCount > 0) {
+      if (isTitular) grantedTitular += 1;
+      else grantedCompanions += 1;
+    }
+  }
+
+  return {
+    titular: grantedTitular,
+    acompanantes: grantedCompanions,
+  };
+}
+
 async function resolvePuntosParaPremio(client, idSucursal) {
   try {
     const { rows } = await client.query(
@@ -778,6 +962,17 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
     [safeClienteId, titular.id_cita]
   );
   if (existingTx.rows[0]) {
+    // AM: En citas de canje el titular no debe conservar acumulacion por la cita canjeada.
+    await dbClient.query(
+      `
+        DELETE FROM public.points_transactions
+        WHERE id_cliente = $1::uuid
+          AND id_cita = $2::uuid
+          AND tipo_puntos_codigo = 'acumular'
+          AND COALESCE(origen_punto_codigo, 'titular') = 'titular'
+      `,
+      [safeClienteId, titular.id_cita]
+    );
     return {
       aplicada: false,
       ya_aplicada: true,
@@ -953,6 +1148,17 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
     );
     const existing = conflictedTx.rows[0] || null;
     if (existing) {
+      // AM: Incluso ante conflicto idempotente, mantenemos la regla: canje no suma punto titular.
+      await dbClient.query(
+        `
+          DELETE FROM public.points_transactions
+          WHERE id_cliente = $1::uuid
+            AND id_cita = $2::uuid
+            AND tipo_puntos_codigo = 'acumular'
+            AND COALESCE(origen_punto_codigo, 'titular') = 'titular'
+        `,
+        [safeClienteId, titular.id_cita]
+      );
       return {
         aplicada: false,
         ya_aplicada: true,
@@ -965,6 +1171,17 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
       code: "POINTS_REDEEM_ALREADY_APPLIED",
     });
   }
+  // AM: Regla de negocio P0.1: en canje no se acumula punto del titular para la cita canjeada.
+  await dbClient.query(
+    `
+      DELETE FROM public.points_transactions
+      WHERE id_cliente = $1::uuid
+        AND id_cita = $2::uuid
+        AND tipo_puntos_codigo = 'acumular'
+        AND COALESCE(origen_punto_codigo, 'titular') = 'titular'
+    `,
+    [safeClienteId, titular.id_cita]
+  );
   const saldoActualizado = await getSaldoActual(dbClient, safeClienteId);
 
   return {
@@ -1013,6 +1230,83 @@ export async function getClientePointsSummary(app, idCliente, { historyLimit = H
   } finally {
     client.release();
   }
+}
+
+export async function resolveRewardRedeemGateForCliente(dbClient, {
+  idCliente,
+  idSucursal = null,
+} = {}) {
+  const safeClienteId = assertUuid(idCliente, "id_cliente");
+  await materializeCyclesIfAvailable(dbClient, safeClienteId);
+  const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: false });
+  const agregados = await getAgregadosPuntos(dbClient, safeClienteId);
+  const puntosParaPremio = await resolvePuntosParaPremio(dbClient, idSucursal || cliente.id_sucursal_origen || null);
+  const safeRequired = Math.max(1, Number(puntosParaPremio || DEFAULT_PUNTOS_PARA_PREMIO));
+  const saldo = Number(agregados.saldo_total || 0);
+  const recompensasDisponibles = Math.floor(Math.max(0, saldo) / safeRequired);
+  const progresoActual = ((saldo % safeRequired) + safeRequired) % safeRequired;
+  return {
+    saldo_total: saldo,
+    recompensas_disponibles: recompensasDisponibles,
+    progreso_actual: progresoActual,
+    puntos_para_premio: safeRequired,
+    reward_redeem_required: recompensasDisponibles >= 1,
+  };
+}
+
+export async function prepareRewardRedeemContextForHold(dbClient, {
+  idCliente,
+  idSucursal,
+  idServicioCanje,
+} = {}) {
+  const safeClienteId = assertUuid(idCliente, "id_cliente");
+  const safeSucursalId = assertUuid(idSucursal, "id_sucursal");
+  const safeServicioId = assertUuid(idServicioCanje, "id_servicio");
+
+  await lockClientePointsScope(dbClient, safeClienteId);
+  await materializeCyclesIfAvailable(dbClient, safeClienteId);
+  const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: false });
+  await validateSucursalActiva(dbClient, safeSucursalId);
+  const puntosParaPremio = await resolvePuntosParaPremio(dbClient, cliente.id_sucursal_origen || safeSucursalId);
+  const safeRequired = Math.max(1, Number(puntosParaPremio || DEFAULT_PUNTOS_PARA_PREMIO));
+  const saldoActual = await getSaldoActual(dbClient, safeClienteId);
+  if (saldoActual < safeRequired) {
+    throw new AppError(409, "No hay puntos suficientes para canjear", {
+      code: "POINTS_REDEEM_INSUFFICIENT_BALANCE",
+      details: {
+        saldo_actual: saldoActual,
+        puntos_requeridos: safeRequired,
+      },
+    });
+  }
+
+  const planActivo = await hasActivePlan(dbClient, safeClienteId);
+  const servicio = await resolveServicioCanjeValido(dbClient, {
+    idServicioCanje: safeServicioId,
+    idSucursal: safeSucursalId,
+    hasPlanActivo: planActivo,
+  });
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresAt = nowSeconds + REDEEM_CONTEXT_TTL_SECONDS;
+  const canjeContextToken = buildRedeemContextToken({
+    v: REDEEM_CONTEXT_TOKEN_VERSION,
+    id_cliente: safeClienteId,
+    id_servicio_canje: safeServicioId,
+    id_sucursal: safeSucursalId,
+    puntos_requeridos: safeRequired,
+    iat: nowSeconds,
+    exp: expiresAt,
+  });
+
+  return {
+    canje_context_token: canjeContextToken,
+    id_cliente: safeClienteId,
+    id_servicio_canje: servicio.id_servicio,
+    id_sucursal_origen: safeSucursalId,
+    servicio_nombre: servicio.nombre_servicio,
+    puntos_requeridos: safeRequired,
+    saldo_actual: saldoActual,
+  };
 }
 
 export async function addManualPointsAdjustment(app, {

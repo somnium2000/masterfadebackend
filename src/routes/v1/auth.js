@@ -297,6 +297,28 @@ const meResponseSchema = {
   500: errorResponseSchema,
 };
 
+const csrfResponseSchema = {
+  200: {
+    type: "object",
+    properties: {
+      ok: { type: "boolean" },
+      data: {
+        type: "object",
+        properties: {
+          csrf_token: { type: "string" },
+        },
+        required: ["csrf_token"],
+        additionalProperties: false,
+      },
+      requestId: requestIdSchema,
+    },
+    required: ["ok", "data", "requestId"],
+    additionalProperties: true,
+  },
+  401: errorResponseSchema,
+  500: errorResponseSchema,
+};
+
 const RESET_MAX_ATTEMPTS = Number(process.env.RESET_MAX_ATTEMPTS || 3);
 const RESET_WINDOW_MS = Number(process.env.RESET_WINDOW_MS || 15 * 60_000);
 const RESET_BLOCK_MS = Number(process.env.RESET_BLOCK_MS || 30 * 60_000);
@@ -339,11 +361,6 @@ async function resolvePasswordRecipientFullNameByEmail(app, email) {
 
   const fullName = String(rows?.[0]?.full_name || "").trim();
   return fullName || null;
-}
-
-function normalizeOptionalUuid(value) {
-  const raw = String(value || "").trim();
-  return raw || null;
 }
 
 function isSupabaseDuplicateError(error) {
@@ -732,19 +749,15 @@ function buildCsrfCookieOptions(app, { remember = false } = {}) {
   };
 }
 
-function issueCsrfCookie(app, reply, { remember = false } = {}) {
+function issueSessionCookies(app, reply, token, { remember = false } = {}) {
   const csrfToken = jwt.sign(
     { type: "csrf", nonce: crypto.randomUUID() },
     app.config?.csrfSecret || process.env.CSRF_SECRET,
     { expiresIn: "12h" }
   );
-  reply.setCookie(AUTH_CSRF_COOKIE, csrfToken, buildCsrfCookieOptions(app, { remember }));
-  return csrfToken;
-}
 
-function issueSessionCookies(app, reply, token, { remember = false } = {}) {
   reply.setCookie(AUTH_SESSION_COOKIE, token, buildCookieOptions(app, { remember }));
-  const csrfToken = issueCsrfCookie(app, reply, { remember });
+  reply.setCookie(AUTH_CSRF_COOKIE, csrfToken, buildCsrfCookieOptions(app, { remember }));
   return csrfToken;
 }
 
@@ -843,92 +856,6 @@ function isUserIdConflictError(error) {
   const detail = normalizePgErrorText(error?.detail);
   const constraint = normalizePgErrorText(error?.constraint);
   return detail.includes("(id_usuario)") || constraint.includes("usuarios_pkey");
-}
-
-async function resolveRegisterBranchId(client, preferredBranchId) {
-  const preferred = normalizeOptionalUuid(preferredBranchId);
-
-  if (preferred) {
-    const preferredResult = await client.query(
-      `
-        SELECT id_sucursal
-        FROM public.sucursales
-        WHERE id_sucursal = $1::uuid
-          AND deleted_at IS NULL
-          AND estado IS TRUE
-        LIMIT 1
-      `,
-      [preferred]
-    );
-    if (preferredResult.rowCount) {
-      return preferredResult.rows[0].id_sucursal;
-    }
-  }
-
-  const fallbackResult = await client.query(
-    `
-      SELECT id_sucursal
-      FROM public.sucursales
-      WHERE deleted_at IS NULL
-        AND estado IS TRUE
-      ORDER BY id_sucursal ASC
-      LIMIT 1
-    `
-  );
-
-  if (!fallbackResult.rowCount) {
-    throw {
-      statusCode: 500,
-      message: "No hay sucursales activas disponibles para completar el flujo.",
-      code: "AUTH_EXCHANGE_BRANCH_NOT_AVAILABLE",
-    };
-  }
-
-  return fallbackResult.rows[0].id_sucursal;
-}
-
-async function resolveRegisterBranchIdOrFail(client, requestedBranchId) {
-  const requested = normalizeOptionalUuid(requestedBranchId);
-  if (requested) {
-    const scopedResult = await client.query(
-      `
-        SELECT id_sucursal
-        FROM public.sucursales
-        WHERE id_sucursal = $1::uuid
-          AND deleted_at IS NULL
-          AND estado IS TRUE
-        LIMIT 1
-      `,
-      [requested]
-    );
-    if (!scopedResult.rowCount) {
-      throw {
-        statusCode: 400,
-        message: "La sucursal de origen indicada no existe o no esta activa.",
-        code: "AUTH_REGISTER_BRANCH_INVALID",
-      };
-    }
-    return scopedResult.rows[0].id_sucursal;
-  }
-
-  return resolveRegisterBranchId(client, null);
-}
-
-async function resolveExchangeBranchId(client) {
-  const preferredBranchId = normalizeOptionalUuid(process.env.AUTH_EXCHANGE_DEFAULT_BRANCH_ID);
-
-  if (preferredBranchId) {
-    if (!UUID_REGEX.test(preferredBranchId)) {
-      throw {
-        statusCode: 500,
-        message: "AUTH_EXCHANGE_DEFAULT_BRANCH_ID no tiene formato UUID valido.",
-        code: "AUTH_EXCHANGE_BRANCH_CONFIG_INVALID",
-      };
-    }
-    return resolveRegisterBranchId(client, preferredBranchId);
-  }
-
-  return resolveRegisterBranchId(client, null);
 }
 
 function buildSocialPersonaNames(supabaseUser) {
@@ -1036,7 +963,6 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
   let transactionStarted = false;
 
   try {
-    const branchId = await resolveExchangeBranchId(client);
     const clienteRoleId = await getClienteRoleId(client);
     await ensureExchangeEmailAvailability(client, email, authUserId);
 
@@ -1086,13 +1012,13 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
         )
         VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE)
       `,
-      [clienteRoleId, authUserId, branchId]
+      [clienteRoleId, authUserId, null]
     );
 
     await insertClientWithConsents(client, {
       idPersona,
       authUserId,
-      branchId,
+      branchId: null,
       consentimientoMarketing: true,
       aceptaTerminos: true,
       aceptaTerminosAt: new Date().toISOString(),
@@ -1198,6 +1124,37 @@ export default async function authRoutes(app) {
   });
 
   app.get(
+    "/csrf",
+    {
+      preHandler: app.authenticate,
+      schema: {
+        response: csrfResponseSchema,
+      },
+    },
+    async (request, reply) => {
+      try {
+        let csrfToken = String(request.cookies?.[AUTH_CSRF_COOKIE] || "").trim();
+        if (!csrfToken) {
+          csrfToken = jwt.sign(
+            { type: "csrf", nonce: crypto.randomUUID() },
+            app.config?.csrfSecret || process.env.CSRF_SECRET,
+            { expiresIn: "12h" }
+          );
+          reply.setCookie(AUTH_CSRF_COOKIE, csrfToken, buildCsrfCookieOptions(app, { remember: false }));
+        }
+
+        return sendOk(reply, { csrf_token: csrfToken }, { requestId: request.id });
+      } catch (error) {
+        request.log.error({ err: error }, "Auth CSRF token error");
+        return sendError(reply, 500, "No se pudo obtener el token CSRF", {
+          code: "AUTH_CSRF_ERROR",
+          requestId: request.id,
+        });
+      }
+    }
+  );
+
+  app.get(
     "/me",
     {
       preHandler: app.authenticate,
@@ -1232,40 +1189,6 @@ export default async function authRoutes(app) {
     }
   );
 
-  app.get(
-    "/csrf",
-    {
-      preHandler: app.authenticate,
-      schema: {
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: {
-                type: "object",
-                properties: {
-                  csrf_token: { type: "string" },
-                },
-                required: ["csrf_token"],
-                additionalProperties: false,
-              },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-          401: errorResponseSchema,
-        },
-      },
-    },
-    async (request, reply) => {
-      const currentToken = String(request.cookies?.[AUTH_CSRF_COOKIE] || "").trim();
-      const csrfToken = currentToken || issueCsrfCookie(app, reply, { remember: false });
-      return sendOk(reply, { csrf_token: csrfToken }, { requestId: request.id });
-    }
-  );
-
   app.post(
     "/exchange",
     {
@@ -1282,6 +1205,7 @@ export default async function authRoutes(app) {
     },
     async (request, reply) => {
       const supabaseToken = extractSupabaseToken(request);
+      const replaceActiveSession = request.body?.replace_active_session === true;
       if (!supabaseToken) {
         return sendError(reply, 400, "Debes enviar el token de Supabase para realizar el exchange.", {
           code: "AUTH_MISSING_TOKEN",
@@ -1441,11 +1365,23 @@ export default async function authRoutes(app) {
           roles: claims.roles || [],
           branchIds: claims.branch_ids || [],
           remember: true,
+          replaceActiveSession,
         });
 
         const csrfToken = issueSessionCookies(app, reply, session.token, { remember: true });
         return sendOk(reply, { user, csrf_token: csrfToken, session: { authenticated: true } });
       } catch (error) {
+        if (error?.statusCode === 409 && error?.code === "AUTH_SESSION_LIMIT_REACHED") {
+          return reply.code(409).send({
+            ok: false,
+            error: {
+              code: "AUTH_SESSION_LIMIT_REACHED",
+              message: "Ya existe una sesion activa para esta cuenta. Puedes cerrar la sesion anterior y continuar.",
+            },
+            requires_session_replacement: error?.requires_session_replacement === true,
+            requestId: request.id,
+          });
+        }
         if (error?.statusCode && error?.code) {
           return sendError(reply, error.statusCode, error.message, {
             code: error.code,
@@ -1642,7 +1578,6 @@ export default async function authRoutes(app) {
       const email = normalizeEmail(body.email);
       const contrasena = String(body.contrasena || "");
       const confirmarContrasena = String(body.confirmar_contrasena || "");
-      const requestedBranchId = normalizeOptionalUuid(body.id_sucursal_origen);
       const consentimientoMarketing = Boolean(body.consentimiento_marketing);
       const aceptaTerminos = body.acepta_terminos === true;
       const aceptaTerminosAt = new Date().toISOString();
@@ -1690,7 +1625,6 @@ export default async function authRoutes(app) {
       let transactionStarted = false;
 
       try {
-        const branchId = await resolveRegisterBranchIdOrFail(client, requestedBranchId);
         await ensureRegisterEmailAvailability(client, email);
         const clienteRoleId = await getClienteRoleId(client);
 
@@ -1764,13 +1698,13 @@ export default async function authRoutes(app) {
             )
             VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE)
           `,
-          [clienteRoleId, authUserId, branchId]
+          [clienteRoleId, authUserId, null]
         );
 
         const idCliente = await insertClientWithConsents(client, {
           idPersona,
           authUserId,
-          branchId,
+          branchId: null,
           consentimientoMarketing,
           aceptaTerminos,
           aceptaTerminosAt,
@@ -1812,7 +1746,7 @@ export default async function authRoutes(app) {
             },
             cliente: {
               id_cliente: idCliente,
-              id_sucursal_origen: branchId,
+              id_sucursal_origen: null,
               estado: true,
             },
             consentimientos: {

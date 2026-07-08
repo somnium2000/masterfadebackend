@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { AppError } from "../utils/errors.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
+import { resolveTodoPagoSimulatedResponse } from "./payments/todopagoSimulatedResponses.js";
 
 const ACTIVE_STATUS = "activa";
 const EXPIRED_STATUS = "vencida";
@@ -1456,7 +1457,7 @@ async function cancelActiveSubscriptionForSameBranch(client, {
       SET ${setParts.join(", ")}
       WHERE id_cliente = $1::uuid
         AND id_sucursal_contratada = $2::uuid
-        AND estado_suscripcion_codigo = 'activa'
+        AND estado_suscripcion_codigo IN ('activa', 'pendiente_renovacion')
       RETURNING id_suscripcion
     `,
     [safeClienteId, safeSucursalId]
@@ -1695,6 +1696,123 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
   return {
     id_suscripcion: createdSubscription.id_suscripcion,
     estado: createdSubscription.estado_suscripcion_codigo || "activa",
+  };
+}
+
+export async function processMembershipSimulatorEvent(client, {
+  idPaymentIntent,
+  clienteId,
+  montoPruebaHnl = null,
+} = {}) {
+  const safeIntentId = normalizeText(idPaymentIntent);
+  const safeClienteId = normalizeText(clienteId);
+  if (!safeIntentId || !safeClienteId) {
+    throw new AppError(400, "id_payment_intent es obligatorio para simular el pago del plan", {
+      code: "MEMBERSHIP_PAYMENT_SIMULATOR_INVALID_INPUT",
+    });
+  }
+
+  const intent = await getMembershipIntentForConfirmation(client, safeIntentId);
+  if (!intent) {
+    throw new AppError(404, "Intent de pago no encontrado", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_NOT_FOUND",
+      details: { id_payment_intent: safeIntentId },
+    });
+  }
+
+  if (normalizeText(intent.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "La orden de membresia no pertenece al cliente autenticado", {
+      code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+      details: { id_payment_intent: safeIntentId },
+    });
+  }
+
+  const currentState = normalizeText(intent.estado_intent_codigo).toLowerCase();
+  if (currentState === "confirmado" || normalizeText(intent.estado_orden_codigo).toLowerCase() === "pagada") {
+    return {
+      processed: false,
+      duplicate: true,
+      normalized_status: "PAID",
+      response_code: "00",
+      response_text: "APPROVAL 599",
+      message: "La membresia ya fue activada previamente.",
+      confirmation: {
+        id_suscripcion: intent.id_suscripcion,
+        estado: "activa",
+      },
+    };
+  }
+
+  if (!["creado", "link_generado", "pendiente_confirmacion", "fallido"].includes(currentState)) {
+    throw new AppError(409, "El intent no esta disponible para simulacion", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_STATE_INVALID",
+      details: { estado_intent_codigo: intent.estado_intent_codigo },
+    });
+  }
+
+  const amountForSimulation = Number.isFinite(Number(montoPruebaHnl)) && Number(montoPruebaHnl) > 0
+    ? Number(montoPruebaHnl)
+    : toNumber(intent.monto_hnl, toNumber(intent.total_hnl, 0));
+  const simulation = resolveTodoPagoSimulatedResponse(amountForSimulation);
+
+  await client.query(
+    `
+      INSERT INTO public.payment_events (id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent)
+      VALUES ($1::uuid, $2::text, 'membership.simulated.result', TRUE, $3::jsonb, $4::uuid)
+    `,
+    [
+      intent.id_provider,
+      `todopago_membership_sim_${safeIntentId}_${simulation.responseCode}_${crypto.randomUUID().slice(0, 8)}`.slice(0, 120),
+      {
+        provider: "todopago",
+        mode: "preprod_simulated",
+        response_code: simulation.responseCode,
+        response_text: simulation.responseText,
+        provider_status_raw: simulation.responseText,
+        normalized_status: simulation.normalizedStatus,
+        monto_resuelto_hnl: amountForSimulation,
+        monto_intent_hnl: toNumber(intent.monto_hnl, 0),
+        id_order: intent.id_order,
+      },
+      intent.id_intent,
+    ]
+  );
+
+  if (simulation.normalizedStatus === "PAID") {
+    const confirmation = await confirmMembershipPaymentAndActivateSubscription(client, {
+      idPaymentIntent: safeIntentId,
+      clienteId: safeClienteId,
+    });
+    return {
+      processed: true,
+      duplicate: false,
+      normalized_status: simulation.normalizedStatus,
+      response_code: simulation.responseCode,
+      response_text: simulation.responseText,
+      message: simulation.userMessage,
+      confirmation,
+    };
+  }
+
+  const nextIntentState = simulation.normalizedStatus === "PENDING" ? "pendiente_confirmacion" : "fallido";
+  await client.query(
+    `
+      UPDATE public.payment_intents
+      SET estado_intent_codigo = $2::text,
+          updated_at = now()
+      WHERE id_intent = $1::uuid
+    `,
+    [safeIntentId, nextIntentState]
+  );
+
+  return {
+    processed: true,
+    duplicate: false,
+    normalized_status: simulation.normalizedStatus,
+    response_code: simulation.responseCode,
+    response_text: simulation.responseText,
+    message: simulation.userMessage,
+    estado_intent_codigo: nextIntentState,
   };
 }
 
@@ -2684,10 +2802,19 @@ export function createCoverageTracker(activeContext, {
   const hasAppointmentBranch = Boolean(appointmentBranch);
   const branchMatch = hasContractedBranch && hasAppointmentBranch && contractedBranchId === appointmentBranch;
   const hasServiceBenefitsAvailable = availableServices > 0;
+  // AM: FASE 1A - Membresía operativa solo cuando estado visible es estrictamente "activa".
+  const visibleState = resolveMembershipVisibleState(
+    activeContext.active,
+    { summary: activeContext.summary, timeRemaining: activeContext.time_remaining }
+  );
+  const operationalState = visibleState === ACTIVE_STATUS;
 
-  let coverageEnabled = branchMatch && hasServiceBenefitsAvailable;
+  let coverageEnabled = operationalState && branchMatch && hasServiceBenefitsAvailable;
   let coverageDisabledReason = null;
-  if (!hasContractedBranch) {
+  if (!operationalState) {
+    coverageEnabled = false;
+    coverageDisabledReason = "non_operational_state";
+  } else if (!hasContractedBranch) {
     coverageEnabled = false;
     coverageDisabledReason = "missing_contracted_branch";
   } else if (!hasAppointmentBranch) {
@@ -2800,6 +2927,8 @@ export function consumeCoverageForServices(tracker, serviceItems = [], { isTitul
     result.items.push({
       item_tipo: "servicio",
       id_servicio: idServicio || null,
+      id_tarifa: item?.id_tarifa || null,
+      origen_item_codigo: item?.origen_item_codigo || "servicio_manual",
       item_codigo: null,
       item_nombre: nombre,
       cantidad: quantity,

@@ -117,14 +117,13 @@ export function getSupabaseDbConnectionHints() {
 }
 
 function resolveSslConfig() {
-  const isProduction = String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase() === "production";
   const sslEnabledRaw = String(process.env.DB_SSL ?? "").trim().toLowerCase();
   const sslEnabled = sslEnabledRaw
     ? ["1", "true", "yes", "on", "require"].includes(sslEnabledRaw)
     : true;
 
   if (!sslEnabled) {
-    if (isProduction) {
+    if (String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase() === "production") {
       throw new Error("DB_SSL no puede estar desactivado en produccion.");
     }
     return false;
@@ -133,7 +132,7 @@ function resolveSslConfig() {
   const rejectUnauthorizedRaw = String(process.env.DB_SSL_REJECT_UNAUTHORIZED ?? "").trim().toLowerCase();
   const rejectUnauthorized = rejectUnauthorizedRaw
     ? ["1", "true", "yes", "on"].includes(rejectUnauthorizedRaw)
-    : isProduction;
+    : true;
 
   const caBase64 = trimEnv("DB_SSL_CA_BASE64");
   if (caBase64) {

@@ -4,26 +4,24 @@ import {
 } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
+  assertBookingSelectionRuntimeSupported,
   assertUuid,
   buildCuratedSlotExposure,
   buildCuratedSlotExposureDebug,
-  buildDayAvailability,
+  countDateKeyRangeDays,
   expireStaleAppointmentReservations,
-  findFirstAvailableBarber,
-  getBarberScheduleBounds,
-  getBookingSelectionDetails,
   getMinSellableServiceMinutes,
-  listAvailabilityByDateRange,
+  listAvailabilityByDateRangeForRequest,
   listBarbersForBranch,
   mapBarbersForResponse,
   mapDayAvailabilityForResponse,
   mapSlotsForResponse,
   parseDateOnly,
+  resolveEffectiveDayAvailability,
   SLOT_INTERVAL_MINUTES,
 } from "../../../services/agendaService.js";
 
 const requestIdSchema = { type: "string" };
-
 const errorResponseSchema = {
   type: "object",
   properties: {
@@ -90,8 +88,26 @@ const availabilityDaySchema = {
         { type: "null" },
       ],
     },
+    tiempos_efectivos: {
+      anyOf: [
+        {
+          type: "object",
+          properties: {
+            duracion_total_min: { type: "integer" },
+            buffer_total_min: { type: "integer" },
+            fecha_operativa: { type: "string", format: "date" },
+            monto_subtotal_hnl: { type: "number" },
+            monto_isv_hnl: { type: "number" },
+            monto_total_hnl: { type: "number" },
+          },
+          required: ["duracion_total_min", "buffer_total_min", "fecha_operativa"],
+          additionalProperties: false,
+        },
+        { type: "null" },
+      ],
+    },
   },
-  required: ["fecha", "disponible", "barberos_disponibles", "primer_horario_disponible", "barbero_autoasignado"],
+  required: ["fecha", "disponible", "barberos_disponibles", "primer_horario_disponible", "barbero_autoasignado", "tiempos_efectivos"],
   additionalProperties: false,
 };
 
@@ -115,6 +131,7 @@ const bookingPromotionSchema = {
   type: "object",
   properties: {
     id_promocion: { type: "string", format: "uuid" },
+    id_promocion_regla: { type: "string", format: "uuid" },
     id_sucursal: { type: "string", format: "uuid" },
     titulo: { type: "string" },
     subtitulo: { type: ["string", "null"] },
@@ -134,12 +151,10 @@ const bookingPromotionSchema = {
     vigencia_hora_hasta: { type: ["string", "null"] },
     servicio_objetivo_nombre: { type: ["string", "null"] },
     paquete_objetivo_nombre: { type: ["string", "null"] },
-    es_acumulable: { type: "boolean" },
-    applicable: { type: "boolean" },
-    reason_code: { type: ["string", "null"] },
   },
   required: [
     "id_promocion",
+    "id_promocion_regla",
     "id_sucursal",
     "titulo",
     "subtitulo",
@@ -159,17 +174,15 @@ const bookingPromotionSchema = {
     "vigencia_hora_hasta",
     "servicio_objetivo_nombre",
     "paquete_objetivo_nombre",
-    "es_acumulable",
-    "applicable",
-    "reason_code",
   ],
   additionalProperties: false,
 };
 
 const PUBLIC_BOOKING_PROMOTIONS_SQL = `
-  -- JK: Expone promociones publicas utilizables en agendamiento con vigencia y datos operativos completos.
+  -- JK: Expone promociones publicas para agendamiento desde reglas normalizadas.
   SELECT
     p.id_promocion,
+    pra.id_promocion_regla,
     ps.id_sucursal,
     p.titulo,
     p.subtitulo,
@@ -177,10 +190,10 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
     p.tipo_promocion,
     p.aplica_a,
     p.mecanica,
-    p.id_servicio_objetivo,
-    p.id_paquete_objetivo,
-    p.valor_descuento,
-    p.cantidad_requerida,
+    COALESCE(pia.id_servicio, p.id_servicio_objetivo) AS id_servicio_objetivo,
+    COALESCE(pia.id_paquete, p.id_paquete_objetivo) AS id_paquete_objetivo,
+    COALESCE(pra.valor_descuento, p.valor_descuento) AS valor_descuento,
+    COALESCE(pia.cantidad_minima, p.cantidad_requerida) AS cantidad_requerida,
     p.cantidad_bonificada,
     ps.vigencia_desde,
     ps.vigencia_hasta,
@@ -191,34 +204,33 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
   FROM public.promociones p
   JOIN public.promociones_sucursal ps
     ON ps.id_promocion = p.id_promocion
+  JOIN public.promociones_reglas_agendamiento pra
+    ON pra.id_promocion = p.id_promocion
+   AND pra.activo IS TRUE
+  LEFT JOIN public.promociones_items_agendamiento pia
+    ON pia.id_promocion_regla = pra.id_promocion_regla
+   AND (
+      (pia.tipo_item_codigo = 'servicio' AND pia.id_servicio IS NOT NULL)
+      OR (pia.tipo_item_codigo = 'paquete' AND pia.id_paquete IS NOT NULL)
+   )
   JOIN public.sucursales su
     ON su.id_sucursal = ps.id_sucursal
   LEFT JOIN public.servicios s
-    ON s.id_servicio = p.id_servicio_objetivo
+    ON s.id_servicio = COALESCE(pia.id_servicio, p.id_servicio_objetivo)
    AND s.deleted_at IS NULL
   LEFT JOIN public.paquetes pk
-    ON pk.id_paquete = p.id_paquete_objetivo
+    ON pk.id_paquete = COALESCE(pia.id_paquete, p.id_paquete_objetivo)
    AND pk.deleted_at IS NULL
+  CROSS JOIN (
+    SELECT (NOW() AT TIME ZONE 'America/Tegucigalpa')::date AS business_date
+  ) business_clock
   WHERE ps.id_sucursal = $1::uuid
     AND su.deleted_at IS NULL
     AND su.estado IS TRUE
     AND p.estado = 'publicada'
     AND ps.visible_publico IS TRUE
-    AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= CURRENT_DATE)
-    AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= CURRENT_DATE)
-    AND (
-      (ps.vigencia_hora_desde IS NULL AND ps.vigencia_hora_hasta IS NULL)
-      OR (ps.vigencia_hora_desde IS NOT NULL AND ps.vigencia_hora_hasta IS NULL AND LOCALTIME >= ps.vigencia_hora_desde)
-      OR (ps.vigencia_hora_desde IS NULL AND ps.vigencia_hora_hasta IS NOT NULL AND LOCALTIME <= ps.vigencia_hora_hasta)
-      OR (
-        ps.vigencia_hora_desde IS NOT NULL
-        AND ps.vigencia_hora_hasta IS NOT NULL
-        AND (
-          (ps.vigencia_hora_desde <= ps.vigencia_hora_hasta AND LOCALTIME BETWEEN ps.vigencia_hora_desde AND ps.vigencia_hora_hasta)
-          OR (ps.vigencia_hora_desde > ps.vigencia_hora_hasta AND (LOCALTIME >= ps.vigencia_hora_desde OR LOCALTIME <= ps.vigencia_hora_hasta))
-        )
-      )
-    )
+    AND (ps.vigencia_desde IS NULL OR ps.vigencia_desde <= business_clock.business_date)
+    AND (ps.vigencia_hasta IS NULL OR ps.vigencia_hasta >= business_clock.business_date)
     AND p.tipo_promocion IN ('descuento_servicio', 'descuento_paquete', 'dos_por_uno_servicio')
     AND p.aplica_a IN ('servicio', 'paquete')
     AND p.mecanica IN ('porcentaje', 'monto_fijo', 'dos_por_uno')
@@ -230,7 +242,7 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
     AND (
       (
         p.aplica_a = 'servicio'
-        AND p.id_servicio_objetivo IS NOT NULL
+        AND COALESCE(pia.id_servicio, p.id_servicio_objetivo) IS NOT NULL
         AND s.id_servicio IS NOT NULL
         AND s.activo IS TRUE
         AND s.agendable IS TRUE
@@ -238,24 +250,24 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
         AND EXISTS (
           SELECT 1
           FROM public.servicios_tarifas st
-          WHERE st.id_servicio = p.id_servicio_objetivo
+          WHERE st.id_servicio = COALESCE(pia.id_servicio, p.id_servicio_objetivo)
             AND st.id_sucursal = ps.id_sucursal
             AND st.deleted_at IS NULL
             AND st.activo IS TRUE
-            AND st.vigente_desde <= CURRENT_DATE
-            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+            AND st.vigente_desde <= business_clock.business_date
+            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= business_clock.business_date)
             AND st.precio_hnl > 0
         )
       )
       OR (
         p.aplica_a = 'paquete'
-        AND p.id_paquete_objetivo IS NOT NULL
+        AND COALESCE(pia.id_paquete, p.id_paquete_objetivo) IS NOT NULL
         AND pk.id_paquete IS NOT NULL
         AND pk.activo IS TRUE
         AND EXISTS (
           SELECT 1
           FROM public.paquetes_sucursal psq
-          WHERE psq.id_paquete = p.id_paquete_objetivo
+          WHERE psq.id_paquete = COALESCE(pia.id_paquete, p.id_paquete_objetivo)
             AND psq.id_sucursal = ps.id_sucursal
             AND psq.activo IS TRUE
             AND psq.visible_publico IS TRUE
@@ -264,66 +276,6 @@ const PUBLIC_BOOKING_PROMOTIONS_SQL = `
       )
     )
   ORDER BY ps.orden_visual ASC, p.titulo ASC
-`;
-
-const PUBLIC_BOOKING_PROMOTIONS_NORMALIZED_SQL = `
-  SELECT
-    r.id_promocion_regla,
-    r.id_promocion,
-    COALESCE(ps.id_sucursal, $1::uuid) AS id_sucursal,
-    p.titulo,
-    p.subtitulo,
-    p.parrafos,
-    p.tipo_promocion,
-    r.aplica_a_codigo AS aplica_a,
-    r.tipo_descuento_codigo AS mecanica,
-    r.valor_descuento,
-    r.es_acumulable,
-    1::int AS cantidad_requerida,
-    1::int AS cantidad_bonificada,
-    ps.vigencia_desde,
-    ps.vigencia_hasta,
-    ps.vigencia_hora_desde,
-    ps.vigencia_hora_hasta,
-    svc_item.id_servicio AS id_servicio_objetivo,
-    pkg_item.id_paquete AS id_paquete_objetivo,
-    s.nombre_servicio AS servicio_objetivo_nombre,
-    pk.nombre_paquete AS paquete_objetivo_nombre
-  FROM public.promociones_reglas_agendamiento r
-  JOIN public.promociones p
-    ON p.id_promocion = r.id_promocion
-  LEFT JOIN public.promociones_sucursal ps
-    ON ps.id_promocion = p.id_promocion
-   AND ps.id_sucursal = $1::uuid
-  LEFT JOIN LATERAL (
-    SELECT i.id_servicio
-    FROM public.promociones_items_agendamiento i
-    WHERE i.id_promocion_regla = r.id_promocion_regla
-      AND i.tipo_item_codigo = 'servicio'
-    ORDER BY i.created_at ASC
-    LIMIT 1
-  ) svc_item ON true
-  LEFT JOIN LATERAL (
-    SELECT i.id_paquete
-    FROM public.promociones_items_agendamiento i
-    WHERE i.id_promocion_regla = r.id_promocion_regla
-      AND i.tipo_item_codigo = 'paquete'
-    ORDER BY i.created_at ASC
-    LIMIT 1
-  ) pkg_item ON true
-  LEFT JOIN public.servicios s
-    ON s.id_servicio = svc_item.id_servicio
-   AND s.deleted_at IS NULL
-  LEFT JOIN public.paquetes pk
-    ON pk.id_paquete = pkg_item.id_paquete
-   AND pk.deleted_at IS NULL
-  WHERE p.estado = 'publicada'
-    AND r.activo IS TRUE
-    AND (
-      ps.id_promocion_sucursal IS NULL
-      OR ps.visible_publico IS TRUE
-    )
-  ORDER BY r.prioridad_aplicacion ASC, p.titulo ASC
 `;
 
 const curatedPeriodSchema = {
@@ -416,7 +368,10 @@ function buildPromotionSummary(row) {
     || (aplicaA === "paquete" && !hasPackageTarget)
     || (mecanica === "porcentaje" && !hasDiscountValue)
     || (mecanica === "monto_fijo" && !hasDiscountValue)
-    || (mecanica === "dos_por_uno" && !hasServiceTarget)
+    || (
+      mecanica === "dos_por_uno"
+      && ((aplicaA === "paquete" && !hasPackageTarget) || (aplicaA !== "paquete" && !hasServiceTarget))
+    )
   );
   if (missingOperationalData) return "Sin aplicación configurada";
 
@@ -433,17 +388,18 @@ function buildPromotionSummary(row) {
     const bonificada = Number(row?.cantidad_bonificada ?? 1);
     const safeRequerida = Number.isInteger(requerida) && requerida > 0 ? requerida : 1;
     const safeBonificada = Number.isInteger(bonificada) && bonificada > 0 ? bonificada : 1;
-    return `${scopeLabel} · ${safeRequerida + safeBonificada}x${safeRequerida}`;
+    const paidUnits = Math.max(0, safeRequerida - safeBonificada);
+    return `${scopeLabel} · Compra ${safeRequerida}, paga ${paidUnits}`;
   }
 
   return "Sin aplicación configurada";
 }
 
 function mapBookingPromotionRow(row) {
-  // JK: Expone payload de promociones amigable para el flujo de agendamiento sin tocar contratos de pago.
   const paragraphs = normalizePromotionParagraphs(row?.parrafos);
   return {
     id_promocion: row.id_promocion,
+    id_promocion_regla: row.id_promocion_regla,
     id_sucursal: String(row.id_sucursal || "").trim(),
     titulo: row.titulo,
     subtitulo: row.subtitulo ?? null,
@@ -463,45 +419,7 @@ function mapBookingPromotionRow(row) {
     vigencia_hora_hasta: row.vigencia_hora_hasta ?? null,
     servicio_objetivo_nombre: row.servicio_objetivo_nombre ?? null,
     paquete_objetivo_nombre: row.paquete_objetivo_nombre ?? null,
-    es_acumulable: Boolean(row.es_acumulable ?? false),
-    applicable: true,
-    reason_code: null,
   };
-}
-
-function normalizeCsvUuids(raw) {
-  if (!raw) return [];
-  return String(raw)
-    .split(",")
-    .map((item) => String(item || "").trim())
-    .filter(Boolean);
-}
-
-function evaluatePromotionApplicability(row, query) {
-  const selectionType = String(query?.selection_type || "").trim().toLowerCase();
-  const selectedServiceIds = new Set(normalizeCsvUuids(query?.servicios));
-  const selectedPackageId = String(query?.id_paquete || "").trim();
-  const appliesTo = String(row?.aplica_a || "").trim().toLowerCase();
-  const targetServiceId = String(row?.id_servicio_objetivo || "").trim();
-  const targetPackageId = String(row?.id_paquete_objetivo || "").trim();
-
-  if (selectionType) {
-    if (appliesTo === "servicio" && !["services", "mixed"].includes(selectionType)) {
-      return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
-    }
-    if (appliesTo === "paquete" && !["package", "mixed"].includes(selectionType)) {
-      return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
-    }
-  }
-
-  if (appliesTo === "servicio" && targetServiceId && selectedServiceIds.size > 0 && !selectedServiceIds.has(targetServiceId)) {
-    return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
-  }
-  if (appliesTo === "paquete" && targetPackageId && selectedPackageId && selectedPackageId !== targetPackageId) {
-    return { applicable: false, reason_code: "PROMOTION_NOT_APPLICABLE" };
-  }
-
-  return { applicable: true, reason_code: null };
 }
 
 function canExposeSlotDebug(request) {
@@ -519,6 +437,18 @@ function mapDiscardedReasonSummary(discarded) {
     counts.set(code, (counts.get(code) || 0) + 1);
   });
   return Array.from(counts.entries()).map(([code, count]) => ({ code, count }));
+}
+
+function mapTariffsForResponse(selection) {
+  return (Array.isArray(selection?.items) ? selection.items : []).map((item) => ({
+    id_servicio: item.id_servicio,
+    id_tarifa: item.id_tarifa ?? null,
+    precio_hnl: Number(item.precio_hnl || 0),
+    precio_total_hnl: Number(item.precio_total_hnl ?? item.total_linea_hnl ?? item.precio_hnl ?? 0),
+    incluye_isv_snapshot: item.incluye_isv_snapshot === true || item.incluye_isv === true,
+    isv_porcentaje: Number(item.isv_porcentaje || 0),
+    isv_hnl: Number(item.isv_hnl || 0),
+  }));
 }
 
 async function expireReservationsBestEffort(app, request, dbClient = null) {
@@ -546,10 +476,6 @@ export default async function publicAgendaRoutes(app) {
           required: ["id_sucursal"],
           properties: {
             id_sucursal: { type: "string", format: "uuid" },
-            selection_type: { type: "string", enum: ["services", "package", "mixed"] },
-            servicios: { type: "string" },
-            id_paquete: { type: "string", format: "uuid" },
-            fecha: { type: "string", format: "date" },
           },
           additionalProperties: false,
         },
@@ -636,22 +562,9 @@ export default async function publicAgendaRoutes(app) {
         // JK: Reusa limpieza de holds vencidos para mantener consistencia con disponibilidad pública.
         await expireStaleAppointmentReservations(app.db, { logger: request.log });
         const idSucursal = assertUuid(request.query?.id_sucursal, "id_sucursal");
-        let { rows } = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_SQL, [idSucursal]);
-        if (!Array.isArray(rows) || rows.length === 0) {
-          const normalizedResult = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_NORMALIZED_SQL, [idSucursal]);
-          rows = normalizedResult.rows || [];
-        }
-        const mapped = rows.map((row) => {
-          const base = mapBookingPromotionRow(row);
-          const applicability = evaluatePromotionApplicability(base, request.query);
-          return {
-            ...base,
-            applicable: applicability.applicable,
-            reason_code: applicability.reason_code,
-          };
-        });
+        const { rows } = await app.db.query(PUBLIC_BOOKING_PROMOTIONS_SQL, [idSucursal]);
         return sendOk(reply, {
-          promociones: mapped,
+          promociones: rows.map(mapBookingPromotionRow),
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudieron consultar promociones disponibles para agendamiento", "PUBLIC_AGENDA_PROMOTIONS_ERROR");
@@ -686,8 +599,8 @@ export default async function publicAgendaRoutes(app) {
                 type: "object",
                 properties: {
                   disponibilidad: { type: "array", items: availabilityDaySchema },
-                  duracion_total_min: { type: "integer" },
-                  buffer_total_min: { type: "integer" },
+                  duracion_total_min: { anyOf: [{ type: "integer" }, { type: "null" }] },
+                  buffer_total_min: { anyOf: [{ type: "integer" }, { type: "null" }] },
                 },
                 required: ["disponibilidad", "duracion_total_min", "buffer_total_min"],
                 additionalProperties: false,
@@ -713,36 +626,26 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const fechaDesde = parseDateOnly(request.query?.fecha_desde, "fecha_desde");
         const fechaHasta = parseDateOnly(request.query?.fecha_hasta, "fecha_hasta");
-        const dateDesde = new Date(fechaDesde);
-        const dateHasta = new Date(fechaHasta);
-        if (dateHasta < dateDesde) {
-          throw new AppError(400, "fecha_hasta no puede ser menor a fecha_desde", { code: "PUBLIC_AGENDA_DATES_INVALID" });
-        }
-        const diffTime = Math.abs(dateHasta - dateDesde);
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        if (diffDays > 60) {
+        const selectionType = assertBookingSelectionRuntimeSupported(request.query?.selection_type || "services");
+        const rangeDays = countDateKeyRangeDays(fechaDesde, fechaHasta);
+        if (rangeDays > 60) {
           throw new AppError(400, "El rango de fechas no puede superar los 60 dias", { code: "PUBLIC_AGENDA_DATE_RANGE_TOO_LARGE" });
         }
-        const serviceSelection = await getBookingSelectionDetails(dbClient, {
+        const rangeResult = await listAvailabilityByDateRangeForRequest(dbClient, {
           id_sucursal: idSucursal,
-          selection_type: request.query?.selection_type,
+          selection_type: selectionType,
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
+          fecha_desde: fechaDesde,
+          fecha_hasta: fechaHasta,
           id_barbero: idBarbero,
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
-        const disponibilidad = await listAvailabilityByDateRange(
-          dbClient,
-          idSucursal,
-          serviceSelection,
-          fechaDesde,
-          fechaHasta,
-          idBarbero
-        );
 
         return sendOk(reply, {
-          disponibilidad: mapDayAvailabilityForResponse(disponibilidad),
-          duracion_total_min: serviceSelection.duracion_total_min,
-          buffer_total_min: serviceSelection.buffer_total_min,
+          disponibilidad: mapDayAvailabilityForResponse(rangeResult.disponibilidad),
+          duracion_total_min: rangeResult.duracion_total_min,
+          buffer_total_min: rangeResult.buffer_total_min,
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo calcular disponibilidad", "PUBLIC_AGENDA_AVAILABILITY_ERROR");
@@ -801,6 +704,34 @@ export default async function publicAgendaRoutes(app) {
                   hora_fin: { type: ["string", "null"] },
                   duracion_total_min: { type: "integer" },
                   buffer_total_min: { type: "integer" },
+                  monto_subtotal_hnl: { type: "number" },
+                  monto_isv_hnl: { type: "number" },
+                  monto_total_hnl: { type: "number" },
+                  tarifas: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        id_servicio: { type: "string", format: "uuid" },
+                        id_tarifa: { type: ["string", "null"], format: "uuid" },
+                        precio_hnl: { type: "number" },
+                        precio_total_hnl: { type: "number" },
+                        incluye_isv_snapshot: { type: "boolean" },
+                        isv_porcentaje: { type: "number" },
+                        isv_hnl: { type: "number" },
+                      },
+                      required: [
+                        "id_servicio",
+                        "id_tarifa",
+                        "precio_hnl",
+                        "precio_total_hnl",
+                        "incluye_isv_snapshot",
+                        "isv_porcentaje",
+                        "isv_hnl",
+                      ],
+                      additionalProperties: false,
+                    },
+                  },
                   slot_step_min: { type: "integer" },
                   debug: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] },
                 },
@@ -814,6 +745,10 @@ export default async function publicAgendaRoutes(app) {
                   "hora_fin",
                   "duracion_total_min",
                   "buffer_total_min",
+                  "monto_subtotal_hnl",
+                  "monto_isv_hnl",
+                  "monto_total_hnl",
+                  "tarifas",
                   "slot_step_min",
                   "debug",
                 ],
@@ -841,68 +776,32 @@ export default async function publicAgendaRoutes(app) {
         const idBarbero = request.query?.id_barbero ? assertUuid(request.query.id_barbero, "id_barbero") : null;
         const minSellableDurationMin = await getMinSellableServiceMinutes(dbClient);
         const includeDebug = canExposeSlotDebug(request);
-        const serviceSelection = await getBookingSelectionDetails(dbClient, {
+        const selectionType = assertBookingSelectionRuntimeSupported(request.query?.selection_type || "services");
+        const availability = await resolveEffectiveDayAvailability(dbClient, {
           id_sucursal: idSucursal,
-          selection_type: request.query?.selection_type,
+          selection_type: selectionType,
           servicios: request.query?.servicios,
           id_paquete: request.query?.id_paquete ?? null,
           id_barbero: idBarbero,
-        });
-        const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
-
-        if (idBarbero) {
-          const availability = await buildDayAvailability(dbClient, idSucursal, serviceSelection, fecha, idBarbero, {
-            minSellableDurationMin,
-            includeDiscardReasons: includeDebug,
-          });
-          const horarios = mapSlotsForResponse(availability.slots, {
-            duracion_visible_min: serviceSelection.duracion_total_min,
-          });
-          const horariosCurados = buildCuratedSlotExposure(horarios, {
-            minSellableDurationMin,
-          });
-          const debugPayload = includeDebug
-            ? {
-                discarded_reason_codes: mapDiscardedReasonSummary(availability?.discarded_slots),
-                discarded_slots: Array.isArray(availability?.discarded_slots)
-                  ? availability.discarded_slots.slice(0, 120)
-                  : [],
-                curated_ranking: buildCuratedSlotExposureDebug(horarios, {
-                  minSellableDurationMin,
-                }),
-              }
-            : null;
-          return sendOk(reply, {
-            fecha,
-            id_barbero: idBarbero,
-            barbero: availability.barbero_autoasignado
-              ? mapBarbersForResponse([availability.barbero_autoasignado])[0]
-              : null,
-            horarios,
-            horarios_curados: horariosCurados,
-            hora_inicio: availability.hora_inicio ?? null,
-            hora_fin: availability.hora_fin ?? null,
-            duracion_total_min: serviceSelection.duracion_total_min,
-            buffer_total_min: serviceSelection.buffer_total_min,
-            slot_step_min: SLOT_INTERVAL_MINUTES,
-            debug: debugPayload,
-          });
-        }
-
-        const result = await findFirstAvailableBarber(dbClient, idSucursal, fecha, serviceTotalMinutes, {
+          fecha,
           minSellableDurationMin,
+          includeDiscardReasons: Boolean(idBarbero && includeDebug),
+          bookingIsvEnabled: app.config?.bookingIsvEnabled,
         });
-        const bounds = result?.barber
-          ? await getBarberScheduleBounds(dbClient, result.barber.id_empleado, fecha)
-          : { hora_inicio: null, hora_fin: null };
-        const horarios = mapSlotsForResponse(result?.slots ?? [], {
-          duracion_visible_min: serviceSelection.duracion_total_min,
+        const serviceSelection = availability.service_selection || null;
+        const effectiveSelection = availability.effective_selection || null;
+        const horarios = mapSlotsForResponse(availability.slots ?? [], {
+          duracion_visible_min: Number(effectiveSelection?.duracion_total_min || 0),
         });
         const horariosCurados = buildCuratedSlotExposure(horarios, {
           minSellableDurationMin,
         });
         const debugPayload = includeDebug
           ? {
+              discarded_reason_codes: idBarbero ? mapDiscardedReasonSummary(availability?.discarded_slots) : [],
+              discarded_slots: idBarbero && Array.isArray(availability?.discarded_slots)
+                ? availability.discarded_slots.slice(0, 120)
+                : [],
               curated_ranking: buildCuratedSlotExposureDebug(horarios, {
                 minSellableDurationMin,
               }),
@@ -910,14 +809,18 @@ export default async function publicAgendaRoutes(app) {
           : null;
         return sendOk(reply, {
           fecha,
-          id_barbero: result?.barber?.id_empleado ?? null,
-          barbero: result?.barber ? mapBarbersForResponse([result.barber])[0] : null,
+          id_barbero: availability.barbero_autoasignado?.id_empleado ?? null,
+          barbero: availability.barbero_autoasignado ? mapBarbersForResponse([availability.barbero_autoasignado])[0] : null,
           horarios,
           horarios_curados: horariosCurados,
-          hora_inicio: bounds.hora_inicio ?? null,
-          hora_fin: bounds.hora_fin ?? null,
-          duracion_total_min: serviceSelection.duracion_total_min,
-          buffer_total_min: serviceSelection.buffer_total_min,
+          hora_inicio: availability.hora_inicio ?? null,
+          hora_fin: availability.hora_fin ?? null,
+          duracion_total_min: Number(effectiveSelection?.duracion_total_min || 0),
+          buffer_total_min: Number(effectiveSelection?.buffer_total_min || 0),
+          monto_subtotal_hnl: Number(effectiveSelection?.monto_subtotal_hnl || 0),
+          monto_isv_hnl: Number(effectiveSelection?.monto_isv_hnl || 0),
+          monto_total_hnl: Number(effectiveSelection?.monto_total_hnl || 0),
+          tarifas: mapTariffsForResponse(serviceSelection),
           slot_step_min: SLOT_INTERVAL_MINUTES,
           debug: debugPayload,
         });

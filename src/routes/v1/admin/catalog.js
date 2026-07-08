@@ -55,10 +55,28 @@ const serviceBodySchema = {
     grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
     orden_visual: { type: "integer", minimum: 0 },
     visible_publico: { type: "boolean" },
+    agendable: { type: "boolean" },
     servicio_informativo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
+    sucursales: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          id_sucursal: { type: "string", format: "uuid" },
+          precio_hnl: { type: "number", minimum: 0 },
+          duracion_min: { type: "integer", minimum: 1 },
+          buffer_min: { type: "integer", minimum: 0 },
+          activo: { type: "boolean" },
+          servicio_informativo: { type: "boolean" },
+        },
+        required: ["id_sucursal", "precio_hnl", "duracion_min"],
+        additionalProperties: false,
+      },
+    },
   },
-  required: ["nombre_servicio", "duracion_min", "precio_hnl"],
+  required: ["nombre_servicio"],
   additionalProperties: false,
 };
 
@@ -73,6 +91,7 @@ const servicePatchSchema = {
     grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
     orden_visual: { type: "integer", minimum: 0 },
     visible_publico: { type: "boolean" },
+    agendable: { type: "boolean" },
     servicio_informativo: { type: "boolean" },
     id_sucursal: { type: ["string", "null"], format: "uuid" },
   },
@@ -90,6 +109,21 @@ const packageBodySchema = {
     // AM: Operacion multi-sucursal: alta y edicion de paquetes siempre debe poder fijar sucursal objetivo.
     id_sucursal: { type: ["string", "null"], format: "uuid" },
     visible_publico: { type: "boolean" },
+    ofertas: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          id_sucursal: { type: "string", format: "uuid" },
+          precio_hnl: { type: "number", minimum: 0 },
+          visible_publico: { type: "boolean" },
+          orden_visual: { type: "integer", minimum: 0 },
+        },
+        required: ["id_sucursal", "precio_hnl"],
+        additionalProperties: false,
+      },
+    },
     items: {
       type: "array",
       minItems: 2,
@@ -104,7 +138,7 @@ const packageBodySchema = {
       },
     },
   },
-  required: ["nombre_paquete", "precio_hnl", "items"],
+  required: ["nombre_paquete", "items"],
   additionalProperties: false,
 };
 
@@ -224,6 +258,83 @@ const serviceBarberAssignmentsResponseSchema = {
     barberos: { type: "array", items: serviceBarberAssignmentItemSchema },
   },
   required: ["id_servicio", "id_sucursal", "barberos"],
+  additionalProperties: false,
+};
+
+const groupedServiceTariffSchema = {
+  type: "object",
+  properties: {
+    id_tarifa: { type: ["string", "null"], format: "uuid" },
+    id_sucursal: { type: "string", format: "uuid" },
+    nombre_sucursal: { type: "string" },
+    precio_hnl: { type: ["number", "null"] },
+    duracion_min: { type: ["integer", "null"] },
+    buffer_min: { type: ["integer", "null"] },
+    tarifa_activa: { type: "boolean" },
+    servicio_informativo: { type: "boolean" },
+    vigente_desde: { type: ["string", "null"] },
+    vigente_hasta: { type: ["string", "null"] },
+    barberos_ofrecen_total: { type: "integer" },
+  },
+  required: [
+    "id_tarifa",
+    "id_sucursal",
+    "nombre_sucursal",
+    "precio_hnl",
+    "duracion_min",
+    "buffer_min",
+    "tarifa_activa",
+    "servicio_informativo",
+    "vigente_desde",
+    "vigente_hasta",
+    "barberos_ofrecen_total",
+  ],
+  additionalProperties: false,
+};
+
+const groupedServiceResponseSchema = {
+  type: "object",
+  properties: {
+    id_servicio: { type: "string", format: "uuid" },
+    nombre_servicio: { type: "string" },
+    descripcion: { type: ["string", "null"] },
+    grupo_catalogo: { type: "string", enum: SERVICE_GROUPS },
+    activo: { type: "boolean" },
+    visible_publico: { type: "boolean" },
+    agendable: { type: "boolean" },
+    orden_visual: { type: "integer" },
+    precio_min_hnl: { type: ["number", "null"] },
+    precio_max_hnl: { type: ["number", "null"] },
+    tarifas_activas_total: { type: "integer" },
+    tarifas: { type: "array", items: groupedServiceTariffSchema },
+  },
+  required: [
+    "id_servicio",
+    "nombre_servicio",
+    "descripcion",
+    "grupo_catalogo",
+    "activo",
+    "visible_publico",
+    "agendable",
+    "orden_visual",
+    "precio_min_hnl",
+    "precio_max_hnl",
+    "tarifas_activas_total",
+    "tarifas",
+  ],
+  additionalProperties: false,
+};
+
+const serviceTariffPatchSchema = {
+  type: "object",
+  properties: {
+    precio_hnl: { type: "number", minimum: 0 },
+    duracion_min: { type: "integer", minimum: 1 },
+    buffer_min: { type: "integer", minimum: 0 },
+    activo: { type: "boolean" },
+    servicio_informativo: { type: "boolean" },
+  },
+  minProperties: 1,
   additionalProperties: false,
 };
 
@@ -359,6 +470,108 @@ const LIST_SERVICES_SQL = `
   ORDER BY s.orden_visual ASC, s.nombre_servicio ASC, st.id_sucursal ASC NULLS LAST
 `;
 
+const LIST_GROUPED_SERVICES_SQL = `
+  WITH active_branches AS (
+    SELECT
+      su.id_sucursal,
+      su.nombre_sucursal
+    FROM public.sucursales su
+    WHERE su.deleted_at IS NULL
+      AND su.estado IS TRUE
+      AND ($1::uuid IS NULL OR su.id_sucursal = $1::uuid)
+  ),
+  current_base_tariffs AS (
+    SELECT DISTINCT ON (st.id_servicio, st.id_sucursal)
+      st.id_tarifa,
+      st.id_servicio,
+      st.id_sucursal,
+      st.precio_hnl,
+      st.duracion_min,
+      st.buffer_min,
+      COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
+      st.activo,
+      st.vigente_desde,
+      st.vigente_hasta
+    FROM public.servicios_tarifas st
+    WHERE st.id_empleado IS NULL
+      AND st.deleted_at IS NULL
+      AND st.vigente_hasta IS NULL
+    ORDER BY st.id_servicio, st.id_sucursal, st.activo DESC, st.updated_at DESC, st.id_tarifa DESC
+  ),
+  service_branch_rows AS (
+    SELECT
+      s.id_servicio,
+      s.nombre_servicio,
+      s.descripcion,
+      s.grupo_catalogo,
+      s.visible_publico,
+      s.agendable,
+      s.orden_visual,
+      s.activo,
+      ab.id_sucursal,
+      ab.nombre_sucursal,
+      st.id_tarifa,
+      st.precio_hnl,
+      COALESCE(st.duracion_min, s.duracion_min) AS duracion_min,
+      COALESCE(st.buffer_min, s.buffer_min) AS buffer_min,
+      COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
+      COALESCE(st.activo, FALSE) AS tarifa_activa,
+      st.vigente_desde,
+      st.vigente_hasta,
+      COALESCE((
+        SELECT COUNT(DISTINCT stb.id_empleado)::int
+        FROM public.servicios_tarifas stb
+        JOIN public.empleados eb
+          ON eb.id_empleado = stb.id_empleado
+        WHERE stb.id_servicio = s.id_servicio
+          AND stb.id_sucursal = ab.id_sucursal
+          AND stb.id_empleado IS NOT NULL
+          AND stb.deleted_at IS NULL
+          AND stb.activo IS TRUE
+          AND eb.deleted_at IS NULL
+          AND COALESCE(eb.estado, TRUE) IS TRUE
+          AND eb.es_barbero IS TRUE
+      ), 0) AS barberos_ofrecen_total
+    FROM public.servicios s
+    CROSS JOIN active_branches ab
+    LEFT JOIN current_base_tariffs st
+      ON st.id_servicio = s.id_servicio
+     AND st.id_sucursal = ab.id_sucursal
+    WHERE s.deleted_at IS NULL
+  )
+  SELECT
+    sbr.id_servicio,
+    MAX(sbr.nombre_servicio) AS nombre_servicio,
+    MAX(sbr.descripcion) AS descripcion,
+    MAX(sbr.grupo_catalogo) AS grupo_catalogo,
+    BOOL_OR(sbr.visible_publico) AS visible_publico,
+    BOOL_OR(sbr.agendable) AS agendable,
+    MIN(sbr.orden_visual)::int AS orden_visual,
+    BOOL_OR(sbr.activo) AS activo,
+    MIN(sbr.precio_hnl) FILTER (WHERE sbr.tarifa_activa IS TRUE AND sbr.precio_hnl IS NOT NULL)::numeric AS precio_min_hnl,
+    MAX(sbr.precio_hnl) FILTER (WHERE sbr.tarifa_activa IS TRUE AND sbr.precio_hnl IS NOT NULL)::numeric AS precio_max_hnl,
+    COUNT(*) FILTER (WHERE sbr.tarifa_activa IS TRUE)::int AS tarifas_activas_total,
+    json_agg(
+      json_build_object(
+        'id_tarifa', sbr.id_tarifa,
+        'id_sucursal', sbr.id_sucursal,
+        'nombre_sucursal', sbr.nombre_sucursal,
+        'precio_hnl', sbr.precio_hnl,
+        'duracion_min', sbr.duracion_min,
+        'buffer_min', sbr.buffer_min,
+        'tarifa_activa', sbr.tarifa_activa,
+        'servicio_informativo', sbr.servicio_informativo,
+        'vigente_desde', sbr.vigente_desde,
+        'vigente_hasta', sbr.vigente_hasta,
+        'barberos_ofrecen_total', sbr.barberos_ofrecen_total
+      )
+      ORDER BY sbr.nombre_sucursal ASC
+    ) AS tarifas
+  FROM service_branch_rows sbr
+  GROUP BY sbr.id_servicio
+  ORDER BY MIN(sbr.orden_visual) ASC, MAX(sbr.nombre_servicio) ASC
+`;
+
 const GET_SERVICE_SQL = `
   WITH scoped_tariffs AS (
     SELECT
@@ -480,7 +693,8 @@ const GET_LATEST_ANY_SERVICE_TARIFF_SQL = `
     st.buffer_min,
     COALESCE(st.servicio_informativo, FALSE) AS servicio_informativo,
     st.activo,
-    st.deleted_at
+    st.deleted_at,
+    st.vigente_hasta
   FROM public.servicios_tarifas st
   WHERE st.id_servicio = $1::uuid
     AND st.id_sucursal = $2::uuid
@@ -666,6 +880,40 @@ const SERVICE_FUTURE_APPOINTMENTS_COUNT_SQL = `
     AND c.id_sucursal = $2::uuid
     AND c.deleted_at IS NULL
     AND c.inicio_at >= NOW()
+`;
+
+const SERVICE_BRANCH_ACTIVE_FUTURE_APPOINTMENTS_COUNT_SQL = `
+  SELECT COUNT(*)::int AS total_citas_futuras
+  FROM public.citas_detalles cd
+  JOIN public.citas c
+    ON c.id_cita = cd.id_cita
+  WHERE cd.id_servicio = $1::uuid
+    AND c.id_sucursal = $2::uuid
+    AND c.deleted_at IS NULL
+    AND c.inicio_at >= NOW()
+    AND COALESCE(c.estado_cita_codigo, '') NOT IN ('cancelada', 'cancelado', 'completada', 'completado', 'no_show', 'no_asistio')
+`;
+
+const SERVICE_GLOBAL_ACTIVE_FUTURE_APPOINTMENTS_COUNT_SQL = `
+  SELECT COUNT(*)::int AS total_citas_futuras
+  FROM public.citas_detalles cd
+  JOIN public.citas c
+    ON c.id_cita = cd.id_cita
+  WHERE cd.id_servicio = $1::uuid
+    AND c.deleted_at IS NULL
+    AND c.inicio_at >= NOW()
+    AND COALESCE(c.estado_cita_codigo, '') NOT IN ('cancelada', 'cancelado', 'expirada', 'completada', 'completado', 'no_show', 'no_asistio')
+`;
+
+const ACTIVE_SERVICE_BRANCH_TARIFFS_COUNT_SQL = `
+  SELECT COUNT(*)::int AS total
+  FROM public.servicios_tarifas st
+  WHERE st.id_servicio = $1::uuid
+    AND st.id_empleado IS NULL
+    AND st.deleted_at IS NULL
+    AND st.activo IS TRUE
+    AND st.vigente_hasta IS NULL
+    AND ($2::uuid IS NULL OR st.id_sucursal <> $2::uuid)
 `;
 
 const PACKAGE_FUTURE_APPOINTMENTS_COUNT_SQL = `
@@ -873,6 +1121,36 @@ function mapAdminServiceRow(row) {
   };
 }
 
+function mapGroupedServiceRow(row) {
+  const tarifas = Array.isArray(row.tarifas) ? row.tarifas : [];
+  return {
+    id_servicio: row.id_servicio,
+    nombre_servicio: row.nombre_servicio,
+    descripcion: row.descripcion ?? null,
+    grupo_catalogo: normalizeServiceGroup(row.grupo_catalogo),
+    activo: Boolean(row.activo),
+    visible_publico: normalizeBoolean(row.visible_publico, true),
+    agendable: normalizeBoolean(row.agendable, true),
+    orden_visual: normalizeOrderVisual(row.orden_visual, 100),
+    precio_min_hnl: row.precio_min_hnl == null ? null : Number(row.precio_min_hnl),
+    precio_max_hnl: row.precio_max_hnl == null ? null : Number(row.precio_max_hnl),
+    tarifas_activas_total: Number(row.tarifas_activas_total ?? 0),
+    tarifas: tarifas.map((tarifa) => ({
+      id_tarifa: tarifa.id_tarifa ?? null,
+      id_sucursal: tarifa.id_sucursal,
+      nombre_sucursal: tarifa.nombre_sucursal,
+      precio_hnl: tarifa.precio_hnl == null ? null : Number(tarifa.precio_hnl),
+      duracion_min: tarifa.duracion_min == null ? null : Number(tarifa.duracion_min),
+      buffer_min: tarifa.buffer_min == null ? null : Number(tarifa.buffer_min),
+      tarifa_activa: Boolean(tarifa.tarifa_activa),
+      servicio_informativo: Boolean(tarifa.servicio_informativo),
+      vigente_desde: tarifa.vigente_desde ?? null,
+      vigente_hasta: tarifa.vigente_hasta ?? null,
+      barberos_ofrecen_total: Number(tarifa.barberos_ofrecen_total ?? 0),
+    })),
+  };
+}
+
 function mapServiceBarberAssignmentRow(row) {
   return {
     id_empleado: row.id_empleado,
@@ -970,24 +1248,24 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
   });
 }
 
-async function ensureUniquePackageNameByBranch(client, packageId, branchId, nombrePaquete) {
+const PACKAGE_DUPLICATE_MESSAGE = "Ya existe un paquete con ese nombre. Usa el paquete existente o cambia el nombre.";
+
+async function ensureUniquePackageNameGlobal(client, packageId, nombrePaquete) {
   const { rows } = await client.query(
     `
       SELECT p.id_paquete
       FROM public.paquetes p
-      JOIN public.paquetes_sucursal ps
-        ON ps.id_paquete = p.id_paquete
-      WHERE UPPER(TRIM(p.nombre_paquete)) = UPPER(TRIM($1))
+      WHERE lower(regexp_replace(trim(p.nombre_paquete), '[^[:alnum:]]+', '', 'g')) =
+            lower(regexp_replace(trim($1), '[^[:alnum:]]+', '', 'g'))
         AND p.deleted_at IS NULL
-        AND ps.id_sucursal = $2::uuid
-        AND ($3::uuid IS NULL OR p.id_paquete <> $3::uuid)
+        AND ($2::uuid IS NULL OR p.id_paquete <> $2::uuid)
       LIMIT 1
     `,
-    [nombrePaquete, branchId, packageId ?? null]
+    [nombrePaquete, packageId ?? null]
   );
 
   if (rows[0]) {
-    throw new AppError(409, "Ya existe un paquete con ese nombre en la sucursal", {
+    throw new AppError(409, PACKAGE_DUPLICATE_MESSAGE, {
       code: "CATALOG_PACKAGE_DUPLICATE",
     });
   }
@@ -1031,6 +1309,134 @@ function normalizePackageItems(items) {
       cantidad,
     };
   });
+}
+
+async function normalizeInitialPackageOffers(client, claims, body = {}) {
+  const hasExplicitOffers = Array.isArray(body.ofertas);
+  const source = hasExplicitOffers
+    ? body.ofertas
+    : [{
+      id_sucursal: body.id_sucursal,
+      precio_hnl: body.precio_hnl,
+      visible_publico: body.visible_publico,
+      orden_visual: body.orden_visual,
+    }];
+
+  if (source.length === 0) {
+    throw new AppError(400, "Debe seleccionar al menos una sucursal para crear el paquete.", {
+      code: "CATALOG_PACKAGE_OFFER_REQUIRED",
+    });
+  }
+
+  const seen = new Set();
+  const offers = [];
+
+  for (const offer of source) {
+    const rawBranchId = String(offer?.id_sucursal || "").trim();
+    if (hasExplicitOffers && !rawBranchId) {
+      throw new AppError(400, "Cada oferta requiere id_sucursal", {
+        code: "CATALOG_PACKAGE_BRANCH_REQUIRED",
+      });
+    }
+
+    const branchId = await resolveBranchId(client, claims, rawBranchId || null);
+    if (seen.has(branchId)) {
+      throw new AppError(400, "No se permite repetir la misma sucursal en las ofertas del paquete.", {
+        code: "CATALOG_PACKAGE_BRANCH_DUPLICATE",
+      });
+    }
+    seen.add(branchId);
+
+    const precioHnl = Number(offer?.precio_hnl);
+    if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
+      throw new AppError(400, "El precio del paquete debe ser mayor a 0", {
+        code: "CATALOG_PACKAGE_PRICE_INVALID",
+      });
+    }
+
+    offers.push({
+      idSucursal: branchId,
+      precioHnl,
+      visiblePublico: normalizeBoolean(offer?.visible_publico, true),
+      ordenVisual: normalizeOrderVisual(offer?.orden_visual, 100),
+    });
+  }
+
+  return offers;
+}
+
+function normalizeServiceBranchTariffs(body = {}) {
+  const source = Array.isArray(body.sucursales)
+    ? body.sucursales
+    : body.id_sucursal
+      ? [{
+        id_sucursal: body.id_sucursal,
+        precio_hnl: body.precio_hnl,
+        duracion_min: body.duracion_min,
+        buffer_min: body.buffer_min,
+        activo: true,
+        servicio_informativo: body.servicio_informativo,
+      }]
+      : [];
+
+  if (source.length === 0) {
+    throw new AppError(400, "Selecciona al menos una sucursal para ofrecer el servicio", {
+      code: "CATALOG_SERVICE_BRANCH_REQUIRED",
+    });
+  }
+
+  const seen = new Set();
+  return source.map((item) => {
+    const branchId = String(item?.id_sucursal || "").trim();
+    if (!branchId) {
+      throw new AppError(400, "Cada sucursal del servicio requiere id_sucursal", {
+        code: "CATALOG_SERVICE_BRANCH_INVALID",
+      });
+    }
+
+    if (seen.has(branchId)) {
+      throw new AppError(400, "No se permite repetir la misma sucursal en el servicio", {
+        code: "CATALOG_SERVICE_BRANCH_DUPLICATE",
+      });
+    }
+    seen.add(branchId);
+
+    const activo = normalizeBoolean(item?.activo, true);
+    const precioHnl = Number(item?.precio_hnl);
+    const duracionMin = Number(item?.duracion_min);
+    const bufferMin = item?.buffer_min === undefined || item?.buffer_min === null
+      ? LEGACY_SERVICE_BUFFER_FALLBACK
+      : Number(item.buffer_min);
+
+    if (activo && (!Number.isFinite(precioHnl) || precioHnl < 0)) {
+      throw new AppError(400, "El precio de cada sucursal debe ser mayor o igual a 0", {
+        code: "CATALOG_SERVICE_TARIFF_PRICE_INVALID",
+      });
+    }
+
+    if (activo && (!Number.isFinite(duracionMin) || duracionMin <= 0)) {
+      throw new AppError(400, "La duracion de cada sucursal debe ser mayor a 0", {
+        code: "CATALOG_SERVICE_TARIFF_DURATION_INVALID",
+      });
+    }
+
+    return {
+      id_sucursal: branchId,
+      precio_hnl: precioHnl,
+      duracion_min: Math.max(1, Math.floor(duracionMin || 1)),
+      buffer_min: Math.max(0, Math.floor(bufferMin || 0)),
+      activo,
+      servicio_informativo: normalizeBoolean(item?.servicio_informativo, false),
+    };
+  });
+}
+
+async function ensureServiceBranchesAccessible(client, claims, branchTariffs) {
+  // AM: Valida sucursales seleccionadas y alcance del admin antes de crear tarifas.
+  const branchIds = [...new Set(branchTariffs.map((item) => item.id_sucursal))];
+  for (const branchId of branchIds) {
+    await resolveBranchId(client, claims, branchId);
+  }
 }
 
 async function ensurePackageItemsAccessible(client, claims, items, branchId = null) {
@@ -1079,7 +1485,7 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
   if (rows.some((row) => !row.has_scoped_tariff)) {
     if (branchId) {
       // AM: Regla multi-sucursal: el paquete no puede depender de servicios no operativos en la sucursal objetivo.
-      throw new AppError(409, "Uno o mas servicios no estan disponibles en la sucursal indicada", {
+      throw new AppError(409, "Uno o más servicios del paquete no están disponibles en la sucursal seleccionada.", {
         code: "CATALOG_PACKAGE_SERVICE_OUT_OF_SCOPE",
       });
     }
@@ -1095,24 +1501,28 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
 async function ensureUniqueServiceNameByBranch(client, serviceId, branchId, nombreServicio) {
   const { rows } = await client.query(
     `
-      SELECT s.id_servicio
+      SELECT
+        s.id_servicio,
+        s.nombre_servicio
       FROM public.servicios s
-      JOIN public.servicios_tarifas st
-        ON st.id_servicio = s.id_servicio
-       AND st.id_sucursal = $2::uuid
-       AND st.id_empleado IS NULL
-       AND st.deleted_at IS NULL
-      WHERE UPPER(TRIM(s.nombre_servicio)) = UPPER(TRIM($1))
+      WHERE lower(regexp_replace(trim(s.nombre_servicio), '[^[:alnum:]]+', '', 'g')) =
+            lower(regexp_replace(trim($1), '[^[:alnum:]]+', '', 'g'))
         AND s.deleted_at IS NULL
-        AND ($3::uuid IS NULL OR s.id_servicio <> $3::uuid)
+        AND ($2::uuid IS NULL OR s.id_servicio <> $2::uuid)
       LIMIT 1
     `,
-    [nombreServicio, branchId, serviceId ?? null]
+    [nombreServicio, serviceId ?? null]
   );
 
   if (rows[0]) {
-    throw new AppError(409, "Ya existe un servicio con ese nombre en la sucursal", {
-      code: "CATALOG_SERVICE_DUPLICATE",
+    // AM: Replica la normalizacion del indice unico global de servicios vivos antes de escribir.
+    throw new AppError(409, "Ya existe un servicio con ese nombre.", {
+      code: "SERVICE_NAME_DUPLICATE",
+      details: {
+        nombre_servicio: nombreServicio,
+        nombre_existente: rows[0].nombre_servicio,
+        id_servicio_existente: rows[0].id_servicio,
+      },
     });
   }
 }
@@ -1673,6 +2083,27 @@ function mapPostgresCatalogError(error) {
   const message = rawMessage.toLowerCase();
   const constraint = String(error?.constraint || "").toLowerCase();
 
+  if (pgCode === "23505" && constraint === "uq_servicios_nombre_normalizado_vivo") {
+    // AM: Fallback defensivo si la carrera llega al indice unico antes que la validacion previa.
+    return new AppError(409, "Ya existe un servicio con ese nombre.", {
+      code: "SERVICE_NAME_DUPLICATE",
+    });
+  }
+
+  if (pgCode === "23505" && constraint === "uq_servicios_tarifas_base_actual_vivo") {
+    // AM: Fallback defensivo para carreras al guardar tarifa base actual por sucursal.
+    return new AppError(409, "Ya existe una tarifa activa para este servicio en esa sucursal.", {
+      code: "SERVICE_TARIFF_DUPLICATE",
+    });
+  }
+
+  if (pgCode === "23505" && constraint === "uq_paquetes_nombre_normalizado_vivo") {
+    // AM: Fallback defensivo si el indice unico global gana la carrera al crear/editar paquete.
+    return new AppError(409, PACKAGE_DUPLICATE_MESSAGE, {
+      code: "CATALOG_PACKAGE_DUPLICATE",
+    });
+  }
+
   const looksLikeBusinessDbError = ["23502", "23514", "23503", "23P01", "P0001"].includes(pgCode);
   if (!looksLikeBusinessDbError) return null;
 
@@ -1769,6 +2200,205 @@ async function activateServiceByBranch(client, idServicio, idSucursal, precioHnl
   );
 }
 
+async function upsertCurrentBaseServiceTariff(client, idServicio, idSucursal, payload = {}, options = {}) {
+  await lockServiceTariffScope(client, idServicio, idSucursal);
+
+  const currentResult = await client.query(GET_LATEST_ANY_SERVICE_TARIFF_SQL, [idServicio, idSucursal]);
+  const currentTariff = currentResult.rows[0] ?? null;
+  if (
+    options.failIfActive &&
+    currentTariff?.id_tarifa &&
+    currentTariff.deleted_at === null &&
+    currentTariff.activo === true &&
+    currentTariff.vigente_hasta === null
+  ) {
+    throw new AppError(409, "Ya existe una tarifa activa para este servicio en esa sucursal.", {
+      code: "SERVICE_TARIFF_DUPLICATE",
+    });
+  }
+  const nextActivo = payload.activo === undefined ? normalizeBoolean(currentTariff?.activo, true) : Boolean(payload.activo);
+  const precioHnl =
+    payload.precio_hnl === undefined
+      ? currentTariff?.precio_hnl == null
+        ? null
+        : Number(currentTariff.precio_hnl)
+      : Number(payload.precio_hnl);
+  const duracionMin =
+    payload.duracion_min === undefined
+      ? currentTariff?.duracion_min == null
+        ? null
+        : Number(currentTariff.duracion_min)
+      : Number(payload.duracion_min);
+  const bufferMin =
+    payload.buffer_min === undefined
+      ? currentTariff?.buffer_min == null
+        ? LEGACY_SERVICE_BUFFER_FALLBACK
+        : Number(currentTariff.buffer_min)
+      : Number(payload.buffer_min);
+  const servicioInformativo =
+    payload.servicio_informativo === undefined
+      ? normalizeBoolean(currentTariff?.servicio_informativo, false)
+      : Boolean(payload.servicio_informativo);
+
+  if (nextActivo && (!Number.isFinite(precioHnl) || precioHnl < 0)) {
+    throw new AppError(400, "El precio de la tarifa debe ser mayor o igual a 0", {
+      code: "CATALOG_SERVICE_TARIFF_PRICE_INVALID",
+    });
+  }
+
+  if (nextActivo && (!Number.isFinite(duracionMin) || duracionMin <= 0)) {
+    throw new AppError(400, "La duracion de la tarifa debe ser mayor a 0", {
+      code: "CATALOG_SERVICE_TARIFF_DURATION_INVALID",
+    });
+  }
+
+  if (currentTariff?.id_tarifa) {
+    await client.query(
+      `
+        UPDATE public.servicios_tarifas
+        SET
+          precio_hnl = $2::numeric,
+          duracion_min = $3::int,
+          buffer_min = $4::int,
+          activo = $5::boolean,
+          servicio_informativo = $6::boolean,
+          vigente_hasta = NULL,
+          deleted_at = NULL,
+          updated_at = NOW()
+        WHERE id_tarifa = $1::uuid
+      `,
+      [
+        currentTariff.id_tarifa,
+        precioHnl,
+        Math.max(1, Math.floor(duracionMin || 1)),
+        Math.max(0, Math.floor(bufferMin || 0)),
+        nextActivo,
+        servicioInformativo,
+      ]
+    );
+    return currentTariff.id_tarifa;
+  }
+
+  const insertResult = await client.query(
+    `
+      INSERT INTO public.servicios_tarifas (
+        id_servicio,
+        id_sucursal,
+        id_empleado,
+        precio_hnl,
+        duracion_min,
+        buffer_min,
+        activo,
+        servicio_informativo,
+        vigente_desde,
+        vigente_hasta
+      )
+      VALUES ($1::uuid, $2::uuid, NULL, $3::numeric, $4::int, $5::int, $6::boolean, $7::boolean, CURRENT_DATE, NULL)
+      RETURNING id_tarifa
+    `,
+    [
+      idServicio,
+      idSucursal,
+      precioHnl,
+      Math.max(1, Math.floor(duracionMin || 1)),
+      Math.max(0, Math.floor(bufferMin || 0)),
+      nextActivo,
+      servicioInformativo,
+    ]
+  );
+  return insertResult.rows[0]?.id_tarifa ?? null;
+}
+
+async function deactivateServiceTariffByBranch(client, idServicio, idSucursal) {
+  await lockServiceTariffScope(client, idServicio, idSucursal);
+
+  const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [idServicio]);
+  const service = serviceResult.rows[0] ?? null;
+  if (!service || service.deleted_at) {
+    throw new AppError(404, "El servicio solicitado no existe", {
+      code: "CATALOG_SERVICE_NOT_FOUND",
+    });
+  }
+
+  const futureAppointmentsResult = await client.query(SERVICE_BRANCH_ACTIVE_FUTURE_APPOINTMENTS_COUNT_SQL, [idServicio, idSucursal]);
+  const totalFutureAppointments = Number(futureAppointmentsResult.rows[0]?.total_citas_futuras ?? 0);
+  if (totalFutureAppointments > 0) {
+    throw new AppError(409, "No se puede quitar este servicio de la sucursal porque tiene citas futuras activas asociadas.", {
+      code: "SERVICE_BRANCH_REMOVE_BLOCKED",
+      details: { total_citas_futuras: totalFutureAppointments },
+    });
+  }
+
+  const remainingResult = await client.query(ACTIVE_SERVICE_BRANCH_TARIFFS_COUNT_SQL, [idServicio, idSucursal]);
+  const remainingActiveBranches = Number(remainingResult.rows[0]?.total ?? 0);
+  const requiresActiveBranch =
+    normalizeBoolean(service.activo, true) &&
+    normalizeBoolean(service.visible_publico, true) &&
+    normalizeBoolean(service.agendable, true);
+  if (requiresActiveBranch && remainingActiveBranches < 1) {
+    throw new AppError(409, "El servicio debe tener al menos una sucursal activa mientras siga activo y visible.", {
+      code: "SERVICE_REQUIRES_ACTIVE_BRANCH",
+    });
+  }
+
+  const updateResult = await client.query(
+    `
+      UPDATE public.servicios_tarifas
+      SET
+        activo = FALSE,
+        vigente_hasta = COALESCE(vigente_hasta, CURRENT_DATE),
+        updated_at = NOW()
+      WHERE id_servicio = $1::uuid
+        AND id_sucursal = $2::uuid
+        AND id_empleado IS NULL
+        AND deleted_at IS NULL
+        AND activo IS TRUE
+        AND vigente_hasta IS NULL
+    `,
+    [idServicio, idSucursal]
+  );
+
+  if (!updateResult.rowCount) {
+    throw new AppError(404, "No existe una tarifa activa para este servicio en esa sucursal.", {
+      code: "CATALOG_SERVICE_TARIFF_NOT_FOUND",
+    });
+  }
+}
+
+async function deactivateServiceGlobally(client, idServicio) {
+  const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [idServicio]);
+  const service = serviceResult.rows[0] ?? null;
+  if (!service || service.deleted_at) {
+    throw new AppError(404, "El servicio solicitado no existe", {
+      code: "CATALOG_SERVICE_NOT_FOUND",
+    });
+  }
+
+  const futureAppointmentsResult = await client.query(SERVICE_GLOBAL_ACTIVE_FUTURE_APPOINTMENTS_COUNT_SQL, [idServicio]);
+  const totalFutureAppointments = Number(futureAppointmentsResult.rows[0]?.total_citas_futuras ?? 0);
+  if (totalFutureAppointments > 0) {
+    throw new AppError(409, "No se puede desactivar globalmente este servicio porque tiene citas futuras activas asociadas.", {
+      code: "SERVICE_GLOBAL_DEACTIVATE_BLOCKED",
+      details: { total_citas_futuras: totalFutureAppointments },
+    });
+  }
+
+  // AM: Desactivacion global conserva tarifas e historial; solo apaga el maestro.
+  await client.query(
+    `
+      UPDATE public.servicios
+      SET
+        activo = FALSE,
+        agendable = FALSE,
+        visible_publico = FALSE,
+        updated_at = NOW()
+      WHERE id_servicio = $1::uuid
+        AND deleted_at IS NULL
+    `,
+    [idServicio]
+  );
+}
+
 async function replacePackageItems(client, idPaquete, items) {
   await client.query("DELETE FROM public.paquetes_detalles WHERE id_paquete = $1::uuid", [idPaquete]);
 
@@ -1781,6 +2411,25 @@ async function replacePackageItems(client, idPaquete, items) {
       [idPaquete, item.id_servicio, item.cantidad]
     );
   }
+}
+
+async function getCurrentPackageItems(client, idPaquete) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        pd.id_servicio,
+        pd.cantidad
+      FROM public.paquetes_detalles pd
+      WHERE pd.id_paquete = $1::uuid
+      ORDER BY pd.id_servicio ASC
+    `,
+    [idPaquete]
+  );
+
+  return rows.map((row) => ({
+    id_servicio: row.id_servicio,
+    cantidad: Number(row.cantidad || 1),
+  }));
 }
 
 async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload = {}) {
@@ -1837,71 +2486,6 @@ async function upsertPackageBranchOffer(client, idPaquete, idSucursal, payload =
     `,
     [idPaquete, idSucursal, precioHnl, activo, visiblePublico, ordenVisual]
   );
-}
-
-async function hasPackageOffersInOtherBranches(client, idPaquete, branchId) {
-  const { rows } = await client.query(
-    `
-      SELECT 1
-      FROM public.paquetes_sucursal ps
-      WHERE ps.id_paquete = $1::uuid
-        AND ps.id_sucursal <> $2::uuid
-      LIMIT 1
-    `,
-    [idPaquete, branchId]
-  );
-  return rows.length > 0;
-}
-
-async function clonePackageForBranch(client, sourcePackage, branchId) {
-  const sourcePrice =
-    sourcePackage?.precio_hnl === undefined || sourcePackage?.precio_hnl === null
-      ? 0
-      : Number(sourcePackage.precio_hnl);
-  const sourceItems = Array.isArray(sourcePackage?.items)
-    ? sourcePackage.items.map((item) => ({
-      id_servicio: item.id_servicio,
-      cantidad: Number(item.cantidad ?? 1),
-    }))
-    : [];
-
-  const clonedPackageResult = await client.query(
-    `
-      INSERT INTO public.paquetes (
-        nombre_paquete,
-        descripcion,
-        precio_hnl,
-        activo
-      )
-      VALUES ($1, $2, $3::numeric, TRUE)
-      RETURNING id_paquete
-    `,
-    [sourcePackage.nombre_paquete, sourcePackage.descripcion ?? null, sourcePrice]
-  );
-  const clonedPackageId = clonedPackageResult.rows[0].id_paquete;
-
-  if (sourceItems.length > 0) {
-    await replacePackageItems(client, clonedPackageId, sourceItems);
-  }
-
-  // AM: Reasigna la oferta de la sucursal al clon para evitar contaminar otras sucursales.
-  const reassignedOffer = await client.query(
-    `
-      UPDATE public.paquetes_sucursal
-      SET
-        id_paquete = $1::uuid,
-        updated_at = NOW()
-      WHERE id_paquete = $2::uuid
-        AND id_sucursal = $3::uuid
-    `,
-    [clonedPackageId, sourcePackage.id_paquete, branchId]
-  );
-
-  if (!reassignedOffer.rowCount) {
-    await upsertPackageBranchOffer(client, clonedPackageId, branchId, {});
-  }
-
-  return clonedPackageId;
 }
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
@@ -1987,6 +2571,62 @@ export default async function adminCatalogRoutes(app) {
     }
   );
 
+  app.get(
+    "/servicios/agrupados",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        querystring: queryBranchSchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_sucursal: { type: ["string", "null"], format: "uuid" },
+                  servicios: { type: "array", items: groupedServiceResponseSchema },
+                },
+                required: ["id_sucursal", "servicios"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const { rows } = await client.query(LIST_GROUPED_SERVICES_SQL, [branchId]);
+        return sendOk(reply, {
+          id_sucursal: branchId,
+          servicios: rows.map(mapGroupedServiceRow),
+        });
+      } catch (error) {
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo consultar el catalogo administrativo agrupado de servicios",
+          "ADMIN_CATALOG_GROUPED_SERVICES_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
   app.post(
     "/servicios",
     {
@@ -1998,7 +2638,7 @@ export default async function adminCatalogRoutes(app) {
             type: "object",
             properties: {
               ok: { type: "boolean" },
-              data: serviceResponseSchema,
+              data: groupedServiceResponseSchema,
               requestId: requestIdSchema,
             },
             required: ["ok", "data"],
@@ -2016,66 +2656,65 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const nombreServicio = normalizeRequiredText(request.body.nombre_servicio);
         const descripcion = normalizeOptionalText(request.body.descripcion);
-        const duracionMin = Number(request.body.duracion_min);
-        // AM: buffer queda deprecado en modulo Servicios; se conserva fallback para agenda legacy.
-        const bufferMin = LEGACY_SERVICE_BUFFER_FALLBACK;
-        const precioHnl = Number(request.body.precio_hnl);
+        const branchTariffs = normalizeServiceBranchTariffs(request.body);
+        await ensureServiceBranchesAccessible(client, request.claims, branchTariffs);
+        const firstActiveTariff = branchTariffs.find((tariff) => tariff.activo) ?? branchTariffs[0];
         const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
         const grupoCatalogo = normalizeServiceGroup(request.body.grupo_catalogo, "barberia");
         const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
-        const servicioInformativo = normalizeBoolean(request.body.servicio_informativo, false);
-        const agendable = !servicioInformativo;
+        const activo = normalizeBoolean(request.body.activo, true);
+        const agendable = normalizeBoolean(request.body.agendable, true);
+
+        if (activo && visiblePublico && agendable && !branchTariffs.some((tariff) => tariff.activo)) {
+          throw new AppError(409, "El servicio debe tener al menos una sucursal activa mientras siga activo y visible.", {
+            code: "SERVICE_REQUIRES_ACTIVE_BRANCH",
+          });
+        }
 
         await client.query("BEGIN");
 
-        await ensureUniqueServiceNameByBranch(client, null, branchId, nombreServicio);
+        await ensureUniqueServiceNameByBranch(client, null, null, nombreServicio);
 
-        let idServicio = null;
-        try {
-          const insertResult = await client.query(
-            `
-              INSERT INTO public.servicios (
-                nombre_servicio,
-                descripcion,
-                duracion_min,
-                grupo_catalogo,
-                orden_visual,
-                visible_publico,
-                agendable,
-                activo
-              )
-              VALUES ($1, $2, $3::int, $4, $5::int, $6::boolean, $7::boolean, TRUE)
-              RETURNING id_servicio
-            `,
-            [nombreServicio, descripcion ?? null, duracionMin, grupoCatalogo, ordenVisual, visiblePublico, agendable]
-          );
-          idServicio = insertResult.rows[0].id_servicio;
-        } catch (insertError) {
-          if (insertError?.code === "23505") {
-            throw new AppError(409, "Existe una restriccion de BD que impide repetir nombre de servicio globalmente", {
-              code: "CATALOG_SERVICE_DUPLICATE_GLOBAL_CONSTRAINT",
-              details: {
-                constraint: insertError?.constraint ?? null,
-                message: insertError?.message ?? null,
-              },
-            });
-          }
-          throw insertError;
+        const insertResult = await client.query(
+          `
+            INSERT INTO public.servicios (
+              nombre_servicio,
+              descripcion,
+              duracion_min,
+              grupo_catalogo,
+              orden_visual,
+              visible_publico,
+              agendable,
+              activo
+            )
+            VALUES ($1, $2, $3::int, $4, $5::int, $6::boolean, $7::boolean, $8::boolean)
+            RETURNING id_servicio
+          `,
+          [
+            nombreServicio,
+            descripcion ?? null,
+            firstActiveTariff.duracion_min,
+            grupoCatalogo,
+            ordenVisual,
+            visiblePublico,
+            agendable,
+            activo,
+          ]
+        );
+        const idServicio = insertResult.rows[0].id_servicio;
+
+        for (const tariff of branchTariffs) {
+          // AM: Crea una tarifa base actual por cada sucursal seleccionada para el servicio maestro.
+          await upsertCurrentBaseServiceTariff(client, idServicio, tariff.id_sucursal, tariff);
         }
 
-        await upsertServiceTariff(client, idServicio, branchId, precioHnl, {
-          duracionMin,
-          bufferMin,
-          servicioInformativo,
-        });
-
-        const finalResult = await client.query(GET_SERVICE_SQL, [idServicio, branchId]);
+        const finalResult = await client.query(LIST_GROUPED_SERVICES_SQL, [null]);
+        const finalService = finalResult.rows.find((row) => row.id_servicio === idServicio);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapAdminServiceRow(finalResult.rows[0]), {
+        return sendOk(reply, mapGroupedServiceRow(finalService), {
           statusCode: 201,
           requestId: request.id,
         });
@@ -2160,20 +2799,27 @@ export default async function adminCatalogRoutes(app) {
           request.body.visible_publico !== undefined
             ? normalizeBoolean(request.body.visible_publico, true)
             : undefined;
+        const requestedAgendable =
+          request.body.agendable !== undefined
+            ? normalizeBoolean(request.body.agendable, true)
+            : undefined;
         const currentNombreServicio = normalizeRequiredText(current.nombre_servicio);
         const currentDescripcion = normalizeOptionalText(current.descripcion);
         const currentOrdenVisual = normalizeOrderVisual(current.orden_visual, 100);
         const currentGrupoCatalogo = normalizeServiceGroup(current.grupo_catalogo, "barberia");
         const currentVisiblePublico = normalizeBoolean(current.visible_publico, true);
+        const currentAgendable = normalizeBoolean(current.agendable, true);
         const shouldMutateServiceBase =
           (requestedNombreServicio !== undefined && requestedNombreServicio !== currentNombreServicio) ||
           (requestedDescripcion !== undefined && requestedDescripcion !== currentDescripcion) ||
           (requestedOrdenVisual !== undefined && requestedOrdenVisual !== currentOrdenVisual) ||
           (requestedGrupoCatalogo !== undefined && requestedGrupoCatalogo !== currentGrupoCatalogo) ||
-          (requestedVisiblePublico !== undefined && requestedVisiblePublico !== currentVisiblePublico);
+          (requestedVisiblePublico !== undefined && requestedVisiblePublico !== currentVisiblePublico) ||
+          (requestedAgendable !== undefined && requestedAgendable !== currentAgendable);
         let targetServiceId = request.params.id;
 
-        if (shouldMutateServiceBase) {
+        if (shouldMutateServiceBase && requestedNombreServicio !== undefined) {
+          await ensureUniqueServiceNameByBranch(client, request.params.id, branchId, requestedNombreServicio);
           const serviceSharedAcrossBranches = await hasServiceTariffsInOtherBranches(client, request.params.id, branchId);
           if (serviceSharedAcrossBranches) {
             const sourceBaseResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id]);
@@ -2183,7 +2829,15 @@ export default async function adminCatalogRoutes(app) {
                 code: "CATALOG_SERVICE_NOT_FOUND",
               });
             }
-            targetServiceId = await cloneServiceForBranch(client, sourceBase, branchId);
+            // AM: El clon nace con el nombre final para respetar el indice unico normalizado global.
+            targetServiceId = await cloneServiceForBranch(
+              client,
+              {
+                ...sourceBase,
+                nombre_servicio: requestedNombreServicio,
+              },
+              branchId
+            );
           }
         }
 
@@ -2212,6 +2866,10 @@ export default async function adminCatalogRoutes(app) {
           requestedVisiblePublico !== undefined
             ? requestedVisiblePublico
             : normalizeBoolean(targetBase.visible_publico, true);
+        const baseAgendable =
+          requestedAgendable !== undefined
+            ? requestedAgendable
+            : normalizeBoolean(targetBase.agendable, true);
         await ensureUniqueServiceNameByBranch(client, targetServiceId, branchId, nombreServicio);
 
         const duracionMin =
@@ -2228,7 +2886,7 @@ export default async function adminCatalogRoutes(app) {
           request.body.servicio_informativo !== undefined
             ? normalizeBoolean(request.body.servicio_informativo, false)
             : normalizeBoolean(current.servicio_informativo, false);
-        const agendable = !servicioInformativo;
+        const agendable = request.body.servicio_informativo !== undefined ? !servicioInformativo : baseAgendable;
 
         if (shouldMutateServiceBase) {
           await client.query(
@@ -2294,6 +2952,325 @@ export default async function adminCatalogRoutes(app) {
           error,
           "No se pudo actualizar el servicio del catalogo",
           "ADMIN_CATALOG_SERVICE_UPDATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.patch(
+    "/servicios/:id_servicio/tarifas/:id_sucursal",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id_servicio: { type: "string", format: "uuid" },
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          required: ["id_servicio", "id_sucursal"],
+          additionalProperties: false,
+        },
+        body: serviceTariffPatchSchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: groupedServiceTariffSchema,
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        const branchId = await resolveBranchId(client, request.claims, request.params.id_sucursal);
+        await client.query("BEGIN");
+
+        const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id_servicio]);
+        if (!serviceResult.rows[0] || serviceResult.rows[0].deleted_at) {
+          throw new AppError(404, "El servicio solicitado no existe", {
+            code: "CATALOG_SERVICE_NOT_FOUND",
+          });
+        }
+
+        // AM: La tarifa se administra por sucursal sin cambiar el servicio maestro.
+        await upsertCurrentBaseServiceTariff(client, request.params.id_servicio, branchId, request.body);
+
+        const groupedResult = await client.query(LIST_GROUPED_SERVICES_SQL, [branchId]);
+        const groupedService = groupedResult.rows.find((row) => row.id_servicio === request.params.id_servicio);
+        const mappedService = groupedService ? mapGroupedServiceRow(groupedService) : null;
+        const mappedTariff = mappedService?.tarifas?.find((tarifa) => tarifa.id_sucursal === branchId);
+
+        if (!mappedTariff) {
+          throw new AppError(404, "No se pudo obtener la tarifa actualizada para la sucursal indicada", {
+            code: "CATALOG_SERVICE_TARIFF_NOT_FOUND",
+          });
+        }
+
+        await client.query("COMMIT");
+        return sendOk(reply, mappedTariff, { requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => { });
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo actualizar la tarifa del servicio",
+          "ADMIN_CATALOG_SERVICE_TARIFF_UPDATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/servicios/:id_servicio/tarifas",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id_servicio: { type: "string", format: "uuid" },
+          },
+          required: ["id_servicio"],
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          properties: {
+            id_sucursal: { type: "string", format: "uuid" },
+            precio_hnl: { type: "number", minimum: 0 },
+            duracion_min: { type: "integer", minimum: 1 },
+            buffer_min: { type: "integer", minimum: 0 },
+            activo: { type: "boolean" },
+            servicio_informativo: { type: "boolean" },
+          },
+          required: ["id_sucursal", "precio_hnl", "duracion_min"],
+          additionalProperties: false,
+        },
+        response: {
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: groupedServiceTariffSchema,
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        const branchId = await resolveBranchId(client, request.claims, request.body.id_sucursal);
+        await client.query("BEGIN");
+
+        const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id_servicio]);
+        if (!serviceResult.rows[0] || serviceResult.rows[0].deleted_at) {
+          throw new AppError(404, "El servicio solicitado no existe", {
+            code: "CATALOG_SERVICE_NOT_FOUND",
+          });
+        }
+
+        // AM: Agrega una sucursal al servicio maestro sin duplicar el servicio.
+        await upsertCurrentBaseServiceTariff(
+          client,
+          request.params.id_servicio,
+          branchId,
+          request.body,
+          { failIfActive: true }
+        );
+
+        const groupedResult = await client.query(LIST_GROUPED_SERVICES_SQL, [branchId]);
+        const groupedService = groupedResult.rows.find((row) => row.id_servicio === request.params.id_servicio);
+        const mappedTariff = mapGroupedServiceRow(groupedService)?.tarifas?.find((tarifa) => tarifa.id_sucursal === branchId);
+
+        await client.query("COMMIT");
+        return sendOk(reply, mappedTariff, {
+          statusCode: 201,
+          requestId: request.id,
+        });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => { });
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo agregar la sucursal al servicio",
+          "ADMIN_CATALOG_SERVICE_TARIFF_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.patch(
+    "/servicios/:id_servicio/tarifas/:id_sucursal/desactivar",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id_servicio: { type: "string", format: "uuid" },
+            id_sucursal: { type: "string", format: "uuid" },
+          },
+          required: ["id_servicio", "id_sucursal"],
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_servicio: { type: "string", format: "uuid" },
+                  id_sucursal: { type: "string", format: "uuid" },
+                  inactivated: { type: "boolean" },
+                },
+                required: ["id_servicio", "id_sucursal", "inactivated"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        const branchId = await resolveBranchId(client, request.claims, request.params.id_sucursal);
+        await client.query("BEGIN");
+
+        // AM: Quitar de sucursal es cierre de tarifa vigente, nunca borrado duro.
+        await deactivateServiceTariffByBranch(client, request.params.id_servicio, branchId);
+
+        await client.query("COMMIT");
+        return sendOk(reply, {
+          id_servicio: request.params.id_servicio,
+          id_sucursal: branchId,
+          inactivated: true,
+        }, { requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => { });
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo quitar el servicio de la sucursal",
+          "ADMIN_CATALOG_SERVICE_TARIFF_DEACTIVATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.patch(
+    "/servicios/:id/desactivar-global",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        params: {
+          type: "object",
+          properties: {
+            id: { type: "string", format: "uuid" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  id_servicio: { type: "string", format: "uuid" },
+                  activo: { type: "boolean" },
+                  visible_publico: { type: "boolean" },
+                  agendable: { type: "boolean" },
+                },
+                required: ["id_servicio", "activo", "visible_publico", "agendable"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          400: errorResponseSchema,
+          401: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          500: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const client = await app.db.connect();
+
+      try {
+        await client.query("BEGIN");
+        await deactivateServiceGlobally(client, request.params.id);
+        await client.query("COMMIT");
+
+        return sendOk(reply, {
+          id_servicio: request.params.id,
+          activo: false,
+          visible_publico: false,
+          agendable: false,
+        }, { requestId: request.id });
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => { });
+        return sendHandledError(
+          reply,
+          request,
+          error,
+          "No se pudo desactivar globalmente el servicio",
+          "ADMIN_CATALOG_SERVICE_GLOBAL_DEACTIVATE_ERROR"
         );
       } finally {
         client.release();
@@ -2785,21 +3762,16 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const nombrePaquete = normalizeRequiredText(request.body.nombre_paquete);
         const descripcion = normalizeOptionalText(request.body.descripcion);
-        const precioHnl = Number(request.body.precio_hnl);
-        if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
-          throw new AppError(400, "El precio del paquete debe ser mayor a 0", {
-            code: "CATALOG_PACKAGE_PRICE_INVALID",
-          });
-        }
-        const ordenVisual = normalizeOrderVisual(request.body.orden_visual, 100);
-        const visiblePublico = normalizeBoolean(request.body.visible_publico, true);
         const items = normalizePackageItems(request.body.items);
+        const offers = await normalizeInitialPackageOffers(client, request.claims, request.body);
+        const firstOffer = offers[0];
 
-        await ensureUniquePackageNameByBranch(client, null, branchId, nombrePaquete);
-        await ensurePackageItemsAccessible(client, request.claims, items, branchId);
+        await ensureUniquePackageNameGlobal(client, null, nombrePaquete);
+        for (const offer of offers) {
+          await ensurePackageItemsAccessible(client, request.claims, items, offer.idSucursal);
+        }
 
         await client.query("BEGIN");
 
@@ -2814,20 +3786,22 @@ export default async function adminCatalogRoutes(app) {
             VALUES ($1, $2, $3::numeric, TRUE)
             RETURNING id_paquete
           `,
-          [nombrePaquete, descripcion ?? null, precioHnl]
+          [nombrePaquete, descripcion ?? null, firstOffer.precioHnl]
         );
 
         const idPaquete = insertResult.rows[0].id_paquete;
         await replacePackageItems(client, idPaquete, items);
-        // AM: Crea oferta operativa del paquete en la sucursal seleccionada.
-        await upsertPackageBranchOffer(client, idPaquete, branchId, {
-          precioHnl,
-          activo: true,
-          visiblePublico,
-          ordenVisual,
-        });
+        for (const offer of offers) {
+          // AM: Crea ofertas operativas iniciales sin duplicar el paquete maestro.
+          await upsertPackageBranchOffer(client, idPaquete, offer.idSucursal, {
+            precioHnl: offer.precioHnl,
+            activo: true,
+            visiblePublico: offer.visiblePublico,
+            ordenVisual: offer.ordenVisual,
+          });
+        }
 
-        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [idPaquete, branchId]);
+        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [idPaquete, firstOffer.idSucursal]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapAdminPackageRow(finalResult.rows[0]), {
@@ -2905,14 +3879,6 @@ export default async function adminCatalogRoutes(app) {
           request.body.nombre_paquete !== undefined ||
           request.body.descripcion !== undefined ||
           request.body.items !== undefined;
-        let targetPackageId = request.params.id;
-
-        if (shouldMutatePackageBase) {
-          const packageSharedAcrossBranches = await hasPackageOffersInOtherBranches(client, request.params.id, branchId);
-          if (packageSharedAcrossBranches) {
-            targetPackageId = await clonePackageForBranch(client, basePackage, branchId);
-          }
-        }
 
         const nombrePaquete =
           request.body.nombre_paquete !== undefined
@@ -2944,10 +3910,11 @@ export default async function adminCatalogRoutes(app) {
         const nextActivo = normalizeBoolean(scopedPackage?.activo, true);
         const nextItems = request.body.items !== undefined ? normalizePackageItems(request.body.items) : null;
 
-        await ensureUniquePackageNameByBranch(client, targetPackageId, branchId, nombrePaquete);
+        await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
 
-        if (nextItems) {
-          await ensurePackageItemsAccessible(client, request.claims, nextItems, branchId);
+        const itemsForScopeValidation = nextItems ?? await getCurrentPackageItems(client, request.params.id);
+        if (itemsForScopeValidation.length > 0) {
+          await ensurePackageItemsAccessible(client, request.claims, itemsForScopeValidation, branchId);
         }
 
         if (shouldMutatePackageBase) {
@@ -2957,28 +3924,27 @@ export default async function adminCatalogRoutes(app) {
               SET
                 nombre_paquete = $2,
                 descripcion = $3,
-                activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_paquete = $1::uuid
             `,
-            [targetPackageId, nombrePaquete, descripcion ?? null]
+            [request.params.id, nombrePaquete, descripcion ?? null]
           );
         }
 
         if (nextItems) {
-          await replacePackageItems(client, targetPackageId, nextItems);
+          await replacePackageItems(client, request.params.id, nextItems);
         }
 
         // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
-        await upsertPackageBranchOffer(client, targetPackageId, branchId, {
+        await upsertPackageBranchOffer(client, request.params.id, branchId, {
           precioHnl,
           activo: nextActivo,
           visiblePublico,
           ordenVisual,
         });
 
-        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [targetPackageId, branchId]);
+        const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [request.params.id, branchId]);
         await client.query("COMMIT");
 
         return sendOk(reply, mapAdminPackageRow(finalResult.rows[0]), { requestId: request.id });

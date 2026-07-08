@@ -7,7 +7,8 @@
     "start": "node app.js",
     "dev": "node --watch app.js",
     "lint": "eslint .",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test",
+    "db:preflight": "node scripts/db-preflight.js"
   },
   "author": "",
   "license": "ISC",
