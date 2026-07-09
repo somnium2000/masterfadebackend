@@ -2832,26 +2832,20 @@ export default async function adminCitasRoutes(app) {
               code: "ADMIN_CITAS_BRANCH_EXCEPTION_BLOCK_RANGE_INVALID",
             });
           }
-          const [startHour, startMinute] = horaInicio.split(":").map(Number);
-          const [endHour, endMinute] = horaFin.split(":").map(Number);
           await dbClient.query(
             `
               INSERT INTO public.agenda_excepciones_sucursal_bloques (
                 id_excepcion_sucursal,
                 hora_inicio,
                 hora_fin,
-                minuto_inicio,
-                minuto_fin,
                 orden_visual
               )
-              VALUES ($1::uuid, $2::time, $3::time, $4::int, $5::int, $6::smallint)
+              VALUES ($1::uuid, $2::time, $3::time, $4::smallint)
             `,
             [
               exceptionId,
               horaInicio,
               horaFin,
-              (startHour * 60) + startMinute,
-              (endHour * 60) + endMinute,
               Number(block?.orden_visual || blockOrder++),
             ]
           );

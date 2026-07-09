@@ -1991,27 +1991,19 @@ export async function getAvailableSlotsForBarber(
   const minSellableDurationMin = Number.isFinite(Number(options?.minSellableDurationMin))
     ? Math.max(0, Math.trunc(Number(options.minSellableDurationMin)))
     : await getMinSellableServiceMinutes(client);
-  const schedules = await getSchedulesForBarberOnDate(client, safeBarberId, safeDate);
-  if (!schedules.length) {
-    return includeDiscardReasons
-      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { schedule: "missing" } }] }
-      : [];
-  }
+  const barber = await getBarberById(client, safeBarberId);
+  const [schedules, branchExceptions] = await Promise.all([
+    getSchedulesForBarberOnDate(client, safeBarberId, safeDate),
+    getBranchExceptionsForDate(client, barber.id_sucursal, safeDate),
+  ]);
 
   const baseIntervals = buildBaseIntervalsFromSchedules(safeDate, schedules);
   const operationalDayBounds = resolveOperationalDayBoundsFromSchedules(safeDate, schedules);
-  if (!baseIntervals.length) {
-    return includeDiscardReasons
-      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { interval: "empty" } }] }
-      : [];
-  }
-
-  const barber = await getBarberById(client, safeBarberId);
-  const branchExceptions = await getBranchExceptionsForDate(client, barber.id_sucursal, safeDate);
   const branchAdjustedIntervals = applyBranchExceptionsToIntervals(safeDate, baseIntervals, branchExceptions);
   if (!branchAdjustedIntervals.length) {
+    const missingBaseReason = schedules.length ? "branch_exceptions" : "schedule_missing_or_closed";
     return includeDiscardReasons
-      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { branch_exceptions: true } }] }
+      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { reason: missingBaseReason } }] }
       : [];
   }
 
@@ -2456,7 +2448,9 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
       const schedules = schedulesByWeekday.get(weekday) || [];
 
       const baseIntervals = buildBaseIntervalsFromSchedules(dateKey, schedules);
-      if (!baseIntervals.length) {
+      const branchExceptions = await getBranchExceptionsForDate(client, barber.id_sucursal, dateKey);
+      const branchAdjustedIntervals = applyBranchExceptionsToIntervals(dateKey, baseIntervals, branchExceptions);
+      if (!branchAdjustedIntervals.length) {
         availability.push({
           fecha: dateKey,
           disponible: false,
@@ -2471,7 +2465,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
       const dayBusyIntervals = busyIntervals.filter(
         (entry) => entry.end.getTime() > dayStart.getTime() && entry.start.getTime() < dayEnd.getTime()
       );
-      const freeIntervals = subtractIntervals(baseIntervals, dayBusyIntervals);
+      const freeIntervals = subtractIntervals(branchAdjustedIntervals, dayBusyIntervals);
       const slotsResult = buildSlotsFromIntervals(
         freeIntervals,
         serviceTotalMinutes,
