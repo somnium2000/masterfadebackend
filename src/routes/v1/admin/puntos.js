@@ -5,6 +5,10 @@ import {
   getClientePointsSummary,
   searchActiveClientesForAdminPoints,
 } from "../../../services/pointsService.js";
+import {
+  getMasterPuntosRewardServicesConfig,
+  updateMasterPuntosRewardServicesConfig,
+} from "../../../services/masterPuntosService.js";
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
 const requestIdSchema = { type: "string" };
@@ -39,6 +43,23 @@ const buscarClientesQuerySchema = {
   additionalProperties: false,
 };
 
+const regaliasBodySchema = {
+  type: "object",
+  properties: {
+    sin_membresia: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", format: "uuid" },
+    },
+    con_membresia: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", format: "uuid" },
+    },
+  },
+  additionalProperties: false,
+};
+
 function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -56,6 +77,65 @@ function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
 }
 
 export default async function adminPointsRoutes(app) {
+  app.get(
+    "/regalias",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await getMasterPuntosRewardServicesConfig(app);
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo cargar la configuracion de regalias", "ADMIN_POINTS_REWARDS_CONFIG_ERROR");
+      }
+    }
+  );
+
+  app.patch(
+    "/regalias",
+    {
+      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      schema: {
+        body: regaliasBodySchema,
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const data = await updateMasterPuntosRewardServicesConfig(app, request.body || {});
+        return sendOk(reply, data, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo guardar la configuracion de regalias", "ADMIN_POINTS_REWARDS_SAVE_ERROR");
+      }
+    }
+  );
+
   app.get(
     "/clientes/buscar",
     {

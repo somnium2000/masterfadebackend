@@ -13,6 +13,9 @@ const DEFAULT_RULE = {
   activo: true,
   servicios_redimibles: [],
 };
+const REWARD_CONDITION_NO_MEMBERSHIP = "sin_membresia";
+const REWARD_CONDITION_WITH_MEMBERSHIP = "con_membresia";
+const REWARD_CONDITIONS = [REWARD_CONDITION_NO_MEMBERSHIP, REWARD_CONDITION_WITH_MEMBERSHIP];
 let legacyMigrationSchemaSupportCache = null;
 
 function normalizeText(value) {
@@ -92,6 +95,31 @@ function mapServiceRow(row) {
     id_servicio: row.id_servicio,
     nombre_servicio: row.nombre_servicio,
     grupo_catalogo: row.grupo_catalogo ?? null,
+  };
+}
+
+function mapRewardCatalogServiceRow(row) {
+  return {
+    id_servicio: row.id_servicio,
+    nombre_servicio: row.nombre_servicio,
+    grupo_catalogo: row.grupo_catalogo ?? null,
+    activo: Boolean(row.activo),
+    visible_publico: Boolean(row.visible_publico),
+    agendable: Boolean(row.agendable),
+    orden_visual: Number(row.orden_visual ?? 100),
+  };
+}
+
+function mapRewardRuleServiceRow(row) {
+  return {
+    id_rule_service: row.id_rule_service ?? null,
+    id_servicio: row.id_servicio,
+    nombre_servicio: row.nombre_servicio,
+    puntos_requeridos: Number(row.puntos_requeridos ?? row.puntos_canje ?? row.puntos_para_premio ?? 10),
+    puntos_canje: row.puntos_canje == null ? null : Number(row.puntos_canje),
+    habilitado: Boolean(row.habilitado),
+    visible_cliente: Boolean(row.visible_cliente),
+    orden_visual: Number(row.orden_visual ?? 100),
   };
 }
 
@@ -188,6 +216,131 @@ async function ensureServicesEligible(client, serviceIds, { idSucursal = null } 
   return rows.map(mapServiceRow);
 }
 
+async function getActiveGlobalPointsRule(client, { forUpdate = false } = {}) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        id_rule,
+        id_sucursal,
+        umbral_monto_hnl,
+        puntos_por_cita,
+        puntos_para_premio,
+        expiracion_meses,
+        activo,
+        updated_at
+      FROM public.points_rules
+      WHERE id_sucursal IS NULL
+        AND activo IS TRUE
+      ORDER BY updated_at DESC, created_at DESC, id_rule DESC
+      LIMIT 1
+      ${forUpdate ? "FOR UPDATE" : ""}
+    `
+  );
+  const rule = rows[0] ?? null;
+  if (!rule) {
+    throw new AppError(409, "No existe una regla global activa de MasterPuntos", {
+      code: "MASTERPUNTOS_GLOBAL_RULE_NOT_FOUND",
+    });
+  }
+  return rule;
+}
+
+async function listRewardEligibleServices(client) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_servicio,
+        s.nombre_servicio,
+        s.grupo_catalogo,
+        s.activo,
+        s.visible_publico,
+        s.agendable,
+        s.orden_visual
+      FROM public.servicios s
+      WHERE s.deleted_at IS NULL
+        AND s.activo IS TRUE
+        AND s.visible_publico IS TRUE
+        AND s.agendable IS TRUE
+      ORDER BY s.orden_visual ASC, s.nombre_servicio ASC, s.id_servicio ASC
+    `
+  );
+  return rows.map(mapRewardCatalogServiceRow);
+}
+
+async function ensureRewardServicesEligible(client, serviceIds) {
+  const uniqueIds = parseUuidArray(serviceIds, "servicios_redimibles");
+  if (!uniqueIds.length) return [];
+
+  const { rows } = await client.query(
+    `
+      SELECT
+        s.id_servicio,
+        s.nombre_servicio,
+        s.grupo_catalogo,
+        s.activo,
+        s.visible_publico,
+        s.agendable,
+        s.orden_visual
+      FROM public.servicios s
+      WHERE s.id_servicio = ANY($1::uuid[])
+        AND s.deleted_at IS NULL
+        AND s.activo IS TRUE
+        AND s.visible_publico IS TRUE
+        AND s.agendable IS TRUE
+      ORDER BY s.orden_visual ASC, s.nombre_servicio ASC, s.id_servicio ASC
+    `,
+    [uniqueIds]
+  );
+
+  if (rows.length !== uniqueIds.length) {
+    throw new AppError(409, "Uno o mas servicios seleccionados no son agendables para canje", {
+      code: "MASTERPUNTOS_REWARD_SERVICES_INVALID",
+      details: {
+        solicitados: uniqueIds,
+        encontrados: rows.map((row) => row.id_servicio),
+      },
+    });
+  }
+
+  const byId = new Map(rows.map((row) => [String(row.id_servicio), mapRewardCatalogServiceRow(row)]));
+  return uniqueIds.map((id) => byId.get(id)).filter(Boolean);
+}
+
+async function listRewardConfigurationForRule(client, rule) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        prs.id_rule_service,
+        prs.id_servicio,
+        s.nombre_servicio,
+        COALESCE(prs.puntos_canje, $2::int)::int AS puntos_requeridos,
+        prs.puntos_canje,
+        prs.habilitado,
+        prs.visible_cliente,
+        prs.orden_visual,
+        prs.cliente_condicion_codigo
+      FROM public.points_rule_services prs
+      JOIN public.servicios s
+        ON s.id_servicio = prs.id_servicio
+      WHERE prs.id_rule = $1::uuid
+        AND prs.cliente_condicion_codigo = ANY($3::text[])
+      ORDER BY prs.cliente_condicion_codigo ASC, prs.orden_visual ASC NULLS LAST, s.nombre_servicio ASC
+    `,
+    [rule.id_rule, Number(rule.puntos_para_premio || 10), REWARD_CONDITIONS]
+  );
+
+  const configuration = {
+    [REWARD_CONDITION_NO_MEMBERSHIP]: [],
+    [REWARD_CONDITION_WITH_MEMBERSHIP]: [],
+  };
+  for (const row of rows) {
+    const condition = String(row.cliente_condicion_codigo || "").trim();
+    if (!REWARD_CONDITIONS.includes(condition)) continue;
+    configuration[condition].push(mapRewardRuleServiceRow(row));
+  }
+  return configuration;
+}
+
 async function listRulesByScope(client, branchIds) {
   const { rows } = await client.query(
     `
@@ -233,6 +386,7 @@ async function listRulesByScope(client, branchIds) {
       FROM ranked r
       LEFT JOIN public.points_rule_services prs
         ON prs.id_rule = r.id_rule
+       AND prs.cliente_condicion_codigo = '${REWARD_CONDITION_NO_MEMBERSHIP}'
       LEFT JOIN public.servicios s
         ON s.id_servicio = prs.id_servicio
       WHERE r.rn = 1
@@ -336,6 +490,7 @@ async function getRuleById(client, idRule) {
       FROM public.points_rules pr
       LEFT JOIN public.points_rule_services prs
         ON prs.id_rule = pr.id_rule
+       AND prs.cliente_condicion_codigo = '${REWARD_CONDITION_NO_MEMBERSHIP}'
       LEFT JOIN public.servicios s
         ON s.id_servicio = prs.id_servicio
       WHERE pr.id_rule = $1::uuid
@@ -545,14 +700,123 @@ export async function getMasterPuntosContext(app, claims) {
   }
 }
 
+export async function getMasterPuntosRewardServicesConfig(app) {
+  const client = await app.db.connect();
+  try {
+    const rule = await getActiveGlobalPointsRule(client);
+    const [servicesCatalog, configuration] = await Promise.all([
+      listRewardEligibleServices(client),
+      listRewardConfigurationForRule(client, rule),
+    ]);
+
+    return {
+      regla: {
+        id_rule: rule.id_rule,
+        puntos_para_premio: Number(rule.puntos_para_premio || 10),
+        scope: "global",
+        id_sucursal: null,
+      },
+      servicios_catalogo: servicesCatalog,
+      configuracion: configuration,
+    };
+  } finally {
+    client.release();
+  }
+}
+
+export async function updateMasterPuntosRewardServicesConfig(app, payload = {}) {
+  const noMembershipIds = parseUuidArray(payload?.[REWARD_CONDITION_NO_MEMBERSHIP], REWARD_CONDITION_NO_MEMBERSHIP);
+  const withMembershipIds = parseUuidArray(payload?.[REWARD_CONDITION_WITH_MEMBERSHIP], REWARD_CONDITION_WITH_MEMBERSHIP);
+  const client = await app.db.connect();
+  try {
+    await client.query("BEGIN");
+    const rule = await getActiveGlobalPointsRule(client, { forUpdate: true });
+
+    const selectedByCondition = {
+      [REWARD_CONDITION_NO_MEMBERSHIP]: await ensureRewardServicesEligible(client, noMembershipIds),
+      [REWARD_CONDITION_WITH_MEMBERSHIP]: await ensureRewardServicesEligible(client, withMembershipIds),
+    };
+
+    for (const condition of REWARD_CONDITIONS) {
+      await client.query(
+        `
+          UPDATE public.points_rule_services
+          SET habilitado = FALSE,
+              visible_cliente = FALSE,
+              updated_at = now()
+          WHERE id_rule = $1::uuid
+            AND cliente_condicion_codigo = $2::text
+        `,
+        [rule.id_rule, condition]
+      );
+
+      const selectedServices = selectedByCondition[condition];
+      for (let index = 0; index < selectedServices.length; index += 1) {
+        const service = selectedServices[index];
+        const order = index + 1;
+        await client.query(
+          `
+            INSERT INTO public.points_rule_services (
+              id_rule,
+              id_servicio,
+              cliente_condicion_codigo,
+              puntos_canje,
+              habilitado,
+              visible_cliente,
+              orden_visual,
+              updated_at
+            )
+            VALUES (
+              $1::uuid,
+              $2::uuid,
+              $3::text,
+              NULL,
+              TRUE,
+              TRUE,
+              $4::int,
+              now()
+            )
+            ON CONFLICT (id_rule, id_servicio, cliente_condicion_codigo)
+            DO UPDATE SET
+              puntos_canje = NULL,
+              habilitado = TRUE,
+              visible_cliente = TRUE,
+              orden_visual = EXCLUDED.orden_visual,
+              updated_at = now()
+          `,
+          [rule.id_rule, service.id_servicio, condition, order]
+        );
+      }
+    }
+
+    const [servicesCatalog, configuration] = await Promise.all([
+      listRewardEligibleServices(client),
+      listRewardConfigurationForRule(client, rule),
+    ]);
+    await client.query("COMMIT");
+    return {
+      regla: {
+        id_rule: rule.id_rule,
+        puntos_para_premio: Number(rule.puntos_para_premio || 10),
+        scope: "global",
+        id_sucursal: null,
+      },
+      servicios_catalogo: servicesCatalog,
+      configuracion: configuration,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function listMasterPuntosClientes(app, claims, query = {}) {
   const { branchIds } = await getScope(app, claims);
   const client = await app.db.connect();
   try {
-    const [config, legacySupport] = await Promise.all([
-      getLegacyMigrationConfig(client),
-      getLegacyMigrationSchemaSupport(client),
-    ]);
+    const legacySupport = await getLegacyMigrationSchemaSupport(client);
     const legacySelectSql = legacySupport.has_points_legacy_migrations
       ? "plm.id_migracion IS NOT NULL AS legacy_migracion_aplicada,"
       : "FALSE AS legacy_migracion_aplicada,";
@@ -962,15 +1226,36 @@ export async function updateMasterPuntosRegla(app, claims, payload = {}) {
       );
     }
 
-    await client.query("DELETE FROM public.points_rule_services WHERE id_rule = $1::uuid", [idRule]);
+    await client.query(
+      `
+        DELETE FROM public.points_rule_services
+        WHERE id_rule = $1::uuid
+          AND cliente_condicion_codigo = $2::text
+      `,
+      [idRule, REWARD_CONDITION_NO_MEMBERSHIP]
+    );
     for (const service of validatedServices) {
       await client.query(
         `
-          INSERT INTO public.points_rule_services (id_rule, id_servicio)
-          VALUES ($1::uuid, $2::uuid)
-          ON CONFLICT (id_rule, id_servicio) DO NOTHING
+          INSERT INTO public.points_rule_services (
+            id_rule,
+            id_servicio,
+            cliente_condicion_codigo,
+            puntos_canje,
+            habilitado,
+            visible_cliente,
+            orden_visual,
+            updated_at
+          )
+          VALUES ($1::uuid, $2::uuid, $3::text, NULL, TRUE, TRUE, 100, now())
+          ON CONFLICT (id_rule, id_servicio, cliente_condicion_codigo)
+          DO UPDATE SET
+            puntos_canje = NULL,
+            habilitado = TRUE,
+            visible_cliente = TRUE,
+            updated_at = now()
         `,
-        [idRule, service.id_servicio]
+        [idRule, service.id_servicio, REWARD_CONDITION_NO_MEMBERSHIP]
       );
     }
 

@@ -47,6 +47,7 @@ export const SLOT_DISCARD_REASONS = {
   CROSS_BLOCK_BOUNDARY: "CROSS_BLOCK_BOUNDARY",
   RESOURCE_UNAVAILABLE: "RESOURCE_UNAVAILABLE",
 };
+const BRANCH_EXCEPTION_MODES = new Set(["cierre_total", "horario_especial", "apertura_extra", "cierre_parcial"]);
 
 function createProviderAdapterByCode(providerCode) {
   const normalized = String(providerCode || "").trim().toLowerCase();
@@ -302,6 +303,17 @@ function isPoolLikeClient(client) {
 
 function startOfDay(dateString) {
   return buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 0, 0, 0, AGENDA_DEFAULT_TIME_ZONE);
+}
+
+export function buildOperationalDayRange(dateString) {
+  const fecha = parseDateOnly(dateString, "fecha");
+  const startAt = startOfDay(fecha);
+  const endAtExclusive = addMinutes(startAt, 24 * 60);
+  return {
+    fecha,
+    startAt,
+    endAtExclusive,
+  };
 }
 
 function endOfDay(dateString) {
@@ -600,11 +612,13 @@ function toHourMinute(value) {
 }
 
 function isFullDayInterval(start, end) {
-  const nextDayStart = startOfDay(formatDateOnly(addMinutes(start, 24 * 60)));
-  return start.getHours() === 0
-    && start.getMinutes() === 0
-    && start.getSeconds() === 0
-    && end.getTime() >= nextDayStart.getTime();
+  const operationalDate = formatDateOnlyInTimeZone(start, AGENDA_DEFAULT_TIME_ZONE);
+  if (!operationalDate) return false;
+  const expectedStart = startOfDay(operationalDate);
+  const expectedEnd = addMinutes(expectedStart, 24 * 60);
+  const toleranceMs = 1000;
+  return Math.abs(start.getTime() - expectedStart.getTime()) <= toleranceMs
+    && end.getTime() + toleranceMs >= expectedEnd.getTime();
 }
 
 export async function getHoldDurationMinutes(client) {
@@ -1050,6 +1064,7 @@ function enrichSelectionItem(row, { bookingIsvEnabled = resolveBookingIsvEnabled
     buffer_min: Number(row.buffer_min ?? 0),
     precio_hnl: precioHnl,
     precio_total_hnl: taxSnapshot.total_linea_hnl,
+    precio_referencia_hnl: precioHnl,
     incluye_isv: incluyeIsv,
     incluye_isv_snapshot: incluyeIsv,
     isv_porcentaje: isvPorcentaje,
@@ -1067,14 +1082,35 @@ function summarizeSelectionItems(items) {
   };
 }
 
+function allocateAmountAcrossSelectionItems(items = [], totalHnl = 0) {
+  const source = Array.isArray(items) ? items : [];
+  const total = normalizeMoney(totalHnl);
+  if (!source.length || total <= 0) return source;
+  const baseTotal = normalizeMoney(source.reduce((sum, item) => sum + Number(item.total_linea_hnl ?? item.precio_hnl ?? 0), 0));
+  let assigned = 0;
+  return source.map((item, index) => {
+    const amount = index === source.length - 1
+      ? normalizeMoney(total - assigned)
+      : normalizeMoney(baseTotal > 0 ? (total * Number(item.total_linea_hnl ?? item.precio_hnl ?? 0)) / baseTotal : total / source.length);
+    assigned = normalizeMoney(assigned + amount);
+    return {
+      ...item,
+      precio_hnl: amount,
+      precio_total_hnl: amount,
+      precio_referencia_hnl: normalizeMoney(item.precio_referencia_hnl ?? item.precio_hnl ?? amount),
+      precio_unitario_hnl: amount,
+      incluye_isv: false,
+      incluye_isv_snapshot: false,
+      isv_porcentaje: 0,
+      isv_hnl: 0,
+      total_linea_hnl: amount,
+      origen_item_codigo: "paquete_incluido",
+    };
+  });
+}
+
 export function assertBookingSelectionRuntimeSupported(selectionType) {
-  const normalized = normalizeBookingSelectionType(selectionType || "services", { required: true });
-  if (normalized === "package" || normalized === "mixed") {
-    throw new AppError(409, "El flujo de paquetes/mixed sera habilitado en Microfase 2B.", {
-      code: "BOOKING_PACKAGE_FLOW_PENDING_2B",
-    });
-  }
-  return normalized;
+  return normalizeBookingSelectionType(selectionType || "services", { required: true });
 }
 
 export async function getServiceSelectionDetails(
@@ -1249,6 +1285,7 @@ export async function getPackageSelectionDetails(
         pd.cantidad,
         s.nombre_servicio,
         COALESCE(s.activo, FALSE) AS servicio_activo,
+        COALESCE(s.agendable, TRUE) AS servicio_agendable,
         s.deleted_at
       FROM public.paquetes_detalles pd
       LEFT JOIN public.servicios s
@@ -1270,6 +1307,7 @@ export async function getPackageSelectionDetails(
     !row?.nombre_servicio
     || row?.deleted_at
     || !row?.servicio_activo
+    || !row?.servicio_agendable
   ));
   if (containsInactiveServices) {
     throw new AppError(409, "El paquete incluye servicios inactivos o no disponibles.", {
@@ -1294,20 +1332,28 @@ export async function getPackageSelectionDetails(
     fechaInicio,
     { bookingIsvEnabled }
   );
-  const packagePrice = packageRow.precio_hnl == null
-    ? Number(serviceSelection.monto_total_hnl || 0)
-    : Number(packageRow.precio_hnl);
+  const packagePrice = Number(packageRow.precio_hnl);
+  if (!Number.isFinite(packagePrice) || packagePrice <= 0) {
+    throw new AppError(409, "El paquete no tiene precio publico valido para la sucursal", {
+      code: "AGENDA_PACKAGE_PRICE_MISSING",
+      details: { id_paquete: safePackageId, id_sucursal: safeBranchId },
+    });
+  }
+  const packageItems = allocateAmountAcrossSelectionItems(serviceSelection.items, packagePrice);
 
   return {
     ...serviceSelection,
     selection_type: "package",
     id_paquete: safePackageId,
+    items: packageItems,
     paquete: {
       id_paquete: packageRow.id_paquete,
       nombre_paquete: packageRow.nombre_paquete,
       descripcion: packageRow.descripcion ?? null,
       precio_hnl: packagePrice,
     },
+    monto_subtotal_hnl: packagePrice,
+    monto_isv_hnl: 0,
     monto_total_hnl: packagePrice,
   };
 }
@@ -1343,6 +1389,7 @@ export async function getBookingSelectionDetails(client, {
         ...packageSelection,
         selection_type: "mixed",
         servicios_extra: [],
+        monto_subtotal_hnl: Number(packageSelection.monto_subtotal_hnl || packageSelection.monto_total_hnl || 0),
         monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
       };
     }
@@ -1352,23 +1399,32 @@ export async function getBookingSelectionDetails(client, {
         .map((item) => item?.id_servicio)
         .filter(Boolean)
     );
-    const conflictingServiceIds = extraServiceIds.filter((idServicio) => packageServiceIds.has(idServicio));
-    if (conflictingServiceIds.length > 0) {
-      throw new AppError(409, "Ese servicio ya lo incluye el paquete seleccionado", {
-        code: "SERVICE_ALREADY_INCLUDED_IN_PACKAGE",
-        details: { field: "servicios" },
-      });
+    const filteredExtraServiceIds = extraServiceIds.filter((idServicio) => !packageServiceIds.has(idServicio));
+    if (!filteredExtraServiceIds.length) {
+      return {
+        ...packageSelection,
+        selection_type: "mixed",
+        servicios_extra: [],
+        monto_subtotal_hnl: Number(packageSelection.monto_subtotal_hnl || packageSelection.monto_total_hnl || 0),
+        monto_total_hnl: Number(packageSelection.monto_total_hnl || 0),
+      };
     }
 
-    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, extraServiceIds, id_barbero, tariffDateSource, {
+    const extraSelection = await getServiceSelectionDetails(client, id_sucursal, filteredExtraServiceIds, id_barbero, tariffDateSource, {
       bookingIsvEnabled,
     });
+    const extraItems = (Array.isArray(extraSelection.items) ? extraSelection.items : []).map((item) => ({
+      ...item,
+      origen_item_codigo: "servicio_extra",
+    }));
     const mergedItems = [
       ...(Array.isArray(packageSelection.items) ? packageSelection.items : []),
-      ...(Array.isArray(extraSelection.items) ? extraSelection.items : []),
+      ...extraItems,
     ];
     const totalDuracion = Number(packageSelection.duracion_total_min || 0) + Number(extraSelection.duracion_total_min || 0);
     const totalMonto = Number(packageSelection.monto_total_hnl || 0) + Number(extraSelection.monto_total_hnl || 0);
+    const totalSubtotal = Number(packageSelection.monto_subtotal_hnl || packageSelection.monto_total_hnl || 0)
+      + Number(extraSelection.monto_subtotal_hnl || extraSelection.monto_total_hnl || 0);
     const totalBuffer = Math.max(
       Number(packageSelection.buffer_total_min || 0),
       Number(extraSelection.buffer_total_min || 0)
@@ -1378,9 +1434,11 @@ export async function getBookingSelectionDetails(client, {
       ...packageSelection,
       selection_type: "mixed",
       items: mergedItems,
-      servicios_extra: extraSelection.items,
+      servicios_extra: extraItems,
       duracion_total_min: totalDuracion,
       buffer_total_min: mergedItems.length > 0 ? totalBuffer : 0,
+      monto_subtotal_hnl: totalSubtotal,
+      monto_isv_hnl: Number(extraSelection.monto_isv_hnl || 0),
       monto_total_hnl: totalMonto,
     };
   }
@@ -1546,7 +1604,17 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString, options
   const dayEnd = endOfDay(safeDate);
   const includeSources = Boolean(options?.includeSources);
 
-  const [bloqueosResult, citasResult] = await Promise.all([
+  const [bloqueosResult, legacyBloqueosResult, citasResult] = await Promise.all([
+    client.query(
+      `
+        SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
+        FROM public.agenda_bloqueos_empleados
+        WHERE id_empleado = $1::uuid
+          AND rango && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+        ORDER BY lower(rango) ASC
+      `,
+      [empleadoId, dayStart.toISOString(), dayEnd.toISOString()]
+    ),
     client.query(
       `
         SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
@@ -1574,7 +1642,7 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString, options
     ),
   ]);
 
-  const blockedBySchedule = bloqueosResult.rows.map((row) => ({
+  const blockedBySchedule = [...bloqueosResult.rows, ...legacyBloqueosResult.rows].map((row) => ({
     start: row.inicio_at,
     end: row.fin_at,
     source: SLOT_DISCARD_REASONS.CONFLICT_WITH_BLOCK,
@@ -1606,7 +1674,17 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
   const rangeStart = startOfDay(safeFrom);
   const rangeEndExclusive = addMinutes(startOfDay(safeTo), 24 * 60);
 
-  const [bloqueosResult, citasResult] = await Promise.all([
+  const [bloqueosResult, legacyBloqueosResult, citasResult] = await Promise.all([
+    client.query(
+      `
+        SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
+        FROM public.agenda_bloqueos_empleados
+        WHERE id_empleado = $1::uuid
+          AND rango && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+        ORDER BY lower(rango) ASC
+      `,
+      [empleadoId, rangeStart.toISOString(), rangeEndExclusive.toISOString()]
+    ),
     client.query(
       `
         SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
@@ -1634,7 +1712,7 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
     ),
   ]);
 
-  const blockedBySchedule = bloqueosResult.rows.map((row) => ({
+  const blockedBySchedule = [...bloqueosResult.rows, ...legacyBloqueosResult.rows].map((row) => ({
     start: row.inicio_at,
     end: row.fin_at,
     source: SLOT_DISCARD_REASONS.CONFLICT_WITH_BLOCK,
@@ -1693,6 +1771,106 @@ function buildBaseIntervalsFromSchedules(dateString, schedules) {
     intervals.push(...subtractIntervals([workInterval], blocks));
   }
   return intervals;
+}
+
+function mapBranchExceptionRow(row) {
+  const blocks = Array.isArray(row?.bloques) ? row.bloques : [];
+  return {
+    id_excepcion_sucursal: row.id_excepcion_sucursal,
+    id_sucursal: row.id_sucursal,
+    fecha: row.fecha instanceof Date ? formatDateOnly(row.fecha) : String(row.fecha).slice(0, 10),
+    modo_excepcion_codigo: row.modo_excepcion_codigo,
+    motivo: row.motivo ?? null,
+    bloques: blocks
+      .map((block) => ({
+        id_bloque_excepcion: block.id_bloque_excepcion ?? null,
+        hora_inicio: block.hora_inicio ? String(block.hora_inicio).slice(0, 8) : null,
+        hora_fin: block.hora_fin ? String(block.hora_fin).slice(0, 8) : null,
+        minuto_inicio: Number(block.minuto_inicio ?? 0),
+        minuto_fin: Number(block.minuto_fin ?? 0),
+        orden_visual: Number(block.orden_visual ?? 0),
+      }))
+      .filter((block) => block.hora_inicio && block.hora_fin),
+  };
+}
+
+async function getBranchExceptionsForDate(client, idSucursal, fecha) {
+  const safeBranchId = assertUuid(idSucursal, "id_sucursal");
+  const safeDate = parseDateOnly(fecha, "fecha");
+  const { rows } = await client.query(
+    `
+      SELECT
+        e.id_excepcion_sucursal,
+        e.id_sucursal,
+        e.fecha,
+        e.modo_excepcion_codigo,
+        e.motivo,
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id_bloque_excepcion', b.id_bloque_excepcion,
+              'hora_inicio', b.hora_inicio,
+              'hora_fin', b.hora_fin,
+              'minuto_inicio', b.minuto_inicio,
+              'minuto_fin', b.minuto_fin,
+              'orden_visual', b.orden_visual
+            )
+            ORDER BY b.orden_visual ASC, b.hora_inicio ASC, b.id_bloque_excepcion ASC
+          ) FILTER (WHERE b.id_bloque_excepcion IS NOT NULL),
+          '[]'::jsonb
+        ) AS bloques
+      FROM public.agenda_excepciones_sucursal e
+      LEFT JOIN public.agenda_excepciones_sucursal_bloques b
+        ON b.id_excepcion_sucursal = e.id_excepcion_sucursal
+      WHERE e.id_sucursal = $1::uuid
+        AND e.fecha = $2::date
+        AND e.modo_excepcion_codigo = ANY($3::text[])
+      GROUP BY e.id_excepcion_sucursal
+      ORDER BY e.fecha ASC, e.created_at ASC, e.id_excepcion_sucursal ASC
+    `,
+    [safeBranchId, safeDate, Array.from(BRANCH_EXCEPTION_MODES)]
+  );
+  return rows.map(mapBranchExceptionRow);
+}
+
+function buildIntervalsFromBranchExceptionBlocks(dateString, exception) {
+  return (Array.isArray(exception?.bloques) ? exception.bloques : [])
+    .map((block) => normalizeInterval(
+      combineDateAndTime(dateString, block.hora_inicio),
+      combineDateAndTime(dateString, block.hora_fin)
+    ))
+    .filter(Boolean);
+}
+
+function applyBranchExceptionsToIntervals(dateString, baseIntervals, exceptions) {
+  let intervals = mergeIntervals(baseIntervals);
+  const normalizedExceptions = Array.isArray(exceptions) ? exceptions : [];
+  if (normalizedExceptions.some((item) => item.modo_excepcion_codigo === "cierre_total")) {
+    return [];
+  }
+
+  const specialIntervals = normalizedExceptions
+    .filter((item) => item.modo_excepcion_codigo === "horario_especial")
+    .flatMap((item) => buildIntervalsFromBranchExceptionBlocks(dateString, item));
+  if (specialIntervals.length) {
+    intervals = mergeIntervals(specialIntervals);
+  }
+
+  const extraIntervals = normalizedExceptions
+    .filter((item) => item.modo_excepcion_codigo === "apertura_extra")
+    .flatMap((item) => buildIntervalsFromBranchExceptionBlocks(dateString, item));
+  if (extraIntervals.length) {
+    intervals = mergeIntervals([...intervals, ...extraIntervals]);
+  }
+
+  const closedIntervals = normalizedExceptions
+    .filter((item) => item.modo_excepcion_codigo === "cierre_parcial")
+    .flatMap((item) => buildIntervalsFromBranchExceptionBlocks(dateString, item));
+  if (closedIntervals.length) {
+    intervals = subtractIntervals(intervals, closedIntervals);
+  }
+
+  return mergeIntervals(intervals);
 }
 
 function resolveOperationalDayBoundsFromSchedules(dateString, schedules) {
@@ -1837,23 +2015,24 @@ export async function getAvailableSlotsForBarber(
   const minSellableDurationMin = Number.isFinite(Number(options?.minSellableDurationMin))
     ? Math.max(0, Math.trunc(Number(options.minSellableDurationMin)))
     : await getMinSellableServiceMinutes(client);
-  const schedules = await getSchedulesForBarberOnDate(client, safeBarberId, safeDate);
-  if (!schedules.length) {
-    return includeDiscardReasons
-      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { schedule: "missing" } }] }
-      : [];
-  }
+  const barber = await getBarberById(client, safeBarberId);
+  const [schedules, branchExceptions] = await Promise.all([
+    getSchedulesForBarberOnDate(client, safeBarberId, safeDate),
+    getBranchExceptionsForDate(client, barber.id_sucursal, safeDate),
+  ]);
 
   const baseIntervals = buildBaseIntervalsFromSchedules(safeDate, schedules);
   const operationalDayBounds = resolveOperationalDayBoundsFromSchedules(safeDate, schedules);
-  if (!baseIntervals.length) {
+  const branchAdjustedIntervals = applyBranchExceptionsToIntervals(safeDate, baseIntervals, branchExceptions);
+  if (!branchAdjustedIntervals.length) {
+    const missingBaseReason = schedules.length ? "branch_exceptions" : "schedule_missing_or_closed";
     return includeDiscardReasons
-      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { interval: "empty" } }] }
+      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { reason: missingBaseReason } }] }
       : [];
   }
 
   const busyIntervals = await getBusyIntervalsForBarber(client, safeBarberId, safeDate);
-  const freeIntervals = subtractIntervals(baseIntervals, busyIntervals);
+  const freeIntervals = subtractIntervals(branchAdjustedIntervals, busyIntervals);
   const todaySellableFloorStartAt = resolveTodaySellableFloorStartAt(safeDate, SLOT_INTERVAL_MINUTES, {
     now: options?.now,
     timeZone: options?.timeZone || AGENDA_DEFAULT_TIME_ZONE,
@@ -2293,7 +2472,9 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
       const schedules = schedulesByWeekday.get(weekday) || [];
 
       const baseIntervals = buildBaseIntervalsFromSchedules(dateKey, schedules);
-      if (!baseIntervals.length) {
+      const branchExceptions = await getBranchExceptionsForDate(client, barber.id_sucursal, dateKey);
+      const branchAdjustedIntervals = applyBranchExceptionsToIntervals(dateKey, baseIntervals, branchExceptions);
+      if (!branchAdjustedIntervals.length) {
         availability.push({
           fecha: dateKey,
           disponible: false,
@@ -2308,7 +2489,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
       const dayBusyIntervals = busyIntervals.filter(
         (entry) => entry.end.getTime() > dayStart.getTime() && entry.start.getTime() < dayEnd.getTime()
       );
-      const freeIntervals = subtractIntervals(baseIntervals, dayBusyIntervals);
+      const freeIntervals = subtractIntervals(branchAdjustedIntervals, dayBusyIntervals);
       const slotsResult = buildSlotsFromIntervals(
         freeIntervals,
         serviceTotalMinutes,
@@ -3022,6 +3203,7 @@ export function mapBarbersForResponse(barbers) {
 export function mapBlockRow(row) {
   const start = new Date(row.inicio_at);
   const end = new Date(row.fin_at);
+  const operationalDate = formatDateOnlyInTimeZone(start, AGENDA_DEFAULT_TIME_ZONE) || formatDateOnly(start);
   return {
     id_bloqueo: row.id_bloqueo,
     id_empleado: row.id_empleado,
@@ -3030,7 +3212,7 @@ export function mapBlockRow(row) {
     motivo: row.motivo ?? null,
     inicio_at: start.toISOString(),
     fin_at: end.toISOString(),
-    fecha: formatDateOnly(start),
+    fecha: operationalDate,
     es_dia_completo: isFullDayInterval(start, end),
     nombre_completo: row.nombre_completo ?? null,
     nombre_sucursal: row.nombre_sucursal ?? null,
