@@ -8,6 +8,18 @@ function normalizeCode(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normalizeEvaluationScope(candidate = {}) {
+  const scope = normalizeCode(candidate.scope_evaluacion_codigo);
+  return ["cita", "integrante", "grupo_cita"].includes(scope) ? scope : "cita";
+}
+
+function normalizeDiscountType(candidate = {}) {
+  const type = normalizeCode(candidate.tipo_descuento_codigo);
+  const mecanica = normalizeCode(candidate.mecanica);
+  if (type === "bonificacion" || mecanica === "dos_por_uno") return "bonificacion";
+  return type || "monto_fijo";
+}
+
 function toDateOnly(value) {
   if (!value) return null;
   const date = new Date(value);
@@ -34,6 +46,11 @@ function normalizeCollectionQuantity(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
 }
 
+function normalizeUnitCount(value) {
+  const quantity = normalizeCollectionQuantity(value);
+  return Math.max(1, Math.trunc(quantity));
+}
+
 function normalizeUnitPrice(entry = {}) {
   const direct = Number(entry?.precio_unitario_hnl ?? entry?.precio_hnl ?? NaN);
   if (Number.isFinite(direct) && direct >= 0) return direct;
@@ -41,6 +58,10 @@ function normalizeUnitPrice(entry = {}) {
   const subtotal = Number(entry?.subtotal_hnl ?? NaN);
   if (Number.isFinite(subtotal) && subtotal >= 0 && qty > 0) return subtotal / qty;
   return null;
+}
+
+function isBonificationPromotion(candidate = {}) {
+  return normalizeDiscountType(candidate) === "bonificacion";
 }
 
 function findApplicablePromotionCode(context = {}, candidate = {}) {
@@ -84,8 +105,36 @@ function getContextDiscountLines(context = {}) {
   });
 }
 
+function matchesEvaluationScope(entry = {}, context = {}, scope = "cita") {
+  if (scope === "grupo_cita") return true;
+  if (scope === "cita") {
+    const contextCitaId = String(context.id_cita || "").trim();
+    const entryCitaId = String(entry.id_cita || "").trim();
+    return !contextCitaId || !entryCitaId || contextCitaId === entryCitaId;
+  }
+  if (scope === "integrante") {
+    const contextIntegranteId = String(context.id_cita_integrante || "").trim();
+    const entryIntegranteId = String(entry.id_cita_integrante || "").trim();
+    if (contextIntegranteId && entryIntegranteId) return contextIntegranteId === entryIntegranteId;
+    const contextOrder = Number(context.orden_integrante || 0);
+    const entryOrder = Number(entry.orden_integrante || 0);
+    return !contextOrder || !entryOrder || contextOrder === entryOrder;
+  }
+  return true;
+}
+
+function getScopedDiscountLines(context = {}, candidate = {}) {
+  const scope = normalizeEvaluationScope(candidate);
+  return getContextDiscountLines(context).filter((line) => matchesEvaluationScope(line, context, scope));
+}
+
+function getScopedCollection(source = [], context = {}, candidate = {}) {
+  const scope = normalizeEvaluationScope(candidate);
+  return (Array.isArray(source) ? source : []).filter((entry) => matchesEvaluationScope(entry, context, scope));
+}
+
 function getEligibleLines(context = {}, candidate = {}) {
-  const lines = getContextDiscountLines(context);
+  const lines = getScopedDiscountLines(context, candidate);
   const applyCode = String(candidate.aplica_a_codigo || "reserva").trim().toLowerCase();
   if (applyCode === "reserva") return lines;
   if (applyCode === "titular") {
@@ -100,7 +149,82 @@ function getEligibleLines(context = {}, candidate = {}) {
     if (!targetServiceIds.size) return [];
     return lines.filter((line) => targetServiceIds.has(String(line.id_servicio || "").trim()));
   }
+  if (applyCode === "paquete") {
+    const targetPackageIds = new Set(
+      (Array.isArray(candidate.items) ? candidate.items : [])
+        .map((item) => String(item?.id_paquete || "").trim())
+        .filter(Boolean)
+    );
+    if (!targetPackageIds.size) return [];
+    const packageIds = new Set(
+      (Array.isArray(context.paquetes) ? context.paquetes : [])
+        .map((item) => String(item?.id_paquete ?? item ?? "").trim())
+        .filter(Boolean)
+    );
+    const hasTargetPackage = [...targetPackageIds].some((id) => packageIds.has(id));
+    return hasTargetPackage ? lines : [];
+  }
   return [];
+}
+
+function emptyTargetStats(requiredQuantity, bonusQuantity) {
+  return {
+    matched: false,
+    quantity: 0,
+    unitPrices: [],
+    targetId: null,
+    requiredQuantity,
+    bonusQuantity,
+  };
+}
+
+function buildTargetItemStats(source = [], targetIds = new Set(), idField, requiredQuantity, bonusQuantity) {
+  if (!targetIds.size) return emptyTargetStats(requiredQuantity, bonusQuantity);
+
+  const byTargetId = new Map();
+  for (const entry of source) {
+    const itemId = String(entry?.[idField] ?? entry ?? "").trim();
+    if (!itemId || !targetIds.has(itemId)) continue;
+
+    const qty = normalizeCollectionQuantity(entry?.cantidad);
+    const unitCount = normalizeUnitCount(entry?.cantidad);
+    if (!byTargetId.has(itemId)) {
+      byTargetId.set(itemId, { targetId: itemId, quantity: 0, unitPrices: [] });
+    }
+    const target = byTargetId.get(itemId);
+    target.quantity += unitCount;
+    const unitPrice = normalizeUnitPrice(entry);
+    if (Number.isFinite(unitPrice) && unitPrice > 0) {
+      for (let i = 0; i < unitCount; i += 1) {
+        target.unitPrices.push(unitPrice);
+      }
+    } else if (Number.isFinite(Number(entry?.subtotal_hnl)) && Number(entry.subtotal_hnl) > 0 && qty > 0) {
+      const fallbackUnitPrice = Number(entry.subtotal_hnl) / qty;
+      for (let i = 0; i < unitCount; i += 1) {
+        target.unitPrices.push(fallbackUnitPrice);
+      }
+    }
+  }
+
+  const groups = [...byTargetId.values()]
+    .filter((row) => row.quantity > 0)
+    .sort((a, b) => {
+      const aEligible = a.quantity >= requiredQuantity ? 1 : 0;
+      const bEligible = b.quantity >= requiredQuantity ? 1 : 0;
+      if (bEligible !== aEligible) return bEligible - aEligible;
+      if (b.quantity !== a.quantity) return b.quantity - a.quantity;
+      return String(a.targetId).localeCompare(String(b.targetId));
+    });
+  const selected = groups[0];
+  if (!selected) return emptyTargetStats(requiredQuantity, bonusQuantity);
+  return {
+    matched: true,
+    quantity: selected.quantity,
+    unitPrices: selected.unitPrices,
+    targetId: selected.targetId,
+    requiredQuantity,
+    bonusQuantity,
+  };
 }
 
 function getTargetItemStats(context = {}, candidate = {}) {
@@ -113,47 +237,113 @@ function getTargetItemStats(context = {}, candidate = {}) {
 
   if (applyCode === "servicio") {
     const targetServiceIds = new Set(ruleItems.map((item) => String(item?.id_servicio || "").trim()).filter(Boolean));
-    if (!targetServiceIds.size) return { matched: false, quantity: 0, unitPrice: 0, requiredQuantity, bonusQuantity };
-    const source = Array.isArray(context.servicios) ? context.servicios : [];
-    let quantity = 0;
-    let subtotal = 0;
-    for (const entry of source) {
-      const serviceId = String(entry?.id_servicio ?? entry ?? "").trim();
-      if (!serviceId || !targetServiceIds.has(serviceId)) continue;
-      const qty = normalizeCollectionQuantity(entry?.cantidad);
-      quantity += qty;
-      const unitPrice = normalizeUnitPrice(entry);
-      if (Number.isFinite(unitPrice)) {
-        subtotal += unitPrice * qty;
-      }
-    }
-    if (!quantity) return { matched: false, quantity: 0, unitPrice: 0, requiredQuantity, bonusQuantity };
-    const unitPrice = subtotal > 0 ? (subtotal / quantity) : 0;
-    return { matched: true, quantity, unitPrice, requiredQuantity, bonusQuantity };
+    const source = getScopedCollection(context.servicios, context, candidate);
+    return buildTargetItemStats(source, targetServiceIds, "id_servicio", requiredQuantity, bonusQuantity);
   }
 
   if (applyCode === "paquete") {
     const targetPackageIds = new Set(ruleItems.map((item) => String(item?.id_paquete || "").trim()).filter(Boolean));
-    if (!targetPackageIds.size) return { matched: false, quantity: 0, unitPrice: 0, requiredQuantity, bonusQuantity };
-    const source = Array.isArray(context.paquetes) ? context.paquetes : [];
-    let quantity = 0;
-    let subtotal = 0;
-    for (const entry of source) {
-      const packageId = String(entry?.id_paquete ?? entry ?? "").trim();
-      if (!packageId || !targetPackageIds.has(packageId)) continue;
-      const qty = normalizeCollectionQuantity(entry?.cantidad);
-      quantity += qty;
-      const unitPrice = normalizeUnitPrice(entry);
-      if (Number.isFinite(unitPrice)) {
-        subtotal += unitPrice * qty;
-      }
-    }
-    if (!quantity) return { matched: false, quantity: 0, unitPrice: 0, requiredQuantity, bonusQuantity };
-    const unitPrice = subtotal > 0 ? (subtotal / quantity) : 0;
-    return { matched: true, quantity, unitPrice, requiredQuantity, bonusQuantity };
+    const source = getScopedCollection(context.paquetes, context, candidate);
+    return buildTargetItemStats(source, targetPackageIds, "id_paquete", requiredQuantity, bonusQuantity);
   }
 
-  return { matched: false, quantity: 0, unitPrice: 0, requiredQuantity, bonusQuantity };
+  return emptyTargetStats(requiredQuantity, bonusQuantity);
+}
+
+function buildEligibleUnitEntries(lines = []) {
+  const unitEntries = [];
+  for (const line of Array.isArray(lines) ? lines : []) {
+    const serviceId = String(line?.id_servicio || "").trim();
+    const unitCount = normalizeUnitCount(line?.cantidad);
+    const base = Number(line?.base_disponible_hnl ?? line?.subtotal_hnl ?? 0);
+    const unitPrice = normalizeUnitPrice(line) ?? (unitCount > 0 ? base / unitCount : 0);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) continue;
+    for (let i = 0; i < unitCount; i += 1) {
+      unitEntries.push({
+        line_key: line.line_key || null,
+        id_servicio: serviceId || null,
+        price: unitPrice,
+      });
+    }
+  }
+  return unitEntries;
+}
+
+function resolveBonificationBlocks(candidate = {}, quantity = 0, requiredQuantity = 1) {
+  let blocks = Math.floor(Number(quantity || 0) / Math.max(1, Number(requiredQuantity || 1)));
+  if (candidate.max_usos_por_reserva != null) {
+    const maxUses = Number(candidate.max_usos_por_reserva);
+    if (Number.isFinite(maxUses) && maxUses > 0) {
+      blocks = Math.min(blocks, Math.floor(maxUses));
+    }
+  } else if (normalizeEvaluationScope(candidate) === "grupo_cita") {
+    blocks = Math.min(blocks, 1);
+  }
+  return Math.max(0, blocks);
+}
+
+function buildBonificationPlanForUnits(candidate = {}, unitEntries = [], requiredQuantity = 1, bonusQuantity = 1) {
+  const mode = normalizeCode(candidate.bonificacion_modo_codigo || "menor_precio");
+  const sortedUnits = [...unitEntries]
+    .sort((a, b) => (mode === "menor_precio" ? a.price - b.price : a.price - b.price));
+  const blocks = resolveBonificationBlocks(candidate, sortedUnits.length, requiredQuantity);
+  const bonusUnits = Math.min(blocks * bonusQuantity, sortedUnits.length);
+  const selectedUnits = sortedUnits.slice(0, bonusUnits);
+  const discount = normalizeMoney(selectedUnits.reduce((sum, entry) => sum + entry.price, 0));
+  const byLineKey = new Map();
+  for (const entry of selectedUnits) {
+    if (!entry.line_key) continue;
+    byLineKey.set(entry.line_key, normalizeMoney((byLineKey.get(entry.line_key) || 0) + entry.price));
+  }
+  const allocations = [...byLineKey.entries()].map(([lineKey, amount]) => ({
+    line_key: lineKey,
+    descuento_hnl: amount,
+  }));
+  return { discount, allocations };
+}
+
+function calculateBonificationPlan(context = {}, candidate = {}, eligibleLines = []) {
+  const stats = getTargetItemStats(context, candidate);
+  const lineUnitEntries = buildEligibleUnitEntries(eligibleLines);
+  const fallbackUnitEntries = Array.isArray(stats.unitPrices)
+    ? stats.unitPrices
+        .filter((price) => Number.isFinite(price) && price > 0)
+        .map((price) => ({ line_key: null, price }))
+    : [];
+  const unitEntries = lineUnitEntries.length ? lineUnitEntries : fallbackUnitEntries;
+
+  if (!stats.matched || stats.quantity < stats.requiredQuantity || !unitEntries.length) {
+    return { discount: 0, allocations: [] };
+  }
+
+  const applyCode = normalizeCode(candidate.aplica_a_codigo);
+  if (applyCode === "servicio" && lineUnitEntries.length) {
+    const targetServiceIds = new Set(
+      (Array.isArray(candidate.items) ? candidate.items : [])
+        .map((item) => String(item?.id_servicio || "").trim())
+        .filter(Boolean)
+    );
+    const byService = new Map();
+    for (const entry of lineUnitEntries) {
+      const serviceId = String(entry.id_servicio || "").trim();
+      if (!serviceId || (targetServiceIds.size && !targetServiceIds.has(serviceId))) continue;
+      if (!byService.has(serviceId)) byService.set(serviceId, []);
+      byService.get(serviceId).push(entry);
+    }
+    const plans = [...byService.values()]
+      .filter((entries) => entries.length >= stats.requiredQuantity)
+      .map((entries) => buildBonificationPlanForUnits(
+        candidate,
+        entries,
+        stats.requiredQuantity,
+        stats.bonusQuantity
+      ))
+      .filter((plan) => Number(plan.discount || 0) > 0)
+      .sort((a, b) => b.discount - a.discount);
+    return plans[0] || { discount: 0, allocations: [] };
+  }
+
+  return buildBonificationPlanForUnits(candidate, unitEntries, stats.requiredQuantity, stats.bonusQuantity);
 }
 
 export function calculateDiscount(context = {}, candidate = {}) {
@@ -166,24 +356,8 @@ export function calculateDiscount(context = {}, candidate = {}) {
     discount = subtotal * (value / 100);
   } else if (candidate.tipo_descuento_codigo === "monto_fijo") {
     discount = value;
-  } else if (
-    candidate.tipo_descuento_codigo === "bonificacion"
-    || String(candidate.mecanica || "").trim().toLowerCase() === "dos_por_uno"
-  ) {
-    const stats = getTargetItemStats(context, candidate);
-    if (!stats.matched || stats.quantity < stats.requiredQuantity || stats.unitPrice <= 0) {
-      discount = 0;
-    } else {
-      let blocks = Math.floor(stats.quantity / stats.requiredQuantity);
-      if (candidate.max_usos_por_reserva != null) {
-        const maxUses = Number(candidate.max_usos_por_reserva);
-        if (Number.isFinite(maxUses) && maxUses > 0) {
-          blocks = Math.min(blocks, Math.floor(maxUses));
-        }
-      }
-      const bonusUnits = blocks * stats.bonusQuantity;
-      discount = bonusUnits * stats.unitPrice;
-    }
+  } else if (isBonificationPromotion(candidate)) {
+    discount = calculateBonificationPlan(context, candidate, eligibleLines).discount;
   }
   if (!Number.isFinite(discount) || discount <= 0) return 0;
   if (maxDiscount != null && Number.isFinite(maxDiscount)) {
@@ -191,6 +365,23 @@ export function calculateDiscount(context = {}, candidate = {}) {
   }
   discount = Math.min(discount, subtotal);
   return Number(discount.toFixed(2));
+}
+
+function buildLineAllocations(context = {}, candidate = {}, eligibleLines = [], discount = 0) {
+  if (isBonificationPromotion(candidate)) {
+    const plan = calculateBonificationPlan(context, candidate, eligibleLines);
+    if (plan.allocations.length) {
+      let remaining = normalizeMoney(discount);
+      return plan.allocations
+        .map((allocation) => {
+          const amount = normalizeMoney(Math.min(Number(allocation.descuento_hnl || 0), remaining));
+          remaining = normalizeMoney(Math.max(0, remaining - amount));
+          return { ...allocation, descuento_hnl: amount };
+        })
+        .filter((allocation) => Number(allocation.descuento_hnl || 0) > 0);
+    }
+  }
+  return allocateDiscountAcrossLines(eligibleLines, discount);
 }
 
 export function validatePromotionCandidate(context = {}, candidate = {}) {
@@ -371,7 +562,10 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       id_promocion_regla: row.id_promocion_regla,
       titulo: row.nombre_promocion_snapshot || "Promocion",
       aplica_a_codigo: row.aplica_a_codigo,
-      tipo_descuento_codigo: row.tipo_descuento_codigo,
+      tipo_descuento_codigo: normalizeDiscountType(row),
+      mecanica: row.mecanica || null,
+      scope_evaluacion_codigo: row.scope_evaluacion_codigo || null,
+      bonificacion_modo_codigo: row.bonificacion_modo_codigo || null,
       valor_descuento: Number(row.valor_descuento || 0),
       base_calculo_hnl: Number(row.base_calculo_hnl || 0),
       descuento_calculado_hnl: Number(row.descuento_calculado_hnl || 0),
@@ -398,7 +592,10 @@ export function buildPromotionResult(context = {}, resolved = {}) {
       motivo_codigo: row.reasonCode || "PROMOCION_NO_ELEGIBLE",
       motivo: row.reason || "La promocion no fue elegible para esta reserva.",
       aplica_a_codigo: row.aplica_a_codigo,
-      tipo_descuento_codigo: row.tipo_descuento_codigo,
+      tipo_descuento_codigo: normalizeDiscountType(row),
+      mecanica: row.mecanica || null,
+      scope_evaluacion_codigo: row.scope_evaluacion_codigo || null,
+      bonificacion_modo_codigo: row.bonificacion_modo_codigo || null,
       valor_descuento: Number(row.valor_descuento || 0),
       prioridad_aplicacion: Number(row.prioridad_aplicacion || 100),
       id_promocion_sucursal: row.id_promocion_sucursal || null,
@@ -490,12 +687,13 @@ export function evaluatePromotions(context = {}, candidates = [], usageStats = {
     const applicableCode = findApplicablePromotionCode(context, candidate);
     const discount = isValid ? calculateDiscount(context, candidate) : 0;
     const lineAllocations = isValid && discount > 0
-      ? allocateDiscountAcrossLines(eligibleLines, discount)
+      ? buildLineAllocations(context, candidate, eligibleLines, discount)
       : [];
 
     const targetKeys = (() => {
       const keys = [];
       const applyCode = String(candidate.aplica_a_codigo || "reserva");
+      const scope = normalizeEvaluationScope(candidate);
       if (applyCode === "servicio") {
         for (const item of candidate.items || []) {
           if (item.id_servicio) keys.push(`servicio:${item.id_servicio}`);
@@ -504,6 +702,10 @@ export function evaluatePromotions(context = {}, candidates = [], usageStats = {
         for (const item of candidate.items || []) {
           if (item.id_paquete) keys.push(`paquete:${item.id_paquete}`);
         }
+      } else if (scope === "integrante") {
+        keys.push(`integrante:${context.id_cita_integrante || context.orden_integrante || "actual"}`);
+      } else if (scope === "cita") {
+        keys.push(`cita:${context.id_cita || context.orden_integrante || "actual"}`);
       } else {
         keys.push(`grupo:${context.id_grupo_cita || "reserva"}`);
       }
