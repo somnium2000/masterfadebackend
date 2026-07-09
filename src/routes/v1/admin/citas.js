@@ -1759,8 +1759,15 @@ export default async function adminCitasRoutes(app) {
           details: { id_sucursal: requestedBranchId },
         });
       }
+      if (!app.dbListenPool) {
+        const message = "DATABASE_LISTEN_URL required for LISTEN/NOTIFY when DATABASE_URL uses Supabase transaction pooler 6543.";
+        request.log.error({ err: app.dbListenConfigError || null }, message);
+        throw new AppError(503, message, {
+          code: "ADMIN_CITAS_OPERATIVE_EVENTS_LISTEN_CONFIG_REQUIRED",
+        });
+      }
 
-      listenClient = await app.db.connect();
+      listenClient = await app.dbListenPool.connect();
       await listenClient.query(`LISTEN ${OPERATIONAL_EVENTS_CHANNEL}`);
 
       const originHeader = String(request.headers?.origin || "").trim();
