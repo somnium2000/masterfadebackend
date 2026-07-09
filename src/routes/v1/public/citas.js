@@ -46,7 +46,11 @@ import {
   buildCanonicalHoldResponse,
   createBookingHold,
 } from "../../../services/booking/bookingHoldOrchestrationService.js";
-import { recordPromotionApplications } from "../../../services/promociones/promocionesService.js";
+import {
+  isGroupScopedBonificationPromotion,
+  previewGroupBonificationPromotions,
+  recordPromotionApplications,
+} from "../../../services/promociones/promocionesService.js";
 
 const requestIdSchema = { type: "string" };
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -305,6 +309,141 @@ function buildPromotionRecordForOption({ integrante, promotionResult, detailRows
     },
     detailRows,
   };
+}
+
+function buildExistingDiscountAllocations(detailRows = []) {
+  return (Array.isArray(detailRows) ? detailRows : [])
+    .filter((row) => Number(row?.descuento_hnl || 0) > 0 && row?.line_key)
+    .map((row) => ({
+      line_key: row.line_key,
+      source_type: "promotion",
+      source_id: "existing_booking_discount",
+      descuento_hnl: normalizeMoney(row.descuento_hnl),
+    }));
+}
+
+function buildGroupPromotionContextFromIntegrantes({
+  branch,
+  clientProfile,
+  integrantes = [],
+}) {
+  const first = integrantes[0] || {};
+  const startDateTime = normalizeOperationalDateTime(first.selection?.startDateTime, "fecha_inicio");
+  const discountLines = [];
+  const serviceItems = [];
+  for (const integrante of integrantes) {
+    for (const row of Array.isArray(integrante.detailRows) ? integrante.detailRows : []) {
+      const baseLine = {
+        ...row,
+        orden_integrante: integrante.orden_integrante,
+        descuento_previo_hnl: normalizeMoney(row.descuento_hnl),
+        base_disponible_hnl: normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0))),
+      };
+      discountLines.push(baseLine);
+      serviceItems.push(baseLine);
+    }
+  }
+  const subtotal = normalizeMoney(discountLines.reduce((sum, row) => sum + Number(row.base_disponible_hnl || 0), 0));
+  return {
+    id_sucursal: branch.id_sucursal,
+    id_empleado_barbero: first.selection?.barber?.id_empleado || null,
+    id_cliente: clientProfile.id_cliente,
+    id_persona: clientProfile.id_persona,
+    id_grupo_cita: null,
+    fecha_hora: startDateTime.iso_utc,
+    fecha: startDateTime.fecha_operativa,
+    fecha_operativa: startDateTime.fecha_operativa,
+    hora: startDateTime.hora_operativa,
+    subtotal_hnl: subtotal,
+    servicios: serviceItems,
+    discount_lines: discountLines,
+    paquetes: [],
+    canal: "public",
+    es_cliente_autenticado: false,
+    es_titular: true,
+  };
+}
+
+function filterPromotionResultByLineKeys(result = {}, lineKeys = new Set()) {
+  const applied = [];
+  for (const promotion of result.promociones_aplicadas || []) {
+    const allocations = (promotion.line_allocations || [])
+      .filter((allocation) => lineKeys.has(String(allocation?.line_key || "").trim()));
+    const discount = normalizeMoney(allocations.reduce((sum, allocation) => sum + Number(allocation.descuento_hnl || 0), 0));
+    if (discount <= 0) continue;
+    applied.push({
+      ...promotion,
+      descuento_calculado_hnl: discount,
+      line_allocations: allocations,
+      targetLineKeys: allocations.map((allocation) => allocation.line_key),
+    });
+  }
+  return {
+    promociones_aplicadas: applied,
+    promociones_descartadas: [],
+  };
+}
+
+function applyGroupPromotionResultToIntegrantes(integrantes = [], groupContext = {}, groupResult = {}, {
+  bookingIsvEnabled = false,
+} = {}) {
+  if (!Array.isArray(groupResult.promociones_aplicadas) || !groupResult.promociones_aplicadas.length) return [];
+  const records = [];
+  for (const integrante of integrantes) {
+    const lineKeys = new Set((integrante.detailRows || []).map((row) => String(row?.line_key || "").trim()).filter(Boolean));
+    if (!lineKeys.size) continue;
+    const filteredResult = filterPromotionResultByLineKeys(groupResult, lineKeys);
+    if (!filteredResult.promociones_aplicadas.length) continue;
+
+    const groupAllocations = filteredResult.promociones_aplicadas.flatMap((promotion) => (
+      (promotion.line_allocations || []).map((allocation) => ({
+        line_key: allocation.line_key,
+        source_type: "promotion",
+        source_id: promotion.id_promocion_regla,
+        id_promocion: promotion.id_promocion,
+        id_promocion_regla: promotion.id_promocion_regla,
+        descuento_hnl: allocation.descuento_hnl,
+      }))
+    ));
+    const existingAllocations = buildExistingDiscountAllocations(integrante.detailRows);
+    const totalDiscount = normalizeMoney([...existingAllocations, ...groupAllocations]
+      .reduce((sum, allocation) => sum + Number(allocation.descuento_hnl || 0), 0));
+    const discountPlan = buildDiscountPlan(integrante.detailRows, [...existingAllocations, ...groupAllocations]);
+    const detailRows = buildAppointmentDetailRows(integrante.selection.serviceSelection.items || [], {
+      descuentoTotalHnl: totalDiscount,
+      discountPlan,
+      ordenIntegrante: integrante.orden_integrante,
+      bookingIsvEnabled,
+    });
+    const subtotal = normalizeMoney(detailRows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
+    const total = normalizeMoney(detailRows.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0));
+
+    integrante.detailRows = detailRows;
+    integrante.descuentoHnl = totalDiscount;
+    integrante.discountPlan = discountPlan;
+    integrante._response_totals = {
+      subtotalHnl: subtotal,
+      descuentoHnl: totalDiscount,
+      totalHnl: total,
+    };
+    integrante._promotion_result = {
+      aplicadas: [
+        ...(integrante._promotion_result?.aplicadas || []),
+        ...filteredResult.promociones_aplicadas,
+      ],
+      descartadas: integrante._promotion_result?.descartadas || [],
+      context: integrante._promotion_result?.context || groupContext,
+    };
+    const record = {
+      order: integrante.orden_integrante,
+      context: groupContext,
+      result: filteredResult,
+      detailRows,
+    };
+    integrante._group_promotion_record = record;
+    records.push(record);
+  }
+  return records;
 }
 
 async function buildPublicCanonicalOption(dbClient, {
@@ -1059,7 +1198,20 @@ async function resolveRequestedPromotionsForPublicHold(client, {
     });
   }
 
-  const ruleIds = candidates.map((row) => row.id_promocion_regla);
+  const groupCandidateKeys = new Set(candidates
+    .filter((candidate) => isGroupScopedBonificationPromotion(candidate))
+    .map(buildPromotionRequestKey));
+  const immediateCandidates = candidates.filter((candidate) => !isGroupScopedBonificationPromotion(candidate));
+  if (!immediateCandidates.length) {
+    return {
+      descuento_hnl: 0,
+      aplicadas: [],
+      descartadas: [],
+      context: promoContext,
+    };
+  }
+
+  const ruleIds = immediateCandidates.map((row) => row.id_promocion_regla);
   const [codeRows, compatibilityRows, usageStats] = await Promise.all([
     getPromotionCodesByRules(client, ruleIds),
     getPromotionCompatibility(client, ruleIds),
@@ -1068,7 +1220,7 @@ async function resolveRequestedPromotionsForPublicHold(client, {
   const codesByRule = buildPromotionCodesByRule(codeRows);
   const evaluated = evaluatePromotions(
     promoContext,
-    candidates.map((candidate) => ({
+    immediateCandidates.map((candidate) => ({
       ...candidate,
       codes: codesByRule.get(candidate.id_promocion_regla) || [],
     })),
@@ -1077,11 +1229,22 @@ async function resolveRequestedPromotionsForPublicHold(client, {
   const resolved = resolvePromotionConflicts(promoContext, evaluated, buildPromotionCompatibilityMap(compatibilityRows));
   const result = buildPromotionResult(promoContext, resolved);
   const appliedKeys = new Set((result.promociones_aplicadas || []).map(buildPromotionRequestKey));
-  const rejectedRequest = requestedPromotions.find((promotion) => !appliedKeys.has(buildPromotionRequestKey(promotion)));
+  const rejectedRequest = requestedPromotions.find((promotion) => {
+    const key = buildPromotionRequestKey(promotion);
+    return !groupCandidateKeys.has(key) && !appliedKeys.has(key);
+  });
   if (rejectedRequest) {
     const rejectedKey = buildPromotionRequestKey(rejectedRequest);
     const discarded = (result.promociones_descartadas || []).find((row) => buildPromotionRequestKey(row) === rejectedKey);
     const evaluatedRejected = evaluated.find((row) => buildPromotionRequestKey(row) === rejectedKey);
+    if (isGroupScopedBonificationPromotion(evaluatedRejected || discarded)) {
+      return {
+        descuento_hnl: normalizeMoney(result.descuento_total_hnl),
+        aplicadas: (result.promociones_aplicadas || []).filter((row) => !isGroupScopedBonificationPromotion(row)),
+        descartadas: (result.promociones_descartadas || []).filter((row) => !isGroupScopedBonificationPromotion(row)),
+        context: promoContext,
+      };
+    }
     throw new AppError(409, "La promocion seleccionada no aplica para esta reserva", {
       code: "PUBLIC_CITAS_PROMOTION_NOT_APPLICABLE",
       details: {
@@ -1610,6 +1773,42 @@ export default async function publicCitasRoutes(app) {
           canonicalIntegrantes.push(canonicalIntegrante);
         }
 
+        const requestedGroupPromotions = integrantes.flatMap((integrante) => (
+          Array.isArray(integrante.promociones) ? integrante.promociones : []
+        ));
+        const groupPromotionContext = requestedGroupPromotions.length
+          ? buildGroupPromotionContextFromIntegrantes({
+            branch,
+            clientProfile,
+            integrantes: canonicalIntegrantes,
+          })
+          : null;
+        const groupPromotionResult = groupPromotionContext
+          ? await previewGroupBonificationPromotions(dbClient, groupPromotionContext, {
+            requestedPromotions: requestedGroupPromotions,
+            publicOnly: true,
+          })
+          : null;
+        const rejectedGroupPromotion = groupPromotionResult?.evaluated?.find((row) => (
+          isGroupScopedBonificationPromotion(row)
+          && row.isValid !== true
+          && requestedGroupPromotions.some((promotion) => buildPromotionRequestKey(promotion) === buildPromotionRequestKey(row))
+        ));
+        if (rejectedGroupPromotion) {
+          throw new AppError(409, "La promocion seleccionada no aplica para esta reserva", {
+            code: "PUBLIC_CITAS_PROMOTION_NOT_APPLICABLE",
+            details: {
+              field: "promociones",
+              reason: rejectedGroupPromotion.reasonCode || "PROMOCION_NO_APLICADA",
+            },
+          });
+        }
+        if (groupPromotionResult?.promociones_aplicadas?.length) {
+          applyGroupPromotionResultToIntegrantes(canonicalIntegrantes, groupPromotionContext, groupPromotionResult, {
+            bookingIsvEnabled: app.config?.bookingIsvEnabled,
+          });
+        }
+
         const canonicalPayload = buildCanonicalReservationPayload({
           requestId,
           idSucursal: branch.id_sucursal,
@@ -1643,6 +1842,7 @@ export default async function publicCitasRoutes(app) {
         totalGrupo = selectedTotals.total_hnl;
         for (const integrante of selectedIntegrantes) {
           if (integrante._promotion_record) pendingPromotionRecords.push(integrante._promotion_record);
+          if (integrante._group_promotion_record) pendingPromotionRecords.push(integrante._group_promotion_record);
           for (const appliedPromotion of integrante._promotion_result?.aplicadas || []) {
             promocionesAplicadasGrupo.push({
               ...appliedPromotion,
@@ -1673,6 +1873,9 @@ export default async function publicCitasRoutes(app) {
               id_grupo_cita: canonicalResult.id_grupo_cita,
               id_cita: block.id_cita,
               id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
+              id_hold: block.id_hold || null,
+              reservado_expires_at: block.expires_at || canonicalResult.expires_at || null,
+              idempotency_key: requestId,
               detailRows,
             },
             promotionRecord.result,
@@ -1898,6 +2101,7 @@ export default async function publicCitasRoutes(app) {
         const hasConsumedHold = holdsResult.rows.some((row) => (
           String(row.estado_hold_codigo || "").trim().toLowerCase() === "consumido"
         ));
+        const holdIds = holdsResult.rows.map((row) => row.id_hold).filter(Boolean);
         if (hasConsumedHold) {
           throw new AppError(409, "La reserva temporal ya no puede liberarse", {
             code: "PUBLIC_CITAS_HOLD_RELEASE_CONSUMED",
@@ -1942,11 +2146,15 @@ export default async function publicCitasRoutes(app) {
           `
             UPDATE public.promociones_usos
             SET estado_uso_codigo = 'cancelado',
+                liberado_at = COALESCE(liberado_at, now()),
                 updated_at = now()
-            WHERE id_grupo_cita = $1::uuid
+            WHERE (
+                id_hold = ANY($2::uuid[])
+                OR (id_hold IS NULL AND id_grupo_cita = $1::uuid)
+              )
               AND estado_uso_codigo = 'reservado'
           `,
-          [groupId]
+          [groupId, holdIds]
         );
         await dbClient.query("COMMIT");
         transactionStarted = false;

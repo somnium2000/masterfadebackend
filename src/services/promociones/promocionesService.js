@@ -46,6 +46,44 @@ function normalizeMoney(value) {
   return Number(amount.toFixed(2));
 }
 
+function normalizePromotionDiscountType(item = {}) {
+  const type = String(item.tipo_descuento_codigo || "").trim().toLowerCase();
+  const mecanica = String(item.mecanica || "").trim().toLowerCase();
+  if (type === "bonificacion" || mecanica === "dos_por_uno") return "bonificacion";
+  return type || "monto_fijo";
+}
+
+export function isGroupScopedBonificationPromotion(item = {}) {
+  return normalizePromotionDiscountType(item) === "bonificacion"
+    && String(item.scope_evaluacion_codigo || "").trim().toLowerCase() === "grupo_cita";
+}
+
+async function resolvePromotionHoldContext(db, context = {}, usageState = null) {
+  const holdContext = {
+    id_hold: context.id_hold || null,
+    reservado_expires_at: context.reservado_expires_at || context.hold_expires_at || context.expires_at || null,
+  };
+  if (usageState !== "reservado" || !context.id_cita || (holdContext.id_hold && holdContext.reservado_expires_at)) {
+    return holdContext;
+  }
+
+  const result = await db.query(
+    `
+      SELECT id_hold, expires_at
+      FROM public.citas_holds
+      WHERE id_cita = $1::uuid
+        AND estado_hold_codigo = 'activo'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+    [context.id_cita]
+  );
+  return {
+    id_hold: holdContext.id_hold || result.rows[0]?.id_hold || null,
+    reservado_expires_at: holdContext.reservado_expires_at || result.rows[0]?.expires_at || null,
+  };
+}
+
 function getPromotionTargetServiceIds(item = {}) {
   const ids = new Set();
   for (const target of Array.isArray(item.target_items) ? item.target_items : []) {
@@ -162,8 +200,11 @@ function buildScopedPromotionPayloads(base = {}, context = {}, item = {}) {
   return [];
 }
 
-export async function previewPromotionsForAppointment(db, context = {}) {
-  const candidates = await getCandidatePromotionRules(db, context);
+export async function previewPromotionsForAppointment(db, context = {}, options = {}) {
+  const allCandidates = await getCandidatePromotionRules(db, context);
+  const candidates = options.includeGroupBonifications === false
+    ? allCandidates.filter((candidate) => !isGroupScopedBonificationPromotion(candidate))
+    : allCandidates;
   if (!candidates.length) {
     return {
       subtotal_hnl: Number(context.subtotal_hnl || 0),
@@ -200,9 +241,67 @@ export async function previewPromotionsForAppointment(db, context = {}) {
   };
 }
 
+export async function previewGroupBonificationPromotions(db, context = {}, options = {}) {
+  const requestedKeys = Array.isArray(options.requestedPromotions)
+    ? new Set(options.requestedPromotions.map((promotion) => [
+      String(promotion?.id_promocion || "").trim(),
+      String(promotion?.id_promocion_regla || "").trim(),
+    ].join(":")))
+    : null;
+  const allCandidates = await getCandidatePromotionRules(db, context);
+  const candidates = allCandidates.filter((candidate) => {
+    if (!isGroupScopedBonificationPromotion(candidate)) return false;
+    if (options.publicOnly === true && candidate.visible_publico !== true) return false;
+    if (!requestedKeys) return true;
+    const key = [
+      String(candidate.id_promocion || "").trim(),
+      String(candidate.id_promocion_regla || "").trim(),
+    ].join(":");
+    return requestedKeys.has(key);
+  });
+  if (!candidates.length) {
+    return {
+      subtotal_hnl: Number(context.subtotal_hnl || 0),
+      descuento_total_hnl: 0,
+      total_hnl: Number(context.subtotal_hnl || 0),
+      promociones_aplicadas: [],
+      promociones_descartadas: [],
+      evaluated: [],
+      resolved: { applied: [], discarded: [] },
+      usedFallbackLegacy: false,
+    };
+  }
+
+  const ruleIds = candidates.map((row) => row.id_promocion_regla);
+  const [codeRows, compatibilityRows, usageStats] = await Promise.all([
+    getPromotionCodesByRules(db, ruleIds),
+    getPromotionCompatibility(db, ruleIds),
+    getPromotionUsageStats(db, context, ruleIds),
+  ]);
+  const codesByRule = buildCodesByRule(codeRows);
+  const evaluated = evaluatePromotions(
+    context,
+    candidates.map((candidate) => ({
+      ...candidate,
+      codes: codesByRule.get(candidate.id_promocion_regla) || [],
+    })),
+    usageStats
+  );
+  const resolved = resolvePromotionConflicts(context, evaluated, buildCompatibilityMap(compatibilityRows));
+  const result = buildPromotionResult(context, resolved);
+  return {
+    ...result,
+    evaluated,
+    resolved,
+    usedFallbackLegacy: false,
+  };
+}
+
 export async function recordPromotionApplications(db, context = {}, result = {}, options = {}) {
   const isFormal = options.formal === true;
   const usageState = options.usageState || (isFormal ? "consumido" : null);
+  const holdContext = await resolvePromotionHoldContext(db, context, usageState);
+  const calculatedAtCode = context.calculado_en_codigo || options.calculadoEnCodigo || (usageState === "reservado" ? "hold" : null);
   const inserted = { aplicadas: [], descartadas: [], usos: [] };
 
   for (const applied of result.promociones_aplicadas || []) {
@@ -215,7 +314,7 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       codigo_promocional_snapshot: applied.codigo_promocional_snapshot || null,
       aplica_a_codigo: applied.aplica_a_codigo,
       nombre_promocion_snapshot: applied.titulo,
-      tipo_descuento_codigo: applied.tipo_descuento_codigo,
+      tipo_descuento_codigo: normalizePromotionDiscountType(applied),
       valor_descuento: applied.valor_descuento,
       base_calculo_hnl: applied.base_calculo_hnl,
       descuento_calculado_hnl: applied.descuento_calculado_hnl,
@@ -223,6 +322,8 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       es_acumulable: applied.es_acumulable,
       estado_aplicacion_codigo: "aplicada",
       motivo_no_aplicada: null,
+      id_hold: holdContext.id_hold,
+      calculado_en_codigo: calculatedAtCode,
     }, context, applied);
 
     for (const appliedPayload of appliedPayloads) {
@@ -242,6 +343,10 @@ export async function recordPromotionApplications(db, context = {}, result = {},
           id_empleado_barbero: context.id_empleado_barbero || null,
           fecha_operativa: normalizeDate(context.fecha_operativa || context.fecha),
           estado_uso_codigo: usageState,
+          id_hold: holdContext.id_hold,
+          reservado_expires_at: usageState === "reservado" ? holdContext.reservado_expires_at : null,
+          liberado_at: null,
+          idempotency_key: context.idempotency_key || null,
         });
         inserted.usos.push(idUso);
       }
@@ -262,7 +367,7 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       codigo_promocional_snapshot: discarded.codigo_promocional_snapshot || null,
       aplica_a_codigo: discarded.aplica_a_codigo || "reserva",
       nombre_promocion_snapshot: discarded.titulo,
-      tipo_descuento_codigo: discarded.tipo_descuento_codigo || "monto_fijo",
+      tipo_descuento_codigo: normalizePromotionDiscountType(discarded),
       valor_descuento: discarded.valor_descuento || 0,
       base_calculo_hnl: Number(context.subtotal_hnl || 0),
       descuento_calculado_hnl: 0,
@@ -270,6 +375,8 @@ export async function recordPromotionApplications(db, context = {}, result = {},
       es_acumulable: false,
       estado_aplicacion_codigo: status,
       motivo_no_aplicada: discarded.motivo || "No elegible",
+      id_hold: holdContext.id_hold,
+      calculado_en_codigo: calculatedAtCode,
     }, context, discarded);
 
     for (const discardedPayload of discardedPayloads) {
@@ -300,6 +407,7 @@ export async function revertPromotionUsages(db, context = {}) {
     `
       UPDATE public.promociones_usos pu
       SET estado_uso_codigo = 'revertido',
+          liberado_at = COALESCE(liberado_at, now()),
           updated_at = now()
       WHERE pu.id_grupo_cita = $1::uuid
         AND pu.estado_uso_codigo IN ('reservado', 'consumido')
@@ -382,6 +490,8 @@ export async function markPromotionUsagesForGroup(db, context = {}) {
       id_empleado_barbero: row.id_empleado_barbero || context.id_empleado_barbero || null,
       fecha_operativa: dateRef,
       estado_uso_codigo: "consumido",
+      id_hold: context.id_hold || null,
+      idempotency_key: context.idempotency_key || null,
     });
   }
 

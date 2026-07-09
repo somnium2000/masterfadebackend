@@ -36,12 +36,14 @@ import {
   resolveRewardRedeemGateForCliente,
 } from "../pointsService.js";
 import {
+  previewGroupBonificationPromotions,
   previewPromotionsForAppointment,
   recordPromotionApplications,
   markPromotionUsagesForGroup,
   revertPromotionUsages,
 } from "../promociones/promocionesService.js";
 import { buildPromotionResult } from "../promociones/promocionesEngine.js";
+import { buildDiscountPlan } from "../bookingDiscounts.js";
 import { AppError } from "../../utils/errors.js";
 import { buildCanonicalHoldResponse, createBookingHold } from "./bookingHoldOrchestrationService.js";
 
@@ -321,6 +323,141 @@ function normalizeMoney(value) {
   const parsed = Number(value ?? 0);
   if (!Number.isFinite(parsed) || parsed < 0) return 0;
   return Number(parsed.toFixed(2));
+}
+
+function buildExistingDiscountAllocations(detailRows = []) {
+  return (Array.isArray(detailRows) ? detailRows : [])
+    .filter((row) => Number(row?.descuento_hnl || 0) > 0 && row?.line_key)
+    .map((row) => ({
+      line_key: row.line_key,
+      source_type: "promotion",
+      source_id: "existing_booking_discount",
+      descuento_hnl: normalizeMoney(row.descuento_hnl),
+    }));
+}
+
+function buildGroupPromotionContextFromIntegrantes({
+  branch,
+  customer,
+  integrantes = [],
+  codigoPromocional = null,
+}) {
+  const first = integrantes[0] || {};
+  const promoDateTime = normalizeOperationalDateTime(first.selection?.startDateTime, "fecha_inicio");
+  const discountLines = [];
+  const serviceItems = [];
+  for (const integrante of integrantes) {
+    for (const row of Array.isArray(integrante.detailRows) ? integrante.detailRows : []) {
+      const baseLine = {
+        ...row,
+        orden_integrante: integrante.orden_integrante,
+        descuento_previo_hnl: normalizeMoney(row.descuento_hnl),
+        base_disponible_hnl: normalizeMoney(Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0))),
+      };
+      discountLines.push(baseLine);
+      serviceItems.push(baseLine);
+    }
+  }
+  const subtotal = normalizeMoney(discountLines.reduce((sum, row) => sum + Number(row.base_disponible_hnl || 0), 0));
+  return {
+    id_sucursal: branch.id_sucursal,
+    id_empleado_barbero: first.selection?.barber?.id_empleado || null,
+    id_cliente: customer.id_cliente,
+    id_persona: customer.id_persona,
+    id_grupo_cita: null,
+    fecha_hora: promoDateTime.iso_utc,
+    fecha: promoDateTime.fecha_operativa,
+    fecha_operativa: promoDateTime.fecha_operativa,
+    hora: promoDateTime.hora_operativa,
+    subtotal_hnl: subtotal,
+    servicios: serviceItems,
+    discount_lines: discountLines,
+    paquetes: [],
+    codigo_promocional: codigoPromocional || null,
+    canal: "privado",
+    es_cliente_autenticado: Boolean(customer.id_usuario),
+    es_titular: true,
+  };
+}
+
+function filterPromotionResultByLineKeys(result = {}, lineKeys = new Set()) {
+  const applied = [];
+  for (const promotion of result.promociones_aplicadas || []) {
+    const allocations = (promotion.line_allocations || [])
+      .filter((allocation) => lineKeys.has(String(allocation?.line_key || "").trim()));
+    const discount = normalizeMoney(allocations.reduce((sum, allocation) => sum + Number(allocation.descuento_hnl || 0), 0));
+    if (discount <= 0) continue;
+    applied.push({
+      ...promotion,
+      descuento_calculado_hnl: discount,
+      line_allocations: allocations,
+      targetLineKeys: allocations.map((allocation) => allocation.line_key),
+    });
+  }
+  return {
+    promociones_aplicadas: applied,
+    promociones_descartadas: [],
+  };
+}
+
+function applyGroupPromotionResultToIntegrantes(integrantes = [], groupContext = {}, groupResult = {}, {
+  bookingIsvEnabled = false,
+} = {}) {
+  if (!Array.isArray(groupResult.promociones_aplicadas) || !groupResult.promociones_aplicadas.length) return [];
+  const records = [];
+  for (const integrante of integrantes) {
+    const lineKeys = new Set((integrante.detailRows || []).map((row) => String(row?.line_key || "").trim()).filter(Boolean));
+    if (!lineKeys.size) continue;
+    const filteredResult = filterPromotionResultByLineKeys(groupResult, lineKeys);
+    if (!filteredResult.promociones_aplicadas.length) continue;
+
+    const groupAllocations = filteredResult.promociones_aplicadas.flatMap((promotion) => (
+      (promotion.line_allocations || []).map((allocation) => ({
+        line_key: allocation.line_key,
+        source_type: "promotion",
+        source_id: promotion.id_promocion_regla,
+        id_promocion: promotion.id_promocion,
+        id_promocion_regla: promotion.id_promocion_regla,
+        descuento_hnl: allocation.descuento_hnl,
+      }))
+    ));
+    const existingAllocations = buildExistingDiscountAllocations(integrante.detailRows);
+    const totalDiscount = normalizeMoney([...existingAllocations, ...groupAllocations]
+      .reduce((sum, allocation) => sum + Number(allocation.descuento_hnl || 0), 0));
+    const discountPlan = buildDiscountPlan(integrante.detailRows, [...existingAllocations, ...groupAllocations]);
+    const detailRows = buildAppointmentDetailRows(integrante.selection.serviceSelection.items || [], {
+      descuentoTotalHnl: totalDiscount,
+      discountPlan,
+      origenItemCodigo: "admin_servicio_manual",
+      ordenIntegrante: integrante.orden_integrante,
+      bookingIsvEnabled,
+    });
+    const subtotal = normalizeMoney(detailRows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
+    const total = normalizeMoney(detailRows.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0));
+
+    integrante.detailRows = detailRows;
+    integrante._response_totals = {
+      ...(integrante._response_totals || {}),
+      subtotal_hnl: subtotal,
+      descuento_hnl: totalDiscount,
+      total_hnl: total,
+    };
+    if (integrante._benefits) {
+      integrante._benefits.promotionDiscountHnl = normalizeMoney(
+        Number(integrante._benefits.promotionDiscountHnl || 0)
+        + filteredResult.promociones_aplicadas.reduce((sum, promotion) => sum + Number(promotion.descuento_calculado_hnl || 0), 0)
+      );
+    }
+    const record = {
+      order: integrante.orden_integrante,
+      context: groupContext,
+      result: filteredResult,
+      detailRows,
+    };
+    integrante._group_promotions_record = record;
+    records.push(record);
+  }
+  return records;
 }
 
 function normalizeNewClientPayload(raw = {}) {
@@ -613,7 +750,9 @@ async function buildAdminCanonicalOption(dbClient, {
     es_cliente_autenticado: Boolean(customer.id_usuario),
     es_titular: isTitular,
   };
-  let promotionsPreview = await previewPromotionsForAppointment(dbClient, promotionContext);
+  let promotionsPreview = await previewPromotionsForAppointment(dbClient, promotionContext, {
+    includeGroupBonifications: false,
+  });
   promotionsPreview = applyManualPromotionSelection(promotionsPreview, {
     benefits: benefitContext.benefits,
     adminContext,
@@ -767,6 +906,19 @@ async function createCanonicalAdminReservation(app, dbClient, {
     }));
   }
 
+  const groupPromotionContext = buildGroupPromotionContextFromIntegrantes({
+    branch,
+    customer,
+    integrantes: canonicalIntegrantes,
+    codigoPromocional: request.body?.codigo_promocional || null,
+  });
+  const groupPromotionResult = await previewGroupBonificationPromotions(dbClient, groupPromotionContext);
+  if (groupPromotionResult.promociones_aplicadas?.length) {
+    applyGroupPromotionResultToIntegrantes(canonicalIntegrantes, groupPromotionContext, groupPromotionResult, {
+      bookingIsvEnabled: app.config?.bookingIsvEnabled,
+    });
+  }
+
   const canonicalPayload = buildCanonicalReservationPayload({
     requestId,
     idSucursal: branch.id_sucursal,
@@ -808,27 +960,53 @@ async function createCanonicalAdminReservation(app, dbClient, {
   for (const key of Object.keys(totalsByBenefit)) totalsByBenefit[key] = normalizeMoney(totalsByBenefit[key]);
 
   for (const integrante of selectedIntegrantes) {
-    const preview = integrante._benefits?.promotionsPreview;
-    if (!preview || preview.usedFallbackLegacy) continue;
     const block = blocksByOrder.get(Number(integrante.orden_integrante || 0));
     if (!block?.id_cita) continue;
-    const detailRows = await loadCanonicalPromotionDetailRows(dbClient, {
-      idCita: block.id_cita,
-      detailRows: integrante.detailRows,
-      canonicalBlock: block,
-    });
-    await recordPromotionApplications(
-      dbClient,
-      {
-        ...integrante._benefits.promotionsContext,
-        id_grupo_cita: canonicalResult.id_grupo_cita,
-        id_cita: block.id_cita,
-        id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
-        detailRows,
-      },
-      preview,
-      { formal: true, usageState: "reservado" }
-    );
+    const preview = integrante._benefits?.promotionsPreview;
+    if (preview && !preview.usedFallbackLegacy) {
+      const detailRows = await loadCanonicalPromotionDetailRows(dbClient, {
+        idCita: block.id_cita,
+        detailRows: integrante.detailRows,
+        canonicalBlock: block,
+      });
+      await recordPromotionApplications(
+        dbClient,
+        {
+          ...integrante._benefits.promotionsContext,
+          id_grupo_cita: canonicalResult.id_grupo_cita,
+          id_cita: block.id_cita,
+          id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
+          id_hold: block.id_hold || null,
+          reservado_expires_at: block.expires_at || canonicalResult.expires_at || null,
+          idempotency_key: requestId,
+          detailRows,
+        },
+        preview,
+        { formal: true, usageState: "reservado" }
+      );
+    }
+    if (integrante._group_promotions_record) {
+      const detailRows = await loadCanonicalPromotionDetailRows(dbClient, {
+        idCita: block.id_cita,
+        detailRows: integrante._group_promotions_record.detailRows,
+        canonicalBlock: block,
+      });
+      await recordPromotionApplications(
+        dbClient,
+        {
+          ...integrante._group_promotions_record.context,
+          id_grupo_cita: canonicalResult.id_grupo_cita,
+          id_cita: block.id_cita,
+          id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
+          id_hold: block.id_hold || null,
+          reservado_expires_at: block.expires_at || canonicalResult.expires_at || null,
+          idempotency_key: requestId,
+          detailRows,
+        },
+        integrante._group_promotions_record.result,
+        { formal: true, usageState: "reservado" }
+      );
+    }
   }
 
   const bloques = selectedIntegrantes.map((integrante) => {
