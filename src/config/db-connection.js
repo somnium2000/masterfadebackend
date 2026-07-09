@@ -25,18 +25,18 @@ function parseDatabaseName(pathname) {
   return raw || "postgres";
 }
 
-function parseTargetFromDatabaseUrl(connectionString) {
+function parseTargetFromDatabaseUrl(connectionString, source = "DATABASE_URL") {
   let url;
   try {
     url = new URL(connectionString);
   } catch {
     throw new Error(
-      "DATABASE_URL no es valida. Usa formato postgresql://usuario:password@host:puerto/db"
+      `${source} no es valida. Usa formato postgresql://usuario:password@host:puerto/db`
     );
   }
 
   return {
-    source: "DATABASE_URL",
+    source,
     host: url.hostname,
     port: url.port ? toInt(url.port, 5432) : 5432,
     user: decodeURIComponent(url.username || ""),
@@ -79,6 +79,10 @@ function isSupabasePoolerHost(host = "") {
 function isSupabaseDirectHost(host = "") {
   const value = host.toLowerCase();
   return value.startsWith("db.") && value.endsWith(".supabase.co");
+}
+
+function isSupabaseTransactionPoolerTarget(target) {
+  return isSupabasePoolerHost(target?.host) && Number(target?.port) === 6543;
 }
 
 function isPoolerTarget(target) {
@@ -194,6 +198,27 @@ function getPoolOptions() {
   };
 }
 
+function getListenPoolOptions() {
+  return {
+    connectionTimeoutMillis: toInt(process.env.DB_LISTEN_CONNECT_TIMEOUT_MS, toInt(process.env.DB_CONNECT_TIMEOUT_MS, 5000)),
+    idleTimeoutMillis: toInt(process.env.DB_LISTEN_IDLE_TIMEOUT_MS, 0),
+    max: toInt(process.env.DB_LISTEN_POOL_MAX, 2)
+  };
+}
+
+function assertListenCompatibleTarget(target) {
+  if (isSupabaseTransactionPoolerTarget(target)) {
+    if (target?.source === "DATABASE_LISTEN_URL") {
+      throw new Error(
+        "DATABASE_LISTEN_URL must use a PostgreSQL session-compatible connection for LISTEN/NOTIFY, not Supabase transaction pooler 6543."
+      );
+    }
+    throw new Error(
+      "DATABASE_LISTEN_URL required for LISTEN/NOTIFY when DATABASE_URL uses Supabase transaction pooler 6543."
+    );
+  }
+}
+
 function resolveDbSettings() {
   const databaseUrl = trimEnv("DATABASE_URL");
   const poolOptions = getPoolOptions();
@@ -236,16 +261,69 @@ function resolveDbSettings() {
   };
 }
 
+function resolveDbListenSettings() {
+  const listenUrl = trimEnv("DATABASE_LISTEN_URL");
+  const sslConfig = resolveSslConfig();
+  const poolOptions = getListenPoolOptions();
+
+  if (listenUrl) {
+    const target = parseTargetFromDatabaseUrl(listenUrl, "DATABASE_LISTEN_URL");
+    validateSupabaseTarget(target);
+    assertListenCompatibleTarget(target);
+    return {
+      target,
+      pgConfig: {
+        connectionString: listenUrl,
+        ssl: sslConfig,
+        ...poolOptions
+      }
+    };
+  }
+
+  const settings = resolveDbSettings();
+  assertListenCompatibleTarget(settings.target);
+
+  return {
+    target: {
+      ...settings.target,
+      source: `${settings.target.source}:listen`
+    },
+    pgConfig: {
+      ...settings.pgConfig,
+      ...poolOptions
+    }
+  };
+}
+
 export function getDbConfig() {
   return resolveDbSettings().pgConfig;
+}
+
+export function getDbListenConfig() {
+  return resolveDbListenSettings().pgConfig;
 }
 
 export function getDbTargetInfo() {
   return resolveDbSettings().target;
 }
 
+export function getDbListenTargetInfo() {
+  return resolveDbListenSettings().target;
+}
+
 export function getSanitizedDbTarget() {
   const target = getDbTargetInfo();
+  return {
+    source: target.source,
+    host: target.host || "<empty>",
+    port: target.port,
+    database: target.database || "postgres",
+    user: maskUser(target.user)
+  };
+}
+
+export function getSanitizedDbListenTarget() {
+  const target = getDbListenTargetInfo();
   return {
     source: target.source,
     host: target.host || "<empty>",

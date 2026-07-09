@@ -4,6 +4,7 @@ import {
   ACTIVE_PAYMENT_INTENT_STATES,
   APPOINTMENT_STATE_TRANSITIONS,
   assertUuid,
+  buildOperationalDayRange,
   expireStaleAppointmentReservations,
   getSystemParameters,
   mapBlockRow,
@@ -30,6 +31,8 @@ const OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES = 5;
 const FINISH_ALERT_THRESHOLD_MINUTES = 7;
 const OPERATIONAL_TIMEZONE = "America/Tegucigalpa";
 const OPERATIONAL_DELAY_AFFECTED_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
+const OPERATIONAL_EVENTS_CHANNEL = "mf_citas_operativas_events";
+const OPERATIONAL_EVENTS_HEARTBEAT_MS = 25000;
 let appointmentContactColumnsSupportCache = null;
 
 function sendHandled(reply, request, error, message, code) {
@@ -61,6 +64,30 @@ function sendHandled(reply, request, error, message, code) {
 function cleanText(value) {
   const raw = String(value ?? "").trim();
   return raw.length ? raw : null;
+}
+
+function parseAllowedCorsOrigins(app) {
+  const configured = Array.isArray(app?.config?.corsOrigins) ? app.config.corsOrigins : [];
+  if (configured.length > 0) return configured;
+  const raw =
+    process.env.CORS_ORIGENES ||
+    process.env.CORS_ORIGINS ||
+    process.env.CORS_ORIGIN ||
+    "http://localhost:5173";
+  return String(raw)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function getOperationalEventBarberId(payload) {
+  return cleanText(payload?.id_barbero) || cleanText(payload?.id_empleado_barbero);
+}
+
+function sendSseEvent(rawReply, eventName, payload) {
+  if (rawReply.writableEnded || rawReply.destroyed) return;
+  rawReply.write(`event: ${eventName}\n`);
+  rawReply.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 function parseDateTime(value, field) {
@@ -1147,38 +1174,6 @@ async function buildBranchScheduleResponse(client, branch) {
   };
 }
 
-async function listBarbersByBranchInScope(client, branchIds, idSucursal) {
-  const safeBranch = assertUuid(idSucursal, "id_sucursal");
-  if (!branchIds.includes(safeBranch)) {
-    throw new AppError(403, "Sucursal fuera de tu alcance", {
-      code: "ADMIN_CITAS_BRANCH_FORBIDDEN",
-      details: { id_sucursal: safeBranch },
-    });
-  }
-
-  const { rows } = await client.query(
-    `
-      SELECT
-        e.id_empleado,
-        e.id_sucursal,
-        e.es_barbero,
-        s.nombre_sucursal,
-        COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Sin nombre') AS nombre_completo
-      FROM public.empleados e
-      JOIN public.personas p ON p.id_persona = e.id_persona
-      JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal
-      WHERE e.deleted_at IS NULL
-        AND e.estado IS TRUE
-        AND e.es_barbero IS TRUE
-        AND e.id_sucursal = $1::uuid
-      ORDER BY nombre_completo ASC
-    `,
-    [safeBranch]
-  );
-
-  return rows.map(mapEmployeeRow);
-}
-
 function groupBranchDayOffs(items) {
   const grouped = new Map();
   for (const item of Array.isArray(items) ? items : []) {
@@ -1204,13 +1199,45 @@ function groupBranchDayOffs(items) {
   return Array.from(grouped.values());
 }
 
+function mapBranchExceptionRow(row) {
+  const fecha = row.fecha instanceof Date ? row.fecha.toISOString().slice(0, 10) : String(row.fecha || "").slice(0, 10);
+  const bloques = Array.isArray(row.bloques) ? row.bloques : [];
+  return {
+    id_excepcion_sucursal: row.id_excepcion_sucursal,
+    id_bloqueo: row.id_excepcion_sucursal,
+    id_sucursal: row.id_sucursal,
+    id_empleado: null,
+    modo_excepcion_codigo: row.modo_excepcion_codigo,
+    tipo_bloqueo_codigo: row.modo_excepcion_codigo,
+    motivo: row.motivo ?? null,
+    fecha,
+    inicio_at: `${fecha}T00:00:00.000`,
+    fin_at: `${fecha}T23:59:59.999`,
+    es_dia_completo: row.modo_excepcion_codigo === "cierre_total",
+    nombre_sucursal: row.nombre_sucursal ?? null,
+    nombre_completo: null,
+    total_barberos: null,
+    origen: "agenda_excepciones_sucursal",
+    bloques: bloques
+      .map((block) => ({
+        id_bloque_excepcion: block.id_bloque_excepcion ?? null,
+        hora_inicio: block.hora_inicio ? String(block.hora_inicio).slice(0, 8) : null,
+        hora_fin: block.hora_fin ? String(block.hora_fin).slice(0, 8) : null,
+        minuto_inicio: Number(block.minuto_inicio ?? 0),
+        minuto_fin: Number(block.minuto_fin ?? 0),
+        orden_visual: Number(block.orden_visual ?? 0),
+      }))
+      .filter((block) => block.hora_inicio && block.hora_fin),
+  };
+}
+
 async function listBlocks(client, branchIds, { idEmpleado, idSucursal, fechaDesde, fechaHasta } = {}) {
   const params = [branchIds];
-  const where = ["b.id_sucursal = ANY($1::uuid[])"];
+  const where = ["x.id_sucursal = ANY($1::uuid[])"];
 
   if (idEmpleado) {
     params.push(assertUuid(idEmpleado, "id_empleado"));
-    where.push(`b.id_empleado = $${params.length}::uuid`);
+    where.push(`x.id_empleado = $${params.length}::uuid`);
   }
   if (idSucursal) {
     const safeBranch = assertUuid(idSucursal, "id_sucursal");
@@ -1221,43 +1248,133 @@ async function listBlocks(client, branchIds, { idEmpleado, idSucursal, fechaDesd
       });
     }
     params.push(safeBranch);
-    where.push(`b.id_sucursal = $${params.length}::uuid`);
+    where.push(`x.id_sucursal = $${params.length}::uuid`);
   }
   if (fechaDesde || fechaHasta) {
     const desde = parseDateOnly(fechaDesde || fechaHasta, "fecha_desde");
     const hasta = parseDateOnly(fechaHasta || fechaDesde, "fecha_hasta");
-    const from = new Date(`${desde}T00:00:00`).toISOString();
-    const to = new Date(new Date(`${hasta}T00:00:00`).getTime() + 24 * 60 * 60 * 1000).toISOString();
+    const { startAt } = buildOperationalDayRange(desde);
+    const { endAtExclusive } = buildOperationalDayRange(hasta);
+    const from = startAt.toISOString();
+    const to = endAtExclusive.toISOString();
     params.push(from);
     const fromI = params.length;
     params.push(to);
     const toI = params.length;
-    where.push(`b.rango && tstzrange($${fromI}::timestamptz, $${toI}::timestamptz, '[)')`);
+    where.push(`x.rango && tstzrange($${fromI}::timestamptz, $${toI}::timestamptz, '[)')`);
+  }
+
+  const { rows } = await client.query(
+    `
+      WITH employee_blocks AS (
+        SELECT
+          'agenda_bloqueos_empleados'::text AS origen,
+          b.id_bloqueo_empleado AS id_bloqueo,
+          b.id_empleado,
+          e.id_sucursal,
+          b.tipo_bloqueo_codigo,
+          b.motivo,
+          b.rango
+        FROM public.agenda_bloqueos_empleados b
+        JOIN public.empleados e ON e.id_empleado = b.id_empleado
+      ),
+      legacy_blocks AS (
+        SELECT
+          'bloqueos_agenda'::text AS origen,
+          b.id_bloqueo,
+          b.id_empleado,
+          b.id_sucursal,
+          b.tipo_bloqueo_codigo,
+          b.motivo,
+          b.rango
+        FROM public.bloqueos_agenda b
+      ),
+      all_blocks AS (
+        SELECT * FROM employee_blocks
+        UNION ALL
+        SELECT * FROM legacy_blocks
+      )
+      SELECT
+        x.id_bloqueo,
+        x.id_empleado,
+        x.id_sucursal,
+        x.tipo_bloqueo_codigo,
+        x.motivo,
+        lower(x.rango) AS inicio_at,
+        upper(x.rango) AS fin_at,
+        x.origen,
+        COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Sin nombre') AS nombre_completo,
+        s.nombre_sucursal
+      FROM all_blocks x
+      JOIN public.empleados e ON e.id_empleado = x.id_empleado
+      JOIN public.personas p ON p.id_persona = e.id_persona
+      JOIN public.sucursales s ON s.id_sucursal = x.id_sucursal
+      WHERE ${where.join(" AND ")}
+      ORDER BY lower(x.rango) ASC, x.id_bloqueo ASC
+    `,
+    params
+  );
+
+  return rows.map((row) => ({ ...mapBlockRow(row), origen: row.origen }));
+}
+
+async function listBranchExceptions(client, branchIds, { idSucursal, fechaDesde, fechaHasta } = {}) {
+  const params = [branchIds];
+  const where = ["e.id_sucursal = ANY($1::uuid[])"];
+  if (idSucursal) {
+    const safeBranch = assertUuid(idSucursal, "id_sucursal");
+    if (!branchIds.includes(safeBranch)) {
+      throw new AppError(403, "Sucursal fuera de tu alcance", {
+        code: "ADMIN_CITAS_BRANCH_FORBIDDEN",
+        details: { id_sucursal: safeBranch },
+      });
+    }
+    params.push(safeBranch);
+    where.push(`e.id_sucursal = $${params.length}::uuid`);
+  }
+  if (fechaDesde || fechaHasta) {
+    params.push(parseDateOnly(fechaDesde || fechaHasta, "fecha_desde"));
+    const fromI = params.length;
+    params.push(parseDateOnly(fechaHasta || fechaDesde, "fecha_hasta"));
+    const toI = params.length;
+    where.push(`e.fecha BETWEEN $${fromI}::date AND $${toI}::date`);
   }
 
   const { rows } = await client.query(
     `
       SELECT
-        b.id_bloqueo,
-        b.id_empleado,
-        b.id_sucursal,
-        b.tipo_bloqueo_codigo,
-        b.motivo,
-        lower(b.rango) AS inicio_at,
-        upper(b.rango) AS fin_at,
-        COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Sin nombre') AS nombre_completo,
-        s.nombre_sucursal
-      FROM public.bloqueos_agenda b
-      JOIN public.empleados e ON e.id_empleado = b.id_empleado
-      JOIN public.personas p ON p.id_persona = e.id_persona
-      JOIN public.sucursales s ON s.id_sucursal = b.id_sucursal
+        e.id_excepcion_sucursal,
+        e.id_sucursal,
+        e.fecha,
+        e.modo_excepcion_codigo,
+        e.motivo,
+        s.nombre_sucursal,
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id_bloque_excepcion', b.id_bloque_excepcion,
+              'hora_inicio', b.hora_inicio,
+              'hora_fin', b.hora_fin,
+              'minuto_inicio', b.minuto_inicio,
+              'minuto_fin', b.minuto_fin,
+              'orden_visual', b.orden_visual
+            )
+            ORDER BY b.orden_visual ASC, b.hora_inicio ASC, b.id_bloque_excepcion ASC
+          ) FILTER (WHERE b.id_bloque_excepcion IS NOT NULL),
+          '[]'::jsonb
+        ) AS bloques
+      FROM public.agenda_excepciones_sucursal e
+      JOIN public.sucursales s ON s.id_sucursal = e.id_sucursal
+      LEFT JOIN public.agenda_excepciones_sucursal_bloques b
+        ON b.id_excepcion_sucursal = e.id_excepcion_sucursal
       WHERE ${where.join(" AND ")}
-      ORDER BY lower(b.rango) ASC, b.id_bloqueo ASC
+      GROUP BY e.id_excepcion_sucursal, s.nombre_sucursal
+      ORDER BY e.fecha ASC, e.created_at ASC, e.id_excepcion_sucursal ASC
     `,
     params
   );
 
-  return rows.map(mapBlockRow);
+  return rows.map(mapBranchExceptionRow);
 }
 
 async function ensureBlockType(client, code) {
@@ -1594,6 +1711,142 @@ export default async function adminCitasRoutes(app) {
         "No se pudo consultar el contexto operativo de citas",
         "ADMIN_CITAS_OPERATIVE_CONTEXT_ERROR"
       );
+    }
+  });
+
+  app.get("/operativas/events", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    let listenClient = null;
+    let heartbeat = null;
+    let closed = false;
+    let streamStarted = false;
+
+    const closeStream = async () => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+      if (listenClient) {
+        const client = listenClient;
+        listenClient = null;
+        client.removeAllListeners("notification");
+        client.removeAllListeners("error");
+        try {
+          await client.query(`UNLISTEN ${OPERATIONAL_EVENTS_CHANNEL}`);
+        } catch (error) {
+          request.log.warn({ err: error }, "Failed to unlisten operational appointments events");
+        } finally {
+          client.release();
+        }
+      }
+      if (streamStarted && !reply.raw.writableEnded && !reply.raw.destroyed) {
+        try {
+          reply.raw.end();
+        } catch {
+          // no-op
+        }
+      }
+    };
+
+    try {
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const requestedBranchId = assertUuid(request.query?.id_sucursal, "id_sucursal");
+      if (!branchIds.includes(requestedBranchId)) {
+        throw new AppError(403, "No tienes permisos para escuchar eventos de esta sucursal", {
+          code: "ADMIN_CITAS_OPERATIVE_EVENTS_BRANCH_FORBIDDEN",
+          details: { id_sucursal: requestedBranchId },
+        });
+      }
+      if (!app.dbListenPool) {
+        const message = "DATABASE_LISTEN_URL required for LISTEN/NOTIFY when DATABASE_URL uses Supabase transaction pooler 6543.";
+        request.log.error({ err: app.dbListenConfigError || null }, message);
+        throw new AppError(503, message, {
+          code: "ADMIN_CITAS_OPERATIVE_EVENTS_LISTEN_CONFIG_REQUIRED",
+        });
+      }
+
+      listenClient = await app.dbListenPool.connect();
+      await listenClient.query(`LISTEN ${OPERATIONAL_EVENTS_CHANNEL}`);
+
+      const originHeader = String(request.headers?.origin || "").trim();
+      const allowedOrigins = parseAllowedCorsOrigins(app);
+      if (originHeader && allowedOrigins.includes(originHeader)) {
+        reply.raw.setHeader("Access-Control-Allow-Origin", originHeader);
+        reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
+        reply.raw.setHeader("Vary", "Origin");
+      }
+      reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.setHeader("X-Accel-Buffering", "no");
+
+      if (typeof reply.hijack === "function") {
+        reply.hijack();
+      }
+      streamStarted = true;
+
+      const writeEvent = (eventName, payload) => {
+        sendSseEvent(reply.raw, eventName, payload);
+      };
+
+      listenClient.on("notification", (message) => {
+        if (closed || message?.channel !== OPERATIONAL_EVENTS_CHANNEL) return;
+        let payload;
+        try {
+          payload = JSON.parse(String(message.payload || "{}"));
+        } catch (error) {
+          request.log.warn({ err: error }, "Invalid operational appointments event payload");
+          return;
+        }
+
+        if (String(payload?.id_sucursal || "") !== requestedBranchId) return;
+        const eventBarberId = getOperationalEventBarberId(payload);
+        if (roleScope.barber_empleado_id && eventBarberId && eventBarberId !== roleScope.barber_empleado_id) return;
+
+        writeEvent("citas.operativas.changed", {
+          id_sucursal: requestedBranchId,
+          id_barbero: eventBarberId || null,
+          reason: cleanText(payload?.reason) || cleanText(payload?.evento) || "changed",
+          changed_at: cleanText(payload?.changed_at) || cleanText(payload?.occurred_at) || new Date().toISOString(),
+        });
+      });
+
+      listenClient.on("error", (error) => {
+        request.log.error({ err: error }, "Operational appointments SSE database listener failed");
+        void closeStream();
+      });
+
+      heartbeat = setInterval(() => {
+        writeEvent("ping", { ts: new Date().toISOString() });
+      }, OPERATIONAL_EVENTS_HEARTBEAT_MS);
+
+      writeEvent("ready", { ok: true });
+
+      request.raw.on("close", () => {
+        void closeStream();
+      });
+      reply.raw.on("close", () => {
+        void closeStream();
+      });
+      reply.raw.on("error", () => {
+        void closeStream();
+      });
+    } catch (error) {
+      await closeStream();
+      if (error instanceof AppError) {
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          details: error.details,
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo abrir SSE de citas operativas");
+      return sendError(reply, 500, "No se pudo abrir el stream de citas operativas", {
+        code: "ADMIN_CITAS_OPERATIVE_EVENTS_ERROR",
+        requestId: request.id,
+      });
     }
   });
 
@@ -2561,13 +2814,12 @@ export default async function adminCitasRoutes(app) {
 
       const inserted = await app.db.query(
         `
-          INSERT INTO public.bloqueos_agenda (id_empleado, id_sucursal, tipo_bloqueo_codigo, rango, motivo, creado_por)
-          VALUES ($1::uuid, $2::uuid, $3::text, tstzrange($4::timestamptz, $5::timestamptz, '[)'), $6, $7::uuid)
-          RETURNING id_bloqueo
+          INSERT INTO public.agenda_bloqueos_empleados (id_empleado, tipo_bloqueo_codigo, rango, motivo, creado_por)
+          VALUES ($1::uuid, $2::text, tstzrange($3::timestamptz, $4::timestamptz, '[)'), $5, $6::uuid)
+          RETURNING id_bloqueo_empleado AS id_bloqueo
         `,
         [
           empleado.id_empleado,
-          empleado.id_sucursal,
           tipoBloqueo,
           inicioAt.toISOString(),
           finAt.toISOString(),
@@ -2583,10 +2835,10 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.delete("/bloqueos", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
+  const deleteBloqueoHandler = async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
-      const idBloqueo = assertUuid(request.query?.id_bloqueo, "id_bloqueo");
+      const idBloqueo = assertUuid(request.params?.id || request.query?.id_bloqueo, "id_bloqueo");
       const bloqueos = await listBlocks(app.db, branchIds, {});
       const objetivo = bloqueos.find((item) => item.id_bloqueo === idBloqueo) ?? null;
       if (!objetivo) {
@@ -2594,16 +2846,31 @@ export default async function adminCitasRoutes(app) {
           code: "ADMIN_CITAS_BLOCK_NOT_FOUND",
         });
       }
-      await app.db.query(`DELETE FROM public.bloqueos_agenda WHERE id_bloqueo = $1::uuid`, [idBloqueo]);
+      if (objetivo.origen === "agenda_bloqueos_empleados") {
+        await app.db.query(`DELETE FROM public.agenda_bloqueos_empleados WHERE id_bloqueo_empleado = $1::uuid`, [idBloqueo]);
+      } else {
+        await app.db.query(`DELETE FROM public.bloqueos_agenda WHERE id_bloqueo = $1::uuid`, [idBloqueo]);
+      }
       return sendOk(reply, { bloqueo: objetivo });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo eliminar el bloqueo", "ADMIN_CITAS_BLOCKS_DELETE_ERROR");
     }
-  });
+  };
+
+  app.delete("/bloqueos", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, deleteBloqueoHandler);
+  app.delete("/bloqueos/:id", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, deleteBloqueoHandler);
 
   app.get("/dias-inhabilitados", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
+      if (String(request.query?.scope || "").toLowerCase() === "sucursal") {
+        const exceptions = await listBranchExceptions(app.db, branchIds, {
+          idSucursal: request.query?.id_sucursal ?? null,
+          fechaDesde: request.query?.fecha_desde ?? null,
+          fechaHasta: request.query?.fecha_hasta ?? null,
+        });
+        return sendOk(reply, { dias_inhabilitados: exceptions });
+      }
       const bloqueos = await listBlocks(app.db, branchIds, {
         idEmpleado: request.query?.id_empleado ?? null,
         idSucursal: request.query?.id_sucursal ?? null,
@@ -2611,9 +2878,6 @@ export default async function adminCitasRoutes(app) {
         fechaHasta: request.query?.fecha_hasta ?? null,
       });
       const diasInhabilitados = bloqueos.filter((item) => item.es_dia_completo);
-      if (String(request.query?.scope || "").toLowerCase() === "sucursal") {
-        return sendOk(reply, { dias_inhabilitados: groupBranchDayOffs(diasInhabilitados) });
-      }
       return sendOk(reply, { dias_inhabilitados: diasInhabilitados });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudieron consultar los dias inhabilitados", "ADMIN_CITAS_DAYS_OFF_GET_ERROR");
@@ -2625,13 +2889,13 @@ export default async function adminCitasRoutes(app) {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
       const fecha = parseDateOnly(request.body?.fecha, "fecha");
-      const start = new Date(`${fecha}T00:00:00`);
-      const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+      const { startAt, endAtExclusive } = buildOperationalDayRange(fecha);
       const motivo = cleanText(request.body?.motivo);
       const createdBy = request.claims?.user?.id_usuario ?? null;
       const typeCode = await getDayOffType(dbClient);
 
       let insertedIds = [];
+      let created = [];
 
       await dbClient.query("BEGIN");
       if (request.body?.id_empleado) {
@@ -2650,80 +2914,123 @@ export default async function adminCitasRoutes(app) {
 
         const inserted = await dbClient.query(
           `
-            INSERT INTO public.bloqueos_agenda (id_empleado, id_sucursal, tipo_bloqueo_codigo, rango, motivo, creado_por)
-            VALUES ($1::uuid, $2::uuid, $3::text, tstzrange($4::timestamptz, $5::timestamptz, '[)'), $6, $7::uuid)
-            RETURNING id_bloqueo
+            INSERT INTO public.agenda_bloqueos_empleados (id_empleado, tipo_bloqueo_codigo, rango, motivo, creado_por)
+            VALUES ($1::uuid, $2::text, tstzrange($3::timestamptz, $4::timestamptz, '[)'), $5, $6::uuid)
+            RETURNING id_bloqueo_empleado AS id_bloqueo
           `,
           [
             empleado.id_empleado,
-            empleado.id_sucursal,
             typeCode,
-            start.toISOString(),
-            end.toISOString(),
+            startAt.toISOString(),
+            endAtExclusive.toISOString(),
             motivo,
             createdBy,
           ]
         );
         insertedIds = inserted.rows.map((row) => row.id_bloqueo);
       } else {
-        const barberos = await listBarbersByBranchInScope(dbClient, branchIds, request.body?.id_sucursal);
-        if (!barberos.length) {
-          throw new AppError(409, "La sucursal no tiene barberos activos para aplicar el cierre", {
-            code: "ADMIN_CITAS_BRANCH_DAY_OFF_NO_BARBERS",
+        const branch = await getBranchInScope(dbClient, request.body?.id_sucursal, branchIds);
+        const modoExcepcion = cleanText(request.body?.modo_excepcion_codigo) || "cierre_total";
+
+        const mode = await dbClient.query(
+          `SELECT modo_excepcion_codigo FROM public.modos_excepcion_sucursal WHERE modo_excepcion_codigo = $1::text LIMIT 1`,
+          [modoExcepcion]
+        );
+        if (!mode.rows[0]) {
+          throw new AppError(404, "modo_excepcion_codigo no existe", {
+            code: "ADMIN_CITAS_BRANCH_EXCEPTION_MODE_NOT_FOUND",
+            details: { modo_excepcion_codigo: modoExcepcion },
+          });
+        }
+
+        const existing = await dbClient.query(
+          `
+            SELECT id_excepcion_sucursal
+            FROM public.agenda_excepciones_sucursal
+            WHERE id_sucursal = $1::uuid
+              AND fecha = $2::date
+              AND modo_excepcion_codigo = $3::text
+              AND COALESCE(motivo, '') = COALESCE($4::text, '')
+            LIMIT 1
+          `,
+          [branch.id_sucursal, fecha, modoExcepcion, motivo]
+        );
+        if (existing.rows[0]) {
+          throw new AppError(409, "La excepcion de sucursal ya existe para esa fecha", {
+            code: "ADMIN_CITAS_BRANCH_DAY_OFF_ALREADY_EXISTS",
+          });
+        }
+
+        const exceptionBlocks = Array.isArray(request.body?.bloques) ? request.body.bloques : [];
+        if (modoExcepcion !== "cierre_total" && !exceptionBlocks.length) {
+          throw new AppError(400, "Este modo de excepcion requiere bloques horarios", {
+            code: "ADMIN_CITAS_BRANCH_EXCEPTION_BLOCKS_REQUIRED",
+            details: { modo_excepcion_codigo: modoExcepcion },
           });
         }
 
         const inserted = await dbClient.query(
           `
-            INSERT INTO public.bloqueos_agenda (id_empleado, id_sucursal, tipo_bloqueo_codigo, rango, motivo, creado_por)
-            SELECT
-              e.id_empleado,
-              $1::uuid,
-              $2::text,
-              tstzrange($3::timestamptz, $4::timestamptz, '[)'),
-              $5::text,
-              $6::uuid
-            FROM public.empleados e
-            WHERE e.deleted_at IS NULL
-              AND e.estado IS TRUE
-              AND e.es_barbero IS TRUE
-              AND e.id_sucursal = $1::uuid
-              AND NOT EXISTS (
-                SELECT 1
-                FROM public.bloqueos_agenda b
-                WHERE b.id_empleado = e.id_empleado
-                  AND b.id_sucursal = $1::uuid
-                  AND b.tipo_bloqueo_codigo = $2::text
-                  AND b.rango = tstzrange($3::timestamptz, $4::timestamptz, '[)')
-                  AND COALESCE(b.motivo, '') = COALESCE($5::text, '')
-              )
-            RETURNING id_bloqueo
+            INSERT INTO public.agenda_excepciones_sucursal (
+              id_sucursal,
+              fecha,
+              modo_excepcion_codigo,
+              motivo,
+              creado_por
+            )
+            VALUES ($1::uuid, $2::date, $3::text, $4::text, $5::uuid)
+            RETURNING id_excepcion_sucursal
           `,
-          [
-            barberos[0].id_sucursal,
-            typeCode,
-            start.toISOString(),
-            end.toISOString(),
-            motivo,
-            createdBy,
-          ]
+          [branch.id_sucursal, fecha, modoExcepcion, motivo, createdBy]
         );
-        insertedIds = inserted.rows.map((row) => row.id_bloqueo);
-        if (!insertedIds.length) {
-          throw new AppError(409, "El cierre por sucursal ya existe para esa fecha", {
-            code: "ADMIN_CITAS_BRANCH_DAY_OFF_ALREADY_EXISTS",
-          });
+        insertedIds = inserted.rows.map((row) => row.id_excepcion_sucursal);
+        const exceptionId = insertedIds[0];
+        let blockOrder = 1;
+        for (const block of exceptionBlocks) {
+          const horaInicio = normalizeTime(block?.hora_inicio, "bloques.hora_inicio");
+          const horaFin = normalizeTime(block?.hora_fin, "bloques.hora_fin");
+          if (horaFin <= horaInicio) {
+            throw new AppError(400, "hora_fin debe ser mayor que hora_inicio en bloques", {
+              code: "ADMIN_CITAS_BRANCH_EXCEPTION_BLOCK_RANGE_INVALID",
+            });
+          }
+          await dbClient.query(
+            `
+              INSERT INTO public.agenda_excepciones_sucursal_bloques (
+                id_excepcion_sucursal,
+                hora_inicio,
+                hora_fin,
+                orden_visual
+              )
+              VALUES ($1::uuid, $2::time, $3::time, $4::smallint)
+            `,
+            [
+              exceptionId,
+              horaInicio,
+              horaFin,
+              Number(block?.orden_visual || blockOrder++),
+            ]
+          );
         }
       }
       await dbClient.query("COMMIT");
 
-      const blocks = await listBlocks(app.db, branchIds, {
-        idSucursal: request.body?.id_sucursal ?? null,
-        fechaDesde: fecha,
-        fechaHasta: fecha,
-      });
-      const created = blocks.filter((item) => insertedIds.includes(item.id_bloqueo));
-      const grouped = groupBranchDayOffs(created);
+      if (request.body?.id_empleado) {
+        const blocks = await listBlocks(app.db, branchIds, {
+          idSucursal: request.body?.id_sucursal ?? null,
+          fechaDesde: fecha,
+          fechaHasta: fecha,
+        });
+        created = blocks.filter((item) => insertedIds.includes(item.id_bloqueo));
+      } else {
+        const exceptions = await listBranchExceptions(app.db, branchIds, {
+          idSucursal: request.body?.id_sucursal ?? null,
+          fechaDesde: fecha,
+          fechaHasta: fecha,
+        });
+        created = exceptions.filter((item) => insertedIds.includes(item.id_excepcion_sucursal));
+      }
+      const grouped = request.body?.id_empleado ? groupBranchDayOffs(created) : created;
       return sendOk(
         reply,
         {
@@ -2744,10 +3051,28 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
-  app.delete("/dias-inhabilitados", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
+  const deleteDiaInhabilitadoHandler = async (request, reply) => {
     try {
       const branchIds = await getScopeBranches(app, request.claims);
-      const idBloqueo = assertUuid(request.query?.id_bloqueo, "id_bloqueo");
+      const idBloqueo = assertUuid(
+        request.params?.id || request.query?.id_bloqueo || request.query?.id_excepcion_sucursal,
+        "id_bloqueo"
+      );
+      const scope = String(request.query?.scope || "").toLowerCase();
+      if (scope === "sucursal") {
+        const exceptions = await listBranchExceptions(app.db, branchIds, {
+          idSucursal: request.query?.id_sucursal ?? null,
+        });
+        const exception = exceptions.find((item) => item.id_excepcion_sucursal === idBloqueo) ?? null;
+        if (exception) {
+          await app.db.query(
+            `DELETE FROM public.agenda_excepciones_sucursal WHERE id_excepcion_sucursal = $1::uuid`,
+            [idBloqueo]
+          );
+          return sendOk(reply, { dia_inhabilitado: exception, bloqueos_eliminados: 1 });
+        }
+      }
+
       const blocks = await listBlocks(app.db, branchIds, {});
       const dayOff = blocks.find((item) => item.id_bloqueo === idBloqueo) ?? null;
       if (!dayOff) {
@@ -2760,7 +3085,6 @@ export default async function adminCitasRoutes(app) {
           code: "ADMIN_CITAS_DAY_OFF_NOT_FULL_DAY",
         });
       }
-      const scope = String(request.query?.scope || "").toLowerCase();
       if (scope === "sucursal") {
         const deleted = await app.db.query(
           `
@@ -2779,12 +3103,19 @@ export default async function adminCitasRoutes(app) {
         });
       }
 
-      await app.db.query(`DELETE FROM public.bloqueos_agenda WHERE id_bloqueo = $1::uuid`, [idBloqueo]);
+      if (dayOff.origen === "agenda_bloqueos_empleados") {
+        await app.db.query(`DELETE FROM public.agenda_bloqueos_empleados WHERE id_bloqueo_empleado = $1::uuid`, [idBloqueo]);
+      } else {
+        await app.db.query(`DELETE FROM public.bloqueos_agenda WHERE id_bloqueo = $1::uuid`, [idBloqueo]);
+      }
       return sendOk(reply, { dia_inhabilitado: dayOff, bloqueos_eliminados: 1 });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo eliminar el dia inhabilitado", "ADMIN_CITAS_DAYS_OFF_DELETE_ERROR");
     }
-  });
+  };
+
+  app.delete("/dias-inhabilitados", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, deleteDiaInhabilitadoHandler);
+  app.delete("/dias-inhabilitados/:id", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, deleteDiaInhabilitadoHandler);
 
   app.get("/parametros", { preHandler: app.requireRoles(CONFIG_ALLOWED_ROLES) }, async (request, reply) => {
     try {
