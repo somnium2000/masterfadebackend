@@ -31,6 +31,8 @@ const OPERATIONAL_DELAY_PROPAGATION_THRESHOLD_MINUTES = 5;
 const FINISH_ALERT_THRESHOLD_MINUTES = 7;
 const OPERATIONAL_TIMEZONE = "America/Tegucigalpa";
 const OPERATIONAL_DELAY_AFFECTED_STATES = ["en_espera", "pendiente_pago", "confirmada", "en_salon"];
+const OPERATIONAL_EVENTS_CHANNEL = "mf_citas_operativas_events";
+const OPERATIONAL_EVENTS_HEARTBEAT_MS = 25000;
 let appointmentContactColumnsSupportCache = null;
 
 function sendHandled(reply, request, error, message, code) {
@@ -62,6 +64,30 @@ function sendHandled(reply, request, error, message, code) {
 function cleanText(value) {
   const raw = String(value ?? "").trim();
   return raw.length ? raw : null;
+}
+
+function parseAllowedCorsOrigins(app) {
+  const configured = Array.isArray(app?.config?.corsOrigins) ? app.config.corsOrigins : [];
+  if (configured.length > 0) return configured;
+  const raw =
+    process.env.CORS_ORIGENES ||
+    process.env.CORS_ORIGINS ||
+    process.env.CORS_ORIGIN ||
+    "http://localhost:5173";
+  return String(raw)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function getOperationalEventBarberId(payload) {
+  return cleanText(payload?.id_barbero) || cleanText(payload?.id_empleado_barbero);
+}
+
+function sendSseEvent(rawReply, eventName, payload) {
+  if (rawReply.writableEnded || rawReply.destroyed) return;
+  rawReply.write(`event: ${eventName}\n`);
+  rawReply.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 function parseDateTime(value, field) {
@@ -1685,6 +1711,135 @@ export default async function adminCitasRoutes(app) {
         "No se pudo consultar el contexto operativo de citas",
         "ADMIN_CITAS_OPERATIVE_CONTEXT_ERROR"
       );
+    }
+  });
+
+  app.get("/operativas/events", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
+    let listenClient = null;
+    let heartbeat = null;
+    let closed = false;
+    let streamStarted = false;
+
+    const closeStream = async () => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+      if (listenClient) {
+        const client = listenClient;
+        listenClient = null;
+        client.removeAllListeners("notification");
+        client.removeAllListeners("error");
+        try {
+          await client.query(`UNLISTEN ${OPERATIONAL_EVENTS_CHANNEL}`);
+        } catch (error) {
+          request.log.warn({ err: error }, "Failed to unlisten operational appointments events");
+        } finally {
+          client.release();
+        }
+      }
+      if (streamStarted && !reply.raw.writableEnded && !reply.raw.destroyed) {
+        try {
+          reply.raw.end();
+        } catch {
+          // no-op
+        }
+      }
+    };
+
+    try {
+      const branchIds = await getScopeBranches(app, request.claims);
+      const roleScope = getRoleScope(request.claims);
+      const requestedBranchId = assertUuid(request.query?.id_sucursal, "id_sucursal");
+      if (!branchIds.includes(requestedBranchId)) {
+        throw new AppError(403, "No tienes permisos para escuchar eventos de esta sucursal", {
+          code: "ADMIN_CITAS_OPERATIVE_EVENTS_BRANCH_FORBIDDEN",
+          details: { id_sucursal: requestedBranchId },
+        });
+      }
+
+      listenClient = await app.db.connect();
+      await listenClient.query(`LISTEN ${OPERATIONAL_EVENTS_CHANNEL}`);
+
+      const originHeader = String(request.headers?.origin || "").trim();
+      const allowedOrigins = parseAllowedCorsOrigins(app);
+      if (originHeader && allowedOrigins.includes(originHeader)) {
+        reply.raw.setHeader("Access-Control-Allow-Origin", originHeader);
+        reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
+        reply.raw.setHeader("Vary", "Origin");
+      }
+      reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.setHeader("X-Accel-Buffering", "no");
+
+      if (typeof reply.hijack === "function") {
+        reply.hijack();
+      }
+      streamStarted = true;
+
+      const writeEvent = (eventName, payload) => {
+        sendSseEvent(reply.raw, eventName, payload);
+      };
+
+      listenClient.on("notification", (message) => {
+        if (closed || message?.channel !== OPERATIONAL_EVENTS_CHANNEL) return;
+        let payload;
+        try {
+          payload = JSON.parse(String(message.payload || "{}"));
+        } catch (error) {
+          request.log.warn({ err: error }, "Invalid operational appointments event payload");
+          return;
+        }
+
+        if (String(payload?.id_sucursal || "") !== requestedBranchId) return;
+        const eventBarberId = getOperationalEventBarberId(payload);
+        if (roleScope.barber_empleado_id && eventBarberId && eventBarberId !== roleScope.barber_empleado_id) return;
+
+        writeEvent("citas.operativas.changed", {
+          id_sucursal: requestedBranchId,
+          id_barbero: eventBarberId || null,
+          reason: cleanText(payload?.reason) || cleanText(payload?.evento) || "changed",
+          changed_at: cleanText(payload?.changed_at) || cleanText(payload?.occurred_at) || new Date().toISOString(),
+        });
+      });
+
+      listenClient.on("error", (error) => {
+        request.log.error({ err: error }, "Operational appointments SSE database listener failed");
+        void closeStream();
+      });
+
+      heartbeat = setInterval(() => {
+        writeEvent("ping", { ts: new Date().toISOString() });
+      }, OPERATIONAL_EVENTS_HEARTBEAT_MS);
+
+      writeEvent("ready", { ok: true });
+
+      request.raw.on("close", () => {
+        void closeStream();
+      });
+      reply.raw.on("close", () => {
+        void closeStream();
+      });
+      reply.raw.on("error", () => {
+        void closeStream();
+      });
+    } catch (error) {
+      await closeStream();
+      if (error instanceof AppError) {
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          details: error.details,
+          requestId: request.id,
+        });
+      }
+      request.log.error({ err: error }, "No se pudo abrir SSE de citas operativas");
+      return sendError(reply, 500, "No se pudo abrir el stream de citas operativas", {
+        code: "ADMIN_CITAS_OPERATIVE_EVENTS_ERROR",
+        requestId: request.id,
+      });
     }
   });
 
