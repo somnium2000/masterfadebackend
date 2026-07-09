@@ -47,6 +47,7 @@ export const SLOT_DISCARD_REASONS = {
   CROSS_BLOCK_BOUNDARY: "CROSS_BLOCK_BOUNDARY",
   RESOURCE_UNAVAILABLE: "RESOURCE_UNAVAILABLE",
 };
+const BRANCH_EXCEPTION_MODES = new Set(["cierre_total", "horario_especial", "apertura_extra", "cierre_parcial"]);
 
 function createProviderAdapterByCode(providerCode) {
   const normalized = String(providerCode || "").trim().toLowerCase();
@@ -1579,7 +1580,17 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString, options
   const dayEnd = endOfDay(safeDate);
   const includeSources = Boolean(options?.includeSources);
 
-  const [bloqueosResult, citasResult] = await Promise.all([
+  const [bloqueosResult, legacyBloqueosResult, citasResult] = await Promise.all([
+    client.query(
+      `
+        SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
+        FROM public.agenda_bloqueos_empleados
+        WHERE id_empleado = $1::uuid
+          AND rango && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+        ORDER BY lower(rango) ASC
+      `,
+      [empleadoId, dayStart.toISOString(), dayEnd.toISOString()]
+    ),
     client.query(
       `
         SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
@@ -1607,7 +1618,7 @@ async function getBusyIntervalsForBarber(client, empleadoId, dateString, options
     ),
   ]);
 
-  const blockedBySchedule = bloqueosResult.rows.map((row) => ({
+  const blockedBySchedule = [...bloqueosResult.rows, ...legacyBloqueosResult.rows].map((row) => ({
     start: row.inicio_at,
     end: row.fin_at,
     source: SLOT_DISCARD_REASONS.CONFLICT_WITH_BLOCK,
@@ -1639,7 +1650,17 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
   const rangeStart = startOfDay(safeFrom);
   const rangeEndExclusive = addMinutes(startOfDay(safeTo), 24 * 60);
 
-  const [bloqueosResult, citasResult] = await Promise.all([
+  const [bloqueosResult, legacyBloqueosResult, citasResult] = await Promise.all([
+    client.query(
+      `
+        SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
+        FROM public.agenda_bloqueos_empleados
+        WHERE id_empleado = $1::uuid
+          AND rango && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+        ORDER BY lower(rango) ASC
+      `,
+      [empleadoId, rangeStart.toISOString(), rangeEndExclusive.toISOString()]
+    ),
     client.query(
       `
         SELECT lower(rango) AS inicio_at, upper(rango) AS fin_at
@@ -1667,7 +1688,7 @@ async function getBusyIntervalsForBarberByRange(client, empleadoId, fromDateStri
     ),
   ]);
 
-  const blockedBySchedule = bloqueosResult.rows.map((row) => ({
+  const blockedBySchedule = [...bloqueosResult.rows, ...legacyBloqueosResult.rows].map((row) => ({
     start: row.inicio_at,
     end: row.fin_at,
     source: SLOT_DISCARD_REASONS.CONFLICT_WITH_BLOCK,
@@ -1726,6 +1747,106 @@ function buildBaseIntervalsFromSchedules(dateString, schedules) {
     intervals.push(...subtractIntervals([workInterval], blocks));
   }
   return intervals;
+}
+
+function mapBranchExceptionRow(row) {
+  const blocks = Array.isArray(row?.bloques) ? row.bloques : [];
+  return {
+    id_excepcion_sucursal: row.id_excepcion_sucursal,
+    id_sucursal: row.id_sucursal,
+    fecha: row.fecha instanceof Date ? formatDateOnly(row.fecha) : String(row.fecha).slice(0, 10),
+    modo_excepcion_codigo: row.modo_excepcion_codigo,
+    motivo: row.motivo ?? null,
+    bloques: blocks
+      .map((block) => ({
+        id_bloque_excepcion: block.id_bloque_excepcion ?? null,
+        hora_inicio: block.hora_inicio ? String(block.hora_inicio).slice(0, 8) : null,
+        hora_fin: block.hora_fin ? String(block.hora_fin).slice(0, 8) : null,
+        minuto_inicio: Number(block.minuto_inicio ?? 0),
+        minuto_fin: Number(block.minuto_fin ?? 0),
+        orden_visual: Number(block.orden_visual ?? 0),
+      }))
+      .filter((block) => block.hora_inicio && block.hora_fin),
+  };
+}
+
+async function getBranchExceptionsForDate(client, idSucursal, fecha) {
+  const safeBranchId = assertUuid(idSucursal, "id_sucursal");
+  const safeDate = parseDateOnly(fecha, "fecha");
+  const { rows } = await client.query(
+    `
+      SELECT
+        e.id_excepcion_sucursal,
+        e.id_sucursal,
+        e.fecha,
+        e.modo_excepcion_codigo,
+        e.motivo,
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id_bloque_excepcion', b.id_bloque_excepcion,
+              'hora_inicio', b.hora_inicio,
+              'hora_fin', b.hora_fin,
+              'minuto_inicio', b.minuto_inicio,
+              'minuto_fin', b.minuto_fin,
+              'orden_visual', b.orden_visual
+            )
+            ORDER BY b.orden_visual ASC, b.hora_inicio ASC, b.id_bloque_excepcion ASC
+          ) FILTER (WHERE b.id_bloque_excepcion IS NOT NULL),
+          '[]'::jsonb
+        ) AS bloques
+      FROM public.agenda_excepciones_sucursal e
+      LEFT JOIN public.agenda_excepciones_sucursal_bloques b
+        ON b.id_excepcion_sucursal = e.id_excepcion_sucursal
+      WHERE e.id_sucursal = $1::uuid
+        AND e.fecha = $2::date
+        AND e.modo_excepcion_codigo = ANY($3::text[])
+      GROUP BY e.id_excepcion_sucursal
+      ORDER BY e.fecha ASC, e.created_at ASC, e.id_excepcion_sucursal ASC
+    `,
+    [safeBranchId, safeDate, Array.from(BRANCH_EXCEPTION_MODES)]
+  );
+  return rows.map(mapBranchExceptionRow);
+}
+
+function buildIntervalsFromBranchExceptionBlocks(dateString, exception) {
+  return (Array.isArray(exception?.bloques) ? exception.bloques : [])
+    .map((block) => normalizeInterval(
+      combineDateAndTime(dateString, block.hora_inicio),
+      combineDateAndTime(dateString, block.hora_fin)
+    ))
+    .filter(Boolean);
+}
+
+function applyBranchExceptionsToIntervals(dateString, baseIntervals, exceptions) {
+  let intervals = mergeIntervals(baseIntervals);
+  const normalizedExceptions = Array.isArray(exceptions) ? exceptions : [];
+  if (normalizedExceptions.some((item) => item.modo_excepcion_codigo === "cierre_total")) {
+    return [];
+  }
+
+  const specialIntervals = normalizedExceptions
+    .filter((item) => item.modo_excepcion_codigo === "horario_especial")
+    .flatMap((item) => buildIntervalsFromBranchExceptionBlocks(dateString, item));
+  if (specialIntervals.length) {
+    intervals = mergeIntervals(specialIntervals);
+  }
+
+  const extraIntervals = normalizedExceptions
+    .filter((item) => item.modo_excepcion_codigo === "apertura_extra")
+    .flatMap((item) => buildIntervalsFromBranchExceptionBlocks(dateString, item));
+  if (extraIntervals.length) {
+    intervals = mergeIntervals([...intervals, ...extraIntervals]);
+  }
+
+  const closedIntervals = normalizedExceptions
+    .filter((item) => item.modo_excepcion_codigo === "cierre_parcial")
+    .flatMap((item) => buildIntervalsFromBranchExceptionBlocks(dateString, item));
+  if (closedIntervals.length) {
+    intervals = subtractIntervals(intervals, closedIntervals);
+  }
+
+  return mergeIntervals(intervals);
 }
 
 function resolveOperationalDayBoundsFromSchedules(dateString, schedules) {
@@ -1885,8 +2006,17 @@ export async function getAvailableSlotsForBarber(
       : [];
   }
 
+  const barber = await getBarberById(client, safeBarberId);
+  const branchExceptions = await getBranchExceptionsForDate(client, barber.id_sucursal, safeDate);
+  const branchAdjustedIntervals = applyBranchExceptionsToIntervals(safeDate, baseIntervals, branchExceptions);
+  if (!branchAdjustedIntervals.length) {
+    return includeDiscardReasons
+      ? { slots: [], discarded: [{ reason: SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE, details: { branch_exceptions: true } }] }
+      : [];
+  }
+
   const busyIntervals = await getBusyIntervalsForBarber(client, safeBarberId, safeDate);
-  const freeIntervals = subtractIntervals(baseIntervals, busyIntervals);
+  const freeIntervals = subtractIntervals(branchAdjustedIntervals, busyIntervals);
   const todaySellableFloorStartAt = resolveTodaySellableFloorStartAt(safeDate, SLOT_INTERVAL_MINUTES, {
     now: options?.now,
     timeZone: options?.timeZone || AGENDA_DEFAULT_TIME_ZONE,
