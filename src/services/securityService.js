@@ -49,7 +49,7 @@ const DEFAULT_SESSION_POLICY = {
   collisionAction: "allow",
 };
 const ADMIN_PAGE_SIZE_MAX = 100;
-const SECURITY_PRIVILEGED_ROLES = new Set(["super_admin", "security_admin"]);
+const SECURITY_PRIVILEGED_ROLES = new Set(["super_admin", "security_admin", "root"]);
 const RESOLVED_ALERT_STATES = new Set(["resuelta", "descartada"]);
 const ALERT_STATE_UPDATE_SET = new Set(["resuelta", "descartada"]);
 const ALERT_RESOLUTION_COMMENT_MAX = 700;
@@ -1746,6 +1746,72 @@ export async function revokeAdminSecuritySession(app, request, {
     ok: true,
     id_sesion: result.rows[0].id_sesion,
   };
+}
+
+export async function revokeAllAdminSecuritySessions(app, request, {
+  actorUserId,
+  actorSessionId,
+}) {
+  if (!app?.db || !isValidUuid(actorUserId) || !isValidUuid(actorSessionId)) {
+    return { ok: false, code: "SECURITY_SESSIONS_REVOKE_ALL_INVALID" };
+  }
+
+  const meta = getRequestMeta(request);
+  const client = await app.db.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
+      `
+        UPDATE public.seguridad_sesiones
+        SET
+          estado = 'revocada',
+          revocada_at = NOW(),
+          cierre_at = NOW(),
+          cerrada_por = $1::uuid,
+          motivo_cierre = 'cierre_masivo_seguridad',
+          ip_ultimo_uso = COALESCE($3::inet, ip_ultimo_uso),
+          request_id = COALESCE($4::text, request_id),
+          ultimo_uso_at = NOW()
+        WHERE estado = 'activa'
+          AND id_sesion <> $2::uuid
+        RETURNING id_sesion, id_usuario
+      `,
+      [actorUserId, actorSessionId, meta.ip, meta.requestId]
+    );
+
+    await insertAdminAuditLog(app, {
+      client,
+      actorUserId,
+      accion: "SECURITY_SESSIONS_REVOKE_ALL",
+      entidad: "seguridad_sesiones",
+      entidadId: null,
+      resultado: "ok",
+      motivoCodigo: "SECURITY_SESSIONS_REVOKED_ALL",
+      request,
+      metadata: {
+        revocadas: Number(result.rowCount || 0),
+        excluded_current_session: true,
+      },
+    });
+
+    await client.query("COMMIT");
+    publishSecurityRealtimeSignal(app, "security.sessions.changed");
+
+    return {
+      ok: true,
+      revocadas: Number(result.rowCount || 0),
+      excluded_current_session: true,
+    };
+  } catch (_error) {
+    await client.query("ROLLBACK").catch(() => {});
+    request?.log?.error(
+      { event: "security_sessions_revoke_all_failed", code: "SECURITY_SESSIONS_REVOKE_ALL_ERROR" },
+      "Could not revoke all active security sessions"
+    );
+    return { ok: false, code: "SECURITY_SESSIONS_REVOKE_ALL_ERROR" };
+  } finally {
+    client.release();
+  }
 }
 
 export async function listAdminSecurityUsers(app, options = {}) {

@@ -9,12 +9,13 @@ import {
   listAdminSecuritySessions,
   listAdminSecurityUsers,
   revokeAdminSecuritySession,
+  revokeAllAdminSecuritySessions,
   updateAdminAlertState,
   updateAdminUserAccessState,
 } from "../../../services/securityService.js";
 
-const SECURITY_READ_ROLES = ["super_admin", "security_admin", "security_auditor"];
-const SECURITY_WRITE_ROLES = ["super_admin", "security_admin"];
+const SECURITY_READ_ROLES = ["super_admin", "security_admin", "security_auditor", "root"];
+const SECURITY_WRITE_ROLES = ["super_admin", "security_admin", "root"];
 const SSE_HEARTBEAT_MS = 25_000;
 
 const listQuerySchemaBase = {
@@ -307,6 +308,53 @@ export default async function adminSeguridadRoutes(app) {
           error,
           "No se pudo consultar sesiones de seguridad",
           "SECURITY_ADMIN_SESSIONS_LIST_ERROR"
+        );
+      }
+    }
+  );
+
+  app.post(
+    "/sesiones/revocar-todas",
+    {
+      preHandler: app.requireRoles(SECURITY_WRITE_ROLES),
+    },
+    async (request, reply) => {
+      try {
+        const actorUserId = request.claims?.user?.id_usuario || null;
+        const actorSessionId = request.user?.sid || request.auth?.sid || null;
+        const action = await revokeAllAdminSecuritySessions(app, request, {
+          actorUserId,
+          actorSessionId,
+        });
+
+        if (!action.ok && action.code === "SECURITY_SESSIONS_REVOKE_ALL_INVALID") {
+          return sendError(reply, 400, "No se pudo identificar la sesion actual para excluirla.", {
+            code: "SECURITY_SESSIONS_REVOKE_ALL_INVALID",
+            requestId: request.id,
+          });
+        }
+        if (!action.ok) {
+          return sendError(reply, 500, "No se pudieron revocar las sesiones activas.", {
+            code: action.code || "SECURITY_SESSIONS_REVOKE_ALL_ERROR",
+            requestId: request.id,
+          });
+        }
+
+        return sendOk(
+          reply,
+          {
+            revocadas: action.revocadas,
+            excluded_current_session: true,
+          },
+          { requestId: request.id }
+        );
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudieron revocar las sesiones activas",
+          "SECURITY_ADMIN_SESSIONS_REVOKE_ALL_ERROR"
         );
       }
     }
