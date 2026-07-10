@@ -16,6 +16,8 @@ import {
 
 const SECURITY_READ_ROLES = ["super_admin", "security_admin", "security_auditor", "root"];
 const SECURITY_WRITE_ROLES = ["super_admin", "security_admin", "root"];
+const SECURITY_ALERTS_READ_ROLES = ["root"];
+const SECURITY_ALERTS_WRITE_ROLES = ["root"];
 const SSE_HEARTBEAT_MS = 25_000;
 
 const listQuerySchemaBase = {
@@ -550,7 +552,7 @@ export default async function adminSeguridadRoutes(app) {
   app.get(
     "/alertas",
     {
-      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      preHandler: app.requireRoles(SECURITY_ALERTS_READ_ROLES),
       schema: { querystring: alertasQuerySchema },
     },
     async (request, reply) => {
@@ -572,7 +574,7 @@ export default async function adminSeguridadRoutes(app) {
   app.get(
     "/alertas/:id_alerta",
     {
-      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      preHandler: app.requireRoles(SECURITY_ALERTS_READ_ROLES),
       schema: { params: idAlertaParamSchema },
     },
     async (request, reply) => {
@@ -610,7 +612,7 @@ export default async function adminSeguridadRoutes(app) {
   app.patch(
     "/alertas/:id_alerta/estado",
     {
-      preHandler: app.requireRoles(SECURITY_WRITE_ROLES),
+      preHandler: app.requireRoles(SECURITY_ALERTS_WRITE_ROLES),
       schema: {
         params: idAlertaParamSchema,
         body: estadoAlertaBodySchema,
