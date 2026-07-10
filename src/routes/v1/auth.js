@@ -924,6 +924,26 @@ async function hasInternalUserByAuthId(db, authUserId) {
   return existing.rowCount > 0;
 }
 
+async function findActiveInternalUserByConfirmedEmail(db, email) {
+  const existing = await db.query(
+    `
+      SELECT u.id_usuario
+      FROM public.correos c
+      JOIN public.usuarios u
+        ON u.id_persona = c.id_persona
+      WHERE LOWER(c.direccion_correo::text) = LOWER($1)
+        AND c.verificado IS TRUE
+        AND u.deleted_at IS NULL
+        AND u.estado IS TRUE
+      ORDER BY c.es_principal DESC NULLS LAST, c.id_correo ASC
+      LIMIT 1
+    `,
+    [email]
+  );
+
+  return existing.rows?.[0]?.id_usuario || null;
+}
+
 async function ensureExchangeInternalUser(app, supabaseUser) {
   const authUserId = String(supabaseUser?.id || "").trim();
   if (!authUserId) {
@@ -1483,8 +1503,28 @@ export default async function authRoutes(app) {
           });
         }
 
-        const provision = await ensureExchangeInternalUser(app, supabaseUser);
-        const claims = await getAuthClaims(app, supabaseUser.id);
+        let claimsUserId = authUserId;
+        let provision = null;
+
+        const internalUserExists = await hasInternalUserByAuthId(app.db, authUserId);
+        if (internalUserExists) {
+          provision = await ensureExchangeInternalUser(app, supabaseUser);
+        } else {
+          const existingUserId = await findActiveInternalUserByConfirmedEmail(app.db, socialEmail);
+          if (existingUserId) {
+            // AM: El enlace social ya confirmo control del correo; reutiliza la cuenta interna existente.
+            claimsUserId = existingUserId;
+            provision = { created: false, authUserId: existingUserId, email: socialEmail, fullName: null };
+            request.log.info(
+              { authUserId, id_usuario: existingUserId, email: socialEmail },
+              "Confirmacion social resuelta contra usuario interno existente por correo verificado"
+            );
+          } else {
+            provision = await ensureExchangeInternalUser(app, supabaseUser);
+          }
+        }
+
+        const claims = await getAuthClaims(app, claimsUserId);
         if (!claims) {
           return sendError(reply, 403, "No se pudo completar la creacion del perfil interno.", {
             code: "AUTH_USER_NOT_ONBOARDED",

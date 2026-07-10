@@ -2535,50 +2535,15 @@ export async function listAvailabilityByDateRangeForRequest(client, {
   const safeTo = parseDateOnly(fecha_hasta, "fecha_hasta");
   const dateKeys = buildDateKeyRange(safeFrom, safeTo);
   const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
+  const branch = await ensureActiveBranch(client, id_sucursal);
 
   if (id_barbero) {
-    try {
-      const serviceSelection = await getBookingSelectionDetails(client, {
-        id_sucursal,
-        selection_type: normalizedSelectionType,
-        servicios,
-        id_paquete,
-        id_barbero,
-        fecha_operativa: safeFrom,
-        bookingIsvEnabled,
+    const barber = await getBarberById(client, id_barbero);
+    if (barber.id_sucursal !== branch.id_sucursal) {
+      throw new AppError(409, "El barbero no pertenece a la sucursal solicitada", {
+        code: "AGENDA_BARBER_BRANCH_MISMATCH",
+        details: { id_barbero: barber.id_empleado, id_sucursal: branch.id_sucursal },
       });
-      const availability = await listAvailabilityByDateRange(
-        client,
-        id_sucursal,
-        serviceSelection,
-        safeFrom,
-        safeTo,
-        id_barbero
-      );
-      const duracionTotalMin = Number(serviceSelection.duracion_total_min || 0);
-      const bufferTotalMin = Number(serviceSelection.buffer_total_min || 0);
-      return {
-        disponibilidad: availability.map((entry) => ({
-          ...entry,
-          effective_selection: {
-            duracion_total_min: duracionTotalMin,
-            buffer_total_min: bufferTotalMin,
-          },
-        })),
-        duracion_total_min: duracionTotalMin,
-        buffer_total_min: bufferTotalMin,
-      };
-    } catch (error) {
-      if (isTariffMissingForSelection(error)) {
-        return {
-          disponibilidad: dateKeys.map((dateKey) => buildUnavailableAvailability(dateKey, null, null, {
-            unavailable_reason: error?.code || "AGENDA_SELECTION_UNAVAILABLE",
-          })),
-          duracion_total_min: null,
-          buffer_total_min: null,
-        };
-      }
-      throw error;
     }
   }
 
@@ -2586,7 +2551,7 @@ export async function listAvailabilityByDateRangeForRequest(client, {
   const availability = await mapWithConcurrency(dateKeys, rangeConcurrency, async (dateKey) => {
     try {
       return await resolveEffectiveDayAvailability(client, {
-        id_sucursal,
+        id_sucursal: branch.id_sucursal,
         selection_type: normalizedSelectionType,
         servicios,
         id_paquete,
