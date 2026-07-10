@@ -767,6 +767,30 @@ function clearSessionCookies(app, reply) {
   reply.clearCookie(AUTH_CSRF_COOKIE, { ...options, httpOnly: false });
 }
 
+function getSessionTokenFromRequest(request) {
+  return String(request.cookies?.[AUTH_SESSION_COOKIE] || "").trim();
+}
+
+function verifyManagedAppSessionPayload(token) {
+  const jwtSecret = process.env.JWT_SECRET?.trim();
+  if (!token || !jwtSecret) return null;
+
+  try {
+    const payload = jwt.verify(token, jwtSecret, {
+      issuer: process.env.APP_JWT_ISSUER || "masterfade-api",
+      audience: process.env.APP_JWT_AUDIENCE || "masterfade-app",
+    });
+
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.token_type !== "app") return null;
+    if (!UUID_REGEX.test(String(payload.sub || ""))) return null;
+    if (!UUID_REGEX.test(String(payload.sid || ""))) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 function signSocialConfirmToken(payload, jwtSecret) {
   return jwt.sign(payload, jwtSecret, {
     expiresIn: process.env.AUTH_SOCIAL_CONFIRM_EXPIRES_IN?.trim() || "30m",
@@ -2115,9 +2139,40 @@ export default async function authRoutes(app) {
   );
 
   app.post(
-    "/logout",
+    "/session/touch",
     {
       preHandler: app.authenticate,
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  touched: { type: "boolean" },
+                },
+                required: ["touched"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      return sendOk(reply, { touched: true }, { requestId: request.id });
+    }
+  );
+
+  app.post(
+    "/logout",
+    {
       schema: {
         response: {
           200: {
@@ -2142,20 +2197,25 @@ export default async function authRoutes(app) {
       },
     },
     async (request, reply) => {
+      const token = getSessionTokenFromRequest(request);
+      const payload = verifyManagedAppSessionPayload(token);
       clearSessionCookies(app, reply);
-      const closed = await closeActiveSession(app, request, {
-        sid: String(request.auth?.sid || ""),
-        id_usuario: String(request.auth?.sub || ""),
-        cerrada_por: String(request.auth?.sub || ""),
-        motivo_cierre: "logout_usuario",
-      });
-      if (!closed.ok) {
-        request.log.error(
-          { event: "auth_logout_session_close_failed", code: closed.code || "AUTH_SESSION_CLOSE_ERROR" },
-          "Logout session close failed"
-        );
+
+      if (payload) {
+        const closed = await closeActiveSession(app, request, {
+          sid: String(payload.sid || ""),
+          id_usuario: String(payload.sub || ""),
+          cerrada_por: String(payload.sub || ""),
+          motivo_cierre: "logout_usuario",
+        });
+        if (!closed.ok) {
+          request.log.warn(
+            { event: "auth_logout_session_close_skipped", code: closed.code || "AUTH_SESSION_CLOSE_ERROR" },
+            "Logout session close skipped"
+          );
+        }
       }
-      request.log.info({ event: "auth_logout", userId: request.auth?.sub || null }, "Logout success");
+      request.log.info({ event: "auth_logout", userId: payload?.sub || null }, "Logout success");
       return sendOk(reply, { logged_out: true }, { requestId: request.id });
     }
   );
