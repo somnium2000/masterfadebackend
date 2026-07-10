@@ -1878,6 +1878,12 @@ export async function listAdminSecurityUsers(app, options = {}) {
         sua.last_login_ip,
         sua.force_password_change,
         sua.updated_at,
+        EXISTS (
+          SELECT 1
+          FROM public.app_protected_users apu
+          WHERE apu.id_usuario = u.id_usuario
+            AND apu.activo IS TRUE
+        ) AS is_protected,
         COALESCE(
           array_agg(DISTINCT r.nombre ORDER BY r.nombre) FILTER (WHERE r.nombre IS NOT NULL),
           ARRAY[]::text[]
@@ -1930,6 +1936,7 @@ export async function listAdminSecurityUsers(app, options = {}) {
     last_login_at: row.last_login_at ? new Date(row.last_login_at).toISOString() : null,
     last_login_ip: maskIpAddress(row.last_login_ip),
     force_password_change: row.force_password_change === null ? null : Boolean(row.force_password_change),
+    is_protected: Boolean(row.is_protected),
     updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
   }));
 

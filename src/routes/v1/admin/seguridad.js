@@ -508,6 +508,18 @@ export default async function adminSeguridadRoutes(app) {
             requestId: request.id,
           });
         }
+        if (!action.ok && action.code === "ROOT_USER_PROTECTED") {
+          return sendError(reply, 403, "El usuario root protegido no puede ser bloqueado ni inactivado.", {
+            code: "ROOT_USER_PROTECTED",
+            requestId: request.id,
+          });
+        }
+        if (!action.ok && action.code === "ROOT_USER_PROTECTION_CHECK_FAILED") {
+          return sendError(reply, 500, "No se pudo validar si el usuario esta protegido.", {
+            code: "ROOT_USER_PROTECTION_CHECK_FAILED",
+            requestId: request.id,
+          });
+        }
         if (!action.ok) {
           return sendError(reply, 500, "No se pudo actualizar estado de acceso.", {
             code: "SECURITY_USER_ACCESS_UPDATE_ERROR",
