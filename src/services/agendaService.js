@@ -2535,12 +2535,23 @@ export async function listAvailabilityByDateRangeForRequest(client, {
   const safeTo = parseDateOnly(fecha_hasta, "fecha_hasta");
   const dateKeys = buildDateKeyRange(safeFrom, safeTo);
   const normalizedSelectionType = assertBookingSelectionRuntimeSupported(selection_type || "services");
+  const branch = await ensureActiveBranch(client, id_sucursal);
+
+  if (id_barbero) {
+    const barber = await getBarberById(client, id_barbero);
+    if (barber.id_sucursal !== branch.id_sucursal) {
+      throw new AppError(409, "El barbero no pertenece a la sucursal solicitada", {
+        code: "AGENDA_BARBER_BRANCH_MISMATCH",
+        details: { id_barbero: barber.id_empleado, id_sucursal: branch.id_sucursal },
+      });
+    }
+  }
 
   const rangeConcurrency = isPoolLikeClient(client) ? 1 : 4;
   const availability = await mapWithConcurrency(dateKeys, rangeConcurrency, async (dateKey) => {
     try {
       return await resolveEffectiveDayAvailability(client, {
-        id_sucursal,
+        id_sucursal: branch.id_sucursal,
         selection_type: normalizedSelectionType,
         servicios,
         id_paquete,

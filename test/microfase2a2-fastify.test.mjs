@@ -12,8 +12,10 @@ const TARIFF_A = "44444444-4444-4444-8444-444444444444";
 const TARIFF_B = "55555555-5555-4555-8555-555555555555";
 const TARIFF_C = "56565656-5656-4565-8565-565656565656";
 const PACKAGE_A = "23232323-2323-4232-8232-232323232323";
+const UNKNOWN_BRANCH = "99999999-9999-4999-8999-999999999999";
+const UNKNOWN_BARBER = "88888888-8888-4888-8888-888888888888";
 
-function createAgendaClient() {
+function createAgendaClient({ branchActive = true } = {}) {
   const calls = [];
   const barberRow = {
     id_empleado: BARBER_A,
@@ -71,8 +73,21 @@ function createAgendaClient() {
       if (text.includes("UPDATE public.citas c") && text.includes("no_show")) return { rows: [], rowCount: 0 };
       if (text.includes("agenda_min_servicio_vendible_min")) return { rows: [{ agenda_min_servicio_vendible_min: 10 }] };
       if (text.includes("agenda_buffer_global_min")) return { rows: [{ agenda_buffer_global_min: 7 }] };
+      if (text.includes("FROM public.sucursales") && text.includes("id_sucursal = $1::uuid")) {
+        return {
+          rows: branchActive && params[0] === BRANCH_A
+            ? [{ id_sucursal: BRANCH_A, nombre_sucursal: "Sucursal QA" }]
+            : [],
+        };
+      }
       if (text.includes("FROM public.empleados e") && text.includes("e.id_sucursal = $1::uuid")) {
         return { rows: [barberRow] };
+      }
+      if (text.includes("FROM public.empleados e") && text.includes("WHERE e.id_empleado = $1::uuid")) {
+        return { rows: params[0] === BARBER_A ? [barberRow] : [] };
+      }
+      if (text.includes("FROM public.empleados") && text.includes("WHERE id_empleado = $1::uuid")) {
+        return { rows: params[0] === BARBER_A ? [{ id_sucursal: BRANCH_A }] : [] };
       }
       if (text.includes("FROM public.paquetes p") && text.includes("picked_offer")) {
         return {
@@ -129,7 +144,7 @@ test("ruta real GET /v1/public/agenda/disponibilidad devuelve 200 para package y
       url: `/v1/public/agenda/disponibilidad?id_sucursal=${BRANCH_A}&selection_type=${selectionType}&id_paquete=${PACKAGE_A}${extraQuery}&fecha_desde=2026-07-15&fecha_hasta=2026-07-15`,
     });
 
-    assert.equal(response.statusCode, 200);
+    assert.equal(response.statusCode, 200, response.body);
     assert.equal(response.json().ok, true);
     assert.equal(response.json().data.duracion_total_min, selectionType === "mixed" ? 65 : 50);
     assert.equal(response.json().data.buffer_total_min, 10);
@@ -149,7 +164,7 @@ test("ruta real GET /v1/public/agenda/horarios devuelve 200 para package y mixed
       url: `/v1/public/agenda/horarios?id_sucursal=${BRANCH_A}&selection_type=${selectionType}&id_paquete=${PACKAGE_A}${extraQuery}&fecha=2026-07-15`,
     });
 
-    assert.equal(response.statusCode, 200);
+    assert.equal(response.statusCode, 200, response.body);
     assert.equal(response.json().ok, true);
     assert.equal(response.json().data.duracion_total_min, selectionType === "mixed" ? 65 : 50);
     assert.equal(response.json().data.buffer_total_min, 10);
@@ -167,9 +182,37 @@ test("ruta real GET /v1/public/agenda/horarios con servicios usa el pipeline rea
     url: `/v1/public/agenda/horarios?id_sucursal=${BRANCH_A}&selection_type=services&servicios=${SERVICE_A}&fecha=2026-07-15`,
   });
 
-  assert.equal(response.statusCode, 200);
+  assert.equal(response.statusCode, 200, response.body);
   assert.equal(response.json().ok, true);
   assert.ok(client.calls.some((call) => call.sql.includes("UPDATE public.citas_holds")));
   assert.ok(client.calls.length > 0);
+  await app.close();
+});
+
+test("GET /v1/public/agenda/disponibilidad responde 404 controlado para sucursal inactiva", async () => {
+  const client = createAgendaClient({ branchActive: false });
+  const app = await createAgendaApp(client);
+  const response = await app.inject({
+    method: "GET",
+    url: `/v1/public/agenda/disponibilidad?id_sucursal=${UNKNOWN_BRANCH}&selection_type=services&servicios=${SERVICE_A}&fecha_desde=2026-07-15&fecha_hasta=2026-07-15`,
+  });
+
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.json().ok, false);
+  assert.equal(response.json().error.code, "AGENDA_BRANCH_NOT_FOUND");
+  await app.close();
+});
+
+test("GET /v1/public/agenda/disponibilidad responde 404 controlado para barbero inexistente", async () => {
+  const client = createAgendaClient();
+  const app = await createAgendaApp(client);
+  const response = await app.inject({
+    method: "GET",
+    url: `/v1/public/agenda/disponibilidad?id_sucursal=${BRANCH_A}&id_barbero=${UNKNOWN_BARBER}&selection_type=services&servicios=${SERVICE_A}&fecha_desde=2026-07-15&fecha_hasta=2026-07-15`,
+  });
+
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.json().ok, false);
+  assert.equal(response.json().error.code, "AGENDA_BARBER_NOT_FOUND");
   await app.close();
 });
