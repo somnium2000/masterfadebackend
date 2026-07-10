@@ -27,6 +27,10 @@ const SESSION_TOUCH_THROTTLE_SECONDS = Math.max(
   30,
   Number(process.env.AUTH_SESSION_TOUCH_THROTTLE_SECONDS || 60)
 );
+const SESSION_IDLE_TIMEOUT_SECONDS = Math.max(
+  60,
+  Number(process.env.AUTH_SESSION_IDLE_TIMEOUT_SECONDS || 1200)
+);
 const ALERT_DEDUP_MINUTES = Math.max(1, Number(process.env.AUTH_SESSION_LIMIT_ALERT_DEDUP_MINUTES || 5));
 const LOGIN_WINDOW_MINUTES = Math.max(1, Number(process.env.AUTH_LOGIN_WINDOW_MINUTES || 15));
 const LOGIN_RATE_LIMIT_IP_MAX = Math.max(1, Number(process.env.AUTH_LOGIN_RATE_LIMIT_IP_MAX || 20));
@@ -632,6 +636,34 @@ export async function validateActiveSession(app, request, payload) {
           .catch(() => {});
       }
       return { ok: false, statusCode: 401, code: "AUTH_SESSION_INVALID" };
+    }
+
+    const ultimoUsoMs = row.ultimo_uso_at ? new Date(row.ultimo_uso_at).getTime() : NaN;
+    const idleExpired = Number.isFinite(ultimoUsoMs)
+      ? Date.now() - ultimoUsoMs > SESSION_IDLE_TIMEOUT_SECONDS * 1000
+      : true;
+
+    if (idleExpired) {
+      await app.db
+        .query(
+          `
+            UPDATE public.seguridad_sesiones
+            SET
+              estado = 'expirada',
+              cierre_at = COALESCE(cierre_at, NOW()),
+              motivo_cierre = 'inactividad_20_minutos',
+              ultimo_uso_at = NOW(),
+              ip_ultimo_uso = COALESCE($2::inet, ip_ultimo_uso),
+              user_agent = COALESCE($3::text, user_agent),
+              request_id = COALESCE($4::text, request_id)
+            WHERE id_sesion = $1::uuid
+              AND estado = 'activa'
+          `,
+          [sid, meta.ip, meta.userAgent, meta.requestId]
+        )
+        .catch(() => {});
+      publishSecurityRealtimeSignal(app, "security.sessions.changed");
+      return { ok: false, statusCode: 401, code: "AUTH_SESSION_IDLE_EXPIRED" };
     }
 
     await app.db
@@ -1870,6 +1902,10 @@ export async function updateAdminUserAccessState(app, request, {
   }
 
   const nextState = String(estadoAcceso || "").trim().toLowerCase();
+  const allowedAccessStates = new Set(["pendiente_password", "activo", "bloqueado", "inactivo"]);
+  if (!allowedAccessStates.has(nextState)) {
+    return { ok: false, code: "SECURITY_USER_ACCESS_STATE_INVALID" };
+  }
   const disableStates = new Set(["bloqueado", "inactivo"]);
   const protectedAccessStates = new Set(["bloqueado", "inactivo", "pendiente_password"]);
   const isDisabling = disableStates.has(nextState);

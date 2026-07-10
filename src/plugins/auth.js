@@ -69,8 +69,12 @@ export default fp(async function authPlugin(app) {
             code: "AUTH_SESSION_VALIDATE_ERROR",
           });
         }
-        return sendError(reply, 401, "Token de acceso invalido", {
-          code: "AUTH_SESSION_INVALID",
+        const sessionErrorCode = sessionValidation.code || "AUTH_SESSION_INVALID";
+        const sessionErrorMessage = sessionErrorCode === "AUTH_SESSION_IDLE_EXPIRED"
+          ? "Sesion expirada por inactividad"
+          : "Token de acceso invalido";
+        return sendError(reply, 401, sessionErrorMessage, {
+          code: sessionErrorCode,
         });
       }
 
