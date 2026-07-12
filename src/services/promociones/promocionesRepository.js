@@ -203,7 +203,7 @@ export async function getPromotionCompatibility(db, ruleIds = []) {
 export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
   if (!Array.isArray(ruleIds) || !ruleIds.length) return { byRule: new Map(), byRuleClient: new Map(), byRulePeriod: new Map() };
 
-  const dateRef = String(context.fecha_operativa || context.fecha || "").slice(0, 10) || new Date().toISOString().slice(0, 10);
+  const dateRef = toIsoDate(context.fecha_operativa || context.fecha) || toIsoDate(new Date());
   const idCliente = context.id_cliente ? String(context.id_cliente).trim() : null;
   const idPersona = context.id_persona ? String(context.id_persona).trim() : null;
   const idPromocionSucursal = context.id_promocion_sucursal ? String(context.id_promocion_sucursal).trim() : null;
@@ -234,7 +234,10 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
   const byRulePeriod = new Map();
 
   const computeWeekKey = (dateIso) => {
-    const date = new Date(`${dateIso}T00:00:00Z`);
+    const normalized = toIsoDate(dateIso);
+    if (!normalized) return null;
+    const date = new Date(`${normalized}T00:00:00Z`);
+    if (Number.isNaN(date.getTime())) return null;
     const day = (date.getUTCDay() + 6) % 7;
     date.setUTCDate(date.getUTCDate() - day);
     return date.toISOString().slice(0, 10);
@@ -255,13 +258,13 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
       byRuleClient.set(key, (byRuleClient.get(key) || 0) + 1);
     }
 
-    const dateOp = String(row.fecha_operativa || "").slice(0, 10);
-    const monthKey = dateOp.slice(0, 7);
+    const dateOp = toIsoDate(row.fecha_operativa);
+    const monthKey = dateOp ? dateOp.slice(0, 7) : null;
     const weekKey = computeWeekKey(dateOp);
     const suffixes = [`total`];
-    if (dateOp === dateRef) suffixes.push(`dia:${dateRef}`);
-    if (monthKey === dateRef.slice(0, 7)) suffixes.push(`mes:${monthKey}`);
-    if (weekKey === computeWeekKey(dateRef)) suffixes.push(`semana:${weekKey}`);
+    if (dateOp && dateOp === dateRef) suffixes.push(`dia:${dateRef}`);
+    if (monthKey && monthKey === dateRef.slice(0, 7)) suffixes.push(`mes:${monthKey}`);
+    if (weekKey && weekKey === computeWeekKey(dateRef)) suffixes.push(`semana:${weekKey}`);
 
     for (const suffix of suffixes) {
       const baseKey = `${ruleId}:${suffix}`;

@@ -385,7 +385,9 @@ function buildLineAllocations(context = {}, candidate = {}, eligibleLines = [], 
 }
 
 export function validatePromotionCandidate(context = {}, candidate = {}) {
-  const dateRef = String(context.fecha_operativa || context.fecha || toDateOnly(new Date()) || "").slice(0, 10);
+  const dateRef = toDateOnly(context.fecha_operativa || context.fecha || new Date()) || "";
+  const validFrom = toDateOnly(candidate.vigencia_desde);
+  const validTo = toDateOnly(candidate.vigencia_hasta);
   const timeRef = String(context.hora || "").trim();
   const barbero = context.id_empleado_barbero ? String(context.id_empleado_barbero).trim() : null;
   const isClientAuthenticated = Boolean(context.es_cliente_autenticado);
@@ -398,10 +400,10 @@ export function validatePromotionCandidate(context = {}, candidate = {}) {
     return { valid: false, reasonCode: "REGLA_INACTIVA", reason: "La regla de promocion esta inactiva." };
   }
 
-  if (candidate.vigencia_desde && dateRef < String(candidate.vigencia_desde).slice(0, 10)) {
+  if (validFrom && dateRef < validFrom) {
     return { valid: false, reasonCode: "PROMOCION_FUERA_DE_VIGENCIA", reason: "La promocion aun no inicia vigencia." };
   }
-  if (candidate.vigencia_hasta && dateRef > String(candidate.vigencia_hasta).slice(0, 10)) {
+  if (validTo && dateRef > validTo) {
     return { valid: false, reasonCode: "PROMOCION_FUERA_DE_VIGENCIA", reason: "La promocion ya no esta vigente." };
   }
 
