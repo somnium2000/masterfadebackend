@@ -19,7 +19,20 @@ export class PaymentProvider {
      * @param {string} opts.descripcion      â€” descripción del cobro
      * @param {string} opts.callbackUrl      â€” URL a la que redirige el proveedor tras el pago
      * @param {Object} opts.metadata         â€” {id_cita, id_cliente, id_sucursal}
-     * @returns {Promise<{providerIntentId: string, paymentUrl: string}>}
+     * AM: Contrato normalizado compartido por todos los proveedores.
+     * @returns {Promise<{
+     *   providerIntentId: string,
+     *   paymentUrl: string|null,
+     *   launch: {
+     *     type: 'redirect'|'iframe_post',
+     *     action: string,
+     *     method: 'GET'|'POST',
+     *     fields: Record<string, string>,
+     *     allowedMessageOrigin: string|null,
+     *     expiresAt: string|null
+     *   }|null,
+     *   raw: Object
+     * }>}
      */
     // eslint-disable-next-line no-unused-vars
     async createIntent(opts) {

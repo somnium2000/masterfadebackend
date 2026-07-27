@@ -1,4 +1,9 @@
 import { PaymentProvider } from "./PaymentProvider.js";
+import {
+    normalizeCreateIntentResult,
+    PAYMENT_LAUNCH_METHODS,
+    PAYMENT_LAUNCH_TYPES,
+} from "./paymentProviderContract.js";
 
 /**
  * MockPaymentProvider â€” Proveedor de pagos simulado para desarrollo y pruebas.
@@ -31,10 +36,19 @@ export class MockPaymentProvider extends PaymentProvider {
         const separator = callbackUrl.includes("?") ? "&" : "?";
         const paymentUrl = `${callbackUrl}${separator}mock_result=${this.mockResult}&provider_intent_id=${providerIntentId}&idempotency_key=${idempotencyKey}`;
 
-        return {
+        return normalizeCreateIntentResult({
             providerIntentId,
             paymentUrl,
-        };
+            launch: {
+                type: PAYMENT_LAUNCH_TYPES.REDIRECT,
+                action: paymentUrl,
+                method: PAYMENT_LAUNCH_METHODS.GET,
+                fields: {},
+                allowedMessageOrigin: null,
+                expiresAt: null,
+            },
+            raw: { mock: true },
+        });
     }
 
     async queryStatus(providerIntentId) {
