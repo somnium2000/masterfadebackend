@@ -91,6 +91,68 @@ test("rechaza un metodo HTTP invalido", () => {
   );
 });
 
+test("rechaza launch redirect con metodo POST", () => {
+  assert.throws(
+    () => normalize({
+      launch: { type: "redirect", action: CALLBACK_URL, method: "POST", fields: {} },
+    }),
+    (error) => error.code === "PAYMENT_PROVIDER_LAUNCH_METHOD_MISMATCH"
+  );
+});
+
+test("rechaza launch iframe_post con metodo GET", () => {
+  assert.throws(
+    () => normalize({
+      launch: {
+        type: "iframe_post",
+        action: CALLBACK_URL,
+        method: "GET",
+        fields: {},
+        allowedMessageOrigin: "https://example.com",
+      },
+    }),
+    (error) => error.code === "PAYMENT_PROVIDER_LAUNCH_METHOD_MISMATCH"
+  );
+});
+
+test("rechaza launch iframe_post sin allowedMessageOrigin", () => {
+  assert.throws(
+    () => normalize({
+      launch: { type: "iframe_post", action: CALLBACK_URL, method: "POST", fields: {} },
+    }),
+    (error) => error.code === "PAYMENT_PROVIDER_URL_REQUIRED"
+  );
+});
+
+test("rechaza expiresAt invalido", () => {
+  assert.throws(
+    () => normalize({
+      launch: {
+        type: "redirect",
+        action: CALLBACK_URL,
+        method: "GET",
+        fields: {},
+        expiresAt: "2026-02-30T12:00:00Z",
+      },
+    }),
+    (error) => error.code === "PAYMENT_PROVIDER_LAUNCH_EXPIRES_AT_INVALID"
+  );
+});
+
+test("normaliza expiresAt RFC3339 valido mediante Date.toISOString", () => {
+  const result = normalize({
+    launch: {
+      type: "redirect",
+      action: CALLBACK_URL,
+      method: "GET",
+      fields: {},
+      expiresAt: "2026-07-27T06:00:00-06:00",
+    },
+  });
+
+  assert.equal(result.launch.expiresAt, "2026-07-27T12:00:00.000Z");
+});
+
 test("MockPaymentProvider conserva paymentUrl y devuelve launch redirect", async () => {
   const provider = new MockPaymentProvider({ mockResult: "PAID" });
   const result = await provider.createIntent({

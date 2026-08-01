@@ -10,6 +10,7 @@ export const PAYMENT_LAUNCH_METHODS = Object.freeze({
 
 const VALID_LAUNCH_TYPES = new Set(Object.values(PAYMENT_LAUNCH_TYPES));
 const VALID_LAUNCH_METHODS = new Set(Object.values(PAYMENT_LAUNCH_METHODS));
+const RFC3339_DATE_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export class PaymentProviderContractError extends Error {
   constructor(code, message) {
@@ -82,6 +83,39 @@ function normalizeFields(fields) {
   );
 }
 
+function normalizeExpiresAt(value) {
+  const normalized = optionalText(value);
+  if (!normalized) return null;
+
+  const match = normalized.match(RFC3339_DATE_TIME_PATTERN);
+  if (!match) {
+    throw new PaymentProviderContractError(
+      "PAYMENT_PROVIDER_LAUNCH_EXPIRES_AT_INVALID",
+      "[PaymentProvider] launch.expiresAt debe ser una fecha ISO 8601/RFC3339 valida."
+    );
+  }
+
+  const [year, month, day] = normalized.slice(0, 10).split("-").map(Number);
+  const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysByMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysByMonth[month - 1]) {
+    throw new PaymentProviderContractError(
+      "PAYMENT_PROVIDER_LAUNCH_EXPIRES_AT_INVALID",
+      "[PaymentProvider] launch.expiresAt debe ser una fecha ISO 8601/RFC3339 valida."
+    );
+  }
+
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new PaymentProviderContractError(
+      "PAYMENT_PROVIDER_LAUNCH_EXPIRES_AT_INVALID",
+      "[PaymentProvider] launch.expiresAt debe ser una fecha ISO 8601/RFC3339 valida."
+    );
+  }
+
+  return parsed.toISOString();
+}
+
 function normalizeLaunch(launch) {
   if (launch == null) return null;
   if (typeof launch !== "object" || Array.isArray(launch)) {
@@ -107,17 +141,33 @@ function normalizeLaunch(launch) {
     );
   }
 
+  if (type === PAYMENT_LAUNCH_TYPES.REDIRECT && method !== PAYMENT_LAUNCH_METHODS.GET) {
+    throw new PaymentProviderContractError(
+      "PAYMENT_PROVIDER_LAUNCH_METHOD_MISMATCH",
+      "[PaymentProvider] launch redirect solo permite GET."
+    );
+  }
+
+  if (type === PAYMENT_LAUNCH_TYPES.IFRAME_POST && method !== PAYMENT_LAUNCH_METHODS.POST) {
+    throw new PaymentProviderContractError(
+      "PAYMENT_PROVIDER_LAUNCH_METHOD_MISMATCH",
+      "[PaymentProvider] launch iframe_post solo permite POST."
+    );
+  }
+
+  const allowedMessageOrigin = normalizeHttpUrl(
+    launch.allowedMessageOrigin,
+    "launch.allowedMessageOrigin",
+    { nullable: type !== PAYMENT_LAUNCH_TYPES.IFRAME_POST, originOnly: true }
+  );
+
   return {
     type,
     action: normalizeHttpUrl(launch.action, "launch.action"),
     method,
     fields: normalizeFields(launch.fields),
-    allowedMessageOrigin: normalizeHttpUrl(
-      launch.allowedMessageOrigin,
-      "launch.allowedMessageOrigin",
-      { nullable: true, originOnly: true }
-    ),
-    expiresAt: optionalText(launch.expiresAt),
+    allowedMessageOrigin,
+    expiresAt: normalizeExpiresAt(launch.expiresAt),
   };
 }
 
