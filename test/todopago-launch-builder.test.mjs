@@ -47,6 +47,36 @@ for (const [amount, expected] of [[1, "1.00"], [1.5, "1.50"]]) {
   });
 }
 
+test("builder TodoPago rechaza amount cero", () => {
+  assert.throws(
+    () => buildTodoPagoLaunch({ ...INPUT, amount: 0 }),
+    (error) => error.code === "TODOPAGO_LAUNCH_AMOUNT_INVALID"
+  );
+});
+
+test("builder TodoPago rechaza amount positivo que redondearia a 0.00", () => {
+  assert.throws(
+    () => buildTodoPagoLaunch({ ...INPUT, amount: 0.001 }),
+    (error) => error.code === "TODOPAGO_LAUNCH_AMOUNT_INVALID"
+  );
+});
+
+test("builder TodoPago rechaza amount negativo", () => {
+  assert.throws(
+    () => buildTodoPagoLaunch({ ...INPUT, amount: -10 }),
+    (error) => error.code === "TODOPAGO_LAUNCH_AMOUNT_INVALID"
+  );
+});
+
+for (const amount of [NaN, Infinity, -Infinity]) {
+  test(`builder TodoPago rechaza amount no finito: ${String(amount)}`, () => {
+    assert.throws(
+      () => buildTodoPagoLaunch({ ...INPUT, amount }),
+      (error) => error.code === "TODOPAGO_LAUNCH_AMOUNT_INVALID"
+    );
+  });
+}
+
 for (const comentario of ["", "   ", null, undefined]) {
   test(`builder TodoPago omite comentario vacio: ${String(comentario)}`, () => {
     const launch = buildTodoPagoLaunch({ ...INPUT, comentario });
@@ -67,6 +97,28 @@ test("builder TodoPago normaliza allowedMessageOrigin con path unicamente al ori
     allowedMessageOrigin: "https://checkout.example.test/messages/result?source=test",
   });
   assert.equal(launch.allowedMessageOrigin, "https://checkout.example.test");
+});
+
+test("builder TodoPago rechaza expiresAt invalido", () => {
+  assert.throws(
+    () => buildTodoPagoLaunch({ ...INPUT, expiresAt: "fecha-libre" }),
+    (error) => error.code === "TODOPAGO_LAUNCH_EXPIRES_AT_INVALID"
+  );
+});
+
+test("builder TodoPago rechaza expiresAt sin timezone", () => {
+  assert.throws(
+    () => buildTodoPagoLaunch({ ...INPUT, expiresAt: "2026-08-01T18:00:00" }),
+    (error) => error.code === "TODOPAGO_LAUNCH_EXPIRES_AT_INVALID"
+  );
+});
+
+test("builder TodoPago acepta RFC3339 valido y normaliza con Date.toISOString", () => {
+  const launch = buildTodoPagoLaunch({
+    ...INPUT,
+    expiresAt: "2026-08-01T12:00:00-06:00",
+  });
+  assert.equal(launch.expiresAt, "2026-08-01T18:00:00.000Z");
 });
 
 test("builder TodoPago exige currencyCode sin usar valor predeterminado", () => {

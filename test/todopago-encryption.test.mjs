@@ -6,6 +6,7 @@ import {
 import test from "node:test";
 import {
   encryptTodoPagoData,
+  encryptTodoPagoDataForTests,
 } from "../src/services/payments/todopago/TodoPagoEncryption.js";
 
 const FIXED_IV = Buffer.from(Array.from({ length: 16 }, (_, index) => index));
@@ -41,7 +42,7 @@ function decryptResult(result, secret) {
 }
 
 test("cifrado TodoPago retorna exclusivamente el formato ivBase64:cipherBase64", () => {
-  const result = encryptTodoPagoData(INPUT, { testIv: FIXED_IV });
+  const result = encryptTodoPagoDataForTests(INPUT, { testIv: FIXED_IV });
   const parts = result.split(":");
 
   assert.equal(parts.length, 2);
@@ -50,19 +51,19 @@ test("cifrado TodoPago retorna exclusivamente el formato ivBase64:cipherBase64",
 });
 
 test("IV Base64 del cifrado TodoPago decodifica a exactamente 16 bytes", () => {
-  const [ivBase64] = encryptTodoPagoData(INPUT, { testIv: FIXED_IV }).split(":");
+  const [ivBase64] = encryptTodoPagoDataForTests(INPUT, { testIv: FIXED_IV }).split(":");
   assert.equal(Buffer.from(ivBase64, "base64").length, 16);
 });
 
-test("cifrado TodoPago coincide con el vector deterministico de IV fijo", () => {
+test("helper exclusivo de pruebas conserva el vector deterministico", () => {
   assert.equal(
-    encryptTodoPagoData(INPUT, { testIv: FIXED_IV }),
+    encryptTodoPagoDataForTests(INPUT, { testIv: FIXED_IV }),
     DETERMINISTIC_VECTOR
   );
 });
 
 test("descifrado de prueba recupera el JSON exacto requerido por TodoPago", () => {
-  const result = encryptTodoPagoData(INPUT, { testIv: FIXED_IV });
+  const result = encryptTodoPagoDataForTests(INPUT, { testIv: FIXED_IV });
   const decrypted = decryptResult(result, INPUT.secret);
 
   assert.equal(decrypted, JSON.stringify(EXPECTED_PAYLOAD));
@@ -72,6 +73,16 @@ test("descifrado de prueba recupera el JSON exacto requerido por TodoPago", () =
 test("dos cifrados con IV aleatorio producen resultados diferentes", () => {
   const first = encryptTodoPagoData(INPUT);
   const second = encryptTodoPagoData(INPUT);
+  assert.notEqual(first, second);
+});
+
+test("funcion productiva ignora cualquier intento de fijar el IV", () => {
+  assert.equal(encryptTodoPagoData.length, 1);
+  const first = encryptTodoPagoData(INPUT, { testIv: FIXED_IV });
+  const second = encryptTodoPagoData(INPUT, { testIv: FIXED_IV });
+
+  assert.notEqual(first, DETERMINISTIC_VECTOR);
+  assert.notEqual(second, DETERMINISTIC_VECTOR);
   assert.notEqual(first, second);
 });
 
@@ -93,7 +104,7 @@ for (const fieldName of [
 
 test("cifrado TodoPago rechaza IV que no tenga 16 bytes", () => {
   assert.throws(
-    () => encryptTodoPagoData(INPUT, { testIv: Buffer.alloc(15) }),
+    () => encryptTodoPagoDataForTests(INPUT, { testIv: Buffer.alloc(15) }),
     (error) => error.code === "TODOPAGO_ENCRYPTION_IV_INVALID"
   );
 });
@@ -112,7 +123,7 @@ test("errores de cifrado TodoPago no exponen secretos", () => {
   ];
 
   assert.throws(
-    () => encryptTodoPagoData(sensitiveInput, { testIv: Buffer.alloc(17) }),
+    () => encryptTodoPagoDataForTests(sensitiveInput, { testIv: Buffer.alloc(17) }),
     (error) => {
       const serializedError = `${error.message}\n${error.stack}`;
       assert.equal(secrets.some((secret) => serializedError.includes(secret)), false);

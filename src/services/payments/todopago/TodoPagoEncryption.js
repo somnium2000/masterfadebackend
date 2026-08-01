@@ -25,8 +25,7 @@ function requireNonEmptyText(value, fieldName) {
   return value;
 }
 
-function resolveIv(testIv) {
-  if (testIv == null) return randomBytes(AES_IV_LENGTH);
+function validateIv(testIv) {
   if (!Buffer.isBuffer(testIv) && !(testIv instanceof Uint8Array)) {
     throw new TodoPagoEncryptionError(
       "TODOPAGO_ENCRYPTION_IV_INVALID",
@@ -44,14 +43,14 @@ function resolveIv(testIv) {
   return iv;
 }
 
-export function encryptTodoPagoData({
+function encryptWithIv({
   secret,
   ip,
   userTodopago,
   passwordTodopago,
   tenantId,
   terminalNbr,
-} = {}, { testIv } = {}) {
+} = {}, iv) {
   const encryptionSecret = requireNonEmptyText(secret, "secret");
   const payload = {
     ip: requireNonEmptyText(ip, "ip"),
@@ -60,7 +59,6 @@ export function encryptTodoPagoData({
     tenantId: requireNonEmptyText(tenantId, "tenantId"),
     terminalNbr: requireNonEmptyText(terminalNbr, "terminalNbr"),
   };
-  const iv = resolveIv(testIv);
   const key = createHash("sha256").update(encryptionSecret, "utf8").digest();
   const cipher = createCipheriv(AES_ALGORITHM, key, iv);
   const encrypted = Buffer.concat([
@@ -69,4 +67,12 @@ export function encryptTodoPagoData({
   ]);
 
   return `${iv.toString("base64")}:${encrypted.toString("base64")}`;
+}
+
+export function encryptTodoPagoData(input) {
+  return encryptWithIv(input, randomBytes(AES_IV_LENGTH));
+}
+
+export function encryptTodoPagoDataForTests(input, { testIv } = {}) {
+  return encryptWithIv(input, validateIv(testIv));
 }

@@ -1,3 +1,7 @@
+import {
+  normalizeCreateIntentResult,
+} from "../paymentProviderContract.js";
+
 export class TodoPagoLaunchBuilderError extends Error {
   constructor(code, message) {
     super(message);
@@ -45,14 +49,14 @@ function normalizeAmount(value) {
     );
   }
   const amount = Number(value);
-  if (!Number.isFinite(amount)) {
+  if (!Number.isFinite(amount) || amount <= 0) {
     throw new TodoPagoLaunchBuilderError(
       "TODOPAGO_LAUNCH_AMOUNT_INVALID",
       "El monto de lanzamiento TodoPago es invalido."
     );
   }
   const normalized = amount.toFixed(2);
-  if (!/^-?\d+\.\d{2}$/.test(normalized)) {
+  if (!/^-?\d+\.\d{2}$/.test(normalized) || Number(normalized) <= 0) {
     throw new TodoPagoLaunchBuilderError(
       "TODOPAGO_LAUNCH_AMOUNT_INVALID",
       "El monto de lanzamiento TodoPago es invalido."
@@ -87,7 +91,7 @@ export function buildTodoPagoLaunch({
   if (normalizedComment) fields.comentario = normalizedComment;
   fields.encrypted = requireNonEmptyText(encrypted, "encrypted");
 
-  return {
+  const launch = {
     type: "iframe_post",
     action: normalizeHttpsUrl(modalUrl, "modalUrl"),
     method: "POST",
@@ -99,4 +103,18 @@ export function buildTodoPagoLaunch({
     ),
     expiresAt: requireNonEmptyText(expiresAt, "expiresAt"),
   };
+
+  try {
+    return normalizeCreateIntentResult({
+      providerIntentId: "todopago-launch-validation",
+      paymentUrl: null,
+      launch,
+      raw: {},
+    }).launch;
+  } catch {
+    throw new TodoPagoLaunchBuilderError(
+      "TODOPAGO_LAUNCH_EXPIRES_AT_INVALID",
+      "expiresAt debe ser una fecha ISO 8601/RFC3339 valida."
+    );
+  }
 }
