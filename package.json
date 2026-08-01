@@ -8,7 +8,8 @@
     "dev": "node --watch app.js",
     "lint": "eslint .",
     "test": "node --test",
-    "db:preflight": "node scripts/db-preflight.js"
+    "db:preflight": "node scripts/db-preflight.js",
+    "todopago:auth-smoke": "node scripts/todopago-auth-smoke.js"
   },
   "author": "",
   "license": "ISC",
