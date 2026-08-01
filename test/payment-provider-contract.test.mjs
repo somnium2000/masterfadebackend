@@ -153,6 +153,28 @@ test("normaliza expiresAt RFC3339 valido mediante Date.toISOString", () => {
   assert.equal(result.launch.expiresAt, "2026-07-27T12:00:00.000Z");
 });
 
+for (const invalidExpiresAt of [
+  "2026-07-27T24:00:00Z",
+  "2026-07-27T12:60:00Z",
+  "2026-07-27T12:00:60Z",
+  "2026-07-27T12:00:00+24:00",
+]) {
+  test(`rechaza expiresAt RFC3339 fuera de rango: ${invalidExpiresAt}`, () => {
+    assert.throws(
+      () => normalize({
+        launch: {
+          type: "redirect",
+          action: CALLBACK_URL,
+          method: "GET",
+          fields: {},
+          expiresAt: invalidExpiresAt,
+        },
+      }),
+      (error) => error.code === "PAYMENT_PROVIDER_LAUNCH_EXPIRES_AT_INVALID"
+    );
+  });
+}
+
 test("MockPaymentProvider conserva paymentUrl y devuelve launch redirect", async () => {
   const provider = new MockPaymentProvider({ mockResult: "PAID" });
   const result = await provider.createIntent({

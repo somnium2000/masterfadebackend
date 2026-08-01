@@ -10,7 +10,7 @@ export const PAYMENT_LAUNCH_METHODS = Object.freeze({
 
 const VALID_LAUNCH_TYPES = new Set(Object.values(PAYMENT_LAUNCH_TYPES));
 const VALID_LAUNCH_METHODS = new Set(Object.values(PAYMENT_LAUNCH_METHODS));
-const RFC3339_DATE_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const RFC3339_DATE_TIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
 
 export class PaymentProviderContractError extends Error {
   constructor(code, message) {
@@ -95,7 +95,8 @@ function normalizeExpiresAt(value) {
     );
   }
 
-  const [year, month, day] = normalized.slice(0, 10).split("-").map(Number);
+  const [, yearText, monthText, dayText] = match;
+  const [year, month, day] = [yearText, monthText, dayText].map(Number);
   const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const daysByMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   if (month < 1 || month > 12 || day < 1 || day > daysByMonth[month - 1]) {
