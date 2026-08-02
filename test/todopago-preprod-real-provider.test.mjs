@@ -100,6 +100,7 @@ test('createIntent orchestrates one authentication and returns the normalized la
   const result = await provider.createIntent(INTENT_INPUT)
 
   assert.equal(calls.authenticate.length, 1)
+  assert.equal(calls.buildLaunch.length, 1)
   assert.deepEqual(calls.authenticate[0], {
     username: CONFIG.username,
     password: CONFIG.password,
@@ -147,6 +148,136 @@ test('createIntent sends the exact payload to the launch builder', async () => {
     },
   ])
 })
+
+test('createIntent rejects an expired expiresAt before authentication', async () => {
+  const { provider, calls } = createHarness()
+
+  await assert.rejects(
+    provider.createIntent({
+      ...INTENT_INPUT,
+      metadata: {
+        ...INTENT_INPUT.metadata,
+        expiresAt: '2026-08-01T11:59:59.000Z',
+      },
+    }),
+    (error) =>
+      error instanceof TodoPagoPreprodRealProviderError &&
+      error.code === 'TODOPAGO_LAUNCH_EXPIRED',
+  )
+
+  assert.equal(calls.authenticate.length, 0)
+  assert.equal(calls.encryptData.length, 0)
+  assert.equal(calls.buildLaunch.length, 0)
+})
+
+test('createIntent rejects invalid RFC3339 expiresAt before authentication', async () => {
+  const { provider, calls } = createHarness()
+
+  await assert.rejects(
+    provider.createIntent({
+      ...INTENT_INPUT,
+      metadata: {
+        ...INTENT_INPUT.metadata,
+        expiresAt: '2026-08-01 18:30:00',
+      },
+    }),
+    (error) => error.code === 'TODOPAGO_LAUNCH_EXPIRES_AT_INVALID',
+  )
+
+  assert.equal(calls.authenticate.length, 0)
+  assert.equal(calls.encryptData.length, 0)
+  assert.equal(calls.buildLaunch.length, 0)
+})
+
+test('createIntent rejects expiresAt equal to now before authentication', async () => {
+  const { provider, calls } = createHarness()
+
+  await assert.rejects(
+    provider.createIntent({
+      ...INTENT_INPUT,
+      metadata: {
+        ...INTENT_INPUT.metadata,
+        expiresAt: '2026-08-01T12:00:00.000Z',
+      },
+    }),
+    (error) =>
+      error instanceof TodoPagoPreprodRealProviderError &&
+      error.code === 'TODOPAGO_LAUNCH_EXPIRED',
+  )
+
+  assert.equal(calls.authenticate.length, 0)
+  assert.equal(calls.encryptData.length, 0)
+  assert.equal(calls.buildLaunch.length, 0)
+})
+
+test('createIntent reports an invalid injected clock before authentication', async () => {
+  const { provider, calls } = createHarness({
+    now: () => new Date('invalid'),
+  })
+
+  await assert.rejects(
+    provider.createIntent(INTENT_INPUT),
+    (error) =>
+      error instanceof TodoPagoPreprodRealProviderError &&
+      error.code === 'TODOPAGO_CLOCK_INVALID',
+  )
+
+  assert.equal(calls.authenticate.length, 0)
+  assert.equal(calls.encryptData.length, 0)
+  assert.equal(calls.buildLaunch.length, 0)
+})
+
+for (const [amount, expectedCode] of [
+  [0, 'TODOPAGO_LAUNCH_AMOUNT_INVALID'],
+  [-1, 'TODOPAGO_LAUNCH_AMOUNT_INVALID'],
+  [0.001, 'TODOPAGO_LAUNCH_AMOUNT_INVALID'],
+  [NaN, 'TODOPAGO_CREATE_INTENT_INVALID'],
+  [Infinity, 'TODOPAGO_CREATE_INTENT_INVALID'],
+]) {
+  test(`createIntent rejects amount ${String(amount)} before authentication`, async () => {
+    const { provider, calls } = createHarness()
+
+    await assert.rejects(
+      provider.createIntent({ ...INTENT_INPUT, montoHnl: amount }),
+      (error) => error.code === expectedCode,
+    )
+
+    assert.equal(calls.authenticate.length, 0)
+    assert.equal(calls.encryptData.length, 0)
+    assert.equal(calls.buildLaunch.length, 0)
+  })
+}
+
+for (const modalUrl of [
+  'http://modal.example.test/checkout',
+  'not-a-valid-url',
+]) {
+  test(`provider rejects invalid modalUrl: ${modalUrl}`, () => {
+    assert.throws(
+      () => createHarness({ config: { ...CONFIG, modalUrl } }),
+      (error) =>
+        error instanceof TodoPagoPreprodRealProviderError &&
+        error.code === 'TODOPAGO_PROVIDER_CONFIG_INVALID',
+    )
+  })
+}
+
+for (const allowedMessageOrigin of [
+  'http://modal.example.test',
+  'not-a-valid-origin',
+  'https://modal.example.test/messages',
+]) {
+  test(`provider rejects invalid allowedMessageOrigin: ${allowedMessageOrigin}`, () => {
+    assert.throws(
+      () => createHarness({
+        config: { ...CONFIG, allowedMessageOrigin },
+      }),
+      (error) =>
+        error instanceof TodoPagoPreprodRealProviderError &&
+        error.code === 'TODOPAGO_PROVIDER_CONFIG_INVALID',
+    )
+  })
+}
 
 test('createIntent raw diagnostic data contains only the approved safe fields', async () => {
   const { provider } = createHarness()

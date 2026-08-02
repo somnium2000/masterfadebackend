@@ -20,7 +20,11 @@ function requireNonEmptyText(value, fieldName) {
   return value;
 }
 
-function normalizeHttpsUrl(value, fieldName, { originOnly = false } = {}) {
+function normalizeHttpsUrl(
+  value,
+  fieldName,
+  { originOnly = false, requireOriginOnly = false } = {}
+) {
   const text = requireNonEmptyText(value, fieldName).trim();
   let parsed;
   try {
@@ -38,10 +42,30 @@ function normalizeHttpsUrl(value, fieldName, { originOnly = false } = {}) {
       `${fieldName} debe ser una URL HTTPS absoluta.`
     );
   }
+  if (requireOriginOnly && text !== parsed.origin) {
+    throw new TodoPagoLaunchBuilderError(
+      "TODOPAGO_LAUNCH_URL_INVALID",
+      `${fieldName} debe contener unicamente el origin HTTPS.`
+    );
+  }
   return originOnly ? parsed.origin : parsed.toString();
 }
 
-function normalizeAmount(value) {
+export function normalizeTodoPagoModalUrl(value) {
+  return normalizeHttpsUrl(value, "modalUrl");
+}
+
+export function normalizeTodoPagoAllowedMessageOrigin(
+  value,
+  { requireOriginOnly = false } = {}
+) {
+  return normalizeHttpsUrl(value, "allowedMessageOrigin", {
+    originOnly: true,
+    requireOriginOnly,
+  });
+}
+
+export function normalizeTodoPagoAmount(value) {
   if (value == null || (typeof value === "string" && value.trim().length === 0)) {
     throw new TodoPagoLaunchBuilderError(
       "TODOPAGO_LAUNCH_AMOUNT_INVALID",
@@ -65,6 +89,31 @@ function normalizeAmount(value) {
   return normalized;
 }
 
+export function normalizeTodoPagoExpiresAt(value) {
+  const expiresAt = requireNonEmptyText(value, "expiresAt");
+
+  try {
+    return normalizeCreateIntentResult({
+      providerIntentId: "todopago-expiry-validation",
+      paymentUrl: null,
+      launch: {
+        type: "iframe_post",
+        action: "https://validation.invalid/",
+        method: "POST",
+        fields: {},
+        allowedMessageOrigin: "https://validation.invalid",
+        expiresAt,
+      },
+      raw: {},
+    }).launch.expiresAt;
+  } catch {
+    throw new TodoPagoLaunchBuilderError(
+      "TODOPAGO_LAUNCH_EXPIRES_AT_INVALID",
+      "expiresAt debe ser una fecha ISO 8601/RFC3339 valida."
+    );
+  }
+}
+
 export function buildTodoPagoLaunch({
   modalUrl,
   allowedMessageOrigin,
@@ -82,7 +131,7 @@ export function buildTodoPagoLaunch({
   const fields = {
     tokenTodomovil: requireNonEmptyText(tokenTodomovil, "tokenTodomovil"),
     idTransaccion: requireNonEmptyText(idTransaccion, "idTransaccion"),
-    amount: normalizeAmount(amount),
+    amount: normalizeTodoPagoAmount(amount),
     customerName: requireNonEmptyText(customerName, "customerName"),
     ordenDeCompra: requireNonEmptyText(ordenDeCompra, "ordenDeCompra"),
     currencyCode: requireNonEmptyText(currencyCode, "currencyCode"),
@@ -93,15 +142,13 @@ export function buildTodoPagoLaunch({
 
   const launch = {
     type: "iframe_post",
-    action: normalizeHttpsUrl(modalUrl, "modalUrl"),
+    action: normalizeTodoPagoModalUrl(modalUrl),
     method: "POST",
     fields,
-    allowedMessageOrigin: normalizeHttpsUrl(
-      allowedMessageOrigin,
-      "allowedMessageOrigin",
-      { originOnly: true }
+    allowedMessageOrigin: normalizeTodoPagoAllowedMessageOrigin(
+      allowedMessageOrigin
     ),
-    expiresAt: requireNonEmptyText(expiresAt, "expiresAt"),
+    expiresAt: normalizeTodoPagoExpiresAt(expiresAt),
   };
 
   try {

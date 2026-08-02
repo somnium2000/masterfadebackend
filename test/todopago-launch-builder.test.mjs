@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildTodoPagoLaunch,
+  normalizeTodoPagoAllowedMessageOrigin,
+  normalizeTodoPagoAmount,
+  normalizeTodoPagoExpiresAt,
+  normalizeTodoPagoModalUrl,
 } from "../src/services/payments/todopago/TodoPagoLaunchBuilder.js";
 
 const INPUT = {
@@ -136,4 +140,31 @@ test("builder TodoPago no muta el objeto recibido", () => {
   buildTodoPagoLaunch(source);
 
   assert.deepEqual(source, snapshot);
+});
+
+test("validadores puros conservan las reglas del builder", () => {
+  assert.equal(normalizeTodoPagoAmount(1.5), "1.50");
+  assert.equal(
+    normalizeTodoPagoModalUrl("https://checkout.example.test/modal"),
+    "https://checkout.example.test/modal"
+  );
+  assert.equal(
+    normalizeTodoPagoAllowedMessageOrigin("https://checkout.example.test/path"),
+    "https://checkout.example.test"
+  );
+  assert.equal(
+    normalizeTodoPagoExpiresAt("2026-08-01T12:00:00-06:00"),
+    "2026-08-01T18:00:00.000Z"
+  );
+});
+
+test("validador puro puede exigir allowedMessageOrigin como origin exacto", () => {
+  assert.throws(
+    () =>
+      normalizeTodoPagoAllowedMessageOrigin(
+        "https://checkout.example.test/messages",
+        { requireOriginOnly: true }
+      ),
+    (error) => error.code === "TODOPAGO_LAUNCH_URL_INVALID"
+  );
 });

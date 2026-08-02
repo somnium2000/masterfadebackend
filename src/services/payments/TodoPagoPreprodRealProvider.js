@@ -1,7 +1,13 @@
 import { PaymentProvider } from './PaymentProvider.js'
 import { normalizeCreateIntentResult } from './paymentProviderContract.js'
 import { encryptTodoPagoData } from './todopago/TodoPagoEncryption.js'
-import { buildTodoPagoLaunch } from './todopago/TodoPagoLaunchBuilder.js'
+import {
+  buildTodoPagoLaunch,
+  normalizeTodoPagoAllowedMessageOrigin,
+  normalizeTodoPagoAmount,
+  normalizeTodoPagoExpiresAt,
+  normalizeTodoPagoModalUrl,
+} from './todopago/TodoPagoLaunchBuilder.js'
 
 const REQUIRED_CONFIG_FIELDS = Object.freeze([
   'username',
@@ -56,7 +62,21 @@ function validateConfig(config) {
     }
   }
 
-  return Object.freeze({ ...config })
+  try {
+    return Object.freeze({
+      ...config,
+      modalUrl: normalizeTodoPagoModalUrl(config.modalUrl),
+      allowedMessageOrigin: normalizeTodoPagoAllowedMessageOrigin(
+        config.allowedMessageOrigin,
+        { requireOriginOnly: true },
+      ),
+    })
+  } catch {
+    throw new TodoPagoPreprodRealProviderError(
+      'TODOPAGO_PROVIDER_CONFIG_INVALID',
+      'TodoPago provider configuration is invalid',
+    )
+  }
 }
 
 function validateDependency(value) {
@@ -73,7 +93,6 @@ function validateCreateIntentInput(input) {
     !isObject(input) ||
     !isNonEmptyText(input.idempotencyKey) ||
     !Number.isFinite(input.montoHnl) ||
-    input.montoHnl <= 0 ||
     !isNonEmptyText(input.moneda) ||
     !isNonEmptyText(input.descripcion) ||
     !isNonEmptyText(input.callbackUrl)
@@ -99,6 +118,30 @@ function validateCreateIntentInput(input) {
       )
     }
   }
+
+  normalizeTodoPagoAmount(input.montoHnl)
+  return normalizeTodoPagoExpiresAt(input.metadata.expiresAt)
+}
+
+function resolveCurrentTime(now) {
+  let currentTime
+  try {
+    currentTime = now()
+  } catch {
+    throw new TodoPagoPreprodRealProviderError(
+      'TODOPAGO_CLOCK_INVALID',
+      'TodoPago provider clock is invalid',
+    )
+  }
+
+  if (!(currentTime instanceof Date) || Number.isNaN(currentTime.getTime())) {
+    throw new TodoPagoPreprodRealProviderError(
+      'TODOPAGO_CLOCK_INVALID',
+      'TodoPago provider clock is invalid',
+    )
+  }
+
+  return currentTime
 }
 
 function validateAuthenticationResult(result) {
@@ -143,7 +186,15 @@ export class TodoPagoPreprodRealProvider extends PaymentProvider {
   }
 
   async createIntent(input) {
-    validateCreateIntentInput(input)
+    const normalizedExpiresAt = validateCreateIntentInput(input)
+    const currentTime = resolveCurrentTime(this.now)
+
+    if (new Date(normalizedExpiresAt).getTime() <= currentTime.getTime()) {
+      throw new TodoPagoPreprodRealProviderError(
+        'TODOPAGO_LAUNCH_EXPIRED',
+        'TodoPago payment launch has expired',
+      )
+    }
 
     const { montoHnl, moneda, descripcion, metadata } = input
     const authentication = await this.authClient.authenticate({
@@ -181,7 +232,7 @@ export class TodoPagoPreprodRealProvider extends PaymentProvider {
       currencyCode: moneda,
       comentario: descripcion,
       encrypted,
-      expiresAt: metadata.expiresAt,
+      expiresAt: normalizedExpiresAt,
     })
 
     return normalizeCreateIntentResult({
