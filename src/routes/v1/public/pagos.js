@@ -23,8 +23,61 @@ function safeText(value) {
   return normalized || null;
 }
 
+export function buildProviderOrderReference({ providerCode, idIntent } = {}) {
+  const provider = String(providerCode || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, 16);
+  const intent = String(idIntent || "").trim().replace(/-/g, "").toUpperCase();
+  if (!provider || !/^[0-9A-F]{32}$/.test(intent)) {
+    throw new AppError(500, "No se pudo iniciar el pago", {
+      code: "PUBLIC_PAGOS_ORDER_REFERENCE_INVALID",
+    });
+  }
+  return `MF-${provider}-${intent}`;
+}
+
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function resolveCustomerName(groupRows) {
+  const name = [groupRows?.[0]?.titular_nombres, groupRows?.[0]?.titular_apellidos]
+    .map((value) => safeText(value))
+    .filter(Boolean)
+    .join(" ");
+  if (!name) {
+    throw new AppError(409, "No se pudo verificar el titular de la reserva", {
+      code: "PUBLIC_PAGOS_CUSTOMER_NAME_MISSING",
+    });
+  }
+  return name;
+}
+
+function buildPublicPaymentIntentPayload(row, pricing, launch = null) {
+  return {
+    id_intent: row.id_intent,
+    payment_url: row.link_pago_url ?? null,
+    launch,
+    expires_at: new Date(row.expires_at).toISOString(),
+    monto_hnl: Number(row.monto_hnl || 0),
+    moneda_codigo: row.moneda_codigo,
+    estado_intent_codigo: row.estado_intent_codigo,
+    subtotal_hnl: pricing.subtotal_hnl,
+    descuento_total_hnl: pricing.descuento_total_hnl,
+    total_hnl: pricing.total_hnl,
+    promociones_aplicadas: pricing.promociones_aplicadas,
+    promociones_descartadas: pricing.promociones_descartadas,
+  };
+}
+
+function buildSafeProviderErrorDiagnostic(error, requestId) {
+  return {
+    requestId,
+    errorCode: safeText(error?.code),
+    errorName: safeText(error?.name),
+  };
 }
 
 function assertUuid(value, field = "id") {
@@ -409,6 +462,8 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
         cg.estado_grupo_codigo,
         cg.id_cliente_titular,
         cg.id_persona_titular,
+        pt.nombres AS titular_nombres,
+        pt.apellidos AS titular_apellidos,
         c.id_cita,
         c.orden_integrante,
         c.estado_cita_codigo,
@@ -432,6 +487,9 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
         ON co.id_persona = cg.id_persona_titular
        AND co.deleted_at IS NULL
        AND co.es_principal IS TRUE
+      LEFT JOIN public.personas pt
+        ON pt.id_persona = cg.id_persona_titular
+       AND pt.deleted_at IS NULL
       WHERE cg.id_grupo_cita = $1::uuid
       ORDER BY c.orden_integrante ASC, c.created_at ASC
     `,
@@ -442,7 +500,7 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
   }
   const normalizedTitularEmail = normalizeEmail(titularEmail);
   const dbTitularEmail = normalizeEmail(result.rows[0]?.direccion_correo || "");
-  if (normalizedTitularEmail && dbTitularEmail && normalizedTitularEmail !== dbTitularEmail) {
+  if (!normalizedTitularEmail || !dbTitularEmail || normalizedTitularEmail !== dbTitularEmail) {
     throw new AppError(403, "No tienes permisos para operar esta reserva", { code: "PUBLIC_PAGOS_GROUP_FORBIDDEN" });
   }
   return result.rows;
@@ -1141,6 +1199,13 @@ export default async function publicPagosRoutes(app) {
       const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, logger: request.log });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       assertPublicGroupPayable(groupRows);
+      const customerName = resolveCustomerName(groupRows);
+      const clientIp = safeText(request.ip);
+      if (!clientIp) {
+        throw new AppError(500, "No se pudo iniciar el pago", {
+          code: "PUBLIC_PAGOS_CLIENT_IP_MISSING",
+        });
+      }
       const expiredHold = groupRows.some((row) => row.estado_hold_codigo !== "activo" || !row.expires_at || new Date(row.expires_at).getTime() <= Date.now());
       if (expiredHold) {
         throw new AppError(409, "El hold de la reserva ya expiro", { code: "PUBLIC_PAGOS_HOLD_EXPIRED" });
@@ -1173,30 +1238,10 @@ export default async function publicPagosRoutes(app) {
         if (amountsMatch(existingAmount, totalGroup)) {
           await dbClient.query("COMMIT");
           inTransaction = false;
-          if (existingIntent.rows[0].link_pago_url) {
-          return sendOk(reply, {
-            id_intent: existingIntent.rows[0].id_intent,
-            payment_url: existingIntent.rows[0].link_pago_url ?? null,
-            expires_at: new Date(existingIntent.rows[0].expires_at).toISOString(),
-            monto_hnl: Number(existingIntent.rows[0].monto_hnl || 0),
-            moneda_codigo: existingIntent.rows[0].moneda_codigo || "HNL",
-            estado_intent_codigo: existingIntent.rows[0].estado_intent_codigo,
-            subtotal_hnl: pricing.subtotal_hnl,
-            descuento_total_hnl: pricing.descuento_total_hnl,
-            total_hnl: pricing.total_hnl,
-            promociones_aplicadas: pricing.promociones_aplicadas,
-            promociones_descartadas: pricing.promociones_descartadas,
-          });
-          }
-          phaseAIntent = {
-            ...existingIntent.rows[0],
-            id_provider: provider.id_provider,
-            id_cita: anchor.id_cita,
-            id_hold: anchor.id_hold,
-            id_grupo_cita: idGrupoCita,
-            idempotency_key: existingIntent.rows[0].idempotency_key || `masterfade:booking-payment:${existingIntent.rows[0].id_intent}`,
-          };
-          phaseAPricing = pricing;
+          return sendOk(
+            reply,
+            buildPublicPaymentIntentPayload(existingIntent.rows[0], pricing, null)
+          );
         } else {
           await dbClient.query(
             `
@@ -1265,13 +1310,28 @@ export default async function publicPagosRoutes(app) {
       dbClient.release();
       dbClient = null;
       const providerAdapter = PaymentProviderFactory.create();
+      const orderReference = buildProviderOrderReference({
+        providerCode,
+        idIntent: phaseAIntent.id_intent,
+      });
+      const currencyCode = safeText(phaseAIntent.moneda_codigo);
+      if (!currencyCode) {
+        throw new AppError(500, "No se pudo iniciar el pago", {
+          code: "PUBLIC_PAGOS_CURRENCY_MISSING",
+        });
+      }
+      const launchExpiresAt = new Date(phaseAIntent.expires_at).toISOString();
       const providerIntent = await providerAdapter.createIntent({
         idempotencyKey: phaseAIntent.idempotency_key,
         montoHnl: normalizeMoney(phaseAIntent.monto_hnl),
-        moneda: "HNL",
+        moneda: currencyCode,
         descripcion: `Reserva publica ${idGrupoCita}`,
         callbackUrl: buildCallbackUrl(idGrupoCita),
         metadata: {
+          customerName,
+          clientIp,
+          ordenDeCompra: orderReference,
+          expiresAt: launchExpiresAt,
           id_grupo_cita: idGrupoCita,
           id_cita_anchor: phaseAIntent.id_cita,
         },
@@ -1286,6 +1346,9 @@ export default async function publicPagosRoutes(app) {
           SET estado_intent_codigo = 'link_generado',
               link_pago_url = $2::text,
               referencia_externa = $3::text,
+              orden_compra = $4::text,
+              provider_session_id = $3::text,
+              launch_expires_at = $5::timestamptz,
               updated_at = now()
           FROM public.citas_holds h
           JOIN public.citas c
@@ -1297,15 +1360,19 @@ export default async function publicPagosRoutes(app) {
             AND pi.expires_at > now()
             AND h.estado_hold_codigo = 'activo'
             AND h.expires_at > now()
-            AND c.id_grupo_cita = $4::uuid
+            AND c.id_grupo_cita = $6::uuid
             AND c.deleted_at IS NULL
             AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
-          RETURNING pi.id_intent, pi.link_pago_url, pi.expires_at, pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
+          RETURNING pi.id_intent, pi.link_pago_url, pi.expires_at, pi.monto_hnl,
+            pi.moneda_codigo, pi.estado_intent_codigo, pi.orden_compra,
+            pi.provider_session_id, pi.launch_expires_at
         `,
         [
           phaseAIntent.id_intent,
           providerIntent.paymentUrl ?? null,
           providerIntent.providerIntentId ?? null,
+          orderReference,
+          providerIntent.launch?.expiresAt ?? null,
           idGrupoCita,
         ]
       );
@@ -1320,7 +1387,10 @@ export default async function publicPagosRoutes(app) {
           }
         } catch (cancelError) {
           request.log.warn(
-            { err: cancelError, id_intent: phaseAIntent.id_intent },
+            {
+              ...buildSafeProviderErrorDiagnostic(cancelError, request.id),
+              id_intent: phaseAIntent.id_intent,
+            },
             "No se pudo cancelar intent externo luego de hold vencido"
           );
         }
@@ -1343,19 +1413,15 @@ export default async function publicPagosRoutes(app) {
       );
       await dbClient.query("COMMIT");
       inTransaction = false;
-      return sendOk(reply, {
-        id_intent: updated.rows[0].id_intent,
-        payment_url: updated.rows[0].link_pago_url ?? null,
-        expires_at: new Date(updated.rows[0].expires_at).toISOString(),
-        monto_hnl: Number(updated.rows[0].monto_hnl || 0),
-        moneda_codigo: updated.rows[0].moneda_codigo || "HNL",
-        estado_intent_codigo: updated.rows[0].estado_intent_codigo,
-        subtotal_hnl: phaseAPricing.subtotal_hnl,
-        descuento_total_hnl: phaseAPricing.descuento_total_hnl,
-        total_hnl: phaseAPricing.total_hnl,
-        promociones_aplicadas: phaseAPricing.promociones_aplicadas,
-        promociones_descartadas: phaseAPricing.promociones_descartadas,
-      }, { statusCode: 201 });
+      return sendOk(
+        reply,
+        buildPublicPaymentIntentPayload(
+          updated.rows[0],
+          phaseAPricing,
+          providerIntent.launch ?? null
+        ),
+        { statusCode: 201 }
+      );
     } catch (error) {
       if (inTransaction) {
         try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
@@ -1372,7 +1438,10 @@ export default async function publicPagosRoutes(app) {
           requestId: request.id,
         });
       }
-      request.log.error({ err: error }, "No se pudo crear intent publico");
+      request.log.error(
+        buildSafeProviderErrorDiagnostic(error, request.id),
+        "No se pudo crear intent publico"
+      );
       return sendError(reply, 500, "No se pudo iniciar el pago", { code: "PUBLIC_PAGOS_CREATE_INTENT_ERROR", requestId: request.id });
     } finally {
       if (dbClient) dbClient.release();
