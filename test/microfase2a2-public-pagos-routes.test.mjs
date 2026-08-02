@@ -10,6 +10,8 @@ import { TodoPagoPreprodSimulatedProvider } from "../src/services/payments/TodoP
 const GROUP_A = "11111111-2222-4333-8444-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
 const HOLD_A = "77777777-7777-4777-8777-777777777777";
+const CITA_B = "67676767-6767-4767-8767-676767676767";
+const HOLD_B = "78787878-7878-4787-8787-787878787878";
 const BRANCH_A = "11111111-1111-4111-8111-111111111111";
 const BARBER_A = "33333333-3333-4333-8333-333333333333";
 const SERVICE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -23,18 +25,23 @@ const PROMO_RULE_A = "14141414-1414-4141-8141-141414141414";
 function makeGroupRow({
   ownerEmail = "cliente@example.com",
   expiresAt = "2099-01-01T16:00:00.000Z",
+  idCita = CITA_A,
+  idHold = HOLD_A,
+  order = 1,
+  holdState = "activo",
+  citaState = "en_espera",
 } = {}) {
   return {
     id_grupo_cita: GROUP_A,
     estado_grupo_codigo: "activo",
     id_cliente_titular: null,
     id_persona_titular: USER_A,
-    id_cita: CITA_A,
-    orden_integrante: 1,
-    estado_cita_codigo: "en_espera",
+    id_cita: idCita,
+    orden_integrante: order,
+    estado_cita_codigo: citaState,
     total_pagar_hnl: "115.00",
-    id_hold: HOLD_A,
-    estado_hold_codigo: "activo",
+    id_hold: idHold,
+    estado_hold_codigo: holdState,
     expires_at: expiresAt,
     direccion_correo: ownerEmail,
     titular_nombres: "Ada",
@@ -49,18 +56,46 @@ function createPagosClient({
   throwProviderUpdate = false,
   ownerEmail = "cliente@example.com",
   holdExpiresAt = "2099-01-01T16:00:00.000Z",
+  groupSize = 1,
+  secondHoldExpiresAt = "2099-01-01T17:00:00.000Z",
+  secondHoldState = "activo",
   providerCode = "mock",
 } = {}) {
   const calls = [];
   let activeIntent = existingIntent ? { ...existingIntent } : null;
+  const groupState = [
+    makeGroupRow({ ownerEmail, expiresAt: holdExpiresAt }),
+    ...(groupSize === 2
+      ? [makeGroupRow({
+          ownerEmail,
+          expiresAt: secondHoldExpiresAt,
+          idCita: CITA_B,
+          idHold: HOLD_B,
+          order: 2,
+          holdState: secondHoldState,
+        })]
+      : []),
+  ];
   const client = {
     calls,
+    setSecondHold({ expiresAt, state } = {}) {
+      const second = groupState.find((row) => row.id_cita === CITA_B);
+      if (!second) return;
+      if (expiresAt !== undefined) second.expires_at = expiresAt;
+      if (state !== undefined) second.estado_hold_codigo = state;
+    },
+    getActiveIntent() {
+      return activeIntent ? structuredClone(activeIntent) : null;
+    },
+    getGroupState() {
+      return structuredClone(groupState);
+    },
     async query(sql, params = []) {
       const text = String(sql);
       calls.push({ sql: text, params });
       if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK") return { rows: [] };
       if (text.includes("FROM public.citas_grupos cg") && text.includes("co.direccion_correo")) {
-        return { rows: [makeGroupRow({ ownerEmail, expiresAt: holdExpiresAt })] };
+        return { rows: structuredClone(groupState) };
       }
       if (text.includes("FROM public.citas c") && text.includes("COALESCE(c.subtotal_servicios_hnl")) {
         return {
@@ -133,7 +168,7 @@ function createPagosClient({
           link_pago_url: null,
           referencia_externa: null,
           idempotency_key: params[5],
-          expires_at: holdExpiresAt,
+          expires_at: params[6],
           monto_hnl: "115.00",
           moneda_codigo: "HNL",
           estado_intent_codigo: "creado",
@@ -141,6 +176,33 @@ function createPagosClient({
         };
         return {
           rows: [{ ...activeIntent }],
+        };
+      }
+      if (text.includes("FOR UPDATE OF c") && text.includes("c.estado_cita_codigo")) {
+        return {
+          rows: groupState.map((row) => ({
+            id_cita: row.id_cita,
+            estado_cita_codigo: row.estado_cita_codigo,
+          })),
+        };
+      }
+      if (text.includes("FOR UPDATE OF h") && text.includes("h.estado_hold_codigo")) {
+        return {
+          rows: groupState.map((row) => ({
+            id_hold: row.id_hold,
+            id_cita: row.id_cita,
+            estado_hold_codigo: row.estado_hold_codigo,
+            expires_at: row.expires_at,
+          })),
+        };
+      }
+      if (text.includes("FOR UPDATE OF pi") && text.includes("pi.id_grupo_cita = $2::uuid")) {
+        return {
+          rows: activeIntent ? [{
+            id_intent: activeIntent.id_intent,
+            estado_intent_codigo: activeIntent.estado_intent_codigo,
+            expires_at: activeIntent.expires_at,
+          }] : [],
         };
       }
       if (text.includes("UPDATE public.payment_intents") && text.includes("link_pago_url = $2::text")) {
@@ -160,6 +222,12 @@ function createPagosClient({
             ...activeIntent,
           }],
         };
+      }
+      if (text.includes("UPDATE public.citas") && text.includes("estado_cita_codigo = 'pendiente_pago'")) {
+        for (const row of groupState) {
+          if (row.estado_cita_codigo === "en_espera") row.estado_cita_codigo = "pendiente_pago";
+        }
+        return { rows: [] };
       }
       return { rows: [] };
     },
@@ -194,13 +262,16 @@ async function createPagosApp(client, {
   return app;
 }
 
-function createIframeProvider({ failure = null } = {}) {
+function createIframeProvider({ failure = null, onCreateIntent = null } = {}) {
   const calls = [];
+  const cancelCalls = [];
   return {
     calls,
+    cancelCalls,
     async createIntent(input) {
       calls.push(input);
       if (failure) throw failure;
+      if (onCreateIntent) await onCreateIntent(input);
       return {
         providerIntentId: "todopago-session-001",
         paymentUrl: null,
@@ -226,7 +297,9 @@ function createIframeProvider({ failure = null } = {}) {
         },
       };
     },
-    async cancelIntent() {},
+    async cancelIntent(providerIntentId) {
+      cancelCalls.push(providerIntentId);
+    },
   };
 }
 
@@ -333,6 +406,118 @@ test("iframe_post persiste solo metadatos seguros y devuelve launch una sola vez
   ), false);
   assert.equal(client.calls.some((call) => call.sql.includes("INSERT INTO public.payments")), false);
 
+  await app.close();
+});
+
+test("grupo usa el menor expires_at y solo persiste launch con ambos holds activos", async () => {
+  const provider = createIframeProvider();
+  const client = createPagosClient({
+    providerCode: "todopago",
+    groupSize: 2,
+    holdExpiresAt: "2099-01-01T18:00:00.000Z",
+    secondHoldExpiresAt: "2099-01-01T17:00:00.000Z",
+  });
+  const app = await createPagosApp(client, {
+    providerCode: "todopago",
+    providerAdapter: provider,
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+
+  assert.equal(response.statusCode, 201);
+  assert.equal(response.json().data.launch.type, "iframe_post");
+  const intentInsert = client.calls.find((call) => call.sql.includes("INSERT INTO public.payment_intents"));
+  assert.equal(intentInsert.params[6], "2099-01-01T17:00:00.000Z");
+  assert.equal(provider.calls[0].metadata.expiresAt, "2099-01-01T17:00:00.000Z");
+  assert.equal(client.getActiveIntent().provider_session_id, "todopago-session-001");
+  assert.deepEqual(
+    client.getGroupState().map((row) => row.estado_cita_codigo),
+    ["pendiente_pago", "pendiente_pago"]
+  );
+  assert.equal(client.calls.filter((call) => call.sql.includes("pg_advisory_xact_lock")).length, 2);
+  assert.equal(provider.calls.length, 1);
+  await app.close();
+});
+
+test("si el hold no principal vence durante el proveedor revierte y cancela sin devolver launch", async () => {
+  let client;
+  const provider = createIframeProvider({
+    onCreateIntent() {
+      client.setSecondHold({ expiresAt: "2000-01-01T00:00:00.000Z" });
+    },
+  });
+  client = createPagosClient({
+    providerCode: "todopago",
+    groupSize: 2,
+    holdExpiresAt: "2099-01-01T18:00:00.000Z",
+    secondHoldExpiresAt: "2099-01-01T17:00:00.000Z",
+  });
+  const app = await createPagosApp(client, {
+    providerCode: "todopago",
+    providerAdapter: provider,
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "PUBLIC_PAGOS_HOLD_EXPIRED");
+  assert.equal(response.body.includes("launch"), false);
+  assert.equal(provider.calls.length, 1);
+  assert.deepEqual(provider.cancelCalls, ["todopago-session-001"]);
+  assert.equal(client.calls.some((call) => call.sql.includes("provider_session_id = $3::text")), false);
+  assert.equal(client.getActiveIntent().provider_session_id, undefined);
+  assert.equal(client.getActiveIntent().orden_compra, undefined);
+  assert.deepEqual(
+    client.getGroupState().map((row) => row.estado_cita_codigo),
+    ["en_espera", "en_espera"]
+  );
+  await app.close();
+});
+
+test("si el hold no principal se cancela durante el proveedor revierte y cancela una sola vez", async () => {
+  let client;
+  const provider = createIframeProvider({
+    onCreateIntent() {
+      client.setSecondHold({ state: "cancelado" });
+    },
+  });
+  client = createPagosClient({
+    providerCode: "todopago",
+    groupSize: 2,
+    holdExpiresAt: "2099-01-01T18:00:00.000Z",
+    secondHoldExpiresAt: "2099-01-01T17:00:00.000Z",
+  });
+  const app = await createPagosApp(client, {
+    providerCode: "todopago",
+    providerAdapter: provider,
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "PUBLIC_PAGOS_HOLD_EXPIRED");
+  assert.equal(response.body.includes("launch"), false);
+  assert.equal(provider.calls.length, 1);
+  assert.deepEqual(provider.cancelCalls, ["todopago-session-001"]);
+  assert.equal(client.calls.some((call) => call.sql.includes("provider_session_id = $3::text")), false);
+  assert.equal(client.getActiveIntent().provider_session_id, undefined);
+  assert.equal(client.getActiveIntent().launch_expires_at, undefined);
+  assert.deepEqual(
+    client.getGroupState().map((row) => row.estado_cita_codigo),
+    ["en_espera", "en_espera"]
+  );
   await app.close();
 });
 

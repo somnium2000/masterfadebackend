@@ -80,6 +80,87 @@ function buildSafeProviderErrorDiagnostic(error, requestId) {
   };
 }
 
+function resolveGroupExpiresAt(groupRows, nowMs = Date.now()) {
+  let nearestExpiryMs = Number.POSITIVE_INFINITY;
+  for (const row of Array.isArray(groupRows) ? groupRows : []) {
+    const expiryMs = new Date(row?.expires_at).getTime();
+    if (
+      row?.estado_hold_codigo !== "activo"
+      || !Number.isFinite(expiryMs)
+      || expiryMs <= nowMs
+    ) {
+      throw new AppError(409, "El hold de la reserva ya expiro", {
+        code: "PUBLIC_PAGOS_HOLD_EXPIRED",
+      });
+    }
+    nearestExpiryMs = Math.min(nearestExpiryMs, expiryMs);
+  }
+  if (!Number.isFinite(nearestExpiryMs)) {
+    throw new AppError(409, "El hold de la reserva ya expiro", {
+      code: "PUBLIC_PAGOS_HOLD_EXPIRED",
+    });
+  }
+  return new Date(nearestExpiryMs).toISOString();
+}
+
+function isRevalidatedPaymentGroupValid({ citas, holds, intent, nowMs = Date.now() }) {
+  const lockedCitas = Array.isArray(citas) ? citas : [];
+  const lockedHolds = Array.isArray(holds) ? holds : [];
+  if (!lockedCitas.length || !intent) return false;
+
+  const citaIds = new Set();
+  for (const cita of lockedCitas) {
+    const idCita = safeText(cita?.id_cita);
+    if (
+      !idCita
+      || citaIds.has(idCita)
+      || !["en_espera", "pendiente_pago"].includes(cita?.estado_cita_codigo)
+    ) {
+      return false;
+    }
+    citaIds.add(idCita);
+  }
+
+  const heldCitaIds = new Set();
+  for (const hold of lockedHolds) {
+    const idCita = safeText(hold?.id_cita);
+    const expiryMs = new Date(hold?.expires_at).getTime();
+    if (
+      !idCita
+      || !citaIds.has(idCita)
+      || heldCitaIds.has(idCita)
+      || hold?.estado_hold_codigo !== "activo"
+      || !Number.isFinite(expiryMs)
+      || expiryMs <= nowMs
+    ) {
+      return false;
+    }
+    heldCitaIds.add(idCita);
+  }
+
+  const intentExpiryMs = new Date(intent?.expires_at).getTime();
+  return heldCitaIds.size === citaIds.size
+    && intent?.estado_intent_codigo === "creado"
+    && Number.isFinite(intentExpiryMs)
+    && intentExpiryMs > nowMs;
+}
+
+async function cancelProviderIntentBestEffort({ providerAdapter, providerIntent, request, idIntent }) {
+  try {
+    if (providerIntent?.providerIntentId && typeof providerAdapter?.cancelIntent === "function") {
+      await providerAdapter.cancelIntent(providerIntent.providerIntentId);
+    }
+  } catch (cancelError) {
+    request.log.warn(
+      {
+        ...buildSafeProviderErrorDiagnostic(cancelError, request.id),
+        id_intent: idIntent,
+      },
+      "No se pudo cancelar intent externo luego de invalidarse la reserva"
+    );
+  }
+}
+
 function assertUuid(value, field = "id") {
   const normalized = String(value || "").trim();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)) {
@@ -1199,16 +1280,13 @@ export default async function publicPagosRoutes(app) {
       const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, logger: request.log });
       const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       assertPublicGroupPayable(groupRows);
+      const groupExpiresAt = resolveGroupExpiresAt(groupRows);
       const customerName = resolveCustomerName(groupRows);
       const clientIp = safeText(request.ip);
       if (!clientIp) {
         throw new AppError(500, "No se pudo iniciar el pago", {
           code: "PUBLIC_PAGOS_CLIENT_IP_MISSING",
         });
-      }
-      const expiredHold = groupRows.some((row) => row.estado_hold_codigo !== "activo" || !row.expires_at || new Date(row.expires_at).getTime() <= Date.now());
-      if (expiredHold) {
-        throw new AppError(409, "El hold de la reserva ya expiro", { code: "PUBLIC_PAGOS_HOLD_EXPIRED" });
       }
       const provider = await ensureProvider(dbClient, providerCode);
       const anchor = groupRows[0];
@@ -1296,7 +1374,7 @@ export default async function publicPagosRoutes(app) {
             anchor.id_hold,
             totalGroup,
             idempotencyKey,
-            new Date(anchor.expires_at).toISOString(),
+            groupExpiresAt,
             createdByUserId,
             idGrupoCita,
           ]
@@ -1340,6 +1418,64 @@ export default async function publicPagosRoutes(app) {
       dbClient = await app.db.connect();
       await dbClient.query("BEGIN");
       inTransaction = true;
+      await dbClient.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        [`public-payment-intent:${idGrupoCita}`]
+      );
+      const lockedCitas = await dbClient.query(
+        `
+          SELECT c.id_cita, c.estado_cita_codigo
+          FROM public.citas c
+          WHERE c.id_grupo_cita = $1::uuid
+            AND c.deleted_at IS NULL
+          ORDER BY c.orden_integrante ASC, c.id_cita ASC
+          FOR UPDATE OF c
+        `,
+        [idGrupoCita]
+      );
+      const lockedHolds = await dbClient.query(
+        `
+          SELECT h.id_hold, h.id_cita, h.estado_hold_codigo, h.expires_at
+          FROM public.citas_holds h
+          JOIN public.citas c
+            ON c.id_cita = h.id_cita
+          WHERE c.id_grupo_cita = $1::uuid
+            AND c.deleted_at IS NULL
+          ORDER BY h.id_cita ASC, h.id_hold ASC
+          FOR UPDATE OF h
+        `,
+        [idGrupoCita]
+      );
+      const lockedIntent = await dbClient.query(
+        `
+          SELECT pi.id_intent, pi.estado_intent_codigo, pi.expires_at
+          FROM public.payment_intents pi
+          WHERE pi.id_intent = $1::uuid
+            AND pi.id_grupo_cita = $2::uuid
+          FOR UPDATE OF pi
+        `,
+        [phaseAIntent.id_intent, idGrupoCita]
+      );
+      if (!isRevalidatedPaymentGroupValid({
+        citas: lockedCitas.rows,
+        holds: lockedHolds.rows,
+        intent: lockedIntent.rows[0],
+      })) {
+        await dbClient.query("ROLLBACK");
+        inTransaction = false;
+        dbClient.release();
+        dbClient = null;
+        await cancelProviderIntentBestEffort({
+          providerAdapter,
+          providerIntent,
+          request,
+          idIntent: phaseAIntent.id_intent,
+        });
+        return sendError(reply, 409, "El hold de la reserva ya expiro", {
+          code: "PUBLIC_PAGOS_HOLD_EXPIRED",
+          requestId: request.id,
+        });
+      }
       const updated = await dbClient.query(
         `
           UPDATE public.payment_intents pi
@@ -1350,19 +1486,10 @@ export default async function publicPagosRoutes(app) {
               provider_session_id = $3::text,
               launch_expires_at = $5::timestamptz,
               updated_at = now()
-          FROM public.citas_holds h
-          JOIN public.citas c
-            ON c.id_cita = h.id_cita
           WHERE pi.id_intent = $1::uuid
-            AND pi.id_hold = h.id_hold
-            AND pi.id_cita = c.id_cita
             AND pi.estado_intent_codigo = 'creado'
             AND pi.expires_at > now()
-            AND h.estado_hold_codigo = 'activo'
-            AND h.expires_at > now()
-            AND c.id_grupo_cita = $6::uuid
-            AND c.deleted_at IS NULL
-            AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+            AND pi.id_grupo_cita = $6::uuid
           RETURNING pi.id_intent, pi.link_pago_url, pi.expires_at, pi.monto_hnl,
             pi.moneda_codigo, pi.estado_intent_codigo, pi.orden_compra,
             pi.provider_session_id, pi.launch_expires_at
@@ -1381,19 +1508,12 @@ export default async function publicPagosRoutes(app) {
         inTransaction = false;
         dbClient.release();
         dbClient = null;
-        try {
-          if (providerIntent.providerIntentId && typeof providerAdapter.cancelIntent === "function") {
-            await providerAdapter.cancelIntent(providerIntent.providerIntentId);
-          }
-        } catch (cancelError) {
-          request.log.warn(
-            {
-              ...buildSafeProviderErrorDiagnostic(cancelError, request.id),
-              id_intent: phaseAIntent.id_intent,
-            },
-            "No se pudo cancelar intent externo luego de hold vencido"
-          );
-        }
+        await cancelProviderIntentBestEffort({
+          providerAdapter,
+          providerIntent,
+          request,
+          idIntent: phaseAIntent.id_intent,
+        });
         return sendError(reply, 409, "El hold de la reserva ya expiro", {
           code: "PUBLIC_PAGOS_HOLD_EXPIRED",
           requestId: request.id,
