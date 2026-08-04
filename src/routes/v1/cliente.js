@@ -18,9 +18,17 @@ import {
   getClienteMembershipState,
   registerSubscriptionAlertEvent,
 } from "../../services/membershipService.js";
+import {
+  confirmClientAccountDeletionRequest,
+  createClientAccountDeletionRequest,
+  evaluateClientAccountDeletion,
+  validateClientAccountDeletionConfirmationBody,
+  verifyRecentAccountDeletionReauthentication,
+} from "../../services/accountDeletionService.js";
 
 const CLIENT_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
+const ACCOUNT_DELETION_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{16,160}$/;
 
 let clienteProfileCapabilitiesCache = null;
 
@@ -468,6 +476,26 @@ function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   });
 }
 
+function ensureCompleteAccountDeletionContext(request) {
+  const context = ensureClienteContext(request);
+  if (!context.clienteId || !context.personaId || !context.userId) {
+    throw new AppError(409, "No se pudo determinar la identidad completa del cliente autenticado.", {
+      code: "CLIENT_ACCOUNT_DELETION_IDENTITY_CONTEXT_REQUIRED",
+    });
+  }
+  return context;
+}
+
+function assertAccountDeletionIdempotencyKey(value) {
+  const normalized = String(value || "").trim();
+  if (!ACCOUNT_DELETION_IDEMPOTENCY_KEY_PATTERN.test(normalized)) {
+    throw new AppError(400, "La clave de idempotencia para la solicitud no es válida.", {
+      code: "CLIENT_ACCOUNT_DELETION_IDEMPOTENCY_KEY_INVALID",
+    });
+  }
+  return normalized;
+}
+
 export default async function clienteRoutes(app) {
   app.get(
     "/me",
@@ -502,6 +530,261 @@ export default async function clienteRoutes(app) {
         return sendOk(reply, payload, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo consultar el perfil del cliente", "CLIENTE_ME_ERROR");
+      }
+    }
+  );
+
+  app.get(
+    "/me/account-deletion/preview",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  can_delete: { type: "boolean" },
+                  account_mode: { type: "string" },
+                  requires_approval: { type: "boolean" },
+                  blocking_reasons: { type: "array", items: { type: "object", additionalProperties: true } },
+                  consequences: { type: "array", items: { type: "object", additionalProperties: true } },
+                  blocking_appointments: { type: "object", additionalProperties: true },
+                  active_holds: { type: "object", additionalProperties: true },
+                  pending_payments: { type: "object", additionalProperties: true },
+                  masterpoints: { type: "object", additionalProperties: true },
+                  membership: { type: "object", additionalProperties: true },
+                  pending_membership_orders: { type: "object", additionalProperties: true },
+                  retained_history: { type: "object", additionalProperties: true },
+                  evaluated_at: { type: "string" },
+                },
+                required: [
+                  "can_delete",
+                  "account_mode",
+                  "requires_approval",
+                  "blocking_reasons",
+                  "consequences",
+                  "blocking_appointments",
+                  "active_holds",
+                  "pending_payments",
+                  "masterpoints",
+                  "membership",
+                  "pending_membership_orders",
+                  "retained_history",
+                  "evaluated_at",
+                ],
+                additionalProperties: true,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      let client;
+      try {
+        const context = ensureCompleteAccountDeletionContext(request);
+
+        client = await app.db.connect();
+        const preview = await evaluateClientAccountDeletion(client, {
+          clienteId: context.clienteId,
+          personaId: context.personaId,
+          usuarioId: context.userId,
+        });
+        return sendOk(reply, preview, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo evaluar la eliminación de la cuenta.",
+          "CLIENT_ACCOUNT_DELETION_PREVIEW_ERROR"
+        );
+      } finally {
+        client?.release();
+      }
+    }
+  );
+
+  app.post(
+    "/me/account-deletion/requests",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "15 minutes",
+          groupId: "account-deletion-create",
+        },
+      },
+      schema: {
+        body: {
+          type: "object",
+          properties: {
+            idempotency_key: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureCompleteAccountDeletionContext(request);
+      const idempotencyKey = assertAccountDeletionIdempotencyKey(request.body?.idempotency_key);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const result = await createClientAccountDeletionRequest(client, {
+          clienteId: context.clienteId,
+          personaId: context.personaId,
+          usuarioId: context.userId,
+          idempotencyKey,
+          requestId: request.id,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, result, {
+          statusCode: result.idempotent_replay ? 200 : 201,
+          requestId: request.id,
+        });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo registrar la solicitud de eliminación de cuenta.",
+          "CLIENT_ACCOUNT_DELETION_REQUEST_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/me/account-deletion/requests/:requestId/confirm",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "15 minutes",
+          groupId: "account-deletion-confirm",
+        },
+      },
+      schema: {
+        params: {
+          type: "object",
+          required: ["requestId"],
+          properties: {
+            requestId: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          properties: {
+            reauth_token: { type: "string" },
+            confirmacion_texto: { type: "string" },
+            acepta_perder_masterpuntos: { type: "boolean" },
+            acepta_cancelar_membresia: { type: "boolean" },
+            acepta_historial_anonimizado: { type: "boolean" },
+            acepta_irreversibilidad: { type: "boolean" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureCompleteAccountDeletionContext(request);
+      validateClientAccountDeletionConfirmationBody(request.body || {});
+
+      const reauth = await verifyRecentAccountDeletionReauthentication(app, {
+        reauthToken: request.body?.reauth_token,
+        expectedUserId: context.userId,
+      });
+
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const result = await confirmClientAccountDeletionRequest(client, {
+          requestId: request.params.requestId,
+          clienteId: context.clienteId,
+          personaId: context.personaId,
+          usuarioId: context.userId,
+          authenticatedAt: reauth.authenticatedAt,
+          traceRequestId: request.id,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, result, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar la solicitud de eliminación de cuenta.",
+          "CLIENT_ACCOUNT_DELETION_REQUEST_CONFIRM_ERROR"
+        );
+      } finally {
+        client.release();
       }
     }
   );

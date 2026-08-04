@@ -2,6 +2,7 @@ import catalogRoutes from "./catalog.js";
 import configuracionRoutes from "./configuracion.js";
 import cortesiasRoutes from "./cortesias.js";
 import adminCitasRoutes from "./citas.js";
+import adminAccountDeletionRoutes from "./accountDeletion.js";
 import empleadosRoutes from "./empleados.js";
 import masterPuntosRoutes from "./masterpuntos.js";
 import adminPointsRoutes from "./puntos.js";
@@ -15,6 +16,7 @@ import sucursalesRoutes from "./sucursales.js";
 
 export default async function adminRoutes(app) {
   await app.register(personasRoutes, { prefix: "/personas" });
+  await app.register(adminAccountDeletionRoutes, { prefix: "/account-deletion" });
   await app.register(catalogRoutes, { prefix: "/catalog" });
   await app.register(cortesiasRoutes, { prefix: "/catalog/cortesias" });
   await app.register(plansRoutes, { prefix: "/catalog/planes" });

@@ -1,5 +1,6 @@
 import healthRoutes from "../health.js";
 import adminRoutes from "./admin/index.js";
+import accountDeletionRoutes from "./accountDeletion.js";
 import authRoutes from "./auth.js";
 import barberoRoutes from "./barbero.js";
 import clienteRoutes from "./cliente.js";
@@ -13,6 +14,7 @@ export default async function v1Routes(app) {
   await app.register(healthRoutes, { prefix: "/v1/health" });
   await app.register(authRoutes, { prefix: "/v1/auth" });
   await app.register(publicRoutes, { prefix: "/v1/public" });
+  await app.register(accountDeletionRoutes, { prefix: "/v1/account-deletion" });
   await app.register(clienteRoutes, { prefix: "/v1/cliente" });
   await app.register(clientePointsRoutes, { prefix: "/v1/cliente/puntos" });
   await app.register(barberoRoutes, { prefix: "/v1/barbero" });
