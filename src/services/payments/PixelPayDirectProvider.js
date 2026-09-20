@@ -3,6 +3,11 @@ import { PaymentProvider } from "./PaymentProvider.js";
 
 const SALE_PATH = "/api/v2/transaction/sale";
 const STATUS_PATH = "/api/v2/transaction/status";
+export const HONDURAS_ISO_3166_2_CODES = Object.freeze([
+  "HN-AT", "HN-CH", "HN-CL", "HN-CM", "HN-CP", "HN-CR", "HN-EP", "HN-FM", "HN-GD",
+  "HN-IB", "HN-IN", "HN-LE", "HN-LP", "HN-OC", "HN-OL", "HN-SB", "HN-VA", "HN-YO",
+]);
+const HONDURAS_ISO_3166_2_CODE_SET = new Set(HONDURAS_ISO_3166_2_CODES);
 
 function text(value) {
   return String(value ?? "").trim();
@@ -11,6 +16,40 @@ function text(value) {
 function money(value) {
   const amount = Number(value);
   return Number.isFinite(amount) ? amount.toFixed(2) : "";
+}
+
+function objectOrEmpty(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function normalizeCardExpire(value) {
+  const normalized = text(value);
+  if (!/^[0-9]{2}(0[1-9]|1[0-2])$/.test(normalized)) {
+    throw new PixelPayDirectError(
+      "PIXELPAY_CARD_EXPIRE_INVALID",
+      "La fecha de expiracion no tiene el formato YYMM requerido por PixelPay."
+    );
+  }
+  return normalized;
+}
+
+function normalizeBillingCountry(value) {
+  const normalized = text(value).toUpperCase();
+  if (normalized !== "HN") {
+    throw new PixelPayDirectError("PIXELPAY_BILLING_COUNTRY_INVALID", "El pais de facturacion no es valido para QA.");
+  }
+  return normalized;
+}
+
+function normalizeBillingState(value) {
+  const normalized = text(value).toUpperCase();
+  if (!HONDURAS_ISO_3166_2_CODE_SET.has(normalized)) {
+    throw new PixelPayDirectError(
+      "PIXELPAY_BILLING_STATE_INVALID",
+      "El departamento debe utilizar un codigo ISO 3166-2 de Honduras."
+    );
+  }
+  return normalized;
 }
 
 export function hashPixelPaySecret(secretKey) {
@@ -31,6 +70,37 @@ export function createPixelPayStatusSignature({ secretKey, appKey, paymentUuid, 
 
 export function createPixelPayPaymentHash({ orderId, keyId, secretKey }) {
   return crypto.createHash("md5").update(`${text(orderId)}|${text(keyId)}|${text(secretKey)}`, "utf8").digest("hex");
+}
+
+export function normalizePixelPaySaleResponse(payload) {
+  const envelope = objectOrEmpty(payload);
+  const data = objectOrEmpty(envelope.data);
+  return {
+    success: typeof envelope.success === "boolean" ? envelope.success : null,
+    message: text(envelope.message) || null,
+    data: {
+      transactionApprovedAmount: data.transaction_approved_amount,
+      transactionAmount: data.transaction_amount,
+      transactionId: text(data.transaction_id) || null,
+      responseApproved: typeof data.response_approved === "boolean" ? data.response_approved : null,
+      responseIncomplete: typeof data.response_incomplete === "boolean" ? data.response_incomplete : null,
+      responseCode: text(data.response_code) || null,
+      paymentUuid: text(data.payment_uuid) || null,
+      paymentHash: text(data.payment_hash) || null,
+    },
+  };
+}
+
+export function normalizePixelPayStatusResponse(payload) {
+  const envelope = objectOrEmpty(payload);
+  const data = objectOrEmpty(envelope.data);
+  return {
+    success: typeof envelope.success === "boolean" ? envelope.success : null,
+    message: text(envelope.message) || null,
+    data: {
+      status: text(data.status).toUpperCase() || "UNKNOWN",
+    },
+  };
 }
 
 function timingSafeHexEqual(actual, expected) {
@@ -61,7 +131,11 @@ export class PixelPayDirectProvider extends PaymentProvider {
     this.timeoutMs = Number(timeoutMs);
     this.fetchImpl = fetchImpl;
 
-    if (this.env !== "sandbox" || this.endpoint !== "https://pixelpay.dev") {
+    if (
+      this.env !== "sandbox"
+      || this.endpoint !== "https://pixelpay.dev"
+      || this.appUrl !== "https://pixelpay.dev"
+    ) {
       throw new Error("PixelPay Direct solo esta habilitado para sandbox QA.");
     }
     if (!this.keyId || !this.secretKey || !this.appUrl || typeof this.fetchImpl !== "function") {
@@ -121,11 +195,11 @@ export class PixelPayDirectProvider extends PaymentProvider {
       customer_email: text(customer?.email),
       card_number: text(card?.number).replace(/\D+/g, ""),
       card_holder: text(card?.holder),
-      card_expire: text(card?.expire).replace(/\D+/g, ""),
+      card_expire: normalizeCardExpire(card?.expire),
       card_cvv: text(card?.cvv).replace(/\D+/g, ""),
       billing_address: text(billing?.address),
-      billing_country: text(billing?.country),
-      billing_state: text(billing?.state),
+      billing_country: normalizeBillingCountry(billing?.country),
+      billing_state: normalizeBillingState(billing?.state),
       billing_city: text(billing?.city),
       billing_phone: text(billing?.phone),
       order_id: text(orderId),
@@ -140,33 +214,37 @@ export class PixelPayDirectProvider extends PaymentProvider {
       appUrl: this.appUrl,
     });
     const result = await this.post(SALE_PATH, body, signature);
-    const payload = result.payload && typeof result.payload === "object" ? result.payload : {};
-    const paymentUuid = text(payload.payment_uuid) || null;
-    const transactionId = text(payload.transaction_id) || null;
+    const payload = normalizePixelPaySaleResponse(result.payload);
+    const paymentUuid = payload.data.paymentUuid;
+    const transactionId = payload.data.transactionId;
     const approved = result.ok
       && payload.success === true
-      && payload.response_approved === true
-      && payload.response_incomplete !== true
+      && payload.data.responseApproved === true
+      && payload.data.responseIncomplete !== true
       && Boolean(paymentUuid)
       && Boolean(transactionId);
     const paymentHashValid = timingSafeHexEqual(
-      payload.payment_hash,
+      payload.data.paymentHash,
       createPixelPayPaymentHash({ orderId, keyId: this.keyId, secretKey: this.secretKey })
     );
-    const amountMatches = money(payload.order_amount ?? payload.amount) === money(amount);
+    const transactionAmountMatches = money(payload.data.transactionAmount) === money(amount);
+    const approvedAmountMatches = money(payload.data.transactionApprovedAmount) === money(amount);
+    const amountMatches = transactionAmountMatches && approvedAmountMatches;
 
     return {
       approved: approved && paymentHashValid && amountMatches,
       definitive: (result.statusCode >= 400 && result.statusCode < 500)
-        || payload.response_approved === false
+        || payload.data.responseApproved === false
         || payload.success === false,
-      incomplete: payload.response_incomplete === true,
+      incomplete: payload.data.responseIncomplete === true,
       paymentUuid,
       transactionId,
       paymentHashValid,
       amountMatches,
+      transactionAmountMatches,
+      approvedAmountMatches,
       statusCode: result.statusCode,
-      raw: payload,
+      response: payload,
     };
   }
 
@@ -180,11 +258,13 @@ export class PixelPayDirectProvider extends PaymentProvider {
       appUrl: this.appUrl,
     });
     const result = await this.post(STATUS_PATH, body, signature);
+    const payload = normalizePixelPayStatusResponse(result.payload);
     return {
       ok: result.ok,
+      success: payload.success,
       paymentUuid: normalizedUuid,
-      status: text(result.payload?.status).toUpperCase() || "UNKNOWN",
-      raw: result.payload,
+      status: payload.data.status,
+      response: payload,
     };
   }
 }

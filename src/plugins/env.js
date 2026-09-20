@@ -112,6 +112,9 @@ async function envPlugin(app) {
     if (String(process.env.PIXELPAY_ENDPOINT || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
       throw new Error("PIXELPAY_ENDPOINT debe apuntar al sandbox oficial de PixelPay.");
     }
+    if (String(process.env.PIXELPAY_APP_URL || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
+      throw new Error("PIXELPAY_APP_URL debe ser https://pixelpay.dev en Sandbox.");
+    }
     readRequired("PIXELPAY_KEY_ID");
     readRequired("PIXELPAY_SECRET_KEY");
     parseIntegerInRange(process.env.PIXELPAY_HTTP_TIMEOUT_MS, "PIXELPAY_HTTP_TIMEOUT_MS", {

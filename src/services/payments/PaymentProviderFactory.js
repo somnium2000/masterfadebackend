@@ -56,7 +56,7 @@ export class PaymentProviderFactory {
                     env: process.env.PIXELPAY_ENV,
                     keyId: process.env.PIXELPAY_KEY_ID,
                     secretKey: process.env.PIXELPAY_SECRET_KEY,
-                    appUrl: process.env.FRONTEND_URL,
+                    appUrl: process.env.PIXELPAY_APP_URL,
                     timeoutMs: Number(process.env.PIXELPAY_HTTP_TIMEOUT_MS || 12000),
                 });
                 break;

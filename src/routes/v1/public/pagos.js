@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
+import { HONDURAS_ISO_3166_2_CODES } from "../../../services/payments/PixelPayDirectProvider.js";
 import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
@@ -17,6 +18,20 @@ import {
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
+const PIXELPAY_SANDBOX_CARD_NUMBERS = new Set(["4111111111111111", "5555555555554444"]);
+
+export const PIXELPAY_SALE_RATE_LIMIT = Object.freeze({
+  max: 5,
+  timeWindow: "15 minutes",
+  groupId: "pixelpay-sale",
+});
+
+export function buildPixelPaySaleRateLimitConfig() {
+  return {
+    ...PIXELPAY_SALE_RATE_LIMIT,
+    keyGenerator: (request) => String(request?.ip || "unknown"),
+  };
+}
 
 function safeText(value) {
   const normalized = String(value || "").trim();
@@ -40,6 +55,16 @@ export function buildProviderOrderReference({ providerCode, idIntent } = {}) {
 
 export function canStartPixelPaySale(intentState) {
   return String(intentState || "").trim().toLowerCase() === "link_generado";
+}
+
+export function assertPixelPaySandboxCardAllowed(cardNumber) {
+  const normalized = String(cardNumber || "").replace(/\D+/g, "");
+  if (!PIXELPAY_SANDBOX_CARD_NUMBERS.has(normalized)) {
+    throw new AppError(422, "La tarjeta no pertenece al set permitido de PixelPay Sandbox", {
+      code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
+    });
+  }
+  return normalized;
 }
 
 function normalizeEmail(value) {
@@ -1649,6 +1674,9 @@ export default async function publicPagosRoutes(app) {
   });
 
   app.post("/pixelpay/sale", {
+    config: {
+      rateLimit: buildPixelPaySaleRateLimitConfig(),
+    },
     schema: {
       body: {
         type: "object",
@@ -1663,13 +1691,13 @@ export default async function publicPagosRoutes(app) {
           titular_email: { type: "string", format: "email", maxLength: 160 },
           card_number: { type: "string", pattern: "^[0-9 ]{13,23}$" },
           card_holder: { type: "string", minLength: 2, maxLength: 120 },
-          card_expire: { type: "string", pattern: "^[0-9/]{4,7}$" },
+          card_expire: { type: "string", pattern: "^[0-9]{2}(0[1-9]|1[0-2])$" },
           card_cvv: { type: "string", pattern: "^[0-9]{3,4}$" },
           billing_address: { type: "string", minLength: 2, maxLength: 180 },
-          billing_country: { type: "string", minLength: 2, maxLength: 80 },
-          billing_state: { type: "string", minLength: 1, maxLength: 80 },
+          billing_country: { type: "string", const: "HN" },
+          billing_state: { type: "string", enum: HONDURAS_ISO_3166_2_CODES },
           billing_city: { type: "string", minLength: 1, maxLength: 80 },
-          billing_phone: { type: "string", minLength: 8, maxLength: 24 },
+          billing_phone: { type: "string", pattern: "^[0-9]{8,15}$" },
         },
         additionalProperties: false,
       },
@@ -1729,6 +1757,7 @@ export default async function publicPagosRoutes(app) {
           code: "PIXELPAY_ORDER_ID_MISSING",
         });
       }
+      assertPixelPaySandboxCardAllowed(request.body.card_number);
       const claimed = await dbClient.query(
         `UPDATE public.payment_intents
          SET estado_intent_codigo = 'pendiente_confirmacion', updated_at = now()
