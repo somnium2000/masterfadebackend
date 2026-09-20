@@ -4,6 +4,7 @@ import {
   assertPixelPaySandboxCardAllowed,
   buildPixelPaySaleRateLimitConfig,
   canStartPixelPaySale,
+  resolvePixelPaySaleFailureState,
 } from "../src/routes/v1/public/pagos.js";
 
 test("doble submit no puede iniciar otro sale cuando el intent ya fue reclamado", () => {
@@ -27,4 +28,15 @@ test("solo permite tarjetas documentadas para PixelPay Sandbox", () => {
     () => assertPixelPaySandboxCardAllowed("4000000000000002"),
     (error) => error.code === "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED"
   );
+});
+
+test("decline definitivo pasa a fallido y resultado incierto conserva pendiente", () => {
+  assert.deepEqual(resolvePixelPaySaleFailureState("declined_definitive"), {
+    keepPending: false,
+    intentState: "fallido",
+  });
+  assert.deepEqual(resolvePixelPaySaleFailureState("uncertain"), {
+    keepPending: true,
+    intentState: "pendiente_confirmacion",
+  });
 });

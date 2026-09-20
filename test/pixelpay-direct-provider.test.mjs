@@ -8,6 +8,7 @@ import {
   hashPixelPaySecret,
   normalizePixelPaySaleResponse,
   normalizePixelPayStatusResponse,
+  PIXELPAY_SALE_OUTCOME,
   PixelPayDirectProvider,
 } from "../src/services/payments/PixelPayDirectProvider.js";
 
@@ -98,6 +99,7 @@ test("x-auth-hash es SHA-512 hexadecimal de Secret Key", () => {
 
 test("sale aprobado exige todos los indicadores, hash y monto", async () => {
   const result = await makeProvider(approvedPayload()).sale(saleInput);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.APPROVED);
   assert.equal(result.approved, true);
   assert.equal(result.paymentHashValid, true);
   assert.equal(result.amountMatches, true);
@@ -105,37 +107,43 @@ test("sale aprobado exige todos los indicadores, hash y monto", async () => {
   assert.equal(result.approvedAmountMatches, true);
 });
 
-test("sale rechazado es definitivo", async () => {
-  const result = await makeProvider(approvedPayload({
+test("decline oficial HTTP 402 es definitivo aun sin hash ni montos", async () => {
+  const result = await makeProvider({
     success: false,
     message: "Transacción declinada",
-    data: { response_approved: false, response_code: "05" },
-  })).sale(saleInput);
+  }, { ok: false, status: 402 }).sale(saleInput);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE);
   assert.equal(result.approved, false);
   assert.equal(result.definitive, true);
+  assert.equal(result.paymentHashValid, false);
+  assert.equal(result.amountMatches, false);
 });
 
-test("response_approved=false nunca se aprueba", async () => {
+test("response_approved=false en HTTP 200 no se adivina como decline definitivo", async () => {
   const result = await makeProvider(approvedPayload({ data: { response_approved: false } })).sale(saleInput);
   assert.equal(result.approved, false);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
 });
 
-test("payment_hash invalido nunca se aprueba", async () => {
+test("approved con payment_hash invalido queda incierto y nunca se confirma", async () => {
   const result = await makeProvider(approvedPayload({ data: { payment_hash: "invalid" } })).sale(saleInput);
   assert.equal(result.approved, false);
   assert.equal(result.paymentHashValid, false);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
 });
 
 test("transaction_amount distinto nunca se aprueba", async () => {
   const result = await makeProvider(approvedPayload({ data: { transaction_amount: 114.99 } })).sale(saleInput);
   assert.equal(result.approved, false);
   assert.equal(result.transactionAmountMatches, false);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
 });
 
 test("transaction_approved_amount distinto nunca se aprueba", async () => {
   const result = await makeProvider(approvedPayload({ data: { transaction_approved_amount: 114.99 } })).sale(saleInput);
   assert.equal(result.approved, false);
   assert.equal(result.approvedAmountMatches, false);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
 });
 
 test("response_incomplete=true permanece no aprobada e incierta", async () => {
@@ -143,6 +151,38 @@ test("response_incomplete=true permanece no aprobada e incierta", async () => {
   assert.equal(result.approved, false);
   assert.equal(result.incomplete, true);
   assert.equal(result.definitive, false);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+});
+
+test("HTTP 500 con success=false siempre queda incierto", async () => {
+  const result = await makeProvider({ success: false, message: "Error general del Sistema" }, {
+    ok: false,
+    status: 500,
+  }).sale(saleInput);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+  assert.equal(result.definitive, false);
+});
+
+test("HTTP 408 y decline incompleto siempre quedan inciertos", async () => {
+  const timeoutResponse = await makeProvider({ success: false, message: "Error Timed Out" }, {
+    ok: false,
+    status: 408,
+  }).sale(saleInput);
+  const incompleteDecline = await makeProvider({
+    success: false,
+    message: "Transacción declinada",
+    data: { response_incomplete: true },
+  }, { ok: false, status: 402 }).sale(saleInput);
+  assert.equal(timeoutResponse.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+  assert.equal(incompleteDecline.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+});
+
+test("HTTP 422 contractual es definitivo segun la tabla documental", async () => {
+  const result = await makeProvider({ success: false, message: "Error de validación" }, {
+    ok: false,
+    status: 422,
+  }).sale(saleInput);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE);
 });
 
 test("timeout produce error incierto y no filtra el secreto", async () => {
@@ -163,6 +203,22 @@ test("timeout produce error incierto y no filtra el secreto", async () => {
     (error) => error.code === "PIXELPAY_TIMEOUT"
       && error.uncertain === true
       && !JSON.stringify(error).includes(SECRET)
+  );
+});
+
+test("error de red produce error incierto", async () => {
+  const provider = new PixelPayDirectProvider({
+    endpoint: "https://pixelpay.dev",
+    env: "sandbox",
+    keyId: KEY_ID,
+    secretKey: SECRET,
+    appUrl: APP_URL,
+    timeoutMs: 1000,
+    fetchImpl: async () => { throw new TypeError("network unavailable"); },
+  });
+  await assert.rejects(
+    provider.sale(saleInput),
+    (error) => error.code === "PIXELPAY_NETWORK_ERROR" && error.uncertain === true
   );
 });
 

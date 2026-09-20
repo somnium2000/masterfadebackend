@@ -3,6 +3,12 @@ import { PaymentProvider } from "./PaymentProvider.js";
 
 const SALE_PATH = "/api/v2/transaction/sale";
 const STATUS_PATH = "/api/v2/transaction/status";
+export const PIXELPAY_SALE_OUTCOME = Object.freeze({
+  APPROVED: "approved",
+  DECLINED_DEFINITIVE: "declined_definitive",
+  UNCERTAIN: "uncertain",
+});
+const PIXELPAY_DEFINITIVE_HTTP_STATUSES = new Set([400, 401, 402, 403, 404, 405, 406, 412, 418, 422]);
 export const HONDURAS_ISO_3166_2_CODES = Object.freeze([
   "HN-AT", "HN-CH", "HN-CL", "HN-CM", "HN-CP", "HN-CR", "HN-EP", "HN-FM", "HN-GD",
   "HN-IB", "HN-IN", "HN-LE", "HN-LP", "HN-OC", "HN-OL", "HN-SB", "HN-VA", "HN-YO",
@@ -107,6 +113,38 @@ function timingSafeHexEqual(actual, expected) {
   const left = Buffer.from(text(actual).toLowerCase(), "utf8");
   const right = Buffer.from(text(expected).toLowerCase(), "utf8");
   return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+export function classifyPixelPaySaleResult({
+  statusCode,
+  payload,
+  paymentHashValid,
+  amountMatches,
+  paymentUuid,
+  transactionId,
+}) {
+  const normalizedStatus = Number(statusCode);
+  const incomplete = payload?.data?.responseIncomplete === true;
+  if (incomplete || normalizedStatus === 408 || normalizedStatus >= 500) {
+    return PIXELPAY_SALE_OUTCOME.UNCERTAIN;
+  }
+
+  const approved = normalizedStatus >= 200
+    && normalizedStatus < 300
+    && payload?.success === true
+    && payload?.data?.responseApproved === true
+    && payload?.data?.responseIncomplete === false
+    && Boolean(paymentUuid)
+    && Boolean(transactionId)
+    && paymentHashValid === true
+    && amountMatches === true;
+  if (approved) return PIXELPAY_SALE_OUTCOME.APPROVED;
+
+  if (PIXELPAY_DEFINITIVE_HTTP_STATUSES.has(normalizedStatus)) {
+    return PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE;
+  }
+
+  return PIXELPAY_SALE_OUTCOME.UNCERTAIN;
 }
 
 export class PixelPayDirectError extends Error {
@@ -217,12 +255,6 @@ export class PixelPayDirectProvider extends PaymentProvider {
     const payload = normalizePixelPaySaleResponse(result.payload);
     const paymentUuid = payload.data.paymentUuid;
     const transactionId = payload.data.transactionId;
-    const approved = result.ok
-      && payload.success === true
-      && payload.data.responseApproved === true
-      && payload.data.responseIncomplete !== true
-      && Boolean(paymentUuid)
-      && Boolean(transactionId);
     const paymentHashValid = timingSafeHexEqual(
       payload.data.paymentHash,
       createPixelPayPaymentHash({ orderId, keyId: this.keyId, secretKey: this.secretKey })
@@ -230,12 +262,19 @@ export class PixelPayDirectProvider extends PaymentProvider {
     const transactionAmountMatches = money(payload.data.transactionAmount) === money(amount);
     const approvedAmountMatches = money(payload.data.transactionApprovedAmount) === money(amount);
     const amountMatches = transactionAmountMatches && approvedAmountMatches;
+    const outcome = classifyPixelPaySaleResult({
+      statusCode: result.statusCode,
+      payload,
+      paymentHashValid,
+      amountMatches,
+      paymentUuid,
+      transactionId,
+    });
 
     return {
-      approved: approved && paymentHashValid && amountMatches,
-      definitive: (result.statusCode >= 400 && result.statusCode < 500)
-        || payload.data.responseApproved === false
-        || payload.success === false,
+      outcome,
+      approved: outcome === PIXELPAY_SALE_OUTCOME.APPROVED,
+      definitive: outcome === PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE,
       incomplete: payload.data.responseIncomplete === true,
       paymentUuid,
       transactionId,

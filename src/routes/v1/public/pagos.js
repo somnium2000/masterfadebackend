@@ -2,7 +2,10 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
-import { HONDURAS_ISO_3166_2_CODES } from "../../../services/payments/PixelPayDirectProvider.js";
+import {
+  HONDURAS_ISO_3166_2_CODES,
+  PIXELPAY_SALE_OUTCOME,
+} from "../../../services/payments/PixelPayDirectProvider.js";
 import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
@@ -65,6 +68,14 @@ export function assertPixelPaySandboxCardAllowed(cardNumber) {
     });
   }
   return normalized;
+}
+
+export function resolvePixelPaySaleFailureState(outcome) {
+  const declinedDefinitive = outcome === PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE;
+  return {
+    keepPending: !declinedDefinitive,
+    intentState: declinedDefinitive ? "fallido" : "pendiente_confirmacion",
+  };
 }
 
 function normalizeEmail(value) {
@@ -1820,11 +1831,8 @@ export default async function publicPagosRoutes(app) {
       }
 
       dbClient = await app.db.connect();
-      if (!saleResult.approved) {
-        const keepPending = !saleResult.definitive
-          || saleResult.incomplete
-          || !saleResult.paymentHashValid
-          || !saleResult.amountMatches;
+      if (saleResult.outcome !== PIXELPAY_SALE_OUTCOME.APPROVED) {
+        const { keepPending, intentState } = resolvePixelPaySaleFailureState(saleResult.outcome);
         await dbClient.query(
           `UPDATE public.payment_intents
            SET estado_intent_codigo = $2::text,
@@ -1832,7 +1840,7 @@ export default async function publicPagosRoutes(app) {
                provider_session_id = COALESCE($3::text, provider_session_id),
                updated_at = now()
            WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
-          [idIntent, keepPending ? "pendiente_confirmacion" : "fallido", saleResult.paymentUuid]
+          [idIntent, intentState, saleResult.paymentUuid]
         );
         if (keepPending && saleResult.paymentUuid) {
           try {
@@ -1847,7 +1855,7 @@ export default async function publicPagosRoutes(app) {
         return sendOk(reply, {
           processed: false,
           pending_confirmation: keepPending,
-          estado_intent_codigo: keepPending ? "pendiente_confirmacion" : "fallido",
+          estado_intent_codigo: intentState,
         }, { statusCode: keepPending ? 202 : 200 });
       }
 
