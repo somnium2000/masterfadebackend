@@ -38,6 +38,10 @@ export function buildProviderOrderReference({ providerCode, idIntent } = {}) {
   return `MF-${provider}-${intent}`;
 }
 
+export function canStartPixelPaySale(intentState) {
+  return String(intentState || "").trim().toLowerCase() === "link_generado";
+}
+
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -621,6 +625,8 @@ async function loadPublicIntentForGroup(client, {
         pi.monto_hnl,
         pi.moneda_codigo,
         pi.referencia_externa,
+        pi.orden_compra,
+        pi.provider_session_id,
         pi.idempotency_key,
         pi.created_by_usuario_id,
         pp.codigo AS provider_code,
@@ -1244,6 +1250,67 @@ async function confirmGroupAfterPaid(client, {
   };
 }
 
+async function activatePixelPayDirectIntent(client, { idGrupoCita, idIntent, orderReference }) {
+  await client.query("BEGIN");
+  try {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+      [`public-payment-intent:${idGrupoCita}`]
+    );
+    const lockedCitas = await client.query(
+      `SELECT id_cita, estado_cita_codigo FROM public.citas
+       WHERE id_grupo_cita = $1::uuid AND deleted_at IS NULL
+       ORDER BY orden_integrante ASC, id_cita ASC FOR UPDATE`,
+      [idGrupoCita]
+    );
+    const lockedHolds = await client.query(
+      `SELECT h.id_hold, h.id_cita, h.estado_hold_codigo, h.expires_at
+       FROM public.citas_holds h
+       JOIN public.citas c ON c.id_cita = h.id_cita
+       WHERE c.id_grupo_cita = $1::uuid AND c.deleted_at IS NULL
+       ORDER BY h.id_cita ASC, h.id_hold ASC FOR UPDATE OF h`,
+      [idGrupoCita]
+    );
+    const lockedIntent = await client.query(
+      `SELECT id_intent, estado_intent_codigo, expires_at FROM public.payment_intents
+       WHERE id_intent = $1::uuid AND id_grupo_cita = $2::uuid FOR UPDATE`,
+      [idIntent, idGrupoCita]
+    );
+    if (!isRevalidatedPaymentGroupValid({
+      citas: lockedCitas.rows,
+      holds: lockedHolds.rows,
+      intent: lockedIntent.rows[0],
+    })) {
+      throw new AppError(409, "El hold de la reserva ya expiro", {
+        code: "PUBLIC_PAGOS_HOLD_EXPIRED",
+      });
+    }
+    const updated = await client.query(
+      `UPDATE public.payment_intents
+       SET estado_intent_codigo = 'link_generado', orden_compra = $2::text, updated_at = now()
+       WHERE id_intent = $1::uuid AND estado_intent_codigo = 'creado' AND expires_at > now()
+       RETURNING id_intent, link_pago_url, expires_at, monto_hnl, moneda_codigo,
+         estado_intent_codigo, orden_compra, provider_session_id, launch_expires_at`,
+      [idIntent, orderReference]
+    );
+    if (!updated.rows[0]) {
+      throw new AppError(409, "El intent no esta disponible para pago", {
+        code: "PUBLIC_PAGOS_INTENT_STATE_INVALID",
+      });
+    }
+    await client.query(
+      `UPDATE public.citas SET estado_cita_codigo = 'pendiente_pago', updated_at = now()
+       WHERE id_grupo_cita = $1::uuid AND deleted_at IS NULL AND estado_cita_codigo = 'en_espera'`,
+      [idGrupoCita]
+    );
+    await client.query("COMMIT");
+    return updated.rows[0];
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* no-op */ }
+    throw error;
+  }
+}
+
 export default async function publicPagosRoutes(app) {
   app.post("/crear-intent", {
     schema: {
@@ -1392,6 +1459,19 @@ export default async function publicPagosRoutes(app) {
         providerCode,
         idIntent: phaseAIntent.id_intent,
       });
+      if (providerCode === "pixelpay") {
+        dbClient = await app.db.connect();
+        const directIntent = await activatePixelPayDirectIntent(dbClient, {
+          idGrupoCita,
+          idIntent: phaseAIntent.id_intent,
+          orderReference,
+        });
+        return sendOk(
+          reply,
+          buildPublicPaymentIntentPayload(directIntent, phaseAPricing, null),
+          { statusCode: 201 }
+        );
+      }
       const currencyCode = safeText(phaseAIntent.moneda_codigo);
       if (!currencyCode) {
         throw new AppError(500, "No se pudo iniciar el pago", {
@@ -1565,6 +1645,330 @@ export default async function publicPagosRoutes(app) {
       return sendError(reply, 500, "No se pudo iniciar el pago", { code: "PUBLIC_PAGOS_CREATE_INTENT_ERROR", requestId: request.id });
     } finally {
       if (dbClient) dbClient.release();
+    }
+  });
+
+  app.post("/pixelpay/sale", {
+    schema: {
+      body: {
+        type: "object",
+        required: [
+          "id_grupo_cita", "id_intent", "titular_email", "card_number", "card_holder",
+          "card_expire", "card_cvv", "billing_address", "billing_country", "billing_state",
+          "billing_city", "billing_phone",
+        ],
+        properties: {
+          id_grupo_cita: { type: "string", format: "uuid" },
+          id_intent: { type: "string", format: "uuid" },
+          titular_email: { type: "string", format: "email", maxLength: 160 },
+          card_number: { type: "string", pattern: "^[0-9 ]{13,23}$" },
+          card_holder: { type: "string", minLength: 2, maxLength: 120 },
+          card_expire: { type: "string", pattern: "^[0-9/]{4,7}$" },
+          card_cvv: { type: "string", pattern: "^[0-9]{3,4}$" },
+          billing_address: { type: "string", minLength: 2, maxLength: 180 },
+          billing_country: { type: "string", minLength: 2, maxLength: 80 },
+          billing_state: { type: "string", minLength: 1, maxLength: 80 },
+          billing_city: { type: "string", minLength: 1, maxLength: 80 },
+          billing_phone: { type: "string", minLength: 8, maxLength: 24 },
+        },
+        additionalProperties: false,
+      },
+    },
+  }, async (request, reply) => {
+    let dbClient = await app.db.connect();
+    let inTransaction = false;
+    let claim = null;
+    try {
+      const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
+      const idIntent = assertUuid(request.body?.id_intent, "id_intent");
+      const titularEmail = normalizeEmail(request.body?.titular_email);
+      await dbClient.query("BEGIN");
+      inTransaction = true;
+      await dbClient.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        [`pixelpay-sale:${idIntent}`]
+      );
+      const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+      assertPublicGroupPayable(groupRows);
+      resolveGroupExpiresAt(groupRows);
+      const pricing = await recalculateGroupPromotionsForPayment(dbClient, {
+        idGrupoCita,
+        logger: request.log,
+      });
+      const totalHnl = normalizeMoney(pricing.total_hnl);
+      const loaded = await loadPublicIntentForGroup(dbClient, {
+        groupId: idGrupoCita,
+        idIntent,
+        titularEmail,
+        expectedAmountHnl: totalHnl,
+      });
+      const intent = loaded.intent;
+      if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
+        throw new AppError(409, "El intent no pertenece a PixelPay", {
+          code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
+        });
+      }
+      if (safeText(intent.moneda_codigo)?.toUpperCase() !== "HNL") {
+        throw new AppError(409, "La moneda del intent no es valida", {
+          code: "PUBLIC_PAGOS_CURRENCY_INVALID",
+        });
+      }
+      if (intent.estado_intent_codigo === "confirmado") {
+        await dbClient.query("COMMIT");
+        inTransaction = false;
+        return sendOk(reply, { processed: false, duplicate: true, booking_confirmed: true });
+      }
+      if (!canStartPixelPaySale(intent.estado_intent_codigo)) {
+        throw new AppError(409, "Ya existe un cobro en curso para este intent", {
+          code: "PIXELPAY_SALE_ALREADY_IN_PROGRESS",
+        });
+      }
+      const orderId = safeText(intent.orden_compra);
+      if (!orderId) {
+        throw new AppError(409, "El intent no tiene una orden estable", {
+          code: "PIXELPAY_ORDER_ID_MISSING",
+        });
+      }
+      const claimed = await dbClient.query(
+        `UPDATE public.payment_intents
+         SET estado_intent_codigo = 'pendiente_confirmacion', updated_at = now()
+         WHERE id_intent = $1::uuid AND estado_intent_codigo = 'link_generado'
+         RETURNING id_intent`,
+        [idIntent]
+      );
+      if (!claimed.rows[0]) {
+        throw new AppError(409, "Ya existe un cobro en curso para este intent", {
+          code: "PIXELPAY_SALE_ALREADY_IN_PROGRESS",
+        });
+      }
+      claim = {
+        idGrupoCita,
+        idIntent,
+        titularEmail,
+        idCita: intent.id_cita,
+        idProvider: intent.id_provider,
+        orderId,
+        amount: totalHnl,
+        currency: "HNL",
+        customerName: resolveCustomerName(groupRows),
+      };
+      await dbClient.query("COMMIT");
+      inTransaction = false;
+      dbClient.release();
+      dbClient = null;
+
+      let saleResult;
+      try {
+        saleResult = await PaymentProviderFactory.create().sale({
+          orderId: claim.orderId,
+          currency: claim.currency,
+          amount: claim.amount,
+          customer: { name: claim.customerName, email: claim.titularEmail },
+          billing: {
+            address: request.body.billing_address,
+            country: request.body.billing_country,
+            state: request.body.billing_state,
+            city: request.body.billing_city,
+            phone: request.body.billing_phone,
+          },
+          card: {
+            number: request.body.card_number,
+            holder: request.body.card_holder,
+            expire: request.body.card_expire,
+            cvv: request.body.card_cvv,
+          },
+        });
+      } catch (providerError) {
+        request.log.warn(
+          buildSafeProviderErrorDiagnostic(providerError, request.id),
+          "Resultado PixelPay incierto"
+        );
+        return sendOk(reply, {
+          processed: false,
+          pending_confirmation: true,
+          estado_intent_codigo: "pendiente_confirmacion",
+        }, { statusCode: 202 });
+      }
+
+      dbClient = await app.db.connect();
+      if (!saleResult.approved) {
+        const keepPending = !saleResult.definitive
+          || saleResult.incomplete
+          || !saleResult.paymentHashValid
+          || !saleResult.amountMatches;
+        await dbClient.query(
+          `UPDATE public.payment_intents
+           SET estado_intent_codigo = $2::text,
+               referencia_externa = COALESCE($3::text, referencia_externa),
+               provider_session_id = COALESCE($3::text, provider_session_id),
+               updated_at = now()
+           WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
+          [idIntent, keepPending ? "pendiente_confirmacion" : "fallido", saleResult.paymentUuid]
+        );
+        if (keepPending && saleResult.paymentUuid) {
+          try {
+            await PaymentProviderFactory.create().queryPaymentStatus(saleResult.paymentUuid);
+          } catch (statusError) {
+            request.log.warn(
+              buildSafeProviderErrorDiagnostic(statusError, request.id),
+              "No se pudo consultar estado PixelPay luego de respuesta incierta"
+            );
+          }
+        }
+        return sendOk(reply, {
+          processed: false,
+          pending_confirmation: keepPending,
+          estado_intent_codigo: keepPending ? "pendiente_confirmacion" : "fallido",
+        }, { statusCode: keepPending ? 202 : 200 });
+      }
+
+      await dbClient.query("BEGIN");
+      inTransaction = true;
+      await dbClient.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        [`pixelpay-sale:${idIntent}`]
+      );
+      const finalRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+      assertPublicGroupPayable(finalRows);
+      resolveGroupExpiresAt(finalRows);
+      const finalPricing = await recalculateGroupPromotionsForPayment(dbClient, {
+        idGrupoCita,
+        logger: request.log,
+      });
+      if (!amountsMatch(finalPricing.total_hnl, claim.amount)) {
+        throw new AppError(409, "El monto de la reserva cambio durante el pago", {
+          code: "PAYMENT_AMOUNT_MISMATCH",
+        });
+      }
+      await dbClient.query(
+        `UPDATE public.payment_intents
+         SET referencia_externa = $2::text, provider_session_id = $2::text, updated_at = now()
+         WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
+        [idIntent, saleResult.paymentUuid]
+      );
+      const paidAt = new Date().toISOString();
+      const insertedPayment = await dbClient.query(
+        `INSERT INTO public.payments (
+           id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
+         ) VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, $5::timestamptz, FALSE)
+         ON CONFLICT (provider_tx_id) DO NOTHING RETURNING id_payment`,
+        [idIntent, saleResult.transactionId, claim.amount, claim.currency, paidAt]
+      );
+      if (!insertedPayment.rows[0]) {
+        const duplicate = await dbClient.query(
+          `SELECT id_intent FROM public.payments WHERE provider_tx_id = $1::text LIMIT 1`,
+          [saleResult.transactionId]
+        );
+        if (String(duplicate.rows[0]?.id_intent || "") !== idIntent) {
+          throw new AppError(409, "La transaccion del proveedor ya fue utilizada", {
+            code: "PIXELPAY_TRANSACTION_CONFLICT",
+          });
+        }
+      }
+      const booking = await confirmGroupAfterPaid(dbClient, {
+        idCitaAnchor: claim.idCita,
+        expectedGroupId: idGrupoCita,
+        expectedIntentId: idIntent,
+        referenciaExterna: saleResult.transactionId,
+        pagadoAt: paidAt,
+      });
+      await dbClient.query("COMMIT");
+      inTransaction = false;
+      return sendOk(reply, {
+        processed: true,
+        duplicate: false,
+        booking_confirmed: true,
+        estado_intent_codigo: "confirmado",
+        booking,
+      });
+    } catch (error) {
+      if (inTransaction && dbClient) {
+        try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
+      }
+      const handled = mapCanonicalReservationError(error, {
+        publicRoute: true,
+        safeMessage: "No se pudo confirmar el pago de la reserva",
+        details: { id_intent: claim?.idIntent || request.body?.id_intent || null },
+      });
+      if (handled instanceof AppError) {
+        return sendError(reply, handled.statusCode, handled.message, {
+          code: handled.code,
+          requestId: request.id,
+        });
+      }
+      request.log.error(buildSafeProviderErrorDiagnostic(error, request.id), "Fallo de venta PixelPay");
+      return sendError(reply, 500, "No se pudo confirmar el pago", {
+        code: "PIXELPAY_SALE_ERROR",
+        requestId: request.id,
+      });
+    } finally {
+      if (dbClient) dbClient.release();
+    }
+  });
+
+  app.post("/pixelpay/status", {
+    schema: {
+      body: {
+        type: "object",
+        required: ["id_grupo_cita", "id_intent", "titular_email"],
+        properties: {
+          id_grupo_cita: { type: "string", format: "uuid" },
+          id_intent: { type: "string", format: "uuid" },
+          titular_email: { type: "string", format: "email", maxLength: 160 },
+        },
+        additionalProperties: false,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
+      const idIntent = assertUuid(request.body?.id_intent, "id_intent");
+      const titularEmail = normalizeEmail(request.body?.titular_email);
+      const currentTotal = calculateGroupTotalFromRows(
+        await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail })
+      );
+      const { intent } = await loadPublicIntentForGroup(app.db, {
+        groupId: idGrupoCita,
+        idIntent,
+        titularEmail,
+        expectedAmountHnl: currentTotal,
+      });
+      if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
+        throw new AppError(409, "El intent no pertenece a PixelPay", {
+          code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
+        });
+      }
+      const paymentUuid = safeText(intent.provider_session_id || intent.referencia_externa);
+      if (!paymentUuid) {
+        throw new AppError(409, "PixelPay aun no proporciono un identificador consultable", {
+          code: "PIXELPAY_PAYMENT_UUID_MISSING",
+        });
+      }
+      const status = await PaymentProviderFactory.create().queryPaymentStatus(paymentUuid);
+      await app.db.query(
+        `UPDATE public.payment_intents
+         SET last_verified_at = now(), verification_attempts = COALESCE(verification_attempts, 0) + 1, updated_at = now()
+         WHERE id_intent = $1::uuid`,
+        [idIntent]
+      );
+      return sendOk(reply, {
+        id_intent: idIntent,
+        payment_uuid: paymentUuid,
+        provider_status: status.status,
+        estado_intent_codigo: intent.estado_intent_codigo,
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        return sendError(reply, error.statusCode, error.message, {
+          code: error.code,
+          requestId: request.id,
+        });
+      }
+      request.log.error(buildSafeProviderErrorDiagnostic(error, request.id), "Fallo de consulta PixelPay");
+      return sendError(reply, 502, "No se pudo consultar el estado en PixelPay", {
+        code: safeText(error?.code) || "PIXELPAY_STATUS_ERROR",
+        requestId: request.id,
+      });
     }
   });
 

@@ -49,6 +49,15 @@ export class PaymentProvider {
         throw new Error(`[PaymentProvider] queryStatus no implementado en ${this.constructor.name}`);
     }
 
+    // AM: Operaciones directas opcionales para proveedores que procesan PAN en backend.
+    async sale(_opts) {
+        throw new Error(`[PaymentProvider] sale no implementado en ${this.constructor.name}`);
+    }
+
+    async queryPaymentStatus(_paymentUuid) {
+        throw new Error(`[PaymentProvider] queryPaymentStatus no implementado en ${this.constructor.name}`);
+    }
+
     /**
      * Anular/cancelar intención de pago pendiente
      * @param {string} providerIntentId

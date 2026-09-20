@@ -1,5 +1,6 @@
 import { MockPaymentProvider } from "./MockPaymentProvider.js";
 import { TodoPagoPreprodSimulatedProvider } from "./TodoPagoPreprodSimulatedProvider.js";
+import { PixelPayDirectProvider } from "./PixelPayDirectProvider.js";
 // import { BanpaisPaymentProvider } from "./BanpaisPaymentProvider.js"; // Descomentar en Sprint 3
 
 /**
@@ -48,6 +49,17 @@ export class PaymentProviderFactory {
                     throw new Error("TodoPago real aun no esta implementado; falta documentacion tecnica oficial.");
                 }
                 throw new Error(`TODOPAGO_MODE invalido: ${todoPagoMode}`);
+
+            case "pixelpay":
+                PaymentProviderFactory._instance = new PixelPayDirectProvider({
+                    endpoint: process.env.PIXELPAY_ENDPOINT,
+                    env: process.env.PIXELPAY_ENV,
+                    keyId: process.env.PIXELPAY_KEY_ID,
+                    secretKey: process.env.PIXELPAY_SECRET_KEY,
+                    appUrl: process.env.FRONTEND_URL,
+                    timeoutMs: Number(process.env.PIXELPAY_HTTP_TIMEOUT_MS || 12000),
+                });
+                break;
 
             // case "banpais":
             //   PaymentProviderFactory._instance = new BanpaisPaymentProvider({

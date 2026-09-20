@@ -91,8 +91,8 @@ async function envPlugin(app) {
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
   const paymentProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
-  if (!["mock", "todopago"].includes(paymentProvider)) {
-    throw new Error("PAYMENT_PROVIDER invalido. Usa mock o todopago.");
+  if (!["mock", "todopago", "pixelpay"].includes(paymentProvider)) {
+    throw new Error("PAYMENT_PROVIDER invalido. Usa mock, todopago o pixelpay.");
   }
   const frontendUrl = readRequired("FRONTEND_URL");
   const jwtSecret = readRequired("JWT_SECRET", { minLength: 24 });
@@ -102,6 +102,24 @@ async function envPlugin(app) {
     active: paymentProvider === "todopago",
     nodeEnv,
   });
+  if (paymentProvider === "pixelpay") {
+    if (nodeEnv === "production" || nodeEnv === "staging") {
+      throw new Error("PixelPay Direct solo esta habilitado para QA.");
+    }
+    if (String(process.env.PIXELPAY_ENV || "").trim().toLowerCase() !== "sandbox") {
+      throw new Error("PIXELPAY_ENV debe ser sandbox para PixelPay Direct.");
+    }
+    if (String(process.env.PIXELPAY_ENDPOINT || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
+      throw new Error("PIXELPAY_ENDPOINT debe apuntar al sandbox oficial de PixelPay.");
+    }
+    readRequired("PIXELPAY_KEY_ID");
+    readRequired("PIXELPAY_SECRET_KEY");
+    parseIntegerInRange(process.env.PIXELPAY_HTTP_TIMEOUT_MS, "PIXELPAY_HTTP_TIMEOUT_MS", {
+      fallback: 12000,
+      min: 1000,
+      max: 60000,
+    });
+  }
   
   const isProdOrStaging = nodeEnv === "production" || nodeEnv === "staging";
 
