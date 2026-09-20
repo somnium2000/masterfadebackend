@@ -112,7 +112,7 @@ test("decline oficial HTTP 402 es definitivo aun sin hash ni montos", async () =
     success: false,
     message: "Transacción declinada",
   }, { ok: false, status: 402 }).sale(saleInput);
-  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED);
   assert.equal(result.approved, false);
   assert.equal(result.definitive, true);
   assert.equal(result.paymentHashValid, false);
@@ -182,7 +182,7 @@ test("HTTP 422 contractual es definitivo segun la tabla documental", async () =>
     ok: false,
     status: 422,
   }).sale(saleInput);
-  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
 });
 
 test("timeout produce error incierto y no filtra el secreto", async () => {

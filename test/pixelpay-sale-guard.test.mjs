@@ -30,8 +30,12 @@ test("solo permite tarjetas documentadas para PixelPay Sandbox", () => {
   );
 });
 
-test("decline definitivo pasa a fallido y resultado incierto conserva pendiente", () => {
-  assert.deepEqual(resolvePixelPaySaleFailureState("declined_definitive"), {
+test("decline y error contractual definitivos pasan a fallido; incierto conserva pendiente", () => {
+  assert.deepEqual(resolvePixelPaySaleFailureState("payment_declined"), {
+    keepPending: false,
+    intentState: "fallido",
+  });
+  assert.deepEqual(resolvePixelPaySaleFailureState("request_error_definitive"), {
     keepPending: false,
     intentState: "fallido",
   });

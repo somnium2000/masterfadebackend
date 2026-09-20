@@ -5,10 +5,11 @@ const SALE_PATH = "/api/v2/transaction/sale";
 const STATUS_PATH = "/api/v2/transaction/status";
 export const PIXELPAY_SALE_OUTCOME = Object.freeze({
   APPROVED: "approved",
-  DECLINED_DEFINITIVE: "declined_definitive",
+  PAYMENT_DECLINED: "payment_declined",
+  REQUEST_ERROR_DEFINITIVE: "request_error_definitive",
   UNCERTAIN: "uncertain",
 });
-const PIXELPAY_DEFINITIVE_HTTP_STATUSES = new Set([400, 401, 402, 403, 404, 405, 406, 412, 418, 422]);
+const PIXELPAY_DEFINITIVE_REQUEST_ERROR_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 406, 412, 418, 422]);
 export const HONDURAS_ISO_3166_2_CODES = Object.freeze([
   "HN-AT", "HN-CH", "HN-CL", "HN-CM", "HN-CP", "HN-CR", "HN-EP", "HN-FM", "HN-GD",
   "HN-IB", "HN-IN", "HN-LE", "HN-LP", "HN-OC", "HN-OL", "HN-SB", "HN-VA", "HN-YO",
@@ -140,8 +141,12 @@ export function classifyPixelPaySaleResult({
     && amountMatches === true;
   if (approved) return PIXELPAY_SALE_OUTCOME.APPROVED;
 
-  if (PIXELPAY_DEFINITIVE_HTTP_STATUSES.has(normalizedStatus)) {
-    return PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE;
+  if (normalizedStatus === 402) {
+    return PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED;
+  }
+
+  if (PIXELPAY_DEFINITIVE_REQUEST_ERROR_HTTP_STATUSES.has(normalizedStatus)) {
+    return PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE;
   }
 
   return PIXELPAY_SALE_OUTCOME.UNCERTAIN;
@@ -274,7 +279,8 @@ export class PixelPayDirectProvider extends PaymentProvider {
     return {
       outcome,
       approved: outcome === PIXELPAY_SALE_OUTCOME.APPROVED,
-      definitive: outcome === PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE,
+      definitive: outcome === PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED
+        || outcome === PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE,
       incomplete: payload.data.responseIncomplete === true,
       paymentUuid,
       transactionId,

@@ -71,10 +71,11 @@ export function assertPixelPaySandboxCardAllowed(cardNumber) {
 }
 
 export function resolvePixelPaySaleFailureState(outcome) {
-  const declinedDefinitive = outcome === PIXELPAY_SALE_OUTCOME.DECLINED_DEFINITIVE;
+  const definitive = outcome === PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED
+    || outcome === PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE;
   return {
-    keepPending: !declinedDefinitive,
-    intentState: declinedDefinitive ? "fallido" : "pendiente_confirmacion",
+    keepPending: !definitive,
+    intentState: definitive ? "fallido" : "pendiente_confirmacion",
   };
 }
 
