@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import test from "node:test";
 import {
   createPixelPayPaymentHash,
   createPixelPaySaleSignature,
   createPixelPayStatusSignature,
-  hashPixelPaySecret,
   normalizePixelPaySaleResponse,
   normalizePixelPayStatusResponse,
   PIXELPAY_SALE_OUTCOME,
@@ -13,6 +13,7 @@ import {
 } from "../src/services/payments/PixelPayDirectProvider.js";
 
 const SECRET = "qa-secret-not-real";
+const AUTH_HASH = "qa-auth-hash-not-real";
 const KEY_ID = "qa-key-not-real";
 const APP_URL = "https://pixelpay.dev";
 const ORDER_ID = "MF-PIXELPAY-ABC123";
@@ -28,6 +29,7 @@ function makeProvider(payload, { ok = true, status = 200 } = {}) {
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
+    authHash: AUTH_HASH,
     appUrl: APP_URL,
     timeoutMs: 1000,
     fetchImpl: async () => ({ ok, status, json: async () => payload }),
@@ -85,6 +87,7 @@ test("Sandbox exige app_url documental https://pixelpay.dev", () => {
       env: "sandbox",
       keyId: KEY_ID,
       secretKey: SECRET,
+      authHash: AUTH_HASH,
       appUrl: "https://qa.masterfade.example",
       timeoutMs: 1000,
       fetchImpl: async () => null,
@@ -93,8 +96,25 @@ test("Sandbox exige app_url documental https://pixelpay.dev", () => {
   );
 });
 
-test("x-auth-hash es SHA-512 hexadecimal de Secret Key", () => {
-  assert.equal(hashPixelPaySecret(SECRET), crypto.createHash("sha512").update(SECRET).digest("hex"));
+test("Sandbox exige authHash independiente y rechaza configuracion incompleta", () => {
+  assert.throws(
+    () => new PixelPayDirectProvider({
+      endpoint: "https://pixelpay.dev",
+      env: "sandbox",
+      keyId: KEY_ID,
+      secretKey: SECRET,
+      appUrl: APP_URL,
+      timeoutMs: 1000,
+      fetchImpl: async () => null,
+    }),
+    /Configuracion PixelPay Direct incompleta/
+  );
+});
+
+test(".env.example declara PIXELPAY_AUTH_HASH sin valor", () => {
+  const envExample = fs.readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+  assert.match(envExample, /^PIXELPAY_AUTH_HASH=$/m);
+  assert.doesNotMatch(envExample, /^PIXELPAY_AUTH_HASH=.+$/m);
 });
 
 test("sale aprobado exige todos los indicadores, hash y monto", async () => {
@@ -191,6 +211,7 @@ test("timeout produce error incierto y no filtra el secreto", async () => {
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
+    authHash: AUTH_HASH,
     appUrl: APP_URL,
     timeoutMs: 1000,
     fetchImpl: (_url, options) => new Promise((_resolve, reject) => {
@@ -203,6 +224,7 @@ test("timeout produce error incierto y no filtra el secreto", async () => {
     (error) => error.code === "PIXELPAY_TIMEOUT"
       && error.uncertain === true
       && !JSON.stringify(error).includes(SECRET)
+      && !JSON.stringify(error).includes(AUTH_HASH)
   );
 });
 
@@ -212,6 +234,7 @@ test("error de red produce error incierto", async () => {
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
+    authHash: AUTH_HASH,
     appUrl: APP_URL,
     timeoutMs: 1000,
     fetchImpl: async () => { throw new TypeError("network unavailable"); },
@@ -229,6 +252,7 @@ test("sale usa form-urlencoded sin PAN ni CVV en query string", async () => {
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
+    authHash: AUTH_HASH,
     appUrl: APP_URL,
     timeoutMs: 1000,
     fetchImpl: async (url, options) => {
@@ -239,6 +263,13 @@ test("sale usa form-urlencoded sin PAN ni CVV en query string", async () => {
   await provider.sale(saleInput);
   assert.equal(captured.url, "https://pixelpay.dev/api/v2/transaction/sale");
   assert.equal(captured.options.headers["Content-Type"], "application/x-www-form-urlencoded");
+  assert.equal(captured.options.headers["x-auth-key"], KEY_ID);
+  assert.equal(captured.options.headers["x-auth-hash"], AUTH_HASH);
+  assert.equal(
+    captured.options.headers["x-client-signature"],
+    createPixelPaySaleSignature({ secretKey: SECRET, appKey: KEY_ID, orderId: ORDER_ID, appUrl: APP_URL })
+  );
+  assert.notEqual(captured.options.headers["x-auth-hash"], captured.options.headers["x-client-signature"]);
   assert.equal(captured.url.includes("4111111111111111"), false);
   assert.equal(captured.url.includes("123"), false);
   assert.equal(captured.options.body.get("card_number"), "4111111111111111");
@@ -263,6 +294,7 @@ test("status usa form-urlencoded, payment_uuid y su firma especifica", async () 
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
+    authHash: AUTH_HASH,
     appUrl: APP_URL,
     timeoutMs: 1000,
     fetchImpl: async (url, options) => {
@@ -278,6 +310,8 @@ test("status usa form-urlencoded, payment_uuid y su firma especifica", async () 
   assert.equal(captured.url, "https://pixelpay.dev/api/v2/transaction/status");
   assert.equal(captured.options.body.get("payment_uuid"), PAYMENT_UUID);
   assert.equal(captured.options.body.get("env"), "sandbox");
+  assert.equal(captured.options.headers["x-auth-key"], KEY_ID);
+  assert.equal(captured.options.headers["x-auth-hash"], AUTH_HASH);
   assert.equal(
     captured.options.headers["x-client-signature"],
     createPixelPayStatusSignature({ secretKey: SECRET, appKey: KEY_ID, paymentUuid: PAYMENT_UUID, appUrl: APP_URL })

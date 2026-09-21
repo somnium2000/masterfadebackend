@@ -117,6 +117,7 @@ async function envPlugin(app) {
     }
     readRequired("PIXELPAY_KEY_ID");
     readRequired("PIXELPAY_SECRET_KEY");
+    readRequired("PIXELPAY_AUTH_HASH");
     parseIntegerInRange(process.env.PIXELPAY_HTTP_TIMEOUT_MS, "PIXELPAY_HTTP_TIMEOUT_MS", {
       fallback: 12000,
       min: 1000,

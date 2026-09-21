@@ -209,6 +209,45 @@ test("TodoPagoPreprodSimulatedProvider conserva su comportamiento redirect", asy
   assert.equal(result.launch.action, result.paymentUrl);
 });
 
+test("PaymentProviderFactory entrega PIXELPAY_AUTH_HASH al proveedor Sandbox", () => {
+  const names = [
+    "PAYMENT_PROVIDER",
+    "PIXELPAY_ENDPOINT",
+    "PIXELPAY_ENV",
+    "PIXELPAY_KEY_ID",
+    "PIXELPAY_SECRET_KEY",
+    "PIXELPAY_AUTH_HASH",
+    "PIXELPAY_APP_URL",
+    "PIXELPAY_HTTP_TIMEOUT_MS",
+  ];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+
+  try {
+    PaymentProviderFactory.reset();
+    Object.assign(process.env, {
+      PAYMENT_PROVIDER: "pixelpay",
+      PIXELPAY_ENDPOINT: "https://pixelpay.dev",
+      PIXELPAY_ENV: "sandbox",
+      PIXELPAY_KEY_ID: "qa-key-not-real",
+      PIXELPAY_SECRET_KEY: "qa-secret-not-real",
+      PIXELPAY_AUTH_HASH: "qa-auth-hash-not-real",
+      PIXELPAY_APP_URL: "https://pixelpay.dev",
+      PIXELPAY_HTTP_TIMEOUT_MS: "1000",
+    });
+
+    const provider = PaymentProviderFactory.create();
+    assert.equal(provider.authHash, "qa-auth-hash-not-real");
+    assert.equal(provider.secretKey, "qa-secret-not-real");
+    assert.notEqual(provider.authHash, provider.secretKey);
+  } finally {
+    PaymentProviderFactory.reset();
+    for (const name of names) {
+      if (previous[name] == null) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
+
 for (const mode of ["preprod_real", "prod_real"]) {
   test(`TodoPago real continua bloqueado para ${mode}`, () => {
     const previousProvider = process.env.PAYMENT_PROVIDER;

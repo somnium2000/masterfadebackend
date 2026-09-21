@@ -59,10 +59,6 @@ function normalizeBillingState(value) {
   return normalized;
 }
 
-export function hashPixelPaySecret(secretKey) {
-  return crypto.createHash("sha512").update(text(secretKey), "utf8").digest("hex");
-}
-
 function signPixelPay(secretKey, parts) {
   return crypto.createHmac("sha3-512", text(secretKey)).update(parts.join("|"), "utf8").digest("hex");
 }
@@ -164,12 +160,13 @@ export class PixelPayDirectError extends Error {
 }
 
 export class PixelPayDirectProvider extends PaymentProvider {
-  constructor({ endpoint, env, keyId, secretKey, appUrl, timeoutMs = 12000, fetchImpl = globalThis.fetch } = {}) {
+  constructor({ endpoint, env, keyId, secretKey, authHash, appUrl, timeoutMs = 12000, fetchImpl = globalThis.fetch } = {}) {
     super();
     this.endpoint = text(endpoint).replace(/\/+$/, "");
     this.env = text(env).toLowerCase();
     this.keyId = text(keyId);
     this.secretKey = text(secretKey);
+    this.authHash = text(authHash);
     this.appUrl = text(appUrl).replace(/\/+$/, "");
     this.timeoutMs = Number(timeoutMs);
     this.fetchImpl = fetchImpl;
@@ -181,7 +178,7 @@ export class PixelPayDirectProvider extends PaymentProvider {
     ) {
       throw new Error("PixelPay Direct solo esta habilitado para sandbox QA.");
     }
-    if (!this.keyId || !this.secretKey || !this.appUrl || typeof this.fetchImpl !== "function") {
+    if (!this.keyId || !this.secretKey || !this.authHash || !this.appUrl || typeof this.fetchImpl !== "function") {
       throw new Error("Configuracion PixelPay Direct incompleta.");
     }
     if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1000 || this.timeoutMs > 60000) {
@@ -194,7 +191,7 @@ export class PixelPayDirectProvider extends PaymentProvider {
       Accept: "application/json",
       "Content-Type": "application/x-www-form-urlencoded",
       "x-auth-key": this.keyId,
-      "x-auth-hash": hashPixelPaySecret(this.secretKey),
+      "x-auth-hash": this.authHash,
       "x-client-signature": signature,
     };
   }
