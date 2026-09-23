@@ -25,6 +25,9 @@ function createPreflightPool({
   omitCron = false,
   inactiveCron = false,
   wrongCronSchedule = false,
+  wrongColumnType = "",
+  wrongNullable = "",
+  wrongDefault = "",
 } = {}) {
   const calls = [];
   const functionRows = [
@@ -38,6 +41,11 @@ function createPreflightPool({
       identity_args: wrongFunctionSignature ? "text, uuid" : "text, uuid, text, text, uuid, uuid, date, date, timestamp with time zone, timestamp with time zone",
     },
     { schema_name: "app_private", function_name: "limpiar_agenda_eventos_outbox_v1", identity_args: "interval, integer" },
+    {
+      schema_name: "app_private",
+      function_name: "registrar_payment_status_check_v1",
+      identity_args: "uuid, text, text, text, text, smallint, text, integer, text, timestamp with time zone",
+    },
   ].filter((row) => row.function_name !== omitFunction);
 
   const columns = [
@@ -61,8 +69,29 @@ function createPreflightPool({
     ["public", "citas_admin_beneficios_resumen", "cortesia_aplicada", "boolean"],
     ["public", "citas_admin_beneficios_resumen", "membresia_aplicada", "boolean"],
     ["public", "citas_admin_beneficios_resumen", "recompensa_aplicada", "boolean"],
-    ["public", "payment_intents", "monto_hnl"],
-    ["public", "payment_intents", "idempotency_key"],
+    ["public", "payment_intents", "id_intent", "uuid"],
+    ["public", "payment_intents", "id_provider", "uuid"],
+    ["public", "payment_intents", "id_cita", "uuid"],
+    ["public", "payment_intents", "id_hold", "uuid"],
+    ["public", "payment_intents", "estado_intent_codigo", "text"],
+    ["public", "payment_intents", "monto_hnl", "numeric"],
+    ["public", "payment_intents", "moneda_codigo", "text"],
+    ["public", "payment_intents", "link_pago_url", "text"],
+    ["public", "payment_intents", "referencia_externa", "text"],
+    ["public", "payment_intents", "idempotency_key", "text"],
+    ["public", "payment_intents", "expires_at", "timestamp with time zone"],
+    ["public", "payment_intents", "created_by_usuario_id", "uuid"],
+    ["public", "payment_intents", "created_at", "timestamp with time zone"],
+    ["public", "payment_intents", "updated_at", "timestamp with time zone"],
+    ["public", "payment_intents", "id_membership_order", "uuid"],
+    ["public", "payment_intents", "origen_pago_codigo", "text"],
+    ["public", "payment_intents", "id_grupo_cita", "uuid"],
+    ["public", "payment_intents", "paid_at", "timestamp with time zone"],
+    ["public", "payment_intents", "orden_compra", "text"],
+    ["public", "payment_intents", "provider_session_id", "text"],
+    ["public", "payment_intents", "launch_expires_at", "timestamp with time zone"],
+    ["public", "payment_intents", "last_verified_at", "timestamp with time zone"],
+    ["public", "payment_intents", "verification_attempts", "integer"],
     ["public", "notificaciones_email", "estado_notificacion_codigo"],
     ["public", "notificaciones_email", "evento"],
     ["public", "notificaciones_email", "id_cita"],
@@ -86,6 +115,17 @@ function createPreflightPool({
     ["app_private", "agenda_eventos_outbox", "txid_origen", "bigint"],
     ["app_private", "agenda_eventos_outbox", "payload", "jsonb"],
     ["app_private", "agenda_eventos_outbox", "created_at", "timestamp with time zone"],
+    ["app_private", "payment_status_checks", "id_status_check", "uuid"],
+    ["app_private", "payment_status_checks", "id_intent", "uuid"],
+    ["app_private", "payment_status_checks", "provider_reference", "text"],
+    ["app_private", "payment_status_checks", "origen_consulta_codigo", "text"],
+    ["app_private", "payment_status_checks", "provider_status", "text"],
+    ["app_private", "payment_status_checks", "resultado_consulta_codigo", "text"],
+    ["app_private", "payment_status_checks", "http_status", "smallint"],
+    ["app_private", "payment_status_checks", "error_code", "text"],
+    ["app_private", "payment_status_checks", "duration_ms", "integer"],
+    ["app_private", "payment_status_checks", "request_id", "text"],
+    ["app_private", "payment_status_checks", "checked_at", "timestamp with time zone"],
   ];
 
   const indexRows = [
@@ -95,10 +135,14 @@ function createPreflightPool({
     { schemaname: "public", indexname: "citas_admin_beneficios_resumen_pkey" },
     { schemaname: "public", indexname: "idx_citas_admin_beneficios_resumen_recompensa" },
     { schemaname: "public", indexname: "idx_payment_intents_activos_expires" },
+    { schemaname: "public", indexname: "idx_payment_intents_provider_order" },
+    { schemaname: "public", indexname: "idx_payment_intents_provider_session" },
     { schemaname: "app_private", indexname: "agenda_eventos_outbox_pkey" },
     { schemaname: "app_private", indexname: "idx_agenda_eventos_outbox_created_at" },
     { schemaname: "app_private", indexname: "idx_agenda_eventos_outbox_sucursal_evento" },
     { schemaname: "app_private", indexname: "idx_agenda_eventos_outbox_sucursal_barbero_evento" },
+    { schemaname: "app_private", indexname: "idx_payment_status_checks_intent_checked_at" },
+    { schemaname: "app_private", indexname: "idx_payment_status_checks_result_checked_at" },
   ].filter((row) => row.indexname !== omitIndex);
 
   const triggerRows = [
@@ -125,9 +169,10 @@ function createPreflightPool({
       }
       if (text.includes("information_schema.tables")) {
         return {
-          rows: omitRelation === "app_private.agenda_eventos_outbox" ? [] : [
+          rows: [
             { table_schema: "app_private", table_name: "agenda_eventos_outbox", table_type: "BASE TABLE" },
-          ],
+            { table_schema: "app_private", table_name: "payment_status_checks", table_type: "BASE TABLE" },
+          ].filter((row) => `${row.table_schema}.${row.table_name}` !== omitRelation),
         };
       }
       if (text.includes("information_schema.columns")) {
@@ -138,7 +183,20 @@ function createPreflightPool({
               table_schema,
               table_name,
               column_name,
-              data_type,
+              data_type: `${table_name}.${column_name}` === wrongColumnType ? "jsonb" : data_type,
+              is_nullable: `${table_name}.${column_name}` === wrongNullable ? "YES" : ([
+                "payment_intents.verification_attempts",
+                "payment_status_checks.id_status_check",
+                "payment_status_checks.id_intent",
+                "payment_status_checks.origen_consulta_codigo",
+                "payment_status_checks.resultado_consulta_codigo",
+                "payment_status_checks.checked_at",
+              ].includes(`${table_name}.${column_name}`) ? "NO" : "YES"),
+              column_default: `${table_name}.${column_name}` === wrongDefault
+                ? "1"
+                : (`${table_name}.${column_name}` === "payment_intents.verification_attempts"
+                ? "0"
+                : (`${table_name}.${column_name}` === "payment_status_checks.origen_consulta_codigo" ? "'manual'::text" : null)),
             })),
         };
       }
@@ -152,6 +210,36 @@ function createPreflightPool({
             table_name: "agenda_eventos_outbox",
             constraint_name: "ck_agenda_eventos_outbox_motivo",
             definition: "CHECK motivo IN ('hold_created','hold_released','hold_expired','booking_confirmed','booking_cancelled','booking_rescheduled','availability_released','block_changed','branch_schedule_changed','barber_schedule_changed','branch_availability_changed','barber_availability_changed','service_availability_changed','booking_rules_changed')",
+          }, {
+            table_schema: "public",
+            table_name: "payment_intents",
+            constraint_name: "ck_payment_intents_verification_attempts_nonnegative",
+            definition: "CHECK ((verification_attempts >= 0))",
+          }, {
+            table_schema: "app_private",
+            table_name: "payment_status_checks",
+            constraint_name: "fk_payment_status_checks_intent",
+            definition: "FOREIGN KEY (id_intent) REFERENCES public.payment_intents(id_intent) ON UPDATE CASCADE ON DELETE RESTRICT",
+          }, {
+            table_schema: "app_private",
+            table_name: "payment_status_checks",
+            constraint_name: "ck_payment_status_checks_origen",
+            definition: "CHECK origen_consulta_codigo IN ('manual','automatico','reconciliacion','post_venta')",
+          }, {
+            table_schema: "app_private",
+            table_name: "payment_status_checks",
+            constraint_name: "ck_payment_status_checks_resultado",
+            definition: "CHECK resultado_consulta_codigo IN ('ok','timeout','error_red','error_proveedor','respuesta_invalida')",
+          }, {
+            table_schema: "app_private",
+            table_name: "payment_status_checks",
+            constraint_name: "ck_payment_status_checks_http_status",
+            definition: "CHECK ((http_status IS NULL) OR ((http_status >= 100) AND (http_status <= 599)))",
+          }, {
+            table_schema: "app_private",
+            table_name: "payment_status_checks",
+            constraint_name: "ck_payment_status_checks_duration",
+            definition: "CHECK ((duration_ms IS NULL) OR (duration_ms >= 0))",
           }],
         };
       }
@@ -214,10 +302,76 @@ test("database schema preflight falla como DB_SCHEMA_OUTDATED y conserva faltant
   );
 });
 
+for (const column of [
+  "orden_compra",
+  "provider_session_id",
+  "launch_expires_at",
+  "last_verified_at",
+  "verification_attempts",
+]) {
+  test(`database schema preflight detecta payment_intents.${column} ausente`, async () => {
+    await assert.rejects(
+      () => runDatabaseSchemaPreflight(createPreflightPool({
+        omitColumn: `payment_intents.${column}`,
+      })),
+      (error) => error.details.missing.some((item) => (
+        item.type === "column" && item.name === `public.payment_intents.${column}`
+      ))
+    );
+  });
+}
+
+for (const [column, expectedType] of [
+  ["orden_compra", "text"],
+  ["provider_session_id", "text"],
+  ["launch_expires_at", "timestamp with time zone"],
+  ["last_verified_at", "timestamp with time zone"],
+  ["verification_attempts", "integer"],
+]) {
+  test(`database schema preflight detecta tipo incorrecto en payment_intents.${column}`, async () => {
+    await assert.rejects(
+      () => runDatabaseSchemaPreflight(createPreflightPool({
+        wrongColumnType: `payment_intents.${column}`,
+      })),
+      (error) => error.details.missing.some((item) => (
+        item.type === "column"
+        && item.name === `public.payment_intents.${column}:${expectedType}`
+      ))
+    );
+  });
+}
+
 test("database schema preflight detecta tabla outbox ausente", async () => {
   await assert.rejects(() => runDatabaseSchemaPreflight(createPreflightPool({
     omitRelation: "app_private.agenda_eventos_outbox",
   })), (error) => error.details.missing.some((item) => item.type === "relation"));
+});
+
+test("database schema preflight exige tabla, funcion, columnas e indices de status checks", async () => {
+  const cases = [
+    ["omitRelation", "app_private.payment_status_checks", "relation"],
+    ["omitFunction", "registrar_payment_status_check_v1", "function"],
+    ["omitColumn", "payment_status_checks.resultado_consulta_codigo", "column"],
+    ["omitIndex", "idx_payment_status_checks_intent_checked_at", "index"],
+  ];
+  for (const [option, value, expectedType] of cases) {
+    await assert.rejects(
+      () => runDatabaseSchemaPreflight(createPreflightPool({ [option]: value })),
+      (error) => error.details.missing.some((item) => item.type === expectedType)
+    );
+  }
+});
+
+test("database schema preflight exige NOT NULL y DEFAULT 0 en verification_attempts", async () => {
+  for (const options of [
+    { wrongNullable: "payment_intents.verification_attempts" },
+    { wrongDefault: "payment_intents.verification_attempts" },
+  ]) {
+    await assert.rejects(
+      () => runDatabaseSchemaPreflight(createPreflightPool(options)),
+      (error) => error.details.missing.some((item) => item.type === "column_contract")
+    );
+  }
 });
 
 test("database schema preflight detecta funcion outbox ausente", async () => {

@@ -233,6 +233,7 @@ CREATE TABLE public.payment_intents (
   id_grupo_cita uuid REFERENCES public.citas_grupos(id_grupo_cita),
   id_provider uuid,
   id_hold uuid REFERENCES public.citas_holds(id_hold),
+  id_membership_order uuid,
   origen_pago_codigo text NOT NULL DEFAULT 'cita',
   estado_intent_codigo text NOT NULL DEFAULT 'creado',
   monto_hnl numeric(12,2) NOT NULL DEFAULT 0,

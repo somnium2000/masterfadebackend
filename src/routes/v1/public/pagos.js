@@ -121,6 +121,103 @@ function buildSafeProviderErrorDiagnostic(error, requestId) {
   };
 }
 
+function safeTelemetryText(value, maxLength = 255) {
+  return safeText(value)?.slice(0, maxLength) || null;
+}
+
+export function classifyPixelPayStatusResult(status) {
+  const providerStatus = safeText(status?.status);
+  if (!providerStatus || providerStatus.toUpperCase() === "UNKNOWN") return "respuesta_invalida";
+  if (status?.ok !== true || status?.success !== true) return "error_proveedor";
+  return "ok";
+}
+
+export function classifyPixelPayStatusError(error) {
+  const code = safeText(error?.code)?.toUpperCase();
+  if (code === "PIXELPAY_TIMEOUT") return "timeout";
+  if (code === "PIXELPAY_NETWORK_ERROR") return "error_red";
+  if (code === "PIXELPAY_RESPONSE_INVALID") return "respuesta_invalida";
+  return "error_proveedor";
+}
+
+async function registerPaymentStatusCheck(db, {
+  idIntent,
+  providerReference,
+  origin,
+  providerStatus = null,
+  result,
+  httpStatus = null,
+  errorCode = null,
+  durationMs,
+  requestId,
+}) {
+  await db.query(
+    `SELECT app_private.registrar_payment_status_check_v1(
+       $1::uuid, $2::text, $3::text, $4::text, $5::text,
+       $6::smallint, $7::text, $8::integer, $9::text, $10::timestamptz
+     ) AS id_status_check`,
+    [
+      idIntent,
+      safeTelemetryText(providerReference),
+      origin,
+      safeTelemetryText(providerStatus, 120),
+      result,
+      Number.isInteger(httpStatus) ? httpStatus : null,
+      safeTelemetryText(errorCode, 120),
+      Math.min(Math.max(0, Math.trunc(durationMs || 0)), 2147483647),
+      safeTelemetryText(requestId),
+      new Date().toISOString(),
+    ]
+  );
+}
+
+async function queryAndRegisterPixelPayStatus({
+  db,
+  provider,
+  idIntent,
+  paymentUuid,
+  origin,
+  requestId,
+}) {
+  const startedAt = Date.now();
+  let recorded = false;
+  try {
+    const status = await provider.queryPaymentStatus(paymentUuid);
+    const result = classifyPixelPayStatusResult(status);
+    await registerPaymentStatusCheck(db, {
+      idIntent,
+      providerReference: paymentUuid,
+      origin,
+      providerStatus: status?.status,
+      result,
+      httpStatus: status?.statusCode,
+      durationMs: Date.now() - startedAt,
+      requestId,
+    });
+    recorded = true;
+    if (result !== "ok") {
+      throw new AppError(502, "No se pudo consultar el estado en PixelPay", {
+        code: result === "respuesta_invalida" ? "PIXELPAY_RESPONSE_INVALID" : "PIXELPAY_STATUS_ERROR",
+      });
+    }
+    return status;
+  } catch (error) {
+    if (!recorded) {
+      await registerPaymentStatusCheck(db, {
+        idIntent,
+        providerReference: paymentUuid,
+        origin,
+        result: classifyPixelPayStatusError(error),
+        httpStatus: error?.statusCode,
+        errorCode: error?.code,
+        durationMs: Date.now() - startedAt,
+        requestId,
+      });
+    }
+    throw error;
+  }
+}
+
 function resolveGroupExpiresAt(groupRows, nowMs = Date.now()) {
   let nearestExpiryMs = Number.POSITIVE_INFINITY;
   for (const row of Array.isArray(groupRows) ? groupRows : []) {
@@ -1845,7 +1942,14 @@ export default async function publicPagosRoutes(app) {
         );
         if (keepPending && saleResult.paymentUuid) {
           try {
-            await PaymentProviderFactory.create().queryPaymentStatus(saleResult.paymentUuid);
+            await queryAndRegisterPixelPayStatus({
+              db: dbClient,
+              provider: PaymentProviderFactory.create(),
+              idIntent,
+              paymentUuid: saleResult.paymentUuid,
+              origin: "post_venta",
+              requestId: request.id,
+            });
           } catch (statusError) {
             request.log.warn(
               buildSafeProviderErrorDiagnostic(statusError, request.id),
@@ -1982,13 +2086,14 @@ export default async function publicPagosRoutes(app) {
           code: "PIXELPAY_PAYMENT_UUID_MISSING",
         });
       }
-      const status = await PaymentProviderFactory.create().queryPaymentStatus(paymentUuid);
-      await app.db.query(
-        `UPDATE public.payment_intents
-         SET last_verified_at = now(), verification_attempts = COALESCE(verification_attempts, 0) + 1, updated_at = now()
-         WHERE id_intent = $1::uuid`,
-        [idIntent]
-      );
+      const status = await queryAndRegisterPixelPayStatus({
+        db: app.db,
+        provider: PaymentProviderFactory.create(),
+        idIntent,
+        paymentUuid,
+        origin: "manual",
+        requestId: request.id,
+      });
       return sendOk(reply, {
         id_intent: idIntent,
         payment_uuid: paymentUuid,

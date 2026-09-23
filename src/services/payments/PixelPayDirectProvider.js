@@ -303,6 +303,7 @@ export class PixelPayDirectProvider extends PaymentProvider {
     const payload = normalizePixelPayStatusResponse(result.payload);
     return {
       ok: result.ok,
+      statusCode: result.statusCode,
       success: payload.success,
       paymentUuid: normalizedUuid,
       status: payload.data.status,
