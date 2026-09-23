@@ -15,6 +15,8 @@ const REQUIRED_FUNCTIONS = [
     schema: "app_private",
     name: "registrar_payment_status_check_v1",
     args: "uuid, text, text, text, text, smallint, text, integer, text, timestamp with time zone",
+    securityDefiner: true,
+    searchPath: "pg_catalog, app_private",
   },
 ];
 
@@ -211,6 +213,13 @@ function normalizeType(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function getFunctionSetting(config, settingName) {
+  const prefix = `${settingName}=`;
+  return (Array.isArray(config) ? config : [])
+    .find((value) => String(value || "").startsWith(prefix))
+    ?.slice(prefix.length) || null;
+}
+
 async function queryRows(client, sql, params = []) {
   const result = await client.query(sql, params);
   return result.rows || [];
@@ -233,7 +242,9 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
         SELECT
           n.nspname AS schema_name,
           p.proname AS function_name,
-          oidvectortypes(p.proargtypes) AS identity_args
+          oidvectortypes(p.proargtypes) AS identity_args,
+          p.prosecdef AS security_definer,
+          p.proconfig AS config
         FROM pg_catalog.pg_proc p
         JOIN pg_catalog.pg_namespace n
           ON n.oid = p.pronamespace
@@ -244,9 +255,23 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
     const functionKeys = new Set(functions.map((row) => (
       `${row.schema_name}.${row.function_name}(${normalizeArgs(row.identity_args)})`
     )));
+    const functionByKey = new Map(functions.map((row) => [
+      `${row.schema_name}.${row.function_name}(${normalizeArgs(row.identity_args)})`,
+      row,
+    ]));
     for (const fn of REQUIRED_FUNCTIONS) {
       const key = `${fn.schema}.${fn.name}(${normalizeArgs(fn.args)})`;
-      if (!functionKeys.has(key)) missing.push({ type: "function", name: key });
+      if (!functionKeys.has(key)) {
+        missing.push({ type: "function", name: key });
+        continue;
+      }
+      const row = functionByKey.get(key);
+      if (fn.securityDefiner === true && row?.security_definer !== true) {
+        missing.push({ type: "function_security", name: `${key}:security_definer` });
+      }
+      if (fn.searchPath && getFunctionSetting(row?.config, "search_path") !== fn.searchPath) {
+        missing.push({ type: "function_security", name: `${key}:search_path=${fn.searchPath}` });
+      }
     }
 
     const relationSchemas = unique(REQUIRED_RELATIONS.map((relation) => relation.schema));

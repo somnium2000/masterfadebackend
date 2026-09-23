@@ -92,6 +92,18 @@ BEGIN
   ) IS NULL THEN
     RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECKS_REGISTER_FUNCTION_MISSING';
   END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'app_private'
+      AND p.proname = 'registrar_payment_status_check_v1'
+      AND p.prosecdef
+      AND p.proconfig = ARRAY['search_path=pg_catalog, app_private']::text[]
+  ) THEN
+    RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECKS_FUNCTION_SECURITY_CONFIG_INVALID';
+  END IF;
 END
 $mf$;
 

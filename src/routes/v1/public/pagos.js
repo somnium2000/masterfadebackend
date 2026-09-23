@@ -126,9 +126,9 @@ function safeTelemetryText(value, maxLength = 255) {
 }
 
 export function classifyPixelPayStatusResult(status) {
+  if (status?.ok !== true || status?.success !== true) return "error_proveedor";
   const providerStatus = safeText(status?.status);
   if (!providerStatus || providerStatus.toUpperCase() === "UNKNOWN") return "respuesta_invalida";
-  if (status?.ok !== true || status?.success !== true) return "error_proveedor";
   return "ok";
 }
 

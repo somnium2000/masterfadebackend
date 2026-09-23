@@ -3,6 +3,7 @@ import test from "node:test";
 import Fastify from "fastify";
 import publicPagosRoutes, {
   buildProviderOrderReference,
+  classifyPixelPayStatusResult,
 } from "../src/routes/v1/public/pagos.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { TodoPagoPreprodSimulatedProvider } from "../src/services/payments/TodoPagoPreprodSimulatedProvider.js";
@@ -21,6 +22,19 @@ const USER_A = "88888888-8888-4888-8888-888888888888";
 const INTENT_A = "99999999-9999-4999-8999-999999999999";
 const PROMO_A = "13131313-1313-4131-8131-131313131313";
 const PROMO_RULE_A = "14141414-1414-4141-8141-141414141414";
+
+for (const [name, status, expected] of [
+  ["request rechazado con UNKNOWN", { ok: false, success: false, status: "UNKNOWN" }, "error_proveedor"],
+  ["request rechazado sin status", { ok: false, success: false, status: "" }, "error_proveedor"],
+  ["respuesta exitosa con UNKNOWN", { ok: true, success: true, status: "UNKNOWN" }, "respuesta_invalida"],
+  ["respuesta exitosa sin status", { ok: true, success: true, status: "" }, "respuesta_invalida"],
+  ["respuesta exitosa PENDING", { ok: true, success: true, status: "PENDING" }, "ok"],
+  ["respuesta exitosa PAID", { ok: true, success: true, status: "PAID" }, "ok"],
+]) {
+  test(`clasificacion status PixelPay: ${name}`, () => {
+    assert.equal(classifyPixelPayStatusResult(status), expected);
+  });
+}
 
 function makeGroupRow({
   ownerEmail = "cliente@example.com",

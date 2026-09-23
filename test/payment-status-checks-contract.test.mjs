@@ -13,7 +13,10 @@ test("payment status checks conserva historial 4FN y un unico punto de resumen",
   assert.match(sql, /CREATE TABLE IF NOT EXISTS app_private\.payment_status_checks/i);
   assert.match(sql, /FOREIGN KEY \(id_intent\)[\s\S]*REFERENCES public\.payment_intents\(id_intent\)/i);
   assert.match(sql, /CREATE OR REPLACE FUNCTION app_private\.registrar_payment_status_check_v1/i);
+  assert.match(sql, /SECURITY DEFINER\s+SET search_path = pg_catalog, app_private\s+AS \$mf\$/i);
+  assert.doesNotMatch(sql, /SET search_path\s*=\s*pg_catalog\s*,\s*app_private\s*,\s*public/i);
   assert.match(sql, /INSERT INTO app_private\.payment_status_checks/i);
+  assert.match(sql, /UPDATE public\.payment_intents/i);
   assert.match(sql, /verification_attempts = COALESCE\(verification_attempts, 0\) \+ 1/i);
   assert.match(sql, /REVOKE ALL ON FUNCTION app_private\.registrar_payment_status_check_v1/i);
   assert.doesNotMatch(sql, /CREATE\s+(?:UNIQUE\s+)?INDEX[^;]*pixelpay/i);

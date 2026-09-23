@@ -169,7 +169,7 @@ CREATE OR REPLACE FUNCTION app_private.registrar_payment_status_check_v1(
 RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, app_private, public
+SET search_path = pg_catalog, app_private
 AS $mf$
 DECLARE
   v_id_status_check uuid;

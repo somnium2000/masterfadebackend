@@ -20,6 +20,7 @@ function createPreflightPool({
   omitConstraint = "",
   omitTrigger = "",
   wrongFunctionSignature = false,
+  wrongPaymentStatusSearchPath = false,
   wrongTriggerTable = false,
   disabledTrigger = false,
   omitCron = false,
@@ -45,6 +46,10 @@ function createPreflightPool({
       schema_name: "app_private",
       function_name: "registrar_payment_status_check_v1",
       identity_args: "uuid, text, text, text, text, smallint, text, integer, text, timestamp with time zone",
+      security_definer: true,
+      config: [wrongPaymentStatusSearchPath
+        ? "search_path=pg_catalog, app_private, public"
+        : "search_path=pg_catalog, app_private"],
     },
   ].filter((row) => row.function_name !== omitFunction);
 
@@ -372,6 +377,15 @@ test("database schema preflight exige NOT NULL y DEFAULT 0 en verification_attem
       (error) => error.details.missing.some((item) => item.type === "column_contract")
     );
   }
+});
+
+test("database schema preflight exige search_path seguro en la funcion de status checks", async () => {
+  await assert.rejects(
+    () => runDatabaseSchemaPreflight(createPreflightPool({ wrongPaymentStatusSearchPath: true })),
+    (error) => error.details.missing.some((item) => (
+      item.type === "function_security" && item.name.includes("search_path=pg_catalog, app_private")
+    ))
+  );
 });
 
 test("database schema preflight detecta funcion outbox ausente", async () => {
