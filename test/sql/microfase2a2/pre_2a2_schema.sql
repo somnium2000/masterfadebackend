@@ -248,6 +248,54 @@ CREATE TABLE public.payment_intents (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE public.bitacoras (
+  id_bitacora bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tabla text NOT NULL,
+  operacion text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.estados_notificacion (
+  estado_notificacion_codigo text PRIMARY KEY
+);
+
+CREATE TABLE public.notificaciones_email (
+  id_notificacion_email bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  estado_notificacion_codigo text NOT NULL,
+  evento text NOT NULL,
+  id_cita uuid
+);
+
+CREATE TABLE public.citas_admin_beneficios_resumen (
+  id_grupo_cita uuid PRIMARY KEY REFERENCES public.citas_grupos(id_grupo_cita),
+  resumen_beneficios jsonb NOT NULL DEFAULT '{}'::jsonb,
+  total_pagar_hnl numeric(12,2) NOT NULL DEFAULT 0,
+  recompensa_context_token text,
+  cortesia_aplicada boolean NOT NULL DEFAULT false,
+  membresia_aplicada boolean NOT NULL DEFAULT false,
+  recompensa_aplicada boolean NOT NULL DEFAULT false
+);
+
+CREATE INDEX idx_citas_admin_beneficios_resumen_recompensa
+  ON public.citas_admin_beneficios_resumen (recompensa_aplicada, id_grupo_cita)
+  WHERE recompensa_aplicada IS TRUE;
+
+CREATE OR REPLACE FUNCTION public.fn_auditar_bitacora()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fixture$
+BEGIN
+  INSERT INTO bitacoras (tabla, operacion)
+  VALUES (TG_TABLE_NAME, TG_OP);
+  RETURN NEW;
+END;
+$fixture$;
+
+CREATE TRIGGER tr_audit_payment_intents
+AFTER UPDATE ON public.payment_intents
+FOR EACH ROW
+EXECUTE FUNCTION public.fn_auditar_bitacora();
+
 CREATE TABLE public.payments (
   id_payment uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   id_intent uuid NOT NULL REFERENCES public.payment_intents(id_intent),

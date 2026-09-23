@@ -64,8 +64,11 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260703010000_fase_2a_agenda_eventos_outbox_v1.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260703020000_fase_2a2_agenda_outbox_fuentes_disponibilidad_v1.sql
-      - name: Apply provider payment contracts twice
+      - name: Apply audit and provider payment contracts twice
         run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260923030000_audit_function_search_path.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/20260923030000_audit_function_search_path.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_audit_function_search_path.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260923010000_payment_intents_provider_contract.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260923020000_payment_status_checks_v1.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260923010000_payment_intents_provider_contract.sql
@@ -73,6 +76,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260923011000_assert_payment_intents_provider_contract.sql
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260923021000_assert_payment_status_checks_v1.sql
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_payment_status_checks_behavior.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_audit_payment_status_trigger_behavior.sql
       - name: Validate objects, backfill, triggers and fiscal guard
         run: |
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_2a2.sql

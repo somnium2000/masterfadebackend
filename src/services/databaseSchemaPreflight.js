@@ -1,6 +1,13 @@
 import { AppError, DB_SCHEMA_OUTDATED_CODE } from "../utils/errors.js";
 
 const REQUIRED_FUNCTIONS = [
+  {
+    schema: "public",
+    name: "fn_auditar_bitacora",
+    args: "",
+    securityDefiner: false,
+    searchPath: "pg_catalog, public",
+  },
   { schema: "app_private", name: "crear_reserva_canonica_v1", args: "jsonb" },
   { schema: "app_private", name: "obtener_reserva_idempotente_v1", args: "uuid, text, text" },
   { schema: "app_private", name: "finalizar_reserva_idempotente_v1", args: "uuid, text, text, jsonb" },
@@ -266,7 +273,7 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
         continue;
       }
       const row = functionByKey.get(key);
-      if (fn.securityDefiner === true && row?.security_definer !== true) {
+      if (typeof fn.securityDefiner === "boolean" && row?.security_definer !== fn.securityDefiner) {
         missing.push({ type: "function_security", name: `${key}:security_definer` });
       }
       if (fn.searchPath && getFunctionSetting(row?.config, "search_path") !== fn.searchPath) {

@@ -21,6 +21,8 @@ function createPreflightPool({
   omitTrigger = "",
   wrongFunctionSignature = false,
   wrongPaymentStatusSearchPath = false,
+  wrongAuditFunctionSearchPath = false,
+  auditFunctionSecurityDefiner = false,
   wrongTriggerTable = false,
   disabledTrigger = false,
   omitCron = false,
@@ -32,6 +34,15 @@ function createPreflightPool({
 } = {}) {
   const calls = [];
   const functionRows = [
+    {
+      schema_name: "public",
+      function_name: "fn_auditar_bitacora",
+      identity_args: "",
+      security_definer: auditFunctionSecurityDefiner,
+      config: [wrongAuditFunctionSearchPath
+        ? "search_path=pg_catalog, app_private"
+        : "search_path=pg_catalog, public"],
+    },
     { schema_name: "app_private", function_name: "crear_reserva_canonica_v1", identity_args: "jsonb" },
     { schema_name: "app_private", function_name: "obtener_reserva_idempotente_v1", identity_args: "uuid, text, text" },
     { schema_name: "app_private", function_name: "finalizar_reserva_idempotente_v1", identity_args: "uuid, text, text, jsonb" },
@@ -386,6 +397,20 @@ test("database schema preflight exige search_path seguro en la funcion de status
       item.type === "function_security" && item.name.includes("search_path=pg_catalog, app_private")
     ))
   );
+});
+
+test("database schema preflight exige contrato seguro de fn_auditar_bitacora", async () => {
+  for (const options of [
+    { wrongAuditFunctionSearchPath: true },
+    { auditFunctionSecurityDefiner: true },
+  ]) {
+    await assert.rejects(
+      () => runDatabaseSchemaPreflight(createPreflightPool(options)),
+      (error) => error.details.missing.some((item) => (
+        item.type === "function_security" && item.name.includes("public.fn_auditar_bitacora()")
+      ))
+    );
+  }
 });
 
 test("database schema preflight detecta funcion outbox ausente", async () => {

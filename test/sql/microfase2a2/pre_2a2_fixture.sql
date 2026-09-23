@@ -1,3 +1,6 @@
+INSERT INTO public.estados_notificacion (estado_notificacion_codigo)
+VALUES ('procesando');
+
 INSERT INTO public.sucursales (id_sucursal, nombre_sucursal)
 VALUES ('11111111-1111-4111-8111-111111111111', 'Sucursal fixture');
 
