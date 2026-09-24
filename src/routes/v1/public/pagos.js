@@ -113,11 +113,24 @@ function buildPublicPaymentIntentPayload(row, pricing, launch = null) {
   };
 }
 
-function buildSafeProviderErrorDiagnostic(error, requestId) {
+function safeDiagnosticLength(value) {
+  const normalized = Number(value);
+  return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : null;
+}
+
+function safeDiagnosticContentType(value) {
+  return safeTelemetryText(value, 160)?.replace(/[\r\n]+/g, " ") || null;
+}
+
+export function buildSafeProviderErrorDiagnostic(error, requestId) {
   return {
     requestId,
     errorCode: safeText(error?.code),
     errorName: safeText(error?.name),
+    upstreamStatusCode: Number.isInteger(Number(error?.statusCode)) ? Number(error.statusCode) : null,
+    upstreamContentType: safeDiagnosticContentType(error?.upstreamContentType),
+    upstreamContentLength: safeDiagnosticLength(error?.upstreamContentLength),
+    uncertain: error?.uncertain === true,
   };
 }
 
@@ -138,6 +151,10 @@ export function classifyPixelPayStatusError(error) {
   if (code === "PIXELPAY_NETWORK_ERROR") return "error_red";
   if (code === "PIXELPAY_RESPONSE_INVALID") return "respuesta_invalida";
   return "error_proveedor";
+}
+
+export function isPixelPayPaidStatus(status) {
+  return safeText(status)?.toUpperCase() === "PAID";
 }
 
 async function registerPaymentStatusCheck(db, {
@@ -1384,6 +1401,164 @@ async function confirmGroupAfterPaid(client, {
   };
 }
 
+async function reconcilePixelPayPaid(client, {
+  idGrupoCita,
+  idIntent,
+  titularEmail,
+  paymentUuid,
+  providerTransactionId,
+  expectedAmount,
+  paidAt,
+  logger,
+}) {
+  await client.query("BEGIN");
+  try {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+      [`pixelpay-sale:${idIntent}`]
+    );
+
+    await loadPublicGroup(client, { groupId: idGrupoCita, titularEmail });
+    const lockedIntentResult = await client.query(
+      `SELECT pi.id_intent, pi.id_cita, pi.id_grupo_cita, pi.id_provider,
+              pi.estado_intent_codigo, pi.monto_hnl, pi.moneda_codigo,
+              pi.referencia_externa, pi.provider_session_id, pp.codigo AS provider_code
+       FROM public.payment_intents pi
+       JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
+       WHERE pi.id_intent = $1::uuid
+       FOR UPDATE OF pi`,
+      [idIntent]
+    );
+    const intent = lockedIntentResult.rows[0];
+    if (!intent || String(intent.id_grupo_cita || "") !== idGrupoCita) {
+      throw new AppError(409, "El intent no pertenece a la reserva indicada", {
+        code: "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH",
+      });
+    }
+    if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
+      throw new AppError(409, "El intent no pertenece a PixelPay", {
+        code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
+      });
+    }
+    if (safeText(intent.moneda_codigo)?.toUpperCase() !== "HNL") {
+      throw new AppError(409, "La moneda del intent no es valida", {
+        code: "PUBLIC_PAGOS_CURRENCY_INVALID",
+      });
+    }
+    if (!amountsMatch(intent.monto_hnl, expectedAmount)) {
+      throw new AppError(409, "El monto del intent no coincide con la reserva vigente", {
+        code: "PAYMENT_AMOUNT_MISMATCH",
+      });
+    }
+
+    await client.query(
+      `SELECT c.id_cita, c.estado_cita_codigo
+       FROM public.citas c
+       WHERE c.id_grupo_cita = $1::uuid AND c.deleted_at IS NULL
+       ORDER BY c.orden_integrante ASC, c.id_cita ASC
+       FOR UPDATE OF c`,
+      [idGrupoCita]
+    );
+    await client.query(
+      `SELECT h.id_hold, h.id_cita, h.estado_hold_codigo, h.expires_at
+       FROM public.citas_holds h
+       JOIN public.citas c ON c.id_cita = h.id_cita
+       WHERE c.id_grupo_cita = $1::uuid AND c.deleted_at IS NULL
+       ORDER BY h.id_cita ASC, h.id_hold ASC
+       FOR UPDATE OF h`,
+      [idGrupoCita]
+    );
+    const groupRows = await loadPublicGroup(client, { groupId: idGrupoCita, titularEmail });
+
+    const existingPaymentResult = await client.query(
+      `SELECT id_payment, provider_tx_id, monto_hnl, moneda_codigo
+       FROM public.payments
+       WHERE id_intent = $1::uuid AND estado_pago_codigo = 'capturado'
+       ORDER BY created_at ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [idIntent]
+    );
+    const existingPayment = existingPaymentResult.rows[0] || null;
+    if (existingPayment && intent.estado_intent_codigo === "confirmado") {
+      await client.query("COMMIT");
+      return {
+        processed: false,
+        duplicate: true,
+        booking_confirmed: true,
+        estado_intent_codigo: "confirmado",
+      };
+    }
+
+    assertPublicGroupPayable(groupRows);
+    resolveGroupExpiresAt(groupRows);
+    const pricing = await recalculateGroupPromotionsForPayment(client, {
+      idGrupoCita,
+      logger,
+    });
+    if (!amountsMatch(pricing.total_hnl, expectedAmount)) {
+      throw new AppError(409, "El monto de la reserva cambio durante el pago", {
+        code: "PAYMENT_AMOUNT_MISMATCH",
+      });
+    }
+
+    await client.query(
+      `UPDATE public.payment_intents
+       SET referencia_externa = COALESCE($2::text, referencia_externa),
+           provider_session_id = COALESCE($2::text, provider_session_id),
+           updated_at = now()
+       WHERE id_intent = $1::uuid`,
+      [idIntent, paymentUuid]
+    );
+
+    const stableProviderTransactionId = safeText(providerTransactionId) || safeText(paymentUuid);
+    if (!stableProviderTransactionId) {
+      throw new AppError(409, "PixelPay aun no proporciono un identificador consultable", {
+        code: "PIXELPAY_PAYMENT_UUID_MISSING",
+      });
+    }
+    if (!existingPayment) {
+      const insertedPayment = await client.query(
+        `INSERT INTO public.payments (
+           id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
+         ) VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, 'HNL', $4::timestamptz, FALSE)
+         ON CONFLICT (provider_tx_id) DO NOTHING RETURNING id_payment`,
+        [idIntent, stableProviderTransactionId, expectedAmount, paidAt]
+      );
+      if (!insertedPayment.rows[0]) {
+        const duplicate = await client.query(
+          "SELECT id_intent FROM public.payments WHERE provider_tx_id = $1::text LIMIT 1",
+          [stableProviderTransactionId]
+        );
+        if (String(duplicate.rows[0]?.id_intent || "") !== idIntent) {
+          throw new AppError(409, "La transaccion del proveedor ya fue utilizada", {
+            code: "PIXELPAY_TRANSACTION_CONFLICT",
+          });
+        }
+      }
+    }
+
+    const booking = await confirmGroupAfterPaid(client, {
+      idCitaAnchor: intent.id_cita,
+      expectedGroupId: idGrupoCita,
+      expectedIntentId: idIntent,
+      referenciaExterna: stableProviderTransactionId,
+      pagadoAt: paidAt,
+    });
+    await client.query("COMMIT");
+    return {
+      processed: !existingPayment,
+      duplicate: Boolean(existingPayment),
+      booking_confirmed: true,
+      estado_intent_codigo: "confirmado",
+      booking,
+    };
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* no-op */ }
+    throw error;
+  }
+}
+
 async function activatePixelPayDirectIntent(client, { idGrupoCita, idIntent, orderReference }) {
   await client.query("BEGIN");
   try {
@@ -1919,13 +2094,30 @@ export default async function publicPagosRoutes(app) {
       } catch (providerError) {
         request.log.warn(
           buildSafeProviderErrorDiagnostic(providerError, request.id),
-          "Resultado PixelPay incierto"
+          providerError?.uncertain === true ? "Resultado PixelPay incierto" : "PixelPay rechazo la solicitud"
         );
-        return sendOk(reply, {
-          processed: false,
-          pending_confirmation: true,
-          estado_intent_codigo: "pendiente_confirmacion",
-        }, { statusCode: 202 });
+        const keepPending = providerError?.uncertain === true;
+        dbClient = await app.db.connect();
+        await dbClient.query(
+          `UPDATE public.payment_intents
+           SET estado_intent_codigo = $2::text,
+               referencia_externa = COALESCE($3::text, referencia_externa),
+               provider_session_id = COALESCE($3::text, provider_session_id),
+               updated_at = now()
+           WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
+          [idIntent, keepPending ? "pendiente_confirmacion" : "fallido", providerError?.paymentUuid]
+        );
+        if (keepPending) {
+          return sendOk(reply, {
+            processed: false,
+            pending_confirmation: true,
+            estado_intent_codigo: "pendiente_confirmacion",
+          }, { statusCode: 202 });
+        }
+        return sendError(reply, 502, "PixelPay no pudo procesar la solicitud", {
+          code: "PIXELPAY_REQUEST_REJECTED",
+          requestId: request.id,
+        });
       }
 
       dbClient = await app.db.connect();
@@ -1940,23 +2132,6 @@ export default async function publicPagosRoutes(app) {
            WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
           [idIntent, intentState, saleResult.paymentUuid]
         );
-        if (keepPending && saleResult.paymentUuid) {
-          try {
-            await queryAndRegisterPixelPayStatus({
-              db: dbClient,
-              provider: PaymentProviderFactory.create(),
-              idIntent,
-              paymentUuid: saleResult.paymentUuid,
-              origin: "post_venta",
-              requestId: request.id,
-            });
-          } catch (statusError) {
-            request.log.warn(
-              buildSafeProviderErrorDiagnostic(statusError, request.id),
-              "No se pudo consultar estado PixelPay luego de respuesta incierta"
-            );
-          }
-        }
         return sendOk(reply, {
           processed: false,
           pending_confirmation: keepPending,
@@ -1964,65 +2139,24 @@ export default async function publicPagosRoutes(app) {
         }, { statusCode: keepPending ? 202 : 200 });
       }
 
-      await dbClient.query("BEGIN");
-      inTransaction = true;
-      await dbClient.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
-        [`pixelpay-sale:${idIntent}`]
-      );
-      const finalRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
-      assertPublicGroupPayable(finalRows);
-      resolveGroupExpiresAt(finalRows);
-      const finalPricing = await recalculateGroupPromotionsForPayment(dbClient, {
-        idGrupoCita,
-        logger: request.log,
-      });
-      if (!amountsMatch(finalPricing.total_hnl, claim.amount)) {
-        throw new AppError(409, "El monto de la reserva cambio durante el pago", {
-          code: "PAYMENT_AMOUNT_MISMATCH",
-        });
-      }
       await dbClient.query(
         `UPDATE public.payment_intents
          SET referencia_externa = $2::text, provider_session_id = $2::text, updated_at = now()
-         WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
+         WHERE id_intent = $1::uuid`,
         [idIntent, saleResult.paymentUuid]
       );
       const paidAt = new Date().toISOString();
-      const insertedPayment = await dbClient.query(
-        `INSERT INTO public.payments (
-           id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
-         ) VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, $4::text, $5::timestamptz, FALSE)
-         ON CONFLICT (provider_tx_id) DO NOTHING RETURNING id_payment`,
-        [idIntent, saleResult.transactionId, claim.amount, claim.currency, paidAt]
-      );
-      if (!insertedPayment.rows[0]) {
-        const duplicate = await dbClient.query(
-          `SELECT id_intent FROM public.payments WHERE provider_tx_id = $1::text LIMIT 1`,
-          [saleResult.transactionId]
-        );
-        if (String(duplicate.rows[0]?.id_intent || "") !== idIntent) {
-          throw new AppError(409, "La transaccion del proveedor ya fue utilizada", {
-            code: "PIXELPAY_TRANSACTION_CONFLICT",
-          });
-        }
-      }
-      const booking = await confirmGroupAfterPaid(dbClient, {
-        idCitaAnchor: claim.idCita,
-        expectedGroupId: idGrupoCita,
-        expectedIntentId: idIntent,
-        referenciaExterna: saleResult.transactionId,
-        pagadoAt: paidAt,
+      const reconciled = await reconcilePixelPayPaid(dbClient, {
+        idGrupoCita,
+        idIntent,
+        titularEmail,
+        paymentUuid: saleResult.paymentUuid,
+        providerTransactionId: saleResult.transactionId,
+        expectedAmount: claim.amount,
+        paidAt,
+        logger: request.log,
       });
-      await dbClient.query("COMMIT");
-      inTransaction = false;
-      return sendOk(reply, {
-        processed: true,
-        duplicate: false,
-        booking_confirmed: true,
-        estado_intent_codigo: "confirmado",
-        booking,
-      });
+      return sendOk(reply, reconciled);
     } catch (error) {
       if (inTransaction && dbClient) {
         try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
@@ -2094,6 +2228,29 @@ export default async function publicPagosRoutes(app) {
         origin: "manual",
         requestId: request.id,
       });
+      if (isPixelPayPaidStatus(status.status)) {
+        const reconciliationClient = await app.db.connect();
+        try {
+          const reconciled = await reconcilePixelPayPaid(reconciliationClient, {
+            idGrupoCita,
+            idIntent,
+            titularEmail,
+            paymentUuid,
+            providerTransactionId: null,
+            expectedAmount: currentTotal,
+            paidAt: new Date().toISOString(),
+            logger: request.log,
+          });
+          return sendOk(reply, {
+            id_intent: idIntent,
+            payment_uuid: paymentUuid,
+            provider_status: status.status,
+            ...reconciled,
+          });
+        } finally {
+          reconciliationClient.release();
+        }
+      }
       return sendOk(reply, {
         id_intent: idIntent,
         payment_uuid: paymentUuid,

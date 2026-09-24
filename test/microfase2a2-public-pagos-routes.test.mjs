@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import Fastify from "fastify";
 import publicPagosRoutes, {
+  buildSafeProviderErrorDiagnostic,
   buildProviderOrderReference,
   classifyPixelPayStatusResult,
+  isPixelPayPaidStatus,
 } from "../src/routes/v1/public/pagos.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { TodoPagoPreprodSimulatedProvider } from "../src/services/payments/TodoPagoPreprodSimulatedProvider.js";
@@ -35,6 +37,37 @@ for (const [name, status, expected] of [
     assert.equal(classifyPixelPayStatusResult(status), expected);
   });
 }
+
+test("solo PAID exacto se clasifica como pago confirmado", () => {
+  assert.equal(isPixelPayPaidStatus("PAID"), true);
+  assert.equal(isPixelPayPaidStatus("paid"), true);
+  assert.equal(isPixelPayPaidStatus("UNPAID"), false);
+  assert.equal(isPixelPayPaidStatus("PAID_PENDING"), false);
+  assert.equal(isPixelPayPaidStatus("APPROVED"), false);
+});
+
+test("diagnostico de proveedor solo expone metadata permitida", () => {
+  const error = Object.assign(new Error("PAN 4111111111111111 CVV 999 secret"), {
+    code: "PIXELPAY_RESPONSE_INVALID",
+    uncertain: true,
+    statusCode: 200,
+    upstreamContentType: "text/html; charset=utf-8\r\nx-secret: hidden",
+    upstreamContentLength: 321,
+    body: "4111111111111111",
+    headers: { "x-client-signature": "private" },
+  });
+  const diagnostic = buildSafeProviderErrorDiagnostic(error, "req-qa");
+  assert.deepEqual(diagnostic, {
+    requestId: "req-qa",
+    errorCode: "PIXELPAY_RESPONSE_INVALID",
+    errorName: "Error",
+    upstreamStatusCode: 200,
+    upstreamContentType: "text/html; charset=utf-8 x-secret: hidden",
+    upstreamContentLength: 321,
+    uncertain: true,
+  });
+  assert.doesNotMatch(JSON.stringify(diagnostic), /4111111111111111|999|x-client-signature|private/i);
+});
 
 function makeGroupRow({
   ownerEmail = "cliente@example.com",
@@ -77,6 +110,7 @@ function createPagosClient({
 } = {}) {
   const calls = [];
   const statusChecks = [];
+  const payments = [];
   let activeIntent = existingIntent ? { ...existingIntent } : null;
   const groupState = [
     makeGroupRow({ ownerEmail, expiresAt: holdExpiresAt }),
@@ -104,6 +138,9 @@ function createPagosClient({
     },
     getStatusChecks() {
       return structuredClone(statusChecks);
+    },
+    getPayments() {
+      return structuredClone(payments);
     },
     getGroupState() {
       return structuredClone(groupState);
@@ -174,6 +211,9 @@ function createPagosClient({
         return { rows: [{ id_provider: PROVIDER_A, codigo: providerCode, nombre: providerCode, activo: true }] };
       }
       if (text.includes("FROM public.payment_intents pi") && text.includes("JOIN public.payment_providers pp")) {
+        if (text.includes("FOR UPDATE OF pi")) {
+          return { rows: activeIntent ? [{ ...activeIntent, provider_code: providerCode }] : [] };
+        }
         return {
           rows: activeIntent ? [{
             ...activeIntent,
@@ -281,6 +321,33 @@ function createPagosClient({
         };
         return { rows: [{ ...activeIntent }] };
       }
+      if (text.includes("UPDATE public.payment_intents")
+        && text.includes("estado_intent_codigo = 'pendiente_confirmacion'")
+        && text.includes("RETURNING id_intent")) {
+        if (!activeIntent || activeIntent.estado_intent_codigo !== "link_generado") return { rows: [] };
+        activeIntent = { ...activeIntent, estado_intent_codigo: "pendiente_confirmacion" };
+        return { rows: [{ id_intent: activeIntent.id_intent }] };
+      }
+      if (text.includes("UPDATE public.payment_intents")
+        && text.includes("estado_intent_codigo = $2::text")
+        && text.includes("provider_session_id = COALESCE")) {
+        activeIntent = {
+          ...activeIntent,
+          estado_intent_codigo: params[1],
+          referencia_externa: params[2] || activeIntent?.referencia_externa || null,
+          provider_session_id: params[2] || activeIntent?.provider_session_id || null,
+        };
+        return { rows: [] };
+      }
+      if (text.includes("UPDATE public.payment_intents")
+        && text.includes("SET referencia_externa = $2::text, provider_session_id = $2::text")) {
+        activeIntent = {
+          ...activeIntent,
+          referencia_externa: params[1],
+          provider_session_id: params[1],
+        };
+        return { rows: [] };
+      }
       if (text.includes("app_private.registrar_payment_status_check_v1")) {
         statusChecks.push({
           id_intent: params[0],
@@ -300,6 +367,58 @@ function createPagosClient({
           last_verified_at: params[9],
         };
         return { rows: [{ id_status_check: "abababab-abab-4bab-8bab-abababababab" }] };
+      }
+      if (text.includes("FROM public.payments") && text.includes("estado_pago_codigo = 'capturado'")) {
+        const payment = payments.find((row) => row.id_intent === params[0]);
+        if (text.includes("EXISTS")) {
+          return { rows: [{
+            ...activeIntent,
+            id_grupo_cita: GROUP_A,
+            has_captured_payment: Boolean(payment),
+          }] };
+        }
+        return { rows: payment ? [{ ...payment }] : [] };
+      }
+      if (text.includes("INSERT INTO public.payments")) {
+        const existing = payments.find((row) => row.provider_tx_id === params[1]);
+        if (existing) return { rows: [] };
+        const payment = {
+          id_payment: "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd",
+          id_intent: params[0],
+          estado_pago_codigo: "capturado",
+          provider_tx_id: params[1],
+          monto_hnl: params[2],
+          moneda_codigo: "HNL",
+          paid_at: params[3],
+        };
+        payments.push(payment);
+        return { rows: [{ id_payment: payment.id_payment }] };
+      }
+      if (text.includes("SELECT id_intent FROM public.payments WHERE provider_tx_id")) {
+        const payment = payments.find((row) => row.provider_tx_id === params[0]);
+        return { rows: payment ? [{ id_intent: payment.id_intent }] : [] };
+      }
+      if (text.includes("UPDATE public.payment_intents") && text.includes("provider_session_id = COALESCE")) {
+        activeIntent = {
+          ...activeIntent,
+          referencia_externa: params[1] || activeIntent?.referencia_externa || null,
+          provider_session_id: params[1] || activeIntent?.provider_session_id || null,
+        };
+        return { rows: [] };
+      }
+      if (text.includes("FROM public.citas c") && text.includes("JOIN public.citas_grupos cg")) {
+        return { rows: [{ id_grupo_cita: GROUP_A, id_cliente_titular: null }] };
+      }
+      if (text.includes("SELECT COALESCE(SUM(total_pagar_hnl),0)::numeric AS total")) {
+        return { rows: [{ total: "115.00" }] };
+      }
+      if (text.includes("app_private.confirmar_reserva_pagada_v1")) {
+        activeIntent = { ...activeIntent, estado_intent_codigo: "confirmado", paid_at: params[2] };
+        for (const row of groupState) {
+          row.estado_cita_codigo = "confirmada";
+          row.estado_hold_codigo = "consumido";
+        }
+        return { rows: [{ resultado: { confirmed: true, id_grupo_cita: GROUP_A } }] };
       }
       if (text.includes("UPDATE public.citas") && text.includes("estado_cita_codigo = 'pendiente_pago'")) {
         for (const row of groupState) {
@@ -947,6 +1066,86 @@ test("sale guard carga intent PixelPay reclamado y no llama al proveedor", async
   await app.close();
 });
 
+for (const scenario of [
+  { name: "incierto", uncertain: true, expectedHttp: 202, expectedState: "pendiente_confirmacion" },
+  { name: "definitivo", uncertain: false, expectedHttp: 502, expectedState: "fallido" },
+]) {
+  test(`sale con error de respuesta ${scenario.name} conserva la semantica y no consulta status`, async () => {
+    const logs = [];
+    const provider = {
+      saleCalls: 0,
+      statusCalls: 0,
+      async sale() {
+        this.saleCalls += 1;
+        const error = new Error("PAN 4111111111111111 CVV 999 secret");
+        Object.assign(error, {
+          code: "PIXELPAY_RESPONSE_INVALID",
+          uncertain: scenario.uncertain,
+          statusCode: scenario.uncertain ? 200 : 422,
+          upstreamContentType: "text/html",
+          upstreamContentLength: 321,
+        });
+        throw error;
+      },
+      async queryPaymentStatus() {
+        this.statusCalls += 1;
+        throw new Error("status no debe ejecutarse");
+      },
+    };
+    const client = createPagosClient({
+      providerCode: "pixelpay",
+      existingIntent: {
+        id_intent: INTENT_A,
+        id_provider: PROVIDER_A,
+        id_cita: CITA_A,
+        id_hold: HOLD_A,
+        id_grupo_cita: GROUP_A,
+        estado_intent_codigo: "link_generado",
+        expires_at: "2099-01-01T16:00:00.000Z",
+        monto_hnl: "115.00",
+        moneda_codigo: "HNL",
+        orden_compra: "MF-PIXELPAY-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        created_by_usuario_id: USER_A,
+      },
+    });
+    const app = await createPagosApp(client, {
+      providerCode: "pixelpay",
+      providerAdapter: provider,
+      logs,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/public/pagos/pixelpay/sale",
+      payload: {
+        id_grupo_cita: GROUP_A,
+        id_intent: INTENT_A,
+        titular_email: "cliente@example.com",
+        card_number: "4111111111111111",
+        card_holder: "CLIENTE PRUEBA",
+        card_expire: "2807",
+        card_cvv: "999",
+        billing_country: "HN",
+        billing_state: "HN-CR",
+        billing_city: "San Pedro Sula",
+        billing_address: "Calle QA",
+        billing_phone: "99999999",
+      },
+    });
+
+    assert.equal(response.statusCode, scenario.expectedHttp, response.body);
+    if (!scenario.uncertain) {
+      assert.equal(response.json().error.code, "PIXELPAY_REQUEST_REJECTED");
+    }
+    assert.equal(client.getActiveIntent().estado_intent_codigo, scenario.expectedState);
+    assert.equal(provider.saleCalls, 1);
+    assert.equal(provider.statusCalls, 0);
+    assert.equal(client.getStatusChecks().length, 0);
+    assert.doesNotMatch(logs.join(""), /4111111111111111|CVV 999|secret/i);
+    await app.close();
+  });
+}
+
 test("status carga intent PixelPay y registra una verificacion con proveedor simulado", async () => {
   const provider = {
     statusCalls: [],
@@ -996,6 +1195,113 @@ test("status carga intent PixelPay y registra una verificacion con proveedor sim
   assert.equal(client.getStatusChecks()[0].provider_status, "pending");
   assert.equal(client.getStatusChecks()[0].http_status, 200);
   assert.ok(!client.calls.some((call) => call.sql.includes("SET last_verified_at = now()")));
+  await app.close();
+});
+
+test("status sin payment_uuid no llama proveedor ni registra telemetria", async () => {
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() {
+      this.statusCalls += 1;
+      throw new Error("no debe ejecutarse");
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "cliente@example.com",
+    },
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "PIXELPAY_PAYMENT_UUID_MISSING");
+  assert.equal(provider.statusCalls, 0);
+  assert.equal(client.getStatusChecks().length, 0);
+  assert.equal(client.getActiveIntent().verification_attempts || 0, 0);
+  assert.equal(client.getPayments().length, 0);
+  await app.close();
+});
+
+test("status PAID reconcilia una sola vez y repetido no duplica payment", async () => {
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus(paymentUuid) {
+      this.statusCalls += 1;
+      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "payment-uuid-paid-qa",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const request = {
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "cliente@example.com",
+    },
+  };
+
+  const first = await app.inject(request);
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.json().data.provider_status, "PAID");
+  assert.equal(first.json().data.booking_confirmed, true);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-paid-qa");
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  const sideEffectsAfterFirst = {
+    promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,
+    emails: client.calls.filter((call) => /notificaciones_email/i.test(call.sql)).length,
+    points: client.calls.filter((call) => /puntos|points/i.test(call.sql)).length,
+  };
+
+  const second = await app.inject(request);
+  assert.equal(second.statusCode, 200, second.body);
+  assert.equal(second.json().data.duplicate, true);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(provider.statusCalls, 2);
+  assert.equal(client.getStatusChecks().length, 2);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
+  assert.deepEqual({
+    promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,
+    emails: client.calls.filter((call) => /notificaciones_email/i.test(call.sql)).length,
+    points: client.calls.filter((call) => /puntos|points/i.test(call.sql)).length,
+  }, sideEffectsAfterFirst);
   await app.close();
 });
 

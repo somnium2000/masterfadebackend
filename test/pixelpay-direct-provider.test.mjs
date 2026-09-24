@@ -8,6 +8,7 @@ import {
   createPixelPayStatusSignature,
   normalizePixelPaySaleResponse,
   normalizePixelPayStatusResponse,
+  isUncertainPixelPayHttpStatus,
   PIXELPAY_SALE_OUTCOME,
   PixelPayDirectProvider,
 } from "../src/services/payments/PixelPayDirectProvider.js";
@@ -203,6 +204,49 @@ test("HTTP 422 contractual es definitivo segun la tabla documental", async () =>
     status: 422,
   }).sale(saleInput);
   assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
+});
+
+test("respuesta no JSON conserva solo metadata segura y clasifica incertidumbre por HTTP", async () => {
+  const makeInvalidProvider = (status) => new PixelPayDirectProvider({
+    endpoint: "https://pixelpay.dev",
+    env: "sandbox",
+    keyId: KEY_ID,
+    secretKey: SECRET,
+    authHash: AUTH_HASH,
+    appUrl: APP_URL,
+    timeoutMs: 1000,
+    fetchImpl: async () => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: new Headers({ "content-type": "text/html; charset=utf-8", "content-length": "321" }),
+      json: async () => { throw new SyntaxError("PAN 4111111111111111 CVV 123"); },
+    }),
+  });
+
+  for (const [status, uncertain] of [[200, true], [408, true], [500, true], [400, false], [402, false], [422, false], [429, true]]) {
+    await assert.rejects(
+      makeInvalidProvider(status).sale(saleInput),
+      (error) => {
+        assert.equal(error.code, "PIXELPAY_RESPONSE_INVALID");
+        assert.equal(error.uncertain, uncertain);
+        assert.equal(error.statusCode, status);
+        assert.equal(error.upstreamContentType, "text/html; charset=utf-8");
+        assert.equal(error.upstreamContentLength, 321);
+        assert.doesNotMatch(JSON.stringify(error), /4111111111111111|CVV|qa-secret|qa-auth/i);
+        return true;
+      }
+    );
+  }
+});
+
+test("clasificacion HTTP invalido es conservadora fuera de los 4xx definitivos", () => {
+  assert.equal(isUncertainPixelPayHttpStatus(200), true);
+  assert.equal(isUncertainPixelPayHttpStatus(408), true);
+  assert.equal(isUncertainPixelPayHttpStatus(503), true);
+  assert.equal(isUncertainPixelPayHttpStatus(401), false);
+  assert.equal(isUncertainPixelPayHttpStatus(402), false);
+  assert.equal(isUncertainPixelPayHttpStatus(429), true);
+  assert.equal(isUncertainPixelPayHttpStatus(null), true);
 });
 
 test("timeout produce error incierto y no filtra el secreto", async () => {

@@ -251,7 +251,12 @@ CREATE TABLE public.payment_intents (
 CREATE TABLE public.bitacoras (
   id_bitacora bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   tabla text NOT NULL,
-  operacion text NOT NULL,
+  registro_id uuid,
+  accion text NOT NULL,
+  descripcion text,
+  datos_antes jsonb,
+  datos_despues jsonb,
+  id_usuario uuid,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -285,8 +290,14 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $fixture$
 BEGIN
-  INSERT INTO bitacoras (tabla, operacion)
-  VALUES (TG_TABLE_NAME, TG_OP);
+  INSERT INTO bitacoras (tabla, registro_id, accion, datos_antes, datos_despues)
+  VALUES (
+    TG_TABLE_NAME,
+    COALESCE(NEW.id_intent, OLD.id_intent),
+    TG_OP,
+    CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END,
+    CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE to_jsonb(NEW) END
+  );
   RETURN NEW;
 END;
 $fixture$;

@@ -31,7 +31,7 @@ BEGIN
 
   SELECT count(*)::integer INTO v_audit_before
   FROM public.bitacoras
-  WHERE tabla = 'payment_intents' AND operacion = 'UPDATE';
+  WHERE tabla = 'payment_intents' AND accion = 'UPDATE';
 
   v_check := app_private.registrar_payment_status_check_v1(
     v_intent,
@@ -52,7 +52,7 @@ BEGIN
 
   SELECT count(*)::integer INTO v_audit_after
   FROM public.bitacoras
-  WHERE tabla = 'payment_intents' AND operacion = 'UPDATE';
+  WHERE tabla = 'payment_intents' AND accion = 'UPDATE';
 
   IF v_check IS NULL OR v_attempts_after <> v_attempts_before + 1 THEN
     RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECK_FUNCTION_REGRESSION';

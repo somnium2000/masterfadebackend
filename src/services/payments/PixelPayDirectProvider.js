@@ -29,6 +29,24 @@ function objectOrEmpty(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+function normalizeHeaderValue(value) {
+  const normalized = text(value).replace(/[\r\n]+/g, " ").slice(0, 160);
+  return normalized || null;
+}
+
+function normalizeContentLength(value) {
+  const normalized = Number.parseInt(text(value), 10);
+  return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : null;
+}
+
+export function isUncertainPixelPayHttpStatus(statusCode) {
+  const normalized = Number(statusCode);
+  if (!Number.isInteger(normalized)) return true;
+  if ((normalized >= 200 && normalized < 300) || normalized === 408 || normalized >= 500) return true;
+  if (normalized === 402 || PIXELPAY_DEFINITIVE_REQUEST_ERROR_HTTP_STATUSES.has(normalized)) return false;
+  return true;
+}
+
 function normalizeCardExpire(value) {
   const normalized = text(value);
   if (!/^[0-9]{2}(0[1-9]|1[0-2])$/.test(normalized)) {
@@ -149,13 +167,21 @@ export function classifyPixelPaySaleResult({
 }
 
 export class PixelPayDirectError extends Error {
-  constructor(code, message, { uncertain = false, paymentUuid = null, statusCode = null } = {}) {
+  constructor(code, message, {
+    uncertain = false,
+    paymentUuid = null,
+    statusCode = null,
+    upstreamContentType = null,
+    upstreamContentLength = null,
+  } = {}) {
     super(message);
     this.name = "PixelPayDirectError";
     this.code = code;
     this.uncertain = uncertain;
     this.paymentUuid = text(paymentUuid) || null;
     this.statusCode = statusCode;
+    this.upstreamContentType = normalizeHeaderValue(upstreamContentType);
+    this.upstreamContentLength = normalizeContentLength(upstreamContentLength);
   }
 }
 
@@ -206,13 +232,17 @@ export class PixelPayDirectProvider extends PaymentProvider {
         body,
         signal: controller.signal,
       });
+      const upstreamContentType = response.headers?.get?.("content-type") || null;
+      const upstreamContentLength = response.headers?.get?.("content-length") || null;
       let payload;
       try {
         payload = await response.json();
       } catch {
         throw new PixelPayDirectError("PIXELPAY_RESPONSE_INVALID", "PixelPay devolvio una respuesta invalida.", {
-          uncertain: response.ok,
+          uncertain: isUncertainPixelPayHttpStatus(response.status),
           statusCode: response.status,
+          upstreamContentType,
+          upstreamContentLength,
         });
       }
       return { ok: response.ok, statusCode: response.status, payload };
