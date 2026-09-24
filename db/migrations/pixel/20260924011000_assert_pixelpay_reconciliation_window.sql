@@ -63,6 +63,23 @@ BEGIN
   FROM pg_catalog.pg_proc p
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
   WHERE n.nspname = 'app_private'
+    AND p.proname = 'mf1b1_expirar_reservas_cliente_v1'
+    AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'p_id_cliente_titular uuid, p_ahora timestamp with time zone'
+    AND p.prosecdef IS TRUE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'MF_CLIENT_PAYMENT_EXPIRY_FUNCTION_MISSING';
+  END IF;
+
+  IF v_config IS DISTINCT FROM ARRAY['search_path=pg_catalog, public, app_private']::text[] THEN
+    RAISE EXCEPTION 'MF_CLIENT_PAYMENT_EXPIRY_SEARCH_PATH_INVALID';
+  END IF;
+
+  SELECT p.proconfig
+  INTO v_config
+  FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'app_private'
     AND p.proname = 'confirmar_reserva_pagada_v1'
     AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'p_id_intent uuid, p_referencia_externa text, p_pagado_at timestamp with time zone'
     AND p.prosecdef IS TRUE;

@@ -40,6 +40,9 @@ test("la migracion y su assert son reentrantes", async () => {
   assert.match(assertion, /search_path=pg_catalog, app_private/i);
   assert.match(assertion, /confirmar_reserva_pagada_v1/i);
   assert.match(assertion, /search_path=pg_catalog, public, app_private/i);
+  assert.match(assertion, /mf1b1_expirar_reservas_cliente_v1/i);
+  assert.match(assertion, /MF_CLIENT_PAYMENT_EXPIRY_FUNCTION_MISSING/i);
+  assert.match(assertion, /MF_CLIENT_PAYMENT_EXPIRY_SEARCH_PATH_INVALID/i);
   assert.match(assertion, /fn_payment_intents_capture_paid_at/i);
   assert.match(assertion, /search_path=pg_catalog'/i);
   assert.match(assertion, /pg_catalog\.pg_trigger/i);
@@ -59,5 +62,11 @@ test("el escenario PostgreSQL cubre proteccion, expiracion y timestamps antes/de
   assert.match(sql, /v_protected_until \+ interval '1 second'/i);
   assert.match(sql, /MF_PAYMENT_AFTER_HOLD_EXPIRY/i);
   assert.match(sql, /active hold confirmation fabricated paid_at/i);
+  assert.match(sql, /mf1b1_expirar_reservas_cliente_v1/i);
+  assert.match(sql, /client expiry did not release the expired hold/i);
+  assert.match(sql, /client expiry did not expire the booking/i);
+  assert.match(sql, /client expiry degraded an unresolved payment intent/i);
+  assert.match(sql, /client could not create a separate reservation after slot release/i);
+  assert.match(sql, /new reservation reused or removed the previous pending intent/i);
   assert.match(sql, /ROLLBACK/i);
 });
