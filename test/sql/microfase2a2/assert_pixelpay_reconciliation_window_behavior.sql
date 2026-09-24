@@ -94,6 +94,33 @@ BEGIN
     RAISE EXCEPTION 'slot was not released after the protection window';
   END IF;
 
+  IF (SELECT estado_intent_codigo FROM public.payment_intents WHERE id_intent = v_intent)
+     <> 'pendiente_confirmacion' THEN
+    RAISE EXCEPTION 'unresolved payment intent was expired with its slot';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.citas c
+    WHERE c.id_grupo_cita = v_group
+      AND c.estado_cita_codigo <> 'expirada'
+  ) THEN
+    RAISE EXCEPTION 'booking was not expired after the protection window';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.citas c
+    LEFT JOIN public.citas_holds h ON h.id_cita = c.id_cita
+    WHERE c.id_grupo_cita = v_group
+      AND (
+        c.estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada', 'en_salon', 'en_atencion')
+        OR h.estado_hold_codigo = 'activo'
+      )
+  ) THEN
+    RAISE EXCEPTION 'pending payment intent kept the slot blocked';
+  END IF;
+
   SELECT app_private.confirmar_reserva_pagada_v1(
     v_intent,
     'TX-BEFORE-EXPIRY',
@@ -164,6 +191,49 @@ BEGIN
   IF (SELECT estado_intent_codigo FROM public.payment_intents WHERE id_intent = v_intent) <> 'confirmado'
      OR (SELECT paid_at FROM public.payment_intents WHERE id_intent = v_intent) IS NOT NULL THEN
     RAISE EXCEPTION 'active hold confirmation fabricated paid_at';
+  END IF;
+
+  UPDATE public.citas
+  SET estado_cita_codigo = 'en_espera'
+  WHERE id_grupo_cita = v_group;
+  UPDATE public.citas_holds h
+  SET estado_hold_codigo = 'activo',
+      expires_at = clock_timestamp() - interval '1 second'
+  FROM public.citas c
+  WHERE c.id_grupo_cita = v_group
+    AND c.id_cita = h.id_cita;
+  UPDATE public.payment_intents
+  SET estado_intent_codigo = 'creado',
+      paid_at = NULL,
+      expires_at = clock_timestamp() - interval '1 second'
+  WHERE id_intent = v_intent;
+
+  PERFORM app_private.expirar_reservas_vencidas_v1(
+    500, clock_timestamp(), NULL, NULL, NULL, NULL, NULL
+  );
+  IF (SELECT estado_intent_codigo FROM public.payment_intents WHERE id_intent = v_intent) <> 'expirado' THEN
+    RAISE EXCEPTION 'created intent did not expire with its slot';
+  END IF;
+
+  UPDATE public.citas
+  SET estado_cita_codigo = 'pendiente_pago'
+  WHERE id_grupo_cita = v_group;
+  UPDATE public.citas_holds h
+  SET estado_hold_codigo = 'activo',
+      expires_at = clock_timestamp() - interval '1 second'
+  FROM public.citas c
+  WHERE c.id_grupo_cita = v_group
+    AND c.id_cita = h.id_cita;
+  UPDATE public.payment_intents
+  SET estado_intent_codigo = 'link_generado',
+      expires_at = clock_timestamp() - interval '1 second'
+  WHERE id_intent = v_intent;
+
+  PERFORM app_private.expirar_reservas_vencidas_v1(
+    500, clock_timestamp(), NULL, NULL, NULL, NULL, NULL
+  );
+  IF (SELECT estado_intent_codigo FROM public.payment_intents WHERE id_intent = v_intent) <> 'expirado' THEN
+    RAISE EXCEPTION 'link-generated intent did not expire with its slot';
   END IF;
 END
 $mf$;

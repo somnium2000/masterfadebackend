@@ -157,13 +157,20 @@ function createPagosClient({
   secondHoldExpiresAt = "2099-01-01T17:00:00.000Z",
   secondHoldState = "activo",
   providerCode = "mock",
+  groupCitaState = "en_espera",
+  groupHoldState = "activo",
 } = {}) {
   const calls = [];
   const statusChecks = [];
   const payments = [];
   let activeIntent = existingIntent ? { ...existingIntent } : null;
   const groupState = [
-    makeGroupRow({ ownerEmail, expiresAt: holdExpiresAt }),
+    makeGroupRow({
+      ownerEmail,
+      expiresAt: holdExpiresAt,
+      citaState: groupCitaState,
+      holdState: groupHoldState,
+    }),
     ...(groupSize === 2
       ? [makeGroupRow({
           ownerEmail,
@@ -1614,6 +1621,40 @@ test("dos Status PAID concurrentes producen un payment y una confirmacion efecti
   await app.close();
 });
 
+test("GET estado conserva pendiente_confirmacion despues de liberar el slot", async () => {
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    holdExpiresAt: "2020-01-01T00:00:00.000Z",
+    groupCitaState: "expirada",
+    groupHoldState: "expirado",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2020-01-01T00:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "payment-uuid-pending-qa",
+      referencia_externa: "transaction-id-pending-qa",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay" });
+
+  const response = await app.inject({
+    method: "GET",
+    url: `/v1/public/pagos/estado?id_grupo_cita=${GROUP_A}&id_intent=${INTENT_A}&titular_email=cliente%40example.com`,
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().data.estado_intent_codigo, "pendiente_confirmacion");
+  assert.equal(response.json().data.booking_confirmed, false);
+  await app.close();
+});
+
 test("status PAID posterior al vencimiento queda en conciliacion manual", async () => {
   const provider = {
     statusCalls: 0,
@@ -1625,13 +1666,15 @@ test("status PAID posterior al vencimiento queda en conciliacion manual", async 
   const client = createPagosClient({
     providerCode: "pixelpay",
     holdExpiresAt: "2020-01-01T00:00:00.000Z",
+    groupCitaState: "expirada",
+    groupHoldState: "expirado",
     existingIntent: {
       id_intent: INTENT_A,
       id_provider: PROVIDER_A,
       id_cita: CITA_A,
       id_hold: HOLD_A,
       id_grupo_cita: GROUP_A,
-      estado_intent_codigo: "expirado",
+      estado_intent_codigo: "pendiente_confirmacion",
       expires_at: "2020-01-01T00:00:00.000Z",
       monto_hnl: "115.00",
       moneda_codigo: "HNL",
@@ -1657,8 +1700,9 @@ test("status PAID posterior al vencimiento queda en conciliacion manual", async 
   assert.equal(response.json().data.manual_reconciliation_required, true);
   assert.equal(response.json().data.booking_confirmed, false);
   assert.equal(client.getPayments().length, 0);
-  assert.equal(client.getGroupState()[0].estado_cita_codigo, "en_espera");
-  assert.equal(client.getGroupState()[0].estado_hold_codigo, "activo");
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "expirada");
+  assert.equal(client.getGroupState()[0].estado_hold_codigo, "expirado");
   assert.equal(provider.statusCalls, 1);
   await app.close();
 });

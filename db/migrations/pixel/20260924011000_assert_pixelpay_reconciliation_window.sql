@@ -40,6 +40,29 @@ BEGIN
   FROM pg_catalog.pg_proc p
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
   WHERE n.nspname = 'app_private'
+    AND p.proname = 'expirar_reservas_vencidas_v1'
+    AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'p_limite integer, p_ahora timestamp with time zone, p_id_sucursal uuid, p_id_barbero uuid, p_inicio_at timestamp with time zone, p_fin_at timestamp with time zone, p_id_usuario_titular uuid'
+    AND p.prosecdef IS TRUE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'MF_PAYMENT_EXPIRY_FUNCTION_MISSING';
+  END IF;
+
+  IF v_config IS DISTINCT FROM ARRAY['search_path=pg_catalog, public, app_private']::text[] THEN
+    RAISE EXCEPTION 'MF_PAYMENT_EXPIRY_SEARCH_PATH_INVALID';
+  END IF;
+
+  IF pg_catalog.pg_get_functiondef(
+    'app_private.expirar_reservas_vencidas_v1(integer,timestamp with time zone,uuid,uuid,timestamp with time zone,timestamp with time zone,uuid)'::regprocedure
+  ) ~ $$estado_intent_codigo\s+IN\s*\([^)]*'pendiente_confirmacion'$$ THEN
+    RAISE EXCEPTION 'MF_PAYMENT_EXPIRY_STILL_EXPIRES_PENDING_CONFIRMATION';
+  END IF;
+
+  SELECT p.proconfig
+  INTO v_config
+  FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'app_private'
     AND p.proname = 'confirmar_reserva_pagada_v1'
     AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'p_id_intent uuid, p_referencia_externa text, p_pagado_at timestamp with time zone'
     AND p.prosecdef IS TRUE;

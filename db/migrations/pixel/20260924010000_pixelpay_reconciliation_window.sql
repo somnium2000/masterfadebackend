@@ -358,4 +358,267 @@ EXCEPTION
 END
 $mf$;
 
+-- La disponibilidad del slot y la resolucion del pago son contratos separados.
+-- Un intent pendiente_confirmacion conserva evidencia de un cobro incierto aunque
+-- el hold y la cita expiren; solo intents que nunca iniciaron Sale se expiran aqui.
+CREATE OR REPLACE FUNCTION app_private.expirar_reservas_vencidas_v1(
+  p_limite integer DEFAULT 500,
+  p_ahora timestamptz DEFAULT clock_timestamp(),
+  p_id_sucursal uuid DEFAULT NULL,
+  p_id_barbero uuid DEFAULT NULL,
+  p_inicio_at timestamptz DEFAULT NULL,
+  p_fin_at timestamptz DEFAULT NULL,
+  p_id_usuario_titular uuid DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public, app_private
+AS $mf$
+DECLARE
+  v_limite integer := LEAST(5000, GREATEST(1, COALESCE(p_limite, 500)));
+  v_holds_consumidos integer := 0;
+  v_citas_confirmadas integer := 0;
+  v_holds_expirados integer := 0;
+  v_citas_expiradas integer := 0;
+  v_intents_expirados integer := 0;
+  v_usos_revertidos integer := 0;
+BEGIN
+  IF (p_inicio_at IS NULL) <> (p_fin_at IS NULL) THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'MF_F1_EXPIRY_RANGE_INCOMPLETE';
+  END IF;
+
+  IF p_inicio_at IS NOT NULL AND p_fin_at <= p_inicio_at THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'MF_F1_EXPIRY_RANGE_INVALID';
+  END IF;
+
+  WITH pagadas AS (
+    SELECT h.id_hold, h.id_cita, c.id_grupo_cita
+    FROM public.citas_holds h
+    JOIN public.citas c ON c.id_cita = h.id_cita
+    LEFT JOIN public.citas_grupos cg ON cg.id_grupo_cita = c.id_grupo_cita
+    WHERE h.estado_hold_codigo = 'activo'
+      AND c.deleted_at IS NULL
+      AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada')
+      AND (p_id_sucursal IS NULL OR c.id_sucursal = p_id_sucursal)
+      AND (p_id_barbero IS NULL OR c.id_empleado_barbero = p_id_barbero)
+      AND (
+        p_id_usuario_titular IS NULL
+        OR cg.id_usuario_titular = p_id_usuario_titular
+        OR h.id_usuario = p_id_usuario_titular
+      )
+      AND (
+        p_inicio_at IS NULL
+        OR tstzrange(c.inicio_at, c.fin_at, '[)') && tstzrange(p_inicio_at, p_fin_at, '[)')
+      )
+      AND (
+        c.estado_cita_codigo = 'confirmada'
+        OR EXISTS (
+          SELECT 1
+          FROM public.payment_intents pi
+          WHERE pi.origen_pago_codigo = 'cita'
+            AND pi.estado_intent_codigo = 'confirmado'
+            AND pi.paid_at IS NOT NULL
+            AND pi.paid_at <= h.expires_at
+            AND (pi.id_hold = h.id_hold OR pi.id_cita = c.id_cita OR pi.id_grupo_cita = c.id_grupo_cita)
+        )
+      )
+    ORDER BY h.id_hold
+    FOR UPDATE OF h SKIP LOCKED
+    LIMIT v_limite
+  ),
+  confirmed_citas AS (
+    UPDATE public.citas c
+    SET estado_cita_codigo = 'confirmada', updated_at = now()
+    FROM pagadas p
+    WHERE c.id_cita = p.id_cita
+      AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+    RETURNING c.id_cita
+  ),
+  consumed_holds AS (
+    UPDATE public.citas_holds h
+    SET estado_hold_codigo = 'consumido', updated_at = now()
+    FROM pagadas p
+    WHERE h.id_hold = p.id_hold
+      AND h.estado_hold_codigo = 'activo'
+    RETURNING h.id_hold
+  )
+  SELECT (SELECT count(*) FROM confirmed_citas), (SELECT count(*) FROM consumed_holds)
+  INTO v_citas_confirmadas, v_holds_consumidos;
+
+  WITH candidatos AS (
+    SELECT h.id_hold, h.id_cita, c.id_grupo_cita, h.expires_at
+    FROM public.citas_holds h
+    JOIN public.citas c ON c.id_cita = h.id_cita
+    LEFT JOIN public.citas_grupos cg ON cg.id_grupo_cita = c.id_grupo_cita
+    WHERE h.estado_hold_codigo = 'activo'
+      AND h.expires_at <= p_ahora
+      AND c.deleted_at IS NULL
+      AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+      AND (p_id_sucursal IS NULL OR c.id_sucursal = p_id_sucursal)
+      AND (p_id_barbero IS NULL OR c.id_empleado_barbero = p_id_barbero)
+      AND (
+        p_id_usuario_titular IS NULL
+        OR cg.id_usuario_titular = p_id_usuario_titular
+        OR h.id_usuario = p_id_usuario_titular
+      )
+      AND (
+        p_inicio_at IS NULL
+        OR tstzrange(c.inicio_at, c.fin_at, '[)') && tstzrange(p_inicio_at, p_fin_at, '[)')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.payment_intents pi
+        WHERE pi.origen_pago_codigo = 'cita'
+          AND pi.estado_intent_codigo = 'confirmado'
+          AND pi.paid_at IS NOT NULL
+          AND pi.paid_at <= h.expires_at
+          AND (pi.id_hold = h.id_hold OR pi.id_cita = c.id_cita OR pi.id_grupo_cita = c.id_grupo_cita)
+      )
+    ORDER BY h.expires_at, h.id_hold
+    FOR UPDATE OF h SKIP LOCKED
+    LIMIT v_limite
+  ),
+  expired_intents AS (
+    UPDATE public.payment_intents pi
+    SET estado_intent_codigo = 'expirado', updated_at = now()
+    FROM candidatos x
+    WHERE pi.origen_pago_codigo = 'cita'
+      AND pi.estado_intent_codigo IN ('creado', 'link_generado')
+      AND (pi.id_hold = x.id_hold OR pi.id_cita = x.id_cita OR pi.id_grupo_cita = x.id_grupo_cita)
+    RETURNING pi.id_intent
+  ),
+  expired_holds AS (
+    UPDATE public.citas_holds h
+    SET estado_hold_codigo = 'expirado', updated_at = now()
+    FROM candidatos x
+    WHERE h.id_hold = x.id_hold
+      AND h.estado_hold_codigo = 'activo'
+    RETURNING h.id_hold
+  ),
+  expired_citas AS (
+    UPDATE public.citas c
+    SET estado_cita_codigo = 'expirada', updated_at = now()
+    FROM candidatos x
+    WHERE c.id_cita = x.id_cita
+      AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+    RETURNING c.id_cita, c.id_grupo_cita
+  ),
+  reverted_usages AS (
+    UPDATE public.promociones_usos pu
+    SET estado_uso_codigo = 'revertido', updated_at = now()
+    FROM public.citas_promociones cp
+    JOIN expired_citas ec
+      ON (
+        cp.id_cita = ec.id_cita
+        OR (cp.id_cita IS NULL AND cp.id_grupo_cita = ec.id_grupo_cita)
+      )
+    WHERE pu.id_cita_promocion = cp.id_cita_promocion
+      AND pu.estado_uso_codigo = 'reservado'
+    RETURNING pu.id_promocion_uso
+  )
+  SELECT
+    (SELECT count(*) FROM expired_intents),
+    (SELECT count(*) FROM expired_holds),
+    (SELECT count(*) FROM expired_citas),
+    (SELECT count(*) FROM reverted_usages)
+  INTO v_intents_expirados, v_holds_expirados, v_citas_expiradas, v_usos_revertidos;
+
+  RETURN jsonb_build_object(
+    'holds_consumidos', v_holds_consumidos,
+    'citas_confirmadas', v_citas_confirmadas,
+    'holds_expirados', v_holds_expirados,
+    'citas_expiradas', v_citas_expiradas,
+    'intents_expirados', v_intents_expirados,
+    'usos_promocion_revertidos', v_usos_revertidos,
+    'procesado_at', p_ahora
+  );
+END;
+$mf$;
+
+CREATE OR REPLACE FUNCTION app_private.mf1b1_expirar_reservas_cliente_v1(
+  p_id_cliente_titular uuid,
+  p_ahora timestamptz DEFAULT clock_timestamp()
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public, app_private
+AS $mf$
+DECLARE
+  v_holds integer := 0;
+  v_citas integer := 0;
+  v_intents integer := 0;
+  v_usos integer := 0;
+BEGIN
+  IF p_id_cliente_titular IS NULL THEN
+    RETURN jsonb_build_object('holds_expirados', 0, 'citas_expiradas', 0, 'intents_expirados', 0, 'usos_revertidos', 0);
+  END IF;
+
+  WITH candidatos AS (
+    SELECT h.id_hold, c.id_cita, c.id_grupo_cita
+    FROM public.citas_grupos cg
+    JOIN public.citas c
+      ON c.id_grupo_cita = cg.id_grupo_cita
+     AND c.deleted_at IS NULL
+    JOIN public.citas_holds h ON h.id_cita = c.id_cita
+    WHERE cg.id_cliente_titular = p_id_cliente_titular
+      AND cg.estado_grupo_codigo = 'activo'
+      AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+      AND h.estado_hold_codigo = 'activo'
+      AND h.expires_at <= p_ahora
+    ORDER BY h.expires_at ASC, h.id_hold ASC
+    FOR UPDATE OF h SKIP LOCKED
+    LIMIT 50
+  ),
+  expired_intents AS (
+    UPDATE public.payment_intents pi
+    SET estado_intent_codigo = 'expirado', updated_at = now()
+    FROM candidatos x
+    WHERE pi.origen_pago_codigo = 'cita'
+      AND pi.estado_intent_codigo IN ('creado', 'link_generado')
+      AND (pi.id_hold = x.id_hold OR pi.id_cita = x.id_cita OR pi.id_grupo_cita = x.id_grupo_cita)
+    RETURNING pi.id_intent
+  ),
+  expired_holds AS (
+    UPDATE public.citas_holds h
+    SET estado_hold_codigo = 'expirado', updated_at = now()
+    FROM candidatos x
+    WHERE h.id_hold = x.id_hold
+      AND h.estado_hold_codigo = 'activo'
+    RETURNING h.id_hold
+  ),
+  expired_citas AS (
+    UPDATE public.citas c
+    SET estado_cita_codigo = 'expirada', updated_at = now()
+    FROM candidatos x
+    WHERE c.id_cita = x.id_cita
+      AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago')
+    RETURNING c.id_cita, c.id_grupo_cita
+  ),
+  reverted_usages AS (
+    UPDATE public.promociones_usos pu
+    SET estado_uso_codigo = 'revertido', updated_at = now()
+    FROM public.citas_promociones cp
+    JOIN expired_citas ec ON cp.id_grupo_cita = ec.id_grupo_cita
+    WHERE pu.id_cita_promocion = cp.id_cita_promocion
+      AND pu.estado_uso_codigo = 'reservado'
+    RETURNING pu.id_promocion_uso
+  )
+  SELECT
+    (SELECT count(*) FROM expired_holds),
+    (SELECT count(*) FROM expired_citas),
+    (SELECT count(*) FROM expired_intents),
+    (SELECT count(*) FROM reverted_usages)
+  INTO v_holds, v_citas, v_intents, v_usos;
+
+  RETURN jsonb_build_object(
+    'holds_expirados', v_holds,
+    'citas_expiradas', v_citas,
+    'intents_expirados', v_intents,
+    'usos_revertidos', v_usos
+  );
+END;
+$mf$;
+
 COMMIT;
