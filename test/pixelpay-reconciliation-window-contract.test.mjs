@@ -38,6 +38,15 @@ test("la migracion y su assert son reentrantes", async () => {
   assert.match(assertion, /valor_numero = 5/i);
   assert.match(assertion, /proteger_reserva_pago_v1/i);
   assert.match(assertion, /search_path=pg_catalog, app_private/i);
+  assert.match(assertion, /confirmar_reserva_pagada_v1/i);
+  assert.match(assertion, /search_path=pg_catalog, public, app_private/i);
+  assert.match(assertion, /fn_payment_intents_capture_paid_at/i);
+  assert.match(assertion, /search_path=pg_catalog'/i);
+  assert.match(assertion, /pg_catalog\.pg_trigger/i);
+  assert.match(assertion, /t\.tgrelid/i);
+  assert.match(assertion, /t\.tgfoid/i);
+  assert.match(assertion, /t\.tgenabled <> 'D'/i);
+  assert.doesNotMatch(assertion, /tgname\s*=/i);
 });
 
 test("el escenario PostgreSQL cubre proteccion, expiracion y timestamps antes/despues", async () => {

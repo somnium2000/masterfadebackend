@@ -158,7 +158,7 @@ export function isPixelPayPaidStatus(status) {
 }
 
 export function resolveStoredPixelPayUuid(intent = {}) {
-  return safeText(intent?.provider_session_id) || safeText(intent?.referencia_externa);
+  return safeText(intent?.provider_session_id);
 }
 
 export function assertPixelPayUuidMatches(intent, paymentUuid) {

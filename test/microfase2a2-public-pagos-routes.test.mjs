@@ -69,6 +69,10 @@ test("solo PAID exacto se clasifica como pago confirmado", () => {
 test("payment_uuid persistido se valida de forma estricta", () => {
   const intent = { provider_session_id: "P-UUID-A", referencia_externa: "TX-A" };
   assert.equal(resolveStoredPixelPayUuid(intent), "P-UUID-A");
+  assert.equal(resolveStoredPixelPayUuid({
+    provider_session_id: null,
+    referencia_externa: "TX-123456",
+  }), null);
   assert.equal(assertPixelPayUuidMatches(intent, "P-UUID-A"), "P-UUID-A");
   assert.throws(
     () => assertPixelPayUuidMatches(intent, "P-UUID-B"),
@@ -1418,6 +1422,8 @@ test("status sin payment_uuid no llama proveedor ni registra telemetria", async 
       expires_at: "2099-01-01T16:00:00.000Z",
       monto_hnl: "115.00",
       moneda_codigo: "HNL",
+      provider_session_id: null,
+      referencia_externa: "TX-123456",
       created_by_usuario_id: USER_A,
     },
   });
@@ -1438,6 +1444,56 @@ test("status sin payment_uuid no llama proveedor ni registra telemetria", async 
   assert.equal(provider.statusCalls, 0);
   assert.equal(client.getStatusChecks().length, 0);
   assert.equal(client.getActiveIntent().verification_attempts || 0, 0);
+  assert.equal(client.getPayments().length, 0);
+  await app.close();
+});
+
+test("status rechaza payment_uuid diferente al persistido", async () => {
+  const provider = {
+    statusCalls: [],
+    async queryPaymentStatus(paymentUuid) {
+      this.statusCalls.push(paymentUuid);
+      return {
+        ok: true,
+        success: true,
+        statusCode: 200,
+        status: "PAID",
+        paymentUuid: "payment-uuid-diferente",
+      };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "payment-uuid-persistido",
+      referencia_externa: "TX-PERSISTIDA",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "cliente@example.com",
+    },
+  });
+
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json().error.code, "PIXELPAY_PAYMENT_UUID_MISMATCH");
+  assert.deepEqual(provider.statusCalls, ["payment-uuid-persistido"]);
   assert.equal(client.getPayments().length, 0);
   await app.close();
 });
