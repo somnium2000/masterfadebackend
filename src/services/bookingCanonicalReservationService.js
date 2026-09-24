@@ -426,11 +426,6 @@ export async function confirmCanonicalPaidReservation(client, {
   referenciaExterna = null,
   pagadoAt = null,
 } = {}) {
-  if (!pagadoAt) {
-    throw new AppError(409, "paid_at es obligatorio para confirmar el pago de una reserva", {
-      code: "PAYMENT_PAID_AT_REQUIRED",
-    });
-  }
   const result = await client.query(
     "SELECT app_private.confirmar_reserva_pagada_v1($1::uuid,$2::text,$3::timestamptz) AS resultado",
     [idIntent, referenciaExterna || null, pagadoAt]
@@ -480,6 +475,10 @@ const ERROR_MAP = new Map([
   ["MF_RESERVA_COMPANION_DATE_MISMATCH", { statusCode: 409, code: "MF_RESERVA_COMPANION_DATE_MISMATCH" }],
   ["AGENDA_DATETIME_TIMEZONE_REQUIRED", { statusCode: 400, code: "AGENDA_DATETIME_TIMEZONE_REQUIRED" }],
   ["MF_PAYMENT_AFTER_HOLD_EXPIRY", { statusCode: 409, code: "PAYMENT_HOLD_EXPIRED" }],
+  ["MF_PAYMENT_HOLD_EXPIRED", { statusCode: 409, code: "PUBLIC_PAGOS_HOLD_EXPIRED" }],
+  ["MF_PAYMENT_GROUP_STATE_INVALID", { statusCode: 409, code: "PUBLIC_PAGOS_GROUP_STATE_INVALID" }],
+  ["MF_PAYMENT_INTENT_STATE_INVALID", { statusCode: 409, code: "PUBLIC_PAGOS_INTENT_STATE_INVALID" }],
+  ["MF_PAYMENT_PAID_AT_REQUIRED", { statusCode: 409, code: "PAYMENT_PAID_AT_REQUIRED" }],
   ["MF_PAYMENT_SLOT_ALREADY_RELEASED", { statusCode: 409, code: "PAYMENT_SLOT_ALREADY_RELEASED" }],
   ["MF_PAYMENT_AMOUNT_MISMATCH", { statusCode: 409, code: "PAYMENT_AMOUNT_MISMATCH" }],
   ["PAYMENT_PAID_AT_REQUIRED", { statusCode: 409, code: "PAYMENT_PAID_AT_REQUIRED" }],

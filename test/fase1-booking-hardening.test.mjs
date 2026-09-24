@@ -49,6 +49,13 @@ function createPreflightPool({
     { schema_name: "app_private", function_name: "confirmar_reserva_pagada_v1", identity_args: "uuid, text, timestamp with time zone" },
     {
       schema_name: "app_private",
+      function_name: "proteger_reserva_pago_v1",
+      identity_args: "uuid, uuid",
+      security_definer: true,
+      config: ["search_path=pg_catalog, app_private"],
+    },
+    {
+      schema_name: "app_private",
       function_name: "registrar_evento_agenda_v1",
       identity_args: wrongFunctionSignature ? "text, uuid" : "text, uuid, text, text, uuid, uuid, date, date, timestamp with time zone, timestamp with time zone",
     },

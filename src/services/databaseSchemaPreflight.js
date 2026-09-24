@@ -14,6 +14,13 @@ const REQUIRED_FUNCTIONS = [
   { schema: "app_private", name: "confirmar_reserva_pagada_v1", args: "uuid, text, timestamp with time zone" },
   {
     schema: "app_private",
+    name: "proteger_reserva_pago_v1",
+    args: "uuid, uuid",
+    securityDefiner: true,
+    searchPath: "pg_catalog, app_private",
+  },
+  {
+    schema: "app_private",
     name: "registrar_evento_agenda_v1",
     args: "text, uuid, text, text, uuid, uuid, date, date, timestamp with time zone, timestamp with time zone",
   },

@@ -157,6 +157,36 @@ export function isPixelPayPaidStatus(status) {
   return safeText(status)?.toUpperCase() === "PAID";
 }
 
+export function resolveStoredPixelPayUuid(intent = {}) {
+  return safeText(intent?.provider_session_id) || safeText(intent?.referencia_externa);
+}
+
+export function assertPixelPayUuidMatches(intent, paymentUuid) {
+  const storedPaymentUuid = resolveStoredPixelPayUuid(intent);
+  const requestedPaymentUuid = safeText(paymentUuid);
+  if (!storedPaymentUuid || !requestedPaymentUuid) {
+    throw new AppError(409, "PixelPay aun no proporciono un identificador consultable", {
+      code: "PIXELPAY_PAYMENT_UUID_MISSING",
+    });
+  }
+  if (storedPaymentUuid !== requestedPaymentUuid) {
+    throw new AppError(409, "El identificador de PixelPay no coincide con el intent", {
+      code: "PIXELPAY_PAYMENT_UUID_MISMATCH",
+    });
+  }
+  return storedPaymentUuid;
+}
+
+export function resolveTrustedPixelPayReferences(saleResult = {}) {
+  if (saleResult?.paymentHashValid !== true || saleResult?.amountMatches !== true) {
+    return { paymentUuid: null, transactionId: null };
+  }
+  return {
+    paymentUuid: safeText(saleResult?.paymentUuid),
+    transactionId: safeText(saleResult?.transactionId),
+  };
+}
+
 async function registerPaymentStatusCheck(db, {
   idIntent,
   providerReference,
@@ -1408,7 +1438,7 @@ async function reconcilePixelPayPaid(client, {
   paymentUuid,
   providerTransactionId,
   expectedAmount,
-  paidAt,
+  paidAt = null,
   logger,
 }) {
   await client.query("BEGIN");
@@ -1422,7 +1452,8 @@ async function reconcilePixelPayPaid(client, {
     const lockedIntentResult = await client.query(
       `SELECT pi.id_intent, pi.id_cita, pi.id_grupo_cita, pi.id_provider,
               pi.estado_intent_codigo, pi.monto_hnl, pi.moneda_codigo,
-              pi.referencia_externa, pi.provider_session_id, pp.codigo AS provider_code
+              pi.referencia_externa, pi.provider_session_id, pi.expires_at,
+              pp.codigo AS provider_code
        FROM public.payment_intents pi
        JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
        WHERE pi.id_intent = $1::uuid
@@ -1450,6 +1481,7 @@ async function reconcilePixelPayPaid(client, {
         code: "PAYMENT_AMOUNT_MISMATCH",
       });
     }
+    assertPixelPayUuidMatches(intent, paymentUuid);
 
     await client.query(
       `SELECT c.id_cita, c.estado_cita_codigo
@@ -1481,6 +1513,11 @@ async function reconcilePixelPayPaid(client, {
     );
     const existingPayment = existingPaymentResult.rows[0] || null;
     if (existingPayment && intent.estado_intent_codigo === "confirmado") {
+      if (providerTransactionId && safeText(existingPayment.provider_tx_id) !== safeText(providerTransactionId)) {
+        throw new AppError(409, "La transaccion de PixelPay no coincide con el pago persistido", {
+          code: "PIXELPAY_TRANSACTION_CONFLICT",
+        });
+      }
       await client.query("COMMIT");
       return {
         processed: false,
@@ -1490,8 +1527,22 @@ async function reconcilePixelPayPaid(client, {
       };
     }
 
-    assertPublicGroupPayable(groupRows);
-    resolveGroupExpiresAt(groupRows);
+    try {
+      assertPublicGroupPayable(groupRows);
+      resolveGroupExpiresAt(groupRows);
+    } catch (error) {
+      if (["PUBLIC_PAGOS_GROUP_STATE_INVALID", "PUBLIC_PAGOS_HOLD_EXPIRED"].includes(error?.code)) {
+        await client.query("COMMIT");
+        return {
+          processed: false,
+          pending_confirmation: true,
+          manual_reconciliation_required: true,
+          booking_confirmed: false,
+          estado_intent_codigo: intent.estado_intent_codigo,
+        };
+      }
+      throw error;
+    }
     const pricing = await recalculateGroupPromotionsForPayment(client, {
       idGrupoCita,
       logger,
@@ -1502,28 +1553,25 @@ async function reconcilePixelPayPaid(client, {
       });
     }
 
-    await client.query(
-      `UPDATE public.payment_intents
-       SET referencia_externa = COALESCE($2::text, referencia_externa),
-           provider_session_id = COALESCE($2::text, provider_session_id),
-           updated_at = now()
-       WHERE id_intent = $1::uuid`,
-      [idIntent, paymentUuid]
-    );
-
-    const stableProviderTransactionId = safeText(providerTransactionId) || safeText(paymentUuid);
+    const stableProviderTransactionId = safeText(providerTransactionId);
     if (!stableProviderTransactionId) {
-      throw new AppError(409, "PixelPay aun no proporciono un identificador consultable", {
-        code: "PIXELPAY_PAYMENT_UUID_MISSING",
-      });
+      await client.query("COMMIT");
+      return {
+        processed: false,
+        pending_confirmation: true,
+        manual_reconciliation_required: true,
+        booking_confirmed: false,
+        estado_intent_codigo: intent.estado_intent_codigo,
+      };
     }
+    const canonicalPaidAt = safeText(paidAt);
     if (!existingPayment) {
       const insertedPayment = await client.query(
         `INSERT INTO public.payments (
            id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
          ) VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, 'HNL', $4::timestamptz, FALSE)
          ON CONFLICT (provider_tx_id) DO NOTHING RETURNING id_payment`,
-        [idIntent, stableProviderTransactionId, expectedAmount, paidAt]
+        [idIntent, stableProviderTransactionId, expectedAmount, canonicalPaidAt]
       );
       if (!insertedPayment.rows[0]) {
         const duplicate = await client.query(
@@ -1543,7 +1591,7 @@ async function reconcilePixelPayPaid(client, {
       expectedGroupId: idGrupoCita,
       expectedIntentId: idIntent,
       referenciaExterna: stableProviderTransactionId,
-      pagadoAt: paidAt,
+      pagadoAt: canonicalPaidAt,
     });
     await client.query("COMMIT");
     return {
@@ -2043,13 +2091,12 @@ export default async function publicPagosRoutes(app) {
       }
       assertPixelPaySandboxCardAllowed(request.body.card_number);
       const claimed = await dbClient.query(
-        `UPDATE public.payment_intents
-         SET estado_intent_codigo = 'pendiente_confirmacion', updated_at = now()
-         WHERE id_intent = $1::uuid AND estado_intent_codigo = 'link_generado'
-         RETURNING id_intent`,
-        [idIntent]
+        `SELECT app_private.proteger_reserva_pago_v1(
+           $1::uuid, $2::uuid
+         ) AS protection_expires_at`,
+        [idIntent, idGrupoCita]
       );
-      if (!claimed.rows[0]) {
+      if (!claimed.rows[0]?.protection_expires_at) {
         throw new AppError(409, "Ya existe un cobro en curso para este intent", {
           code: "PIXELPAY_SALE_ALREADY_IN_PROGRESS",
         });
@@ -2101,11 +2148,9 @@ export default async function publicPagosRoutes(app) {
         await dbClient.query(
           `UPDATE public.payment_intents
            SET estado_intent_codigo = $2::text,
-               referencia_externa = COALESCE($3::text, referencia_externa),
-               provider_session_id = COALESCE($3::text, provider_session_id),
                updated_at = now()
            WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
-          [idIntent, keepPending ? "pendiente_confirmacion" : "fallido", providerError?.paymentUuid]
+          [idIntent, keepPending ? "pendiente_confirmacion" : "fallido"]
         );
         if (keepPending) {
           return sendOk(reply, {
@@ -2123,14 +2168,15 @@ export default async function publicPagosRoutes(app) {
       dbClient = await app.db.connect();
       if (saleResult.outcome !== PIXELPAY_SALE_OUTCOME.APPROVED) {
         const { keepPending, intentState } = resolvePixelPaySaleFailureState(saleResult.outcome);
+        const trustedReferences = resolveTrustedPixelPayReferences(saleResult);
         await dbClient.query(
           `UPDATE public.payment_intents
            SET estado_intent_codigo = $2::text,
                referencia_externa = COALESCE($3::text, referencia_externa),
-               provider_session_id = COALESCE($3::text, provider_session_id),
+               provider_session_id = COALESCE($4::text, provider_session_id),
                updated_at = now()
            WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
-          [idIntent, intentState, saleResult.paymentUuid]
+          [idIntent, intentState, trustedReferences.transactionId, trustedReferences.paymentUuid]
         );
         return sendOk(reply, {
           processed: false,
@@ -2141,11 +2187,10 @@ export default async function publicPagosRoutes(app) {
 
       await dbClient.query(
         `UPDATE public.payment_intents
-         SET referencia_externa = $2::text, provider_session_id = $2::text, updated_at = now()
+         SET referencia_externa = $2::text, provider_session_id = $3::text, updated_at = now()
          WHERE id_intent = $1::uuid`,
-        [idIntent, saleResult.paymentUuid]
+        [idIntent, saleResult.transactionId, saleResult.paymentUuid]
       );
-      const paidAt = new Date().toISOString();
       const reconciled = await reconcilePixelPayPaid(dbClient, {
         idGrupoCita,
         idIntent,
@@ -2153,7 +2198,6 @@ export default async function publicPagosRoutes(app) {
         paymentUuid: saleResult.paymentUuid,
         providerTransactionId: saleResult.transactionId,
         expectedAmount: claim.amount,
-        paidAt,
         logger: request.log,
       });
       return sendOk(reply, reconciled);
@@ -2214,12 +2258,13 @@ export default async function publicPagosRoutes(app) {
           code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
         });
       }
-      const paymentUuid = safeText(intent.provider_session_id || intent.referencia_externa);
+      const paymentUuid = resolveStoredPixelPayUuid(intent);
       if (!paymentUuid) {
         throw new AppError(409, "PixelPay aun no proporciono un identificador consultable", {
           code: "PIXELPAY_PAYMENT_UUID_MISSING",
         });
       }
+      assertPixelPayUuidMatches(intent, paymentUuid);
       const status = await queryAndRegisterPixelPayStatus({
         db: app.db,
         provider: PaymentProviderFactory.create(),
@@ -2228,17 +2273,25 @@ export default async function publicPagosRoutes(app) {
         origin: "manual",
         requestId: request.id,
       });
+      if (safeText(status.paymentUuid) !== paymentUuid) {
+        throw new AppError(409, "El identificador de PixelPay no coincide con el intent", {
+          code: "PIXELPAY_PAYMENT_UUID_MISMATCH",
+        });
+      }
       if (isPixelPayPaidStatus(status.status)) {
         const reconciliationClient = await app.db.connect();
         try {
+          const providerTransactionId = safeText(intent.provider_session_id)
+            && safeText(intent.referencia_externa) !== paymentUuid
+            ? safeText(intent.referencia_externa)
+            : null;
           const reconciled = await reconcilePixelPayPaid(reconciliationClient, {
             idGrupoCita,
             idIntent,
             titularEmail,
             paymentUuid,
-            providerTransactionId: null,
+            providerTransactionId,
             expectedAmount: currentTotal,
-            paidAt: new Date().toISOString(),
             logger: request.log,
           });
           return sendOk(reply, {
@@ -2246,7 +2299,7 @@ export default async function publicPagosRoutes(app) {
             payment_uuid: paymentUuid,
             provider_status: status.status,
             ...reconciled,
-          });
+          }, { statusCode: reconciled.manual_reconciliation_required ? 202 : 200 });
         } finally {
           reconciliationClient.release();
         }
