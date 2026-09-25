@@ -23,6 +23,15 @@ function objectOrNull(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
+function safeClassName(value) {
+  const name = text(value?.constructor?.name);
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name.slice(0, 80) : null;
+}
+
+function valuePresent(value) {
+  return value !== null && value !== undefined && text(value) !== "";
+}
+
 function normalizeCardExpire(value) {
   const normalized = text(value);
   if (!/^[0-9]{2}(0[1-9]|1[0-2])$/.test(normalized)) {
@@ -95,6 +104,7 @@ export class PixelPaySdkError extends Error {
     uncertain = false,
     paymentUuid = null,
     statusCode = null,
+    sdkErrorName = null,
   } = {}) {
     super(message);
     this.name = "PixelPaySdkError";
@@ -103,6 +113,9 @@ export class PixelPaySdkError extends Error {
     this.paymentUuid = text(paymentUuid) || null;
     this.statusCode = statusCode != null && Number.isInteger(Number(statusCode))
       ? Number(statusCode)
+      : null;
+    this.sdkErrorName = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text(sdkErrorName))
+      ? text(sdkErrorName).slice(0, 80)
       : null;
   }
 }
@@ -185,13 +198,16 @@ export class PixelPaySdkProvider extends PaymentProvider {
 
   readTransactionResult(response) {
     const TransactionResult = this.sdk.Entities.TransactionResult;
-    if (!TransactionResult.validateResponse(response) || !objectOrNull(response?.data)) {
-      return null;
+    const valid = TransactionResult.validateResponse(response) === true;
+    const dataPresent = Boolean(objectOrNull(response?.data));
+    if (!valid || !dataPresent) {
+      return { result: null, valid, dataPresent, parsed: false };
     }
     try {
-      return TransactionResult.fromResponse(response);
+      const result = objectOrNull(TransactionResult.fromResponse(response));
+      return { result, valid, dataPresent, parsed: Boolean(result) };
     } catch {
-      return null;
+      return { result: null, valid, dataPresent, parsed: false };
     }
   }
 
@@ -208,20 +224,22 @@ export class PixelPaySdkProvider extends PaymentProvider {
     let response;
     try {
       response = await transaction.doSale(saleRequest);
-    } catch {
+    } catch (error) {
       throw new PixelPaySdkError(
         "PIXELPAY_NETWORK_ERROR",
         "No fue posible confirmar la respuesta de PixelPay.",
-        { uncertain: true }
+        { uncertain: true, sdkErrorName: safeClassName(error) }
       );
     }
 
     const statusCode = responseStatus(response);
-    const result = this.readTransactionResult(response);
+    const transactionResult = this.readTransactionResult(response);
+    const result = transactionResult.result;
     const paymentUuid = text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
+    const hasPaymentHash = Boolean(text(result?.payment_hash));
     let paymentHashValid = false;
-    if (text(result?.payment_hash)) {
+    if (hasPaymentHash) {
       try {
         paymentHashValid = transaction.verifyPaymentHash(
           result.payment_hash,
@@ -232,8 +250,12 @@ export class PixelPaySdkProvider extends PaymentProvider {
         paymentHashValid = false;
       }
     }
-    const transactionAmountMatches = money(result?.transaction_amount) === money(input.amount);
-    const approvedAmountMatches = money(result?.transaction_approved_amount) === money(input.amount);
+    const transactionAmountPresent = valuePresent(result?.transaction_amount);
+    const approvedAmountPresent = valuePresent(result?.transaction_approved_amount);
+    const transactionAmountMatches = transactionAmountPresent
+      && money(result?.transaction_amount) === money(input.amount);
+    const approvedAmountMatches = approvedAmountPresent
+      && money(result?.transaction_approved_amount) === money(input.amount);
     const amountMatches = transactionAmountMatches && approvedAmountMatches;
     const normalizedResponse = {
       success: responseSuccess(response),
@@ -255,6 +277,27 @@ export class PixelPaySdkProvider extends PaymentProvider {
       paymentUuid,
       transactionId,
     });
+    const diagnostics = {
+      sdkResponseClass: safeClassName(response),
+      statusCode,
+      responseSuccess: responseSuccess(response),
+      transactionResultValid: transactionResult.valid,
+      transactionResultDataPresent: transactionResult.dataPresent,
+      transactionResultParsed: transactionResult.parsed,
+      responseApproved: normalizedResponse.data.responseApproved,
+      responseIncomplete: normalizedResponse.data.responseIncomplete,
+      responseCodePresent: Boolean(normalizedResponse.data.responseCode),
+      hasPaymentUuid: Boolean(paymentUuid),
+      hasTransactionId: Boolean(transactionId),
+      hasPaymentHash,
+      paymentHashValid,
+      transactionAmountPresent,
+      approvedAmountPresent,
+      transactionAmountMatches,
+      approvedAmountMatches,
+      amountMatches,
+      outcome,
+    };
 
     return {
       outcome,
@@ -270,6 +313,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       approvedAmountMatches,
       statusCode,
       response: normalizedResponse,
+      diagnostics,
     };
   }
 
@@ -303,7 +347,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
 
     const statusCode = responseStatus(response);
-    const result = this.readTransactionResult(response);
+    const transactionResult = this.readTransactionResult(response);
+    const result = transactionResult.result;
     const status = text(result?.status).toUpperCase() || "UNKNOWN";
     return {
       ok: statusCode != null && statusCode >= 200 && statusCode < 300,

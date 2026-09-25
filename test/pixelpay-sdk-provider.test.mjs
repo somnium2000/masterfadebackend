@@ -152,6 +152,27 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   assert.equal(result.paymentHashValid, true);
   assert.equal(result.amountMatches, true);
   assert.equal(result.statusCode, 200);
+  assert.deepEqual(result.diagnostics, {
+    sdkResponseClass: "Object",
+    statusCode: 200,
+    responseSuccess: true,
+    transactionResultValid: true,
+    transactionResultDataPresent: true,
+    transactionResultParsed: true,
+    responseApproved: true,
+    responseIncomplete: false,
+    responseCodePresent: true,
+    hasPaymentUuid: true,
+    hasTransactionId: true,
+    hasPaymentHash: true,
+    paymentHashValid: true,
+    transactionAmountPresent: true,
+    approvedAmountPresent: true,
+    transactionAmountMatches: true,
+    approvedAmountMatches: true,
+    amountMatches: true,
+    outcome: PIXELPAY_SALE_OUTCOME.APPROVED,
+  });
   assert.equal(fake.calls.sale, 1);
   assert.equal(fake.calls.concurrency, 1);
   assert.equal(fake.calls.saleRequest.order.id, ORDER_ID);
@@ -222,8 +243,39 @@ test("SDK timeout, network y respuesta invalida permanecen uncertain sin retry d
     const result = await makeProvider(fake).sale(saleInput);
     assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
     assert.equal(result.paymentUuid, null);
+    assert.equal(result.diagnostics.transactionResultValid, false);
+    assert.equal(result.diagnostics.transactionResultDataPresent, true);
+    assert.equal(result.diagnostics.transactionResultParsed, false);
     assert.equal(fake.calls.sale, 1);
   });
+
+  await t.test("respuesta validada sin data de TransactionResult", async () => {
+    const fake = makeFakeSdk({
+      saleResponse: sdkResponse(200, { success: true, data: null, valid: true }),
+    });
+    const result = await makeProvider(fake).sale(saleInput);
+    assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+    assert.equal(result.diagnostics.transactionResultValid, true);
+    assert.equal(result.diagnostics.transactionResultDataPresent, false);
+    assert.equal(result.diagnostics.transactionResultParsed, false);
+    assert.equal(fake.calls.fromResponse, 0);
+  });
+});
+
+test("diagnostico SDK distingue parse fallido sin exponer la excepcion", async () => {
+  const sensitive = `${SECRET} ${AUTH_HASH}`;
+  const fake = makeFakeSdk({
+    saleResponse: sdkResponse(200, { data: approvedData() }),
+    transactionResultError: new TypeError(sensitive),
+  });
+  const result = await makeProvider(fake).sale(saleInput);
+
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+  assert.equal(result.diagnostics.transactionResultValid, true);
+  assert.equal(result.diagnostics.transactionResultDataPresent, true);
+  assert.equal(result.diagnostics.transactionResultParsed, false);
+  assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(SECRET));
+  assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(AUTH_HASH));
 });
 
 test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente", async (t) => {
@@ -234,6 +286,8 @@ test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente",
     const result = await makeProvider(fake).sale(saleInput);
     assert.equal(result.paymentHashValid, false);
     assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+    assert.equal(result.diagnostics.hasPaymentHash, true);
+    assert.equal(result.diagnostics.paymentHashValid, false);
   });
 
   await t.test("amount mismatch", async () => {
@@ -243,6 +297,8 @@ test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente",
     const result = await makeProvider(fake).sale(saleInput);
     assert.equal(result.amountMatches, false);
     assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+    assert.equal(result.diagnostics.transactionAmountMatches, false);
+    assert.equal(result.diagnostics.approvedAmountMatches, true);
   });
 
   await t.test("payment_uuid ausente", async () => {
@@ -252,7 +308,49 @@ test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente",
     const result = await makeProvider(fake).sale(saleInput);
     assert.equal(result.paymentUuid, null);
     assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+    assert.equal(result.diagnostics.hasPaymentUuid, false);
   });
+});
+
+test("diagnostico SDK identifica campos ausentes, montos y flags de respuesta", async (t) => {
+  for (const scenario of [
+    {
+      name: "transaction_id ausente",
+      data: { transaction_id: null },
+      expected: { hasTransactionId: false },
+    },
+    {
+      name: "payment_hash ausente",
+      data: { payment_hash: null },
+      expected: { hasPaymentHash: false, paymentHashValid: false },
+    },
+    {
+      name: "transaction_approved_amount mismatch",
+      data: { transaction_approved_amount: 2 },
+      expected: { transactionAmountMatches: true, approvedAmountMatches: false, amountMatches: false },
+    },
+    {
+      name: "response_approved false",
+      data: { response_approved: false },
+      expected: { responseApproved: false },
+    },
+    {
+      name: "response_incomplete true",
+      data: { response_incomplete: true },
+      expected: { responseIncomplete: true },
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const fake = makeFakeSdk({
+        saleResponse: sdkResponse(200, { data: approvedData(scenario.data) }),
+      });
+      const result = await makeProvider(fake).sale(saleInput);
+      for (const [key, value] of Object.entries(scenario.expected)) {
+        assert.equal(result.diagnostics[key], value);
+      }
+      assert.equal(fake.calls.sale, 1);
+    });
+  }
 });
 
 test("SDK Status valido usa TransactionResult y devuelve PAID", async () => {
@@ -352,6 +450,7 @@ test("SDK sanitiza excepciones y no expone PAN, CVV ni credenciales", async () =
       const serialized = JSON.stringify(error);
       assert.equal(error.code, "PIXELPAY_NETWORK_ERROR");
       assert.equal(error.uncertain, true);
+      assert.equal(error.sdkErrorName, "Error");
       assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
       assert.doesNotMatch(serialized, new RegExp(SECRET));
       assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
@@ -372,6 +471,40 @@ test("SDK sanitiza excepciones y no expone PAN, CVV ni credenciales", async () =
   assert.doesNotMatch(JSON.stringify(result), new RegExp(saleInput.card.number.replace(/\D+/g, "")));
   assert.doesNotMatch(JSON.stringify(result), new RegExp(SECRET));
   assert.doesNotMatch(JSON.stringify(result), new RegExp(AUTH_HASH));
+});
+
+test("diagnostics contiene solo metadata y nunca valores sensibles ni payload crudo", async () => {
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const result = await makeProvider(fake).sale(saleInput);
+  const serialized = JSON.stringify(result.diagnostics);
+
+  assert.deepEqual(Object.keys(result.diagnostics).sort(), [
+    "amountMatches",
+    "approvedAmountMatches",
+    "approvedAmountPresent",
+    "hasPaymentHash",
+    "hasPaymentUuid",
+    "hasTransactionId",
+    "outcome",
+    "paymentHashValid",
+    "responseApproved",
+    "responseCodePresent",
+    "responseIncomplete",
+    "responseSuccess",
+    "sdkResponseClass",
+    "statusCode",
+    "transactionAmountMatches",
+    "transactionAmountPresent",
+    "transactionResultDataPresent",
+    "transactionResultParsed",
+    "transactionResultValid",
+  ].sort());
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.cvv));
+  assert.doesNotMatch(serialized, new RegExp(SECRET));
+  assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
+  assert.doesNotMatch(serialized, /valid-hash|transaction-sdk-qa|11111111-2222-4333-8444-555555555555/i);
+  assert.doesNotMatch(serialized, /payment_uuid|transaction_id|payment_hash|x-client-signature|authorization|response\.data/i);
 });
 
 test("PaymentProviderFactory conserva direct por default y permite sdk explicito", () => {

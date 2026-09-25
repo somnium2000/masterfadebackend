@@ -127,6 +127,9 @@ export function buildSafeProviderErrorDiagnostic(error, requestId) {
     requestId,
     errorCode: safeText(error?.code),
     errorName: safeText(error?.name),
+    sdkErrorName: /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(safeText(error?.sdkErrorName) || "")
+      ? safeText(error.sdkErrorName).slice(0, 80)
+      : null,
     upstreamStatusCode: Number.isInteger(Number(error?.statusCode)) ? Number(error.statusCode) : null,
     upstreamContentType: safeDiagnosticContentType(error?.upstreamContentType),
     upstreamContentLength: safeDiagnosticLength(error?.upstreamContentLength),
@@ -136,6 +139,43 @@ export function buildSafeProviderErrorDiagnostic(error, requestId) {
 
 function safeTelemetryText(value, maxLength = 255) {
   return safeText(value)?.slice(0, maxLength) || null;
+}
+
+function safeDiagnosticBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+export function buildSafePixelPaySdkDiagnostics(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return null;
+  const sdkResponseClass = safeTelemetryText(diagnostics.sdkResponseClass, 80);
+  const outcome = Object.values(PIXELPAY_SALE_OUTCOME).includes(diagnostics.outcome)
+    ? diagnostics.outcome
+    : null;
+  return {
+    sdkResponseClass: sdkResponseClass && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sdkResponseClass)
+      ? sdkResponseClass
+      : null,
+    statusCode: diagnostics.statusCode != null && Number.isInteger(Number(diagnostics.statusCode))
+      ? Number(diagnostics.statusCode)
+      : null,
+    responseSuccess: safeDiagnosticBoolean(diagnostics.responseSuccess),
+    transactionResultValid: safeDiagnosticBoolean(diagnostics.transactionResultValid),
+    transactionResultDataPresent: safeDiagnosticBoolean(diagnostics.transactionResultDataPresent),
+    transactionResultParsed: safeDiagnosticBoolean(diagnostics.transactionResultParsed),
+    responseApproved: safeDiagnosticBoolean(diagnostics.responseApproved),
+    responseIncomplete: safeDiagnosticBoolean(diagnostics.responseIncomplete),
+    responseCodePresent: safeDiagnosticBoolean(diagnostics.responseCodePresent),
+    hasPaymentUuid: safeDiagnosticBoolean(diagnostics.hasPaymentUuid),
+    hasTransactionId: safeDiagnosticBoolean(diagnostics.hasTransactionId),
+    hasPaymentHash: safeDiagnosticBoolean(diagnostics.hasPaymentHash),
+    paymentHashValid: safeDiagnosticBoolean(diagnostics.paymentHashValid),
+    transactionAmountPresent: safeDiagnosticBoolean(diagnostics.transactionAmountPresent),
+    approvedAmountPresent: safeDiagnosticBoolean(diagnostics.approvedAmountPresent),
+    transactionAmountMatches: safeDiagnosticBoolean(diagnostics.transactionAmountMatches),
+    approvedAmountMatches: safeDiagnosticBoolean(diagnostics.approvedAmountMatches),
+    amountMatches: safeDiagnosticBoolean(diagnostics.amountMatches),
+    outcome,
+  };
 }
 
 export function classifyPixelPayStatusResult(status) {
@@ -2167,6 +2207,11 @@ export default async function publicPagosRoutes(app) {
 
       dbClient = await app.db.connect();
       if (saleResult.outcome !== PIXELPAY_SALE_OUTCOME.APPROVED) {
+        request.log.warn({
+          requestId: request.id,
+          id_intent: idIntent,
+          pixelPaySdkDiagnostics: buildSafePixelPaySdkDiagnostics(saleResult.diagnostics),
+        }, "Resultado PixelPay SDK no aprobado");
         const { keepPending, intentState } = resolvePixelPaySaleFailureState(saleResult.outcome);
         const trustedReferences = resolveTrustedPixelPayReferences(saleResult);
         await dbClient.query(

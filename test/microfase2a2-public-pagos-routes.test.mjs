@@ -3,6 +3,7 @@ import test from "node:test";
 import Fastify from "fastify";
 import publicPagosRoutes, {
   buildSafeProviderErrorDiagnostic,
+  buildSafePixelPaySdkDiagnostics,
   buildProviderOrderReference,
   classifyPixelPayStatusResult,
   assertPixelPayUuidMatches,
@@ -110,12 +111,46 @@ test("diagnostico de proveedor solo expone metadata permitida", () => {
     requestId: "req-qa",
     errorCode: "PIXELPAY_RESPONSE_INVALID",
     errorName: "Error",
+    sdkErrorName: null,
     upstreamStatusCode: 200,
     upstreamContentType: "text/html; charset=utf-8 x-secret: hidden",
     upstreamContentLength: 321,
     uncertain: true,
   });
   assert.doesNotMatch(JSON.stringify(diagnostic), /4111111111111111|999|x-client-signature|private/i);
+});
+
+test("diagnostico SDK de ruta aplica lista blanca estricta", () => {
+  const diagnostic = buildSafePixelPaySdkDiagnostics({
+    sdkResponseClass: "SuccessResponse",
+    statusCode: 200,
+    responseSuccess: true,
+    transactionResultValid: true,
+    transactionResultDataPresent: true,
+    transactionResultParsed: false,
+    responseApproved: null,
+    responseIncomplete: null,
+    responseCodePresent: false,
+    hasPaymentUuid: false,
+    hasTransactionId: false,
+    hasPaymentHash: false,
+    paymentHashValid: false,
+    transactionAmountPresent: false,
+    approvedAmountPresent: false,
+    transactionAmountMatches: false,
+    approvedAmountMatches: false,
+    amountMatches: false,
+    outcome: "uncertain",
+    payment_uuid: "must-not-appear",
+    response: { data: { card: "must-not-appear" } },
+  });
+
+  assert.equal(diagnostic.sdkResponseClass, "SuccessResponse");
+  assert.equal(diagnostic.transactionResultParsed, false);
+  assert.equal(diagnostic.outcome, "uncertain");
+  assert.equal(Object.hasOwn(diagnostic, "payment_uuid"), false);
+  assert.equal(Object.hasOwn(diagnostic, "response"), false);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /must-not-appear/);
 });
 
 function makeGroupRow({
@@ -1261,6 +1296,90 @@ for (const scenario of [
     await app.close();
   });
 }
+
+test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve", async () => {
+  const logs = [];
+  const provider = {
+    saleCalls: 0,
+    async sale() {
+      this.saleCalls += 1;
+      return {
+        outcome: "uncertain",
+        paymentUuid: null,
+        transactionId: null,
+        paymentHashValid: false,
+        amountMatches: false,
+        diagnostics: {
+          sdkResponseClass: "SuccessResponse",
+          statusCode: 200,
+          responseSuccess: true,
+          transactionResultValid: false,
+          transactionResultDataPresent: true,
+          transactionResultParsed: false,
+          responseApproved: null,
+          responseIncomplete: null,
+          responseCodePresent: false,
+          hasPaymentUuid: false,
+          hasTransactionId: false,
+          hasPaymentHash: false,
+          paymentHashValid: false,
+          transactionAmountPresent: false,
+          approvedAmountPresent: false,
+          transactionAmountMatches: false,
+          approvedAmountMatches: false,
+          amountMatches: false,
+          outcome: "uncertain",
+          payment_uuid: "sensitive-payment-uuid",
+          transaction_id: "sensitive-transaction-id",
+          payment_hash: "sensitive-payment-hash",
+          response: { data: { card_number: "sensitive-pan" } },
+        },
+      };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "link_generado",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      orden_compra: "MF-PIXELPAY-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    providerAdapter: provider,
+    logs,
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/sale",
+    payload: pixelPaySalePayload(),
+  });
+
+  const payload = response.json();
+  const diagnosticLogs = logs
+    .map((entry) => JSON.parse(entry))
+    .filter((entry) => entry.msg === "Resultado PixelPay SDK no aprobado");
+  assert.equal(response.statusCode, 202, response.body);
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(diagnosticLogs.length, 1);
+  assert.equal(diagnosticLogs[0].id_intent, INTENT_A);
+  assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.transactionResultValid, false);
+  assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.outcome, "uncertain");
+  assert.equal(Object.hasOwn(payload.data, "diagnostics"), false);
+  assert.doesNotMatch(response.body, /sdkResponseClass|transactionResultValid|sensitive-/i);
+  assert.doesNotMatch(logs.join(""), /sensitive-payment|sensitive-transaction|sensitive-pan/i);
+  await app.close();
+});
 
 test("al iniciar sale protege transaccionalmente el slot durante aproximadamente cinco minutos", async () => {
   const provider = {
