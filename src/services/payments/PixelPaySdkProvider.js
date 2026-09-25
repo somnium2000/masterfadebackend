@@ -303,16 +303,17 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
 
     const statusCode = responseStatus(response);
-    const data = objectOrNull(response?.data);
+    const result = this.readTransactionResult(response);
+    const status = text(result?.status).toUpperCase() || "UNKNOWN";
     return {
       ok: statusCode != null && statusCode >= 200 && statusCode < 300,
       statusCode,
       success: responseSuccess(response),
       paymentUuid: normalizedUuid,
-      status: text(data?.status).toUpperCase() || "UNKNOWN",
+      status,
       response: {
         success: responseSuccess(response),
-        data: { status: text(data?.status).toUpperCase() || "UNKNOWN" },
+        data: { status },
       },
     };
   }

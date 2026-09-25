@@ -4,6 +4,7 @@ import test from "node:test";
 import { PixelPayDirectProvider, PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { PixelPaySdkProvider } from "../src/services/payments/PixelPaySdkProvider.js";
+import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
 
 const KEY_ID = "qa-key-not-real";
 const SECRET = "qa-secret-not-real";
@@ -34,7 +35,14 @@ function approvedData(overrides = {}) {
   };
 }
 
-function makeFakeSdk({ saleResponse, statusResponse, saleError, statusError } = {}) {
+function makeFakeSdk({
+  saleResponse,
+  statusResponse,
+  saleError,
+  statusError,
+  transactionResult,
+  transactionResultError,
+} = {}) {
   const calls = {
     concurrency: 0,
     sale: 0,
@@ -43,6 +51,8 @@ function makeFakeSdk({ saleResponse, statusResponse, saleError, statusError } = 
     saleRequest: null,
     statusRequest: null,
     hash: [],
+    validateResponse: 0,
+    fromResponse: 0,
   };
 
   class Settings {
@@ -65,8 +75,15 @@ function makeFakeSdk({ saleResponse, statusResponse, saleError, statusError } = 
   }
   class StatusTransaction {}
   class TransactionResult {
-    static validateResponse(response) { return response?.transactionResultValid === true; }
-    static fromResponse(response) { return { ...response.data }; }
+    static validateResponse(response) {
+      calls.validateResponse += 1;
+      return response?.transactionResultValid === true;
+    }
+    static fromResponse(response) {
+      calls.fromResponse += 1;
+      if (transactionResultError) throw transactionResultError;
+      return transactionResult === undefined ? { ...response.data } : transactionResult;
+    }
   }
   class Transaction {
     static withConcurrency() { calls.concurrency += 1; }
@@ -238,9 +255,10 @@ test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente",
   });
 });
 
-test("SDK Status usa getStatus solo cuando existe payment_uuid", async () => {
+test("SDK Status valido usa TransactionResult y devuelve PAID", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: false }),
+    statusResponse: sdkResponse(200, { data: { status: "raw-no-confiable" }, valid: true }),
+    transactionResult: { status: "paid" },
   });
   const provider = makeProvider(fake);
   const result = await provider.queryPaymentStatus(PAYMENT_UUID);
@@ -250,13 +268,77 @@ test("SDK Status usa getStatus solo cuando existe payment_uuid", async () => {
   assert.equal(result.status, "PAID");
   assert.equal(result.paymentUuid, PAYMENT_UUID);
   assert.equal(fake.calls.status, 1);
+  assert.equal(fake.calls.validateResponse, 1);
+  assert.equal(fake.calls.fromResponse, 1);
   assert.equal(fake.calls.statusRequest.payment_uuid, PAYMENT_UUID);
   assert.match(fake.calls.settings[0].headers["x-client-signature"], /^[a-f0-9]{128}$/);
+});
+
+test("SDK Status con validateResponse=false devuelve UNKNOWN", async () => {
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(200, { success: true, data: {}, valid: false }),
+  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "UNKNOWN");
+  assert.equal(result.response.data.status, "UNKNOWN");
+  assert.equal(classifyPixelPayStatusResult(result), "respuesta_invalida");
+  assert.equal(fake.calls.status, 1);
+  assert.equal(fake.calls.validateResponse, 1);
+  assert.equal(fake.calls.fromResponse, 0);
+});
+
+test("SDK Status HTTP 200 invalido conserva ok pero nunca confia en success ni payload crudo", async () => {
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(200, { success: true, data: { status: "paid" }, valid: false }),
+  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.success, true);
+  assert.equal(result.status, "UNKNOWN");
+  assert.equal(result.response.data.status, "UNKNOWN");
+  assert.equal(classifyPixelPayStatusResult(result), "respuesta_invalida");
+  assert.equal(fake.calls.status, 1);
+  assert.equal(fake.calls.fromResponse, 0);
+});
+
+test("SDK Status con fromResponse fallido devuelve UNKNOWN sin filtrar payload", async () => {
+  const sensitive = [saleInput.card.number.replace(/\D+/g, ""), saleInput.card.cvv, SECRET, AUTH_HASH].join(" ");
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(200, { success: true, data: { status: "paid", raw: sensitive }, valid: true }),
+    transactionResultError: new Error(sensitive),
+  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
+  const serialized = JSON.stringify(result);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "UNKNOWN");
+  assert.equal(classifyPixelPayStatusResult(result), "respuesta_invalida");
+  assert.equal(fake.calls.status, 1);
+  assert.equal(fake.calls.validateResponse, 1);
+  assert.equal(fake.calls.fromResponse, 1);
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
+  assert.doesNotMatch(serialized, new RegExp(SECRET));
+  assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
+});
+
+test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", async () => {
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
+    transactionResult: { status: "paid" },
+  });
+  const provider = makeProvider(fake);
 
   await assert.rejects(
     provider.queryPaymentStatus(""),
     (error) => error.code === "PIXELPAY_PAYMENT_UUID_MISSING" && error.uncertain === false
   );
+  assert.equal(fake.calls.status, 0);
+
+  const result = await provider.queryPaymentStatus(PAYMENT_UUID);
+  assert.equal(result.status, "PAID");
   assert.equal(fake.calls.status, 1);
 });
 
@@ -364,4 +446,6 @@ test("SDK oficial carga en ESM y construye sus modelos sin ejecutar red", () => 
   assert.equal(request.card_expire, "2807");
   assert.equal(request.billing_country, "HN");
   assert.equal(request.billing_state, "HN-CR");
+  assert.equal(typeof provider.sdk.Entities.TransactionResult.validateResponse, "function");
+  assert.equal(typeof provider.sdk.Entities.TransactionResult.fromResponse, "function");
 });
