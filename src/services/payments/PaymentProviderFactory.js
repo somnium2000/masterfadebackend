@@ -1,6 +1,7 @@
 import { MockPaymentProvider } from "./MockPaymentProvider.js";
 import { TodoPagoPreprodSimulatedProvider } from "./TodoPagoPreprodSimulatedProvider.js";
 import { PixelPayDirectProvider } from "./PixelPayDirectProvider.js";
+import { PixelPaySdkProvider } from "./PixelPaySdkProvider.js";
 // import { BanpaisPaymentProvider } from "./BanpaisPaymentProvider.js"; // Descomentar en Sprint 3
 
 /**
@@ -27,6 +28,7 @@ export class PaymentProviderFactory {
         }
 
         const provider = String(process.env.PAYMENT_PROVIDER || "mock").toLowerCase().trim();
+        const pixelPayImplementation = String(process.env.PIXELPAY_IMPLEMENTATION || "direct").toLowerCase().trim();
         const todoPagoMode = String(process.env.TODOPAGO_MODE || "preprod_simulated").toLowerCase().trim();
         const nodeEnv = String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase();
         if ((nodeEnv === "production" || nodeEnv === "prod") && provider === "mock") {
@@ -50,17 +52,26 @@ export class PaymentProviderFactory {
                 }
                 throw new Error(`TODOPAGO_MODE invalido: ${todoPagoMode}`);
 
-            case "pixelpay":
-                PaymentProviderFactory._instance = new PixelPayDirectProvider({
+            case "pixelpay": {
+                if (!["direct", "sdk"].includes(pixelPayImplementation)) {
+                    throw new Error(`PIXELPAY_IMPLEMENTATION invalido: ${pixelPayImplementation}`);
+                }
+                const pixelPayConfig = {
                     endpoint: process.env.PIXELPAY_ENDPOINT,
                     env: process.env.PIXELPAY_ENV,
                     keyId: process.env.PIXELPAY_KEY_ID,
                     secretKey: process.env.PIXELPAY_SECRET_KEY,
                     authHash: process.env.PIXELPAY_AUTH_HASH,
                     appUrl: process.env.PIXELPAY_APP_URL,
-                    timeoutMs: Number(process.env.PIXELPAY_HTTP_TIMEOUT_MS || 12000),
-                });
+                };
+                PaymentProviderFactory._instance = pixelPayImplementation === "sdk"
+                    ? new PixelPaySdkProvider(pixelPayConfig)
+                    : new PixelPayDirectProvider({
+                        ...pixelPayConfig,
+                        timeoutMs: Number(process.env.PIXELPAY_HTTP_TIMEOUT_MS || 12000),
+                    });
                 break;
+            }
 
             // case "banpais":
             //   PaymentProviderFactory._instance = new BanpaisPaymentProvider({

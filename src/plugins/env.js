@@ -103,11 +103,15 @@ async function envPlugin(app) {
     nodeEnv,
   });
   if (paymentProvider === "pixelpay") {
+    const pixelPayImplementation = String(process.env.PIXELPAY_IMPLEMENTATION || "direct").trim().toLowerCase();
+    if (!["direct", "sdk"].includes(pixelPayImplementation)) {
+      throw new Error("PIXELPAY_IMPLEMENTATION invalido. Usa direct o sdk.");
+    }
     if (nodeEnv === "production" || nodeEnv === "staging") {
-      throw new Error("PixelPay Direct solo esta habilitado para QA.");
+      throw new Error("PixelPay solo esta habilitado para QA.");
     }
     if (String(process.env.PIXELPAY_ENV || "").trim().toLowerCase() !== "sandbox") {
-      throw new Error("PIXELPAY_ENV debe ser sandbox para PixelPay Direct.");
+      throw new Error("PIXELPAY_ENV debe ser sandbox para PixelPay.");
     }
     if (String(process.env.PIXELPAY_ENDPOINT || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
       throw new Error("PIXELPAY_ENDPOINT debe apuntar al sandbox oficial de PixelPay.");
