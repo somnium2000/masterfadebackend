@@ -145,6 +145,16 @@ function safeDiagnosticBoolean(value) {
   return typeof value === "boolean" ? value : null;
 }
 
+const SAFE_PIXELPAY_SDK_MESSAGE_CODES = new Set([
+  "SDK_PUBLIC_KEY_UNAVAILABLE",
+  "SDK_ENCRYPTION_FAILED",
+  "SDK_HTTP_TIMEOUT",
+  "SDK_NETWORK_ERROR",
+  "SDK_REQUEST_CONFIG_ERROR",
+  "SDK_EXCEPTION_OTHER",
+  "SDK_MESSAGE_ABSENT",
+]);
+
 export function buildSafePixelPaySdkDiagnostics(diagnostics) {
   if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return null;
   const sdkResponseClass = safeTelemetryText(diagnostics.sdkResponseClass, 80);
@@ -159,6 +169,9 @@ export function buildSafePixelPaySdkDiagnostics(diagnostics) {
       ? Number(diagnostics.statusCode)
       : null,
     responseSuccess: safeDiagnosticBoolean(diagnostics.responseSuccess),
+    safeMessageCode: SAFE_PIXELPAY_SDK_MESSAGE_CODES.has(diagnostics.safeMessageCode)
+      ? diagnostics.safeMessageCode
+      : null,
     transactionResultValid: safeDiagnosticBoolean(diagnostics.transactionResultValid),
     transactionResultDataPresent: safeDiagnosticBoolean(diagnostics.transactionResultDataPresent),
     transactionResultParsed: safeDiagnosticBoolean(diagnostics.transactionResultParsed),

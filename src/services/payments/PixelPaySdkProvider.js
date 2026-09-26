@@ -10,6 +10,17 @@ import {
 
 const HONDURAS_ISO_3166_2_CODE_SET = new Set(HONDURAS_ISO_3166_2_CODES);
 
+const SDK_FAILURE_MESSAGE_CODES = new Map([
+  ["Could not obtain necessary credentials for transaction.", "SDK_PUBLIC_KEY_UNAVAILABLE"],
+  ["Could not process transaction without merchant public key.", "SDK_PUBLIC_KEY_UNAVAILABLE"],
+  ["Could not process encryption, please try again.", "SDK_ENCRYPTION_FAILED"],
+  ["Encryption process encountered an unexpected error.", "SDK_ENCRYPTION_FAILED"],
+  ["timeout of 60000ms exceeded", "SDK_HTTP_TIMEOUT"],
+  ["Network Error", "SDK_NETWORK_ERROR"],
+  ["Invalid URL", "SDK_REQUEST_CONFIG_ERROR"],
+  ["The merchant credentials are not definied (key/hash).", "SDK_REQUEST_CONFIG_ERROR"],
+]);
+
 function text(value) {
   return String(value ?? "").trim();
 }
@@ -75,6 +86,12 @@ function responseStatus(response) {
 
 function responseSuccess(response) {
   return typeof response?.success === "boolean" ? response.success : null;
+}
+
+export function classifySdkFailureMessage(response) {
+  const message = typeof response?.message === "string" ? response.message : "";
+  if (!message) return "SDK_MESSAGE_ABSENT";
+  return SDK_FAILURE_MESSAGE_CODES.get(message) || "SDK_EXCEPTION_OTHER";
 }
 
 function assertSdkShape(sdk) {
@@ -281,6 +298,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       sdkResponseClass: safeClassName(response),
       statusCode,
       responseSuccess: responseSuccess(response),
+      safeMessageCode: classifySdkFailureMessage(response),
       transactionResultValid: transactionResult.valid,
       transactionResultDataPresent: transactionResult.dataPresent,
       transactionResultParsed: transactionResult.parsed,

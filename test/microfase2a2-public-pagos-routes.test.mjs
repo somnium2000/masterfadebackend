@@ -1313,6 +1313,7 @@ test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve"
           sdkResponseClass: "SuccessResponse",
           statusCode: 200,
           responseSuccess: true,
+          safeMessageCode: "SDK_PUBLIC_KEY_UNAVAILABLE",
           transactionResultValid: false,
           transactionResultDataPresent: true,
           transactionResultParsed: false,
@@ -1375,8 +1376,9 @@ test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve"
   assert.equal(diagnosticLogs[0].id_intent, INTENT_A);
   assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.transactionResultValid, false);
   assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.outcome, "uncertain");
+  assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.safeMessageCode, "SDK_PUBLIC_KEY_UNAVAILABLE");
   assert.equal(Object.hasOwn(payload.data, "diagnostics"), false);
-  assert.doesNotMatch(response.body, /sdkResponseClass|transactionResultValid|sensitive-/i);
+  assert.doesNotMatch(response.body, /sdkResponseClass|transactionResultValid|safeMessageCode|sensitive-/i);
   assert.doesNotMatch(logs.join(""), /sensitive-payment|sensitive-transaction|sensitive-pan/i);
   await app.close();
 });

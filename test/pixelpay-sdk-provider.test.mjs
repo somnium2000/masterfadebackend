@@ -3,7 +3,10 @@ import fs from "node:fs";
 import test from "node:test";
 import { PixelPayDirectProvider, PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
-import { PixelPaySdkProvider } from "../src/services/payments/PixelPaySdkProvider.js";
+import {
+  classifySdkFailureMessage,
+  PixelPaySdkProvider,
+} from "../src/services/payments/PixelPaySdkProvider.js";
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
 
 const KEY_ID = "qa-key-not-real";
@@ -156,6 +159,7 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
     sdkResponseClass: "Object",
     statusCode: 200,
     responseSuccess: true,
+    safeMessageCode: "SDK_MESSAGE_ABSENT",
     transactionResultValid: true,
     transactionResultDataPresent: true,
     transactionResultParsed: true,
@@ -276,6 +280,54 @@ test("diagnostico SDK distingue parse fallido sin exponer la excepcion", async (
   assert.equal(result.diagnostics.transactionResultParsed, false);
   assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(SECRET));
   assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(AUTH_HASH));
+});
+
+test("clasifica FailureResponse 520 sin conservar el mensaje del SDK", async (t) => {
+  for (const scenario of [
+    {
+      name: "public key no disponible",
+      message: "Could not obtain necessary credentials for transaction.",
+      expected: "SDK_PUBLIC_KEY_UNAVAILABLE",
+    },
+    {
+      name: "timeout Axios configurado por el SDK",
+      message: "timeout of 60000ms exceeded",
+      expected: "SDK_HTTP_TIMEOUT",
+    },
+    {
+      name: "network error Axios",
+      message: "Network Error",
+      expected: "SDK_NETWORK_ERROR",
+    },
+    {
+      name: "mensaje desconocido",
+      message: `unknown ${saleInput.card.number} ${saleInput.card.cvv} ${SECRET}`,
+      expected: "SDK_EXCEPTION_OTHER",
+    },
+    {
+      name: "mensaje ausente",
+      message: "",
+      expected: "SDK_MESSAGE_ABSENT",
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const response = {
+        ...sdkResponse(520, { success: false, data: null, valid: false }),
+        message: scenario.message,
+      };
+      assert.equal(classifySdkFailureMessage(response), scenario.expected);
+
+      const result = await makeProvider(makeFakeSdk({ saleResponse: response })).sale(saleInput);
+      const serialized = JSON.stringify(result.diagnostics);
+      assert.equal(result.diagnostics.safeMessageCode, scenario.expected);
+      assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+      assert.equal(result.statusCode, 520);
+      assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
+      assert.doesNotMatch(serialized, new RegExp(saleInput.card.cvv));
+      assert.doesNotMatch(serialized, new RegExp(SECRET));
+      if (scenario.message) assert.equal(serialized.includes(scenario.message), false);
+    });
+  }
 });
 
 test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente", async (t) => {
@@ -491,6 +543,7 @@ test("diagnostics contiene solo metadata y nunca valores sensibles ni payload cr
     "responseCodePresent",
     "responseIncomplete",
     "responseSuccess",
+    "safeMessageCode",
     "sdkResponseClass",
     "statusCode",
     "transactionAmountMatches",
