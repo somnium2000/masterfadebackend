@@ -555,6 +555,11 @@ export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = nu
     const isvPorcentaje = normalizePercentage(row?.isv_porcentaje);
     return {
       id_cita_detalle: row?.id_cita_detalle,
+      id_servicio: row?.id_servicio,
+      id_cita_paquete: row?.id_cita_paquete,
+      nombre_servicio_snapshot: safeText(row?.nombre_servicio_snapshot),
+      nombre_paquete_snapshot: safeText(row?.nombre_paquete_snapshot) || null,
+      cantidad: quantity,
       subtotal_hnl: subtotalHnl,
       descuento_hnl: overrideDiscounts ? overrideDiscounts[index] : normalizeMoney(row?.descuento_hnl),
       incluye_isv_snapshot: incluyeIsvSnapshot,
@@ -579,6 +584,17 @@ export function buildPaymentDetailRows(detailRows = [], { descuentoTotalHnl = nu
     });
   });
   return rows;
+}
+
+export function buildPixelPayOrderItems(detailRows = []) {
+  return (Array.isArray(detailRows) ? detailRows : []).map((detail) => ({
+    code: safeText(detail?.id_cita_paquete || detail?.id_servicio),
+    title: safeText(detail?.nombre_paquete_snapshot)
+      ? `${safeText(detail.nombre_paquete_snapshot)}: ${safeText(detail.nombre_servicio_snapshot)}`
+      : safeText(detail?.nombre_servicio_snapshot),
+    price: normalizeMoney(detail?.total_linea_hnl),
+    qty: 1,
+  }));
 }
 
 function classifyPromotionValidationError(error) {
@@ -972,25 +988,31 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, logge
   let subtotal = 0;
   let descuentoTotal = 0;
   let total = 0;
+  const items = [];
   const appliedGroupPromotionIds = new Set();
 
   for (const cita of citasResult.rows || []) {
     const detallesResult = await client.query(
       `
         SELECT
-          id_cita_detalle,
-          id_servicio,
-          cantidad,
-          precio_unitario_hnl,
-          subtotal_hnl,
-          descuento_hnl,
-          incluye_isv_snapshot,
-          isv_porcentaje,
-          isv_hnl,
-          total_linea_hnl
-        FROM public.citas_detalles
-        WHERE id_cita = $1::uuid
-        ORDER BY id_cita_detalle ASC
+          cd.id_cita_detalle,
+          cd.id_servicio,
+          cd.id_cita_paquete,
+          cd.nombre_servicio_snapshot,
+          cp.nombre_paquete_snapshot,
+          cd.cantidad,
+          cd.precio_unitario_hnl,
+          cd.subtotal_hnl,
+          cd.descuento_hnl,
+          cd.incluye_isv_snapshot,
+          cd.isv_porcentaje,
+          cd.isv_hnl,
+          cd.total_linea_hnl
+        FROM public.citas_detalles cd
+        LEFT JOIN public.citas_paquetes cp
+          ON cp.id_cita_paquete = cd.id_cita_paquete
+        WHERE cd.id_cita = $1::uuid
+        ORDER BY cd.id_cita_detalle ASC
       `,
       [cita.id_cita]
     );
@@ -1082,6 +1104,7 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, logge
       ? applyPersistedPromotionDiscounts(detallesResult.rows, persistedPromotions)
       : detallesResult.rows;
     const normalizedDetails = buildPaymentDetailRows(detailSource);
+    items.push(...buildPixelPayOrderItems(normalizedDetails));
     const totalCita = normalizedDetails.length
       ? normalizeMoney(normalizedDetails.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0))
       : normalizeMoney(Math.max(0, subtotalCita));
@@ -1129,6 +1152,7 @@ async function recalculateGroupPromotionsForPayment(client, { idGrupoCita, logge
     subtotal_hnl: Number(subtotal.toFixed(2)),
     descuento_total_hnl: Number(descuentoTotal.toFixed(2)),
     total_hnl: Number(total.toFixed(2)),
+    items,
     promociones_aplicadas: promocionesAplicadas,
     promociones_descartadas: promocionesDescartadas,
   };
@@ -2109,6 +2133,22 @@ export default async function publicPagosRoutes(app) {
         logger: request.log,
       });
       const totalHnl = normalizeMoney(pricing.total_hnl);
+      const itemTotalHnl = normalizeMoney(
+        pricing.items.reduce((sum, item) => sum + (Number(item.price) * Number(item.qty)), 0)
+      );
+      const itemsValid = pricing.items.length > 0 && pricing.items.every((item) => (
+        safeText(item.code)
+        && safeText(item.title)
+        && Number.isFinite(Number(item.price))
+        && Number(item.price) >= 0
+        && Number.isInteger(Number(item.qty))
+        && Number(item.qty) > 0
+      ));
+      if (!itemsValid || !amountsMatch(itemTotalHnl, totalHnl)) {
+        throw new AppError(409, "Los items de la reserva no coinciden con el monto canonico", {
+          code: "PIXELPAY_ORDER_ITEMS_MISMATCH",
+        });
+      }
       const loaded = await loadPublicIntentForGroup(dbClient, {
         groupId: idGrupoCita,
         idIntent,
@@ -2162,6 +2202,7 @@ export default async function publicPagosRoutes(app) {
         idProvider: intent.id_provider,
         orderId,
         amount: totalHnl,
+        items: pricing.items,
         currency: "HNL",
         customerName: resolveCustomerName(groupRows),
       };
@@ -2176,6 +2217,7 @@ export default async function publicPagosRoutes(app) {
           orderId: claim.orderId,
           currency: claim.currency,
           amount: claim.amount,
+          items: claim.items,
           customer: { name: claim.customerName, email: claim.titularEmail },
           billing: {
             address: request.body.billing_address,

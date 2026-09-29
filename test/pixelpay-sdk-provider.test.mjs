@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import Fastify from "fastify";
 import { PixelPayDirectProvider, PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import {
@@ -8,6 +9,7 @@ import {
   PixelPaySdkProvider,
 } from "../src/services/payments/PixelPaySdkProvider.js";
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
+import envPlugin from "../src/plugins/env.js";
 
 const KEY_ID = "qa-key-not-real";
 const SECRET = "qa-secret-not-real";
@@ -19,6 +21,7 @@ const saleInput = {
   orderId: ORDER_ID,
   currency: "HNL",
   amount: 1,
+  items: [{ code: "service-qa", title: "Servicio QA", price: 1, qty: 1 }],
   customer: { name: "Cliente QA", email: "qa@example.com" },
   billing: { address: "QA 1", country: "HN", state: "HN-CR", city: "SPS", phone: "99999999" },
   card: { number: "4111 1111 1111 1111", holder: "CLIENTE QA", expire: "2807", cvv: "999" },
@@ -51,6 +54,13 @@ function makeFakeSdk({
     sale: 0,
     status: 0,
     settings: [],
+    setupSandbox: 0,
+    setupEndpoint: 0,
+    setupCredentials: 0,
+    setupEnvironment: 0,
+    setupHeaders: [],
+    items: [],
+    addItem: 0,
     saleRequest: null,
     statusRequest: null,
     hash: [],
@@ -59,12 +69,36 @@ function makeFakeSdk({
   };
 
   class Settings {
-    setupEndpoint(value) { this.endpoint = value; }
-    setupCredentials(key, hash) { this.auth_key = key; this.auth_hash = hash; }
-    setupEnvironment(value) { this.environment = value; }
-    setupHeaders(value) { this.headers = value; }
+    setupSandbox() {
+      calls.setupSandbox += 1;
+      this.endpoint = "https://pixelpay.dev";
+      this.auth_key = "1234567890";
+      this.auth_hash = "official-sandbox-auth-hash";
+      this.environment = "sandbox";
+    }
+    setupEndpoint(value) { calls.setupEndpoint += 1; this.endpoint = value; }
+    setupCredentials(key, hash) { calls.setupCredentials += 1; this.auth_key = key; this.auth_hash = hash; }
+    setupEnvironment(value) { calls.setupEnvironment += 1; this.environment = value; }
+    setupHeaders(value) { calls.setupHeaders.push(value); this.headers = value; }
   }
-  class Order {}
+  class Item {
+    constructor() {
+      calls.items.push(this);
+    }
+    totalize() {
+      this.total = this.price * this.qty;
+      return this;
+    }
+  }
+  class Order {
+    constructor() { this.content = []; }
+    addItem(item) {
+      calls.addItem += 1;
+      this.content.push(item);
+      this.amount = this.content.reduce((sum, entry) => sum + (entry.price * entry.qty), 0);
+      return this;
+    }
+  }
   class Card {
     getExpireFormat() {
       return `${String(this.expire_year).slice(-2)}${String(this.expire_month).padStart(2, "0")}`;
@@ -112,11 +146,10 @@ function makeFakeSdk({
   return {
     calls,
     sdk: {
-      Models: { Settings, Order, Card, Billing },
+      Models: { Settings, Order, Item, Card, Billing },
       Requests: { SaleTransaction, StatusTransaction },
       Services: { Transaction },
       Entities: { TransactionResult },
-      Resources: { Environment: { SANDBOX: "sandbox" } },
     },
   };
 }
@@ -137,7 +170,6 @@ function makeProvider(fake) {
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
-    authHash: AUTH_HASH,
     appUrl: "https://pixelpay.dev",
     sdk: fake.sdk,
   });
@@ -181,13 +213,65 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   assert.equal(fake.calls.concurrency, 1);
   assert.equal(fake.calls.saleRequest.order.id, ORDER_ID);
   assert.equal(fake.calls.saleRequest.order.amount, 1);
+  assert.equal(fake.calls.saleRequest.order.constructor.name, "Order");
+  assert.equal(fake.calls.saleRequest.order.content.length, 1);
+  assert.equal(fake.calls.saleRequest.order.content[0].constructor.name, "Item");
+  assert.deepEqual({
+    code: fake.calls.saleRequest.order.content[0].code,
+    title: fake.calls.saleRequest.order.content[0].title,
+    price: fake.calls.saleRequest.order.content[0].price,
+    qty: fake.calls.saleRequest.order.content[0].qty,
+  }, saleInput.items[0]);
+  assert.equal(fake.calls.addItem, 1);
+  assert.equal(fake.calls.saleRequest.constructor.name, "SaleTransaction");
+  assert.equal(fake.calls.saleRequest.card.constructor.name, "Card");
+  assert.deepEqual({
+    number: fake.calls.saleRequest.card.number,
+    cardholder: fake.calls.saleRequest.card.cardholder,
+    expire_month: fake.calls.saleRequest.card.expire_month,
+    expire_year: fake.calls.saleRequest.card.expire_year,
+    cvv2: fake.calls.saleRequest.card.cvv2,
+  }, {
+    number: "4111111111111111",
+    cardholder: "CLIENTE QA",
+    expire_month: 7,
+    expire_year: 2028,
+    cvv2: "999",
+  });
   assert.equal(fake.calls.saleRequest.card.getExpireFormat(), "2807");
-  assert.equal(fake.calls.saleRequest.billing.state, "HN-CR");
+  assert.equal(fake.calls.saleRequest.billing.constructor.name, "Billing");
+  assert.deepEqual({
+    address: fake.calls.saleRequest.billing.address,
+    country: fake.calls.saleRequest.billing.country,
+    state: fake.calls.saleRequest.billing.state,
+    city: fake.calls.saleRequest.billing.city,
+    phone: fake.calls.saleRequest.billing.phone,
+  }, saleInput.billing);
   assert.equal(fake.calls.settings[0].endpoint, "https://pixelpay.dev");
   assert.equal(fake.calls.settings[0].environment, "sandbox");
-  assert.equal(fake.calls.settings[0].auth_key, KEY_ID);
-  assert.equal(fake.calls.settings[0].auth_hash, AUTH_HASH);
+  assert.equal(fake.calls.settings[0].auth_key, "1234567890");
+  assert.equal(fake.calls.settings[0].auth_hash, "official-sandbox-auth-hash");
   assert.match(fake.calls.settings[0].headers["x-client-signature"], /^[a-f0-9]{128}$/);
+  assert.equal(fake.calls.setupSandbox, 1);
+  assert.equal(fake.calls.setupEndpoint, 0);
+  assert.equal(fake.calls.setupCredentials, 0);
+  assert.equal(fake.calls.setupEnvironment, 0);
+  assert.equal(fake.calls.setupHeaders.length, 1);
+});
+
+test("SDK rechaza items ausentes o monto distinto antes de doSale", async () => {
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const provider = makeProvider(fake);
+
+  await assert.rejects(
+    provider.sale({ ...saleInput, items: [] }),
+    (error) => error.code === "PIXELPAY_ORDER_ITEMS_INVALID"
+  );
+  await assert.rejects(
+    provider.sale({ ...saleInput, amount: 2 }),
+    (error) => error.code === "PIXELPAY_ORDER_AMOUNT_MISMATCH"
+  );
+  assert.equal(fake.calls.sale, 0);
 });
 
 test("SDK declined HTTP 402 es definitivo", async () => {
@@ -591,14 +675,59 @@ test("PaymentProviderFactory conserva direct por default y permite sdk explicito
     assert.ok(PaymentProviderFactory.create() instanceof PixelPayDirectProvider);
 
     process.env.PIXELPAY_IMPLEMENTATION = "sdk";
+    delete process.env.PIXELPAY_AUTH_HASH;
     PaymentProviderFactory.reset();
-    assert.ok(PaymentProviderFactory.create() instanceof PixelPaySdkProvider);
+    const sdkProvider = PaymentProviderFactory.create();
+    assert.ok(sdkProvider instanceof PixelPaySdkProvider);
+    assert.equal(Object.hasOwn(sdkProvider, "authHash"), false);
 
     process.env.PIXELPAY_IMPLEMENTATION = "invalid";
     PaymentProviderFactory.reset();
     assert.throws(() => PaymentProviderFactory.create(), /PIXELPAY_IMPLEMENTATION invalido/);
   } finally {
     PaymentProviderFactory.reset();
+    for (const name of names) {
+      if (previous[name] == null) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
+
+test("configuracion QA SDK no requiere PIXELPAY_AUTH_HASH y Direct lo conserva obligatorio", async () => {
+  const names = [
+    "NODE_ENV", "FRONTEND_URL", "JWT_SECRET", "COOKIE_SECRET", "CSRF_SECRET",
+    "PAYMENT_PROVIDER", "PIXELPAY_IMPLEMENTATION", "PIXELPAY_ENV", "PIXELPAY_ENDPOINT",
+    "PIXELPAY_APP_URL", "PIXELPAY_KEY_ID", "PIXELPAY_SECRET_KEY", "PIXELPAY_AUTH_HASH",
+  ];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, {
+    NODE_ENV: "test",
+    FRONTEND_URL: "http://localhost:5173",
+    JWT_SECRET: "test-jwt-secret-at-least-24",
+    COOKIE_SECRET: "test-cookie-secret-at-least-24",
+    CSRF_SECRET: "test-csrf-secret-at-least-24",
+    PAYMENT_PROVIDER: "pixelpay",
+    PIXELPAY_IMPLEMENTATION: "sdk",
+    PIXELPAY_ENV: "sandbox",
+    PIXELPAY_ENDPOINT: "https://pixelpay.dev",
+    PIXELPAY_APP_URL: "https://pixelpay.dev",
+    PIXELPAY_KEY_ID: KEY_ID,
+    PIXELPAY_SECRET_KEY: SECRET,
+    PIXELPAY_AUTH_HASH: "",
+  });
+
+  try {
+    const sdkApp = Fastify();
+    sdkApp.register(envPlugin);
+    await sdkApp.ready();
+    await sdkApp.close();
+
+    process.env.PIXELPAY_IMPLEMENTATION = "direct";
+    const directApp = Fastify();
+    directApp.register(envPlugin);
+    await assert.rejects(directApp.ready(), /PIXELPAY_AUTH_HASH/);
+    await directApp.close();
+  } finally {
     for (const name of names) {
       if (previous[name] == null) delete process.env[name];
       else process.env[name] = previous[name];

@@ -98,6 +98,7 @@ function assertSdkShape(sdk) {
   const requiredConstructors = [
     sdk?.Models?.Settings,
     sdk?.Models?.Order,
+    sdk?.Models?.Item,
     sdk?.Models?.Card,
     sdk?.Models?.Billing,
     sdk?.Requests?.SaleTransaction,
@@ -108,11 +109,15 @@ function assertSdkShape(sdk) {
   if (requiredConstructors.some((value) => typeof value !== "function")) {
     throw new Error("@pixelpay/sdk-core no expone el contrato requerido.");
   }
-  if (
-    typeof sdk?.Services?.Transaction?.withConcurrency !== "function"
-    || !sdk?.Resources?.Environment?.SANDBOX
-  ) {
+  if (typeof sdk?.Services?.Transaction?.withConcurrency !== "function") {
     throw new Error("@pixelpay/sdk-core no expone la configuracion Sandbox requerida.");
+  }
+  const settingsPrototype = sdk.Models.Settings.prototype;
+  if (
+    typeof settingsPrototype?.setupSandbox !== "function"
+    || typeof settingsPrototype?.setupHeaders !== "function"
+  ) {
+    throw new Error("@pixelpay/sdk-core no expone Settings Sandbox requerido.");
   }
 }
 
@@ -143,7 +148,6 @@ export class PixelPaySdkProvider extends PaymentProvider {
     env,
     keyId,
     secretKey,
-    authHash,
     appUrl,
     sdk = PixelPaySdk,
   } = {}) {
@@ -152,7 +156,6 @@ export class PixelPaySdkProvider extends PaymentProvider {
     this.env = text(env).toLowerCase();
     this.keyId = text(keyId);
     this.secretKey = text(secretKey);
-    this.authHash = text(authHash);
     this.appUrl = text(appUrl).replace(/\/+$/, "");
     this.sdk = sdk;
 
@@ -163,7 +166,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     ) {
       throw new Error("PixelPay SDK solo esta habilitado para sandbox QA.");
     }
-    if (!this.keyId || !this.secretKey || !this.authHash || !this.appUrl) {
+    if (!this.keyId || !this.secretKey || !this.appUrl) {
       throw new Error("Configuracion PixelPay SDK incompleta.");
     }
     assertSdkShape(this.sdk);
@@ -175,22 +178,50 @@ export class PixelPaySdkProvider extends PaymentProvider {
 
   createTransaction(signature) {
     const settings = new this.sdk.Models.Settings();
-    settings.setupEndpoint(this.endpoint);
-    settings.setupCredentials(this.keyId, this.authHash);
-    settings.setupEnvironment(this.sdk.Resources.Environment.SANDBOX);
+    settings.setupSandbox();
     settings.setupHeaders({ "x-client-signature": signature });
     return new this.sdk.Services.Transaction(settings);
   }
 
-  buildSaleRequest({ orderId, currency, amount, customer, billing, card } = {}) {
+  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card } = {}) {
     const normalizedExpire = normalizeCardExpire(card?.expire);
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new PixelPaySdkError(
+        "PIXELPAY_ORDER_ITEMS_INVALID",
+        "La orden PixelPay no contiene items canonicos."
+      );
+    }
 
     const order = new this.sdk.Models.Order();
     order.id = text(orderId);
     order.currency = text(currency).toUpperCase();
-    order.amount = Number(amount);
     order.customer_name = text(customer?.name);
     order.customer_email = text(customer?.email);
+
+    for (const source of items) {
+      const code = text(source?.code);
+      const title = text(source?.title);
+      const price = Number(source?.price);
+      const qty = Number(source?.qty);
+      if (!code || !title || !Number.isFinite(price) || price < 0 || !Number.isInteger(qty) || qty < 1) {
+        throw new PixelPaySdkError(
+          "PIXELPAY_ORDER_ITEMS_INVALID",
+          "La orden PixelPay contiene un item canonico invalido."
+        );
+      }
+      const item = new this.sdk.Models.Item();
+      item.code = code;
+      item.title = title;
+      item.price = price;
+      item.qty = qty;
+      order.addItem(item);
+    }
+    if (money(order.amount) !== money(amount)) {
+      throw new PixelPaySdkError(
+        "PIXELPAY_ORDER_AMOUNT_MISMATCH",
+        "La suma de items PixelPay no coincide con el monto canonico."
+      );
+    }
 
     const paymentCard = new this.sdk.Models.Card();
     paymentCard.number = text(card?.number).replace(/\D+/g, "");

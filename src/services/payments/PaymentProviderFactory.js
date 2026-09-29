@@ -61,13 +61,13 @@ export class PaymentProviderFactory {
                     env: process.env.PIXELPAY_ENV,
                     keyId: process.env.PIXELPAY_KEY_ID,
                     secretKey: process.env.PIXELPAY_SECRET_KEY,
-                    authHash: process.env.PIXELPAY_AUTH_HASH,
                     appUrl: process.env.PIXELPAY_APP_URL,
                 };
                 PaymentProviderFactory._instance = pixelPayImplementation === "sdk"
                     ? new PixelPaySdkProvider(pixelPayConfig)
                     : new PixelPayDirectProvider({
                         ...pixelPayConfig,
+                        authHash: process.env.PIXELPAY_AUTH_HASH,
                         timeoutMs: Number(process.env.PIXELPAY_HTTP_TIMEOUT_MS || 12000),
                     });
                 break;

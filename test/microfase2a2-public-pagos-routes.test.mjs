@@ -258,11 +258,14 @@ function createPagosClient({
           }],
         };
       }
-      if (text.includes("FROM public.citas_detalles") && text.includes("WHERE id_cita = $1::uuid")) {
+      if (text.includes("FROM public.citas_detalles") && text.includes("id_cita = $1::uuid")) {
         return {
           rows: [{
             id_cita_detalle: DETAIL_A,
             id_servicio: SERVICE_A,
+            id_cita_paquete: null,
+            nombre_servicio_snapshot: "Corte QA",
+            nombre_paquete_snapshot: null,
             cantidad: 1,
             precio_unitario_hnl: "100.00",
             subtotal_hnl: "100.00",
@@ -1301,8 +1304,10 @@ test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve"
   const logs = [];
   const provider = {
     saleCalls: 0,
-    async sale() {
+    saleInput: null,
+    async sale(input) {
       this.saleCalls += 1;
+      this.saleInput = structuredClone(input);
       return {
         outcome: "uncertain",
         paymentUuid: null,
@@ -1372,6 +1377,13 @@ test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve"
     .filter((entry) => entry.msg === "Resultado PixelPay SDK no aprobado");
   assert.equal(response.statusCode, 202, response.body);
   assert.equal(provider.saleCalls, 1);
+  assert.equal(provider.saleInput.amount, 115);
+  assert.deepEqual(provider.saleInput.items, [{
+    code: SERVICE_A,
+    title: "Corte QA",
+    price: 115,
+    qty: 1,
+  }]);
   assert.equal(diagnosticLogs.length, 1);
   assert.equal(diagnosticLogs[0].id_intent, INTENT_A);
   assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.transactionResultValid, false);
