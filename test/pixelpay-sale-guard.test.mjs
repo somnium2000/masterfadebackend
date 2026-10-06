@@ -12,6 +12,7 @@ test("doble submit no puede iniciar otro sale cuando el intent ya fue reclamado"
   assert.equal(canStartPixelPaySale("pendiente_confirmacion"), false);
   assert.equal(canStartPixelPaySale("confirmado"), false);
   assert.equal(canStartPixelPaySale("fallido"), false);
+  assert.equal(canStartPixelPaySale("expirado"), false);
 });
 
 test("sale aplica rate limit por IP con ventana acotada", () => {

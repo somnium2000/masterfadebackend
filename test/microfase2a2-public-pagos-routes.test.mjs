@@ -109,12 +109,17 @@ test("diagnostico de proveedor solo expone metadata permitida", () => {
   const diagnostic = buildSafeProviderErrorDiagnostic(error, "req-qa");
   assert.deepEqual(diagnostic, {
     requestId: "req-qa",
+    paymentAttemptId: null,
     errorCode: "PIXELPAY_RESPONSE_INVALID",
     errorName: "Error",
     sdkErrorName: null,
     upstreamStatusCode: 200,
     upstreamContentType: "text/html; charset=utf-8 x-secret: hidden",
     upstreamContentLength: 321,
+    cfRay: null,
+    responseClass: null,
+    safeMessageCode: null,
+    errorConstructorName: null,
     uncertain: true,
   });
   assert.doesNotMatch(JSON.stringify(diagnostic), /4111111111111111|999|x-client-signature|private/i);

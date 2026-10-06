@@ -10,6 +10,7 @@ import {
 } from "../src/services/payments/PixelPaySdkProvider.js";
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
 import envPlugin from "../src/plugins/env.js";
+import { PIXELPAY_SALE_EVENT } from "../src/services/payments/pixelPaySaleTelemetry.js";
 
 const KEY_ID = "qa-key-not-real";
 const SECRET = "qa-secret-not-real";
@@ -175,6 +176,15 @@ function makeProvider(fake) {
   });
 }
 
+function makeTelemetryLogger() {
+  const events = [];
+  return {
+    events,
+    info(payload) { events.push(payload); },
+    warn(payload) { events.push(payload); },
+  };
+}
+
 test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
   const result = await makeProvider(fake).sale(saleInput);
@@ -188,6 +198,7 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   assert.equal(result.amountMatches, true);
   assert.equal(result.statusCode, 200);
   assert.deepEqual(result.diagnostics, {
+    paymentAttemptId: result.paymentAttemptId,
     sdkResponseClass: "Object",
     statusCode: 200,
     responseSuccess: true,
@@ -257,6 +268,74 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   assert.equal(fake.calls.setupCredentials, 0);
   assert.equal(fake.calls.setupEnvironment, 0);
   assert.equal(fake.calls.setupHeaders.length, 1);
+});
+
+test("telemetria correlaciona STARTED, HTTP_STARTED y RESPONSE_RECEIVED en Sale simulada", async () => {
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const result = await makeProvider(fake).sale(saleInput, {
+    requestId: "req-telemetry-ok",
+    idIntent: "intent-telemetry-ok",
+    logger,
+  });
+  assert.deepEqual(logger.events.map((entry) => entry.event), [
+    PIXELPAY_SALE_EVENT.ATTEMPT_STARTED,
+    PIXELPAY_SALE_EVENT.HTTP_STARTED,
+    PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED,
+  ]);
+  assert.ok(result.paymentAttemptId);
+  assert.ok(logger.events.every((entry) => entry.paymentAttemptId === result.paymentAttemptId));
+  assert.ok(logger.events.every((entry) => entry.requestId === "req-telemetry-ok"));
+  assert.ok(logger.events.every((entry) => entry.idIntent === "intent-telemetry-ok"));
+  assert.equal(fake.calls.sale, 1);
+});
+
+test("telemetria registra FAILED y UNCERTAIN cuando doSale lanza antes de responder", async () => {
+  const logger = makeTelemetryLogger();
+  const failure = Object.assign(new Error("sensitive provider detail"), {
+    response: { status: 503, headers: { "content-type": "text/html", "cf-ray": "safe-ray" } },
+  });
+  const fake = makeFakeSdk({ saleError: failure });
+  await assert.rejects(
+    makeProvider(fake).sale(saleInput, { requestId: "req-failed", idIntent: "intent-failed", logger }),
+    (error) => error.code === "PIXELPAY_NETWORK_ERROR"
+      && error.statusCode === 503
+      && error.cfRay === "safe-ray"
+  );
+  assert.deepEqual(logger.events.map((entry) => entry.event), [
+    PIXELPAY_SALE_EVENT.ATTEMPT_STARTED,
+    PIXELPAY_SALE_EVENT.HTTP_STARTED,
+    PIXELPAY_SALE_EVENT.FAILED,
+    PIXELPAY_SALE_EVENT.UNCERTAIN,
+  ]);
+  assert.equal(new Set(logger.events.map((entry) => entry.paymentAttemptId)).size, 1);
+  assert.equal(fake.calls.sale, 1);
+});
+
+test("respuesta incierta registra RESPONSE_RECEIVED y UNCERTAIN sin segunda Sale", async () => {
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(520, { success: false, data: null, valid: false }) });
+  const result = await makeProvider(fake).sale(saleInput, { logger });
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+  assert.deepEqual(logger.events.map((entry) => entry.event), [
+    PIXELPAY_SALE_EVENT.ATTEMPT_STARTED,
+    PIXELPAY_SALE_EVENT.HTTP_STARTED,
+    PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED,
+    PIXELPAY_SALE_EVENT.UNCERTAIN,
+  ]);
+  assert.equal(fake.calls.sale, 1);
+});
+
+test("telemetria PixelPay nunca registra datos sensibles ni objetos completos", async () => {
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  await makeProvider(fake).sale(saleInput, { logger });
+  const serialized = JSON.stringify(logger.events);
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.cvv));
+  assert.doesNotMatch(serialized, new RegExp(SECRET));
+  assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
+  assert.doesNotMatch(serialized, /cardholder|billing|auth_key|auth_hash|secretKey|publicKey|valid-hash|x-client-signature|payment_hash|Authorization/i);
 });
 
 test("SDK rechaza items ausentes o monto distinto antes de doSale", async () => {
@@ -622,6 +701,7 @@ test("diagnostics contiene solo metadata y nunca valores sensibles ni payload cr
     "hasPaymentUuid",
     "hasTransactionId",
     "outcome",
+    "paymentAttemptId",
     "paymentHashValid",
     "responseApproved",
     "responseCodePresent",

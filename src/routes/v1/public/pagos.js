@@ -125,6 +125,7 @@ function safeDiagnosticContentType(value) {
 export function buildSafeProviderErrorDiagnostic(error, requestId) {
   return {
     requestId,
+    paymentAttemptId: safeTelemetryText(error?.paymentAttemptId, 80),
     errorCode: safeText(error?.code),
     errorName: safeText(error?.name),
     sdkErrorName: /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(safeText(error?.sdkErrorName) || "")
@@ -133,6 +134,10 @@ export function buildSafeProviderErrorDiagnostic(error, requestId) {
     upstreamStatusCode: Number.isInteger(Number(error?.statusCode)) ? Number(error.statusCode) : null,
     upstreamContentType: safeDiagnosticContentType(error?.upstreamContentType),
     upstreamContentLength: safeDiagnosticLength(error?.upstreamContentLength),
+    cfRay: safeTelemetryText(error?.cfRay, 120),
+    responseClass: safeTelemetryText(error?.responseClass, 80),
+    safeMessageCode: safeTelemetryText(error?.safeMessageCode, 120),
+    errorConstructorName: safeTelemetryText(error?.errorConstructorName, 80),
     uncertain: error?.uncertain === true,
   };
 }
@@ -162,6 +167,7 @@ export function buildSafePixelPaySdkDiagnostics(diagnostics) {
     ? diagnostics.outcome
     : null;
   return {
+    paymentAttemptId: safeTelemetryText(diagnostics.paymentAttemptId, 80),
     sdkResponseClass: sdkResponseClass && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sdkResponseClass)
       ? sdkResponseClass
       : null,
@@ -2232,6 +2238,10 @@ export default async function publicPagosRoutes(app) {
             expire: request.body.card_expire,
             cvv: request.body.card_cvv,
           },
+        }, {
+          requestId: request.id,
+          idIntent,
+          logger: request.log,
         });
       } catch (providerError) {
         request.log.warn(

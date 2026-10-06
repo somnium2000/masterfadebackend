@@ -1,6 +1,12 @@
 import PixelPaySdk from "@pixelpay/sdk-core";
 import { PaymentProvider } from "./PaymentProvider.js";
 import {
+  createPixelPaySaleAttempt,
+  emitPixelPaySaleEvent,
+  PIXELPAY_SALE_EVENT,
+  readPixelPayHttpMetadata,
+} from "./pixelPaySaleTelemetry.js";
+import {
   createPixelPaySaleSignature,
   createPixelPayStatusSignature,
   classifyPixelPaySaleResult,
@@ -35,7 +41,11 @@ function objectOrNull(value) {
 }
 
 function safeClassName(value) {
-  const name = text(value?.constructor?.name);
+  return safeIdentifier(value?.constructor?.name);
+}
+
+function safeIdentifier(value) {
+  const name = text(value);
   return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name.slice(0, 80) : null;
 }
 
@@ -127,6 +137,13 @@ export class PixelPaySdkError extends Error {
     paymentUuid = null,
     statusCode = null,
     sdkErrorName = null,
+    errorName = null,
+    errorConstructorName = null,
+    responseClass = null,
+    safeMessageCode = null,
+    upstreamContentType = null,
+    cfRay = null,
+    paymentAttemptId = null,
   } = {}) {
     super(message);
     this.name = "PixelPaySdkError";
@@ -139,6 +156,13 @@ export class PixelPaySdkError extends Error {
     this.sdkErrorName = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text(sdkErrorName))
       ? text(sdkErrorName).slice(0, 80)
       : null;
+    this.errorName = safeIdentifier(errorName);
+    this.errorConstructorName = safeIdentifier(errorConstructorName);
+    this.responseClass = safeIdentifier(responseClass);
+    this.safeMessageCode = text(safeMessageCode).slice(0, 120) || null;
+    this.upstreamContentType = text(upstreamContentType).replace(/[\r\n]+/g, " ").slice(0, 160) || null;
+    this.cfRay = text(cfRay).replace(/[\r\n]+/g, " ").slice(0, 120) || null;
+    this.paymentAttemptId = text(paymentAttemptId).slice(0, 80) || null;
   }
 }
 
@@ -259,25 +283,68 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
   }
 
-  async sale(input = {}) {
-    const signature = createPixelPaySaleSignature({
-      secretKey: this.secretKey,
-      appKey: this.keyId,
-      orderId: input.orderId,
-      appUrl: this.appUrl,
-    });
-    const transaction = this.createTransaction(signature);
-    const saleRequest = this.buildSaleRequest(input);
+  async sale(input = {}, telemetryContext = {}) {
+    const attempt = createPixelPaySaleAttempt({ ...input, ...telemetryContext });
+    const logger = telemetryContext.logger;
+    const startedAt = Date.now();
+    emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.ATTEMPT_STARTED, attempt);
 
     let response;
+    let transaction;
     try {
+      const signature = createPixelPaySaleSignature({
+        secretKey: this.secretKey,
+        appKey: this.keyId,
+        orderId: input.orderId,
+        appUrl: this.appUrl,
+      });
+      transaction = this.createTransaction(signature);
+      const saleRequest = this.buildSaleRequest(input);
+      emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
+        durationMs: Date.now() - startedAt,
+      });
       response = await transaction.doSale(saleRequest);
     } catch (error) {
-      throw new PixelPaySdkError(
-        "PIXELPAY_NETWORK_ERROR",
-        "No fue posible confirmar la respuesta de PixelPay.",
-        { uncertain: true, sdkErrorName: safeClassName(error) }
-      );
+      const metadata = readPixelPayHttpMetadata(error);
+      const errorConstructorName = safeClassName(error);
+      const errorName = safeIdentifier(error?.name);
+      const safeMessageCode = error instanceof PixelPaySdkError
+        ? error.code
+        : "SDK_NETWORK_ERROR";
+      const details = {
+        durationMs: Date.now() - startedAt,
+        statusCode: error?.statusCode ?? metadata.statusCode,
+        responseClass: error?.responseClass,
+        errorName,
+        errorConstructorName,
+        sdkErrorName: error?.sdkErrorName ?? errorConstructorName,
+        safeMessageCode,
+        outcome: error?.uncertain === false
+          ? PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE
+          : PIXELPAY_SALE_OUTCOME.UNCERTAIN,
+        contentType: error?.upstreamContentType ?? metadata.contentType,
+        cfRay: error?.cfRay ?? metadata.cfRay,
+      };
+      emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.FAILED, attempt, details);
+      if (details.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) {
+        emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.UNCERTAIN, attempt, details);
+      }
+      if (error instanceof PixelPaySdkError) {
+        error.paymentAttemptId ||= attempt.paymentAttemptId;
+        throw error;
+      }
+      throw new PixelPaySdkError("PIXELPAY_NETWORK_ERROR", "No fue posible confirmar la respuesta de PixelPay.", {
+        uncertain: true,
+        statusCode: metadata.statusCode,
+        sdkErrorName: errorConstructorName,
+        errorName,
+        errorConstructorName,
+        responseClass: safeClassName(error?.response),
+        safeMessageCode,
+        upstreamContentType: metadata.contentType,
+        cfRay: metadata.cfRay,
+        paymentAttemptId: attempt.paymentAttemptId,
+      });
     }
 
     const statusCode = responseStatus(response);
@@ -326,6 +393,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionId,
     });
     const diagnostics = {
+      paymentAttemptId: attempt.paymentAttemptId,
       sdkResponseClass: safeClassName(response),
       statusCode,
       responseSuccess: responseSuccess(response),
@@ -348,6 +416,25 @@ export class PixelPaySdkProvider extends PaymentProvider {
       outcome,
     };
 
+    const responseMetadata = readPixelPayHttpMetadata(response);
+    const telemetryDetails = {
+      durationMs: Date.now() - startedAt,
+      responseClass: diagnostics.sdkResponseClass,
+      statusCode,
+      safeMessageCode: diagnostics.safeMessageCode,
+      outcome,
+      contentType: responseMetadata.contentType,
+      cfRay: responseMetadata.cfRay,
+      paymentUuidPresent: diagnostics.hasPaymentUuid,
+      transactionIdPresent: diagnostics.hasTransactionId,
+      transactionResultValid: diagnostics.transactionResultValid,
+      transactionResultParsed: diagnostics.transactionResultParsed,
+    };
+    emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED, attempt, telemetryDetails);
+    if (outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) {
+      emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.UNCERTAIN, attempt, telemetryDetails);
+    }
+
     return {
       outcome,
       approved: outcome === PIXELPAY_SALE_OUTCOME.APPROVED,
@@ -363,6 +450,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       statusCode,
       response: normalizedResponse,
       diagnostics,
+      paymentAttemptId: attempt.paymentAttemptId,
     };
   }
 
