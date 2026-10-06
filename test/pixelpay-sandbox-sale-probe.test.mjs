@@ -18,7 +18,37 @@ function probeEnv(overrides = {}) {
   };
 }
 
-function fakeProbeSdk() {
+function approvedResult(overrides = {}) {
+  return {
+    response_approved: true,
+    response_incomplete: false,
+    payment_uuid: "payment-uuid-not-real",
+    transaction_id: "transaction-id-not-real",
+    payment_hash: "payment-hash-not-real",
+    transaction_amount: 1,
+    transaction_approved_amount: 1,
+    ...overrides,
+  };
+}
+
+function sdkResponse({ status = 200, success = true, useGetStatus = false } = {}) {
+  if (!useGetStatus) return { status, success, data: {} };
+  return new (class SuccessResponse {
+    constructor() {
+      this.success = success;
+      this.data = {};
+    }
+    getStatus() { return status; }
+  })();
+}
+
+function fakeProbeSdk({
+  response = sdkResponse({ status: 520, success: false }),
+  result = null,
+  responseValid = false,
+  paymentHashValid = false,
+  saleError = null,
+} = {}) {
   const calls = {
     settings: 0,
     order: 0,
@@ -30,6 +60,7 @@ function fakeProbeSdk() {
     setBilling: 0,
     transaction: 0,
     sale: 0,
+    verifyPaymentHash: 0,
     setupSandbox: 0,
   };
   class Settings {
@@ -48,11 +79,19 @@ function fakeProbeSdk() {
   }
   class Transaction {
     constructor() { calls.transaction += 1; }
-    async doSale() { calls.sale += 1; return { status: 520, success: false }; }
+    async doSale() {
+      calls.sale += 1;
+      if (saleError) throw saleError;
+      return response;
+    }
+    verifyPaymentHash() {
+      calls.verifyPaymentHash += 1;
+      return paymentHashValid;
+    }
   }
   class TransactionResult {
-    static validateResponse() { return false; }
-    static fromResponse() { return null; }
+    static validateResponse() { return responseValid; }
+    static fromResponse() { return result; }
   }
   return {
     calls,
@@ -63,6 +102,16 @@ function fakeProbeSdk() {
       Entities: { TransactionResult },
     },
   };
+}
+
+async function runSimulatedSale(fake) {
+  const output = outputCollector();
+  const result = await runPixelPaySandboxSaleProbe({
+    env: probeEnv({ PIXELPAY_PROBE_DRY_RUN: "false" }),
+    sdk: fake.sdk,
+    write: output.write,
+  });
+  return { result, output, afterSale: output.lines.find((entry) => entry.event === "AFTER_SALE") };
 }
 
 function outputCollector() {
@@ -172,6 +221,103 @@ test("probe invoca doSale como maximo una vez con servicio simulado", async () =
   assert.equal(fake.calls.sale, 1);
   assert.deepEqual(output.lines.map((entry) => entry.event), ["PROBE_START", "BEFORE_SALE", "AFTER_SALE"]);
 });
+
+test("AFTER_SALE usa response.status y conserva telemetria estrictamente permitida", async () => {
+  const fake = fakeProbeSdk({
+    response: sdkResponse({ status: 201 }),
+    result: approvedResult(),
+    responseValid: true,
+    paymentHashValid: true,
+  });
+  const { result, afterSale } = await runSimulatedSale(fake);
+  assert.equal(result.outcome, "APPROVED");
+  assert.equal(afterSale.statusCode, 201);
+  assert.deepEqual(Object.keys(afterSale).sort(), [
+    "amount", "approvedAmountMatches", "currency", "event", "orderId", "outcome",
+    "paymentHashPresent", "paymentHashValid", "paymentUuidPresent", "probeId",
+    "responseApproved", "responseClass", "responseIncomplete", "statusCode", "success",
+    "timestamp", "transactionAmountMatches", "transactionIdPresent",
+    "transactionResultParsed", "transactionResultValid",
+  ].sort());
+  assert.doesNotMatch(JSON.stringify(afterSale), /payment-hash-not-real|payment_hash/i);
+  assert.equal(fake.calls.sale, 1);
+});
+
+test("SuccessResponse con getStatus reporta 200 y hash valido queda APPROVED", async () => {
+  const fake = fakeProbeSdk({
+    response: sdkResponse({ status: 200, useGetStatus: true }),
+    result: approvedResult(),
+    responseValid: true,
+    paymentHashValid: true,
+  });
+  const { result, afterSale } = await runSimulatedSale(fake);
+  assert.equal(result.outcome, "APPROVED");
+  assert.equal(result.exitCode, 0);
+  assert.equal(afterSale.responseClass, "SuccessResponse");
+  assert.equal(afterSale.statusCode, 200);
+  assert.equal(afterSale.paymentHashPresent, true);
+  assert.equal(afterSale.paymentHashValid, true);
+  assert.equal(fake.calls.verifyPaymentHash, 1);
+  assert.equal(fake.calls.sale, 1);
+});
+
+for (const scenario of [
+  {
+    name: "payment_hash ausente",
+    result: approvedResult({ payment_hash: null }),
+    paymentHashValid: true,
+    expected: { paymentHashPresent: false, paymentHashValid: false },
+  },
+  {
+    name: "payment_hash invalido",
+    result: approvedResult(),
+    paymentHashValid: false,
+    expected: { paymentHashPresent: true, paymentHashValid: false },
+  },
+  {
+    name: "response_incomplete true",
+    result: approvedResult({ response_incomplete: true }),
+    paymentHashValid: true,
+    expected: { responseIncomplete: true },
+  },
+  {
+    name: "status 500 aunque datos parezcan aprobados",
+    response: sdkResponse({ status: 500 }),
+    result: approvedResult(),
+    paymentHashValid: true,
+    expected: { statusCode: 500 },
+  },
+  {
+    name: "transaction_amount diferente",
+    result: approvedResult({ transaction_amount: 1.01 }),
+    paymentHashValid: true,
+    expected: { transactionAmountMatches: false },
+  },
+  {
+    name: "transaction_approved_amount diferente",
+    result: approvedResult({ transaction_approved_amount: 0.99 }),
+    paymentHashValid: true,
+    expected: { approvedAmountMatches: false },
+  },
+]) {
+  test(`${scenario.name} queda UNCERTAIN sin retry`, async () => {
+    const fake = fakeProbeSdk({
+      response: scenario.response || sdkResponse({ status: 200 }),
+      result: scenario.result,
+      responseValid: true,
+      paymentHashValid: scenario.paymentHashValid,
+    });
+    const { result, afterSale } = await runSimulatedSale(fake);
+    assert.equal(result.outcome, "UNCERTAIN");
+    assert.equal(result.exitCode, 3);
+    assert.equal(afterSale.outcome, "UNCERTAIN");
+    assert.deepEqual(
+      Object.fromEntries(Object.keys(scenario.expected).map((key) => [key, afterSale[key]])),
+      scenario.expected
+    );
+    assert.equal(fake.calls.sale, 1);
+  });
+}
 
 test("probe sanitiza name y message cuando falla la unica Sale", async () => {
   const fake = fakeProbeSdk();

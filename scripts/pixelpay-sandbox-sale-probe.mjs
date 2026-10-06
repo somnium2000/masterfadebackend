@@ -23,21 +23,73 @@ function safeErrorMessage(value) {
   return normalized.replace(/\d{3,}/g, "[REDACTED]");
 }
 
+function safeBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function objectOrNull(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function money(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount.toFixed(2) : "";
+}
+
+function responseStatus(response) {
+  const raw = typeof response?.getStatus === "function"
+    ? response.getStatus()
+    : response?.status;
+  const normalized = Number(raw);
+  return Number.isInteger(normalized) ? normalized : null;
+}
+
+function readTransactionResult(sdk, response) {
+  const TransactionResult = sdk.Entities.TransactionResult;
+  const valid = TransactionResult.validateResponse(response) === true;
+  if (!valid) return { result: null, valid, parsed: false };
+  try {
+    const result = objectOrNull(TransactionResult.fromResponse(response));
+    return { result, valid, parsed: Boolean(result) };
+  } catch {
+    return { result: null, valid, parsed: false };
+  }
+}
+
 function writeSafeEvent(write, event, context, details = {}) {
-  write(JSON.stringify({
+  const payload = {
     event,
     timestamp: new Date().toISOString(),
     probeId: context.probeId,
     orderId: context.orderId,
     amount: context.amount,
     currency: context.currency,
-    responseClass: safeIdentifier(details.responseClass),
-    statusCode: Number.isInteger(Number(details.statusCode)) ? Number(details.statusCode) : null,
-    success: typeof details.success === "boolean" ? details.success : null,
-    outcome: text(details.outcome).slice(0, 80) || null,
-    errorName: safeIdentifier(details.errorName),
-    errorMessage: safeErrorMessage(details.errorMessage),
-  }));
+  };
+  if (event === "AFTER_SALE") {
+    Object.assign(payload, {
+      responseClass: safeIdentifier(details.responseClass),
+      statusCode: Number.isInteger(Number(details.statusCode)) ? Number(details.statusCode) : null,
+      success: safeBoolean(details.success),
+      outcome: text(details.outcome).slice(0, 80) || null,
+      transactionResultValid: safeBoolean(details.transactionResultValid),
+      transactionResultParsed: safeBoolean(details.transactionResultParsed),
+      responseApproved: safeBoolean(details.responseApproved),
+      responseIncomplete: safeBoolean(details.responseIncomplete),
+      paymentUuidPresent: safeBoolean(details.paymentUuidPresent),
+      transactionIdPresent: safeBoolean(details.transactionIdPresent),
+      paymentHashPresent: safeBoolean(details.paymentHashPresent),
+      paymentHashValid: safeBoolean(details.paymentHashValid),
+      transactionAmountMatches: safeBoolean(details.transactionAmountMatches),
+      approvedAmountMatches: safeBoolean(details.approvedAmountMatches),
+    });
+  } else {
+    Object.assign(payload, {
+      outcome: text(details.outcome).slice(0, 80) || null,
+      errorName: safeIdentifier(details.errorName),
+      errorMessage: safeErrorMessage(details.errorMessage),
+    });
+  }
+  write(JSON.stringify(payload));
 }
 
 function buildModels(sdk, env, context) {
@@ -126,20 +178,56 @@ export async function runPixelPaySandboxSaleProbe({
     writeSafeEvent(write, "BEFORE_SALE", context);
     saleCount = 1;
     const response = await service.doSale(models.sale);
-    const valid = sdk.Entities.TransactionResult.validateResponse(response) === true;
-    const result = valid ? sdk.Entities.TransactionResult.fromResponse(response) : null;
-    const approved = response?.success === true
+    const statusCode = responseStatus(response);
+    const transactionResult = readTransactionResult(sdk, response);
+    const result = transactionResult.result;
+    const paymentUuidPresent = Boolean(text(result?.payment_uuid));
+    const transactionIdPresent = Boolean(text(result?.transaction_id));
+    const paymentHashPresent = Boolean(text(result?.payment_hash));
+    let paymentHashValid = false;
+    if (paymentHashPresent) {
+      try {
+        paymentHashValid = service.verifyPaymentHash(
+          result.payment_hash,
+          context.orderId,
+          env.PIXELPAY_SECRET_KEY
+        ) === true;
+      } catch {
+        paymentHashValid = false;
+      }
+    }
+    const transactionAmountMatches = money(result?.transaction_amount) === money(context.amount);
+    const approvedAmountMatches = money(result?.transaction_approved_amount) === money(context.amount);
+    const approved = statusCode != null
+      && statusCode >= 200
+      && statusCode < 300
+      && response?.success === true
+      && transactionResult.valid
+      && transactionResult.parsed
       && result?.response_approved === true
-      && Boolean(result?.payment_uuid)
-      && Boolean(result?.transaction_id)
-      && Number(result?.transaction_amount) === context.amount
-      && Number(result?.transaction_approved_amount) === context.amount;
+      && result?.response_incomplete === false
+      && paymentUuidPresent
+      && transactionIdPresent
+      && paymentHashPresent
+      && paymentHashValid
+      && transactionAmountMatches
+      && approvedAmountMatches;
     const outcome = approved ? "APPROVED" : "UNCERTAIN";
     writeSafeEvent(write, "AFTER_SALE", context, {
       responseClass: response?.constructor?.name,
-      statusCode: response?.status,
+      statusCode,
       success: response?.success,
       outcome,
+      transactionResultValid: transactionResult.valid,
+      transactionResultParsed: transactionResult.parsed,
+      responseApproved: typeof result?.response_approved === "boolean" ? result.response_approved : null,
+      responseIncomplete: typeof result?.response_incomplete === "boolean" ? result.response_incomplete : null,
+      paymentUuidPresent,
+      transactionIdPresent,
+      paymentHashPresent,
+      paymentHashValid,
+      transactionAmountMatches,
+      approvedAmountMatches,
     });
     return { exitCode: approved ? 0 : 3, saleCount, outcome, context };
   } catch (error) {
