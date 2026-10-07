@@ -8,6 +8,7 @@ import publicPagosRoutes, {
   classifyPixelPayStatusResult,
   assertPixelPayUuidMatches,
   isPixelPayPaidStatus,
+  reconcilePixelPayPaid,
   resolveStoredPixelPayUuid,
   resolveTrustedPixelPayReferences,
 } from "../src/routes/v1/public/pagos.js";
@@ -199,10 +200,11 @@ function createPagosClient({
   providerCode = "mock",
   groupCitaState = "en_espera",
   groupHoldState = "activo",
+  initialPayments = [],
 } = {}) {
   const calls = [];
   const statusChecks = [];
-  const payments = [];
+  const payments = structuredClone(initialPayments);
   let activeIntent = existingIntent ? { ...existingIntent } : null;
   const groupState = [
     makeGroupRow({
@@ -1495,6 +1497,139 @@ test("APPROVED seguido de falla DB conserva order_id y nunca repite sale", async
   await app.close();
 });
 
+test("Sale APPROVED sin paidAt persiste timestamp backend y conserva referencias canonicas", async () => {
+  const provider = {
+    saleCalls: 0,
+    async sale() {
+      this.saleCalls += 1;
+      return {
+        outcome: "approved",
+        paymentUuid: "P-UUID-PAID-AT",
+        transactionId: "TX-PAID-AT",
+        paymentHashValid: true,
+        amountMatches: true,
+      };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "link_generado",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      orden_compra: "MF-PIXELPAY-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const startedAt = Date.now();
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/sale",
+    payload: pixelPaySalePayload(),
+  });
+
+  const payment = client.getPayments()[0];
+  const intent = client.getActiveIntent();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(client.getPayments().length, 1);
+  assert.ok(Number.isFinite(Date.parse(payment.paid_at)));
+  assert.ok(Date.parse(payment.paid_at) >= startedAt);
+  assert.equal(intent.estado_intent_codigo, "confirmado");
+  assert.equal(intent.provider_session_id, "P-UUID-PAID-AT");
+  assert.equal(payment.provider_tx_id, "TX-PAID-AT");
+  assert.equal(payment.monto_hnl, 115);
+  assert.equal(payment.moneda_codigo, "HNL");
+  await app.close();
+});
+
+test("reconcilePixelPayPaid respeta paidAt explicito", async () => {
+  const explicitPaidAt = "2026-10-06T14:51:50.768Z";
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "P-UUID-EXPLICIT",
+      referencia_externa: "TX-EXPLICIT",
+      created_by_usuario_id: USER_A,
+    },
+  });
+
+  await reconcilePixelPayPaid(client, {
+    idGrupoCita: GROUP_A,
+    idIntent: INTENT_A,
+    titularEmail: "cliente@example.com",
+    paymentUuid: "P-UUID-EXPLICIT",
+    providerTransactionId: "TX-EXPLICIT",
+    expectedAmount: 115,
+    paidAt: explicitPaidAt,
+  });
+
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getPayments()[0].paid_at, explicitPaidAt);
+  assert.equal(client.getActiveIntent().paid_at, explicitPaidAt);
+});
+
+test("provider_tx_id duplicado en otro intent sigue protegido", async () => {
+  const duplicateTransactionId = "TX-DUPLICATE";
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialPayments: [{
+      id_payment: "edededed-eded-4ded-8ded-edededededed",
+      id_intent: "98989898-9898-4989-8989-989898989898",
+      estado_pago_codigo: "capturado",
+      provider_tx_id: duplicateTransactionId,
+      monto_hnl: 115,
+      moneda_codigo: "HNL",
+      paid_at: "2026-10-06T14:00:00.000Z",
+    }],
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "P-UUID-DUPLICATE",
+      referencia_externa: duplicateTransactionId,
+      created_by_usuario_id: USER_A,
+    },
+  });
+
+  await assert.rejects(
+    reconcilePixelPayPaid(client, {
+      idGrupoCita: GROUP_A,
+      idIntent: INTENT_A,
+      titularEmail: "cliente@example.com",
+      paymentUuid: "P-UUID-DUPLICATE",
+      providerTransactionId: duplicateTransactionId,
+      expectedAmount: 115,
+    }),
+    (error) => error?.code === "PIXELPAY_TRANSACTION_CONFLICT"
+  );
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getPayments()[0].id_intent, "98989898-9898-4989-8989-989898989898");
+});
+
 test("status carga intent PixelPay y registra una verificacion con proveedor simulado", async () => {
   const provider = {
     statusCalls: [],
@@ -1685,6 +1820,10 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   assert.equal(first.json().data.booking_confirmed, true);
   assert.equal(client.getPayments().length, 1);
   assert.equal(client.getPayments()[0].provider_tx_id, "transaction-id-paid-qa");
+  assert.ok(Number.isFinite(Date.parse(client.getPayments()[0].paid_at)));
+  assert.equal(client.getPayments()[0].monto_hnl, 115);
+  assert.equal(client.getPayments()[0].moneda_codigo, "HNL");
+  assert.equal(client.getActiveIntent().provider_session_id, "payment-uuid-paid-qa");
   assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
   const sideEffectsAfterFirst = {
     promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,

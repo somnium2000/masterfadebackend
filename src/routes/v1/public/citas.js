@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { AppError, sendError, toDatabaseSchemaOutdatedError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
+import { resolvePublicCitasHoldRateLimit } from "../../../config/publicCitasRateLimitConfig.js";
 import {
   assertUuid,
   ensureActiveBranch,
@@ -1217,6 +1218,7 @@ async function resolveOrCreatePublicClient(client, payload) {
 }
 
 export default async function publicCitasRoutes(app) {
+  const holdRateLimit = resolvePublicCitasHoldRateLimit();
   app.post(
     "/validar-contactos",
     {
@@ -1376,8 +1378,8 @@ export default async function publicCitasRoutes(app) {
     {
       config: {
         rateLimit: {
-          max: 5,
-          timeWindow: "15 minutes",
+          max: holdRateLimit.max,
+          timeWindow: holdRateLimit.timeWindow,
         },
       },
       schema: {

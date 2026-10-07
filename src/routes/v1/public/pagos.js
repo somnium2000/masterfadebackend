@@ -1514,7 +1514,7 @@ async function confirmGroupAfterPaid(client, {
   };
 }
 
-async function reconcilePixelPayPaid(client, {
+export async function reconcilePixelPayPaid(client, {
   idGrupoCita,
   idIntent,
   titularEmail,
@@ -1647,7 +1647,7 @@ async function reconcilePixelPayPaid(client, {
         estado_intent_codigo: intent.estado_intent_codigo,
       };
     }
-    const canonicalPaidAt = safeText(paidAt);
+    const canonicalPaidAt = safeText(paidAt) || new Date().toISOString();
     if (!existingPayment) {
       const insertedPayment = await client.query(
         `INSERT INTO public.payments (
