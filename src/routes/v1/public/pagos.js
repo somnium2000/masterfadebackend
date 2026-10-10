@@ -6,6 +6,7 @@ import {
   HONDURAS_ISO_3166_2_CODES,
   PIXELPAY_SALE_OUTCOME,
 } from "../../../services/payments/PixelPayDirectProvider.js";
+import { safePixelPayInputErrorFields } from "../../../services/payments/pixelPaySaleTelemetry.js";
 import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
@@ -150,6 +151,10 @@ function safeDiagnosticBoolean(value) {
   return typeof value === "boolean" ? value : null;
 }
 
+function safeDiagnosticCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 const SAFE_PIXELPAY_SDK_MESSAGE_CODES = new Set([
   "SDK_PUBLIC_KEY_UNAVAILABLE",
   "SDK_ENCRYPTION_FAILED",
@@ -166,6 +171,7 @@ export function buildSafePixelPaySdkDiagnostics(diagnostics) {
   const outcome = Object.values(PIXELPAY_SALE_OUTCOME).includes(diagnostics.outcome)
     ? diagnostics.outcome
     : null;
+  const inputErrorFields = safePixelPayInputErrorFields(diagnostics.inputErrorFields);
   return {
     paymentAttemptId: safeTelemetryText(diagnostics.paymentAttemptId, 80),
     sdkResponseClass: sdkResponseClass && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sdkResponseClass)
@@ -193,6 +199,9 @@ export function buildSafePixelPaySdkDiagnostics(diagnostics) {
     transactionAmountMatches: safeDiagnosticBoolean(diagnostics.transactionAmountMatches),
     approvedAmountMatches: safeDiagnosticBoolean(diagnostics.approvedAmountMatches),
     amountMatches: safeDiagnosticBoolean(diagnostics.amountMatches),
+    inputErrorFields,
+    inputErrorCount: inputErrorFields.length,
+    inputErrorUnknownCount: safeDiagnosticCount(diagnostics.inputErrorUnknownCount),
     outcome,
   };
 }

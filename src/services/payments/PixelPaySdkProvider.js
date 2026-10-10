@@ -4,6 +4,7 @@ import {
   createPixelPaySaleAttempt,
   emitPixelPaySaleEvent,
   PIXELPAY_SALE_EVENT,
+  readPixelPayInputErrors,
   readPixelPayHttpMetadata,
 } from "./pixelPaySaleTelemetry.js";
 import {
@@ -392,6 +393,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       paymentUuid,
       transactionId,
     });
+    const inputErrors = readPixelPayInputErrors(response?.errors);
     const diagnostics = {
       paymentAttemptId: attempt.paymentAttemptId,
       sdkResponseClass: safeClassName(response),
@@ -413,6 +415,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionAmountMatches,
       approvedAmountMatches,
       amountMatches,
+      ...inputErrors,
       outcome,
     };
 
@@ -429,6 +432,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionIdPresent: diagnostics.hasTransactionId,
       transactionResultValid: diagnostics.transactionResultValid,
       transactionResultParsed: diagnostics.transactionResultParsed,
+      inputErrorFields: inputErrors.inputErrorFields,
+      inputErrorUnknownCount: inputErrors.inputErrorUnknownCount,
     };
     emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED, attempt, telemetryDetails);
     if (outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) {

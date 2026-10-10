@@ -218,6 +218,9 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
     transactionAmountMatches: true,
     approvedAmountMatches: true,
     amountMatches: true,
+    inputErrorFields: [],
+    inputErrorCount: 0,
+    inputErrorUnknownCount: 0,
     outcome: PIXELPAY_SALE_OUTCOME.APPROVED,
   });
   assert.equal(fake.calls.sale, 1);
@@ -325,6 +328,92 @@ test("respuesta incierta registra RESPONSE_RECEIVED y UNCERTAIN sin segunda Sale
   ]);
   assert.equal(fake.calls.sale, 1);
 });
+
+test("InputErrorResponse 422 registra solo nombres seguros de campos rechazados", async () => {
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({
+    saleResponse: {
+      ...sdkResponse(422, { success: false, data: null, valid: false }),
+      errors: {
+        order_id: ["invalid", saleInput.card.number, SECRET, "secretKey-value"],
+        billing_state: ["invalid", saleInput.card.cvv, AUTH_HASH, "authHash-value", "x-client-signature"],
+      },
+      message: `invalid ${saleInput.card.number} ${saleInput.card.cvv} ${SECRET}`,
+    },
+  });
+
+  const result = await makeProvider(fake).sale(saleInput, { logger });
+  const serializedDiagnostics = JSON.stringify(result.diagnostics);
+  const responseEvent = logger.events.find((entry) => entry.event === PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED);
+
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
+  assert.equal(result.statusCode, 422);
+  assert.deepEqual(result.diagnostics.inputErrorFields, ["billing_state", "order_id"]);
+  assert.equal(result.diagnostics.inputErrorCount, 2);
+  assert.equal(result.diagnostics.inputErrorUnknownCount, 0);
+  assert.deepEqual(responseEvent.inputErrorFields, ["billing_state", "order_id"]);
+  assert.equal(responseEvent.inputErrorCount, 2);
+  assert.equal(responseEvent.inputErrorUnknownCount, 0);
+  assert.doesNotMatch(serializedDiagnostics, /invalid|secretKey|authHash|x-client-signature/i);
+  assert.doesNotMatch(serializedDiagnostics, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
+  assert.equal(Object.values(result.diagnostics).includes(saleInput.card.cvv), false);
+  assert.doesNotMatch(serializedDiagnostics, new RegExp(SECRET));
+  assert.doesNotMatch(serializedDiagnostics, new RegExp(AUTH_HASH));
+  assert.equal(fake.calls.sale, 1);
+});
+
+test("InputErrorResponse 422 cuenta keys desconocidas sin registrarlas", async () => {
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({
+    saleResponse: {
+      ...sdkResponse(422, { success: false, data: null, valid: false }),
+      errors: {
+        billing_state: ["invalid"],
+        "5555555555554444": ["invalid"],
+        "999": ["invalid"],
+        "secret-value": ["invalid"],
+      },
+    },
+  });
+
+  const result = await makeProvider(fake).sale(saleInput, { logger });
+  const responseEvent = logger.events.find((entry) => entry.event === PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED);
+  const serialized = JSON.stringify({ diagnostics: result.diagnostics, event: responseEvent });
+
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
+  assert.deepEqual(result.diagnostics.inputErrorFields, ["billing_state"]);
+  assert.equal(result.diagnostics.inputErrorCount, 1);
+  assert.equal(result.diagnostics.inputErrorUnknownCount, 3);
+  assert.deepEqual(responseEvent.inputErrorFields, ["billing_state"]);
+  assert.equal(responseEvent.inputErrorCount, 1);
+  assert.equal(responseEvent.inputErrorUnknownCount, 3);
+  assert.doesNotMatch(serialized, /5555555555554444|"999"|secret-value/);
+  assert.equal(fake.calls.sale, 1);
+});
+
+for (const [name, errors] of [["null", null], ["array", [["invalid"]]]]) {
+  test(`InputErrorResponse 422 con errors ${name} no produce campos ni indices`, async () => {
+    const logger = makeTelemetryLogger();
+    const fake = makeFakeSdk({
+      saleResponse: {
+        ...sdkResponse(422, { success: false, data: null, valid: false }),
+        errors,
+      },
+    });
+
+    const result = await makeProvider(fake).sale(saleInput, { logger });
+    const responseEvent = logger.events.find((entry) => entry.event === PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED);
+
+    assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
+    assert.deepEqual(result.diagnostics.inputErrorFields, []);
+    assert.equal(result.diagnostics.inputErrorCount, 0);
+    assert.equal(result.diagnostics.inputErrorUnknownCount, 0);
+    assert.deepEqual(responseEvent.inputErrorFields, []);
+    assert.equal(responseEvent.inputErrorCount, 0);
+    assert.equal(responseEvent.inputErrorUnknownCount, 0);
+    assert.equal(fake.calls.sale, 1);
+  });
+}
 
 test("telemetria PixelPay nunca registra datos sensibles ni objetos completos", async () => {
   const logger = makeTelemetryLogger();
@@ -700,6 +789,9 @@ test("diagnostics contiene solo metadata y nunca valores sensibles ni payload cr
     "hasPaymentHash",
     "hasPaymentUuid",
     "hasTransactionId",
+    "inputErrorCount",
+    "inputErrorFields",
+    "inputErrorUnknownCount",
     "outcome",
     "paymentAttemptId",
     "paymentHashValid",

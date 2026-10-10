@@ -8,6 +8,29 @@ export const PIXELPAY_SALE_EVENT = Object.freeze({
   UNCERTAIN: "PIXELPAY_SALE_UNCERTAIN",
 });
 
+const SAFE_PIXELPAY_INPUT_ERROR_FIELDS = new Set([
+  "authentication_request",
+  "billing_address",
+  "billing_city",
+  "billing_country",
+  "billing_phone",
+  "billing_state",
+  "card_cvv",
+  "card_expire",
+  "card_holder",
+  "card_number",
+  "customer_email",
+  "customer_name",
+  "from",
+  "lang",
+  "order_amount",
+  "order_content",
+  "order_currency",
+  "order_extras",
+  "order_id",
+  "sdk_version",
+]);
+
 function text(value, maxLength = 255) {
   const normalized = String(value ?? "").trim();
   return normalized ? normalized.slice(0, maxLength) : null;
@@ -37,6 +60,36 @@ function safeAmount(value) {
 
 function safeBoolean(value) {
   return typeof value === "boolean" ? value : null;
+}
+
+function safeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+export function safePixelPayInputErrorFields(value, maxFields = 32) {
+  if (!Array.isArray(value)) return [];
+  const normalizedLimit = Number.isInteger(maxFields) && maxFields > 0 ? maxFields : 32;
+  return [...new Set(value
+    .filter((field) => typeof field === "string" && SAFE_PIXELPAY_INPUT_ERROR_FIELDS.has(field)))]
+    .sort()
+    .slice(0, normalizedLimit);
+}
+
+export function readPixelPayInputErrors(errors, maxFields = 32) {
+  if (!errors || typeof errors !== "object" || Array.isArray(errors)) {
+    return { inputErrorFields: [], inputErrorCount: 0, inputErrorUnknownCount: 0 };
+  }
+  const prototype = Object.getPrototypeOf(errors);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return { inputErrorFields: [], inputErrorCount: 0, inputErrorUnknownCount: 0 };
+  }
+  const keys = Object.keys(errors);
+  const inputErrorFields = safePixelPayInputErrorFields(keys, maxFields);
+  return {
+    inputErrorFields,
+    inputErrorCount: inputErrorFields.length,
+    inputErrorUnknownCount: keys.filter((field) => !SAFE_PIXELPAY_INPUT_ERROR_FIELDS.has(field)).length,
+  };
 }
 
 export function safePixelPayHeader(value, maxLength = 160) {
@@ -70,6 +123,7 @@ export function createPixelPaySaleAttempt(input = {}, { randomUUID = crypto.rand
 }
 
 export function buildPixelPaySaleEvent(event, attempt, details = {}) {
+  const inputErrorFields = safePixelPayInputErrorFields(details.inputErrorFields);
   return {
     event,
     timestamp: new Date().toISOString(),
@@ -95,6 +149,9 @@ export function buildPixelPaySaleEvent(event, attempt, details = {}) {
     transactionIdPresent: safeBoolean(details.transactionIdPresent),
     transactionResultValid: safeBoolean(details.transactionResultValid),
     transactionResultParsed: safeBoolean(details.transactionResultParsed),
+    inputErrorFields,
+    inputErrorCount: inputErrorFields.length,
+    inputErrorUnknownCount: safeCount(details.inputErrorUnknownCount),
   };
 }
 

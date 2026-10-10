@@ -146,6 +146,9 @@ test("diagnostico SDK de ruta aplica lista blanca estricta", () => {
     transactionAmountMatches: false,
     approvedAmountMatches: false,
     amountMatches: false,
+    inputErrorFields: ["order_id", "billing_state", "5555555555554444", "999", "secret-value", "billing_state"],
+    inputErrorCount: 99,
+    inputErrorUnknownCount: 3,
     outcome: "uncertain",
     payment_uuid: "must-not-appear",
     response: { data: { card: "must-not-appear" } },
@@ -154,9 +157,12 @@ test("diagnostico SDK de ruta aplica lista blanca estricta", () => {
   assert.equal(diagnostic.sdkResponseClass, "SuccessResponse");
   assert.equal(diagnostic.transactionResultParsed, false);
   assert.equal(diagnostic.outcome, "uncertain");
+  assert.deepEqual(diagnostic.inputErrorFields, ["billing_state", "order_id"]);
+  assert.equal(diagnostic.inputErrorCount, 2);
+  assert.equal(diagnostic.inputErrorUnknownCount, 3);
   assert.equal(Object.hasOwn(diagnostic, "payment_uuid"), false);
   assert.equal(Object.hasOwn(diagnostic, "response"), false);
-  assert.doesNotMatch(JSON.stringify(diagnostic), /must-not-appear/);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /must-not-appear|5555555555554444|"999"|secret-value/);
 });
 
 function makeGroupRow({
@@ -1341,6 +1347,9 @@ test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve"
           transactionAmountMatches: false,
           approvedAmountMatches: false,
           amountMatches: false,
+          inputErrorFields: ["billing_state", "5555555555554444", "999", "secret-value"],
+          inputErrorCount: 4,
+          inputErrorUnknownCount: 3,
           outcome: "uncertain",
           payment_uuid: "sensitive-payment-uuid",
           transaction_id: "sensitive-transaction-id",
@@ -1396,9 +1405,16 @@ test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve"
   assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.transactionResultValid, false);
   assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.outcome, "uncertain");
   assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.safeMessageCode, "SDK_PUBLIC_KEY_UNAVAILABLE");
+  assert.deepEqual(diagnosticLogs[0].pixelPaySdkDiagnostics.inputErrorFields, ["billing_state"]);
+  assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.inputErrorCount, 1);
+  assert.equal(diagnosticLogs[0].pixelPaySdkDiagnostics.inputErrorUnknownCount, 3);
   assert.equal(Object.hasOwn(payload.data, "diagnostics"), false);
   assert.doesNotMatch(response.body, /sdkResponseClass|transactionResultValid|safeMessageCode|sensitive-/i);
   assert.doesNotMatch(logs.join(""), /sensitive-payment|sensitive-transaction|sensitive-pan/i);
+  assert.doesNotMatch(
+    JSON.stringify(diagnosticLogs[0].pixelPaySdkDiagnostics),
+    /5555555555554444|"999"|secret-value/
+  );
   await app.close();
 });
 
