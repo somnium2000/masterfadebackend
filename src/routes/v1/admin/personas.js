@@ -12,7 +12,7 @@ import {
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
 const USER_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
-const EMPLOYEE_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const EMPLOYEE_ROUTE_ALLOWED_ROLES = ["super_admin"];
 const CLIENT_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
 const ACCESS_STATUS = {
   PENDING_PASSWORD: "pendiente_password",
