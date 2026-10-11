@@ -303,6 +303,50 @@ test("asociacion transversal exige contexto completo verificado por backend", as
   }), { code: "STORAGE_REPLACEMENT_CONTEXT_INCOMPLETE" });
 });
 
+test("asociacion inicial rechaza propietario, metadatos, estado, bucket y destino manipulados", async () => {
+  const scenarios = [
+    {
+      asset: barberAsset({ entity_id: null, status: "temporal", owner_user_id: OTHER_CLIENT_ID, uploaded_by: OTHER_CLIENT_ID }),
+      code: "STORAGE_BRANCH_FORBIDDEN",
+    },
+    {
+      asset: barberAsset({ entity_id: null, status: "temporal", owner_user_id: USER_ID, uploaded_by: OTHER_CLIENT_ID }),
+      code: "STORAGE_BRANCH_FORBIDDEN",
+    },
+    {
+      asset: barberAsset({ entity_id: null, status: "activo", owner_user_id: USER_ID, uploaded_by: USER_ID }),
+      code: "STORAGE_BRANCH_FORBIDDEN",
+    },
+    {
+      asset: barberAsset({ entity_id: OTHER_CLIENT_ID, owner_user_id: USER_ID, uploaded_by: USER_ID }),
+      code: "STORAGE_ASSET_ENTITY_MISMATCH",
+    },
+    {
+      asset: barberAsset({ entity_id: null, id_sucursal: OWN_BRANCH_ID, owner_user_id: USER_ID, uploaded_by: USER_ID }),
+      code: "STORAGE_ASSET_BRANCH_MISMATCH",
+    },
+    {
+      asset: barberAsset({ entity_id: null, bucket_name: "otro_bucket", owner_user_id: USER_ID, uploaded_by: USER_ID }),
+      code: "STORAGE_ASSET_BUCKET_MISMATCH",
+    },
+    {
+      asset: barberAsset({ entity_id: null, deleted_at: new Date().toISOString(), owner_user_id: USER_ID, uploaded_by: USER_ID }),
+      code: "STORAGE_ASSET_NOT_FOUND",
+    },
+  ];
+  for (const scenario of scenarios) {
+    const { client } = buildHarness({ assets: [scenario.asset] });
+    await assert.rejects(() => resolveAssetForBinding(client, {
+      assetId: ASSET_ID,
+      scopeKey: "public_barber_profile",
+      entityType: "barbero",
+      entityId: EMPLOYEE_ID,
+      idSucursal: BRANCH_ID,
+      claims: claims("admin"),
+    }), { code: scenario.code });
+  }
+});
+
 test("reemplazos historicos de promociones principal y movil conservan compatibilidad y sucursal", async () => {
   for (const scopeKey of ["public_promotion_main", "public_promotion_mobile"]) {
     for (const nextAssetId of [OLD_ASSET_ID, null]) {
@@ -539,4 +583,166 @@ test("fallo anterior al COMMIT conserva rollback y compensacion Auth", async (t)
   assert.deepEqual(activity.commands, ["BEGIN", "ROLLBACK"]);
   assert.deepEqual(activity.authEmails, ["nuevo@example.test", "anterior@example.test"]);
   assert.equal(activity.cleanupAttempts, 0);
+});
+
+async function buildNewBarberCreationApp({ assetOverrides = {} } = {}) {
+  const activity = { commands: [], authCreated: 0, authDeleted: 0, assetActivated: 0 };
+  const temporaryAsset = barberAsset({
+    entity_id: null,
+    status: "temporal",
+    owner_user_id: USER_ID,
+    uploaded_by: USER_ID,
+    ...assetOverrides,
+  });
+  const dbClient = {
+    async query(sql) {
+      const text = String(sql).replace(/\s+/g, " ").trim();
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(text)) {
+        activity.commands.push(text);
+        return { rows: [], rowCount: 0 };
+      }
+      if (text.includes("FROM public.sucursales")) return { rows: [{ id_sucursal: BRANCH_ID }], rowCount: 1 };
+      if (text.includes("regexp_replace") || text.includes("FROM auth.users")) return { rows: [], rowCount: 0 };
+      if (text.includes("FROM public.correos") && text.includes("LOWER")) return { rows: [], rowCount: 0 };
+      if (text === "SELECT id_rol, nombre FROM public.roles") {
+        return { rows: [{ id_rol: CLIENT_ID, nombre: "barbero" }], rowCount: 1 };
+      }
+      if (text.startsWith("INSERT INTO public.personas")) {
+        return { rows: [{ id_persona: OTHER_CLIENT_ID }], rowCount: 1 };
+      }
+      if (text.includes("SELECT id_correo FROM public.correos")) return { rows: [], rowCount: 0 };
+      if (text.includes("FROM public.empleados e") && text.includes("has_super_admin")) {
+        return { rows: [{
+          id_empleado: EMPLOYEE_ID,
+          id_sucursal: BRANCH_ID,
+          id_usuario: USER_ID,
+          has_super_admin: false,
+          is_protected: false,
+        }], rowCount: 1 };
+      }
+      if (text.includes("FROM public.app_protected_users")) return { rows: [], rowCount: 0 };
+      if (text.startsWith("UPDATE public.roles_usuarios")) return { rows: [], rowCount: 0 };
+      if (text.startsWith("INSERT INTO public.empleados")) {
+        return { rows: [{ id_empleado: EMPLOYEE_ID }], rowCount: 1 };
+      }
+      if (text.includes("FROM public.barberos_perfiles_publicos")) return { rows: [], rowCount: 0 };
+      if (text.includes("FROM public.storage_assets")) return { rows: [temporaryAsset], rowCount: 1 };
+      if (text.startsWith("UPDATE public.storage_assets")) {
+        activity.assetActivated += 1;
+        return {
+          rows: [{ ...temporaryAsset, entity_id: EMPLOYEE_ID, status: "activo" }],
+          rowCount: 1,
+        };
+      }
+      if (text.includes("FROM public.empleados e") && text.includes("u.id_usuario = $1")) {
+        return { rows: [{
+          id_empleado: EMPLOYEE_ID,
+          id_persona: OTHER_CLIENT_ID,
+          id_usuario: USER_ID,
+          id_sucursal: BRANCH_ID,
+          nombres: "Nueva",
+          apellidos: "Barbera",
+          correo_principal: "nueva@example.test",
+          estado_laboral: true,
+          estado_usuario: true,
+          es_barbero: true,
+          foto_perfil_asset_id: ASSET_ID,
+          foto_perfil_path: temporaryAsset.object_path,
+          roles: ["barbero"],
+        }], rowCount: 1 };
+      }
+      if (/^(UPDATE|INSERT) /i.test(text)) return { rows: [], rowCount: 1 };
+      throw new Error(`Unexpected query: ${text}`);
+    },
+    release() {},
+  };
+  const app = Fastify({ logger: false });
+  app.decorate("db", { async connect() { return dbClient; } });
+  app.decorate("supabaseAdmin", {
+    auth: {
+      admin: {
+        async createUser() {
+          activity.authCreated += 1;
+          return { data: { user: { id: USER_ID } }, error: null };
+        },
+        async deleteUser() {
+          activity.authDeleted += 1;
+          return { error: null };
+        },
+      },
+    },
+    storage: { from() { return {}; } },
+  });
+  app.decorate("mailer", { configured: false });
+  app.decorate("requireRoles", () => async (request) => {
+    request.claims = claims("admin");
+  });
+  await app.register(adminPersonasRoutes, { prefix: "/personas" });
+  await app.ready();
+  return { app, activity };
+}
+
+test("admin crea barbero transversal y asocia su asset temporal propio antes del COMMIT", async (t) => {
+  const { app, activity } = await buildNewBarberCreationApp();
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST",
+    url: "/personas/empleados",
+    payload: {
+      persona: {
+        nombres: "Nueva",
+        apellidos: "Barbera",
+        dni: "0801199012345",
+        telefono_principal: "99990000",
+      },
+      acceso: { correo_principal: "nueva@example.test", roles: ["barbero"] },
+      empleado: {
+        id_sucursal: BRANCH_ID,
+        salario_base: 10000,
+        estado: true,
+        es_barbero: true,
+        foto_perfil_asset_id: ASSET_ID,
+      },
+      perfil_publico: {},
+    },
+  });
+  assert.equal(response.statusCode, 201, response.body);
+  assert.deepEqual(activity.commands, ["BEGIN", "COMMIT"]);
+  assert.equal(activity.authCreated, 1);
+  assert.equal(activity.authDeleted, 0);
+  assert.equal(activity.assetActivated, 1);
+});
+
+test("creacion transversal rechaza asset temporal ajeno y compensa antes del COMMIT", async (t) => {
+  const { app, activity } = await buildNewBarberCreationApp({
+    assetOverrides: { owner_user_id: OTHER_CLIENT_ID, uploaded_by: OTHER_CLIENT_ID },
+  });
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST",
+    url: "/personas/empleados",
+    payload: {
+      persona: {
+        nombres: "Nueva",
+        apellidos: "Barbera",
+        dni: "0801199012345",
+        telefono_principal: "99990000",
+      },
+      acceso: { correo_principal: "nueva@example.test", roles: ["barbero"] },
+      empleado: {
+        id_sucursal: BRANCH_ID,
+        salario_base: 10000,
+        estado: true,
+        es_barbero: true,
+        foto_perfil_asset_id: ASSET_ID,
+      },
+      perfil_publico: {},
+    },
+  });
+  assert.equal(response.statusCode, 403, response.body);
+  assert.equal(response.json().error.code, "STORAGE_BRANCH_FORBIDDEN");
+  assert.deepEqual(activity.commands, ["BEGIN", "ROLLBACK"]);
+  assert.equal(activity.authCreated, 1);
+  assert.equal(activity.authDeleted, 1);
+  assert.equal(activity.assetActivated, 0);
 });

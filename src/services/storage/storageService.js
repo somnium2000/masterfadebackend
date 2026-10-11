@@ -185,14 +185,25 @@ async function assertBarberProfileContext(client, {
 }
 
 function assertContextualAssetAccess(claims, asset, context = null) {
+  const actorUserId = String(claims?.user?.id_usuario || "");
+  const assetOwnerIds = [asset?.owner_user_id, asset?.uploaded_by]
+    .filter(Boolean)
+    .map((value) => String(value));
+  const isOwnedTemporaryBinding = String(asset?.status || "") === "temporal"
+    && !asset?.entity_id
+    && actorUserId
+    && assetOwnerIds.length > 0
+    && assetOwnerIds.every((value) => value === actorUserId);
+  const isExistingEntityBinding = context?.entityId
+    && String(asset?.entity_id || "") === String(context.entityId);
   const hasVerifiedBarberContext = context
     && isAdminBarberProfileContext(claims, context.scopeKey, context.entityType)
     && context.entityId
     && context.idSucursal
     && String(asset?.scope_key || "") === String(context.scopeKey)
     && String(asset?.entity_type || "") === String(context.entityType)
-    && String(asset?.entity_id || "") === String(context.entityId)
-    && String(asset?.id_sucursal || "") === String(context.idSucursal);
+    && String(asset?.id_sucursal || "") === String(context.idSucursal)
+    && (isExistingEntityBinding || isOwnedTemporaryBinding);
   if (hasVerifiedBarberContext) return;
   assertAssetAccessByClaims(claims, asset);
 }
@@ -298,6 +309,12 @@ export async function resolveAssetForBinding(client, {
     throw new AppError(400, "El asset no pertenece al scope esperado", {
       code: "STORAGE_ASSET_SCOPE_MISMATCH",
       details: { expected_scope: scopeKey, received_scope: asset.scope_key },
+    });
+  }
+  const expectedScope = scopeKey ? getStorageScope(scopeKey) : null;
+  if (expectedScope && String(asset.bucket_name) !== String(expectedScope.bucket)) {
+    throw new AppError(400, "El asset no pertenece al bucket esperado", {
+      code: "STORAGE_ASSET_BUCKET_MISMATCH",
     });
   }
   if (entityType && String(asset.entity_type) !== String(entityType)) {
