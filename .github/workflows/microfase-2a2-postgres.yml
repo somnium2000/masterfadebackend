@@ -95,6 +95,12 @@ jobs:
         run: npm run db:preflight
       - name: Run app.inject PostgreSQL integration
         run: RUN_CANONICAL_BOOKING_INTEGRATION=true node --test test/canonical-booking.integration.test.mjs
+      - name: Run late payment triggers and durable recovery in isolated PostgreSQL
+        env:
+          RUN_PAYMENT_LATE_PG_INTEGRATION: "true"
+        run: |
+          sudo apt-get install -y postgresql postgresql-contrib
+          MASTERFADE_TEST_PG_BIN="$(find /usr/lib/postgresql -name initdb -printf '%h\n' | sort -V | tail -n 1)" node --test test/payment-late-paid-at.postgres.test.mjs
       - name: Run lint
         run: npm run lint
       - name: Check whitespace
