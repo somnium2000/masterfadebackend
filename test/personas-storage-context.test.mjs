@@ -65,19 +65,41 @@ function privateClientAsset(overrides = {}) {
   };
 }
 
-function buildHarness({ assets = [barberAsset()], privileged = false, cleanupError = null } = {}) {
+function promotionAsset(scopeKey, overrides = {}) {
+  return {
+    id_asset: ASSET_ID,
+    bucket_name: "imagenes_publicas",
+    object_path: `promociones/${BRANCH_ID}/${scopeKey}.webp`,
+    scope_key: scopeKey,
+    visibility: "public",
+    entity_type: "promocion",
+    entity_id: null,
+    id_sucursal: BRANCH_ID,
+    status: "activo",
+    deleted_at: null,
+    ...overrides,
+  };
+}
+
+function buildHarness({
+  assets = [barberAsset()],
+  privileged = false,
+  historicalSuperAdmin = false,
+  cleanupError = null,
+} = {}) {
   const activity = { inserts: 0, updates: 0, removes: 0, signedUploads: 0, signedReads: 0 };
   const assetMap = new Map(assets.map((asset) => [asset.id_asset, asset]));
   const client = {
     async query(sql, params = []) {
       const text = String(sql).replace(/\s+/g, " ").trim();
       if (text.includes("FROM public.empleados e")) {
+        const hasHistoricalRole = historicalSuperAdmin && !text.includes("ru.activo IS TRUE");
         return {
           rows: [{
             id_empleado: EMPLOYEE_ID,
             id_sucursal: BRANCH_ID,
             id_usuario: USER_ID,
-            has_super_admin: privileged,
+            has_super_admin: privileged || hasHistoricalRole,
             is_protected: false,
           }],
           rowCount: 1,
@@ -252,6 +274,56 @@ test("la excepcion no se activa para barbero, otros scopes, entidad distinta ni 
   await assert.rejects(() => prepareStorageUpload(privileged.app, uploadInput(claims("admin"))), {
     code: "STORAGE_PRIVILEGED_BARBER_FORBIDDEN",
   });
+
+  const historical = buildHarness({ historicalSuperAdmin: true });
+  await assert.rejects(() => prepareStorageUpload(historical.app, uploadInput(claims("admin"))), {
+    code: "STORAGE_PRIVILEGED_BARBER_FORBIDDEN",
+  });
+});
+
+test("asociacion transversal exige contexto completo verificado por backend", async () => {
+  const unbound = barberAsset({ entity_id: null, status: "temporal" });
+  const { client } = buildHarness({ assets: [unbound] });
+  await assert.rejects(() => resolveAssetForBinding(client, {
+    assetId: ASSET_ID,
+    scopeKey: "public_barber_profile",
+    entityType: "barbero",
+    entityId: null,
+    idSucursal: BRANCH_ID,
+    claims: claims("admin"),
+  }), { code: "STORAGE_BRANCH_FORBIDDEN" });
+
+  await assert.rejects(() => validateAssetReplacement(client, {
+    previousAssetId: ASSET_ID,
+    nextAssetId: OLD_ASSET_ID,
+    scopeKey: "public_barber_profile",
+    entityType: "barbero",
+    entityId: EMPLOYEE_ID,
+    claims: claims("admin"),
+  }), { code: "STORAGE_REPLACEMENT_CONTEXT_INCOMPLETE" });
+});
+
+test("reemplazos historicos de promociones principal y movil conservan compatibilidad y sucursal", async () => {
+  for (const scopeKey of ["public_promotion_main", "public_promotion_mobile"]) {
+    for (const nextAssetId of [OLD_ASSET_ID, null]) {
+      const asset = promotionAsset(scopeKey);
+      const { app, client, activity } = buildHarness({ assets: [asset] });
+      const replaced = await replaceAssetIfNeeded(app, client, {
+        previousAssetId: ASSET_ID,
+        nextAssetId,
+        claims: claims("admin", [BRANCH_ID]),
+      });
+      assert.equal(replaced.id_asset, ASSET_ID);
+      assert.equal(activity.removes, 1);
+    }
+  }
+
+  const restricted = buildHarness({ assets: [promotionAsset("public_promotion_main")] });
+  await assert.rejects(() => replaceAssetIfNeeded(restricted.app, restricted.client, {
+    previousAssetId: ASSET_ID,
+    nextAssetId: null,
+    claims: claims("admin"),
+  }), { code: "STORAGE_BRANCH_FORBIDDEN" });
 });
 
 test("DELETE y READ-URL genericos transversales de admin permanecen restringidos", async () => {

@@ -77,7 +77,6 @@ async function loadBarberStorageContext(client, idEmpleado) {
           FROM public.roles_usuarios ru
           INNER JOIN public.roles r ON r.id_rol = ru.id_rol
           WHERE ru.id_usuario = u.id_usuario
-            AND ru.activo IS TRUE
             AND r.nombre = 'super_admin'
         ) AS has_super_admin,
         EXISTS (
@@ -185,8 +184,16 @@ async function assertBarberProfileContext(client, {
   return barber;
 }
 
-function assertContextualAssetAccess(claims, asset) {
-  if (isAdminBarberProfileContext(claims, asset?.scope_key, asset?.entity_type)) return;
+function assertContextualAssetAccess(claims, asset, context = null) {
+  const hasVerifiedBarberContext = context
+    && isAdminBarberProfileContext(claims, context.scopeKey, context.entityType)
+    && context.entityId
+    && context.idSucursal
+    && String(asset?.scope_key || "") === String(context.scopeKey)
+    && String(asset?.entity_type || "") === String(context.entityType)
+    && String(asset?.entity_id || "") === String(context.entityId)
+    && String(asset?.id_sucursal || "") === String(context.idSucursal);
+  if (hasVerifiedBarberContext) return;
   assertAssetAccessByClaims(claims, asset);
 }
 
@@ -313,11 +320,17 @@ export async function resolveAssetForBinding(client, {
       code: "STORAGE_ASSET_BRANCH_MISMATCH",
     });
   }
-  if (scopeKey === "public_barber_profile" && entityType === "barbero" && entityId) {
-    await assertBarberProfileContext(client, { claims, entityId, idSucursal });
+  let barberContext = null;
+  if (scopeKey === "public_barber_profile" && entityType === "barbero" && entityId && idSucursal) {
+    barberContext = await assertBarberProfileContext(client, { claims, entityId, idSucursal });
   }
   if (claims) {
-    assertContextualAssetAccess(claims, asset);
+    assertContextualAssetAccess(claims, asset, barberContext ? {
+      scopeKey,
+      entityType,
+      entityId,
+      idSucursal,
+    } : null);
   }
   return asset;
 }
@@ -807,9 +820,17 @@ export async function validateAssetReplacement(client, {
   const previousId = normalizeOptionalText(previousAssetId);
   const nextId = normalizeOptionalText(nextAssetId);
   if (!previousId || previousId === nextId) return null;
+  const contextValues = [scopeKey, entityType, entityId, idSucursal];
+  const hasContext = contextValues.some(Boolean);
+  const hasCompleteContext = contextValues.every(Boolean);
+  if (hasContext && !hasCompleteContext) {
+    throw new AppError(400, "El contexto de reemplazo de Storage esta incompleto", {
+      code: "STORAGE_REPLACEMENT_CONTEXT_INCOMPLETE",
+    });
+  }
   const previous = asset || await getAssetById(client, previousId);
   if (!previous || previous.deleted_at) {
-    if (scopeKey || entityType || entityId) {
+    if (hasContext) {
       throw new AppError(404, "Asset anterior no encontrado", {
         code: "STORAGE_ASSET_NOT_FOUND",
       });
@@ -826,7 +847,7 @@ export async function validateAssetReplacement(client, {
       code: "STORAGE_ASSET_ENTITY_TYPE_MISMATCH",
     });
   }
-  if (!entityId || String(previous.entity_id || "") !== String(entityId)) {
+  if (hasContext && String(previous.entity_id || "") !== String(entityId)) {
     throw new AppError(409, "El asset anterior no esta vinculado a la entidad esperada", {
       code: "STORAGE_ASSET_ENTITY_MISMATCH",
     });
@@ -836,9 +857,22 @@ export async function validateAssetReplacement(client, {
       code: "STORAGE_ASSET_BRANCH_MISMATCH",
     });
   }
-  if (scopeKey === "public_barber_profile" && entityType === "barbero") {
-    await assertBarberProfileContext(client, { claims, entityId, idSucursal });
+  let barberContext = null;
+  if (hasContext) {
+    if (scopeKey !== "public_barber_profile" || entityType !== "barbero") {
+      throw new AppError(403, "El contexto no permite una excepcion transversal de Storage", {
+        code: "STORAGE_REPLACEMENT_CONTEXT_FORBIDDEN",
+      });
+    }
+    barberContext = await assertBarberProfileContext(client, { claims, entityId, idSucursal });
   }
-  if (claims) assertContextualAssetAccess(claims, previous);
+  if (claims) {
+    assertContextualAssetAccess(claims, previous, barberContext ? {
+      scopeKey,
+      entityType,
+      entityId,
+      idSucursal,
+    } : null);
+  }
   return previous;
 }
