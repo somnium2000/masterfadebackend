@@ -3,7 +3,7 @@ import { sendOk } from "../../../utils/response.js";
 import { assertUuid, parseDateOnly, resolveBranchIdsForClaims } from "../../../services/agendaService.js";
 
 // JK: Modulo de reportes administrativos para BI operativo (citas + pagos + membresias).
-const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const ADMIN_ALLOWED_ROLES = ["super_admin"];
 const SUCCESS_PAYMENT_STATES = ["capturado", "conciliado", "manual_pagado"];
 const NON_ACTIVE_SUBSCRIPTION_STATES = ["cancelada", "expirada", "inactiva", "vencida"];
 const REPORTS_TIMEZONE = "America/Tegucigalpa";
