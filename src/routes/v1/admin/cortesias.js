@@ -695,33 +695,45 @@ export default async function adminCortesiasRoutes(app) {
 
         await assertCourtesyWriteAccess(client, request.claims, request.params.id);
 
-        const nextNombre =
-          request.body?.nombre !== undefined
-            ? normalizeRequiredText(request.body.nombre, "nombre")
-            : normalizeRequiredText(current.nombre, "nombre");
-        const nextDescripcion =
-          request.body?.descripcion !== undefined
-            ? normalizeOptionalText(request.body.descripcion)
-            : current.descripcion;
+        const hasNombre = request.body?.nombre !== undefined;
+        const hasDescripcion = request.body?.descripcion !== undefined;
+        const nextNombre = hasNombre
+          ? normalizeRequiredText(request.body.nombre, "nombre")
+          : null;
+        const nextDescripcion = hasDescripcion
+          ? normalizeOptionalText(request.body.descripcion)
+          : null;
 
         let nextSucursales = null;
         if (request.body?.sucursales !== undefined) {
           nextSucursales = await normalizePayloadSucursales(client, request.claims, request.body.sucursales);
         }
 
-        await ensureUniqueCourtesyNameGlobal(client, request.params.id, nextNombre);
+        if (hasNombre) {
+          await ensureUniqueCourtesyNameGlobal(client, request.params.id, nextNombre);
+        }
 
-        await client.query(
-          `
-            UPDATE public.cortesias
-            SET
-              nombre = $2::text,
-              descripcion = $3::text,
-              updated_at = NOW()
-            WHERE id = $1::uuid
-          `,
-          [request.params.id, nextNombre, nextDescripcion ?? null]
-        );
+        const masterUpdates = [];
+        const masterParams = [request.params.id];
+        if (hasNombre) {
+          masterParams.push(nextNombre);
+          masterUpdates.push(`nombre = $${masterParams.length}::text`);
+        }
+        if (hasDescripcion) {
+          masterParams.push(nextDescripcion ?? null);
+          masterUpdates.push(`descripcion = $${masterParams.length}::text`);
+        }
+        if (masterUpdates.length > 0) {
+          masterUpdates.push("updated_at = NOW()");
+          await client.query(
+            `
+              UPDATE public.cortesias
+              SET ${masterUpdates.join(", ")}
+              WHERE id = $1::uuid
+            `,
+            masterParams
+          );
+        }
 
         if (nextSucursales) {
           await syncCourtesyBranches(client, request.params.id, nextSucursales);
