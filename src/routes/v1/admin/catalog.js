@@ -3983,8 +3983,9 @@ export default async function adminCatalogRoutes(app) {
         }
 
         let compositionChanged = false;
+        let currentItems = null;
         if (nextItems) {
-          const currentItems = await getCurrentPackageItems(client, request.params.id);
+          currentItems = await getCurrentPackageItems(client, request.params.id);
           compositionChanged = !packageItemsAreEquivalent(currentItems, nextItems);
           if (compositionChanged) {
             await ensurePackageCompositionAcrossActiveOffers(
@@ -3995,8 +3996,10 @@ export default async function adminCatalogRoutes(app) {
               branchId
             );
           }
-        } else if (shouldMutateOffer) {
-          const currentItems = await getCurrentPackageItems(client, request.params.id);
+        }
+
+        if (shouldMutateOffer && !compositionChanged) {
+          currentItems ??= await getCurrentPackageItems(client, request.params.id);
           if (currentItems.length > 0) {
             await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
           }

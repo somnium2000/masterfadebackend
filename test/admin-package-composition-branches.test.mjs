@@ -312,3 +312,51 @@ test("cambio de servicio ejecuta validacion global y reemplazo", async (t) => {
   assert.equal(state.detailDeletes, 1);
   assert.equal(state.detailInserts, 2);
 });
+
+for (const [label, localField] of [
+  ["precio", { precio_hnl: 650 }],
+  ["visibilidad", { visible_publico: false }],
+  ["orden visual", { orden_visual: 25 }],
+]) {
+  test(`items equivalentes con ${label} conservan validacion local`, async (t) => {
+    const { app, state } = await buildApp({ incompatibleBranches: [A] }); t.after(() => app.close());
+    const response = await patchPackage(app, { ...compositionPayload, items: [
+      { id_servicio: S2, cantidad: 1 },
+      { id_servicio: S1, cantidad: 1 },
+    ], ...localField });
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(state.validatedBranches, [A]);
+    assert.equal(state.activeOfferQueries, 0);
+    assert.equal(state.offerWrites, 0);
+    assert.equal(state.detailDeletes, 0);
+  });
+}
+
+test("oferta local incompatible se rechaza igual con y sin items equivalentes", async (t) => {
+  const withItems = await buildApp({ incompatibleBranches: [A] }); t.after(() => withItems.app.close());
+  const withoutItems = await buildApp({ incompatibleBranches: [A] }); t.after(() => withoutItems.app.close());
+  const equivalentItems = [
+    { id_servicio: S1, cantidad: 1 },
+    { id_servicio: S2, cantidad: 1 },
+  ];
+  const first = await patchPackage(withItems.app, { id_sucursal: A, items: equivalentItems, precio_hnl: 650 });
+  const second = await patchPackage(withoutItems.app, { id_sucursal: A, precio_hnl: 650 });
+  assert.equal(first.statusCode, 409);
+  assert.equal(second.statusCode, 409);
+  assert.equal(withItems.state.offerWrites, 0);
+  assert.equal(withoutItems.state.offerWrites, 0);
+});
+
+test("items equivalentes con precio y servicios disponibles actualizan solo oferta local", async (t) => {
+  const { app, state } = await buildApp({ incompatibleBranches: [] }); t.after(() => app.close());
+  const response = await patchPackage(app, { id_sucursal: A, items: [
+    { id_servicio: S2, cantidad: 1 },
+    { id_servicio: S1, cantidad: 1 },
+  ], precio_hnl: 650 });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(state.validatedBranches, [A]);
+  assert.equal(state.activeOfferQueries, 0);
+  assert.equal(state.offerWrites, 1);
+  assert.equal(state.detailDeletes, 0);
+  assert.equal(state.detailInserts, 0);
+});
