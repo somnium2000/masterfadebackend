@@ -9,6 +9,7 @@ import publicPagosRoutes, {
   assertPixelPayUuidMatches,
   isPixelPayPaidStatus,
   reconcilePixelPayPaid,
+  reconcilePixelPayFromDurableApproval,
   resolveStoredPixelPayUuid,
   resolveTrustedPixelPayReferences,
 } from "../src/routes/v1/public/pagos.js";
@@ -225,6 +226,10 @@ function createPagosClient({
   initialSaleAttempts = [],
   groupStateCode = "activo",
   slotReused = false,
+  groupId = GROUP_A,
+  citaId = CITA_A,
+  holdId = HOLD_A,
+  amountHnl = 115,
 } = {}) {
   const calls = [];
   const statusChecks = [];
@@ -238,6 +243,8 @@ function createPagosClient({
       expiresAt: holdExpiresAt,
       citaState: groupCitaState,
       holdState: groupHoldState,
+      idCita: citaId,
+      idHold: holdId,
     }),
     ...(groupSize === 2
       ? [makeGroupRow({
@@ -250,6 +257,11 @@ function createPagosClient({
         })]
       : []),
   ];
+  for (const row of groupState) {
+    row.id_grupo_cita = groupId;
+    row.total_pagar_hnl = String(amountHnl);
+    row.estado_grupo_codigo = groupStateCode;
+  }
   const client = {
     calls,
     setSecondHold({ expiresAt, state } = {}) {
@@ -278,7 +290,7 @@ function createPagosClient({
       const text = typeof sql === "object" ? sql.text : String(sql);
       calls.push({ sql: text, params });
       if (text === "BEGIN") {
-        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, saleAttempts });
+        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, saleAttempts, groupStateCode });
         return { rows: [] };
       }
       if (text === "COMMIT") { transactionSnapshot = null; return { rows: [] }; }
@@ -288,6 +300,7 @@ function createPagosClient({
           groupState.splice(0, groupState.length, ...transactionSnapshot.groupState);
           payments.splice(0, payments.length, ...transactionSnapshot.payments);
           saleAttempts = transactionSnapshot.saleAttempts;
+          groupStateCode = transactionSnapshot.groupStateCode;
           transactionSnapshot = null;
         }
         return { rows: [] };
@@ -316,17 +329,20 @@ function createPagosClient({
         });
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
       }
-      if (text.includes("SELECT finalized_at FROM app_private.pixelpay_sale_attempts")) {
+      if (text.includes("AS finalized_at FROM app_private.pixelpay_sale_attempts")) {
         const flags = ["response_success", "response_approved", "transaction_result_valid", "transaction_result_parsed",
           "payment_uuid_present", "transaction_id_present", "payment_hash_present", "payment_hash_valid",
           "transaction_amount_matches", "approved_amount_matches", "amount_matches"];
         for (const flag of flags) assert.ok(text.includes(`${flag} IS TRUE`));
         assert.ok(text.includes("response_incomplete IS FALSE AND uncertain IS FALSE"));
         assert.ok(text.includes("finalized_at <= $2::timestamptz"));
-        const row = saleAttempts.find((entry) => entry.id_intent === params[0] && entry.outcome === "approved"
+        assert.ok(text.includes("LIMIT 2"));
+        assert.ok(text.includes("SELECT min(h.expires_at)"));
+        const rows = saleAttempts.filter((entry) => entry.id_intent === params[0] && entry.outcome === "approved"
+          && entry.sdk_response_class === "SuccessResponse" && entry.upstream_http_status === 200
           && entry.finalized_at && new Date(entry.finalized_at).getTime() <= new Date(params[1]).getTime()
           && flags.every((flag) => entry[flag] === true) && entry.response_incomplete === false && entry.uncertain === false);
-        return { rows: row ? [{ finalized_at: row.finalized_at }] : [] };
+        return { rows: rows.slice(0, 2).map((row) => ({ finalized_at: row.finalized_at })) };
       }
       if (failPaymentInsert && text.includes("INSERT INTO public.payments")) {
         throw new Error("fixture fallo financiero posterior a FINAL");
@@ -344,7 +360,7 @@ function createPagosClient({
             inicio_at: "2026-07-15T15:00:00.000Z",
             selection_type: "services",
             id_paquete: null,
-            subtotal_servicios_hnl: "100.00",
+            subtotal_servicios_hnl: String(amountHnl === 115 ? 100 : amountHnl),
           }],
         };
       }
@@ -357,13 +373,13 @@ function createPagosClient({
             nombre_servicio_snapshot: "Corte QA",
             nombre_paquete_snapshot: null,
             cantidad: 1,
-            precio_unitario_hnl: "100.00",
-            subtotal_hnl: "100.00",
+            precio_unitario_hnl: String(amountHnl === 115 ? 100 : amountHnl),
+            subtotal_hnl: String(amountHnl === 115 ? 100 : amountHnl),
             descuento_hnl: "0.00",
             incluye_isv_snapshot: false,
-            isv_porcentaje: "15.00",
-            isv_hnl: "15.00",
-            total_linea_hnl: "115.00",
+            isv_porcentaje: amountHnl === 115 ? "15.00" : "0.00",
+            isv_hnl: amountHnl === 115 ? "15.00" : "0.00",
+            total_linea_hnl: String(amountHnl),
           }],
         };
       }
@@ -583,7 +599,7 @@ function createPagosClient({
         if (text.includes("EXISTS")) {
           return { rows: [{
             ...activeIntent,
-            id_grupo_cita: GROUP_A,
+            id_grupo_cita: groupId,
             has_captured_payment: Boolean(payment),
           }] };
         }
@@ -617,10 +633,10 @@ function createPagosClient({
         return { rows: [] };
       }
       if (text.includes("FROM public.citas c") && text.includes("JOIN public.citas_grupos cg")) {
-        return { rows: [{ id_grupo_cita: GROUP_A, id_cliente_titular: null }] };
+        return { rows: [{ id_grupo_cita: groupId, id_cliente_titular: null }] };
       }
       if (text.includes("SELECT COALESCE(SUM(total_pagar_hnl),0)::numeric AS total")) {
-        return { rows: [{ total: "115.00" }] };
+        return { rows: [{ total: String(amountHnl) }] };
       }
       if (text.includes("app_private.confirmar_reserva_pagada_v1")) {
         if (slotReused) {
@@ -633,7 +649,12 @@ function createPagosClient({
           row.estado_cita_codigo = "confirmada";
           row.estado_hold_codigo = "consumido";
         }
-        return { rows: [{ resultado: { confirmed: true, id_grupo_cita: GROUP_A } }] };
+        return { rows: [{ resultado: { confirmed: true, id_grupo_cita: groupId } }] };
+      }
+      if (text.includes("UPDATE public.citas_grupos") && text.includes("estado_grupo_codigo = 'activo'")) {
+        groupStateCode = "activo";
+        for (const row of groupState) row.estado_grupo_codigo = "activo";
+        return { rows: [] };
       }
       if (text.includes("UPDATE public.citas") && text.includes("estado_cita_codigo = 'pendiente_pago'")) {
         for (const row of groupState) {
@@ -2103,6 +2124,7 @@ test("compatibilidad legacy no permite UUID perteneciente a otro intent", async 
 function durableApprovalFixture(overrides = {}) {
   return {
     id_intent: INTENT_A, outcome: "approved", finalized_at: "2020-01-01T15:59:00.000Z",
+    sdk_response_class: "SuccessResponse", upstream_http_status: 200,
     response_success: true, response_approved: true, response_incomplete: false,
     transaction_result_valid: true, transaction_result_parsed: true,
     payment_uuid_present: true, transaction_id_present: true, payment_hash_present: true,
@@ -2117,6 +2139,8 @@ const invalidApprovals = [
   ["despues del expiry", { finalized_at: "2020-01-01T16:00:00.001Z" }],
   ["otro intent", { id_intent: CITA_B }],
   ["outcome incierto", { outcome: "uncertain" }],
+  ["HTTP no exitoso", { upstream_http_status: 422 }],
+  ["clase no exitosa", { sdk_response_class: "InputErrorResponse" }],
   ["uncertain true", { uncertain: true }],
   ["incomplete true", { response_incomplete: true }],
   ...["response_success", "response_approved", "transaction_result_valid", "transaction_result_parsed",
@@ -2210,6 +2234,184 @@ test("helper durable falla cerrado con holds ausentes o invalidos sin consultar 
   for (const groupRows of [[], [{}], [{ expires_at: null }], [{ expires_at: "invalid" }]]) {
     assert.equal(await loadDurablePixelPayApproval(client, { idIntent: INTENT_A, groupRows }), null);
   }
+});
+
+function localRecoveryClient(overrides = {}) {
+  return createPagosClient({ providerCode: "pixelpay", groupStateCode: "cancelado",
+    groupCitaState: "expirada", groupHoldState: "expirado", holdExpiresAt: "2020-01-01T16:00:00.000Z",
+    existingIntent: reconciliationIntent(), initialSaleAttempts: [durableApprovalFixture()], ...overrides });
+}
+
+async function recoverLocally(client, overrides = {}) {
+  const previousProvider = PaymentProviderFactory._instance;
+  const provider = { saleCalls: 0, statusCalls: 0,
+    async sale() { this.saleCalls++; throw new Error("Sale prohibida en recovery local"); },
+    async queryPaymentStatus() { this.statusCalls++; throw new Error("Status prohibido en recovery local"); },
+  };
+  PaymentProviderFactory._instance = provider;
+  try {
+    return await reconcilePixelPayFromDurableApproval(client, {
+      idGrupoCita: GROUP_A, idIntent: INTENT_A, titularEmail: "cliente@example.com", ...overrides,
+    });
+  } finally {
+    assert.equal(provider.saleCalls, 0);
+    assert.equal(provider.statusCalls, 0);
+    assert.equal(client.getStatusChecks().length, 0);
+    PaymentProviderFactory._instance = previousProvider;
+  }
+}
+
+test("durable recovery local: aprobado pre-expiry recupera grupo sin Sale/Status y es idempotente", async () => {
+  const client = localRecoveryClient();
+  const result = await recoverLocally(client);
+  assert.equal(result.booking_confirmed, true);
+  const payment = client.getPayments()[0];
+  assert.equal(payment.provider_tx_id, "PAYMENT-UUID-NEW");
+  assert.equal(payment.estado_pago_codigo, "capturado");
+  assert.equal(payment.paid_at, durableApprovalFixture().finalized_at);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getActiveIntent().paid_at, payment.paid_at);
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  assert.equal(client.getGroupState()[0].estado_hold_codigo, "consumido");
+  assert.equal(client.getGroupState()[0].estado_grupo_codigo, "activo");
+  const afterFirst = client.calls.length;
+  assert.equal((await recoverLocally(client)).duplicate, true);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
+  assert.doesNotMatch(client.calls.slice(afterFirst).map((call) => call.sql).join("\n"),
+    /INSERT INTO|UPDATE public\.|promociones|notificaciones_email|puntos/i);
+  const approvalQuery = client.calls.findIndex((call) => call.sql.includes("AS finalized_at FROM"));
+  assert.ok(client.calls.findIndex((call) => call.sql.includes("FOR UPDATE OF h")) < approvalQuery);
+});
+
+for (const [name, approvalOverride] of invalidApprovals) {
+  test(`durable recovery local rechaza ${name}, incluso con hold vigente`, async () => {
+    for (const expired of [true, false]) {
+      const client = localRecoveryClient({
+        ...(expired ? {} : { groupCitaState: "pendiente_pago", groupHoldState: "activo", groupStateCode: "activo" }),
+        initialSaleAttempts: approvalOverride === null ? [] : [durableApprovalFixture(approvalOverride)],
+      });
+      const result = await recoverLocally(client);
+      assert.equal(result.manual_reconciliation_required, true);
+      assert.equal(client.getPayments().length, 0);
+      assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+      assert.doesNotMatch(client.calls.map((call) => call.sql).join("\n"), /INSERT INTO|UPDATE public\./);
+    }
+  });
+}
+
+for (const [name, intentOverride] of [
+  ["UUID ausente", { provider_session_id: null }],
+  ["transactionId ausente", { referencia_externa: null }],
+  ["referencias iguales", { referencia_externa: "PAYMENT-UUID-NEW" }],
+  ["intent fallido", { estado_intent_codigo: "fallido" }],
+  ["monto diferente", { monto_hnl: "114.00" }],
+]) {
+  test(`durable recovery local rechaza ${name}`, async () => {
+    const client = localRecoveryClient({ existingIntent: reconciliationIntent(intentOverride) });
+    assert.equal((await recoverLocally(client)).manual_reconciliation_required, true);
+    assert.equal(client.getPayments().length, 0);
+  });
+}
+
+for (const state of ["cancelada", "cancelada_por_cliente", "anulada", "no_show", "completada"]) {
+  test(`durable recovery local no revive cita ${state}`, async () => {
+    const client = localRecoveryClient({ groupCitaState: state });
+    assert.equal((await recoverLocally(client)).manual_reconciliation_required, true);
+    assert.equal(client.getPayments().length, 0);
+    assert.equal(client.getGroupState()[0].estado_cita_codigo, state);
+  });
+}
+
+test("durable recovery local rechaza evidencia ambigua (dos aprobaciones compatibles)", async () => {
+  const client = localRecoveryClient({ initialSaleAttempts: [durableApprovalFixture(), durableApprovalFixture()] });
+  assert.equal((await recoverLocally(client)).manual_reconciliation_required, true);
+  assert.equal(client.getPayments().length, 0);
+});
+
+test("durable recovery local usa solo referencias DB e ignora paidAt/monto/UUID del caller", async () => {
+  const client = localRecoveryClient({ groupStateCode: "activo", groupCitaState: "pendiente_pago",
+    groupHoldState: "activo", holdExpiresAt: "2099-01-01T16:00:00.000Z" });
+  const result = await recoverLocally(client, { paymentUuid: "OTRO-UUID", providerTransactionId: "OTRA-TX",
+    paidAt: "2099-01-01T00:00:00Z", expectedAmount: 1 });
+  assert.equal(result.booking_confirmed, true);
+  assert.equal(client.getPayments()[0].provider_tx_id, "PAYMENT-UUID-NEW");
+  assert.equal(client.getPayments()[0].paid_at, durableApprovalFixture().finalized_at);
+  assert.equal(client.getPayments()[0].monto_hnl, 115);
+});
+
+test("durable recovery local valida titular y pertenencia del intent sin escrituras", async () => {
+  const client = localRecoveryClient();
+  await assert.rejects(recoverLocally(client, { titularEmail: "otra-persona@example.com" }),
+    (error) => error.code === "PUBLIC_PAGOS_GROUP_FORBIDDEN");
+  const mismatched = localRecoveryClient({ existingIntent: reconciliationIntent({ id_grupo_cita: CITA_B }) });
+  await assert.rejects(recoverLocally(mismatched), (error) => error.code === "PUBLIC_PAGOS_INTENT_GROUP_MISMATCH");
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(mismatched.getPayments().length, 0);
+});
+
+test("durable recovery local exige el menor expiry de todos los holds", async () => {
+  const client = localRecoveryClient({ groupSize: 2, secondHoldState: "expirado",
+    secondHoldExpiresAt: "2020-01-01T15:58:00.000Z", existingIntent: reconciliationIntent({ monto_hnl: "230.00" }) });
+  assert.equal((await recoverLocally(client)).manual_reconciliation_required, true);
+  assert.equal(client.getPayments().length, 0);
+  const evidence = client.calls.find((call) => call.sql.includes("AS finalized_at FROM"));
+  assert.equal(evidence.params[1], "2020-01-01T15:58:00.000Z");
+});
+
+test("durable recovery local rechaza payment previo de monto incorrecto", async () => {
+  const client = localRecoveryClient({ initialPayments: [{ id_intent: INTENT_A, provider_tx_id: "PAYMENT-UUID-NEW",
+    estado_pago_codigo: "capturado", monto_hnl: 114, moneda_codigo: "HNL" }] });
+  assert.equal((await recoverLocally(client)).manual_reconciliation_required, true);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+});
+
+test("durable recovery local protege slot reutilizado con rollback completo", async () => {
+  const client = localRecoveryClient({ slotReused: true });
+  await assert.rejects(recoverLocally(client), (error) => error.code === "PAYMENT_SLOT_ALREADY_RELEASED");
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "expirada");
+  assert.equal(client.getGroupState()[0].estado_hold_codigo, "expirado");
+  assert.equal(client.getGroupState()[0].estado_grupo_codigo, "cancelado");
+  assert.ok(client.calls.some((call) => call.sql === "ROLLBACK"));
+});
+
+test("durable recovery local acepta payment legacy del mismo intent sin segundo payment", async () => {
+  const legacy = { id_intent: INTENT_A, provider_tx_id: "TX-SANDBOX-REPEATED", estado_pago_codigo: "capturado",
+    monto_hnl: 115, moneda_codigo: "HNL" };
+  const client = localRecoveryClient({ initialPayments: [legacy] });
+  assert.equal((await recoverLocally(client)).duplicate, true);
+  assert.equal((await recoverLocally(client)).duplicate, true);
+  assert.deepEqual(client.getPayments(), [legacy]);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
+});
+
+test("durable recovery local fixture real QA preserva microsegundos e ignora colision historica transactionId", async () => {
+  const idIntent = "9b1626eb-0c04-4ce3-ae93-5296ddcb02fe";
+  const groupId = "1cc40753-b888-4452-82b5-8e384d590fbc";
+  const citaId = "05f53173-ab1a-4b35-8a70-88f2f40d22f2";
+  const holdId = "1dcc3717-bec0-4b31-be58-20f0821c947a";
+  const uuid = "S-a2f5612c-5084-4134-ad5f-feeb0ae6d8c8";
+  const tx = "1f694eee-4715-45b8-a545-000000000000";
+  const finalizedAt = "2026-10-11T19:43:29.880935Z";
+  const historical = { id_intent: CITA_B, provider_tx_id: tx, estado_pago_codigo: "capturado" };
+  const client = localRecoveryClient({ groupId, citaId, holdId, amountHnl: 1,
+    holdExpiresAt: "2026-10-11T19:48:29.071048Z", ownerEmail: "jorgedavidcarbajal1960@gmail.com",
+    existingIntent: reconciliationIntent({ id_intent: idIntent, id_grupo_cita: groupId, id_cita: citaId, id_hold: holdId,
+      provider_session_id: uuid, referencia_externa: tx, monto_hnl: "1.00" }),
+    initialSaleAttempts: [durableApprovalFixture({ id_intent: idIntent, finalized_at: finalizedAt })],
+    initialPayments: [historical],
+  });
+  assert.equal((await recoverLocally(client, { idGrupoCita: groupId, idIntent, titularEmail: "jorgedavidcarbajal1960@gmail.com" })).booking_confirmed, true);
+  assert.deepEqual(client.getPayments()[0], historical);
+  assert.equal(client.getPayments().length, 2);
+  assert.equal(client.getPayments()[1].provider_tx_id, uuid);
+  assert.equal(client.getPayments()[1].paid_at, finalizedAt);
+  assert.equal(client.getPayments()[1].monto_hnl, 1);
+  assert.equal(client.getActiveIntent().referencia_externa, tx);
+  assert.equal(client.getActiveIntent().paid_at, finalizedAt);
 });
 
 test("status carga intent PixelPay y registra una verificacion con proveedor simulado", async () => {
