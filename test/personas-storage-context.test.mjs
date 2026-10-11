@@ -307,15 +307,15 @@ test("asociacion inicial rechaza propietario, metadatos, estado, bucket y destin
   const scenarios = [
     {
       asset: barberAsset({ entity_id: null, status: "temporal", owner_user_id: OTHER_CLIENT_ID, uploaded_by: OTHER_CLIENT_ID }),
-      code: "STORAGE_BRANCH_FORBIDDEN",
+      code: "STORAGE_ASSET_FORBIDDEN",
     },
     {
       asset: barberAsset({ entity_id: null, status: "temporal", owner_user_id: USER_ID, uploaded_by: OTHER_CLIENT_ID }),
-      code: "STORAGE_BRANCH_FORBIDDEN",
+      code: "STORAGE_ASSET_FORBIDDEN",
     },
     {
       asset: barberAsset({ entity_id: null, status: "activo", owner_user_id: USER_ID, uploaded_by: USER_ID }),
-      code: "STORAGE_BRANCH_FORBIDDEN",
+      code: "STORAGE_ASSET_FORBIDDEN",
     },
     {
       asset: barberAsset({ entity_id: OTHER_CLIENT_ID, owner_user_id: USER_ID, uploaded_by: USER_ID }),
@@ -344,6 +344,57 @@ test("asociacion inicial rechaza propietario, metadatos, estado, bucket y destin
       idSucursal: BRANCH_ID,
       claims: claims("admin"),
     }), { code: scenario.code });
+  }
+});
+
+test("asociacion inicial no puede usar fallback de sucursal cuando la autoria no es valida", async () => {
+  for (const asset of [
+    barberAsset({ entity_id: null, status: "temporal", owner_user_id: OTHER_CLIENT_ID, uploaded_by: OTHER_CLIENT_ID }),
+    barberAsset({ entity_id: null, status: "temporal", owner_user_id: USER_ID, uploaded_by: OTHER_CLIENT_ID }),
+    barberAsset({ entity_id: null, status: "temporal", owner_user_id: null, uploaded_by: null }),
+    barberAsset({ entity_id: null, status: "activo", owner_user_id: USER_ID, uploaded_by: USER_ID }),
+  ]) {
+    const { client } = buildHarness({ assets: [asset] });
+    await assert.rejects(() => resolveAssetForBinding(client, {
+      assetId: ASSET_ID,
+      scopeKey: "public_barber_profile",
+      entityType: "barbero",
+      entityId: EMPLOYEE_ID,
+      idSucursal: BRANCH_ID,
+      claims: claims("admin", [BRANCH_ID]),
+    }), { code: "STORAGE_ASSET_FORBIDDEN" });
+  }
+});
+
+test("asociacion propia y fotografias ya vinculadas conservan acceso administrativo", async () => {
+  for (const actor of [claims("admin", [BRANCH_ID]), claims("admin"), claims("super_admin")]) {
+    const temporary = barberAsset({
+      entity_id: null,
+      status: "temporal",
+      owner_user_id: USER_ID,
+      uploaded_by: USER_ID,
+    });
+    const temporaryHarness = buildHarness({ assets: [temporary] });
+    const resolvedTemporary = await resolveAssetForBinding(temporaryHarness.client, {
+      assetId: ASSET_ID,
+      scopeKey: "public_barber_profile",
+      entityType: "barbero",
+      entityId: EMPLOYEE_ID,
+      idSucursal: BRANCH_ID,
+      claims: actor,
+    });
+    assert.equal(resolvedTemporary.id_asset, ASSET_ID);
+
+    const linkedHarness = buildHarness({ assets: [barberAsset()] });
+    const resolvedLinked = await resolveAssetForBinding(linkedHarness.client, {
+      assetId: ASSET_ID,
+      scopeKey: "public_barber_profile",
+      entityType: "barbero",
+      entityId: EMPLOYEE_ID,
+      idSucursal: BRANCH_ID,
+      claims: actor,
+    });
+    assert.equal(resolvedLinked.id_asset, ASSET_ID);
   }
 });
 
@@ -740,7 +791,7 @@ test("creacion transversal rechaza asset temporal ajeno y compensa antes del COM
     },
   });
   assert.equal(response.statusCode, 403, response.body);
-  assert.equal(response.json().error.code, "STORAGE_BRANCH_FORBIDDEN");
+  assert.equal(response.json().error.code, "STORAGE_ASSET_FORBIDDEN");
   assert.deepEqual(activity.commands, ["BEGIN", "ROLLBACK"]);
   assert.equal(activity.authCreated, 1);
   assert.equal(activity.authDeleted, 1);

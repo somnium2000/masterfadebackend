@@ -196,15 +196,20 @@ function assertContextualAssetAccess(claims, asset, context = null) {
     && assetOwnerIds.every((value) => value === actorUserId);
   const isExistingEntityBinding = context?.entityId
     && String(asset?.entity_id || "") === String(context.entityId);
-  const hasVerifiedBarberContext = context
+  const isVerifiedAdminBarberContext = context
     && isAdminBarberProfileContext(claims, context.scopeKey, context.entityType)
     && context.entityId
     && context.idSucursal
     && String(asset?.scope_key || "") === String(context.scopeKey)
     && String(asset?.entity_type || "") === String(context.entityType)
-    && String(asset?.id_sucursal || "") === String(context.idSucursal)
-    && (isExistingEntityBinding || isOwnedTemporaryBinding);
-  if (hasVerifiedBarberContext) return;
+    && String(asset?.id_sucursal || "") === String(context.idSucursal);
+  if (isVerifiedAdminBarberContext && !asset?.entity_id) {
+    if (isOwnedTemporaryBinding) return;
+    throw new AppError(403, "No tienes permisos para asociar este asset temporal", {
+      code: "STORAGE_ASSET_FORBIDDEN",
+    });
+  }
+  if (isVerifiedAdminBarberContext && isExistingEntityBinding) return;
   assertAssetAccessByClaims(claims, asset);
 }
 
