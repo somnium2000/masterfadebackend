@@ -5,9 +5,10 @@ import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
 import { assertUserNotProtected } from "../../../services/protectedUsersService.js";
 import {
   activateAssetForEntity,
-  buildAssetReadUrl,
+  buildPersonasClientProfileReadUrl,
   replaceAssetIfNeeded,
   resolveAssetForBinding,
+  validateAssetReplacement,
 } from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
@@ -742,8 +743,9 @@ async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
     return cliente;
   }
   try {
-    const readUrl = await buildAssetReadUrl(app, {
+    const readUrl = await buildPersonasClientProfileReadUrl(app, {
       claims,
+      clientId: cliente.id_cliente,
       assetId: cliente.foto_perfil_asset_id,
     });
     return {
@@ -1865,6 +1867,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
   let authEmailUpdated = false;
   let authEmailPrevious = null;
   let authUserIdForCompensation = null;
+  let transactionCommitted = false;
 
   try {
     const current = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
@@ -1924,6 +1927,17 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
         claims: request.claims,
         allowUnboundEntity: true,
         allowedStatuses: ["temporal", "activo"],
+      })
+      : null;
+    const previousFotoPerfilAsset = fotoPerfilChanged && esBarbero
+      ? await validateAssetReplacement(client, {
+        previousAssetId: currentRow.foto_perfil_asset_id,
+        nextAssetId: nextFotoPerfilAssetIdRaw,
+        scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+        entityType: "barbero",
+        entityId: idEmpleado,
+        idSucursal: currentRow.id_sucursal,
+        claims: request.claims,
       })
       : null;
 
@@ -2038,13 +2052,31 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     await client.query("COMMIT");
     transactionStarted = false;
+    transactionCommitted = true;
 
     if (fotoPerfilChanged && esBarbero) {
-      await replaceAssetIfNeeded(app, client, {
-        previousAssetId: currentRow.foto_perfil_asset_id,
-        nextAssetId: nextFotoPerfilAssetIdRaw,
-        claims: request.claims,
-      });
+      try {
+        await replaceAssetIfNeeded(app, client, {
+          previousAssetId: currentRow.foto_perfil_asset_id,
+          nextAssetId: nextFotoPerfilAssetIdRaw,
+          claims: request.claims,
+          scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+          entityType: "barbero",
+          entityId: idEmpleado,
+          idSucursal: currentRow.id_sucursal,
+          prevalidatedAsset: previousFotoPerfilAsset,
+          logger: request.log,
+        });
+      } catch (cleanupError) {
+        request.log.warn(
+          {
+            err: cleanupError,
+            id_empleado: idEmpleado,
+            id_asset_anterior: currentRow.foto_perfil_asset_id,
+          },
+          "No se pudo limpiar la fotografia anterior despues de actualizar el empleado"
+        );
+      }
     }
 
     return { empleado: mapEmpleado(detail.rows[0]) };
@@ -2052,7 +2084,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     if (transactionStarted) {
       await client.query("ROLLBACK").catch(() => {});
     }
-    if (authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
+    if (!transactionCommitted && authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
       try {
         await syncAuthUserEmail(app, authUserIdForCompensation, authEmailPrevious);
       } catch (compensationError) {

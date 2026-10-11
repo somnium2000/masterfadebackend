@@ -30,11 +30,22 @@ test("detalle de cliente recupera el asset y genera URL firmada privada", async 
     bucket_name: "private-client-profile",
     object_path: PHOTO_PATH,
     visibility: "private",
+    scope_key: "private_client_profile",
+    entity_type: "cliente",
+    entity_id: CLIENT_ID,
+    owner_cliente_id: CLIENT_ID,
     deleted_at: null,
   };
   const dbClient = {
     async query(sql) {
-      assert.match(String(sql), /FROM public\.storage_assets/);
+      const text = String(sql);
+      if (text.includes("FROM public.clientes c")) {
+        return {
+          rows: [{ id_cliente: CLIENT_ID, foto_perfil_asset_id: ASSET_ID }],
+          rowCount: 1,
+        };
+      }
+      assert.match(text, /FROM public\.storage_assets/);
       return { rows: [assetRow], rowCount: 1 };
     },
     release() {},
