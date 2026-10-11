@@ -5,7 +5,9 @@ import {
   createPixelPaySaleAttemptRecord,
   finalizePixelPaySaleAttempt,
   finalizePixelPaySaleAttemptBestEffort,
+  PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS,
 } from "../src/services/payments/pixelPaySaleAttemptStore.js";
+import { createHangingPgPool } from "./helpers/hangingPgPool.mjs";
 import {
   buildSafePixelPaySdkDiagnostics,
   buildSafeProviderErrorDiagnostic,
@@ -33,7 +35,10 @@ function makeMemoryDb() {
   return {
     calls, records,
     async query(sql, params) {
-      calls.push({ sql, params });
+      const queryTimeout = typeof sql === "object" ? sql.query_timeout : null;
+      params = typeof sql === "object" ? sql.values : params;
+      sql = typeof sql === "object" ? sql.text : sql;
+      calls.push({ sql, params, queryTimeout });
       if (sql.includes("INSERT")) {
         records.push({ payment_attempt_id: params[1], finalized_at: null });
         return { rows: [{ id_sale_attempt: ID_ATTEMPT }] };
@@ -55,6 +60,7 @@ test("START usa el client suministrado y solamente identifiers y flags seguros",
     card_expire: privateValues[2], cardholder: privateValues[4], billing_address: privateValues[3],
   });
   assert.deepEqual(db.calls[0].params, [ID_INTENT, ID_ATTEMPT, "req-store", true, true, 30]);
+  assert.equal(db.calls[0].queryTimeout, null);
   assert.doesNotMatch(db.calls[0].sql, /BEGIN|COMMIT|ROLLBACK|payment_intents/);
   for (const value of privateValues) assert.equal(JSON.stringify(db.calls[0].params).includes(value), false);
 });
@@ -80,6 +86,7 @@ for (const outcome of Object.values(PIXELPAY_SALE_OUTCOME)) {
       durationMs: 12, cfRay: "aabbccddeeff0011-MIA",
     }), true);
     const { sql, params } = db.calls[1];
+    assert.equal(db.calls[1].queryTimeout, PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS);
     assert.equal(params[5], outcome);
     assert.equal(params[6], outcome === "uncertain");
     assert.ok(params.slice(13, 26).every((value) => value === false));
@@ -198,6 +205,30 @@ test("fallo FINAL produce log critico sanitizado y nunca propaga la excepcion", 
   assert.equal(logs[0].paymentAttemptId, ID_ATTEMPT);
   for (const value of privateValues) assert.equal(JSON.stringify(logs).includes(value), false);
   assert.equal(await finalizePixelPaySaleAttemptBestEffort(pool, start, { fatal() { throw new Error("fallo logger"); } }), false);
+});
+
+test("FINAL excedido usa el timer real de pg 8.16.3 y destruye/retira la conexion del pool", {
+  timeout: PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS + 10000,
+}, async (t) => {
+  const { pool, connections } = createHangingPgPool();
+  const logs = [];
+  t.after(() => pool.end());
+  const startedAt = Date.now();
+  const finalized = await finalizePixelPaySaleAttemptBestEffort(pool, start, {
+    fatal(payload) { logs.push(payload); },
+  });
+  assert.equal(finalized, false);
+  assert.ok(Date.now() - startedAt >= PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS - 20);
+  assert.equal(connections.length, 1);
+  assert.equal(connections[0].executions, 1);
+  assert.equal(connections[0].destroyed, true);
+  assert.equal(pool.totalCount, 0);
+  assert.equal(pool.idleCount, 0);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].event, "PIXELPAY_SALE_FINAL_PERSISTENCE_FAILED");
+  assert.equal(logs[0].paymentAttemptId, ID_ATTEMPT);
+  assert.equal(logs[0].err, undefined);
+  assert.equal(logs[0].message, undefined);
 });
 
 test("migration privada define contrato, checks y allowlists identicas a JavaScript", async () => {

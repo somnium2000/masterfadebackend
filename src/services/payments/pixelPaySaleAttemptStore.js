@@ -6,6 +6,8 @@ import {
 import { safePixelPayUuid } from "./pixelPaySaleTelemetry.js";
 import { PIXELPAY_SALE_OUTCOME } from "./PixelPayDirectProvider.js";
 
+export const PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS = 1000;
+
 function requireUuid(value) {
   const uuid = safePixelPayUuid(value);
   if (!uuid) throw new TypeError("Identificador de diagnostico PixelPay invalido.");
@@ -36,8 +38,10 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
     code: dto.errorCode, name: dto.errorName, sdkErrorName: dto.sdkErrorName,
     errorConstructorName: dto.errorConstructorName,
   });
-  const result = await pool.query(
-    `UPDATE app_private.pixelpay_sale_attempts
+  const result = await pool.query({
+    // AM: El timeout nativo de pg-pool retira la conexion fallida; no afecta START ni finanzas.
+    query_timeout: PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS,
+    text: `UPDATE app_private.pixelpay_sale_attempts
      SET finalized_at = clock_timestamp(),
          duration_ms = $2::integer,
          sdk_response_class = $3::varchar(80), upstream_http_status = $4::smallint,
@@ -57,7 +61,7 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
          sdk_error_name = $30::varchar(80), error_constructor_name = $31::varchar(80)
      WHERE payment_attempt_id = $1::uuid AND finalized_at IS NULL
      RETURNING id_sale_attempt`,
-    [
+    values: [
       requireUuid(dto.paymentAttemptId), safe?.durationMs ?? null,
       safe?.sdkResponseClass ?? null, safe?.statusCode ?? null, safe?.safeMessageCode ?? null,
       safe?.outcome ?? null, safe?.outcome == null ? null : safe.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN,
@@ -70,7 +74,7 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
       safe?.approvedAmountMatches ?? null, safe?.amountMatches ?? null, safe?.cfRay ?? null,
       error.errorCode, error.errorName, error.sdkErrorName, error.errorConstructorName,
     ]
-  );
+  });
   return result.rows.length > 0;
 }
 
