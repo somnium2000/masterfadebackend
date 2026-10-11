@@ -10,6 +10,7 @@ const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const S1 = "21111111-1111-4111-8111-111111111111";
 const S2 = "22222222-2222-4222-8222-222222222222";
+const S3 = "23333333-3333-4333-8333-333333333333";
 
 const cleanSql = (sql) => String(sql).replace(/\s+/g, " ").trim();
 const packageRow = (branchId = A) => ({
@@ -37,7 +38,7 @@ async function buildApp({
   exists = true,
   failOn = null,
 } = {}) {
-  const state = { masterUpdates: 0, detailDeletes: 0, detailInserts: 0, offerWrites: 0, rollback: 0, commit: 0, activeOfferQueries: 0, validatedBranches: [], sequence: [] };
+  const state = { masterUpdates: [], detailDeletes: 0, detailInserts: 0, offerWrites: 0, rollback: 0, commit: 0, activeOfferQueries: 0, validatedBranches: [], sequence: [] };
   const query = async (sql, params = []) => {
     const text = cleanSql(sql);
     if (text === "BEGIN") return { rows: [], rowCount: 0 };
@@ -63,7 +64,7 @@ async function buildApp({
       };
     }
     if (text.includes("FROM public.paquetes_detalles pd") && text.includes("ORDER BY pd.id_servicio")) return { rows: [{ id_servicio: S1, cantidad: 1 }, { id_servicio: S2, cantidad: 1 }], rowCount: 2 };
-    if (text.startsWith("UPDATE public.paquetes SET")) { state.sequence.push("master"); state.masterUpdates += 1; if (failOn === "master") throw new Error("simulated"); return { rows: [], rowCount: 1 }; }
+    if (text.startsWith("UPDATE public.paquetes SET")) { state.sequence.push("master"); state.masterUpdates.push({ sql: text, params }); if (failOn === "master") throw new Error("simulated"); return { rows: [], rowCount: 1 }; }
     if (text.startsWith("DELETE FROM public.paquetes_detalles")) { state.sequence.push("delete"); state.detailDeletes += 1; if (failOn === "delete") throw new Error("simulated"); return { rows: [], rowCount: 1 }; }
     if (text.startsWith("INSERT INTO public.paquetes_detalles")) { state.sequence.push("insert"); state.detailInserts += 1; if (failOn === "insert") throw new Error("simulated"); return { rows: [], rowCount: 1 }; }
     if (text.includes("FROM public.paquetes_sucursal ps") && text.includes("FOR UPDATE")) {
@@ -88,7 +89,7 @@ async function buildApp({
 const compositionPayload = {
   id_sucursal: A,
   items: [
-    { id_servicio: S1, cantidad: 1 },
+    { id_servicio: S1, cantidad: 2 },
     { id_servicio: S2, cantidad: 1 },
   ],
 };
@@ -105,7 +106,7 @@ test("rechaza composicion compatible en A pero incompatible en oferta activa B",
   const response = await patchPackage(app);
   assert.equal(response.statusCode, 409);
   assert.equal(response.json().error.code, "CATALOG_PACKAGE_COMPOSITION_BRANCH_CONFLICT");
-  assert.equal(state.masterUpdates, 0);
+  assert.equal(state.masterUpdates.length, 0);
   assert.equal(state.detailDeletes, 0);
   assert.equal(state.detailInserts, 0);
   assert.equal(state.offerWrites, 0);
@@ -166,7 +167,7 @@ for (const [label, payload] of [
     const { app, state } = await buildApp(); t.after(() => app.close());
     assert.equal((await patchPackage(app, payload)).statusCode, 200);
     assert.equal(state.activeOfferQueries, 0);
-    assert.deepEqual(state.validatedBranches, [A]);
+    assert.deepEqual(state.validatedBranches, label === "nombre y descripcion" ? [] : [A]);
   });
 }
 
@@ -188,7 +189,7 @@ test("incompatibilidad preserva maestro detalles y ofertas", async (t) => {
   const { app, state } = await buildApp(); t.after(() => app.close());
   assert.equal((await patchPackage(app)).statusCode, 409);
   assert.deepEqual(
-    { master: state.masterUpdates, deletes: state.detailDeletes, inserts: state.detailInserts, offers: state.offerWrites },
+    { master: state.masterUpdates.length, deletes: state.detailDeletes, inserts: state.detailInserts, offers: state.offerWrites },
     { master: 0, deletes: 0, inserts: 0, offers: 0 }
   );
 });
@@ -239,7 +240,7 @@ test("bloquea el paquete antes de validar y sustituir composicion", async (t) =>
   assert.ok(state.sequence.indexOf("lock") < state.sequence.indexOf("delete"));
 });
 
-for (const failOn of ["master", "delete", "insert", "offer"]) {
+for (const failOn of ["delete", "insert"]) {
   test(`falla SQL en ${failOn} revierte la transaccion`, async (t) => {
     const { app, state } = await buildApp({ incompatibleBranches: [], failOn }); t.after(() => app.close());
     assert.equal((await patchPackage(app)).statusCode, 500);
@@ -247,3 +248,67 @@ for (const failOn of ["master", "delete", "insert", "offer"]) {
     assert.equal(state.commit, 0);
   });
 }
+
+for (const [failOn, payload] of [
+  ["master", { id_sucursal: A, nombre_paquete: "Nuevo nombre" }],
+  ["offer", { id_sucursal: A, precio_hnl: 650 }],
+]) {
+  test(`falla SQL en ${failOn} revierte la transaccion`, async (t) => {
+    const { app, state } = await buildApp({ incompatibleBranches: [], failOn }); t.after(() => app.close());
+    assert.equal((await patchPackage(app, payload)).statusCode, 500);
+    assert.equal(state.rollback, 1);
+    assert.equal(state.commit, 0);
+  });
+}
+
+test("nombre parcial no sobrescribe descripcion ni oferta", async (t) => {
+  const { app, state } = await buildApp({ incompatibleBranches: [] }); t.after(() => app.close());
+  assert.equal((await patchPackage(app, { id_sucursal: A, nombre_paquete: "Nuevo nombre" })).statusCode, 200);
+  assert.equal(state.masterUpdates.length, 1);
+  assert.match(state.masterUpdates[0].sql, /nombre_paquete = \$2/);
+  assert.doesNotMatch(state.masterUpdates[0].sql, /descripcion\s*=/);
+  assert.equal(state.offerWrites, 0);
+  assert.equal(state.detailDeletes, 0);
+});
+
+test("descripcion parcial admite limpieza explicita sin sobrescribir nombre", async (t) => {
+  const { app, state } = await buildApp({ incompatibleBranches: [] }); t.after(() => app.close());
+  assert.equal((await patchPackage(app, { id_sucursal: A, descripcion: null })).statusCode, 200);
+  assert.equal(state.masterUpdates.length, 1);
+  assert.match(state.masterUpdates[0].sql, /descripcion = \$2/);
+  assert.doesNotMatch(state.masterUpdates[0].sql, /nombre_paquete\s*=/);
+  assert.equal(state.masterUpdates[0].params[1], null);
+  assert.equal(state.offerWrites, 0);
+});
+
+test("composicion equivalente en distinto orden no se revalida ni reemplaza", async (t) => {
+  const { app, state } = await buildApp(); t.after(() => app.close());
+  const response = await patchPackage(app, {
+    id_sucursal: A,
+    items: [
+      { id_servicio: S2, cantidad: 1 },
+      { id_servicio: S1, cantidad: 1 },
+    ],
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(state.activeOfferQueries, 0);
+  assert.equal(state.detailDeletes, 0);
+  assert.equal(state.detailInserts, 0);
+  assert.equal(state.masterUpdates.length, 0);
+  assert.equal(state.offerWrites, 0);
+});
+
+test("cambio de servicio ejecuta validacion global y reemplazo", async (t) => {
+  const { app, state } = await buildApp({ incompatibleBranches: [] }); t.after(() => app.close());
+  const response = await patchPackage(app, {
+    id_sucursal: A,
+    items: [
+      { id_servicio: S1, cantidad: 1 },
+      { id_servicio: S3, cantidad: 1 },
+    ],
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(state.activeOfferQueries, 1);
+  assert.equal(state.detailDeletes, 1);
+  assert.equal(state.detailInserts, 2);
+});

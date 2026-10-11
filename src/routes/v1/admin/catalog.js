@@ -1340,6 +1340,15 @@ function normalizePackageItems(items) {
   });
 }
 
+function packageItemsAreEquivalent(currentItems, nextItems) {
+  const canonicalize = (items) => items
+    .map((item) => `${String(item.id_servicio || "").trim()}:${Number(item.cantidad)}`)
+    .sort();
+  const current = canonicalize(currentItems);
+  const next = canonicalize(nextItems);
+  return current.length === next.length && current.every((value, index) => value === next[index]);
+}
+
 async function normalizeInitialPackageOffers(client, claims, body = {}) {
   const hasExplicitOffers = Array.isArray(body.ofertas);
   const source = hasExplicitOffers
@@ -3932,10 +3941,12 @@ export default async function adminCatalogRoutes(app) {
           });
         }
 
-        const shouldMutatePackageBase =
-          request.body.nombre_paquete !== undefined ||
-          request.body.descripcion !== undefined ||
-          request.body.items !== undefined;
+        const hasNombre = request.body.nombre_paquete !== undefined;
+        const hasDescripcion = request.body.descripcion !== undefined;
+        const shouldMutateOffer =
+          request.body.precio_hnl !== undefined ||
+          request.body.visible_publico !== undefined ||
+          request.body.orden_visual !== undefined;
 
         const nombrePaquete =
           request.body.nombre_paquete !== undefined
@@ -3967,49 +3978,67 @@ export default async function adminCatalogRoutes(app) {
         const nextActivo = normalizeBoolean(scopedPackage?.activo, true);
         const nextItems = request.body.items !== undefined ? normalizePackageItems(request.body.items) : null;
 
-        await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
+        if (hasNombre) {
+          await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
+        }
 
+        let compositionChanged = false;
         if (nextItems) {
-          await ensurePackageCompositionAcrossActiveOffers(
-            client,
-            request.claims,
-            request.params.id,
-            nextItems,
-            branchId
-          );
-        } else {
+          const currentItems = await getCurrentPackageItems(client, request.params.id);
+          compositionChanged = !packageItemsAreEquivalent(currentItems, nextItems);
+          if (compositionChanged) {
+            await ensurePackageCompositionAcrossActiveOffers(
+              client,
+              request.claims,
+              request.params.id,
+              nextItems,
+              branchId
+            );
+          }
+        } else if (shouldMutateOffer) {
           const currentItems = await getCurrentPackageItems(client, request.params.id);
           if (currentItems.length > 0) {
             await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
           }
         }
 
-        if (shouldMutatePackageBase) {
+        if (hasNombre || hasDescripcion) {
+          const assignments = [];
+          const params = [request.params.id];
+          if (hasNombre) {
+            params.push(nombrePaquete);
+            assignments.push(`nombre_paquete = $${params.length}`);
+          }
+          if (hasDescripcion) {
+            params.push(descripcion ?? null);
+            assignments.push(`descripcion = $${params.length}`);
+          }
           await client.query(
             `
               UPDATE public.paquetes
               SET
-                nombre_paquete = $2,
-                descripcion = $3,
+                ${assignments.join(",\n                ")},
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_paquete = $1::uuid
             `,
-            [request.params.id, nombrePaquete, descripcion ?? null]
+            params
           );
         }
 
-        if (nextItems) {
+        if (compositionChanged) {
           await replacePackageItems(client, request.params.id, nextItems);
         }
 
-        // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
-        await upsertPackageBranchOffer(client, request.params.id, branchId, {
-          precioHnl,
-          activo: nextActivo,
-          visiblePublico,
-          ordenVisual,
-        });
+        if (shouldMutateOffer) {
+          // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
+          await upsertPackageBranchOffer(client, request.params.id, branchId, {
+            precioHnl,
+            activo: nextActivo,
+            visiblePublico,
+            ordenVisual,
+          });
+        }
 
         const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [request.params.id, branchId]);
         await client.query("COMMIT");
