@@ -11,6 +11,7 @@ const PHOTO_PATH = "clientes/11111111-1111-4111-8111-111111111111/perfil.webp";
 const SIGNED_URL = "https://storage.test/signed/client-profile";
 
 test("detalle de cliente recupera el asset y genera URL firmada privada", async (t) => {
+  let connectCount = 0;
   const clientRow = {
     id_cliente: CLIENT_ID,
     id_persona: PERSON_ID,
@@ -47,6 +48,7 @@ test("detalle de cliente recupera el asset y genera URL firmada privada", async 
       return { rows: [clientRow], rowCount: 1 };
     },
     async connect() {
+      connectCount += 1;
       return dbClient;
     },
   });
@@ -80,4 +82,34 @@ test("detalle de cliente recupera el asset y genera URL firmada privada", async 
   assert.equal(cliente.foto_perfil_asset_id, ASSET_ID);
   assert.equal(cliente.foto_perfil_path, PHOTO_PATH);
   assert.equal(cliente.foto_perfil_signed_url, SIGNED_URL);
+
+  const validPersona = {
+    nombres: "Ana",
+    apellidos: "Prueba",
+    dni: "0801199012345",
+    telefono_principal: "9999-9999",
+  };
+  const createResponse = await app.inject({
+    method: "POST",
+    url: "/personas/clientes",
+    payload: {
+      persona: validPersona,
+      acceso: { habilitar_acceso: true, correo_principal: "ana@example.test" },
+      cliente: { foto_perfil_asset_id: ASSET_ID },
+    },
+  });
+  assert.equal(createResponse.statusCode, 400);
+  assert.equal(createResponse.json().error.code, "PERSONAS_CLIENT_PHOTO_SELF_SERVICE_ONLY");
+
+  const updateResponse = await app.inject({
+    method: "PATCH",
+    url: `/personas/clientes/${CLIENT_ID}`,
+    payload: {
+      persona: validPersona,
+      cliente: { foto_perfil_asset_id: null },
+    },
+  });
+  assert.equal(updateResponse.statusCode, 400);
+  assert.equal(updateResponse.json().error.code, "PERSONAS_CLIENT_PHOTO_SELF_SERVICE_ONLY");
+  assert.equal(connectCount, 1, "los rechazos administrativos no deben abrir transacciones ni modificar datos");
 });

@@ -26,7 +26,6 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // AM: Regla operativa de identidad hondurena para esta fase (13 digitos).
 const DNI_PATTERN = /^\d{13}$/;
 const RTN_PATTERN = /^\d{14}$/;
-const STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE = "private_client_profile";
 const STORAGE_SCOPE_PUBLIC_BARBER_PROFILE = "public_barber_profile";
 const BARBER_PUBLIC_ALIAS_MAX = 80;
 const BARBER_PUBLIC_SUMMARY_MAX = 500;
@@ -720,6 +719,14 @@ function mapCliente(row) {
     credenciales_completadas_at: row.credenciales_completadas_at ?? null,
     ultimo_login_at: row.ultimo_login_at ?? null,
   };
+}
+
+function assertAdminClientPhotoUnchanged(payload) {
+  if (Object.prototype.hasOwnProperty.call(payload?.cliente || {}, "foto_perfil_asset_id")) {
+    throw new AppError(400, "La fotografía de perfil solo puede ser modificada por el cliente", {
+      code: "PERSONAS_CLIENT_PHOTO_SELF_SERVICE_ONLY",
+    });
+  }
 }
 
 async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
@@ -2011,6 +2018,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 }
 
 async function createCliente(app, request, payload) {
+  assertAdminClientPhotoUnchanged(payload);
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
@@ -2025,7 +2033,6 @@ async function createCliente(app, request, payload) {
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
     const consentimientoMarketing = Boolean(cliente.consentimiento_marketing);
     const aceptaTerminos = Boolean(cliente.acepta_terminos);
-    const fotoPerfilAssetId = normalizeOptional(cliente.foto_perfil_asset_id ?? null);
     const consentimientosAt = new Date().toISOString();
     const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
@@ -2187,40 +2194,6 @@ async function createCliente(app, request, payload) {
         );
 
     const createdClientId = clienteInsert.rows[0].id_cliente;
-    if (fotoPerfilAssetId) {
-      const fotoAsset = await resolveAssetForBinding(client, {
-        assetId: fotoPerfilAssetId,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: createdClientId,
-        idSucursal: idSucursalOrigen,
-        claims: request.claims,
-        allowUnboundEntity: true,
-        allowedStatuses: ["temporal", "activo"],
-      });
-      const activatedPhoto = await activateAssetForEntity(app, client, {
-        assetId: fotoAsset.id_asset,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: createdClientId,
-        idSucursal: idSucursalOrigen,
-        ownerClienteId: createdClientId,
-        claims: request.claims,
-        replaceCurrent: false,
-      });
-      await client.query(
-        `
-          UPDATE public.personas
-          SET
-            foto_perfil_asset_id = $2::uuid,
-            foto_perfil_path = $3,
-            updated_at = NOW()
-          WHERE id_persona = $1::uuid
-        `,
-        [idPersona, activatedPhoto.asset.id_asset, activatedPhoto.asset.object_path]
-      );
-    }
-
     const detail = await client.query(CLIENTE_BY_ID_SQL, [createdClientId]);
 
     await client.query("COMMIT");
@@ -2984,6 +2957,7 @@ async function activateEmpleado(app, request, idEmpleado) {
 }
 
 async function updateCliente(app, request, idCliente, payload) {
+  assertAdminClientPhotoUnchanged(payload);
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
@@ -3023,10 +2997,6 @@ async function updateCliente(app, request, idCliente, payload) {
       ? await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null)
       : normalizeOptional(currentRow.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
-    const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(cliente, "foto_perfil_asset_id");
-    const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
-      ? normalizeOptional(cliente.foto_perfil_asset_id ?? null)
-      : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
 
     if (!habilitarAcceso) {
       throw new AppError(400, "Los clientes deben conservar acceso habilitado", {
@@ -3105,18 +3075,6 @@ async function updateCliente(app, request, idCliente, payload) {
       : null;
 
     const roleIdsByName = await loadRoleIdByName(client);
-    const nextFotoPerfilAsset = nextFotoPerfilAssetIdRaw
-      ? await resolveAssetForBinding(client, {
-        assetId: nextFotoPerfilAssetIdRaw,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: idCliente,
-        idSucursal: idSucursalOrigen,
-        claims: request.claims,
-        allowUnboundEntity: true,
-        allowedStatuses: ["temporal", "activo"],
-      })
-      : null;
     if (habilitarAcceso && !currentRow.id_usuario) {
       authUserId = await createAuthIdentity(app, {
         email: correoPrincipal,
@@ -3213,40 +3171,6 @@ async function updateCliente(app, request, idCliente, payload) {
       }
     }
 
-    let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
-    let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
-    if (hasFotoPerfilPatch) {
-      if (!nextFotoPerfilAsset) {
-        nextFotoPerfilAssetId = null;
-        nextFotoPerfilPath = null;
-      } else {
-        const activatedPhoto = await activateAssetForEntity(app, client, {
-          assetId: nextFotoPerfilAsset.id_asset,
-          scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-          entityType: "cliente",
-          entityId: idCliente,
-          idSucursal: idSucursalOrigen,
-          ownerClienteId: idCliente,
-          claims: request.claims,
-          replaceCurrent: false,
-        });
-        nextFotoPerfilAssetId = activatedPhoto.asset.id_asset;
-        nextFotoPerfilPath = activatedPhoto.asset.object_path;
-      }
-
-      await client.query(
-        `
-          UPDATE public.personas
-          SET
-            foto_perfil_asset_id = $2::uuid,
-            foto_perfil_path = $3,
-            updated_at = NOW()
-          WHERE id_persona = $1::uuid
-        `,
-        [currentRow.id_persona, nextFotoPerfilAssetId, nextFotoPerfilPath]
-      );
-    }
-
     if (hasConsentTimestampColumns) {
       await client.query(
         `
@@ -3303,14 +3227,6 @@ async function updateCliente(app, request, idCliente, payload) {
 
     await client.query("COMMIT");
     transactionStarted = false;
-
-    if (hasFotoPerfilPatch) {
-      await replaceAssetIfNeeded(app, client, {
-        previousAssetId: currentRow.foto_perfil_asset_id,
-        nextAssetId: nextFotoPerfilAssetIdRaw,
-        claims: request.claims,
-      });
-    }
 
     let setupPassword = null;
     if (habilitarAcceso && !currentRow.id_usuario) {
