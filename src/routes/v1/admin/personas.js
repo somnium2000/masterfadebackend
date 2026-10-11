@@ -3620,7 +3620,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/catalogos", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/catalogos", { preHandler: app.requireRoles(["super_admin", "admin"]) }, async (request, reply) => {
     try {
       const [rolesResult, sucursalesResult] = await Promise.all([
         app.db.query("SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"),

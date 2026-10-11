@@ -38,6 +38,12 @@ async function createApp() {
       if (String(sql).includes("FROM public.empleados e")) {
         return { rows: [], rowCount: 0 };
       }
+      if (String(sql).includes("FROM public.roles")) {
+        return { rows: [{ id_rol: "rol-admin", nombre: "admin" }], rowCount: 1 };
+      }
+      if (String(sql).includes("FROM public.sucursales")) {
+        return { rows: [{ id_sucursal: BRANCH_ID, nombre_sucursal: "Sucursal QA" }], rowCount: 1 };
+      }
       throw new Error("Unexpected database query in authorization test");
     },
     async connect() {
@@ -133,6 +139,27 @@ test("usuarios sin rol autorizado reciben 403", async (t) => {
   assert.equal(response.statusCode, 403);
   assert.equal(response.json().error.code, "AUTH_FORBIDDEN");
   assert.equal(activity.dbQueries, 0);
+});
+
+test("admin y super_admin conservan acceso al catalogo compartido", async (t) => {
+  const { app, activity } = await createApp();
+  t.after(() => app.close());
+
+  for (const role of ["admin", "super_admin"]) {
+    const response = await app.inject({
+      method: "GET",
+      url: "/personas/catalogos",
+      headers: { "x-test-roles": role },
+    });
+
+    assert.equal(response.statusCode, 200, role);
+    assert.equal(response.json().data.roles[0].nombre, "admin", role);
+    assert.equal(response.json().data.sucursales[0].id_sucursal, BRANCH_ID, role);
+  }
+
+  assert.equal(activity.dbQueries, 4);
+  assert.equal(activity.dbConnections, 0);
+  assert.equal(activity.authCalls, 0);
 });
 
 test("super_admin supera el guard y conserva la eliminacion permanente prohibida", async (t) => {
