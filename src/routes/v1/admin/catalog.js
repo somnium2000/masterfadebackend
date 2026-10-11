@@ -2818,7 +2818,11 @@ export default async function adminCatalogRoutes(app) {
           (requestedAgendable !== undefined && requestedAgendable !== currentAgendable);
         let targetServiceId = request.params.id;
 
-        if (shouldMutateServiceBase && requestedNombreServicio !== undefined) {
+        if (
+          shouldMutateServiceBase &&
+          requestedNombreServicio !== undefined &&
+          requestedNombreServicio !== currentNombreServicio
+        ) {
           await ensureUniqueServiceNameByBranch(client, request.params.id, branchId, requestedNombreServicio);
           const serviceSharedAcrossBranches = await hasServiceTariffsInOtherBranches(client, request.params.id, branchId);
           if (serviceSharedAcrossBranches) {
