@@ -6,7 +6,17 @@ import {
   HONDURAS_ISO_3166_2_CODES,
   PIXELPAY_SALE_OUTCOME,
 } from "../../../services/payments/PixelPayDirectProvider.js";
-import { safePixelPayInputErrorFields } from "../../../services/payments/pixelPaySaleTelemetry.js";
+import {
+  buildSafeProviderErrorDiagnostic,
+  buildSafePixelPaySdkDiagnostics,
+  safePixelPayRequestId,
+} from "../../../services/payments/pixelPaySaleDiagnostics.js";
+import {
+  createPixelPaySaleAttemptRecord,
+  finalizePixelPaySaleAttemptBestEffort,
+} from "../../../services/payments/pixelPaySaleAttemptStore.js";
+import { inspectPixelPayCardExpire } from "../../../services/payments/PixelPaySdkProvider.js";
+export { buildSafeProviderErrorDiagnostic, buildSafePixelPaySdkDiagnostics };
 import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
@@ -114,102 +124,8 @@ function buildPublicPaymentIntentPayload(row, pricing, launch = null) {
   };
 }
 
-function safeDiagnosticLength(value) {
-  const normalized = Number(value);
-  return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : null;
-}
-
-function safeDiagnosticContentType(value) {
-  return safeTelemetryText(value, 160)?.replace(/[\r\n]+/g, " ") || null;
-}
-
-export function buildSafeProviderErrorDiagnostic(error, requestId) {
-  return {
-    requestId,
-    paymentAttemptId: safeTelemetryText(error?.paymentAttemptId, 80),
-    errorCode: safeText(error?.code),
-    errorName: safeText(error?.name),
-    sdkErrorName: /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(safeText(error?.sdkErrorName) || "")
-      ? safeText(error.sdkErrorName).slice(0, 80)
-      : null,
-    upstreamStatusCode: Number.isInteger(Number(error?.statusCode)) ? Number(error.statusCode) : null,
-    upstreamContentType: safeDiagnosticContentType(error?.upstreamContentType),
-    upstreamContentLength: safeDiagnosticLength(error?.upstreamContentLength),
-    cfRay: safeTelemetryText(error?.cfRay, 120),
-    responseClass: safeTelemetryText(error?.responseClass, 80),
-    safeMessageCode: safeTelemetryText(error?.safeMessageCode, 120),
-    errorConstructorName: safeTelemetryText(error?.errorConstructorName, 80),
-    uncertain: error?.uncertain === true,
-    cardExpireFormatValid: safeDiagnosticBoolean(error?.cardExpireFormatValid),
-    cardExpireFuture: safeDiagnosticBoolean(error?.cardExpireFuture),
-    billingAddressLength: safeDiagnosticLength(error?.billingAddressLength),
-  };
-}
-
 function safeTelemetryText(value, maxLength = 255) {
   return safeText(value)?.slice(0, maxLength) || null;
-}
-
-function safeDiagnosticBoolean(value) {
-  return typeof value === "boolean" ? value : null;
-}
-
-function safeDiagnosticCount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
-const SAFE_PIXELPAY_SDK_MESSAGE_CODES = new Set([
-  "SDK_PUBLIC_KEY_UNAVAILABLE",
-  "SDK_ENCRYPTION_FAILED",
-  "SDK_HTTP_TIMEOUT",
-  "SDK_NETWORK_ERROR",
-  "SDK_REQUEST_CONFIG_ERROR",
-  "SDK_EXCEPTION_OTHER",
-  "SDK_MESSAGE_ABSENT",
-]);
-
-export function buildSafePixelPaySdkDiagnostics(diagnostics) {
-  if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return null;
-  const sdkResponseClass = safeTelemetryText(diagnostics.sdkResponseClass, 80);
-  const outcome = Object.values(PIXELPAY_SALE_OUTCOME).includes(diagnostics.outcome)
-    ? diagnostics.outcome
-    : null;
-  const inputErrorFields = safePixelPayInputErrorFields(diagnostics.inputErrorFields);
-  return {
-    paymentAttemptId: safeTelemetryText(diagnostics.paymentAttemptId, 80),
-    sdkResponseClass: sdkResponseClass && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(sdkResponseClass)
-      ? sdkResponseClass
-      : null,
-    statusCode: diagnostics.statusCode != null && Number.isInteger(Number(diagnostics.statusCode))
-      ? Number(diagnostics.statusCode)
-      : null,
-    responseSuccess: safeDiagnosticBoolean(diagnostics.responseSuccess),
-    safeMessageCode: SAFE_PIXELPAY_SDK_MESSAGE_CODES.has(diagnostics.safeMessageCode)
-      ? diagnostics.safeMessageCode
-      : null,
-    transactionResultValid: safeDiagnosticBoolean(diagnostics.transactionResultValid),
-    transactionResultDataPresent: safeDiagnosticBoolean(diagnostics.transactionResultDataPresent),
-    transactionResultParsed: safeDiagnosticBoolean(diagnostics.transactionResultParsed),
-    responseApproved: safeDiagnosticBoolean(diagnostics.responseApproved),
-    responseIncomplete: safeDiagnosticBoolean(diagnostics.responseIncomplete),
-    responseCodePresent: safeDiagnosticBoolean(diagnostics.responseCodePresent),
-    hasPaymentUuid: safeDiagnosticBoolean(diagnostics.hasPaymentUuid),
-    hasTransactionId: safeDiagnosticBoolean(diagnostics.hasTransactionId),
-    hasPaymentHash: safeDiagnosticBoolean(diagnostics.hasPaymentHash),
-    paymentHashValid: safeDiagnosticBoolean(diagnostics.paymentHashValid),
-    transactionAmountPresent: safeDiagnosticBoolean(diagnostics.transactionAmountPresent),
-    approvedAmountPresent: safeDiagnosticBoolean(diagnostics.approvedAmountPresent),
-    transactionAmountMatches: safeDiagnosticBoolean(diagnostics.transactionAmountMatches),
-    approvedAmountMatches: safeDiagnosticBoolean(diagnostics.approvedAmountMatches),
-    amountMatches: safeDiagnosticBoolean(diagnostics.amountMatches),
-    inputErrorFields,
-    inputErrorCount: inputErrorFields.length,
-    inputErrorUnknownCount: safeDiagnosticCount(diagnostics.inputErrorUnknownCount),
-    cardExpireFormatValid: safeDiagnosticBoolean(diagnostics.cardExpireFormatValid),
-    cardExpireFuture: safeDiagnosticBoolean(diagnostics.cardExpireFuture),
-    billingAddressLength: safeDiagnosticLength(diagnostics.billingAddressLength),
-    outcome,
-  };
 }
 
 export function classifyPixelPayStatusResult(status) {
@@ -2226,13 +2142,24 @@ export default async function publicPagosRoutes(app) {
         items: pricing.items,
         currency: "HNL",
         customerName: resolveCustomerName(groupRows),
+        paymentAttemptId: crypto.randomUUID(),
       };
+      const expiry = inspectPixelPayCardExpire(request.body.card_expire);
+      await createPixelPaySaleAttemptRecord(dbClient, {
+        idIntent,
+        paymentAttemptId: claim.paymentAttemptId,
+        requestId: safePixelPayRequestId(request.id),
+        cardExpireFormatValid: expiry.formatValid,
+        cardExpireFuture: expiry.future,
+        billingAddressLength: String(request.body.billing_address).trim().length,
+      });
       await dbClient.query("COMMIT");
       inTransaction = false;
       dbClient.release();
       dbClient = null;
 
       let saleResult;
+      const saleStartedAt = Date.now();
       try {
         saleResult = await PaymentProviderFactory.create().sale({
           orderId: claim.orderId,
@@ -2256,11 +2183,23 @@ export default async function publicPagosRoutes(app) {
         }, {
           requestId: request.id,
           idIntent,
+          paymentAttemptId: claim.paymentAttemptId,
           logger: request.log,
         });
       } catch (providerError) {
+        const diagnostic = buildSafeProviderErrorDiagnostic(providerError, request.id);
+        await finalizePixelPaySaleAttemptBestEffort(app.db, {
+          ...diagnostic,
+          idIntent,
+          paymentAttemptId: claim.paymentAttemptId,
+          sdkResponseClass: diagnostic.responseClass,
+          statusCode: diagnostic.upstreamStatusCode,
+          outcome: providerError?.uncertain === true
+            ? PIXELPAY_SALE_OUTCOME.UNCERTAIN : PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE,
+          durationMs: Date.now() - saleStartedAt,
+        }, request.log);
         request.log.warn(
-          buildSafeProviderErrorDiagnostic(providerError, request.id),
+          { ...diagnostic, paymentAttemptId: claim.paymentAttemptId },
           providerError?.uncertain === true ? "Resultado PixelPay incierto" : "PixelPay rechazo la solicitud"
         );
         const keepPending = providerError?.uncertain === true;
@@ -2285,12 +2224,22 @@ export default async function publicPagosRoutes(app) {
         });
       }
 
+      const diagnostics = buildSafePixelPaySdkDiagnostics(saleResult.diagnostics);
+      await finalizePixelPaySaleAttemptBestEffort(app.db, {
+        ...diagnostics,
+        idIntent,
+        requestId: request.id,
+        paymentAttemptId: claim.paymentAttemptId,
+        outcome: saleResult.outcome,
+        statusCode: diagnostics?.statusCode ?? saleResult.statusCode,
+        durationMs: Date.now() - saleStartedAt,
+      }, request.log);
       dbClient = await app.db.connect();
       if (saleResult.outcome !== PIXELPAY_SALE_OUTCOME.APPROVED) {
         request.log.warn({
           requestId: request.id,
           id_intent: idIntent,
-          pixelPaySdkDiagnostics: buildSafePixelPaySdkDiagnostics(saleResult.diagnostics),
+          pixelPaySdkDiagnostics: diagnostics,
         }, "Resultado PixelPay SDK no aprobado");
         const { keepPending, intentState } = resolvePixelPaySaleFailureState(saleResult.outcome);
         const trustedReferences = resolveTrustedPixelPayReferences(saleResult);

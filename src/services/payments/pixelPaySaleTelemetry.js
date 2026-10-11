@@ -8,7 +8,7 @@ export const PIXELPAY_SALE_EVENT = Object.freeze({
   UNCERTAIN: "PIXELPAY_SALE_UNCERTAIN",
 });
 
-const SAFE_PIXELPAY_INPUT_ERROR_FIELDS = new Set([
+export const SAFE_PIXELPAY_INPUT_ERROR_FIELDS = new Set([
   "authentication_request",
   "billing_address",
   "billing_city",
@@ -72,7 +72,7 @@ function safeLength(value) {
 
 export function safePixelPayInputErrorFields(value, maxFields = 32) {
   if (!Array.isArray(value)) return [];
-  const normalizedLimit = Number.isInteger(maxFields) && maxFields > 0 ? maxFields : 32;
+  const normalizedLimit = Number.isInteger(maxFields) && maxFields > 0 ? Math.min(maxFields, 32) : 32;
   return [...new Set(value
     .filter((field) => typeof field === "string" && SAFE_PIXELPAY_INPUT_ERROR_FIELDS.has(field)))]
     .sort()
@@ -114,8 +114,10 @@ export function readPixelPayHttpMetadata(source) {
 }
 
 export function createPixelPaySaleAttempt(input = {}, { randomUUID = crypto.randomUUID } = {}) {
+  const paymentAttemptId = input.paymentAttemptId === undefined ? randomUUID() : input.paymentAttemptId;
+  if (!safePixelPayUuid(paymentAttemptId)) throw new TypeError("PixelPay paymentAttemptId invalido.");
   return Object.freeze({
-    paymentAttemptId: randomUUID(),
+    paymentAttemptId,
     requestId: text(input.requestId, 120),
     idIntent: text(input.idIntent, 120),
     orderId: text(input.orderId, 180),
@@ -124,6 +126,13 @@ export function createPixelPaySaleAttempt(input = {}, { randomUUID = crypto.rand
     amount: safeAmount(input.amount),
     currency: text(input.currency, 12)?.toUpperCase() || null,
   });
+}
+
+export function safePixelPayUuid(value) {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+    ? value
+    : null;
 }
 
 export function buildPixelPaySaleEvent(event, attempt, details = {}) {

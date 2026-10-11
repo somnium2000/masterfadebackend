@@ -406,7 +406,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
         emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.UNCERTAIN, attempt, details);
       }
       if (error instanceof PixelPaySdkError) {
-        error.paymentAttemptId ||= attempt.paymentAttemptId;
+        error.paymentAttemptId = attempt.paymentAttemptId;
         error.cardExpireFormatValid ??= inputDiagnostics.cardExpireFormatValid;
         error.cardExpireFuture ??= inputDiagnostics.cardExpireFuture;
         error.billingAddressLength ??= inputDiagnostics.billingAddressLength;
@@ -423,6 +423,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
         upstreamContentType: metadata.contentType,
         cfRay: metadata.cfRay,
         paymentAttemptId: attempt.paymentAttemptId,
+        ...inputDiagnostics,
       });
     }
 
@@ -472,6 +473,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionId,
     });
     const inputErrors = readPixelPayInputErrors(response?.errors);
+    const responseMetadata = readPixelPayHttpMetadata(response);
     const diagnostics = {
       paymentAttemptId: attempt.paymentAttemptId,
       sdkResponseClass: safeClassName(response),
@@ -496,9 +498,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
       ...inputErrors,
       ...inputDiagnostics,
       outcome,
+      durationMs: Date.now() - startedAt,
+      cfRay: responseMetadata.cfRay,
     };
 
-    const responseMetadata = readPixelPayHttpMetadata(response);
     const telemetryDetails = {
       durationMs: Date.now() - startedAt,
       responseClass: diagnostics.sdkResponseClass,

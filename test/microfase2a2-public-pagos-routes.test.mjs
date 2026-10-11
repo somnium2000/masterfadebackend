@@ -207,6 +207,9 @@ function createPagosClient({
   failProviderUpdate = false,
   throwProviderUpdate = false,
   throwPixelPayReferenceUpdate = false,
+  failAttemptStart = false,
+  failAttemptFinal = false,
+  failPaymentInsert = false,
   ownerEmail = "cliente@example.com",
   holdExpiresAt = "2099-01-01T16:00:00.000Z",
   groupSize = 1,
@@ -220,6 +223,8 @@ function createPagosClient({
   const calls = [];
   const statusChecks = [];
   const payments = structuredClone(initialPayments);
+  let saleAttempts = [];
+  let transactionSnapshot = null;
   let activeIntent = existingIntent ? { ...existingIntent } : null;
   const groupState = [
     makeGroupRow({
@@ -256,13 +261,57 @@ function createPagosClient({
     getPayments() {
       return structuredClone(payments);
     },
+    getSaleAttempts() {
+      return structuredClone(saleAttempts);
+    },
     getGroupState() {
       return structuredClone(groupState);
     },
     async query(sql, params = []) {
       const text = String(sql);
       calls.push({ sql: text, params });
-      if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK") return { rows: [] };
+      if (text === "BEGIN") {
+        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, saleAttempts });
+        return { rows: [] };
+      }
+      if (text === "COMMIT") { transactionSnapshot = null; return { rows: [] }; }
+      if (text === "ROLLBACK") {
+        if (transactionSnapshot) {
+          activeIntent = transactionSnapshot.activeIntent;
+          groupState.splice(0, groupState.length, ...transactionSnapshot.groupState);
+          payments.splice(0, payments.length, ...transactionSnapshot.payments);
+          saleAttempts = transactionSnapshot.saleAttempts;
+          transactionSnapshot = null;
+        }
+        return { rows: [] };
+      }
+      if (text.includes("INSERT INTO app_private.pixelpay_sale_attempts")) {
+        if (failAttemptStart) throw new Error("fixture de fallo en INSERT START");
+        assert.ok(transactionSnapshot, "START debe compartir la transaccion del claim");
+        const row = {
+          id_sale_attempt: params[1], id_intent: params[0], payment_attempt_id: params[1],
+          request_id: params[2], card_expire_format_valid: params[3], card_expire_future: params[4],
+          billing_address_length: params[5], finalized_at: null,
+        };
+        saleAttempts.push(row);
+        return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
+      }
+      if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) {
+        assert.equal(transactionSnapshot, null, "FINAL debe usar autocommit fuera del claim");
+        if (failAttemptFinal) throw new Error("fixture privada 4111111111111111 secretKey-final");
+        const row = saleAttempts.find((entry) => entry.payment_attempt_id === params[0] && !entry.finalized_at);
+        if (!row) return { rows: [] };
+        Object.assign(row, {
+          finalized_at: new Date().toISOString(), duration_ms: params[1], sdk_response_class: params[2],
+          upstream_http_status: params[3], safe_message_code: params[4], outcome: params[5], uncertain: params[6],
+          input_error_fields: params[7], input_error_count: params[8], input_error_unknown_count: params[9],
+          final_parameters: structuredClone(params),
+        });
+        return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
+      }
+      if (failPaymentInsert && text.includes("INSERT INTO public.payments")) {
+        throw new Error("fixture fallo financiero posterior a FINAL");
+      }
       if (text.includes("FROM public.citas_grupos cg") && text.includes("co.direccion_correo")) {
         return { rows: structuredClone(groupState) };
       }
@@ -1573,6 +1622,233 @@ test("Sale APPROVED sin paidAt persiste timestamp backend y conserva referencias
   assert.equal(payment.provider_tx_id, "TX-PAID-AT");
   assert.equal(payment.monto_hnl, 115);
   assert.equal(payment.moneda_codigo, "HNL");
+  await app.close();
+});
+
+function pixelPayClaimClient(options = {}) {
+  return createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: {
+      id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A, estado_intent_codigo: "link_generado",
+      expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+      orden_compra: "MF-PIXELPAY-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", created_by_usuario_id: USER_A,
+    },
+    ...options,
+  });
+}
+
+test("START comparte transaccion/COMMIT con el claim y el mismo UUID llega al provider y FINAL", async () => {
+  const client = pixelPayClaimClient();
+  const trace = [];
+  let connections = 0;
+  const provider = {
+    saleCalls: 0,
+    async sale(input, context) {
+      this.saleCalls += 1;
+      trace.push({ source: "provider", sql: "SALE" });
+      const row = client.getSaleAttempts()[0];
+      assert.equal(row.payment_attempt_id, context.paymentAttemptId);
+      assert.equal(row.request_id, context.requestId);
+      assert.equal(row.finalized_at, null);
+      assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+      return { outcome: "payment_declined", statusCode: 402, diagnostics: {
+        paymentAttemptId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sdkResponseClass: "PaymentDeclinedResponse",
+        statusCode: 402, outcome: "payment_declined", responseSuccess: false,
+      } };
+    },
+  };
+  const app = await createPagosApp(client, {
+    providerCode: "pixelpay", providerAdapter: provider,
+    connectFactory() {
+      const source = `client-${++connections}`;
+      return {
+        async query(sql, params) { trace.push({ source, sql }); return client.query(sql, params); },
+        release() { trace.push({ source, sql: "RELEASE" }); },
+      };
+    },
+  });
+  app.db.query = async (sql, params) => { trace.push({ source: "pool-autocommit", sql }); return client.query(sql, params); };
+  const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+  assert.equal(response.statusCode, 200, response.body);
+  const startIndex = trace.findIndex((entry) => entry.sql.includes("INSERT INTO app_private.pixelpay_sale_attempts"));
+  const claimIndex = trace.findIndex((entry) => entry.sql.includes("proteger_reserva_pago_v1"));
+  const commitIndex = trace.findIndex((entry) => entry.sql === "COMMIT");
+  const saleIndex = trace.findIndex((entry) => entry.sql === "SALE");
+  const finalIndex = trace.findIndex((entry) => entry.sql.includes("UPDATE app_private.pixelpay_sale_attempts"));
+  assert.ok(claimIndex < startIndex && startIndex < commitIndex && commitIndex < saleIndex && saleIndex < finalIndex);
+  assert.equal(trace[claimIndex].source, trace[startIndex].source);
+  assert.equal(trace[startIndex].source, trace[commitIndex].source);
+  assert.equal(trace[finalIndex].source, "pool-autocommit");
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(client.getSaleAttempts().length, 1);
+  assert.equal(client.getSaleAttempts()[0].outcome, "payment_declined");
+  assert.equal(client.getSaleAttempts()[0].card_expire_format_valid, true);
+  assert.equal(client.getSaleAttempts()[0].card_expire_future, true);
+  await app.close();
+});
+
+test("INSERT START fallido hace ROLLBACK del claim sin Sale ni intent abandonado", async () => {
+  const client = pixelPayClaimClient({ failAttemptStart: true });
+  const initialIntent = client.getActiveIntent();
+  const initialGroup = client.getGroupState();
+  const provider = { saleCalls: 0, async sale() { this.saleCalls += 1; throw new Error("no debe invocarse"); } };
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+  assert.equal(response.statusCode, 500, response.body);
+  assert.equal(provider.saleCalls, 0);
+  assert.ok(client.calls.some((call) => call.sql === "ROLLBACK"));
+  assert.equal(client.calls.some((call) => call.sql === "COMMIT"), false);
+  assert.deepEqual(client.getActiveIntent(), initialIntent);
+  assert.deepEqual(client.getGroupState(), initialGroup);
+  assert.deepEqual(client.getSaleAttempts(), []);
+  await app.close();
+});
+
+for (const scenario of [
+  { outcome: "approved", status: 200, responseClass: "SuccessResponse", http: 200, intent: "confirmado" },
+  { outcome: "payment_declined", status: 402, responseClass: "PaymentDeclinedResponse", http: 200, intent: "fallido" },
+  { outcome: "request_error_definitive", status: 422, responseClass: "InputErrorResponse", http: 200, intent: "fallido" },
+  { outcome: "uncertain", status: 503, responseClass: "NetworkFailureResponse", http: 202, intent: "pendiente_confirmacion" },
+]) {
+  for (const finalFailure of [false, true]) {
+    test(`FINAL ${scenario.outcome}, persistencia ${finalFailure ? "fallida" : "correcta"}, conserva resultado financiero`, async () => {
+      const logs = [];
+      const client = pixelPayClaimClient({ failAttemptFinal: finalFailure });
+      const provider = {
+        saleCalls: 0, statusCalls: 0,
+        async sale(input, context) {
+          this.saleCalls += 1;
+          return {
+            outcome: scenario.outcome, statusCode: scenario.status,
+            paymentUuid: "P-UUID-DURABLE", transactionId: "TX-DURABLE",
+            paymentHashValid: true, amountMatches: true,
+            diagnostics: {
+              paymentAttemptId: context.paymentAttemptId, sdkResponseClass: scenario.responseClass,
+              statusCode: scenario.status, safeMessageCode: "SDK_MESSAGE_ABSENT", outcome: scenario.outcome,
+              inputErrorFields: scenario.status === 422
+                ? ["order_id", "billing_state", "billing_state", "5555555555554444", "999", "secret-value"] : [],
+              inputErrorUnknownCount: scenario.status === 422 ? 3 : 0,
+              responseSuccess: scenario.outcome === "approved", transactionResultValid: true,
+              transactionResultParsed: true, responseApproved: scenario.outcome === "approved",
+              responseIncomplete: false, responseCodePresent: true, hasPaymentUuid: true,
+              hasTransactionId: true, hasPaymentHash: true, paymentHashValid: true,
+              transactionAmountMatches: true, approvedAmountMatches: true, amountMatches: true,
+              cfRay: "aabbccddeeff0011-MIA",
+              response: { card_number: "4111111111111111" }, errors: { order_id: ["secretKey-value"] },
+              payment_hash: "hash-privado", secretKey: "secretKey-value", authHash: "authHash-value",
+            },
+          };
+        },
+        async queryPaymentStatus() { this.statusCalls += 1; throw new Error("Status prohibido"); },
+      };
+      const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+      const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+      assert.equal(response.statusCode, scenario.http, response.body);
+      assert.equal(client.getActiveIntent().estado_intent_codigo, scenario.intent);
+      assert.equal(client.getPayments().length, scenario.outcome === "approved" ? 1 : 0);
+      assert.equal(provider.saleCalls, 1);
+      assert.equal(provider.statusCalls, 0);
+      assert.equal(client.getStatusChecks().length, 0);
+      const row = client.getSaleAttempts()[0];
+      assert.equal(client.getSaleAttempts().length, 1);
+      assert.equal(row.finalized_at !== null, !finalFailure);
+      if (!finalFailure) {
+        assert.equal(row.outcome, scenario.outcome);
+        assert.equal(row.upstream_http_status, scenario.status);
+        assert.equal(row.sdk_response_class, scenario.responseClass);
+        assert.deepEqual(row.input_error_fields, scenario.status === 422 ? ["billing_state", "order_id"] : []);
+        assert.equal(row.input_error_count, scenario.status === 422 ? 2 : 0);
+        assert.equal(row.input_error_unknown_count, scenario.status === 422 ? 3 : 0);
+      }
+      const critical = logs.map((entry) => JSON.parse(entry)).filter((entry) => entry.event === "PIXELPAY_SALE_FINAL_PERSISTENCE_FAILED");
+      assert.equal(critical.length, finalFailure ? 1 : 0);
+      if (finalFailure) {
+        assert.equal(critical[0].level, 60);
+        assert.equal(critical[0].paymentAttemptId, row.payment_attempt_id);
+        assert.equal(critical[0].err, undefined);
+      }
+      const diagnosticWrites = client.calls.filter((call) => call.sql.includes("app_private.pixelpay_sale_attempts"));
+      assert.equal(diagnosticWrites.length, 2);
+      assert.doesNotMatch(JSON.stringify({ sqlParams: diagnosticWrites.map((call) => call.params), row, logs }),
+        /4111111111111111|5555555555554444|"999"|secret-value|secretKey-value|authHash-value|hash-privado|CLIENTE PRUEBA|Calle QA|"2807"/);
+      await app.close();
+    });
+  }
+}
+
+for (const uncertain of [false, true]) {
+  for (const failAttemptFinal of [false, true]) {
+    test(`excepcion provider uncertain=${uncertain}, FINAL failure=${failAttemptFinal} mantiene clasificacion`, async () => {
+      const client = pixelPayClaimClient({ failAttemptFinal });
+      const provider = {
+        saleCalls: 0, statusCalls: 0,
+        async sale() {
+          this.saleCalls += 1;
+          throw Object.assign(new Error("fixture-privada"), {
+            code: "PIXELPAY_RESPONSE_INVALID", uncertain, statusCode: uncertain ? 503 : 422,
+            responseClass: "InputErrorResponse", safeMessageCode: "SDK_EXCEPTION_OTHER",
+            errorConstructorName: "Error", sdkErrorName: "Error",
+          });
+        },
+        async queryPaymentStatus() { this.statusCalls += 1; throw new Error("Status prohibido"); },
+      };
+      const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+      const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+      assert.equal(response.statusCode, uncertain ? 202 : 502, response.body);
+      assert.equal(client.getActiveIntent().estado_intent_codigo, uncertain ? "pendiente_confirmacion" : "fallido");
+      assert.equal(provider.saleCalls, 1);
+      assert.equal(provider.statusCalls, 0);
+      const row = client.getSaleAttempts()[0];
+      assert.equal(row.finalized_at !== null, !failAttemptFinal);
+      if (!failAttemptFinal) {
+        assert.equal(row.outcome, uncertain ? "uncertain" : "request_error_definitive");
+        assert.equal(row.sdk_response_class, "InputErrorResponse");
+        assert.equal(row.upstream_http_status, uncertain ? 503 : 422);
+        assert.equal(row.final_parameters[27], "PIXELPAY_RESPONSE_INVALID");
+      }
+      await app.close();
+    });
+  }
+}
+
+test("FINAL aprobado sigue disponible si falla despues la escritura de referencias", async () => {
+  const client = pixelPayClaimClient({ throwPixelPayReferenceUpdate: true });
+  const provider = {
+    async sale() { return { outcome: "approved", statusCode: 200, paymentUuid: "P-UUID", transactionId: "TX",
+      diagnostics: { sdkResponseClass: "SuccessResponse", statusCode: 200, amountMatches: true } }; },
+  };
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+  assert.equal(response.statusCode, 500, response.body);
+  assert.equal(client.getSaleAttempts()[0].outcome, "approved");
+  assert.ok(client.getSaleAttempts()[0].finalized_at);
+  await app.close();
+});
+
+test("ROLLBACK de reconciliacion posterior no elimina START ni FINAL durable", async () => {
+  const client = pixelPayClaimClient({ failPaymentInsert: true });
+  const provider = {
+    saleCalls: 0,
+    async sale() {
+      this.saleCalls += 1;
+      return { outcome: "approved", paymentUuid: "P-UUID", transactionId: "TX", statusCode: 200,
+        diagnostics: { sdkResponseClass: "SuccessResponse", statusCode: 200, amountMatches: true } };
+    },
+  };
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+  assert.equal(response.statusCode, 500, response.body);
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(client.getPayments().length, 0);
+  const finalIndex = client.calls.findIndex((call) => call.sql.includes("UPDATE app_private.pixelpay_sale_attempts"));
+  const beginIndices = client.calls.flatMap((call, i) => call.sql === "BEGIN" ? [i] : []);
+  const rollbackIndex = client.calls.findIndex((call) => call.sql === "ROLLBACK");
+  assert.equal(beginIndices.length, 2);
+  assert.ok(finalIndex < beginIndices[1] && beginIndices[1] < rollbackIndex);
+  assert.equal(client.getSaleAttempts().length, 1);
+  assert.equal(client.getSaleAttempts()[0].outcome, "approved");
+  assert.ok(client.getSaleAttempts()[0].finalized_at);
   await app.close();
 });
 

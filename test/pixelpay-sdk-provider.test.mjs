@@ -12,7 +12,7 @@ import {
 } from "../src/services/payments/PixelPaySdkProvider.js";
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
 import envPlugin from "../src/plugins/env.js";
-import { PIXELPAY_SALE_EVENT } from "../src/services/payments/pixelPaySaleTelemetry.js";
+import { PIXELPAY_SALE_EVENT, createPixelPaySaleAttempt } from "../src/services/payments/pixelPaySaleTelemetry.js";
 
 const KEY_ID = "qa-key-not-real";
 const SECRET = "qa-secret-not-real";
@@ -228,6 +228,8 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
     cardExpireFuture: true,
     billingAddressLength: saleInput.billing.address.length,
     outcome: PIXELPAY_SALE_OUTCOME.APPROVED,
+    durationMs: result.diagnostics.durationMs,
+    cfRay: null,
   });
   assert.equal(fake.calls.sale, 1);
   assert.equal(fake.calls.concurrency, 1);
@@ -293,10 +295,42 @@ test("telemetria correlaciona STARTED, HTTP_STARTED y RESPONSE_RECEIVED en Sale 
     PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED,
   ]);
   assert.ok(result.paymentAttemptId);
+  assert.match(result.paymentAttemptId, /^[0-9a-f-]{36}$/);
   assert.ok(logger.events.every((entry) => entry.paymentAttemptId === result.paymentAttemptId));
   assert.ok(logger.events.every((entry) => entry.requestId === "req-telemetry-ok"));
   assert.ok(logger.events.every((entry) => entry.idIntent === "intent-telemetry-ok"));
   assert.equal(fake.calls.sale, 1);
+});
+
+test("el UUID inyectado se conserva exactamente en eventos, diagnosticos y errores del provider", async () => {
+  const paymentAttemptId = "AABBCCDD-2222-4333-8444-555555555555";
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const result = await makeProvider(fake).sale(saleInput, { paymentAttemptId, logger });
+  assert.equal(result.paymentAttemptId, paymentAttemptId);
+  assert.equal(result.diagnostics.paymentAttemptId, paymentAttemptId);
+  assert.ok(logger.events.every((event) => event.paymentAttemptId === paymentAttemptId));
+  const failure = makeFakeSdk({ saleError: new Error("fixture privada") });
+  await assert.rejects(makeProvider(failure).sale(saleInput, { paymentAttemptId }),
+    (error) => error.paymentAttemptId === paymentAttemptId);
+  const expired = makeFakeSdk();
+  await assert.rejects(makeProvider(expired).sale({ ...saleInput, card: { ...saleInput.card, expire: "2512" } },
+    { paymentAttemptId }), (error) => error.paymentAttemptId === paymentAttemptId);
+  assert.equal(expired.calls.sale, 0);
+});
+
+test("createPixelPaySaleAttempt genera fallback solo si el UUID externo no fue proporcionado", () => {
+  const paymentAttemptId = "aabbccdd-2222-4333-8444-555555555555";
+  let generated = 0;
+  const options = { randomUUID() { generated += 1; return paymentAttemptId; } };
+  assert.equal(createPixelPaySaleAttempt({ paymentAttemptId }, options).paymentAttemptId, paymentAttemptId);
+  assert.equal(generated, 0);
+  assert.equal(createPixelPaySaleAttempt({}, options).paymentAttemptId, paymentAttemptId);
+  assert.equal(generated, 1);
+  for (const invalid of [null, "", "4111111111111111", "not-a-uuid", `${paymentAttemptId} `]) {
+    assert.throws(() => createPixelPaySaleAttempt({ paymentAttemptId: invalid }, options), TypeError);
+  }
+  assert.equal(generated, 1);
 });
 
 test("telemetria registra FAILED y UNCERTAIN cuando doSale lanza antes de responder", async () => {
@@ -876,6 +910,8 @@ test("diagnostics contiene solo metadata y nunca valores sensibles ni payload cr
     "billingAddressLength",
     "cardExpireFormatValid",
     "cardExpireFuture",
+    "cfRay",
+    "durationMs",
     "hasPaymentHash",
     "hasPaymentUuid",
     "hasTransactionId",
