@@ -151,6 +151,7 @@ function assertAssetAccessByClaims(claims, asset) {
 
 function isAdminBarberProfileContext(claims, scopeKey, entityType) {
   return userHasRole(claims, "admin")
+    && !userHasRole(claims, "super_admin")
     && String(scopeKey || "") === "public_barber_profile"
     && String(entityType || "") === "barbero";
 }

@@ -398,6 +398,28 @@ test("asociacion propia y fotografias ya vinculadas conservan acceso administrat
   }
 });
 
+test("super_admin con rol admin adicional conserva la asociacion autorizada", async () => {
+  const foreignTemporaryAsset = barberAsset({
+    entity_id: null,
+    status: "temporal",
+    owner_user_id: OTHER_CLIENT_ID,
+    uploaded_by: OTHER_CLIENT_ID,
+  });
+  for (const roles of [["super_admin"], ["super_admin", "admin"]]) {
+    const { client } = buildHarness({ assets: [foreignTemporaryAsset] });
+    const actor = { ...claims("super_admin"), roles };
+    const resolved = await resolveAssetForBinding(client, {
+      assetId: ASSET_ID,
+      scopeKey: "public_barber_profile",
+      entityType: "barbero",
+      entityId: EMPLOYEE_ID,
+      idSucursal: BRANCH_ID,
+      claims: actor,
+    });
+    assert.equal(resolved.id_asset, ASSET_ID);
+  }
+});
+
 test("reemplazos historicos de promociones principal y movil conservan compatibilidad y sucursal", async () => {
   for (const scopeKey of ["public_promotion_main", "public_promotion_mobile"]) {
     for (const nextAssetId of [OLD_ASSET_ID, null]) {
