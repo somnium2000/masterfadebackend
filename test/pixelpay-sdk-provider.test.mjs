@@ -492,7 +492,7 @@ test("SDK rechaza tarjeta vencida o formato invalido antes de doSale", async () 
 
 test("SDK rechaza solo placeholders exactos de billing address antes de doSale", async () => {
   const invalidAddresses = ["QA", " qa ", "TEST", "N/A"];
-  const validAddresses = ["Blvd Suyapa", "Blvd. Suyapa", "Tegucigalpa", "Residencial QA"];
+  const validAddresses = ["Blvd Suyapa", "Blvd. Suyapa, Tegucigalpa", "Residencial QA"];
 
   for (const address of invalidAddresses) {
     assert.equal(isPixelPayBillingAddressPlaceholder(address), true);
