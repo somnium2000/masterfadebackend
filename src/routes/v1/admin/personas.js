@@ -5,9 +5,10 @@ import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
 import { assertUserNotProtected } from "../../../services/protectedUsersService.js";
 import {
   activateAssetForEntity,
-  buildAssetReadUrl,
+  buildPersonasClientProfileReadUrl,
   replaceAssetIfNeeded,
   resolveAssetForBinding,
+  validateAssetReplacement,
 } from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
@@ -26,7 +27,6 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // AM: Regla operativa de identidad hondurena para esta fase (13 digitos).
 const DNI_PATTERN = /^\d{13}$/;
 const RTN_PATTERN = /^\d{14}$/;
-const STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE = "private_client_profile";
 const STORAGE_SCOPE_PUBLIC_BARBER_PROFILE = "public_barber_profile";
 const BARBER_PUBLIC_ALIAS_MAX = 80;
 const BARBER_PUBLIC_SUMMARY_MAX = 500;
@@ -392,6 +392,8 @@ const CLIENTE_BASE_SQL = `
     p.telefono_principal,
     p.direccion_texto,
     p.observaciones,
+    p.foto_perfil_asset_id,
+    p.foto_perfil_path,
     COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo_principal,
     c.fecha_ingreso,
     COALESCE(c.estado, TRUE) AS estado_cliente,
@@ -651,6 +653,14 @@ function mapUsuario(row) {
   };
 }
 
+function filterUsuariosForActor(usuarios, claims) {
+  if (!isAdminWithoutSuperAdmin(claims)) return usuarios;
+  return usuarios.filter((usuario) => (
+    !usuario.is_protected
+    && !usuario.roles.some((role) => role?.rol === "super_admin")
+  ));
+}
+
 function mapEmpleado(row) {
   return {
     id_empleado: row.id_empleado,
@@ -704,6 +714,8 @@ function mapCliente(row) {
     telefono_principal: row.telefono_principal ?? null,
     direccion_texto: row.direccion_texto ?? null,
     observaciones: row.observaciones ?? null,
+    foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
+    foto_perfil_path: row.foto_perfil_path ?? null,
     correo_principal: row.correo_principal ?? null,
     fecha_ingreso: row.fecha_ingreso ?? null,
     estado_cliente: Boolean(row.estado_cliente),
@@ -718,13 +730,22 @@ function mapCliente(row) {
   };
 }
 
+function assertAdminClientPhotoUnchanged(payload) {
+  if (Object.prototype.hasOwnProperty.call(payload?.cliente || {}, "foto_perfil_asset_id")) {
+    throw new AppError(400, "La fotografía de perfil solo puede ser modificada por el cliente", {
+      code: "PERSONAS_CLIENT_PHOTO_SELF_SERVICE_ONLY",
+    });
+  }
+}
+
 async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
   if (!cliente?.foto_perfil_asset_id) {
     return cliente;
   }
   try {
-    const readUrl = await buildAssetReadUrl(app, {
+    const readUrl = await buildPersonasClientProfileReadUrl(app, {
       claims,
+      clientId: cliente.id_cliente,
       assetId: cliente.foto_perfil_asset_id,
     });
     return {
@@ -1299,7 +1320,43 @@ async function upsertBarberPublicProfile(client, { idEmpleado, profile }) {
   );
 }
 
-function parseEmployeeRoleNames(rawRoles, esBarbero) {
+function isAdminWithoutSuperAdmin(claims) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  return roles.includes("admin") && !roles.includes("super_admin");
+}
+
+function assertActorCanAssignEmployeeRoles(claims, roleNames) {
+  if (isAdminWithoutSuperAdmin(claims) && roleNames.includes("super_admin")) {
+    throw new AppError(403, "Un administrador no puede asignar el rol super_admin", {
+      code: "PERSONAS_SUPER_ADMIN_ROLE_FORBIDDEN",
+    });
+  }
+}
+
+async function assertActorCanManagePrivilegedUser(app, request, client, userId, actionCode) {
+  await assertUserNotProtected(app, userId, actionCode, { client });
+  if (!isAdminWithoutSuperAdmin(request?.claims)) return;
+
+  const privilegedRole = await client.query(
+    `
+      SELECT 1
+      FROM public.roles_usuarios ru
+      JOIN public.roles r ON r.id_rol = ru.id_rol
+      WHERE ru.id_usuario = $1::uuid
+        AND r.nombre = 'super_admin'
+      LIMIT 1
+    `,
+    [userId]
+  );
+  if (privilegedRole.rowCount > 0) {
+    throw new AppError(403, "Un administrador no puede gestionar cuentas super_admin", {
+      code: "PERSONAS_SUPER_ADMIN_TARGET_FORBIDDEN",
+      details: { action: actionCode || "UNKNOWN_ACTION" },
+    });
+  }
+}
+
+function parseEmployeeRoleNames(rawRoles, esBarbero, claims = null) {
   const normalizedRoles = Array.isArray(rawRoles)
     ? rawRoles.map((value) => normalizeRequired(value).toLowerCase()).filter(Boolean)
     : [];
@@ -1321,6 +1378,8 @@ function parseEmployeeRoleNames(rawRoles, esBarbero) {
   }
 
   if (esBarbero && !uniqueRoles.includes("barbero")) uniqueRoles.push("barbero");
+
+  assertActorCanAssignEmployeeRoles(claims, uniqueRoles);
 
   return uniqueRoles;
 }
@@ -1390,7 +1449,8 @@ async function assertPersonaNotEmpleado(client, personaId) {
   }
 }
 
-async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleNames, userId, branchId, assignedBy }) {
+async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleNames, userId, branchId, assignedBy, actorClaims }) {
+  assertActorCanAssignEmployeeRoles(actorClaims, roleNames);
   await assertUserNotProtected(app, userId, "ROLE_ASSIGNMENT_UPDATE", { client });
 
   const employeeRoleIds = [];
@@ -1611,7 +1671,7 @@ async function createEmpleado(app, request, payload) {
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
     const empleadoRaw = payload?.empleado || {};
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
-    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
+    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero), request.claims);
     const esBarbero = roles.includes("barbero");
     const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
     const fotoPerfilAssetIdRaw = normalizeOptional(empleadoRaw.foto_perfil_asset_id ?? null);
@@ -1702,6 +1762,7 @@ async function createEmpleado(app, request, payload) {
       userId: authUserId,
       branchId: idSucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
+      actorClaims: request.claims,
     });
 
     const fechaIngreso = normalizeOptional(empleadoRaw.fecha_ingreso ?? null);
@@ -1806,6 +1867,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
   let authEmailUpdated = false;
   let authEmailPrevious = null;
   let authUserIdForCompensation = null;
+  let transactionCommitted = false;
 
   try {
     const current = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
@@ -1822,11 +1884,13 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
       });
     }
 
+    await assertActorCanManagePrivilegedUser(app, request, client, currentRow.id_usuario, "EMPLOYEE_UPDATE");
+
     const persona = buildPersonaPayload(payload?.persona || {});
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
     const empleadoRaw = payload?.empleado || {};
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
-    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
+    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero), request.claims);
     const esBarbero = roles.includes("barbero");
     const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
     const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(empleadoRaw, "foto_perfil_asset_id");
@@ -1863,6 +1927,17 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
         claims: request.claims,
         allowUnboundEntity: true,
         allowedStatuses: ["temporal", "activo"],
+      })
+      : null;
+    const previousFotoPerfilAsset = fotoPerfilChanged && esBarbero
+      ? await validateAssetReplacement(client, {
+        previousAssetId: currentRow.foto_perfil_asset_id,
+        nextAssetId: nextFotoPerfilAssetIdRaw,
+        scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+        entityType: "barbero",
+        entityId: idEmpleado,
+        idSucursal: currentRow.id_sucursal,
+        claims: request.claims,
       })
       : null;
 
@@ -1931,6 +2006,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
       userId: currentRow.id_usuario,
       branchId: idSucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
+      actorClaims: request.claims,
     });
 
     let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
@@ -1976,13 +2052,31 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     await client.query("COMMIT");
     transactionStarted = false;
+    transactionCommitted = true;
 
     if (fotoPerfilChanged && esBarbero) {
-      await replaceAssetIfNeeded(app, client, {
-        previousAssetId: currentRow.foto_perfil_asset_id,
-        nextAssetId: nextFotoPerfilAssetIdRaw,
-        claims: request.claims,
-      });
+      try {
+        await replaceAssetIfNeeded(app, client, {
+          previousAssetId: currentRow.foto_perfil_asset_id,
+          nextAssetId: nextFotoPerfilAssetIdRaw,
+          claims: request.claims,
+          scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+          entityType: "barbero",
+          entityId: idEmpleado,
+          idSucursal: currentRow.id_sucursal,
+          prevalidatedAsset: previousFotoPerfilAsset,
+          logger: request.log,
+        });
+      } catch (cleanupError) {
+        request.log.warn(
+          {
+            err: cleanupError,
+            id_empleado: idEmpleado,
+            id_asset_anterior: currentRow.foto_perfil_asset_id,
+          },
+          "No se pudo limpiar la fotografia anterior despues de actualizar el empleado"
+        );
+      }
     }
 
     return { empleado: mapEmpleado(detail.rows[0]) };
@@ -1990,7 +2084,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     if (transactionStarted) {
       await client.query("ROLLBACK").catch(() => {});
     }
-    if (authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
+    if (!transactionCommitted && authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
       try {
         await syncAuthUserEmail(app, authUserIdForCompensation, authEmailPrevious);
       } catch (compensationError) {
@@ -2007,6 +2101,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 }
 
 async function createCliente(app, request, payload) {
+  assertAdminClientPhotoUnchanged(payload);
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
@@ -2021,7 +2116,6 @@ async function createCliente(app, request, payload) {
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
     const consentimientoMarketing = Boolean(cliente.consentimiento_marketing);
     const aceptaTerminos = Boolean(cliente.acepta_terminos);
-    const fotoPerfilAssetId = normalizeOptional(cliente.foto_perfil_asset_id ?? null);
     const consentimientosAt = new Date().toISOString();
     const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
@@ -2183,40 +2277,6 @@ async function createCliente(app, request, payload) {
         );
 
     const createdClientId = clienteInsert.rows[0].id_cliente;
-    if (fotoPerfilAssetId) {
-      const fotoAsset = await resolveAssetForBinding(client, {
-        assetId: fotoPerfilAssetId,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: createdClientId,
-        idSucursal: idSucursalOrigen,
-        claims: request.claims,
-        allowUnboundEntity: true,
-        allowedStatuses: ["temporal", "activo"],
-      });
-      const activatedPhoto = await activateAssetForEntity(app, client, {
-        assetId: fotoAsset.id_asset,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: createdClientId,
-        idSucursal: idSucursalOrigen,
-        ownerClienteId: createdClientId,
-        claims: request.claims,
-        replaceCurrent: false,
-      });
-      await client.query(
-        `
-          UPDATE public.personas
-          SET
-            foto_perfil_asset_id = $2::uuid,
-            foto_perfil_path = $3,
-            updated_at = NOW()
-          WHERE id_persona = $1::uuid
-        `,
-        [idPersona, activatedPhoto.asset.id_asset, activatedPhoto.asset.object_path]
-      );
-    }
-
     const detail = await client.query(CLIENTE_BY_ID_SQL, [createdClientId]);
 
     await client.query("COMMIT");
@@ -2249,7 +2309,7 @@ async function createCliente(app, request, payload) {
   }
 }
 
-async function sendUsuarioPasswordSetup(app, userId, body) {
+async function sendUsuarioPasswordSetup(app, request, userId, body) {
   const markPending = body?.marcar_pendiente_password !== false;
   const client = await app.db.connect();
   let transactionStarted = false;
@@ -2287,6 +2347,7 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     }
 
     const userRow = userResult.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, userId, "PASSWORD_SETUP");
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -2324,10 +2385,6 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     const email = normalizeEmail(userRow.email);
     if (!email) {
       throw new AppError(409, "El usuario no tiene correo principal", { code: "PERSONAS_USER_EMAIL_MISSING" });
-    }
-
-    if (markPending) {
-      await assertUserNotProtected(app, userId, "ACCESS_STATUS_PENDING_PASSWORD", { client });
     }
 
     await client.query("BEGIN");
@@ -2457,7 +2514,7 @@ async function restoreUserAccessByLifecycle(client, userId) {
   );
 }
 
-async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, assignedBy, esBarbero }) {
+async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, assignedBy, esBarbero, actorClaims }) {
   if (!userId) return;
 
   const historicalRolesResult = await client.query(
@@ -2489,7 +2546,7 @@ async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, 
     candidateRoles = esBarbero ? ["barbero"] : ["admin"];
   }
 
-  const normalizedRoles = parseEmployeeRoleNames(candidateRoles, esBarbero);
+  const normalizedRoles = parseEmployeeRoleNames(candidateRoles, esBarbero, actorClaims);
   if (normalizedRoles.some((role) => BRANCH_REQUIRED_ROLES.has(role)) && !branchId) {
     throw new AppError(409, "No se puede activar empleado sin sucursal valida para sus roles internos", {
       code: "PERSONAS_EMPLOYEE_ACTIVATE_BRANCH_REQUIRED",
@@ -2503,6 +2560,7 @@ async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, 
     userId,
     branchId,
     assignedBy,
+    actorClaims,
   });
 }
 
@@ -2514,6 +2572,7 @@ async function updateUsuario(app, request, userId, payload) {
     const current = await getUsuarioOrThrow(client, userId);
     const raw = current.raw;
     const currentUsuario = current.usuario;
+    await assertActorCanManagePrivilegedUser(app, request, client, raw.id_usuario, "USER_UPDATE");
 
     const personaPatch = payload?.persona || {};
     const accesoPatch = payload?.acceso || {};
@@ -2725,7 +2784,7 @@ async function updateUsuario(app, request, userId, payload) {
   }
 }
 
-async function updateUsuarioAccessStatus(app, userId, status) {
+async function updateUsuarioAccessStatus(app, request, userId, status) {
   if (!Object.values(ACCESS_STATUS).includes(status)) {
     throw new AppError(400, `estado_acceso invalido: ${status}`, {
       code: "PERSONAS_USER_ACCESS_STATUS_INVALID",
@@ -2737,9 +2796,7 @@ async function updateUsuarioAccessStatus(app, userId, status) {
 
   try {
     await getUsuarioOrThrow(client, userId);
-    if ([ACCESS_STATUS.PENDING_PASSWORD, ACCESS_STATUS.BLOCKED, ACCESS_STATUS.INACTIVE].includes(status)) {
-      await assertUserNotProtected(app, userId, "ACCESS_STATUS_UPDATE", { client });
-    }
+    await assertActorCanManagePrivilegedUser(app, request, client, userId, "ACCESS_STATUS_UPDATE");
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -2872,7 +2929,7 @@ async function updateUsuarioAccessStatus(app, userId, status) {
   }
 }
 
-async function inactivateEmpleado(app, idEmpleado) {
+async function inactivateEmpleado(app, request, idEmpleado) {
   const client = await app.db.connect();
   let transactionStarted = false;
 
@@ -2890,6 +2947,8 @@ async function inactivateEmpleado(app, idEmpleado) {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
+
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "EMPLOYEE_INACTIVATE");
 
     await client.query("BEGIN");
     transactionStarted = true;
@@ -2942,6 +3001,8 @@ async function activateEmpleado(app, request, idEmpleado) {
       });
     }
 
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "EMPLOYEE_ACTIVATE");
+
     await client.query("BEGIN");
     transactionStarted = true;
 
@@ -2960,6 +3021,7 @@ async function activateEmpleado(app, request, idEmpleado) {
       branchId: row.id_sucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
       esBarbero: Boolean(row.es_barbero),
+      actorClaims: request.claims,
     });
     await restoreUserAccessByLifecycle(client, row.id_usuario);
 
@@ -2980,6 +3042,7 @@ async function activateEmpleado(app, request, idEmpleado) {
 }
 
 async function updateCliente(app, request, idCliente, payload) {
+  assertAdminClientPhotoUnchanged(payload);
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
@@ -3019,10 +3082,6 @@ async function updateCliente(app, request, idCliente, payload) {
       ? await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null)
       : normalizeOptional(currentRow.id_sucursal_origen ?? null);
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
-    const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(cliente, "foto_perfil_asset_id");
-    const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
-      ? normalizeOptional(cliente.foto_perfil_asset_id ?? null)
-      : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
 
     if (!habilitarAcceso) {
       throw new AppError(400, "Los clientes deben conservar acceso habilitado", {
@@ -3101,18 +3160,6 @@ async function updateCliente(app, request, idCliente, payload) {
       : null;
 
     const roleIdsByName = await loadRoleIdByName(client);
-    const nextFotoPerfilAsset = nextFotoPerfilAssetIdRaw
-      ? await resolveAssetForBinding(client, {
-        assetId: nextFotoPerfilAssetIdRaw,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: idCliente,
-        idSucursal: idSucursalOrigen,
-        claims: request.claims,
-        allowUnboundEntity: true,
-        allowedStatuses: ["temporal", "activo"],
-      })
-      : null;
     if (habilitarAcceso && !currentRow.id_usuario) {
       authUserId = await createAuthIdentity(app, {
         email: correoPrincipal,
@@ -3209,40 +3256,6 @@ async function updateCliente(app, request, idCliente, payload) {
       }
     }
 
-    let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
-    let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
-    if (hasFotoPerfilPatch) {
-      if (!nextFotoPerfilAsset) {
-        nextFotoPerfilAssetId = null;
-        nextFotoPerfilPath = null;
-      } else {
-        const activatedPhoto = await activateAssetForEntity(app, client, {
-          assetId: nextFotoPerfilAsset.id_asset,
-          scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-          entityType: "cliente",
-          entityId: idCliente,
-          idSucursal: idSucursalOrigen,
-          ownerClienteId: idCliente,
-          claims: request.claims,
-          replaceCurrent: false,
-        });
-        nextFotoPerfilAssetId = activatedPhoto.asset.id_asset;
-        nextFotoPerfilPath = activatedPhoto.asset.object_path;
-      }
-
-      await client.query(
-        `
-          UPDATE public.personas
-          SET
-            foto_perfil_asset_id = $2::uuid,
-            foto_perfil_path = $3,
-            updated_at = NOW()
-          WHERE id_persona = $1::uuid
-        `,
-        [currentRow.id_persona, nextFotoPerfilAssetId, nextFotoPerfilPath]
-      );
-    }
-
     if (hasConsentTimestampColumns) {
       await client.query(
         `
@@ -3299,14 +3312,6 @@ async function updateCliente(app, request, idCliente, payload) {
 
     await client.query("COMMIT");
     transactionStarted = false;
-
-    if (hasFotoPerfilPatch) {
-      await replaceAssetIfNeeded(app, client, {
-        previousAssetId: currentRow.foto_perfil_asset_id,
-        nextAssetId: nextFotoPerfilAssetIdRaw,
-        claims: request.claims,
-      });
-    }
 
     let setupPassword = null;
     if (habilitarAcceso && !currentRow.id_usuario) {
@@ -3700,7 +3705,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/catalogos", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/catalogos", { preHandler: app.requireRoles(["super_admin", "admin"]) }, async (request, reply) => {
     try {
       const [rolesResult, sucursalesResult] = await Promise.all([
         app.db.query("SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"),
@@ -3786,7 +3791,8 @@ export default async function adminPersonasRoutes(app) {
   app.get("/usuarios", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(LIST_USUARIOS_SQL);
-      return sendOk(reply, { usuarios: rows.map(mapUsuario) });
+      const usuarios = filterUsuariosForActor(rows.map(mapUsuario), request.claims);
+      return sendOk(reply, { usuarios });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar usuarios", "PERSONAS_USERS_LIST_ERROR");
     }
@@ -3810,7 +3816,7 @@ export default async function adminPersonasRoutes(app) {
     { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioAccessStatusBodySchema } },
     async (request, reply) => {
       try {
-        const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, request.body?.estado_acceso);
+        const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, request.body?.estado_acceso);
         return sendOk(reply, updated, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo actualizar estado de acceso", "PERSONAS_USER_STATUS_UPDATE_ERROR");
@@ -3820,7 +3826,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.BLOCKED);
+      const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.BLOCKED);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo bloquear usuario", "PERSONAS_USER_BLOCK_ERROR");
@@ -3829,7 +3835,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.ACTIVE);
+      const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.ACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo activar usuario", "PERSONAS_USER_ACTIVATE_ERROR");
@@ -3838,7 +3844,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.INACTIVE);
+      const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.INACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo inactivar usuario", "PERSONAS_USER_INACTIVATE_ERROR");
@@ -3858,7 +3864,7 @@ export default async function adminPersonasRoutes(app) {
     { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioSetupBodySchema } },
     async (request, reply) => {
       try {
-        const result = await sendUsuarioPasswordSetup(app, request.params.id_usuario, request.body || {});
+        const result = await sendUsuarioPasswordSetup(app, request, request.params.id_usuario, request.body || {});
         return sendOk(reply, result, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo enviar configuracion de password", "PERSONAS_USER_SETUP_PASSWORD_ERROR");
@@ -3914,7 +3920,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const updated = await inactivateEmpleado(app, request.params.id_empleado);
+      const updated = await inactivateEmpleado(app, request, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo inactivar empleado", "PERSONAS_EMPLOYEE_INACTIVATE_ERROR");

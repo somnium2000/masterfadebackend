@@ -65,6 +65,39 @@ async function loadClienteStorageContext(client, idCliente) {
   return rows[0] ?? null;
 }
 
+async function loadBarberStorageContext(client, idEmpleado) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        e.id_empleado,
+        e.id_sucursal,
+        u.id_usuario,
+        EXISTS (
+          SELECT 1
+          FROM public.roles_usuarios ru
+          INNER JOIN public.roles r ON r.id_rol = ru.id_rol
+          WHERE ru.id_usuario = u.id_usuario
+            AND r.nombre = 'super_admin'
+        ) AS has_super_admin,
+        EXISTS (
+          SELECT 1
+          FROM public.app_protected_users apu
+          WHERE apu.id_usuario = u.id_usuario
+            AND apu.activo = TRUE
+        ) AS is_protected
+      FROM public.empleados e
+      LEFT JOIN public.usuarios u
+        ON u.id_persona = e.id_persona
+        AND u.deleted_at IS NULL
+      WHERE e.id_empleado = $1::uuid
+        AND e.deleted_at IS NULL
+      LIMIT 1
+    `,
+    [idEmpleado]
+  );
+  return rows[0] ?? null;
+}
+
 async function loadPromocionStorageContext(client, idPromocion, idSucursal = null) {
   const { rows } = await client.query(
     `
@@ -114,6 +147,71 @@ function assertAssetAccessByClaims(claims, asset) {
   throw new AppError(403, "No tienes permisos sobre este asset", {
     code: "STORAGE_ASSET_FORBIDDEN",
   });
+}
+
+function isAdminBarberProfileContext(claims, scopeKey, entityType) {
+  return userHasRole(claims, "admin")
+    && !userHasRole(claims, "super_admin")
+    && String(scopeKey || "") === "public_barber_profile"
+    && String(entityType || "") === "barbero";
+}
+
+async function assertBarberProfileContext(client, {
+  claims,
+  entityId,
+  idSucursal,
+}) {
+  if (!entityId) return null;
+  const barber = await loadBarberStorageContext(client, entityId);
+  if (!barber) {
+    throw new AppError(404, "Empleado no encontrado para el scope de Storage", {
+      code: "STORAGE_BARBER_NOT_FOUND",
+    });
+  }
+  if (idSucursal && String(barber.id_sucursal) !== String(idSucursal)) {
+    throw new AppError(409, "La sucursal no corresponde al empleado", {
+      code: "STORAGE_BARBER_BRANCH_MISMATCH",
+    });
+  }
+  if (
+    userHasRole(claims, "admin")
+    && !userHasRole(claims, "super_admin")
+    && (barber.has_super_admin || barber.is_protected)
+  ) {
+    throw new AppError(403, "Un administrador no puede gestionar esta cuenta privilegiada", {
+      code: "STORAGE_PRIVILEGED_BARBER_FORBIDDEN",
+    });
+  }
+  return barber;
+}
+
+function assertContextualAssetAccess(claims, asset, context = null) {
+  const actorUserId = String(claims?.user?.id_usuario || "");
+  const assetOwnerIds = [asset?.owner_user_id, asset?.uploaded_by]
+    .filter(Boolean)
+    .map((value) => String(value));
+  const isOwnedTemporaryBinding = String(asset?.status || "") === "temporal"
+    && !asset?.entity_id
+    && actorUserId
+    && assetOwnerIds.length > 0
+    && assetOwnerIds.every((value) => value === actorUserId);
+  const isExistingEntityBinding = context?.entityId
+    && String(asset?.entity_id || "") === String(context.entityId);
+  const isVerifiedAdminBarberContext = context
+    && isAdminBarberProfileContext(claims, context.scopeKey, context.entityType)
+    && context.entityId
+    && context.idSucursal
+    && String(asset?.scope_key || "") === String(context.scopeKey)
+    && String(asset?.entity_type || "") === String(context.entityType)
+    && String(asset?.id_sucursal || "") === String(context.idSucursal);
+  if (isVerifiedAdminBarberContext && !asset?.entity_id) {
+    if (isOwnedTemporaryBinding) return;
+    throw new AppError(403, "No tienes permisos para asociar este asset temporal", {
+      code: "STORAGE_ASSET_FORBIDDEN",
+    });
+  }
+  if (isVerifiedAdminBarberContext && isExistingEntityBinding) return;
+  assertAssetAccessByClaims(claims, asset);
 }
 
 async function validateScopeEntityContext(client, scope, {
@@ -168,6 +266,16 @@ async function validateScopeEntityContext(client, scope, {
         normalizedSucursalId = promotion.id_sucursal;
       }
     }
+  } else if (scope.key === "public_barber_profile" && scope.entityType === "barbero") {
+    const barber = await assertBarberProfileContext(client, {
+      claims,
+      entityId: normalizedEntityId,
+      idSucursal: normalizedSucursalId,
+    });
+    if (barber) {
+      normalizedEntityId = barber.id_empleado;
+      normalizedSucursalId = barber.id_sucursal;
+    }
   }
 
   return {
@@ -209,6 +317,12 @@ export async function resolveAssetForBinding(client, {
       details: { expected_scope: scopeKey, received_scope: asset.scope_key },
     });
   }
+  const expectedScope = scopeKey ? getStorageScope(scopeKey) : null;
+  if (expectedScope && String(asset.bucket_name) !== String(expectedScope.bucket)) {
+    throw new AppError(400, "El asset no pertenece al bucket esperado", {
+      code: "STORAGE_ASSET_BUCKET_MISMATCH",
+    });
+  }
   if (entityType && String(asset.entity_type) !== String(entityType)) {
     throw new AppError(400, "El asset no pertenece al entity_type esperado", {
       code: "STORAGE_ASSET_ENTITY_TYPE_MISMATCH",
@@ -229,8 +343,17 @@ export async function resolveAssetForBinding(client, {
       code: "STORAGE_ASSET_BRANCH_MISMATCH",
     });
   }
+  let barberContext = null;
+  if (scopeKey === "public_barber_profile" && entityType === "barbero" && entityId && idSucursal) {
+    barberContext = await assertBarberProfileContext(client, { claims, entityId, idSucursal });
+  }
   if (claims) {
-    assertAssetAccessByClaims(claims, asset);
+    assertContextualAssetAccess(claims, asset, barberContext ? {
+      scopeKey,
+      entityType,
+      entityId,
+      idSucursal,
+    } : null);
   }
   return asset;
 }
@@ -294,7 +417,7 @@ export async function prepareStorageUpload(app, {
       });
     }
 
-    if (safeSucursalId) {
+    if (safeSucursalId && !isAdminBarberProfileContext(claims, scope.key, scope.entityType)) {
       assertBranchAccess(claims, safeSucursalId);
     }
 
@@ -410,6 +533,92 @@ export async function buildAssetReadUrl(app, { claims, assetId, expiresIn = SIGN
       });
     }
 
+    return {
+      asset_id: asset.id_asset,
+      visibility: asset.visibility,
+      expires_in: ttl,
+      url: data?.signedUrl || null,
+    };
+  } finally {
+    client.release();
+  }
+}
+
+export async function buildPersonasClientProfileReadUrl(app, {
+  claims,
+  clientId,
+  assetId,
+  expiresIn = SIGNED_READ_EXPIRES_IN,
+}) {
+  if (!userHasRole(claims, "admin") && !userHasRole(claims, "super_admin")) {
+    throw new AppError(403, "No tienes permisos sobre este asset", {
+      code: "STORAGE_ASSET_FORBIDDEN",
+    });
+  }
+
+  const safeClientId = assertUuid(clientId, "id_cliente", {
+    required: true,
+    code: "STORAGE_CLIENT_ID_REQUIRED",
+  });
+  const safeAssetId = assertUuid(assetId, "id_asset", {
+    required: true,
+    code: "STORAGE_ASSET_ID_REQUIRED",
+  });
+  const supabase = ensureSupabaseStorageAdmin(app);
+  const client = await app.db.connect();
+  try {
+    const { rows } = await client.query(
+      `
+        SELECT c.id_cliente, p.foto_perfil_asset_id
+        FROM public.clientes c
+        INNER JOIN public.personas p ON p.id_persona = c.id_persona
+        WHERE c.id_cliente = $1::uuid
+          AND c.deleted_at IS NULL
+        LIMIT 1
+      `,
+      [safeClientId]
+    );
+    const cliente = rows[0] ?? null;
+    if (!cliente) {
+      throw new AppError(404, "Cliente no encontrado", { code: "STORAGE_CLIENT_NOT_FOUND" });
+    }
+    if (String(cliente.foto_perfil_asset_id || "") !== safeAssetId) {
+      throw new AppError(403, "El asset no corresponde a la fotografia actual del cliente", {
+        code: "STORAGE_CLIENT_PROFILE_ASSET_FORBIDDEN",
+      });
+    }
+
+    const asset = await getAssetById(client, safeAssetId);
+    if (!asset || asset.deleted_at) {
+      throw new AppError(404, "Asset no encontrado", { code: "STORAGE_ASSET_NOT_FOUND" });
+    }
+    if (
+      asset.scope_key !== "private_client_profile"
+      || asset.entity_type !== "cliente"
+      || asset.visibility !== STORAGE_VISIBILITY.PRIVATE
+    ) {
+      throw new AppError(403, "El asset no corresponde al perfil privado del cliente", {
+        code: "STORAGE_CLIENT_PROFILE_ASSET_FORBIDDEN",
+      });
+    }
+    const ownershipIds = [asset.entity_id, asset.owner_cliente_id]
+      .filter(Boolean)
+      .map((value) => String(value));
+    if (!ownershipIds.length || ownershipIds.some((value) => value !== safeClientId)) {
+      throw new AppError(403, "El asset no corresponde al cliente consultado", {
+        code: "STORAGE_CLIENT_PROFILE_ASSET_FORBIDDEN",
+      });
+    }
+
+    const ttl = Math.max(30, Number(expiresIn) || SIGNED_READ_EXPIRES_IN);
+    const { data, error } = await supabase.storage
+      .from(asset.bucket_name)
+      .createSignedUrl(asset.object_path, ttl);
+    if (error) {
+      throw new AppError(502, "No se pudo generar signed read URL", {
+        code: "STORAGE_SIGNED_READ_ERROR",
+      });
+    }
     return {
       asset_id: asset.id_asset,
       visibility: asset.visibility,
@@ -582,16 +791,31 @@ export async function replaceAssetIfNeeded(app, client, {
   previousAssetId,
   nextAssetId,
   claims = null,
+  scopeKey = null,
+  entityType = null,
+  entityId = null,
+  idSucursal = null,
+  prevalidatedAsset = null,
+  logger = null,
 }) {
   const previousId = normalizeOptionalText(previousAssetId);
   const nextId = normalizeOptionalText(nextAssetId);
   if (!previousId || previousId === nextId) return null;
 
-  const previous = await getAssetById(client, previousId);
+  const previous = prevalidatedAsset || await getAssetById(client, previousId);
   if (!previous || previous.deleted_at) return null;
 
-  if (claims) {
-    assertAssetAccessByClaims(claims, previous);
+  if (!prevalidatedAsset) {
+    await validateAssetReplacement(client, {
+      previousAssetId: previousId,
+      nextAssetId: nextId,
+      claims,
+      scopeKey,
+      entityType,
+      entityId,
+      idSucursal,
+      asset: previous,
+    });
   }
 
   await markAssetStatus(client, {
@@ -602,6 +826,76 @@ export async function replaceAssetIfNeeded(app, client, {
       replaced_at: new Date().toISOString(),
     },
   });
-  await removeStorageObjectBestEffort(app, previous.bucket_name, previous.object_path);
+  await removeStorageObjectBestEffort(app, previous.bucket_name, previous.object_path, logger);
+  return previous;
+}
+
+export async function validateAssetReplacement(client, {
+  previousAssetId,
+  nextAssetId,
+  claims = null,
+  scopeKey = null,
+  entityType = null,
+  entityId = null,
+  idSucursal = null,
+  asset = null,
+}) {
+  const previousId = normalizeOptionalText(previousAssetId);
+  const nextId = normalizeOptionalText(nextAssetId);
+  if (!previousId || previousId === nextId) return null;
+  const contextValues = [scopeKey, entityType, entityId, idSucursal];
+  const hasContext = contextValues.some(Boolean);
+  const hasCompleteContext = contextValues.every(Boolean);
+  if (hasContext && !hasCompleteContext) {
+    throw new AppError(400, "El contexto de reemplazo de Storage esta incompleto", {
+      code: "STORAGE_REPLACEMENT_CONTEXT_INCOMPLETE",
+    });
+  }
+  const previous = asset || await getAssetById(client, previousId);
+  if (!previous || previous.deleted_at) {
+    if (hasContext) {
+      throw new AppError(404, "Asset anterior no encontrado", {
+        code: "STORAGE_ASSET_NOT_FOUND",
+      });
+    }
+    return null;
+  }
+  if (scopeKey && String(previous.scope_key) !== String(scopeKey)) {
+    throw new AppError(400, "El asset anterior no pertenece al scope esperado", {
+      code: "STORAGE_ASSET_SCOPE_MISMATCH",
+    });
+  }
+  if (entityType && String(previous.entity_type) !== String(entityType)) {
+    throw new AppError(400, "El asset anterior no pertenece al entity_type esperado", {
+      code: "STORAGE_ASSET_ENTITY_TYPE_MISMATCH",
+    });
+  }
+  if (hasContext && String(previous.entity_id || "") !== String(entityId)) {
+    throw new AppError(409, "El asset anterior no esta vinculado a la entidad esperada", {
+      code: "STORAGE_ASSET_ENTITY_MISMATCH",
+    });
+  }
+  if (idSucursal && String(previous.id_sucursal || "") !== String(idSucursal)) {
+    throw new AppError(409, "El asset anterior pertenece a otra sucursal", {
+      code: "STORAGE_ASSET_BRANCH_MISMATCH",
+    });
+  }
+  let barberContext = null;
+  if (hasContext) {
+    if (scopeKey !== "public_barber_profile" || entityType !== "barbero") {
+      throw new AppError(403, "El contexto no permite una excepcion transversal de Storage", {
+        code: "STORAGE_REPLACEMENT_CONTEXT_FORBIDDEN",
+      });
+    }
+    barberContext = await assertBarberProfileContext(client, { claims, entityId, idSucursal });
+  }
+  if (claims) {
+    assertContextualAssetAccess(claims, previous, barberContext ? {
+      scopeKey,
+      entityType,
+      entityId,
+      idSucursal,
+    } : null);
+  }
   return previous;
 }
