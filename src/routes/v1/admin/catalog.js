@@ -1048,6 +1048,35 @@ const GET_PACKAGE_OFFER_SQL = `
   FOR UPDATE
 `;
 
+const GET_ACTIVE_PACKAGE_OFFER_BRANCHES_SQL = `
+  -- AM: package_active_offers toma solo la version vigente de cada oferta por sucursal.
+  WITH ranked_offers AS (
+    SELECT
+      ps.id_sucursal,
+      ps.activo,
+      ROW_NUMBER() OVER (
+        PARTITION BY ps.id_sucursal
+        ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
+      ) AS rn
+    FROM public.paquetes_sucursal ps
+    WHERE ps.id_paquete = $1::uuid
+  )
+  SELECT ro.id_sucursal
+  FROM ranked_offers ro
+  WHERE ro.rn = 1
+    AND ro.activo IS TRUE
+  ORDER BY ro.id_sucursal ASC
+`;
+
+const LOCK_PACKAGE_COMPOSITION_SQL = `
+  -- AM: package_composition_lock serializa validacion y reemplazo del mismo paquete.
+  SELECT p.id_paquete
+  FROM public.paquetes p
+  WHERE p.id_paquete = $1::uuid
+    AND p.deleted_at IS NULL
+  FOR UPDATE
+`;
+
 function normalizeOptionalText(value) {
   if (value === undefined) {
     return undefined;
@@ -1494,6 +1523,28 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
       throw new AppError(403, "Uno o mas servicios del paquete no estan tarifados dentro del alcance del administrador", {
         code: "AUTH_FORBIDDEN_BRANCH",
       });
+    }
+  }
+}
+
+async function ensurePackageCompositionAcrossActiveOffers(client, claims, idPaquete, items, operationBranchId) {
+  const { rows } = await client.query(GET_ACTIVE_PACKAGE_OFFER_BRANCHES_SQL, [idPaquete]);
+  const branchIds = new Set(rows.map((row) => row.id_sucursal).filter(Boolean));
+  if (operationBranchId) branchIds.add(operationBranchId);
+
+  for (const branchId of branchIds) {
+    try {
+      await ensurePackageItemsAccessible(client, claims, items, branchId);
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      throw new AppError(
+        409,
+        "No se puede actualizar la composición del paquete porque uno o más servicios no están disponibles en todas las sucursales donde se ofrece actualmente.",
+        {
+          code: "CATALOG_PACKAGE_COMPOSITION_BRANCH_CONFLICT",
+          details: { id_sucursal: branchId },
+        }
+      );
     }
   }
 }
@@ -3868,6 +3919,8 @@ export default async function adminCatalogRoutes(app) {
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
+        await client.query(LOCK_PACKAGE_COMPOSITION_SQL, [request.params.id]);
+
         const baseResult = await client.query(GET_PACKAGE_BASE_SQL, [request.params.id]);
         const basePackage = baseResult.rows[0];
         const scopedResult = await client.query(GET_PACKAGE_SCOPED_SQL, [request.params.id, branchId]);
@@ -3916,9 +3969,19 @@ export default async function adminCatalogRoutes(app) {
 
         await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
 
-        const itemsForScopeValidation = nextItems ?? await getCurrentPackageItems(client, request.params.id);
-        if (itemsForScopeValidation.length > 0) {
-          await ensurePackageItemsAccessible(client, request.claims, itemsForScopeValidation, branchId);
+        if (nextItems) {
+          await ensurePackageCompositionAcrossActiveOffers(
+            client,
+            request.claims,
+            request.params.id,
+            nextItems,
+            branchId
+          );
+        } else {
+          const currentItems = await getCurrentPackageItems(client, request.params.id);
+          if (currentItems.length > 0) {
+            await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
+          }
         }
 
         if (shouldMutatePackageBase) {
