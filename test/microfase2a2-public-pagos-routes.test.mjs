@@ -16,6 +16,7 @@ import { PaymentProviderFactory } from "../src/services/payments/PaymentProvider
 import { TodoPagoPreprodSimulatedProvider } from "../src/services/payments/TodoPagoPreprodSimulatedProvider.js";
 import { PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS } from "../src/services/payments/pixelPaySaleAttemptStore.js";
 import { createHangingPgPool } from "./helpers/hangingPgPool.mjs";
+import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
 
 const GROUP_A = "11111111-2222-4333-8444-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
@@ -221,11 +222,14 @@ function createPagosClient({
   groupCitaState = "en_espera",
   groupHoldState = "activo",
   initialPayments = [],
+  initialSaleAttempts = [],
+  groupStateCode = "activo",
+  slotReused = false,
 } = {}) {
   const calls = [];
   const statusChecks = [];
   const payments = structuredClone(initialPayments);
-  let saleAttempts = [];
+  let saleAttempts = structuredClone(initialSaleAttempts);
   let transactionSnapshot = null;
   let activeIntent = existingIntent ? { ...existingIntent } : null;
   const groupState = [
@@ -312,11 +316,23 @@ function createPagosClient({
         });
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
       }
+      if (text.includes("SELECT finalized_at FROM app_private.pixelpay_sale_attempts")) {
+        const flags = ["response_success", "response_approved", "transaction_result_valid", "transaction_result_parsed",
+          "payment_uuid_present", "transaction_id_present", "payment_hash_present", "payment_hash_valid",
+          "transaction_amount_matches", "approved_amount_matches", "amount_matches"];
+        for (const flag of flags) assert.ok(text.includes(`${flag} IS TRUE`));
+        assert.ok(text.includes("response_incomplete IS FALSE AND uncertain IS FALSE"));
+        assert.ok(text.includes("finalized_at <= $2::timestamptz"));
+        const row = saleAttempts.find((entry) => entry.id_intent === params[0] && entry.outcome === "approved"
+          && entry.finalized_at && new Date(entry.finalized_at).getTime() <= new Date(params[1]).getTime()
+          && flags.every((flag) => entry[flag] === true) && entry.response_incomplete === false && entry.uncertain === false);
+        return { rows: row ? [{ finalized_at: row.finalized_at }] : [] };
+      }
       if (failPaymentInsert && text.includes("INSERT INTO public.payments")) {
         throw new Error("fixture fallo financiero posterior a FINAL");
       }
       if (text.includes("FROM public.citas_grupos cg") && text.includes("co.direccion_correo")) {
-        return { rows: structuredClone(groupState) };
+        return { rows: structuredClone(groupState).map((row) => ({ ...row, estado_grupo_codigo: groupStateCode })) };
       }
       if (text.includes("FROM public.citas c") && text.includes("COALESCE(c.subtotal_servicios_hnl")) {
         return {
@@ -607,6 +623,11 @@ function createPagosClient({
         return { rows: [{ total: "115.00" }] };
       }
       if (text.includes("app_private.confirmar_reserva_pagada_v1")) {
+        if (slotReused) {
+          const error = new Error("MF_PAYMENT_SLOT_ALREADY_RELEASED");
+          error.code = "P0001";
+          throw error;
+        }
         activeIntent = { ...activeIntent, estado_intent_codigo: "confirmado", paid_at: params[2] };
         for (const row of groupState) {
           row.estado_cita_codigo = "confirmada";
@@ -1622,9 +1643,11 @@ test("Sale APPROVED sin paidAt persiste timestamp backend y conserva referencias
   assert.ok(Date.parse(payment.paid_at) >= startedAt);
   assert.equal(intent.estado_intent_codigo, "confirmado");
   assert.equal(intent.provider_session_id, "P-UUID-PAID-AT");
-  assert.equal(payment.provider_tx_id, "TX-PAID-AT");
+  assert.equal(payment.provider_tx_id, "P-UUID-PAID-AT");
   assert.equal(payment.monto_hnl, 115);
   assert.equal(payment.moneda_codigo, "HNL");
+  assert.equal(client.getGroupState()[0].estado_hold_codigo, "consumido");
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
   await app.close();
 });
 
@@ -1960,7 +1983,7 @@ test("reconcilePixelPayPaid respeta paidAt explicito", async () => {
   assert.equal(client.getActiveIntent().paid_at, explicitPaidAt);
 });
 
-test("provider_tx_id duplicado en otro intent sigue protegido", async () => {
+test("payment_uuid duplicado en otro intent sigue protegido", async () => {
   const duplicateTransactionId = "TX-DUPLICATE";
   const client = createPagosClient({
     providerCode: "pixelpay",
@@ -1968,7 +1991,7 @@ test("provider_tx_id duplicado en otro intent sigue protegido", async () => {
       id_payment: "edededed-eded-4ded-8ded-edededededed",
       id_intent: "98989898-9898-4989-8989-989898989898",
       estado_pago_codigo: "capturado",
-      provider_tx_id: duplicateTransactionId,
+      provider_tx_id: "P-UUID-DUPLICATE",
       monto_hnl: 115,
       moneda_codigo: "HNL",
       paid_at: "2026-10-06T14:00:00.000Z",
@@ -2002,6 +2025,191 @@ test("provider_tx_id duplicado en otro intent sigue protegido", async () => {
   );
   assert.equal(client.getPayments().length, 1);
   assert.equal(client.getPayments()[0].id_intent, "98989898-9898-4989-8989-989898989898");
+});
+
+function reconciliationIntent(overrides = {}) {
+  return {
+    id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
+    id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
+    expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+    provider_session_id: "PAYMENT-UUID-NEW", referencia_externa: "TX-SANDBOX-REPEATED",
+    created_by_usuario_id: USER_A, ...overrides,
+  };
+}
+
+function reconcileFixture(client, overrides = {}) {
+  return reconcilePixelPayPaid(client, {
+    idGrupoCita: GROUP_A, idIntent: INTENT_A, titularEmail: "cliente@example.com",
+    paymentUuid: "PAYMENT-UUID-NEW", providerTransactionId: "TX-SANDBOX-REPEATED",
+    expectedAmount: 115, ...overrides,
+  });
+}
+
+test("transactionId repetido y UUID distinto no colisionan, incluyendo caso real QA", async () => {
+  for (const [tx, historicalUuid, newUuid] of [
+    ["TX-SANDBOX-REPEATED", "PAYMENT-UUID-OLD", "PAYMENT-UUID-NEW"],
+    ["1f694eee-4715-45b8-a545-000000000000", "S-a2eae9f3-11f5-4d5c-8190-0beec0242038", "S-a2f5612c-5084-4134-ad5f-feeb0ae6d8c8"],
+  ]) {
+    const historical = { id_intent: "98989898-9898-4989-8989-989898989898", provider_tx_id: tx,
+      estado_pago_codigo: "capturado", provider_session_id: historicalUuid };
+    const client = createPagosClient({ providerCode: "pixelpay", initialPayments: [historical],
+      existingIntent: reconciliationIntent({ referencia_externa: tx, provider_session_id: newUuid }) });
+    const result = await reconcileFixture(client, { providerTransactionId: tx, paymentUuid: newUuid });
+    assert.equal(result.booking_confirmed, true);
+    assert.equal(client.getPayments().filter((row) => row.id_intent === INTENT_A).length, 1);
+    assert.equal(client.getPayments().find((row) => row.id_intent === INTENT_A).provider_tx_id, newUuid);
+    assert.deepEqual(client.getPayments()[0], historical);
+    assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+    assert.equal(client.getActiveIntent().referencia_externa, tx);
+  }
+});
+
+for (const state of ["confirmado", "pendiente_confirmacion"]) {
+  test(`payment legacy del mismo intent es idempotente (${state})`, async () => {
+    const legacy = { id_intent: INTENT_A, provider_tx_id: "TX-SANDBOX-REPEATED", estado_pago_codigo: "capturado" };
+    const client = createPagosClient({ providerCode: "pixelpay", initialPayments: [legacy],
+      existingIntent: reconciliationIntent({ estado_intent_codigo: state }) });
+    const first = await reconcileFixture(client);
+    const second = await reconcileFixture(client);
+    assert.equal(first.duplicate, true);
+    assert.equal(second.duplicate, true);
+    assert.deepEqual(client.getPayments(), [legacy]);
+    assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  });
+}
+
+test("UUID nuevo idempotente ejecuta confirmacion y efectos postpago solo una vez", async () => {
+  const client = createPagosClient({ providerCode: "pixelpay", existingIntent: reconciliationIntent() });
+  await reconcileFixture(client);
+  const callsAfterFirst = client.calls.length;
+  const repeated = await reconcileFixture(client);
+  assert.equal(repeated.duplicate, true);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
+  const repeatedSql = client.calls.slice(callsAfterFirst).map((call) => call.sql).join("\n");
+  assert.doesNotMatch(repeatedSql, /INSERT INTO|UPDATE public\.|promociones|notificaciones_email|puntos/i);
+});
+
+test("compatibilidad legacy no permite UUID perteneciente a otro intent", async () => {
+  const client = createPagosClient({ providerCode: "pixelpay", existingIntent: reconciliationIntent({ estado_intent_codigo: "confirmado" }),
+    initialPayments: [
+      { id_intent: INTENT_A, provider_tx_id: "TX-SANDBOX-REPEATED", estado_pago_codigo: "capturado" },
+      { id_intent: CITA_B, provider_tx_id: "PAYMENT-UUID-NEW", estado_pago_codigo: "capturado" },
+    ] });
+  await assert.rejects(reconcileFixture(client), (error) => error.code === "PIXELPAY_TRANSACTION_CONFLICT");
+  assert.equal(client.getPayments().length, 2);
+});
+
+function durableApprovalFixture(overrides = {}) {
+  return {
+    id_intent: INTENT_A, outcome: "approved", finalized_at: "2020-01-01T15:59:00.000Z",
+    response_success: true, response_approved: true, response_incomplete: false,
+    transaction_result_valid: true, transaction_result_parsed: true,
+    payment_uuid_present: true, transaction_id_present: true, payment_hash_present: true,
+    payment_hash_valid: true, transaction_amount_matches: true, approved_amount_matches: true,
+    amount_matches: true, uncertain: false, ...overrides,
+  };
+}
+
+const invalidApprovals = [
+  ["sin evidencia", null],
+  ["solo START", { finalized_at: null, created_at: "2020-01-01T15:58:00.000Z" }],
+  ["despues del expiry", { finalized_at: "2020-01-01T16:00:00.001Z" }],
+  ["otro intent", { id_intent: CITA_B }],
+  ["outcome incierto", { outcome: "uncertain" }],
+  ["uncertain true", { uncertain: true }],
+  ["incomplete true", { response_incomplete: true }],
+  ...["response_success", "response_approved", "transaction_result_valid", "transaction_result_parsed",
+    "payment_uuid_present", "transaction_id_present", "payment_hash_present", "payment_hash_valid",
+    "transaction_amount_matches", "approved_amount_matches", "amount_matches"].flatMap((flag) => [
+    [`${flag} false`, { [flag]: false }], [`${flag} null`, { [flag]: null }],
+  ]),
+];
+
+for (const [name, approvalOverrides, slotReused] of [
+  ["aprobacion previa", {}], ["aprobacion exactamente en expiry", { finalized_at: "2020-01-01T16:00:00.000Z" }],
+  ["slot reutilizado", {}, true], ...invalidApprovals,
+]) {
+  test(`Status MOCK PAID post-expiry: ${name}`, async () => {
+    const provider = { saleCalls: 0, statusCalls: 0,
+      async sale() { this.saleCalls++; throw new Error("Sale prohibida"); },
+      async queryPaymentStatus(paymentUuid) { this.statusCalls++; return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid }; },
+    };
+    const approval = approvalOverrides === null ? null : durableApprovalFixture(approvalOverrides);
+    const client = createPagosClient({ providerCode: "pixelpay", groupCitaState: "expirada", groupHoldState: "expirado",
+      groupStateCode: "cancelado", holdExpiresAt: "2020-01-01T16:00:00.000Z", slotReused,
+      existingIntent: reconciliationIntent({ expires_at: "2020-01-01T16:00:00.000Z" }),
+      initialSaleAttempts: approval ? [approval] : [] });
+    const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+    try {
+      const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/status",
+        payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" } });
+      if (slotReused) {
+        assert.equal(response.statusCode, 409, response.body);
+        assert.equal(response.json().error.code, "PAYMENT_SLOT_ALREADY_RELEASED");
+        assert.equal(client.getPayments().length, 0);
+        assert.equal(client.getGroupState()[0].estado_cita_codigo, "expirada");
+        assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+      } else if (name.startsWith("aprobacion")) {
+        assert.equal(response.statusCode, 200, response.body);
+        assert.equal(response.json().data.booking_confirmed, true);
+        assert.equal(client.getPayments().length, 1);
+        assert.equal(client.getPayments()[0].provider_tx_id, "PAYMENT-UUID-NEW");
+        assert.equal(client.getPayments()[0].paid_at, approval.finalized_at);
+        assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+        assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+        assert.equal(client.getGroupState()[0].estado_hold_codigo, "consumido");
+      } else {
+        assert.equal(response.statusCode, 202, response.body);
+        assert.equal(response.json().data.manual_reconciliation_required, true);
+        assert.equal(client.getPayments().length, 0);
+      }
+      assert.equal(provider.saleCalls, 0);
+      assert.equal(provider.statusCalls, 1);
+    } finally { await app.close(); }
+  });
+}
+
+test("flag allowExpiredRecovery solo no habilita recuperacion ni permite backdate libre", async () => {
+  for (const hasEvidence of [false, true]) {
+    const client = createPagosClient({ providerCode: "pixelpay", groupStateCode: "cancelado",
+      groupCitaState: "expirada", groupHoldState: "expirado", holdExpiresAt: "2020-01-01T16:00:00.000Z",
+      existingIntent: reconciliationIntent(), initialSaleAttempts: hasEvidence ? [durableApprovalFixture()] : [] });
+    const result = await reconcileFixture(client, { allowExpiredRecovery: true, paidAt: "2020-01-01T15:00:00.000Z" });
+    assert.equal(result.manual_reconciliation_required, true);
+    assert.equal(client.getPayments().length, 0);
+  }
+});
+
+test("recuperacion requiere opt-in y nunca revive una cita cancelada explicitamente", async () => {
+  for (const [allowExpiredRecovery, groupCitaState] of [[false, "expirada"], [true, "cancelada"]]) {
+    const client = createPagosClient({ providerCode: "pixelpay", groupStateCode: "cancelado", groupCitaState,
+      groupHoldState: "expirado", holdExpiresAt: "2020-01-01T16:00:00.000Z", existingIntent: reconciliationIntent(),
+      initialSaleAttempts: [durableApprovalFixture()] });
+    const result = await reconcileFixture(client, { allowExpiredRecovery, paidAt: durableApprovalFixture().finalized_at });
+    assert.equal(result.manual_reconciliation_required, true);
+    assert.equal(client.getPayments().length, 0);
+  }
+});
+
+test("recuperacion usa menor expiry de todos los holds y lo revalida bajo locks", async () => {
+  const client = createPagosClient({ providerCode: "pixelpay", groupStateCode: "cancelado", groupCitaState: "expirada",
+    groupHoldState: "expirado", holdExpiresAt: "2020-01-01T16:00:00.000Z", groupSize: 2,
+    secondHoldState: "expirado", secondHoldExpiresAt: "2020-01-01T15:58:00.000Z",
+    existingIntent: reconciliationIntent(), initialSaleAttempts: [durableApprovalFixture()] });
+  const result = await reconcileFixture(client, { allowExpiredRecovery: true, paidAt: durableApprovalFixture().finalized_at });
+  assert.equal(result.manual_reconciliation_required, true);
+  assert.equal(client.getPayments().length, 0);
+  const evidenceQuery = client.calls.find((call) => call.sql.includes("SELECT finalized_at"));
+  assert.equal(evidenceQuery.params[1], "2020-01-01T15:58:00.000Z");
+  assert.ok(client.calls.findIndex((call) => call.sql.includes("FOR UPDATE OF h")) < client.calls.indexOf(evidenceQuery));
+});
+
+test("helper durable falla cerrado con holds ausentes o invalidos sin consultar DB", async () => {
+  const client = { async query() { throw new Error("No debe consultar evidencia sin expiry valido"); } };
+  for (const groupRows of [[], [{}], [{ expires_at: null }], [{ expires_at: "invalid" }]]) {
+    assert.equal(await loadDurablePixelPayApproval(client, { idIntent: INTENT_A, groupRows }), null);
+  }
 });
 
 test("status carga intent PixelPay y registra una verificacion con proveedor simulado", async () => {
@@ -2193,7 +2401,7 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   assert.equal(first.json().data.provider_status, "PAID");
   assert.equal(first.json().data.booking_confirmed, true);
   assert.equal(client.getPayments().length, 1);
-  assert.equal(client.getPayments()[0].provider_tx_id, "transaction-id-paid-qa");
+  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-paid-qa");
   assert.ok(Number.isFinite(Date.parse(client.getPayments()[0].paid_at)));
   assert.equal(client.getPayments()[0].monto_hnl, 115);
   assert.equal(client.getPayments()[0].moneda_codigo, "HNL");
@@ -2266,7 +2474,7 @@ test("dos Status PAID concurrentes producen un payment y una confirmacion efecti
   assert.equal(provider.statusCalls, 2);
   assert.equal(client.getStatusChecks().length, 2);
   assert.equal(client.getPayments().length, 1);
-  assert.equal(client.getPayments()[0].provider_tx_id, "transaction-id-concurrent-qa");
+  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-concurrent-qa");
   assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
   assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
   await app.close();

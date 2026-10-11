@@ -16,6 +16,7 @@ import {
   finalizePixelPaySaleAttemptBestEffort,
 } from "../../../services/payments/pixelPaySaleAttemptStore.js";
 import { inspectPixelPayCardExpire } from "../../../services/payments/PixelPaySdkProvider.js";
+import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
 export { buildSafeProviderErrorDiagnostic, buildSafePixelPaySdkDiagnostics };
 import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
@@ -1453,6 +1454,7 @@ export async function reconcilePixelPayPaid(client, {
   providerTransactionId,
   expectedAmount,
   paidAt = null,
+  allowExpiredRecovery = false,
   logger,
 }) {
   await client.query("BEGIN");
@@ -1526,12 +1528,25 @@ export async function reconcilePixelPayPaid(client, {
       [idIntent]
     );
     const existingPayment = existingPaymentResult.rows[0] || null;
-    if (existingPayment && intent.estado_intent_codigo === "confirmado") {
-      if (providerTransactionId && safeText(existingPayment.provider_tx_id) !== safeText(providerTransactionId)) {
+    const providerPaymentId = safeText(paymentUuid);
+    const stableProviderTransactionId = safeText(providerTransactionId);
+    const paymentIdentityOwner = await client.query(
+      "SELECT id_intent FROM public.payments WHERE provider_tx_id = $1::text LIMIT 1",
+      [providerPaymentId]
+    );
+    if (paymentIdentityOwner.rows[0] && String(paymentIdentityOwner.rows[0].id_intent) !== idIntent) {
+      throw new AppError(409, "La transaccion del proveedor ya fue utilizada", {
+        code: "PIXELPAY_TRANSACTION_CONFLICT",
+      });
+    }
+    if (existingPayment) {
+      if (![providerPaymentId, stableProviderTransactionId].filter(Boolean).includes(safeText(existingPayment.provider_tx_id))) {
         throw new AppError(409, "La transaccion de PixelPay no coincide con el pago persistido", {
           code: "PIXELPAY_TRANSACTION_CONFLICT",
         });
       }
+    }
+    if (existingPayment && intent.estado_intent_codigo === "confirmado") {
       await client.query("COMMIT");
       return {
         processed: false,
@@ -1541,21 +1556,34 @@ export async function reconcilePixelPayPaid(client, {
       };
     }
 
+    let canonicalPaidAt = safeText(paidAt) || new Date().toISOString();
     try {
       assertPublicGroupPayable(groupRows);
       resolveGroupExpiresAt(groupRows);
     } catch (error) {
       if (["PUBLIC_PAGOS_GROUP_STATE_INVALID", "PUBLIC_PAGOS_HOLD_EXPIRED"].includes(error?.code)) {
-        await client.query("COMMIT");
-        return {
-          processed: false,
-          pending_confirmation: true,
-          manual_reconciliation_required: true,
-          booking_confirmed: false,
-          estado_intent_codigo: intent.estado_intent_codigo,
-        };
+        // AM: El modo no basta: revalidar evidencia bajo los locks y excluir cancelaciones de citas.
+        const recoveryStatesValid = intent.estado_intent_codigo === "pendiente_confirmacion"
+          && ["activo", "cancelado"].includes(groupRows[0]?.estado_grupo_codigo)
+          && groupRows.every((row) => ["en_espera", "pendiente_pago", "expirada"].includes(row.estado_cita_codigo)
+            && ["activo", "expirado"].includes(row.estado_hold_codigo));
+        const durableApproval = allowExpiredRecovery && recoveryStatesValid
+          ? await loadDurablePixelPayApproval(client, { idIntent, groupRows }) : null;
+        if (durableApproval && new Date(paidAt).getTime() === new Date(durableApproval.finalized_at).getTime()) {
+          canonicalPaidAt = durableApproval.finalized_at;
+        } else {
+          await client.query("COMMIT");
+          return {
+            processed: false,
+            pending_confirmation: true,
+            manual_reconciliation_required: true,
+            booking_confirmed: false,
+            estado_intent_codigo: intent.estado_intent_codigo,
+          };
+        }
+      } else {
+        throw error;
       }
-      throw error;
     }
     const pricing = await recalculateGroupPromotionsForPayment(client, {
       idGrupoCita,
@@ -1567,8 +1595,7 @@ export async function reconcilePixelPayPaid(client, {
       });
     }
 
-    const stableProviderTransactionId = safeText(providerTransactionId);
-    if (!stableProviderTransactionId) {
+    if (!providerPaymentId || !stableProviderTransactionId) {
       await client.query("COMMIT");
       return {
         processed: false,
@@ -1578,19 +1605,18 @@ export async function reconcilePixelPayPaid(client, {
         estado_intent_codigo: intent.estado_intent_codigo,
       };
     }
-    const canonicalPaidAt = safeText(paidAt) || new Date().toISOString();
     if (!existingPayment) {
       const insertedPayment = await client.query(
         `INSERT INTO public.payments (
            id_intent, estado_pago_codigo, provider_tx_id, monto_hnl, moneda_codigo, paid_at, registrado_manualmente
          ) VALUES ($1::uuid, 'capturado', $2::text, $3::numeric, 'HNL', $4::timestamptz, FALSE)
          ON CONFLICT (provider_tx_id) DO NOTHING RETURNING id_payment`,
-        [idIntent, stableProviderTransactionId, expectedAmount, canonicalPaidAt]
+        [idIntent, providerPaymentId, expectedAmount, canonicalPaidAt]
       );
       if (!insertedPayment.rows[0]) {
         const duplicate = await client.query(
           "SELECT id_intent FROM public.payments WHERE provider_tx_id = $1::text LIMIT 1",
-          [stableProviderTransactionId]
+          [providerPaymentId]
         );
         if (String(duplicate.rows[0]?.id_intent || "") !== idIntent) {
           throw new AppError(409, "La transaccion del proveedor ya fue utilizada", {
@@ -1617,7 +1643,7 @@ export async function reconcilePixelPayPaid(client, {
     };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* no-op */ }
-    throw error;
+    throw mapCanonicalReservationError(error, { publicRoute: true, safeMessage: "No se pudo confirmar el pago de la reserva" });
   }
 }
 
@@ -2321,7 +2347,7 @@ export default async function publicPagosRoutes(app) {
       const currentTotal = calculateGroupTotalFromRows(
         await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail })
       );
-      const { intent } = await loadPublicIntentForGroup(app.db, {
+      const { intent, groupRows } = await loadPublicIntentForGroup(app.db, {
         groupId: idGrupoCita,
         idIntent,
         titularEmail,
@@ -2355,6 +2381,7 @@ export default async function publicPagosRoutes(app) {
       if (isPixelPayPaidStatus(status.status)) {
         const reconciliationClient = await app.db.connect();
         try {
+          const durableApproval = await loadDurablePixelPayApproval(reconciliationClient, { idIntent, groupRows });
           const providerTransactionId = safeText(intent.provider_session_id)
             && safeText(intent.referencia_externa) !== paymentUuid
             ? safeText(intent.referencia_externa)
@@ -2366,6 +2393,8 @@ export default async function publicPagosRoutes(app) {
             paymentUuid,
             providerTransactionId,
             expectedAmount: currentTotal,
+            paidAt: durableApproval?.finalized_at ?? null,
+            allowExpiredRecovery: Boolean(durableApproval),
             logger: request.log,
           });
           return sendOk(reply, {
