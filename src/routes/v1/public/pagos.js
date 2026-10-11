@@ -140,6 +140,9 @@ export function buildSafeProviderErrorDiagnostic(error, requestId) {
     safeMessageCode: safeTelemetryText(error?.safeMessageCode, 120),
     errorConstructorName: safeTelemetryText(error?.errorConstructorName, 80),
     uncertain: error?.uncertain === true,
+    cardExpireFormatValid: safeDiagnosticBoolean(error?.cardExpireFormatValid),
+    cardExpireFuture: safeDiagnosticBoolean(error?.cardExpireFuture),
+    billingAddressLength: safeDiagnosticLength(error?.billingAddressLength),
   };
 }
 
@@ -202,6 +205,9 @@ export function buildSafePixelPaySdkDiagnostics(diagnostics) {
     inputErrorFields,
     inputErrorCount: inputErrorFields.length,
     inputErrorUnknownCount: safeDiagnosticCount(diagnostics.inputErrorUnknownCount),
+    cardExpireFormatValid: safeDiagnosticBoolean(diagnostics.cardExpireFormatValid),
+    cardExpireFuture: safeDiagnosticBoolean(diagnostics.cardExpireFuture),
+    billingAddressLength: safeDiagnosticLength(diagnostics.billingAddressLength),
     outcome,
   };
 }

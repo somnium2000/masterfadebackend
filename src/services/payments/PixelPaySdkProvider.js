@@ -16,6 +16,15 @@ import {
 } from "./PixelPayDirectProvider.js";
 
 const HONDURAS_ISO_3166_2_CODE_SET = new Set(HONDURAS_ISO_3166_2_CODES);
+const PIXELPAY_BILLING_ADDRESS_PLACEHOLDERS = new Set([
+  "QA",
+  "TEST",
+  "PRUEBA",
+  "N/A",
+  "NA",
+  "NONE",
+  "NULL",
+]);
 
 const SDK_FAILURE_MESSAGE_CODES = new Map([
   ["Could not obtain necessary credentials for transaction.", "SDK_PUBLIC_KEY_UNAVAILABLE"],
@@ -54,15 +63,52 @@ function valuePresent(value) {
   return value !== null && value !== undefined && text(value) !== "";
 }
 
-function normalizeCardExpire(value) {
+export function inspectPixelPayCardExpire(value, referenceDate = new Date()) {
   const normalized = text(value);
-  if (!/^[0-9]{2}(0[1-9]|1[0-2])$/.test(normalized)) {
+  const formatValid = /^[0-9]{2}(0[1-9]|1[0-2])$/.test(normalized);
+  if (!formatValid) return { normalized, formatValid: false, future: false };
+
+  const currentYear = referenceDate.getUTCFullYear();
+  const currentMonth = referenceDate.getUTCMonth() + 1;
+  const expireYear = 2000 + Number(normalized.slice(0, 2));
+  const expireMonth = Number(normalized.slice(2, 4));
+  return {
+    normalized,
+    formatValid: true,
+    future: expireYear > currentYear || (expireYear === currentYear && expireMonth >= currentMonth),
+  };
+}
+
+export function isPixelPayBillingAddressPlaceholder(value) {
+  return PIXELPAY_BILLING_ADDRESS_PLACEHOLDERS.has(text(value).toUpperCase());
+}
+
+function inspectPixelPaySaleInput(input, referenceDate) {
+  const cardExpire = inspectPixelPayCardExpire(input?.card?.expire, referenceDate);
+  return {
+    cardExpireFormatValid: cardExpire.formatValid,
+    cardExpireFuture: cardExpire.future,
+    billingAddressLength: text(input?.billing?.address).length,
+  };
+}
+
+function normalizeCardExpire(value, referenceDate) {
+  const inspection = inspectPixelPayCardExpire(value, referenceDate);
+  if (!inspection.formatValid) {
     throw new PixelPaySdkError(
       "PIXELPAY_CARD_EXPIRE_INVALID",
-      "La fecha de expiracion no tiene el formato YYMM requerido por PixelPay."
+      "La fecha de expiracion no tiene el formato YYMM requerido por PixelPay.",
+      { cardExpireFormatValid: false, cardExpireFuture: false }
     );
   }
-  return normalized;
+  if (!inspection.future) {
+    throw new PixelPaySdkError(
+      "PIXELPAY_CARD_EXPIRED",
+      "La tarjeta se encuentra vencida.",
+      { cardExpireFormatValid: true, cardExpireFuture: false }
+    );
+  }
+  return inspection.normalized;
 }
 
 function normalizeBillingCountry(value) {
@@ -145,6 +191,9 @@ export class PixelPaySdkError extends Error {
     upstreamContentType = null,
     cfRay = null,
     paymentAttemptId = null,
+    cardExpireFormatValid = null,
+    cardExpireFuture = null,
+    billingAddressLength = null,
   } = {}) {
     super(message);
     this.name = "PixelPaySdkError";
@@ -164,6 +213,11 @@ export class PixelPaySdkError extends Error {
     this.upstreamContentType = text(upstreamContentType).replace(/[\r\n]+/g, " ").slice(0, 160) || null;
     this.cfRay = text(cfRay).replace(/[\r\n]+/g, " ").slice(0, 120) || null;
     this.paymentAttemptId = text(paymentAttemptId).slice(0, 80) || null;
+    this.cardExpireFormatValid = typeof cardExpireFormatValid === "boolean" ? cardExpireFormatValid : null;
+    this.cardExpireFuture = typeof cardExpireFuture === "boolean" ? cardExpireFuture : null;
+    this.billingAddressLength = Number.isSafeInteger(billingAddressLength) && billingAddressLength >= 0
+      ? billingAddressLength
+      : null;
   }
 }
 
@@ -175,6 +229,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     secretKey,
     appUrl,
     sdk = PixelPaySdk,
+    now = () => new Date(),
   } = {}) {
     super();
     this.endpoint = text(endpoint).replace(/\/+$/, "");
@@ -183,6 +238,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     this.secretKey = text(secretKey);
     this.appUrl = text(appUrl).replace(/\/+$/, "");
     this.sdk = sdk;
+    this.now = now;
 
     if (
       this.env !== "sandbox"
@@ -195,6 +251,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       throw new Error("Configuracion PixelPay SDK incompleta.");
     }
     assertSdkShape(this.sdk);
+    if (typeof this.now !== "function") throw new Error("Reloj PixelPay invalido.");
 
     // El SDK bloquea globalmente transacciones concurrentes por defecto. MasterFade
     // ya serializa cada intent con advisory lock y debe permitir intents distintos.
@@ -208,8 +265,20 @@ export class PixelPaySdkProvider extends PaymentProvider {
     return new this.sdk.Services.Transaction(settings);
   }
 
-  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card } = {}) {
-    const normalizedExpire = normalizeCardExpire(card?.expire);
+  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card } = {}, referenceDate = this.now()) {
+    const normalizedExpire = normalizeCardExpire(card?.expire, referenceDate);
+    const normalizedBillingAddress = text(billing?.address);
+    if (isPixelPayBillingAddressPlaceholder(normalizedBillingAddress)) {
+      throw new PixelPaySdkError(
+        "PIXELPAY_BILLING_ADDRESS_INVALID",
+        "Ingresa una direccion de facturacion valida.",
+        {
+          cardExpireFormatValid: true,
+          cardExpireFuture: true,
+          billingAddressLength: normalizedBillingAddress.length,
+        }
+      );
+    }
     if (!Array.isArray(items) || items.length === 0) {
       throw new PixelPaySdkError(
         "PIXELPAY_ORDER_ITEMS_INVALID",
@@ -256,7 +325,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     paymentCard.cardholder = text(card?.holder);
 
     const paymentBilling = new this.sdk.Models.Billing();
-    paymentBilling.address = text(billing?.address);
+    paymentBilling.address = normalizedBillingAddress;
     paymentBilling.country = normalizeBillingCountry(billing?.country);
     paymentBilling.state = normalizeBillingState(billing?.state);
     paymentBilling.city = text(billing?.city);
@@ -288,7 +357,9 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const attempt = createPixelPaySaleAttempt({ ...input, ...telemetryContext });
     const logger = telemetryContext.logger;
     const startedAt = Date.now();
-    emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.ATTEMPT_STARTED, attempt);
+    const referenceDate = this.now();
+    const inputDiagnostics = inspectPixelPaySaleInput(input, referenceDate);
+    emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.ATTEMPT_STARTED, attempt, inputDiagnostics);
 
     let response;
     let transaction;
@@ -300,9 +371,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
         appUrl: this.appUrl,
       });
       transaction = this.createTransaction(signature);
-      const saleRequest = this.buildSaleRequest(input);
+      const saleRequest = this.buildSaleRequest(input, referenceDate);
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
         durationMs: Date.now() - startedAt,
+        ...inputDiagnostics,
       });
       response = await transaction.doSale(saleRequest);
     } catch (error) {
@@ -325,6 +397,9 @@ export class PixelPaySdkProvider extends PaymentProvider {
           : PIXELPAY_SALE_OUTCOME.UNCERTAIN,
         contentType: error?.upstreamContentType ?? metadata.contentType,
         cfRay: error?.cfRay ?? metadata.cfRay,
+        cardExpireFormatValid: error?.cardExpireFormatValid ?? inputDiagnostics.cardExpireFormatValid,
+        cardExpireFuture: error?.cardExpireFuture ?? inputDiagnostics.cardExpireFuture,
+        billingAddressLength: error?.billingAddressLength ?? inputDiagnostics.billingAddressLength,
       };
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.FAILED, attempt, details);
       if (details.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) {
@@ -332,6 +407,9 @@ export class PixelPaySdkProvider extends PaymentProvider {
       }
       if (error instanceof PixelPaySdkError) {
         error.paymentAttemptId ||= attempt.paymentAttemptId;
+        error.cardExpireFormatValid ??= inputDiagnostics.cardExpireFormatValid;
+        error.cardExpireFuture ??= inputDiagnostics.cardExpireFuture;
+        error.billingAddressLength ??= inputDiagnostics.billingAddressLength;
         throw error;
       }
       throw new PixelPaySdkError("PIXELPAY_NETWORK_ERROR", "No fue posible confirmar la respuesta de PixelPay.", {
@@ -416,6 +494,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       approvedAmountMatches,
       amountMatches,
       ...inputErrors,
+      ...inputDiagnostics,
       outcome,
     };
 
@@ -434,6 +513,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionResultParsed: diagnostics.transactionResultParsed,
       inputErrorFields: inputErrors.inputErrorFields,
       inputErrorUnknownCount: inputErrors.inputErrorUnknownCount,
+      ...inputDiagnostics,
     };
     emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.RESPONSE_RECEIVED, attempt, telemetryDetails);
     if (outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) {

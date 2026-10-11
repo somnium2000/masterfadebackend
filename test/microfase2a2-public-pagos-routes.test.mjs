@@ -122,6 +122,9 @@ test("diagnostico de proveedor solo expone metadata permitida", () => {
     safeMessageCode: null,
     errorConstructorName: null,
     uncertain: true,
+    cardExpireFormatValid: null,
+    cardExpireFuture: null,
+    billingAddressLength: null,
   });
   assert.doesNotMatch(JSON.stringify(diagnostic), /4111111111111111|999|x-client-signature|private/i);
 });
@@ -149,6 +152,9 @@ test("diagnostico SDK de ruta aplica lista blanca estricta", () => {
     inputErrorFields: ["order_id", "billing_state", "5555555555554444", "999", "secret-value", "billing_state"],
     inputErrorCount: 99,
     inputErrorUnknownCount: 3,
+    cardExpireFormatValid: true,
+    cardExpireFuture: true,
+    billingAddressLength: 24,
     outcome: "uncertain",
     payment_uuid: "must-not-appear",
     response: { data: { card: "must-not-appear" } },
@@ -160,6 +166,9 @@ test("diagnostico SDK de ruta aplica lista blanca estricta", () => {
   assert.deepEqual(diagnostic.inputErrorFields, ["billing_state", "order_id"]);
   assert.equal(diagnostic.inputErrorCount, 2);
   assert.equal(diagnostic.inputErrorUnknownCount, 3);
+  assert.equal(diagnostic.cardExpireFormatValid, true);
+  assert.equal(diagnostic.cardExpireFuture, true);
+  assert.equal(diagnostic.billingAddressLength, 24);
   assert.equal(Object.hasOwn(diagnostic, "payment_uuid"), false);
   assert.equal(Object.hasOwn(diagnostic, "response"), false);
   assert.doesNotMatch(JSON.stringify(diagnostic), /must-not-appear|5555555555554444|"999"|secret-value/);

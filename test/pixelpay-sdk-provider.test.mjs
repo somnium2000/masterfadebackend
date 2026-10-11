@@ -6,6 +6,8 @@ import { PixelPayDirectProvider, PIXELPAY_SALE_OUTCOME } from "../src/services/p
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import {
   classifySdkFailureMessage,
+  inspectPixelPayCardExpire,
+  isPixelPayBillingAddressPlaceholder,
   PixelPaySdkProvider,
 } from "../src/services/payments/PixelPaySdkProvider.js";
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
@@ -165,7 +167,7 @@ function sdkResponse(status, { success = status >= 200 && status < 300, data = n
   };
 }
 
-function makeProvider(fake) {
+function makeProvider(fake, overrides = {}) {
   return new PixelPaySdkProvider({
     endpoint: "https://pixelpay.dev",
     env: "sandbox",
@@ -173,6 +175,7 @@ function makeProvider(fake) {
     secretKey: SECRET,
     appUrl: "https://pixelpay.dev",
     sdk: fake.sdk,
+    ...overrides,
   });
 }
 
@@ -221,6 +224,9 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
     inputErrorFields: [],
     inputErrorCount: 0,
     inputErrorUnknownCount: 0,
+    cardExpireFormatValid: true,
+    cardExpireFuture: true,
+    billingAddressLength: saleInput.billing.address.length,
     outcome: PIXELPAY_SALE_OUTCOME.APPROVED,
   });
   assert.equal(fake.calls.sale, 1);
@@ -424,7 +430,7 @@ test("telemetria PixelPay nunca registra datos sensibles ni objetos completos", 
   assert.doesNotMatch(serialized, new RegExp(saleInput.card.cvv));
   assert.doesNotMatch(serialized, new RegExp(SECRET));
   assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
-  assert.doesNotMatch(serialized, /cardholder|billing|auth_key|auth_hash|secretKey|publicKey|valid-hash|x-client-signature|payment_hash|Authorization/i);
+  assert.doesNotMatch(serialized, /cardholder|billing_address|auth_key|auth_hash|secretKey|publicKey|valid-hash|x-client-signature|payment_hash|Authorization/i);
 });
 
 test("SDK rechaza items ausentes o monto distinto antes de doSale", async () => {
@@ -440,6 +446,87 @@ test("SDK rechaza items ausentes o monto distinto antes de doSale", async () => 
     (error) => error.code === "PIXELPAY_ORDER_AMOUNT_MISMATCH"
   );
   assert.equal(fake.calls.sale, 0);
+});
+
+test("SDK valida vigencia YYMM por mes completo con reloj controlado", async () => {
+  const referenceDate = new Date("2026-10-10T16:51:50.000Z");
+  for (const expire of ["2610", "2611", "2812"]) {
+    assert.deepEqual(inspectPixelPayCardExpire(expire, referenceDate), {
+      normalized: expire,
+      formatValid: true,
+      future: true,
+    });
+  }
+  for (const expire of ["2609", "2512"]) {
+    assert.deepEqual(inspectPixelPayCardExpire(expire, referenceDate), {
+      normalized: expire,
+      formatValid: true,
+      future: false,
+    });
+  }
+  assert.deepEqual(inspectPixelPayCardExpire("1228", referenceDate), {
+    normalized: "1228",
+    formatValid: false,
+    future: false,
+  });
+});
+
+test("SDK rechaza tarjeta vencida o formato invalido antes de doSale", async () => {
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const provider = makeProvider(fake, { now: () => new Date("2026-10-10T16:51:50.000Z") });
+
+  for (const expire of ["2609", "2512"]) {
+    await assert.rejects(
+      provider.sale({ ...saleInput, card: { ...saleInput.card, expire } }),
+      (error) => error.code === "PIXELPAY_CARD_EXPIRED"
+        && error.message === "La tarjeta se encuentra vencida."
+        && error.uncertain === false
+    );
+  }
+  await assert.rejects(
+    provider.sale({ ...saleInput, card: { ...saleInput.card, expire: "1228" } }),
+    (error) => error.code === "PIXELPAY_CARD_EXPIRE_INVALID"
+  );
+  assert.equal(fake.calls.sale, 0);
+});
+
+test("SDK rechaza solo placeholders exactos de billing address antes de doSale", async () => {
+  const invalidAddresses = ["QA", " qa ", "TEST", "N/A"];
+  const validAddresses = ["Blvd Suyapa", "Blvd. Suyapa", "Tegucigalpa", "Residencial QA"];
+
+  for (const address of invalidAddresses) {
+    assert.equal(isPixelPayBillingAddressPlaceholder(address), true);
+    const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+    await assert.rejects(
+      makeProvider(fake).sale({ ...saleInput, billing: { ...saleInput.billing, address } }),
+      (error) => error.code === "PIXELPAY_BILLING_ADDRESS_INVALID" && error.uncertain === false
+    );
+    assert.equal(fake.calls.sale, 0);
+  }
+
+  for (const address of validAddresses) {
+    assert.equal(isPixelPayBillingAddressPlaceholder(address), false);
+    const fake = makeFakeSdk({ saleResponse: sdkResponse(422, { success: false, data: null, valid: false }) });
+    const result = await makeProvider(fake).sale({ ...saleInput, billing: { ...saleInput.billing, address } });
+    assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
+    assert.equal(fake.calls.sale, 1);
+  }
+});
+
+test("telemetria local conserva solo metadata de validacion segura", async () => {
+  const logger = makeTelemetryLogger();
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const result = await makeProvider(fake, { now: () => new Date("2026-10-10T16:51:50.000Z") })
+    .sale(saleInput, { logger });
+  const serialized = JSON.stringify({ diagnostics: result.diagnostics, events: logger.events });
+
+  assert.equal(result.diagnostics.cardExpireFormatValid, true);
+  assert.equal(result.diagnostics.cardExpireFuture, true);
+  assert.equal(result.diagnostics.billingAddressLength, saleInput.billing.address.length);
+  assert.doesNotMatch(serialized, new RegExp(saleInput.billing.address));
+  assert.doesNotMatch(serialized, /2807/);
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
+  assert.doesNotMatch(serialized, new RegExp(saleInput.card.cvv));
 });
 
 test("SDK declined HTTP 402 es definitivo", async () => {
@@ -786,6 +873,9 @@ test("diagnostics contiene solo metadata y nunca valores sensibles ni payload cr
     "amountMatches",
     "approvedAmountMatches",
     "approvedAmountPresent",
+    "billingAddressLength",
+    "cardExpireFormatValid",
+    "cardExpireFuture",
     "hasPaymentHash",
     "hasPaymentUuid",
     "hasTransactionId",

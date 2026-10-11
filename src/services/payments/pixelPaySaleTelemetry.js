@@ -66,6 +66,10 @@ function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function safeLength(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 export function safePixelPayInputErrorFields(value, maxFields = 32) {
   if (!Array.isArray(value)) return [];
   const normalizedLimit = Number.isInteger(maxFields) && maxFields > 0 ? maxFields : 32;
@@ -152,6 +156,9 @@ export function buildPixelPaySaleEvent(event, attempt, details = {}) {
     inputErrorFields,
     inputErrorCount: inputErrorFields.length,
     inputErrorUnknownCount: safeCount(details.inputErrorUnknownCount),
+    cardExpireFormatValid: safeBoolean(details.cardExpireFormatValid),
+    cardExpireFuture: safeBoolean(details.cardExpireFuture),
+    billingAddressLength: safeLength(details.billingAddressLength),
   };
 }
 
