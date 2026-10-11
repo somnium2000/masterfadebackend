@@ -121,14 +121,16 @@ export function getSupabaseDbConnectionHints() {
 }
 
 function resolveSslConfig() {
+  const environment = String(process.env.NODE_ENV || process.env.ENTORNO || "").trim().toLowerCase();
+  const isProtectedEnvironment = environment === "production" || environment === "staging";
   const sslEnabledRaw = String(process.env.DB_SSL ?? "").trim().toLowerCase();
   const sslEnabled = sslEnabledRaw
     ? ["1", "true", "yes", "on", "require"].includes(sslEnabledRaw)
     : true;
 
   if (!sslEnabled) {
-    if (String(process.env.NODE_ENV || process.env.ENTORNO || "").toLowerCase() === "production") {
-      throw new Error("DB_SSL no puede estar desactivado en produccion.");
+    if (isProtectedEnvironment) {
+      throw new Error("DB_SSL no puede estar desactivado en production o staging.");
     }
     return false;
   }
@@ -137,6 +139,10 @@ function resolveSslConfig() {
   const rejectUnauthorized = rejectUnauthorizedRaw
     ? ["1", "true", "yes", "on"].includes(rejectUnauthorizedRaw)
     : true;
+
+  if (isProtectedEnvironment && !rejectUnauthorized) {
+    throw new Error("DB_SSL_REJECT_UNAUTHORIZED debe estar activado en production o staging.");
+  }
 
   const caBase64 = trimEnv("DB_SSL_CA_BASE64");
   if (caBase64) {
@@ -159,7 +165,6 @@ function validateSupabaseTarget(target) {
         `Configuracion DB invalida: host de pooler (${target.host}) debe usar puerto 5432 (session) o 6543 (transaction). ${getSupabaseDbConnectionHints()}`
       );
     }
-    return; // OK
   }
 
   if (isSupabaseDirectHost(target.host) && Number(target.port) !== 5432) {
