@@ -438,8 +438,6 @@ async function ensureUniqueCourtesyNameGlobal(client, cortesiaId, nombre) {
 }
 
 async function syncCourtesyBranches(client, cortesiaId, sucursales) {
-  const branchIds = sucursales.map((sucursal) => sucursal.id_sucursal);
-
   for (const sucursal of sucursales) {
     // AM: Mantiene la relacion por sucursal sin borrado fisico.
     await client.query(
@@ -459,18 +457,36 @@ async function syncCourtesyBranches(client, cortesiaId, sucursales) {
       [cortesiaId, sucursal.id_sucursal, sucursal.activa]
     );
   }
+}
 
-  await client.query(
+async function assertCourtesyWriteAccess(client, claims, cortesiaId) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  if (roles.includes("super_admin")) return;
+
+  const branchIds = Array.isArray(claims?.branch_ids) ? claims.branch_ids.filter(Boolean) : [];
+  if (branchIds.length === 0) {
+    throw new AppError(403, "No tienes sucursales autorizadas para modificar esta cortesia", {
+      code: "AUTH_FORBIDDEN_BRANCH",
+    });
+  }
+
+  const { rowCount } = await client.query(
     `
-      UPDATE public.cortesias_sucursales
-      SET
-        activa = FALSE,
-        updated_at = NOW()
-      WHERE cortesia_id = $1::uuid
-        AND NOT (id_sucursal = ANY($2::uuid[]))
+      SELECT 1
+      FROM public.cortesias_sucursales cs
+      WHERE cs.cortesia_id = $1::uuid
+        AND cs.id_sucursal = ANY($2::uuid[])
+      LIMIT 1
+      FOR UPDATE
     `,
     [cortesiaId, branchIds]
   );
+
+  if (!rowCount) {
+    throw new AppError(403, "La cortesia no pertenece al alcance del usuario autenticado", {
+      code: "AUTH_FORBIDDEN_BRANCH",
+    });
+  }
 }
 
 function sendHandledError(reply, request, error, fallbackMessage, fallbackCode) {
@@ -676,6 +692,8 @@ export default async function adminCortesiasRoutes(app) {
             code: "CORTESIAS_NOT_FOUND",
           });
         }
+
+        await assertCourtesyWriteAccess(client, request.claims, request.params.id);
 
         const nextNombre =
           request.body?.nombre !== undefined
