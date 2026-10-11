@@ -74,6 +74,9 @@ async function createApp() {
         });
       }
       request.claims = { roles };
+      if (request.headers["x-test-guard-only"] === "true") {
+        return reply.code(204).send();
+      }
     };
   });
 
@@ -106,7 +109,7 @@ const adminRequests = [
   { name: "eliminacion permanente", method: "DELETE", url: `/personas/empleados/${EMPLOYEE_ID}/permanente` },
 ];
 
-test("admin recibe 403 antes de cualquier operacion en las siete rutas de empleados", async (t) => {
+test("admin accede al guard de las siete rutas de empleados", async (t) => {
   const { app, activity } = await createApp();
   t.after(() => app.close());
 
@@ -114,11 +117,10 @@ test("admin recibe 403 antes de cualquier operacion en las siete rutas de emplea
     const response = await app.inject({
       method: request.method,
       url: request.url,
-      headers: { "x-test-roles": "admin" },
+      headers: { "x-test-roles": "admin", "x-test-guard-only": "true" },
       payload: request.payload,
     });
-    assert.equal(response.statusCode, 403, request.name);
-    assert.equal(response.json().error.code, "AUTH_FORBIDDEN", request.name);
+    assert.equal(response.statusCode, 204, request.name);
   }
 
   assert.equal(activity.dbQueries, 0);
@@ -126,19 +128,23 @@ test("admin recibe 403 antes de cualquier operacion en las siete rutas de emplea
   assert.equal(activity.authCalls, 0);
 });
 
-test("usuarios sin rol autorizado reciben 403", async (t) => {
+test("usuarios sin rol autorizado reciben 403 en las siete rutas antes de operar", async (t) => {
   const { app, activity } = await createApp();
   t.after(() => app.close());
 
-  const response = await app.inject({
-    method: "GET",
-    url: "/personas/empleados",
-    headers: { "x-test-roles": "barbero" },
-  });
-
-  assert.equal(response.statusCode, 403);
-  assert.equal(response.json().error.code, "AUTH_FORBIDDEN");
+  for (const request of adminRequests) {
+    const response = await app.inject({
+      method: request.method,
+      url: request.url,
+      headers: { "x-test-roles": "barbero" },
+      payload: request.payload,
+    });
+    assert.equal(response.statusCode, 403, request.name);
+    assert.equal(response.json().error.code, "AUTH_FORBIDDEN", request.name);
+  }
   assert.equal(activity.dbQueries, 0);
+  assert.equal(activity.dbConnections, 0);
+  assert.equal(activity.authCalls, 0);
 });
 
 test("admin y super_admin conservan acceso al catalogo compartido", async (t) => {
@@ -162,17 +168,19 @@ test("admin y super_admin conservan acceso al catalogo compartido", async (t) =>
   assert.equal(activity.authCalls, 0);
 });
 
-test("super_admin supera el guard y conserva la eliminacion permanente prohibida", async (t) => {
+test("super_admin accede al guard de las siete rutas y conserva la eliminacion permanente prohibida", async (t) => {
   const { app, activity } = await createApp();
   t.after(() => app.close());
 
-  const listResponse = await app.inject({
-    method: "GET",
-    url: "/personas/empleados",
-    headers: { "x-test-roles": "super_admin" },
-  });
-  assert.equal(listResponse.statusCode, 200);
-  assert.deepEqual(listResponse.json().data.empleados, []);
+  for (const request of adminRequests) {
+    const response = await app.inject({
+      method: request.method,
+      url: request.url,
+      headers: { "x-test-roles": "super_admin", "x-test-guard-only": "true" },
+      payload: request.payload,
+    });
+    assert.equal(response.statusCode, 204, request.name);
+  }
 
   const deleteResponse = await app.inject({
     method: "DELETE",
@@ -182,11 +190,11 @@ test("super_admin supera el guard y conserva la eliminacion permanente prohibida
   assert.equal(deleteResponse.statusCode, 410);
   assert.equal(deleteResponse.json().error.code, "PERSONAS_EMPLOYEE_PERMANENT_DELETE_DISABLED");
 
-  assert.equal(activity.dbQueries, 1);
+  assert.equal(activity.dbQueries, 0);
   assert.equal(activity.dbConnections, 0);
   assert.equal(activity.authCalls, 0);
   assert.ok(
-    activity.allowedRoleSets.filter((roles) => roles.length === 1 && roles[0] === "super_admin").length >= 7,
-    "las rutas de empleados deben registrarse exclusivamente para super_admin",
+    activity.allowedRoleSets.filter((roles) => roles.includes("super_admin") && roles.includes("admin")).length >= 7,
+    "las rutas de empleados deben registrarse para super_admin y admin",
   );
 });
