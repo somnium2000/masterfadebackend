@@ -412,6 +412,34 @@ const GET_PLAN_OFFER_SQL = `
   FOR UPDATE
 `;
 
+const GET_ACTIVE_PLAN_OFFER_BRANCHES_SQL = `
+  -- AM: Considera solo la version vigente de cada oferta, incluso si no es publica.
+  WITH ranked_offers AS (
+    SELECT
+      mps.id_sucursal,
+      mps.activo,
+      ROW_NUMBER() OVER (
+        PARTITION BY mps.id_sucursal
+        ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
+      ) AS rn
+    FROM public.membership_plans_sucursal mps
+    WHERE mps.id_plan = $1::uuid
+  )
+  SELECT ro.id_sucursal
+  FROM ranked_offers ro
+  WHERE ro.rn = 1
+    AND ro.activo IS TRUE
+  ORDER BY ro.id_sucursal ASC
+`;
+
+const LOCK_PLAN_BENEFITS_SQL = `
+  -- AM: Serializa la comparacion y sustitucion de beneficios del mismo plan maestro.
+  SELECT mp.id_plan
+  FROM public.membership_plans mp
+  WHERE mp.id_plan = $1::uuid
+  FOR UPDATE
+`;
+
 const GET_ACTIVE_SERVICES_IN_BRANCH_SQL = `
   SELECT
     s.id_servicio,
@@ -673,6 +701,20 @@ function serializePlanBenefits(beneficios = []) {
   };
 }
 
+function planBenefitsAreEquivalent(currentBenefits = [], nextBenefits = []) {
+  const canonicalize = (benefits) => (Array.isArray(benefits) ? benefits : [])
+    .map((benefit) => {
+      const tipo = String(benefit?.tipo || "").trim().toLowerCase();
+      const id = tipo === "servicio"
+        ? String(benefit?.id_servicio || "").trim()
+        : String(benefit?.id_cortesia || "").trim();
+      return `${tipo}:${id}:${Number(benefit?.cantidad)}`;
+    })
+    .sort();
+
+  return JSON.stringify(canonicalize(currentBenefits)) === JSON.stringify(canonicalize(nextBenefits));
+}
+
 function mapPlanRow(row) {
   return {
     id_plan: row.id_plan,
@@ -924,10 +966,10 @@ async function ensurePlanCourtesyBenefitsAccessible(client, benefits, branchId, 
     });
   }
 
-  const existingCourtesyIds = new Set(
+  const existingCourtesyQuantityById = new Map(
     (Array.isArray(existingBenefits) ? existingBenefits : [])
       .filter((benefit) => benefit?.tipo === "cortesia" && benefit?.id_cortesia)
-      .map((benefit) => benefit.id_cortesia)
+      .map((benefit) => [benefit.id_cortesia, Number(benefit.cantidad)])
   );
   const courtesyById = new Map(rows.map((row) => [row.id_cortesia, row]));
 
@@ -937,7 +979,11 @@ async function ensurePlanCourtesyBenefitsAccessible(client, benefits, branchId, 
     const currentCourtesy = courtesyById.get(benefit.id_cortesia);
     if (!currentCourtesy) return benefit;
 
-    if (!currentCourtesy.activa && !existingCourtesyIds.has(benefit.id_cortesia)) {
+    const previousQuantity = existingCourtesyQuantityById.get(benefit.id_cortesia);
+    if (
+      !currentCourtesy.activa
+      && (!Number.isInteger(previousQuantity) || Number(benefit.cantidad) > previousQuantity)
+    ) {
       throw new AppError(409, "No puedes agregar cortesias inactivas al plan", {
         code: "CATALOG_PLAN_COURTESY_INACTIVE",
       });
@@ -949,6 +995,28 @@ async function ensurePlanCourtesyBenefitsAccessible(client, benefits, branchId, 
       nombre: String(currentCourtesy.nombre || "").trim() || benefit.nombre || "Cortesia del catalogo",
     };
   });
+}
+
+async function ensurePlanBenefitsAcrossActiveOffers(client, idPlan, benefits, existingBenefits, operationBranchId) {
+  const { rows } = await client.query(GET_ACTIVE_PLAN_OFFER_BRANCHES_SQL, [idPlan]);
+  const branchIds = new Set(rows.map((row) => row.id_sucursal).filter(Boolean));
+  if (operationBranchId) branchIds.add(operationBranchId);
+
+  for (const branchId of branchIds) {
+    try {
+      await ensurePlanBenefitsAccessible(client, benefits, branchId, existingBenefits);
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      throw new AppError(
+        409,
+        "No se pueden actualizar los beneficios del plan porque uno o más beneficios no están disponibles en todas las sucursales donde el plan tiene ofertas activas.",
+        {
+          code: "CATALOG_PLAN_BENEFITS_BRANCH_CONFLICT",
+          details: { id_sucursal: branchId },
+        }
+      );
+    }
+  }
 }
 
 async function ensurePlanBenefitsAccessible(client, benefits, branchId, existingBenefits = []) {
@@ -1347,6 +1415,8 @@ export default async function adminPlansRoutes(app) {
         const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
+        await client.query(LOCK_PLAN_BENEFITS_SQL, [request.params.id]);
+
         const baseResult = await client.query(
           supportsPlanCategoryColumn ? GET_PLAN_BASE_SQL : GET_PLAN_BASE_SQL_LEGACY,
           [request.params.id]
@@ -1364,24 +1434,16 @@ export default async function adminPlansRoutes(app) {
         );
         const scopedPlan = scopedResult.rows[0] ?? null;
 
-        const shouldMutatePlanBase =
-          request.body.nombre_plan !== undefined ||
-          request.body.descripcion !== undefined ||
-          request.body.periodo_membresia_codigo !== undefined ||
-          (supportsPlanCategoryColumn && request.body.categoria_nivel !== undefined) ||
-          request.body.beneficios !== undefined;
         const targetPlanId = request.params.id;
-
-        const targetBaseResult = await client.query(
-          supportsPlanCategoryColumn ? GET_PLAN_BASE_SQL : GET_PLAN_BASE_SQL_LEGACY,
-          [targetPlanId]
-        );
-        const targetBasePlan = targetBaseResult.rows[0];
-        if (!targetBasePlan) {
-          throw new AppError(404, "El plan solicitado no existe", {
-            code: "CATALOG_PLAN_NOT_FOUND",
-          });
-        }
+        const targetBasePlan = basePlan;
+        const hasNombre = request.body.nombre_plan !== undefined;
+        const hasDescripcion = request.body.descripcion !== undefined;
+        const hasPeriod = request.body.periodo_membresia_codigo !== undefined;
+        const hasCategory = supportsPlanCategoryColumn && request.body.categoria_nivel !== undefined;
+        const shouldMutateOffer =
+          request.body.precio_hnl !== undefined ||
+          request.body.visible_publico !== undefined ||
+          request.body.orden_visual !== undefined;
 
         const nombrePlan =
           request.body.nombre_plan !== undefined
@@ -1422,122 +1484,67 @@ export default async function adminPlansRoutes(app) {
           ? normalizePlanBenefits(request.body.beneficios)
           : null;
 
-        if (!Number.isFinite(precioHnl) || precioHnl <= 0) {
+        if (request.body.precio_hnl !== undefined && (!Number.isFinite(precioHnl) || precioHnl <= 0)) {
           throw new AppError(400, "El precio del plan debe ser mayor a 0", {
             code: "CATALOG_PLAN_PRICE_INVALID",
           });
         }
 
-        await ensurePeriodExists(client, periodCode);
-        await ensureUniquePlanNameGlobal(client, targetPlanId, nombrePlan);
-        const canonicalBenefits = shouldUpdateBenefits
-          ? await ensurePlanBenefitsAccessible(client, sourceBenefits, branchId, [])
-          : null;
+        if (hasPeriod) await ensurePeriodExists(client, periodCode);
+        if (hasNombre) await ensureUniquePlanNameGlobal(client, targetPlanId, nombrePlan);
 
-        if (shouldMutatePlanBase) {
-          if (supportsPlanCategoryColumn) {
-            if (shouldUpdateBenefits) {
-              await client.query(
-                `
-                  UPDATE public.membership_plans
-                  SET
-                    nombre_plan = $2,
-                    descripcion = $3,
-                    periodo_membresia_codigo = $4,
-                    categoria_nivel = $5::smallint,
-                    beneficios = $6::jsonb,
-                    activo = TRUE,
-                    updated_at = NOW()
-                  WHERE id_plan = $1::uuid
-                `,
-                [
-                  targetPlanId,
-                  nombrePlan,
-                  descripcion ?? null,
-                  periodCode,
-                  categoriaNivel,
-                  serializePlanBenefits(canonicalBenefits),
-                ]
-              );
-            } else {
-              await client.query(
-                `
-                  UPDATE public.membership_plans
-                  SET
-                    nombre_plan = $2,
-                    descripcion = $3,
-                    periodo_membresia_codigo = $4,
-                    categoria_nivel = $5::smallint,
-                    activo = TRUE,
-                    updated_at = NOW()
-                  WHERE id_plan = $1::uuid
-                `,
-                [
-                  targetPlanId,
-                  nombrePlan,
-                  descripcion ?? null,
-                  periodCode,
-                  categoriaNivel,
-                ]
-              );
-            }
-          } else {
-            if (shouldUpdateBenefits) {
-              await client.query(
-                `
-                  UPDATE public.membership_plans
-                  SET
-                    nombre_plan = $2,
-                    descripcion = $3,
-                    periodo_membresia_codigo = $4,
-                    beneficios = $5::jsonb,
-                    activo = TRUE,
-                    updated_at = NOW()
-                  WHERE id_plan = $1::uuid
-                `,
-                [
-                  targetPlanId,
-                  nombrePlan,
-                  descripcion ?? null,
-                  periodCode,
-                  serializePlanBenefits(canonicalBenefits),
-                ]
-              );
-            } else {
-              await client.query(
-                `
-                  UPDATE public.membership_plans
-                  SET
-                    nombre_plan = $2,
-                    descripcion = $3,
-                    periodo_membresia_codigo = $4,
-                    activo = TRUE,
-                    updated_at = NOW()
-                  WHERE id_plan = $1::uuid
-                `,
-                [
-                  targetPlanId,
-                  nombrePlan,
-                  descripcion ?? null,
-                  periodCode,
-                ]
-              );
-            }
-          }
+        const currentBenefits = parseStoredBenefits(targetBasePlan.beneficios);
+        const benefitsChanged = shouldUpdateBenefits
+          ? !planBenefitsAreEquivalent(currentBenefits, sourceBenefits)
+          : false;
+        let canonicalBenefits = currentBenefits;
+        if (benefitsChanged) {
+          await ensurePlanBenefitsAcrossActiveOffers(
+            client,
+            targetPlanId,
+            sourceBenefits,
+            currentBenefits,
+            branchId
+          );
+          canonicalBenefits = await ensurePlanBenefitsAccessible(client, sourceBenefits, branchId, currentBenefits);
         }
 
-        await ensurePlanBenefitsAvailableForOffer(
-          client,
-          canonicalBenefits ?? parseStoredBenefits(targetBasePlan.beneficios),
-          branchId
-        );
+        if (hasNombre || hasDescripcion || hasPeriod || hasCategory || benefitsChanged) {
+          const assignments = [];
+          const params = [targetPlanId];
+          const pushAssignment = (column, value, cast = "") => {
+            params.push(value);
+            assignments.push(`${column} = $${params.length}${cast}`);
+          };
+          if (hasNombre) pushAssignment("nombre_plan", nombrePlan);
+          if (hasDescripcion) pushAssignment("descripcion", descripcion ?? null);
+          if (hasPeriod) pushAssignment("periodo_membresia_codigo", periodCode);
+          if (hasCategory) pushAssignment("categoria_nivel", categoriaNivel, "::smallint");
+          if (benefitsChanged) pushAssignment("beneficios", serializePlanBenefits(canonicalBenefits), "::jsonb");
 
-        await upsertPlanBranchOffer(client, targetPlanId, branchId, {
-          precioHnl,
-          activo: nextActive,
-          visiblePublico,
-          ordenVisual,
-        });
+          await client.query(
+            `
+              UPDATE public.membership_plans
+              SET
+                ${assignments.join(",\n                ")},
+                updated_at = NOW()
+              WHERE id_plan = $1::uuid
+            `,
+            params
+          );
+        }
+
+        if (shouldMutateOffer) {
+          if (!benefitsChanged && canonicalBenefits.length > 0) {
+            await ensurePlanBenefitsAccessible(client, canonicalBenefits, branchId, canonicalBenefits);
+          }
+          await upsertPlanBranchOffer(client, targetPlanId, branchId, {
+            precioHnl,
+            activo: nextActive,
+            visiblePublico,
+            ordenVisual,
+          });
+        }
 
         const finalResult = await client.query(
           supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
