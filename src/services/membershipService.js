@@ -869,6 +869,8 @@ async function getPlanOfferForPurchaseOrder(client, idPlanSucursal) {
         mp.beneficios,
         mp.activo AS plan_activo,
         pm.descripcion AS periodo_membresia_label,
+        s.estado AS sucursal_activa,
+        s.deleted_at AS sucursal_deleted_at,
         s.nombre_sucursal
       FROM public.membership_plans_sucursal mps
       JOIN public.membership_plans mp
@@ -986,6 +988,13 @@ export async function createMembershipPurchaseOrder(client, {
     throw new AppError(409, "La oferta del plan tiene un precio inv�lido para compra", {
       code: "MEMBERSHIP_PURCHASE_PRICE_INVALID",
       details: { id_plan_sucursal: safePlanSucursalId, precio_hnl: planOffer.precio_hnl },
+    });
+  }
+
+  // AM: Rechaza nuevas ordenes antes de crear snapshots o escribir en la BD.
+  if (planOffer.sucursal_activa !== true || planOffer.sucursal_deleted_at !== null) {
+    throw new AppError(409, "La sucursal de esta oferta no está disponible para nuevas compras.", {
+      code: "MEMBERSHIP_PURCHASE_BRANCH_INACTIVE",
     });
   }
 
