@@ -455,16 +455,23 @@ const GET_ACTIVE_SERVICES_IN_BRANCH_SQL = `
     s.nombre_servicio,
     EXISTS (
       SELECT 1
-      FROM public.servicios_tarifas st
-      WHERE st.id_servicio = s.id_servicio
-        AND st.id_sucursal = $2::uuid
-        AND st.id_empleado IS NULL
-        AND st.deleted_at IS NULL
-        AND st.activo IS TRUE
-        -- AM: En planes operativos solo se permiten servicios agendables (no informativos).
-        AND COALESCE(st.servicio_informativo, FALSE) IS FALSE
-        AND st.vigente_desde <= CURRENT_DATE
-        AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+      FROM (
+        -- AM: Selecciona la tarifa general efectiva antes de comprobar su operatividad.
+        SELECT st.servicio_informativo
+        FROM public.servicios_tarifas st
+        WHERE st.id_servicio = s.id_servicio
+          AND st.id_sucursal = $2::uuid
+          AND st.id_empleado IS NULL
+          AND st.deleted_at IS NULL
+          AND st.activo IS TRUE
+          AND st.vigente_desde <= CURRENT_DATE
+          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+          AND st.precio_hnl > 0
+        ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
+        LIMIT 1
+      ) effective_tariff
+      WHERE s.agendable IS TRUE
+        AND COALESCE(effective_tariff.servicio_informativo, FALSE) IS FALSE
     ) AS has_scope_tariff
   FROM public.servicios s
   WHERE s.id_servicio = ANY($1::uuid[])
