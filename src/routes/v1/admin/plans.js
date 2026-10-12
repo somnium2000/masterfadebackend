@@ -440,6 +440,15 @@ const LOCK_PLAN_BENEFITS_SQL = `
   FOR UPDATE
 `;
 
+const PLAN_MASTER_SCOPE_SQL = `
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.membership_plans_sucursal mps
+    WHERE mps.id_plan = $1::uuid
+      AND mps.id_sucursal = ANY($2::uuid[])
+  ) AS has_authorized_offer
+`;
+
 const GET_ACTIVE_SERVICES_IN_BRANCH_SQL = `
   SELECT
     s.id_servicio,
@@ -713,6 +722,23 @@ function planBenefitsAreEquivalent(currentBenefits = [], nextBenefits = []) {
     .sort();
 
   return JSON.stringify(canonicalize(currentBenefits)) === JSON.stringify(canonicalize(nextBenefits));
+}
+
+async function ensurePlanMasterScope(client, claims, idPlan) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  if (roles.includes("super_admin")) return;
+
+  const branchIds = [...new Set(
+    (Array.isArray(claims?.branch_ids) ? claims.branch_ids : [])
+      .map((branchId) => String(branchId || "").trim())
+      .filter(Boolean)
+  )];
+  const { rows } = await client.query(PLAN_MASTER_SCOPE_SQL, [idPlan, branchIds]);
+  if (!rows[0]?.has_authorized_offer) {
+    throw new AppError(403, "El plan no pertenece al alcance autorizado del administrador", {
+      code: "CATALOG_PLAN_MASTER_OUT_OF_SCOPE",
+    });
+  }
 }
 
 function mapPlanRow(row) {
@@ -1428,6 +1454,16 @@ export default async function adminPlansRoutes(app) {
           });
         }
 
+        const hasNombre = request.body.nombre_plan !== undefined;
+        const hasDescripcion = request.body.descripcion !== undefined;
+        const hasPeriod = request.body.periodo_membresia_codigo !== undefined;
+        const hasCategory = supportsPlanCategoryColumn && request.body.categoria_nivel !== undefined;
+        const shouldUpdateBenefits = request.body.beneficios !== undefined;
+        const shouldMutateMaster = hasNombre || hasDescripcion || hasPeriod || hasCategory || shouldUpdateBenefits;
+        if (shouldMutateMaster) {
+          await ensurePlanMasterScope(client, request.claims, request.params.id);
+        }
+
         const scopedResult = await client.query(
           supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
           [request.params.id, branchId]
@@ -1436,10 +1472,6 @@ export default async function adminPlansRoutes(app) {
 
         const targetPlanId = request.params.id;
         const targetBasePlan = basePlan;
-        const hasNombre = request.body.nombre_plan !== undefined;
-        const hasDescripcion = request.body.descripcion !== undefined;
-        const hasPeriod = request.body.periodo_membresia_codigo !== undefined;
-        const hasCategory = supportsPlanCategoryColumn && request.body.categoria_nivel !== undefined;
         const shouldMutateOffer =
           request.body.precio_hnl !== undefined ||
           request.body.visible_publico !== undefined ||
@@ -1479,7 +1511,6 @@ export default async function adminPlansRoutes(app) {
             ? normalizeOrderVisual(request.body.orden_visual, 100)
             : normalizeOrderVisual(scopedPlan?.orden_visual, 100);
         const nextActive = normalizeBoolean(scopedPlan?.activo, true);
-        const shouldUpdateBenefits = request.body.beneficios !== undefined;
         const sourceBenefits = shouldUpdateBenefits
           ? normalizePlanBenefits(request.body.beneficios)
           : null;
@@ -1550,9 +1581,16 @@ export default async function adminPlansRoutes(app) {
           supportsPlanCategoryColumn ? GET_PLAN_SCOPED_SQL : GET_PLAN_SCOPED_SQL_LEGACY,
           [targetPlanId, branchId]
         );
+        const finalPlan = finalResult.rows[0];
+        if (!finalPlan) {
+          throw new AppError(409, "El plan no tiene una oferta asociada a la sucursal seleccionada", {
+            code: "CATALOG_PLAN_OFFER_NOT_FOUND",
+          });
+        }
+        const responseData = mapPlanRow(finalPlan);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapPlanRow(finalResult.rows[0]), { requestId: request.id });
+        return sendOk(reply, responseData, { requestId: request.id });
       } catch (error) {
         await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(

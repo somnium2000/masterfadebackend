@@ -45,6 +45,7 @@ async function buildApp({
   roles = ["admin"],
   claims = [A, B],
   failOn = null,
+  associatedBranches = [A, B],
 } = {}) {
   const state = {
     activeOfferQueries: 0,
@@ -56,6 +57,7 @@ async function buildApp({
     commit: 0,
     rollback: 0,
     subscriptionWrites: 0,
+    scopedReads: 0,
   };
 
   const query = async (sql, params = []) => {
@@ -65,6 +67,13 @@ async function buildApp({
     if (text === "ROLLBACK") { state.rollback += 1; return { rows: [], rowCount: 0 }; }
     if (text.includes("information_schema.columns") && text.includes("membership_plans")) return { rows: [{ exists: true }], rowCount: 1 };
     if (text.startsWith("SELECT 1 FROM public.sucursales")) return { rows: [{}], rowCount: 1 };
+    if (text.includes("AS has_authorized_offer") && text.includes("membership_plans_sucursal")) {
+      const authorizedBranches = Array.isArray(params[1]) ? params[1] : [];
+      return {
+        rows: [{ has_authorized_offer: associatedBranches.some((branchId) => authorizedBranches.includes(branchId)) }],
+        rowCount: 1,
+      };
+    }
     if (text.includes("Serializa la comparacion") || (text.includes("FROM public.membership_plans mp") && text.endsWith("FOR UPDATE"))) {
       state.sequence.push("lock");
       return { rows: exists ? [{ id_plan: PLAN }] : [], rowCount: exists ? 1 : 0 };
@@ -73,7 +82,9 @@ async function buildApp({
       return { rows: exists ? [planRow(A, storedBenefits)] : [], rowCount: exists ? 1 : 0 };
     }
     if (text.includes("JOIN public.membership_plans_sucursal mps") && text.includes("pm.descripcion AS periodo_membresia_label")) {
-      return { rows: exists ? [planRow(params[1], storedBenefits)] : [], rowCount: exists ? 1 : 0 };
+      state.scopedReads += 1;
+      const isAssociated = associatedBranches.includes(params[1]) || state.offerWrites > 0;
+      return { rows: exists && isAssociated ? [planRow(params[1], storedBenefits)] : [], rowCount: exists && isAssociated ? 1 : 0 };
     }
     if (text.includes("WITH ranked_offers AS") && text.includes("membership_plans_sucursal")) {
       if (failOn === "activeOffers") throw new Error("simulated");
@@ -104,7 +115,11 @@ async function buildApp({
       return { rows: [], rowCount: 1 };
     }
     if (text.includes("FROM public.membership_plans_sucursal mps") && text.includes("FOR UPDATE")) {
-      return { rows: [{ id_plan: PLAN, id_sucursal: A, precio_hnl: 1000, activo: true, visible_publico: true, orden_visual: 10 }], rowCount: 1 };
+      const isAssociated = associatedBranches.includes(params[1]);
+      return {
+        rows: isAssociated ? [{ id_plan: PLAN, id_sucursal: params[1], precio_hnl: 1000, activo: true, visible_publico: true, orden_visual: 10 }] : [],
+        rowCount: isAssociated ? 1 : 0,
+      };
     }
     if (text.startsWith("INSERT INTO public.membership_plans_sucursal")) {
       if (failOn === "offer") throw new Error("simulated");
@@ -311,4 +326,85 @@ test("lectura legacy se compara sin reescribir nombres snapshot", async (t) => {
   t.after(() => app.close());
   assert.equal((await patchPlan(app, { id_sucursal: A, beneficios: benefits() })).statusCode, 200);
   assert.equal(state.masterUpdates.length, 0);
+});
+
+test("admin A no puede editar maestro asociado solamente a B", async (t) => {
+  const { app, state } = await buildApp({ claims: [A], associatedBranches: [B], activeBranches: [B] });
+  t.after(() => app.close());
+  const response = await patchPlan(app, { id_sucursal: A, nombre_plan: "Nombre modificado" });
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "CATALOG_PLAN_MASTER_OUT_OF_SCOPE");
+  assert.equal(state.masterUpdates.length, 0);
+  assert.equal(state.offerWrites, 0);
+  assert.equal(state.commit, 0);
+  assert.equal(state.rollback, 1);
+});
+
+test("admin A no puede modificar beneficios de maestro asociado solamente a B", async (t) => {
+  const { app, state } = await buildApp({ claims: [A], associatedBranches: [B], activeBranches: [B] });
+  t.after(() => app.close());
+  const response = await patchPlan(app, { id_sucursal: A, beneficios: benefits(2) });
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "CATALOG_PLAN_MASTER_OUT_OF_SCOPE");
+  assert.equal(state.masterUpdates.length, 0);
+  assert.equal(state.offerWrites, 0);
+  assert.equal(state.commit, 0);
+  assert.equal(state.rollback, 1);
+});
+
+test("admin A puede editar maestro asociado a A", async (t) => {
+  const { app, state } = await buildApp({ claims: [A], associatedBranches: [A], activeBranches: [A] });
+  t.after(() => app.close());
+  assert.equal((await patchPlan(app, { id_sucursal: A, nombre_plan: "Nombre autorizado" })).statusCode, 200);
+  assert.equal(state.masterUpdates.length, 1);
+  assert.equal(state.commit, 1);
+});
+
+test("admin con A y B puede editar maestro asociado a B", async (t) => {
+  const { app, state } = await buildApp({ claims: [A, B], associatedBranches: [B], activeBranches: [B] });
+  t.after(() => app.close());
+  assert.equal((await patchPlan(app, { id_sucursal: B, descripcion: "Autorizada" })).statusCode, 200);
+  assert.equal(state.masterUpdates.length, 1);
+  assert.equal(state.commit, 1);
+});
+
+test("addOffer autorizado en A no exige asociacion previa del maestro", async (t) => {
+  const { app, state } = await buildApp({ claims: [A], associatedBranches: [B], activeBranches: [B] });
+  t.after(() => app.close());
+  const response = await patchPlan(app, {
+    id_sucursal: A,
+    precio_hnl: 1100,
+    visible_publico: true,
+    orden_visual: 20,
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(state.masterUpdates.length, 0);
+  assert.equal(state.offerWrites, 1);
+  assert.equal(state.commit, 1);
+});
+
+test("editOffer autorizado en A conserva actualizacion local", async (t) => {
+  const { app, state } = await buildApp({ claims: [A], associatedBranches: [A], activeBranches: [A] });
+  t.after(() => app.close());
+  const response = await patchPlan(app, { id_sucursal: A, precio_hnl: 1250, visible_publico: false });
+  assert.equal(response.statusCode, 200);
+  assert.equal(state.masterUpdates.length, 0);
+  assert.equal(state.offerWrites, 1);
+  assert.equal(state.commit, 1);
+});
+
+test("respuesta scoped inexistente revierte antes de COMMIT", async (t) => {
+  const { app, state } = await buildApp({
+    roles: ["super_admin"],
+    claims: [],
+    associatedBranches: [B],
+    activeBranches: [B],
+  });
+  t.after(() => app.close());
+  const response = await patchPlan(app, { id_sucursal: A, nombre_plan: "Cambio global" });
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "CATALOG_PLAN_OFFER_NOT_FOUND");
+  assert.equal(state.commit, 0);
+  assert.equal(state.rollback, 1);
+  assert.equal(state.offerWrites, 0);
 });
