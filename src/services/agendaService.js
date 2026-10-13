@@ -305,6 +305,11 @@ function startOfDay(dateString) {
   return buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 0, 0, 0, AGENDA_DEFAULT_TIME_ZONE);
 }
 
+function operationalWeekday(dateString) {
+  // A calendar date has a weekday independent of the host's timezone.
+  return new Date(`${parseDateOnly(dateString, "fecha")}T12:00:00.000Z`).getUTCDay();
+}
+
 export function buildOperationalDayRange(dateString) {
   const fecha = parseDateOnly(dateString, "fecha");
   const startAt = startOfDay(fecha);
@@ -378,7 +383,9 @@ function getDateTimePartsInTimeZone(dateValue, timeZone) {
   if (Number.isNaN(parsed.getTime())) return null;
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
-    hour12: false,
+    // h23 avoids ICU versions that represent midnight as 24:00 (the same day).
+    // Treating that value as Date.UTC(..., 24) shifts the offset by an entire day.
+    hourCycle: "h23",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -1432,7 +1439,7 @@ export async function getBookingSelectionDetails(client, {
 
 async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
   const targetDate = parseDateOnly(dateString, "fecha");
-  const dayOfWeek = startOfDay(targetDate).getDay();
+  const dayOfWeek = operationalWeekday(targetDate);
   const branchSchedule = await client.query(
     `
       WITH target_branch AS (
@@ -2426,7 +2433,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
     const sampleDateByWeekday = new Map();
     for (const dateKey of dateKeys) {
-      const weekday = startOfDay(dateKey).getDay();
+      const weekday = operationalWeekday(dateKey);
       if (!sampleDateByWeekday.has(weekday)) {
         sampleDateByWeekday.set(weekday, dateKey);
       }
@@ -2444,7 +2451,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     for (const dateKey of dateKeys) {
       const dayStart = startOfDay(dateKey);
       const dayEnd = endOfDay(dateKey);
-      const weekday = dayStart.getDay();
+      const weekday = operationalWeekday(dateKey);
       const schedules = schedulesByWeekday.get(weekday) || [];
 
       const baseIntervals = buildBaseIntervalsFromSchedules(dateKey, schedules);
