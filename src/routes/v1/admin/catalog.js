@@ -3273,7 +3273,7 @@ export default async function adminCatalogRoutes(app) {
   app.patch(
     "/servicios/:id/desactivar-global",
     {
-      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(SUPER_ADMIN_ONLY),
       schema: {
         params: {
           type: "object",
