@@ -916,10 +916,86 @@ async function getClienteSnapshotForPurchaseOrder(client, clienteId) {
   return rows?.[0] ?? null;
 }
 
+function membershipPurchaseIdempotencySchemaError() {
+  return new AppError(503, "La creación idempotente de órdenes no está disponible temporalmente.", {
+    code: "MEMBERSHIP_PURCHASE_IDEMPOTENCY_SCHEMA_NOT_READY",
+  });
+}
+
+async function getMembershipPurchaseOrderByKey(client, clienteId, idempotencyKey) {
+  try {
+    const { rows } = await client.query(
+      `
+        SELECT id_order, id_cliente, id_plan_sucursal, estado_orden_codigo,
+               moneda_codigo, subtotal_hnl, descuento_hnl, total_hnl,
+               plan_snapshot, cliente_snapshot, factura_snapshot, expires_at,
+               (expires_at IS NOT NULL AND expires_at > clock_timestamp()) AS unexpired
+        FROM public.membership_purchase_orders
+        WHERE id_cliente = $1::uuid AND idempotency_key = $2::text
+      `,
+      [clienteId, idempotencyKey]
+    );
+    return rows[0] ?? null;
+  } catch (error) {
+    if (error?.code === "42703") throw membershipPurchaseIdempotencySchemaError();
+    throw error;
+  }
+}
+
+function mapIdempotentMembershipPurchaseOrder(order, clienteId, idPlanSucursal) {
+  if (normalizeText(order.id_cliente).toLowerCase() !== clienteId.toLowerCase()
+    || normalizeText(order.id_plan_sucursal).toLowerCase() !== idPlanSucursal.toLowerCase()) {
+    throw new AppError(409, "La clave de esta operación ya está asociada a otra oferta.", {
+      code: "MEMBERSHIP_PURCHASE_IDEMPOTENCY_CONFLICT",
+    });
+  }
+  const unavailable = () => new AppError(409, "Esta operación ya no puede retomarse. Inicia una nueva compra con otra clave.", {
+    code: "MEMBERSHIP_PURCHASE_IDEMPOTENCY_ORDER_UNAVAILABLE",
+  });
+  if (normalizeText(order.estado_orden_codigo).toLowerCase() !== "pendiente_pago" || order.unexpired !== true) {
+    throw unavailable();
+  }
+  let planSnapshot;
+  let clienteSnapshot;
+  try {
+    planSnapshot = typeof order.plan_snapshot === "string" ? JSON.parse(order.plan_snapshot) : order.plan_snapshot;
+    clienteSnapshot = typeof order.cliente_snapshot === "string" ? JSON.parse(order.cliente_snapshot) : order.cliente_snapshot;
+  } catch {
+    throw unavailable();
+  }
+  if (!planSnapshot?.id_plan || !planSnapshot.beneficios
+    || normalizeText(planSnapshot.id_plan_sucursal).toLowerCase() !== idPlanSucursal.toLowerCase()
+    || normalizeText(clienteSnapshot?.id_cliente).toLowerCase() !== clienteId.toLowerCase()) {
+    throw unavailable();
+  }
+  // AM: El reintento devuelve datos persistidos; nunca reconstruye el contrato desde el catalogo.
+  return {
+    id_order: order.id_order,
+    estado_orden_codigo: order.estado_orden_codigo,
+    plan: {
+      id_plan: planSnapshot.id_plan,
+      id_plan_sucursal: planSnapshot.id_plan_sucursal,
+      nombre_plan: planSnapshot.nombre_plan,
+      id_sucursal: planSnapshot.id_sucursal,
+      sucursal_nombre: planSnapshot.sucursal_nombre,
+      precio_hnl: planSnapshot.precio_hnl,
+      beneficios: planSnapshot.beneficios,
+    },
+    totales: {
+      subtotal_hnl: Number(order.subtotal_hnl),
+      descuento_hnl: Number(order.descuento_hnl),
+      total_hnl: Number(order.total_hnl),
+      moneda_codigo: order.moneda_codigo,
+    },
+    cliente: { id_cliente: order.id_cliente, email: clienteSnapshot.email ?? null },
+  };
+}
+
 export async function createMembershipPurchaseOrder(client, {
   clienteId,
   usuarioId = null,
   idPlanSucursal,
+  idempotencyKey,
 } = {}) {
   const safeClienteId = normalizeText(clienteId);
   const safePlanSucursalId = normalizeText(idPlanSucursal);
@@ -928,6 +1004,15 @@ export async function createMembershipPurchaseOrder(client, {
       code: "MEMBERSHIP_PURCHASE_ORDER_INVALID_INPUT",
     });
   }
+
+  const hasIdempotencyKey = idempotencyKey !== undefined;
+  if (hasIdempotencyKey && (typeof idempotencyKey !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idempotencyKey))) {
+    throw new AppError(400, "La clave de idempotencia debe ser un UUID válido.", {
+      code: "MEMBERSHIP_PURCHASE_IDEMPOTENCY_KEY_INVALID",
+    });
+  }
+  const safeIdempotencyKey = hasIdempotencyKey ? idempotencyKey.toLowerCase() : null;
 
   const orderCapabilities = await getMembershipPurchaseOrderCapabilities(client);
   if (!orderCapabilities.hasTable) {
@@ -954,6 +1039,15 @@ export async function createMembershipPurchaseOrder(client, {
       code: "MEMBERSHIP_PURCHASE_ORDER_SCHEMA_MISMATCH",
       details: { missing_columns: missingColumns },
     });
+  }
+
+  if (safeIdempotencyKey) {
+    const idempotencyColumns = ["idempotency_key", "plan_snapshot", "cliente_snapshot", "factura_snapshot", "expires_at"];
+    if (idempotencyColumns.some((column) => !orderCapabilities.columns.has(column))) {
+      throw membershipPurchaseIdempotencySchemaError();
+    }
+    const existing = await getMembershipPurchaseOrderByKey(client, safeClienteId, safeIdempotencyKey);
+    if (existing) return mapIdempotentMembershipPurchaseOrder(existing, safeClienteId, safePlanSucursalId);
   }
 
   const planOffer = await getPlanOfferForPurchaseOrder(client, safePlanSucursalId);
@@ -1052,12 +1146,18 @@ export async function createMembershipPurchaseOrder(client, {
     "cliente_snapshot",
     "factura_snapshot",
     "email_factura",
+    ...(safeIdempotencyKey ? ["idempotency_key"] : []),
     "expires_at",
   ].filter((columnName) => orderCapabilities.columns.has(columnName));
 
   const insertValues = [];
   const params = [];
   for (const columnName of insertColumns) {
+    if (columnName === "idempotency_key") {
+      params.push(safeIdempotencyKey);
+      insertValues.push(`$${params.length}::text`);
+      continue;
+    }
     params.push(
       columnName === "id_cliente"
         ? safeClienteId
@@ -1104,19 +1204,34 @@ export async function createMembershipPurchaseOrder(client, {
     }
   }
 
-  const { rows } = await client.query(
-    `
-      INSERT INTO public.membership_purchase_orders (
-        ${insertColumns.join(", ")}
-      )
-      VALUES (
-        ${insertValues.join(", ")}
-      )
-      RETURNING id_order
-    `
-  , params);
+  let rows;
+  try {
+    ({ rows } = await client.query(
+      `
+        INSERT INTO public.membership_purchase_orders (
+          ${insertColumns.join(", ")}
+        )
+        VALUES (
+          ${insertValues.join(", ")}
+        )
+        ${safeIdempotencyKey ? "ON CONFLICT (id_cliente, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING" : ""}
+        RETURNING id_order
+      `,
+      params
+    ));
+  } catch (error) {
+    if (safeIdempotencyKey && ["42P10", "42703"].includes(error?.code)) {
+      throw membershipPurchaseIdempotencySchemaError();
+    }
+    throw error;
+  }
 
   const created = rows?.[0];
+  if (!created?.id_order && safeIdempotencyKey) {
+    // AM: Consulta posterior al ON CONFLICT para ver el ganador confirmado sin abortar la transaccion.
+    const existing = await getMembershipPurchaseOrderByKey(client, safeClienteId, safeIdempotencyKey);
+    if (existing) return mapIdempotentMembershipPurchaseOrder(existing, safeClienteId, safePlanSucursalId);
+  }
   if (!created?.id_order) {
     throw new AppError(500, "No se pudo crear la orden de compra del plan", {
       code: "MEMBERSHIP_PURCHASE_ORDER_CREATE_FAILED",

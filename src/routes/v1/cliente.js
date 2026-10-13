@@ -1030,6 +1030,7 @@ export default async function clienteRoutes(app) {
           required: ["id_plan_sucursal"],
           properties: {
             id_plan_sucursal: { type: "string", format: "uuid" },
+            idempotency_key: { type: "string", format: "uuid", minLength: 36, maxLength: 36 },
           },
           additionalProperties: false,
         },
@@ -1071,6 +1072,7 @@ export default async function clienteRoutes(app) {
           clienteId: context.clienteId,
           usuarioId: context.userId ?? null,
           idPlanSucursal: request.body.id_plan_sucursal,
+          idempotencyKey: request.body.idempotency_key,
         });
 
         await client.query("COMMIT");
