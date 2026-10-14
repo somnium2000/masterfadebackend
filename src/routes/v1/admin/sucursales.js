@@ -434,21 +434,31 @@ async function setSucursalState(client, idSucursal, targetState) {
 }
 
 export default async function adminSucursalesRoutes(app) {
-  // AM: Admin solo consulta las sucursales de sus claims; el resto de rutas sigue exclusivo de super_admin.
+  // AM: El alcance del listado requiere una asignacion admin activa; las demas rutas siguen exclusivas de super_admin.
   app.get("/", { preHandler: app.requireRoles(["super_admin", "admin"]), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
     try {
       const onlyActive = request.query?.solo_activas === true || request.query?.solo_activas === "true";
       const isSuperAdmin = Array.isArray(request.claims?.roles) && request.claims.roles.includes("super_admin");
-      const branchIds = Array.isArray(request.claims?.roles) && request.claims.roles.includes("admin") && Array.isArray(request.claims?.branch_ids)
-        ? request.claims.branch_ids.filter((id) => typeof id === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id))
-        : [];
+      const userId = request.claims?.user?.id_usuario;
+      if (!isSuperAdmin && (!Array.isArray(request.claims?.roles) || !request.claims.roles.includes("admin")
+        || typeof userId !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId))) {
+        return sendOk(reply, { sucursales: [] });
+      }
       const { rows } = isSuperAdmin
         ? await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL)
         : await app.db.query(`${SUCURSAL_SELECT_SQL}
-            AND s.id_sucursal = ANY($1::uuid[])
+            AND EXISTS (
+              SELECT 1
+              FROM public.roles_usuarios ru
+              JOIN public.roles r ON r.id_rol = ru.id_rol
+              WHERE ru.id_usuario = $1::uuid
+                AND ru.id_sucursal = s.id_sucursal
+                AND ru.activo IS TRUE
+                AND r.nombre = 'admin'
+            )
             ${onlyActive ? "AND COALESCE(s.estado, TRUE) IS TRUE" : ""}
             ORDER BY s.nombre_sucursal ASC
-          `, [branchIds]);
+          `, [userId]);
       return sendOk(reply, { sucursales: rows.map(mapSucursal) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar sucursales", "SUCURSALES_LIST_ERROR");
