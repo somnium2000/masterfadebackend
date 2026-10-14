@@ -11,7 +11,7 @@ const C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 const cleanSql = (sql) => String(sql).replace(/\s+/g, " ").trim();
 
-async function buildApp({ roles = ["admin"], claims = [A], linked = true, exists = true, duplicate = false, failUpdate = false } = {}) {
+async function buildApp({ roles = ["admin"], claims = [A], linked = true, exists = true, duplicate = false, failUpdate = false, failState = false } = {}) {
   const state = { branches: new Map([[A, true], [B, true], [C, false]]), upserts: [], masterUpdates: [], implicitUpdates: 0, begin: 0, commit: 0, rollback: 0 };
   const row = () => ({
     id: ID,
@@ -29,6 +29,12 @@ async function buildApp({ roles = ["admin"], claims = [A], linked = true, exists
     if (text.includes("FROM public.sucursales s") && text.includes("ANY($1::uuid[])")) return { rows: params[0].map((id_sucursal) => ({ id_sucursal })), rowCount: params[0].length };
     if (text.includes("LOWER(regexp_replace(TRIM(c.nombre)")) return { rows: duplicate ? [{}] : [], rowCount: duplicate ? 1 : 0 };
     if (text.startsWith("UPDATE public.cortesias SET")) { state.masterUpdates.push({ text, params }); if (failUpdate) throw new Error("simulated"); return { rows: [], rowCount: 1 }; }
+    if (text.includes("SELECT 1 FROM public.sucursales WHERE id_sucursal")) return { rows: [{}], rowCount: 1 };
+    if (text.startsWith("UPDATE public.cortesias_sucursales SET activa =")) {
+      if (failState) throw new Error("simulated state failure");
+      state.branches.set(params[1], params[2]);
+      return { rows: [{ id: ID }], rowCount: 1 };
+    }
     if (text.startsWith("INSERT INTO public.cortesias_sucursales")) { state.upserts.push({ id_sucursal: params[1], activa: params[2] }); state.branches.set(params[1], params[2]); return { rows: [], rowCount: 1 }; }
     if (text.includes("NOT (id_sucursal = ANY")) { state.implicitUpdates += 1; return { rows: [], rowCount: 1 }; }
     if (text.includes("WHERE c.id = $1::uuid") && text.includes("GROUP BY c.id")) return { rows: [row()], rowCount: 1 };
@@ -49,6 +55,47 @@ async function buildApp({ roles = ["admin"], claims = [A], linked = true, exists
 async function patch(app, payload) {
   return app.inject({ method: "PATCH", url: `/v1/admin/catalog/cortesias/${ID}`, payload });
 }
+
+for (const endpoint of ["", "/estado"]) {
+  for (const [roles, claims, expected] of [
+    [["admin"], [A], [A]],
+    [["admin"], [A, B], [A, B]],
+    [["super_admin"], [], [A, B, C]],
+    [["admin", "super_admin"], [A], [A, B, C]],
+  ]) {
+    test(`PATCH ${endpoint || "maestro"} limita respuesta para ${roles.join("+")} con ${claims.length} sucursales`, async (t) => {
+      const { app, state } = await buildApp({ roles, claims });
+      t.after(() => app.close());
+      const response = await app.inject({ method: "PATCH", url: `/v1/admin/catalog/cortesias/${ID}${endpoint}`,
+        payload: endpoint ? { id_sucursal: A, activa: false } : { descripcion: "Actualizada" } });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.deepEqual(response.json().data.sucursales.map((scope) => scope.id_sucursal), expected);
+      assert.equal(state.branches.get(B), true);
+      assert.equal(state.branches.get(C), false);
+      assert.equal(state.masterUpdates.length, endpoint ? 0 : 1);
+      assert.equal(state.branches.get(A), endpoint ? false : true);
+      assert.equal(state.commit, 1);
+      assert.equal(state.rollback, 0);
+    });
+  }
+}
+
+test("estado fuera de alcance devuelve 403 sin escrituras", async (t) => {
+  const { app, state } = await buildApp(); t.after(() => app.close());
+  const response = await app.inject({ method: "PATCH", url: `/v1/admin/catalog/cortesias/${ID}/estado`, payload: { id_sucursal: B, activa: false } });
+  assert.equal(response.statusCode, 403);
+  assert.equal(state.begin, 0);
+  assert.equal(state.branches.get(B), true);
+});
+
+test("error al cambiar estado revierte sin commit", async (t) => {
+  const { app, state } = await buildApp({ failState: true }); t.after(() => app.close());
+  const response = await app.inject({ method: "PATCH", url: `/v1/admin/catalog/cortesias/${ID}/estado`, payload: { id_sucursal: A, activa: false } });
+  assert.equal(response.statusCode, 500);
+  assert.equal(state.rollback, 1);
+  assert.equal(state.commit, 0);
+  assert.equal(state.branches.get(A), true);
+});
 
 test("admin de A edita campos globales y conserva B y C por omision", async (t) => {
   const { app, state } = await buildApp(); t.after(() => app.close());

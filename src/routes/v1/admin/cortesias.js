@@ -270,6 +270,13 @@ function mapCortesiaRow(row) {
   };
 }
 
+function mapScopedCortesiaRow(row, claims) {
+  const mapped = mapCortesiaRow(row);
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) return mapped;
+  const allowed = new Set(Array.isArray(claims?.branch_ids) ? claims.branch_ids : []);
+  return { ...mapped, sucursales: mapped.sucursales.filter((scope) => allowed.has(scope.id_sucursal)) };
+}
+
 async function resolveBranchId(client, claims, requestedBranchId, allowAllForSuperAdmin = false) {
   const claimBranchIds = Array.isArray(claims?.branch_ids) ? claims.branch_ids.filter(Boolean) : [];
   const isSuperAdmin = Array.isArray(claims?.roles) && claims.roles.includes("super_admin");
@@ -742,7 +749,7 @@ export default async function adminCortesiasRoutes(app) {
         const finalResult = await client.query(GET_CORTESIA_SQL, [request.params.id, null]);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapCortesiaRow(finalResult.rows[0]), { requestId: request.id });
+        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], request.claims), { requestId: request.id });
       } catch (error) {
         await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
@@ -829,7 +836,7 @@ export default async function adminCortesiasRoutes(app) {
         const finalResult = await client.query(GET_CORTESIA_SQL, [request.params.id, null]);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapCortesiaRow(finalResult.rows[0]), { requestId: request.id });
+        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], request.claims), { requestId: request.id });
       } catch (error) {
         await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
