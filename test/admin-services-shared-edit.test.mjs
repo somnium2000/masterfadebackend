@@ -18,6 +18,7 @@ function normalizedSql(sql) {
 async function buildApp({
   roles = ["admin"],
   claimBranches = [BRANCH_A],
+  adminBranches = claimBranches,
   shared = false,
   duplicateName = false,
   failMasterUpdate = false,
@@ -54,6 +55,10 @@ async function buildApp({
 
   const query = async (sql, params = []) => {
     const text = normalizedSql(sql);
+    if (text.startsWith("SELECT DISTINCT ru.id_sucursal")) {
+      assert.deepEqual(params, [SERVICE_ID]);
+      return { rows: adminBranches.map((id_sucursal) => ({ id_sucursal })), rowCount: adminBranches.length };
+    }
     if (text === "BEGIN") {
       state.begin += 1;
       return { rows: [], rowCount: 0 };
@@ -148,7 +153,7 @@ async function buildApp({
     if (!roles.some((role) => allowedRoles.includes(role))) {
       return reply.code(403).send({ ok: false, error: { code: "AUTH_FORBIDDEN", message: "Forbidden" } });
     }
-    request.claims = { roles, branch_ids: claimBranches };
+    request.claims = { roles, branch_ids: claimBranches, user: { id_usuario: SERVICE_ID } };
   });
   app.decorate("db", {
     query,
@@ -169,6 +174,25 @@ async function patchService(app, body) {
     method: "PATCH",
     url: `/v1/admin/catalog/servicios/${SERVICE_ID}`,
     payload: body,
+  });
+}
+
+for (const scenario of [
+  { name: "admin A + barbero B edita A", adminBranches: [BRANCH_A], target: BRANCH_A, status: 200 },
+  { name: "admin A + barbero B no edita B", adminBranches: [BRANCH_A], target: BRANCH_B, status: 403 },
+  { name: "admin A+B edita A", adminBranches: [BRANCH_A, BRANCH_B], target: BRANCH_A, status: 200 },
+  { name: "admin A+B edita B", adminBranches: [BRANCH_A, BRANCH_B], target: BRANCH_B, status: 200 },
+  { name: "sin asignacion admin no escribe", adminBranches: [], target: BRANCH_A, status: 403 },
+]) {
+  test(scenario.name, async (t) => {
+    const { app, state } = await buildApp({ roles: ["admin", "barbero"], claimBranches: [BRANCH_A, BRANCH_B], adminBranches: scenario.adminBranches });
+    t.after(() => app.close());
+    const response = await patchService(app, { id_sucursal: scenario.target, descripcion: "Descripcion autorizada" });
+    assert.equal(response.statusCode, scenario.status, response.body);
+    assert.equal(state.masterUpdates, scenario.status === 200 ? 1 : 0);
+    assert.equal(state.commit, scenario.status === 200 ? 1 : 0);
+    assert.equal(state.begin, scenario.status === 200 ? 1 : 0);
+    if (scenario.status === 200) assert.equal(response.json().data.descripcion, "Descripcion autorizada");
   });
 }
 

@@ -1277,6 +1277,32 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
   });
 }
 
+// AM: Servicios usa solo asignaciones admin; Paquetes conserva su resolver y contrato actuales.
+async function resolveServiceBranchId(client, claims, requestedBranchId, allowAllForSuperAdmin = false) {
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) {
+    return resolveBranchId(client, claims, requestedBranchId, allowAllForSuperAdmin);
+  }
+
+  const userId = claims?.user?.id_usuario;
+  let branchIds = [];
+  if (Array.isArray(claims?.roles) && claims.roles.includes("admin")
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rows } = await client.query(
+      `SELECT DISTINCT ru.id_sucursal
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+         AND ru.id_sucursal IS NOT NULL`,
+      [userId]
+    );
+    branchIds = rows.map((row) => row.id_sucursal);
+  }
+
+  return resolveBranchId(client, { ...claims, branch_ids: branchIds }, requestedBranchId, allowAllForSuperAdmin);
+}
+
 const PACKAGE_DUPLICATE_MESSAGE = "Ya existe un paquete con ese nombre. Usa el paquete existente o cambia el nombre.";
 
 async function ensureUniquePackageNameGlobal(client, packageId, nombrePaquete) {
@@ -1473,7 +1499,7 @@ async function ensureServiceBranchesAccessible(client, claims, branchTariffs) {
   // AM: Valida sucursales seleccionadas y alcance del admin antes de crear tarifas.
   const branchIds = [...new Set(branchTariffs.map((item) => item.id_sucursal))];
   for (const branchId of branchIds) {
-    await resolveBranchId(client, claims, branchId);
+    await resolveServiceBranchId(client, claims, branchId);
   }
 }
 
@@ -2610,7 +2636,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_SERVICES_SQL, [branchId]);
 
         return sendOk(reply, {
@@ -2667,7 +2693,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_GROUPED_SERVICES_SQL, [branchId]);
         return sendOk(reply, {
           id_sucursal: branchId,
@@ -2831,7 +2857,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.body?.id_sucursal ?? null);
 
         await client.query("BEGIN");
 
@@ -3060,7 +3086,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.params.id_sucursal);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.params.id_sucursal);
         await client.query("BEGIN");
 
         const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id_servicio]);
@@ -3151,7 +3177,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body.id_sucursal);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.body.id_sucursal);
         await client.query("BEGIN");
 
         const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id_servicio]);
@@ -3241,7 +3267,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.params.id_sucursal);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.params.id_sucursal);
         await client.query("BEGIN");
 
         // AM: Quitar de sucursal es cierre de tarifa vigente, nunca borrado duro.
@@ -3378,7 +3404,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const requestedState = Boolean(request.body?.activo);
         const precioHnl =
           request.body?.precio_hnl === undefined || request.body?.precio_hnl === null
@@ -3704,7 +3730,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.query?.id_sucursal ?? null);
 
         await client.query("BEGIN");
 

@@ -12,6 +12,7 @@ async function buildApp(roles) {
   const query = async (sql) => {
     const text = String(sql).replace(/\s+/g, " ").trim();
     calls.push(text);
+    if (text.startsWith("SELECT DISTINCT ru.id_sucursal")) return { rows: [{ id_sucursal: BRANCH }], rowCount: 1 };
     if (text.includes("FROM public.servicios s") && text.includes("LIMIT 1")) {
       return { rows: [{ id_servicio: SERVICE, deleted_at: null }] };
     }
@@ -24,7 +25,7 @@ async function buildApp(roles) {
     if (!roles.some((role) => allowed.includes(role))) {
       return reply.code(403).send({ ok: false, error: { code: "AUTH_FORBIDDEN", message: "Acceso no permitido" } });
     }
-    request.claims = { roles, branch_ids: [BRANCH] };
+    request.claims = { roles, branch_ids: [BRANCH], user: { id_usuario: SERVICE } };
   });
   app.decorate("db", { query, connect: async () => {
     connections += 1;
