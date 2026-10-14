@@ -2963,7 +2963,6 @@ export default async function adminCatalogRoutes(app) {
                 orden_visual = $5::int,
                 visible_publico = $6::boolean,
                 agendable = $7::boolean,
-                activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
@@ -2976,7 +2975,6 @@ export default async function adminCatalogRoutes(app) {
               UPDATE public.servicios
               SET
                 agendable = $2::boolean,
-                activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid

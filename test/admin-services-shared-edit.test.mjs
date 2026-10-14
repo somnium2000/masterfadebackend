@@ -21,6 +21,7 @@ async function buildApp({
   shared = false,
   duplicateName = false,
   failMasterUpdate = false,
+  activo = true,
 } = {}) {
   const state = {
     service: {
@@ -33,7 +34,7 @@ async function buildApp({
       visible_publico: true,
       agendable: true,
       orden_visual: 100,
-      activo: true,
+      activo,
       id_sucursal: BRANCH_A,
       precio_hnl: 250,
       servicio_informativo: false,
@@ -103,6 +104,8 @@ async function buildApp({
     if (text.startsWith("UPDATE public.servicios SET")) {
       state.masterUpdates += 1;
       if (failMasterUpdate) throw new Error("simulated database failure");
+      // AM: Reproduce el efecto real de la asignacion SQL sobre el estado maestro.
+      if (/\bactivo\s*=\s*TRUE\b/i.test(text)) state.service.activo = true;
       if (params.length >= 7) {
         state.service = {
           ...state.service,
@@ -168,6 +171,42 @@ async function patchService(app, body) {
     payload: body,
   });
 }
+
+for (const activo of [false, true]) {
+  for (const shared of [false, true]) {
+    for (const [field, value] of [["descripcion", "Descripcion revisada"], ["precio_hnl", 275]]) {
+      test(`edicion de ${field} conserva activo=${activo}, compartido=${shared}`, async (t) => {
+        const { app, state } = await buildApp({ activo, shared });
+        t.after(() => app.close());
+        const response = await patchService(app, { id_sucursal: BRANCH_A, [field]: value });
+        assert.equal(response.statusCode, 200, response.body);
+        assert.equal(state.service.activo, activo);
+        assert.equal(response.json().data.activo, activo);
+        if (field === "descripcion") assert.equal(state.service.descripcion, value);
+        else assert.ok(state.tariffWrites > 0);
+        assert.equal(state.cloneAttempts, 0);
+        assert.equal(state.commit, 1);
+        assert.equal(state.rollback, 0);
+        assert.equal(state.released, 1);
+      });
+    }
+  }
+}
+
+test("reactivacion explicita por endpoint de estado conserva su funcionamiento", async (t) => {
+  const { app, state } = await buildApp({ activo: false });
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "PATCH",
+    url: `/v1/admin/catalog/servicios/${SERVICE_ID}/estado`,
+    payload: { id_sucursal: BRANCH_A, activo: true, precio_hnl: 275 },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(state.service.activo, true);
+  assert.equal(response.json().data.activo, true);
+  assert.equal(state.commit, 1);
+  assert.equal(state.rollback, 0);
+});
 
 test("servicio de una sucursal edita descripcion sin clonar", async (t) => {
   const { app, state } = await buildApp();
