@@ -1303,6 +1303,28 @@ async function resolveServiceBranchId(client, claims, requestedBranchId, allowAl
   return resolveBranchId(client, { ...claims, branch_ids: branchIds }, requestedBranchId, allowAllForSuperAdmin);
 }
 
+// AM: Paquetes resuelve su alcance administrativo sin alterar claims globales ni Servicios.
+async function resolvePackageClaims(client, claims) {
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) return claims;
+  const userId = claims?.user?.id_usuario;
+  let branchIds = [];
+  if (Array.isArray(claims?.roles) && claims.roles.includes("admin")
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rows } = await client.query(
+      `SELECT DISTINCT ru.id_sucursal
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+         AND ru.id_sucursal IS NOT NULL`,
+      [userId]
+    );
+    branchIds = rows.map((row) => row.id_sucursal);
+  }
+  return { ...claims, branch_ids: branchIds };
+}
+
 const PACKAGE_DUPLICATE_MESSAGE = "Ya existe un paquete con ese nombre. Usa el paquete existente o cambia el nombre.";
 
 async function ensureUniquePackageNameGlobal(client, packageId, nombrePaquete) {
@@ -1567,6 +1589,7 @@ async function ensurePackageCompositionAcrossActiveOffers(client, claims, idPaqu
   const branchIds = new Set(rows.map((row) => row.id_sucursal).filter(Boolean));
   if (operationBranchId) branchIds.add(operationBranchId);
 
+  // AM: Verifica disponibilidad en todas las ofertas; no concede permisos para operar sus sucursales.
   for (const branchId of branchIds) {
     try {
       await ensurePackageItemsAccessible(client, claims, items, branchId);
@@ -3622,7 +3645,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         const baseResult = await client.query(GET_PACKAGE_BASE_SQL, [request.params.id]);
@@ -3637,7 +3661,7 @@ export default async function adminCatalogRoutes(app) {
         if (nextActivo) {
           // AM: Solo se reactiva una oferta de sucursal si su composicion sigue disponible en esa sucursal.
           const currentItems = normalizePackageItems(basePackage.items || []);
-          await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
+          await ensurePackageItemsAccessible(client, scopedClaims, currentItems, branchId);
           await upsertPackageBranchOffer(client, request.params.id, branchId, {
             activo: true,
           });
@@ -3801,7 +3825,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_PACKAGES_SQL, [branchId]);
         return sendOk(reply, {
           id_sucursal: branchId,
@@ -3853,12 +3878,13 @@ export default async function adminCatalogRoutes(app) {
         const nombrePaquete = normalizeRequiredText(request.body.nombre_paquete);
         const descripcion = normalizeOptionalText(request.body.descripcion);
         const items = normalizePackageItems(request.body.items);
-        const offers = await normalizeInitialPackageOffers(client, request.claims, request.body);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const offers = await normalizeInitialPackageOffers(client, scopedClaims, request.body);
         const firstOffer = offers[0];
 
         await ensureUniquePackageNameGlobal(client, null, nombrePaquete);
         for (const offer of offers) {
-          await ensurePackageItemsAccessible(client, request.claims, items, offer.idSucursal);
+          await ensurePackageItemsAccessible(client, scopedClaims, items, offer.idSucursal);
         }
 
         await client.query("BEGIN");
@@ -3949,7 +3975,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         await client.query(LOCK_PACKAGE_COMPOSITION_SQL, [request.params.id]);
@@ -4014,7 +4041,7 @@ export default async function adminCatalogRoutes(app) {
           if (compositionChanged) {
             await ensurePackageCompositionAcrossActiveOffers(
               client,
-              request.claims,
+              scopedClaims,
               request.params.id,
               nextItems,
               branchId
@@ -4025,7 +4052,7 @@ export default async function adminCatalogRoutes(app) {
         if (shouldMutateOffer && !compositionChanged) {
           currentItems ??= await getCurrentPackageItems(client, request.params.id);
           if (currentItems.length > 0) {
-            await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
+            await ensurePackageItemsAccessible(client, scopedClaims, currentItems, branchId);
           }
         }
 
@@ -4132,7 +4159,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.query?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         const baseResult = await client.query(GET_PACKAGE_BASE_SQL, [request.params.id]);

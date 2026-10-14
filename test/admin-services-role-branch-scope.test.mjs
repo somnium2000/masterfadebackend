@@ -145,12 +145,12 @@ for (const roles of [null, ["barbero"], ["cliente"]]) {
   });
 }
 
-test("Paquetes conserva branch_ids sin consultar asignaciones admin", async (t) => {
+test("Paquetes rechaza la sucursal de barbero tras incorporar su alcance admin", async (t) => {
   const { app, calls } = await buildApp(); t.after(() => app.close());
   const response = await app.inject({ method: "GET", url: `${BASE}/paquetes?id_sucursal=${B}` });
-  assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.json().data.id_sucursal, B);
-  assert.ok(!calls.some((call) => call.sql.includes("roles_usuarios")));
+  assert.equal(response.statusCode, 403, response.body);
+  assert.equal(response.json().error.code, "AUTH_FORBIDDEN_BRANCH");
+  assert.ok(calls.some((call) => call.sql.includes("roles_usuarios")));
 });
 
 for (const request of [

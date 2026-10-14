@@ -11,6 +11,8 @@ const C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const S1 = "21111111-1111-4111-8111-111111111111";
 const S2 = "22222222-2222-4222-8222-222222222222";
 const S3 = "23333333-3333-4333-8333-333333333333";
+const OTHER_USER = "44444444-4444-4444-8444-444444444444";
+const assignment = (rol, id_sucursal, activo = true, id_usuario = PACKAGE) => ({ rol, id_sucursal, activo, id_usuario });
 
 const cleanSql = (sql) => String(sql).replace(/\s+/g, " ").trim();
 const packageRow = (branchId = A) => ({
@@ -31,16 +33,32 @@ const packageRow = (branchId = A) => ({
 async function buildApp({
   roles = ["admin"],
   claims = [A],
+  assignments = claims.map((id) => assignment("admin", id)),
+  userId = PACKAGE,
+  missingUser = false,
   activeBranches = [A, B],
   incompatibleBranches = [B],
   notBookableBranches = [],
   missingServiceBranches = [],
   exists = true,
+  duplicateName = false,
   failOn = null,
 } = {}) {
-  const state = { masterUpdates: [], detailDeletes: 0, detailInserts: 0, offerWrites: 0, rollback: 0, commit: 0, activeOfferQueries: 0, validatedBranches: [], sequence: [] };
+  const state = { queries: [], masterUpdates: [], detailDeletes: 0, detailInserts: 0, offerWrites: 0, rollback: 0, commit: 0, activeOfferQueries: 0, validatedBranches: [], sequence: [] };
   const query = async (sql, params = []) => {
     const text = cleanSql(sql);
+    state.queries.push({ text, params });
+    if (text.startsWith("SELECT DISTINCT ru.id_sucursal")) {
+      assert.match(text, /FROM public\.roles_usuarios ru JOIN public\.roles r ON r\.id_rol = ru\.id_rol/);
+      assert.match(text, /WHERE ru\.id_usuario = \$1::uuid/);
+      assert.match(text, /AND ru\.activo IS TRUE/);
+      assert.match(text, /AND r\.nombre = 'admin'/);
+      assert.match(text, /AND ru\.id_sucursal IS NOT NULL/);
+      assert.deepEqual(params, [userId]);
+      assert.ok(!text.includes(userId));
+      const ids = [...new Set(assignments.filter((item) => item.id_usuario === params[0] && item.rol === "admin" && item.activo === true && item.id_sucursal).map((item) => item.id_sucursal))];
+      return { rows: ids.map((id_sucursal) => ({ id_sucursal })), rowCount: ids.length };
+    }
     if (text === "BEGIN") return { rows: [], rowCount: 0 };
     if (text === "COMMIT") { state.commit += 1; return { rows: [], rowCount: 0 }; }
     if (text === "ROLLBACK") { state.rollback += 1; return { rows: [], rowCount: 0 }; }
@@ -48,8 +66,11 @@ async function buildApp({
     if (text.includes("package_active_offers")) { state.sequence.push("active-offers"); state.activeOfferQueries += 1; if (failOn === "activeOffers") throw new Error("simulated"); return { rows: activeBranches.map((id_sucursal) => ({ id_sucursal })), rowCount: activeBranches.length }; }
     if (text.includes("package_composition_lock")) { state.sequence.push("lock"); return { rows: exists ? [{ id_paquete: PACKAGE }] : [], rowCount: exists ? 1 : 0 }; }
     if (text.includes("WITH picked_offer AS") && text.includes("GROUP BY p.id_paquete")) return { rows: [packageRow(params[1])], rowCount: 1 };
+    if (text.includes("HAVING COUNT(pd.id_servicio) >= 2")) return { rows: [packageRow(params[0])], rowCount: 1 };
     if (text.includes("FROM public.paquetes p") && text.includes("GROUP BY p.id_paquete")) return { rows: exists ? [packageRow()] : [], rowCount: exists ? 1 : 0 };
-    if (text.includes("lower(regexp_replace(trim(p.nombre_paquete)")) return { rows: [], rowCount: 0 };
+    if (text.includes("lower(regexp_replace(trim(p.nombre_paquete)")) return { rows: duplicateName ? [{ id_paquete: PACKAGE }] : [], rowCount: duplicateName ? 1 : 0 };
+    if (text.startsWith("INSERT INTO public.paquetes (")) { if (failOn === "create") throw new Error("simulated"); return { rows: [{ id_paquete: PACKAGE }], rowCount: 1 }; }
+    if (text.includes("total_citas_futuras")) return { rows: [{ total_citas_futuras: 0 }], rowCount: 1 };
     if (text.includes("AS has_scoped_tariff") && text.includes("FROM public.servicios s")) {
       const branchId = params[0]?.[0];
       state.validatedBranches.push(branchId);
@@ -78,7 +99,7 @@ async function buildApp({
   app.decorate("requireRoles", (allowed) => async (request, reply) => {
     if (!roles) return reply.code(401).send({ ok: false, error: { code: "AUTH_REQUIRED", message: "Unauthorized" } });
     if (!roles.some((role) => allowed.includes(role))) return reply.code(403).send({ ok: false, error: { code: "AUTH_FORBIDDEN", message: "Forbidden" } });
-    request.claims = { roles, branch_ids: claims };
+    request.claims = { roles, branch_ids: claims, user: missingUser ? undefined : { id_usuario: userId } };
   });
   app.decorate("db", { connect: async () => ({ query, release() {} }) });
   await app.register(routes, { prefix: "/v1/admin/catalog" });
@@ -360,3 +381,146 @@ test("items equivalentes con precio y servicios disponibles actualizan solo ofer
   assert.equal(state.detailDeletes, 0);
   assert.equal(state.detailInserts, 0);
 });
+
+function scopeRequests(branch) {
+  const base = "/v1/admin/catalog/paquetes";
+  return [
+    { method: "GET", url: `${base}?id_sucursal=${branch}` },
+    { method: "POST", url: base, payload: { nombre_paquete: "Nuevo", items: compositionPayload.items, ofertas: [{ id_sucursal: branch, precio_hnl: 600 }] } },
+    { method: "PATCH", url: `${base}/${PACKAGE}`, payload: { id_sucursal: branch, descripcion: "Editada" } },
+    { method: "PATCH", url: `${base}/${PACKAGE}/estado`, payload: { id_sucursal: branch, activo: true } },
+    { method: "PATCH", url: `${base}/${PACKAGE}/estado`, payload: { id_sucursal: branch, activo: false } },
+    { method: "DELETE", url: `${base}/${PACKAGE}?id_sucursal=${branch}` },
+  ];
+}
+
+for (const request of scopeRequests(B)) {
+  for (const scenario of [
+    { name: "admin A + barbero B", assignments: [assignment("admin", A), assignment("barbero", B)] },
+    { name: "admin B inactivo", assignments: [assignment("admin", B, false)] },
+    { name: "admin B de otro usuario", assignments: [assignment("admin", B, true, OTHER_USER)] },
+    { name: "sin asignaciones", assignments: [] },
+  ]) {
+    test(`${scenario.name} rechaza ${request.method} ${request.url} antes de escribir`, async (t) => {
+      const { app, state } = await buildApp({ roles: ["admin", "barbero"], claims: [A, B], assignments: scenario.assignments });
+      t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, 403, response.body);
+      assert.equal(response.json().error.code, "AUTH_FORBIDDEN_BRANCH");
+      assert.ok(!state.queries.some(({ text }) => /^(BEGIN|INSERT|UPDATE|DELETE)/.test(text)));
+      assert.equal(state.commit, 0);
+    });
+  }
+}
+
+for (const scenario of [
+  { name: "admin A + barbero B opera A", assignments: [assignment("admin", A), assignment("barbero", B)], branch: A },
+  { name: "admin A+B opera A", assignments: [assignment("admin", A), assignment("admin", B)], branch: A },
+  { name: "admin A+B opera B", assignments: [assignment("admin", A), assignment("admin", B)], branch: B },
+]) {
+  for (const request of scopeRequests(scenario.branch)) {
+    test(`${scenario.name}: ${request.method} ${request.url}`, async (t) => {
+      const { app, state } = await buildApp({ roles: ["admin", "barbero"], claims: [A, B, C], assignments: scenario.assignments, incompatibleBranches: [] });
+      t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, request.method === "POST" ? 201 : 200, response.body);
+      const data = response.json().data;
+      assert.equal(data.id_sucursal ?? data.paquetes?.[0]?.id_sucursal, scenario.branch);
+      assert.equal(state.queries.filter(({ text }) => text.startsWith("SELECT DISTINCT ru.id_sucursal")).length, 1);
+      if (request.method !== "GET") assert.equal(state.commit, 1);
+    });
+  }
+}
+
+for (const scenario of [
+  { name: "ausente", missingUser: true },
+  { name: "nula", userId: null },
+  { name: "no UUID", userId: "' OR TRUE --" },
+]) {
+  for (const request of scopeRequests(A)) {
+    test(`identidad ${scenario.name} rechaza ${request.method} ${request.url}`, async (t) => {
+      const { app, state } = await buildApp(scenario); t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, 403, response.body);
+      assert.ok(!state.queries.some(({ text }) => /^(BEGIN|INSERT|UPDATE|DELETE)/.test(text) || text.includes("roles_usuarios")));
+    });
+  }
+}
+
+for (const roles of [["super_admin"], ["super_admin", "admin"]]) {
+  for (const request of scopeRequests(B)) {
+    test(`${roles.join("+")} conserva ${request.method} ${request.url}`, async (t) => {
+      const { app, state } = await buildApp({ roles, claims: [], assignments: [], missingUser: true, incompatibleBranches: [] });
+      t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, request.method === "POST" ? 201 : 200, response.body);
+      assert.ok(!state.queries.some(({ text }) => text.includes("roles_usuarios")));
+    });
+  }
+  test(`${roles.join("+")} conserva GET global`, async (t) => {
+    const { app, state } = await buildApp({ roles, claims: [], assignments: [] }); t.after(() => app.close());
+    const response = await app.inject({ method: "GET", url: "/v1/admin/catalog/paquetes" });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().data.id_sucursal, null);
+    assert.ok(!state.queries.some(({ text }) => text.includes("roles_usuarios")));
+  });
+}
+
+for (const offers of [[A, B], [B, A]]) {
+  test(`POST mixto rechaza todas las ofertas antes de escribir: ${offers.join(",")}`, async (t) => {
+    const { app, state } = await buildApp({ roles: ["admin", "barbero"], claims: [A, B], assignments: [assignment("admin", A), assignment("barbero", B)], incompatibleBranches: [] });
+    t.after(() => app.close());
+    const response = await app.inject({ method: "POST", url: "/v1/admin/catalog/paquetes", payload: { nombre_paquete: "Multiple", items: compositionPayload.items, ofertas: offers.map((id_sucursal) => ({ id_sucursal, precio_hnl: 600 })) } });
+    assert.equal(response.statusCode, 403, response.body);
+    assert.ok(!state.queries.some(({ text }) => /^(BEGIN|INSERT|UPDATE|DELETE)/.test(text)));
+  });
+}
+
+test("POST permite ofertas A+B administrativas y valida servicios de ambas", async (t) => {
+  const { app, state } = await buildApp({ claims: [A, B, C], assignments: [assignment("admin", A), assignment("admin", B), assignment("barbero", C)], incompatibleBranches: [] });
+  t.after(() => app.close());
+  const response = await app.inject({ method: "POST", url: "/v1/admin/catalog/paquetes", payload: { nombre_paquete: "Multiple", items: compositionPayload.items, ofertas: [A, B].map((id_sucursal) => ({ id_sucursal, precio_hnl: 600 })) } });
+  assert.equal(response.statusCode, 201, response.body);
+  assert.deepEqual(state.validatedBranches, [A, B]);
+  assert.equal(state.offerWrites, 2);
+  assert.equal(state.commit, 1);
+});
+
+for (const [name, assignments, status] of [
+  ["una admin y otra barbero", [assignment("admin", A), assignment("admin", A), assignment("barbero", B)], 200],
+  ["varias admin", [assignment("admin", A), assignment("admin", B)], 400],
+  ["ninguna admin", [], 400],
+]) {
+  test(`GET seleccion automatica con ${name}`, async (t) => {
+    const { app } = await buildApp({ claims: [A, B], assignments }); t.after(() => app.close());
+    const response = await app.inject({ method: "GET", url: "/v1/admin/catalog/paquetes" });
+    assert.equal(response.statusCode, status, response.body);
+    if (status === 200) assert.equal(response.json().data.id_sucursal, A);
+    else assert.equal(response.json().error.code, "CATALOG_BRANCH_REQUIRED");
+  });
+}
+
+for (const compatible of [false, true]) {
+  test(`admin A sin autorizacion en B conserva validacion global de composicion: compatible=${compatible}`, async (t) => {
+    const { app, state } = await buildApp({ roles: ["admin", "barbero"], claims: [A, B], assignments: [assignment("admin", A), assignment("barbero", B)], incompatibleBranches: compatible ? [] : [B] });
+    t.after(() => app.close());
+    const response = await patchPackage(app);
+    assert.equal(response.statusCode, compatible ? 200 : 409, response.body);
+    assert.deepEqual(state.validatedBranches, [A, B]);
+    assert.equal(state.offerWrites, 0);
+    assert.equal(state.commit, compatible ? 1 : 0);
+    assert.equal(state.rollback, compatible ? 0 : 1);
+  });
+}
+
+for (const failure of ["duplicate", "create"]) {
+  test(`POST conserva ${failure === "duplicate" ? "duplicados" : "rollback"}`, async (t) => {
+    const { app, state } = await buildApp({ duplicateName: failure === "duplicate", failOn: failure === "create" ? "create" : null });
+    t.after(() => app.close());
+    const response = await app.inject(scopeRequests(A)[1]);
+    assert.equal(response.statusCode, failure === "duplicate" ? 409 : 500, response.body);
+    assert.equal(state.commit, 0);
+    assert.equal(state.rollback, 1);
+    assert.equal(state.offerWrites, 0);
+  });
+}
