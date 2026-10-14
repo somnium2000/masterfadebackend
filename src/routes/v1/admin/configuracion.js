@@ -324,9 +324,25 @@ async function ensureBranchExists(client, idSucursal) {
 // AM: Alcance exclusivo de Promociones; no altera los permisos de Comunicacion.
 async function ensurePromotionBranchAccess(client, claims, idSucursal, { allowGlobal = false } = {}) {
   const roles = Array.isArray(claims?.roles) ? claims.roles : [];
-  const branchIds = Array.isArray(claims?.branch_ids) ? claims.branch_ids : [];
   const isSuperAdmin = roles.includes("super_admin");
-  if (!isSuperAdmin && (!roles.includes("admin") || !idSucursal || !branchIds.includes(idSucursal))) {
+  let hasAdminAssignment = false;
+  const userId = claims?.user?.id_usuario;
+  if (!isSuperAdmin && roles.includes("admin") && idSucursal
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rowCount } = await client.query(
+      `SELECT 1
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.id_sucursal = $2::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+       LIMIT 1`,
+      [userId, idSucursal]
+    );
+    hasAdminAssignment = rowCount > 0;
+  }
+  if (!isSuperAdmin && !hasAdminAssignment) {
     throw new AppError(403, "No tienes acceso a las promociones de esta sucursal", {
       code: "CONFIG_PROMOTION_BRANCH_FORBIDDEN",
     });

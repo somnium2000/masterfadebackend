@@ -10,6 +10,9 @@ const PROMO = "11111111-1111-4111-8111-111111111111";
 const SERVICE = "21111111-1111-4111-8111-111111111111";
 const PACKAGE = "31111111-1111-4111-8111-111111111111";
 const RULE = "41111111-1111-4111-8111-111111111111";
+const USER = "51111111-1111-4111-8111-111111111111";
+const OTHER_USER = "61111111-1111-4111-8111-111111111111";
+const assignment = (rol, id_sucursal, activo = true, id_usuario = USER) => ({ rol, id_sucursal, activo, id_usuario });
 const base = (id_sucursal = A) => ({
   id_promocion: PROMO, id_sucursal, titulo: "Promocion original", slug: "promocion-original",
   subtitulo: "Original", parrafos: ["Descripcion original"], estado: "borrador", visible_publico: false,
@@ -20,13 +23,27 @@ const base = (id_sucursal = A) => ({
 });
 const createPayload = (branch = A) => ({ ...base(branch), id_promocion: undefined });
 
-async function buildApp({ roles = ["admin"], branches = [A], missingBranch = false, failWrite = false, duplicate = false } = {}) {
-  const state = { reads: [], writes: [], commit: 0, rollback: 0, row: base() };
+async function buildApp({ roles = ["admin"], branches = [A], assignments = branches.map((id) => assignment("admin", id)), userId = USER, missingUser = false, missingBranch = false, failWrite = false, duplicate = false } = {}) {
+  const state = { queries: [], assetCalls: 0, reads: [], writes: [], commit: 0, rollback: 0, row: base() };
   const query = async (sql, params = []) => {
     const text = String(sql).replace(/\s+/g, " ").trim();
+    state.queries.push({ text, params });
+    if (text.startsWith("SELECT 1 FROM public.roles_usuarios ru")) {
+      assert.match(text, /JOIN public\.roles r ON r\.id_rol = ru\.id_rol/);
+      assert.match(text, /WHERE ru\.id_usuario = \$1::uuid/);
+      assert.match(text, /AND ru\.id_sucursal = \$2::uuid/);
+      assert.match(text, /AND ru\.activo IS TRUE/);
+      assert.match(text, /AND r\.nombre = 'admin'/);
+      assert.deepEqual(params.slice(0, 1), [userId]);
+      assert.ok(!text.includes(userId) && !text.includes(params[1]));
+      const allowed = assignments.some((item) => item.id_usuario === params[0] && item.id_sucursal === params[1] && item.rol === "admin" && item.activo === true);
+      return { rows: allowed ? [{}] : [], rowCount: allowed ? 1 : 0 };
+    }
     if (text === "BEGIN") return { rows: [], rowCount: 0 };
     if (text === "COMMIT") { state.commit++; return { rows: [], rowCount: 0 }; }
     if (text === "ROLLBACK") { state.rollback++; return { rows: [], rowCount: 0 }; }
+    if (text.includes("FROM public.comunicaciones_campanias")) return text.includes("SELECT COUNT(*)::int AS total FROM filtered")
+      ? { rows: [{ total: 0 }], rowCount: 1 } : { rows: [], rowCount: 0 };
     if (text.includes("FROM public.sucursales") && text.startsWith("SELECT 1")) return { rows: missingBranch ? [] : [{}], rowCount: missingBranch ? 0 : 1 };
     if (text.includes("FROM public.promociones p") && text.includes("JOIN public.promociones_sucursal ps")) {
       state.reads.push(params);
@@ -65,9 +82,10 @@ async function buildApp({ roles = ["admin"], branches = [A], missingBranch = fal
   app.decorate("requireRoles", (allowed) => async (request, reply) => {
     if (!roles) return reply.code(401).send({ ok: false, error: { code: "AUTH_REQUIRED", message: "Unauthorized" } });
     if (!roles.some((role) => allowed.includes(role))) return reply.code(403).send({ ok: false, error: { code: "AUTH_FORBIDDEN", message: "Forbidden" } });
-    request.claims = { roles, branch_ids: branches };
+    request.claims = { roles, branch_ids: branches, user: missingUser ? undefined : { id_usuario: userId } };
   });
   app.decorate("db", { connect: async () => ({ query, release() {} }) });
+  app.decorate("supabase", { storage: { from() { state.assetCalls++; throw new Error("Unexpected storage operation in authorization test"); } } });
   await app.register(routes, { prefix: "/v1/admin/configuracion" });
   await app.ready();
   return { app, state };
@@ -197,3 +215,134 @@ test("duplicado conserva 409 y fallo SQL revierte sin commit", async (t) => {
   assert.equal(failing.state.commit, 0);
   assert.equal(failing.state.rollback, 1);
 });
+
+for (const request of requests(B)) {
+  for (const scenario of [
+    { name: "admin A + barbero B", assignments: [assignment("admin", A), assignment("barbero", B)] },
+    { name: "admin B inactivo", assignments: [assignment("admin", B, false)] },
+    { name: "admin B de otro usuario", assignments: [assignment("admin", B, true, OTHER_USER)] },
+    { name: "sin asignaciones", assignments: [] },
+  ]) {
+    test(`${scenario.name} rechaza ${request.method} ${request.url} antes de leer o escribir`, async (t) => {
+      const { app, state } = await buildApp({ roles: ["admin", "barbero"], branches: [A, B], assignments: scenario.assignments });
+      t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, 403, response.body);
+      assert.equal(response.json().error.code, "CONFIG_PROMOTION_BRANCH_FORBIDDEN");
+      assert.equal(state.reads.length + state.writes.length + state.assetCalls + state.commit, 0);
+      assert.ok(state.queries.every(({ text }) => text.startsWith("SELECT 1 FROM public.roles_usuarios ru") || text === "ROLLBACK"));
+      const scopeQuery = state.queries.find(({ text }) => text.includes("roles_usuarios"));
+      assert.deepEqual(scopeQuery.params, [USER, B]);
+    });
+  }
+}
+
+for (const scenario of [
+  { name: "admin A + barbero B opera A", assignments: [assignment("admin", A), assignment("barbero", B)], branch: A },
+  { name: "admin A+B opera A", assignments: [assignment("admin", A), assignment("admin", B)], branch: A },
+  { name: "admin A+B opera B", assignments: [assignment("admin", A), assignment("admin", B)], branch: B },
+]) {
+  for (const request of requests(scenario.branch)) {
+    test(`${scenario.name}: ${request.method} ${request.url}`, async (t) => {
+      const { app, state } = await buildApp({ roles: ["admin", "barbero"], branches: [A, B], assignments: scenario.assignments });
+      t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, request.method === "POST" ? 201 : 200, response.body);
+      const data = response.json().data;
+      assert.equal(data.promocion?.id_sucursal ?? data.promociones[0].id_sucursal, scenario.branch);
+      assert.equal(state.queries.filter(({ text }) => text.includes("roles_usuarios")).length, 1);
+      if (request.method !== "GET") assert.equal(state.commit, 1);
+    });
+  }
+}
+
+for (const scenario of [{ missingUser: true }, { userId: null }, { userId: "' OR TRUE --" }]) {
+  for (const request of requests(A)) {
+    test(`identidad invalida ${JSON.stringify(scenario)} rechaza ${request.method} ${request.url}`, async (t) => {
+      const { app, state } = await buildApp(scenario); t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, 403, response.body);
+      assert.equal(response.json().error.code, "CONFIG_PROMOTION_BRANCH_FORBIDDEN");
+      assert.equal(state.reads.length + state.writes.length + state.assetCalls, 0);
+      assert.ok(state.queries.every(({ text }) => text === "ROLLBACK"));
+    });
+  }
+}
+
+for (const roles of [["super_admin"], ["super_admin", "admin"]]) {
+  for (const request of requests(B)) {
+    test(`${roles.join("+")} conserva ${request.method} ${request.url} sin identidad admin`, async (t) => {
+      const { app, state } = await buildApp({ roles, branches: [], assignments: [], missingUser: true }); t.after(() => app.close());
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, request.method === "POST" ? 201 : 200, response.body);
+      assert.ok(!state.queries.some(({ text }) => text.includes("roles_usuarios")));
+    });
+  }
+  test(`${roles.join("+")} conserva listado global sin asignaciones administrativas`, async (t) => {
+    const { app } = await buildApp({ roles, branches: [], assignments: [], missingUser: true }); t.after(() => app.close());
+    const response = await app.inject({ method: "GET", url: "/v1/admin/configuracion/promociones" });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json().data.promociones.map((row) => row.id_sucursal), [A, B]);
+  });
+}
+
+for (const assignments of [[assignment("admin", A)], [assignment("admin", A), assignment("barbero", B)], [assignment("admin", A), assignment("admin", B)], []]) {
+  test(`admin con ${assignments.length} asignaciones requiere id_sucursal explicito`, async (t) => {
+    const { app, state } = await buildApp({ branches: [A, B], assignments }); t.after(() => app.close());
+    const response = await app.inject({ method: "GET", url: "/v1/admin/configuracion/promociones" });
+    assert.equal(response.statusCode, 403);
+    assert.equal(state.queries.length + state.reads.length + state.writes.length, 0);
+  });
+}
+
+for (const request of requests(B).filter((item) => item.method !== "GET")) {
+  test(`${request.method} rechaza assets de sucursal ajena antes de cualquier operacion de Storage`, async (t) => {
+    const { app, state } = await buildApp({ roles: ["admin", "barbero"], branches: [A, B], assignments: [assignment("admin", A), assignment("barbero", B)] });
+    t.after(() => app.close());
+    const response = await app.inject({ ...request, payload: { ...request.payload, imagen_principal_asset_id: SERVICE, imagen_mobile_asset_id: PACKAGE } });
+    assert.equal(response.statusCode, 403, response.body);
+    assert.equal(state.assetCalls + state.reads.length + state.writes.length, 0);
+    assert.ok(state.queries.every(({ text }) => text.startsWith("SELECT 1 FROM public.roles_usuarios ru") || text === "ROLLBACK"));
+  });
+}
+
+for (const branches of [[], [B]]) {
+  test(`branch_ids ${JSON.stringify(branches)} no reemplaza la asignacion admin real`, async (t) => {
+    const { app } = await buildApp({ branches, assignments: [assignment("admin", A)] }); t.after(() => app.close());
+    for (const request of requests(A)) {
+      const response = await app.inject(request);
+      assert.equal(response.statusCode, request.method === "POST" ? 201 : 200, response.body);
+    }
+  });
+}
+
+test("la consulta utiliza el identificador autenticado y no una identidad fija", async (t) => {
+  const { app } = await buildApp({ userId: OTHER_USER, branches: [A, B], assignments: [assignment("admin", A), assignment("admin", B, true, OTHER_USER)] });
+  t.after(() => app.close());
+  for (const request of requests(B)) {
+    const response = await app.inject(request);
+    assert.equal(response.statusCode, request.method === "POST" ? 201 : 200, response.body);
+  }
+});
+
+for (const roles of [["admin"], ["super_admin"], ["super_admin", "admin"]]) {
+  test(`Comunicacion conserva listado sin alcance administrativo para ${roles.join("+")}`, async (t) => {
+    const { app, state } = await buildApp({ roles, branches: [], assignments: [], missingUser: true }); t.after(() => app.close());
+    const response = await app.inject({ method: "GET", url: "/v1/admin/configuracion/comunicacion/campanias" });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json().data.campanias, []);
+    assert.equal(response.json().data.total, 0);
+    assert.equal(state.queries.length, 2);
+    assert.ok(!state.queries.some(({ text }) => text.includes("roles_usuarios")));
+    assert.equal(state.writes.length + state.assetCalls, 0);
+  });
+}
+
+for (const roles of [null, ["cliente"]]) {
+  test(`Comunicacion conserva ${roles ? 403 : 401} para actores no autorizados`, async (t) => {
+    const { app, state } = await buildApp({ roles }); t.after(() => app.close());
+    const response = await app.inject({ method: "GET", url: "/v1/admin/configuracion/comunicacion/campanias" });
+    assert.equal(response.statusCode, roles ? 403 : 401);
+    assert.deepEqual(state.queries, []);
+  });
+}
