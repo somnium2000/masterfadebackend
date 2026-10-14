@@ -270,6 +270,28 @@ function mapCortesiaRow(row) {
   };
 }
 
+// AM: Alcance local de Cortesias, independiente de las sucursales de otros roles.
+async function resolveCourtesyClaims(client, claims) {
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) return claims;
+  const userId = claims?.user?.id_usuario;
+  let branchIds = [];
+  if (Array.isArray(claims?.roles) && claims.roles.includes("admin")
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rows } = await client.query(
+      `SELECT DISTINCT ru.id_sucursal
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+         AND ru.id_sucursal IS NOT NULL`,
+      [userId]
+    );
+    branchIds = rows.map((row) => row.id_sucursal);
+  }
+  return { ...claims, branch_ids: branchIds };
+}
+
 function mapScopedCortesiaRow(row, claims) {
   const mapped = mapCortesiaRow(row);
   if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) return mapped;
@@ -559,13 +581,14 @@ export default async function adminCortesiasRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const scopedClaims = await resolveCourtesyClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.query?.id_sucursal ?? null, true);
         const buscar = normalizeBuscar(request.query?.buscar);
         const { rows } = await client.query(LIST_CORTESIAS_SQL, [branchId, buscar]);
 
         return sendOk(reply, {
           id_sucursal: branchId,
-          cortesias: rows.map(mapCortesiaRow),
+          cortesias: rows.map((row) => mapScopedCortesiaRow(row, scopedClaims)),
         }, { requestId: request.id });
       } catch (error) {
         return sendHandledError(
@@ -613,7 +636,8 @@ export default async function adminCortesiasRoutes(app) {
       try {
         const nombre = normalizeRequiredText(request.body?.nombre, "nombre");
         const descripcion = normalizeOptionalText(request.body?.descripcion);
-        const sucursales = await normalizePayloadSucursales(client, request.claims, request.body?.sucursales);
+        const scopedClaims = await resolveCourtesyClaims(client, request.claims);
+        const sucursales = await normalizePayloadSucursales(client, scopedClaims, request.body?.sucursales);
         await ensureUniqueCourtesyNameGlobal(client, null, nombre);
 
         await client.query("BEGIN");
@@ -633,7 +657,7 @@ export default async function adminCortesiasRoutes(app) {
         const finalResult = await client.query(GET_CORTESIA_SQL, [cortesiaId, null]);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapCortesiaRow(finalResult.rows[0]), {
+        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], scopedClaims), {
           statusCode: 201,
           requestId: request.id,
         });
@@ -700,7 +724,8 @@ export default async function adminCortesiasRoutes(app) {
           });
         }
 
-        await assertCourtesyWriteAccess(client, request.claims, request.params.id);
+        const scopedClaims = await resolveCourtesyClaims(client, request.claims);
+        await assertCourtesyWriteAccess(client, scopedClaims, request.params.id);
 
         const hasNombre = request.body?.nombre !== undefined;
         const hasDescripcion = request.body?.descripcion !== undefined;
@@ -713,7 +738,7 @@ export default async function adminCortesiasRoutes(app) {
 
         let nextSucursales = null;
         if (request.body?.sucursales !== undefined) {
-          nextSucursales = await normalizePayloadSucursales(client, request.claims, request.body.sucursales);
+          nextSucursales = await normalizePayloadSucursales(client, scopedClaims, request.body.sucursales);
         }
 
         if (hasNombre) {
@@ -749,7 +774,7 @@ export default async function adminCortesiasRoutes(app) {
         const finalResult = await client.query(GET_CORTESIA_SQL, [request.params.id, null]);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], request.claims), { requestId: request.id });
+        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], scopedClaims), { requestId: request.id });
       } catch (error) {
         await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
@@ -802,7 +827,8 @@ export default async function adminCortesiasRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolveCourtesyClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         const nextActiva = Boolean(request.body?.activa);
 
         await client.query("BEGIN");
@@ -836,7 +862,7 @@ export default async function adminCortesiasRoutes(app) {
         const finalResult = await client.query(GET_CORTESIA_SQL, [request.params.id, null]);
         await client.query("COMMIT");
 
-        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], request.claims), { requestId: request.id });
+        return sendOk(reply, mapScopedCortesiaRow(finalResult.rows[0], scopedClaims), { requestId: request.id });
       } catch (error) {
         await client.query("ROLLBACK").catch(() => { });
         return sendHandledError(
