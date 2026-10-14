@@ -46,6 +46,8 @@ async function buildApp({
   claims = [A, B],
   failOn = null,
   associatedBranches = [A, B],
+  masterActive = false,
+  activeSubscribers = 0,
 } = {}) {
   const state = {
     activeOfferQueries: 0,
@@ -58,6 +60,8 @@ async function buildApp({
     rollback: 0,
     subscriptionWrites: 0,
     scopedReads: 0,
+    masterActive,
+    offerParams: [],
   };
 
   const query = async (sql, params = []) => {
@@ -66,6 +70,8 @@ async function buildApp({
     if (text === "COMMIT") { state.commit += 1; return { rows: [], rowCount: 0 }; }
     if (text === "ROLLBACK") { state.rollback += 1; return { rows: [], rowCount: 0 }; }
     if (text.includes("information_schema.columns") && text.includes("membership_plans")) return { rows: [{ exists: true }], rowCount: 1 };
+    if (text.includes("information_schema.columns") && text.includes("subscriptions")) return { rows: [{ exists: true }], rowCount: 1 };
+    if (text.includes("SELECT COUNT(*)::int AS total")) return { rows: [{ total: activeSubscribers }], rowCount: 1 };
     if (text.startsWith("SELECT 1 FROM public.sucursales")) return { rows: [{}], rowCount: 1 };
     if (text.includes("AS has_authorized_offer") && text.includes("membership_plans_sucursal")) {
       const authorizedBranches = Array.isArray(params[1]) ? params[1] : [];
@@ -112,6 +118,7 @@ async function buildApp({
       state.sequence.push("master");
       if (failOn === "master") throw new Error("simulated");
       state.masterUpdates.push({ sql: text, params });
+      if (text.includes("activo = TRUE")) state.masterActive = true;
       return { rows: [], rowCount: 1 };
     }
     if (text.includes("FROM public.membership_plans_sucursal mps") && text.includes("FOR UPDATE")) {
@@ -124,6 +131,7 @@ async function buildApp({
     if (text.startsWith("INSERT INTO public.membership_plans_sucursal")) {
       if (failOn === "offer") throw new Error("simulated");
       state.offerWrites += 1;
+      state.offerParams.push(params);
       return { rows: [], rowCount: 1 };
     }
     if (/\b(subscriptions|subscription_consumptions|membership_purchase_orders|membership_payment_intents)\b/i.test(text) && /^(INSERT|UPDATE|DELETE)/i.test(text)) {
@@ -148,6 +156,57 @@ async function buildApp({
 }
 
 const patchPlan = (app, payload) => app.inject({ method: "PATCH", url: `/v1/admin/planes/${PLAN}`, payload });
+
+for (const masterActive of [false, true]) {
+  test(`inactivar oferta conserva estado maestro ${masterActive}`, async (t) => {
+    const { app, state } = await buildApp({ masterActive });
+    t.after(() => app.close());
+    const response = await app.inject({ method: "PATCH", url: `/v1/admin/planes/${PLAN}/estado`, payload: { id_sucursal: A, activo: false } });
+    assert.equal(response.statusCode, 200);
+    assert.equal(state.masterActive, masterActive);
+    assert.equal(state.offerWrites, 1);
+    assert.equal(state.commit, 1);
+    assert.equal(state.subscriptionWrites, 0);
+    assert.deepEqual(state.offerParams[0], [PLAN, A, 1000, false, true, 10]);
+  });
+}
+
+test("estado rechaza oferta inexistente sin crearla", async (t) => {
+  const { app, state } = await buildApp({ associatedBranches: [B] });
+  t.after(() => app.close());
+  const response = await app.inject({ method: "PATCH", url: `/v1/admin/planes/${PLAN}/estado`, payload: { id_sucursal: A, activo: false } });
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.json().error.code, "CATALOG_PLAN_OFFER_NOT_FOUND");
+  assert.equal(state.offerWrites, 0);
+  assert.equal(state.masterUpdates.length, 0);
+  assert.equal(state.rollback, 1);
+});
+
+test("activar oferta existente activa explicitamente el maestro", async (t) => {
+  const { app, state } = await buildApp();
+  t.after(() => app.close());
+  const response = await app.inject({ method: "PATCH", url: `/v1/admin/planes/${PLAN}/estado`, payload: { id_sucursal: A, activo: true } });
+  assert.equal(response.statusCode, 200);
+  assert.equal(state.masterActive, true);
+  assert.equal(state.offerWrites, 1);
+});
+
+test("estado conserva confirmacion de suscripciones y rollback SQL", async (t) => {
+  const guarded = await buildApp({ activeSubscribers: 2 });
+  t.after(() => guarded.app.close());
+  const request = { method: "PATCH", url: `/v1/admin/planes/${PLAN}/estado`, payload: { id_sucursal: A, activo: false } };
+  const response = await guarded.app.inject(request);
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "CATALOG_PLAN_ACTIVE_SUBSCRIPTIONS_CONFIRM_REQUIRED");
+  assert.equal(guarded.state.offerWrites, 0);
+  assert.equal((await guarded.app.inject({ ...request, payload: { ...request.payload, confirmar_clientes_activos: true } })).statusCode, 200);
+  const failing = await buildApp({ failOn: "offer" });
+  t.after(() => failing.app.close());
+  assert.equal((await failing.app.inject(request)).statusCode, 500);
+  assert.equal(failing.state.rollback, 1);
+  assert.equal(failing.state.commit, 0);
+  assert.equal(failing.state.masterUpdates.length, 0);
+});
 
 test("rechaza beneficios compatibles en A pero incompatibles en oferta activa B", async (t) => {
   const { app, state } = await buildApp({ incompatibleServiceBranches: [B] });

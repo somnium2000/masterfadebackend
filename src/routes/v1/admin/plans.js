@@ -1671,6 +1671,11 @@ export default async function adminPlansRoutes(app) {
           [request.params.id, branchId]
         );
         const scopedPlan = scopedResult.rows[0] ?? null;
+        if (!scopedPlan) {
+          throw new AppError(404, "La oferta solicitada no existe en la sucursal", {
+            code: "CATALOG_PLAN_OFFER_NOT_FOUND",
+          });
+        }
         const nextActivo = Boolean(request.body.activo);
         const baseBenefits = parseStoredBenefits(basePlan.beneficios);
         const requiresActiveSubscriptionsConfirmation = !nextActivo && request.body?.confirmar_clientes_activos !== true;
@@ -1699,7 +1704,7 @@ export default async function adminPlansRoutes(app) {
           ordenVisual: normalizeOrderVisual(scopedPlan?.orden_visual, 100),
         });
 
-        await client.query(
+        if (nextActivo) await client.query(
           `
             UPDATE public.membership_plans
             SET
