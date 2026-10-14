@@ -434,11 +434,21 @@ async function setSucursalState(client, idSucursal, targetState) {
 }
 
 export default async function adminSucursalesRoutes(app) {
-  // JK: Listado principal para el modulo SUCURSALES, restringido a SUPER_ADMIN en esta fase.
-  app.get("/", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
+  // AM: Admin solo consulta las sucursales de sus claims; el resto de rutas sigue exclusivo de super_admin.
+  app.get("/", { preHandler: app.requireRoles(["super_admin", "admin"]), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
     try {
       const onlyActive = request.query?.solo_activas === true || request.query?.solo_activas === "true";
-      const { rows } = await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL);
+      const isSuperAdmin = Array.isArray(request.claims?.roles) && request.claims.roles.includes("super_admin");
+      const branchIds = Array.isArray(request.claims?.roles) && request.claims.roles.includes("admin") && Array.isArray(request.claims?.branch_ids)
+        ? request.claims.branch_ids.filter((id) => typeof id === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id))
+        : [];
+      const { rows } = isSuperAdmin
+        ? await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL)
+        : await app.db.query(`${SUCURSAL_SELECT_SQL}
+            AND s.id_sucursal = ANY($1::uuid[])
+            ${onlyActive ? "AND COALESCE(s.estado, TRUE) IS TRUE" : ""}
+            ORDER BY s.nombre_sucursal ASC
+          `, [branchIds]);
       return sendOk(reply, { sucursales: rows.map(mapSucursal) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar sucursales", "SUCURSALES_LIST_ERROR");
