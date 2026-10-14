@@ -731,6 +731,28 @@ function planBenefitsAreEquivalent(currentBenefits = [], nextBenefits = []) {
   return JSON.stringify(canonicalize(currentBenefits)) === JSON.stringify(canonicalize(nextBenefits));
 }
 
+// AM: Alcance local de Planes, exclusivamente desde asignaciones admin activas del usuario.
+async function resolvePlanClaims(client, claims) {
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) return claims;
+  const userId = claims?.user?.id_usuario;
+  let branchIds = [];
+  if (Array.isArray(claims?.roles) && claims.roles.includes("admin")
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rows } = await client.query(
+      `SELECT DISTINCT ru.id_sucursal
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+         AND ru.id_sucursal IS NOT NULL`,
+      [userId]
+    );
+    branchIds = rows.map((row) => row.id_sucursal);
+  }
+  return { ...claims, branch_ids: branchIds };
+}
+
 async function ensurePlanMasterScope(client, claims, idPlan) {
   const roles = Array.isArray(claims?.roles) ? claims.roles : [];
   if (roles.includes("super_admin")) return;
@@ -1266,7 +1288,8 @@ export default async function adminPlansRoutes(app) {
 
       try {
         const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const scopedClaims = await resolvePlanClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.query?.id_sucursal ?? null, true);
         const listSql = supportsPlanCategoryColumn ? LIST_PLANS_SQL : LIST_PLANS_SQL_LEGACY;
         const { rows } = await client.query(listSql, [branchId]);
 
@@ -1323,7 +1346,8 @@ export default async function adminPlansRoutes(app) {
         const periodCode = normalizePeriodCode(request.body.periodo_membresia_codigo, "mensual");
         const categoriaNivel = normalizePlanCategory(request.body.categoria_nivel, DEFAULT_PLAN_CATEGORY);
         const normalizedBenefits = normalizePlanBenefits(request.body.beneficios);
-        const offers = await normalizeInitialPlanOffers(client, request.claims, request.body);
+        const scopedClaims = await resolvePlanClaims(client, request.claims);
+        const offers = await normalizeInitialPlanOffers(client, scopedClaims, request.body);
         const firstOffer = offers[0];
 
         await ensurePeriodExists(client, periodCode);
@@ -1445,7 +1469,8 @@ export default async function adminPlansRoutes(app) {
 
       try {
         const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolvePlanClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         await client.query(LOCK_PLAN_BENEFITS_SQL, [request.params.id]);
@@ -1468,7 +1493,7 @@ export default async function adminPlansRoutes(app) {
         const shouldUpdateBenefits = request.body.beneficios !== undefined;
         const shouldMutateMaster = hasNombre || hasDescripcion || hasPeriod || hasCategory || shouldUpdateBenefits;
         if (shouldMutateMaster) {
-          await ensurePlanMasterScope(client, request.claims, request.params.id);
+          await ensurePlanMasterScope(client, scopedClaims, request.params.id);
         }
 
         const scopedResult = await client.query(
@@ -1652,7 +1677,8 @@ export default async function adminPlansRoutes(app) {
 
       try {
         const supportsPlanCategoryColumn = await hasPlanCategoryColumn(client);
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolvePlanClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         const baseResult = await client.query(

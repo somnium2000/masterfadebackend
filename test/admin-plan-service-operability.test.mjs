@@ -55,6 +55,10 @@ async function buildApp(t, data = fixture()) {
     const text = cleanSql(sql);
     state.calls.push({ sql: text, params });
     const result = (rows) => ({ rows, rowCount: rows.length });
+    if (text.startsWith("SELECT DISTINCT ru.id_sucursal")) {
+      assert.deepEqual(params, [PLAN]);
+      return result([{ id_sucursal: A }, { id_sucursal: B }]);
+    }
     if (text === "BEGIN") return result([]);
     if (text === "COMMIT") { state.commit += 1; return result([]); }
     if (text === "ROLLBACK") { state.rollback += 1; return result([]); }
@@ -88,7 +92,7 @@ async function buildApp(t, data = fixture()) {
     throw new Error(`Unexpected mock SQL: ${text.slice(0, 120)}`);
   };
   const app = Fastify();
-  app.decorate("requireRoles", () => async (request) => { request.claims = { roles: ["admin"], branch_ids: [A, B] }; });
+  app.decorate("requireRoles", () => async (request) => { request.claims = { roles: ["admin"], branch_ids: [A, B], user: { id_usuario: PLAN } }; });
   app.decorate("db", { connect: async () => ({ query, release() {} }) });
   await app.register(routes, { prefix: "/v1/admin/planes" });
   await app.ready();
