@@ -321,6 +321,20 @@ async function ensureBranchExists(client, idSucursal) {
   return idSucursal;
 }
 
+// AM: Alcance exclusivo de Promociones; no altera los permisos de Comunicacion.
+async function ensurePromotionBranchAccess(client, claims, idSucursal, { allowGlobal = false } = {}) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  const branchIds = Array.isArray(claims?.branch_ids) ? claims.branch_ids : [];
+  const isSuperAdmin = roles.includes("super_admin");
+  if (!isSuperAdmin && (!roles.includes("admin") || !idSucursal || !branchIds.includes(idSucursal))) {
+    throw new AppError(403, "No tienes acceso a las promociones de esta sucursal", {
+      code: "CONFIG_PROMOTION_BRANCH_FORBIDDEN",
+    });
+  }
+  if (isSuperAdmin && allowGlobal && !idSucursal) return null;
+  return ensureBranchExists(client, idSucursal);
+}
+
 function normalizeCommunicationCampaignType(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return COMMUNICATION_FIXED_TYPE;
@@ -3438,9 +3452,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
-        const branchId = request.query?.id_sucursal
-          ? await ensureBranchExists(client, request.query.id_sucursal)
-          : null;
+        const branchId = await ensurePromotionBranchAccess(client, request.claims, request.query?.id_sucursal, { allowGlobal: true });
         const promociones = await listPromotions(client, branchId);
         return sendOk(reply, { id_sucursal: branchId, promociones }, { requestId: request.id });
       } catch (error) {
@@ -3493,7 +3505,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
-        const branchId = await ensureBranchExists(client, request.query?.id_sucursal);
+        const branchId = await ensurePromotionBranchAccess(client, request.claims, request.query?.id_sucursal);
         const promocion = await getPromotionScoped(client, request.params.id, branchId);
         if (!promocion) {
           throw new AppError(404, "La promocion indicada no existe para la sucursal", {
@@ -3538,7 +3550,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
-        const branchId = await ensureBranchExists(client, request.body.id_sucursal);
+        const branchId = await ensurePromotionBranchAccess(client, request.claims, request.body.id_sucursal);
         const titulo = normalizeRequiredText(request.body.titulo, "titulo");
         const slug = normalizeSlug(request.body.slug || titulo);
         if (!slug) {
@@ -3871,7 +3883,7 @@ export default async function adminConfiguracionRoutes(app) {
     async (request, reply) => {
       const client = await app.db.connect();
       try {
-        const branchId = await ensureBranchExists(client, request.body.id_sucursal);
+        const branchId = await ensurePromotionBranchAccess(client, request.claims, request.body.id_sucursal);
         const currentPromotion = await getPromotionScoped(client, request.params.id, branchId);
         if (!currentPromotion) {
           throw new AppError(404, "La promocion indicada no existe para la sucursal", {
