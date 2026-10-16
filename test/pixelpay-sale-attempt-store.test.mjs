@@ -201,7 +201,7 @@ test("fallo FINAL produce log critico sanitizado y nunca propaga la excepcion", 
 });
 
 test("migration privada define contrato, checks y allowlists identicas a JavaScript", async () => {
-  const sql = await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8");
+  const sql = (await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
   assert.match(sql, /CREATE TABLE IF NOT EXISTS app_private\.pixelpay_sale_attempts/);
   assert.match(sql, /payment_attempt_id uuid NOT NULL UNIQUE/);
   assert.match(sql, /REFERENCES public\.payment_intents\(id_intent\)\s+ON UPDATE CASCADE ON DELETE RESTRICT/);
