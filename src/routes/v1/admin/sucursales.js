@@ -434,11 +434,31 @@ async function setSucursalState(client, idSucursal, targetState) {
 }
 
 export default async function adminSucursalesRoutes(app) {
-  // JK: Listado principal para el modulo SUCURSALES, restringido a SUPER_ADMIN en esta fase.
-  app.get("/", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
+  // AM: El alcance del listado requiere una asignacion admin activa; las demas rutas siguen exclusivas de super_admin.
+  app.get("/", { preHandler: app.requireRoles(["super_admin", "admin"]), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
     try {
       const onlyActive = request.query?.solo_activas === true || request.query?.solo_activas === "true";
-      const { rows } = await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL);
+      const isSuperAdmin = Array.isArray(request.claims?.roles) && request.claims.roles.includes("super_admin");
+      const userId = request.claims?.user?.id_usuario;
+      if (!isSuperAdmin && (!Array.isArray(request.claims?.roles) || !request.claims.roles.includes("admin")
+        || typeof userId !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId))) {
+        return sendOk(reply, { sucursales: [] });
+      }
+      const { rows } = isSuperAdmin
+        ? await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL)
+        : await app.db.query(`${SUCURSAL_SELECT_SQL}
+            AND EXISTS (
+              SELECT 1
+              FROM public.roles_usuarios ru
+              JOIN public.roles r ON r.id_rol = ru.id_rol
+              WHERE ru.id_usuario = $1::uuid
+                AND ru.id_sucursal = s.id_sucursal
+                AND ru.activo IS TRUE
+                AND r.nombre = 'admin'
+            )
+            ${onlyActive ? "AND COALESCE(s.estado, TRUE) IS TRUE" : ""}
+            ORDER BY s.nombre_sucursal ASC
+          `, [userId]);
       return sendOk(reply, { sucursales: rows.map(mapSucursal) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar sucursales", "SUCURSALES_LIST_ERROR");

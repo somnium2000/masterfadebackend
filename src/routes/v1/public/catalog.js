@@ -292,22 +292,21 @@ const PUBLIC_PACKAGES_SQL = `
   ),
   effective_offers AS (
     SELECT
-      po.id_paquete,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl)
-        ELSE MAX(po.precio_hnl)
-      END AS precio_hnl,
-      CASE
-        WHEN $1::uuid IS NULL THEN MIN(po.orden_visual)
-        ELSE MAX(po.orden_visual)
-      END AS orden_visual,
-      CASE
-        -- AM: PostgreSQL no soporta min/max directo sobre UUID en algunos entornos; se castea via text para seleccion determinista.
-        WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid
-        ELSE MAX(po.id_sucursal::text)::uuid
-      END AS id_sucursal
-    FROM picked_offers po
-    GROUP BY po.id_paquete
+      ranked.id_paquete,
+      ranked.id_sucursal,
+      ranked.precio_hnl,
+      ranked.orden_visual
+    FROM (
+      -- AM: Precio, sucursal y orden pertenecen a una misma oferta real.
+      SELECT
+        po.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY po.id_paquete
+          ORDER BY po.precio_hnl ASC, po.orden_visual ASC, po.id_sucursal::text ASC
+        ) AS rn_offer
+      FROM picked_offers po
+    ) ranked
+    WHERE ranked.rn_offer = 1
   )
   SELECT
     p.id_paquete,
@@ -347,18 +346,25 @@ const PUBLIC_PACKAGES_SQL = `
       AND s.visible_publico IS TRUE
       AND EXISTS (
         SELECT 1
-        FROM public.servicios_tarifas st
-        WHERE st.id_servicio = pd.id_servicio
-          AND st.id_sucursal = eo.id_sucursal
-          AND st.deleted_at IS NULL
-          AND st.activo IS TRUE
-          AND (
-            ($2::uuid IS NULL AND st.id_empleado IS NULL)
-            OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
-          )
-          AND st.vigente_desde <= CURRENT_DATE
-          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-          AND st.precio_hnl > 0
+        FROM (
+          -- AM: Selecciona la tarifa efectiva como Servicios antes de comprobar si es informativa.
+          SELECT st.servicio_informativo
+          FROM public.servicios_tarifas st
+          WHERE st.id_servicio = pd.id_servicio
+            AND st.id_sucursal = eo.id_sucursal
+            AND st.deleted_at IS NULL
+            AND st.activo IS TRUE
+            AND (
+              ($2::uuid IS NULL AND st.id_empleado IS NULL)
+              OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
+            )
+            AND st.vigente_desde <= CURRENT_DATE
+            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+            AND st.precio_hnl > 0
+          ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
+          LIMIT 1
+        ) effective_tariff
+        WHERE COALESCE(effective_tariff.servicio_informativo, FALSE) IS FALSE
       )
     )
   ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
@@ -480,12 +486,21 @@ const PUBLIC_PACKAGES_SEARCH_SQL = `
   ),
   effective_offers AS (
     SELECT
-      po.id_paquete,
-      CASE WHEN $1::uuid IS NULL THEN MIN(po.precio_hnl) ELSE MAX(po.precio_hnl) END AS precio_hnl,
-      CASE WHEN $1::uuid IS NULL THEN MIN(po.orden_visual) ELSE MAX(po.orden_visual) END AS orden_visual,
-      CASE WHEN $1::uuid IS NULL THEN MIN(po.id_sucursal::text)::uuid ELSE MAX(po.id_sucursal::text)::uuid END AS id_sucursal
-    FROM picked_offers po
-    GROUP BY po.id_paquete
+      ranked.id_paquete,
+      ranked.id_sucursal,
+      ranked.precio_hnl,
+      ranked.orden_visual
+    FROM (
+      -- AM: Conserva la misma seleccion de oferta completa que el catalogo principal.
+      SELECT
+        po.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY po.id_paquete
+          ORDER BY po.precio_hnl ASC, po.orden_visual ASC, po.id_sucursal::text ASC
+        ) AS rn_offer
+      FROM picked_offers po
+    ) ranked
+    WHERE ranked.rn_offer = 1
   )
   SELECT
     p.id_paquete,
@@ -525,18 +540,25 @@ const PUBLIC_PACKAGES_SEARCH_SQL = `
       AND s.visible_publico IS TRUE
       AND EXISTS (
         SELECT 1
-        FROM public.servicios_tarifas st
-        WHERE st.id_servicio = pd.id_servicio
-          AND st.id_sucursal = eo.id_sucursal
-          AND st.deleted_at IS NULL
-          AND st.activo IS TRUE
-          AND (
-            ($3::uuid IS NULL AND st.id_empleado IS NULL)
-            OR ($3::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $3::uuid))
-          )
-          AND st.vigente_desde <= CURRENT_DATE
-          AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-          AND st.precio_hnl > 0
+        FROM (
+          -- AM: Una tarifa antigua operativa no oculta una tarifa efectiva informativa.
+          SELECT st.servicio_informativo
+          FROM public.servicios_tarifas st
+          WHERE st.id_servicio = pd.id_servicio
+            AND st.id_sucursal = eo.id_sucursal
+            AND st.deleted_at IS NULL
+            AND st.activo IS TRUE
+            AND (
+              ($3::uuid IS NULL AND st.id_empleado IS NULL)
+              OR ($3::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $3::uuid))
+            )
+            AND st.vigente_desde <= CURRENT_DATE
+            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+            AND st.precio_hnl > 0
+          ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
+          LIMIT 1
+        ) effective_tariff
+        WHERE COALESCE(effective_tariff.servicio_informativo, FALSE) IS FALSE
       )
     )
   ORDER BY COALESCE(eo.orden_visual, 100) ASC, p.nombre_paquete ASC
