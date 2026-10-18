@@ -350,8 +350,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
       patch.fecha_inauguracion !== undefined
         ? normalizeDateOnly(patch.fecha_inauguracion)
         : current.fecha_inauguracion,
-    estado:
-      patch.estado !== undefined ? Boolean(patch.estado) : Boolean(current.estado),
+    estado: patch.estado !== undefined ? Boolean(patch.estado) : undefined,
   };
 
   await ensureCompanyExists(client, next.id_empresa);
@@ -361,7 +360,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
     excludeId: idSucursal,
   });
 
-  if (Boolean(current.estado) && !next.estado) {
+  if (Boolean(current.estado) && next.estado === false) {
     await assertCanDeactivateBranch(client, idSucursal);
   }
 
@@ -374,7 +373,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
         direccion_texto = $4::text,
         telefono_texto = $5::text,
         fecha_inauguracion = $6::date,
-        estado = $7::boolean,
+        ${next.estado !== undefined ? "estado = $7::boolean," : ""}
         updated_at = NOW()
       WHERE id_sucursal = $1::uuid
         AND deleted_at IS NULL
@@ -386,7 +385,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
       next.direccion ?? null,
       next.telefono ?? null,
       next.fecha_inauguracion ?? null,
-      next.estado,
+      ...(next.estado !== undefined ? [next.estado] : []),
     ]
   );
 
@@ -431,6 +430,26 @@ async function setSucursalState(client, idSucursal, targetState) {
     sucursal: mapSucursal(updated),
     changed: true,
   };
+}
+
+async function withSucursalStateLock(pool, idSucursal, operation) {
+  const client = await pool.connect();
+  let started = false;
+  try {
+    await client.query("BEGIN");
+    started = true;
+    // AM: Serializa las transiciones de esta sucursal antes de leer su estado.
+    await client.query("SELECT id_sucursal FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL FOR UPDATE", [idSucursal]);
+    const result = await operation(client);
+    await client.query("COMMIT");
+    started = false;
+    return result;
+  } catch (error) {
+    if (started) await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export default async function adminSucursalesRoutes(app) {
@@ -516,7 +535,10 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const updated = await updateSucursal(app.db, request.params.id, request.body || {});
+        const patch = request.body || {};
+        const updated = patch.estado === undefined
+          ? await updateSucursal(app.db, request.params.id, patch)
+          : await withSucursalStateLock(app.db, request.params.id, client => updateSucursal(client, request.params.id, patch));
         return sendOk(reply, { sucursal: mapSucursal(updated) }, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo actualizar sucursal", "SUCURSALES_UPDATE_ERROR");
@@ -532,7 +554,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const result = await setSucursalState(app.db, request.params.id, false);
+        const result = await withSucursalStateLock(app.db, request.params.id, client => setSucursalState(client, request.params.id, false));
         return sendOk(
           reply,
           {
@@ -556,7 +578,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const result = await setSucursalState(app.db, request.params.id, true);
+        const result = await withSucursalStateLock(app.db, request.params.id, client => setSucursalState(client, request.params.id, true));
         return sendOk(
           reply,
           {
@@ -581,7 +603,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const result = await setSucursalState(app.db, request.params.id, false);
+        const result = await withSucursalStateLock(app.db, request.params.id, client => setSucursalState(client, request.params.id, false));
         return sendOk(
           reply,
           {

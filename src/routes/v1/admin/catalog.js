@@ -3033,7 +3033,7 @@ export default async function adminCatalogRoutes(app) {
         }
 
         if (
-          precioHnl !== null ||
+          request.body.precio_hnl !== undefined ||
           request.body.duracion_min !== undefined ||
           request.body.servicio_informativo !== undefined
         ) {

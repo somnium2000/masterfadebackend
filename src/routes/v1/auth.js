@@ -658,6 +658,18 @@ function decodeJwtExpiryUnix(token) {
 }
 
 async function issueManagedAppSession(app, request, { jwtSecret, claims, email, roles, branchIds, remember = false, replaceActiveSession = false, identifier = null, provider = "supabase_password" }) {
+  // AM: Todos los accesos (incluido OAuth) verifican el bloqueo antes de emitir sesión.
+  const tempLock = await checkUserTemporaryLock(app, { idUsuario: claims.user.id_usuario });
+  if (!tempLock.ok) {
+    throw { statusCode: 503, code: "AUTH_LOCK_CHECK_UNAVAILABLE", message: "No se pudo verificar el acceso. Intenta nuevamente más tarde." };
+  }
+  if (tempLock.blocked) {
+    await logLoginAttempt(app, request, {
+      id_usuario: claims.user.id_usuario, identifier, provider, resultado: "blocked",
+      motivo_codigo: "LOGIN_TEMPORARILY_LOCKED", metadata: { auth_stage: "app_session" },
+    });
+    throw { statusCode: 429, code: "AUTH_USER_TEMPORARILY_LOCKED", message: "No fue posible iniciar sesion en este momento. Intenta nuevamente mas tarde." };
+  }
   const sid = crypto.randomUUID();
   const jti = crypto.randomUUID();
   const token = signAppToken(
@@ -2049,25 +2061,6 @@ export default async function authRoutes(app) {
           });
         }
 
-        const tempLock = await checkUserTemporaryLock(app, { idUsuario: claims.user.id_usuario });
-        if (tempLock.ok && tempLock.blocked) {
-          await logLoginAttempt(app, request, {
-            id_usuario: claims.user.id_usuario,
-            identifier,
-            provider: "supabase_password",
-            resultado: "blocked",
-            motivo_codigo: "LOGIN_TEMPORARILY_LOCKED",
-            metadata: {
-              auth_stage: "password_login",
-            },
-          });
-          return sendError(reply, 429, "No fue posible iniciar sesion en este momento. Intenta nuevamente mas tarde.", {
-            code: "AUTH_USER_TEMPORARILY_LOCKED",
-          });
-        }
-
-        await registerSuccessfulLogin(app, request, { idUsuario: claims.user.id_usuario });
-
         const user = {
           ...claims.user,
           roles: claims.roles,
@@ -2092,6 +2085,7 @@ export default async function authRoutes(app) {
           provider: "supabase_password",
         });
 
+        await registerSuccessfulLogin(app, request, { idUsuario: claims.user.id_usuario });
         const csrfToken = issueSessionCookies(app, reply, session.token, { remember });
         await logLoginAttempt(app, request, {
           id_usuario: claims.user.id_usuario,
@@ -2116,6 +2110,9 @@ export default async function authRoutes(app) {
             requires_session_replacement: error?.requires_session_replacement === true,
             requestId: request.id,
           });
+        }
+        if (["AUTH_LOCK_CHECK_UNAVAILABLE", "AUTH_USER_TEMPORARILY_LOCKED"].includes(error?.code)) {
+          return sendError(reply, error.statusCode, error.message, { code: error.code, requestId: request.id });
         }
         const message = error instanceof Error ? error.message : "Unknown login error";
         await logLoginAttempt(app, request, {
@@ -2199,8 +2196,6 @@ export default async function authRoutes(app) {
     async (request, reply) => {
       const token = getSessionTokenFromRequest(request);
       const payload = verifyManagedAppSessionPayload(token);
-      clearSessionCookies(app, reply);
-
       if (payload) {
         const closed = await closeActiveSession(app, request, {
           sid: String(payload.sid || ""),
@@ -2213,8 +2208,12 @@ export default async function authRoutes(app) {
             { event: "auth_logout_session_close_skipped", code: closed.code || "AUTH_SESSION_CLOSE_ERROR" },
             "Logout session close skipped"
           );
+          return sendError(reply, 503, "No se pudo confirmar el cierre de sesión. Intenta nuevamente.", {
+            code: "AUTH_LOGOUT_UNCONFIRMED", requestId: request.id,
+          });
         }
       }
+      clearSessionCookies(app, reply);
       request.log.info({ event: "auth_logout", userId: payload?.sub || null }, "Logout success");
       return sendOk(reply, { logged_out: true }, { requestId: request.id });
     }

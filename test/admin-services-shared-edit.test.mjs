@@ -23,6 +23,9 @@ async function buildApp({
   duplicateName = false,
   failMasterUpdate = false,
   activo = true,
+  tariffActive = true,
+  hasTariff = true,
+  failTariffUpdate = false,
 } = {}) {
   const state = {
     service: {
@@ -37,9 +40,9 @@ async function buildApp({
       orden_visual: 100,
       activo,
       id_sucursal: BRANCH_A,
-      precio_hnl: 250,
+      precio_hnl: hasTariff ? 250 : null,
       servicio_informativo: false,
-      tarifa_activa: true,
+      tarifa_activa: hasTariff && tariffActive,
       barberos_ofrecen_total: 0,
       barberos_ofrecen: [],
       deleted_at: null,
@@ -51,10 +54,12 @@ async function buildApp({
     commit: 0,
     rollback: 0,
     released: 0,
+    queries: [],
   };
 
   const query = async (sql, params = []) => {
     const text = normalizedSql(sql);
+    state.queries.push(text);
     if (text.startsWith("SELECT DISTINCT ru.id_sucursal")) {
       assert.deepEqual(params, [SERVICE_ID]);
       return { rows: adminBranches.map((id_sucursal) => ({ id_sucursal })), rowCount: adminBranches.length };
@@ -129,6 +134,7 @@ async function buildApp({
       return { rows: [{}], rowCount: 1 };
     }
     if (text.includes("FROM public.servicios_tarifas st") && text.includes("LIMIT 1 FOR UPDATE")) {
+      if (!hasTariff) return { rows: [], rowCount: 0 };
       return {
         rows: [{
           id_tarifa: TARIFF_ID,
@@ -136,14 +142,21 @@ async function buildApp({
           duracion_min: state.service.duracion_min,
           buffer_min: state.service.buffer_min,
           servicio_informativo: false,
-          activo: true,
+          activo: state.service.tarifa_activa,
         }],
         rowCount: 1,
       };
     }
     if (text.startsWith("UPDATE public.servicios_tarifas SET")) {
+      if (failTariffUpdate) throw new Error("simulated tariff failure");
       state.tariffWrites += 1;
+      if (/activo = TRUE/.test(text)) state.service.tarifa_activa = true;
       return { rows: [], rowCount: 1 };
+    }
+    if (text.startsWith("INSERT INTO public.servicios_tarifas")) {
+      state.tariffWrites += 1;
+      state.service.tarifa_activa = true;
+      return { rows: [{ id_tarifa: TARIFF_ID }], rowCount: 1 };
     }
     throw new Error(`Unexpected SQL in test: ${text.slice(0, 180)}`);
   };
@@ -322,4 +335,51 @@ test("payload equivalente al frontend conserva el nombre y evita clon innecesari
   });
   assert.equal(response.statusCode, 200);
   assert.equal(state.cloneAttempts, 0);
+});
+
+for (const tariffActive of [false, true]) {
+  for (const patch of [{ descripcion: "Nueva" }, { nombre_servicio: "Nuevo nombre" }, { visible_publico: false }, { orden_visual: 77 }, { agendable: false }]) {
+    test(`QA09 metadatos ${Object.keys(patch)[0]} preservan tarifa activa=${tariffActive}`, async t => {
+      const { app, state } = await buildApp({ tariffActive }); t.after(() => app.close());
+      const response = await patchService(app, { id_sucursal: BRANCH_A, ...patch });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.equal(state.tariffWrites, 0);
+      assert.equal(state.service.tarifa_activa, tariffActive);
+      assert.ok(!state.queries.some(sql => sql.includes('pg_advisory_xact_lock')));
+    });
+  }
+}
+for (const patch of [{ precio_hnl: 275 }, { duracion_min: 45 }, { servicio_informativo: true }]) {
+  test(`QA09 campo tarifario explícito ${Object.keys(patch)[0]} conserva upsert intencional`, async t => {
+    const { app, state } = await buildApp(); t.after(() => app.close());
+    const response = await patchService(app, { id_sucursal: BRANCH_A, ...patch });
+    assert.equal(response.statusCode, 200, response.body); assert.ok(state.tariffWrites > 0);
+    assert.equal(state.commit, 1);
+  });
+}
+test('QA09 sin tarifa: descripción no crea tarifa', async t => {
+  const { app, state } = await buildApp({ hasTariff: false }); t.after(() => app.close());
+  assert.equal((await patchService(app, { id_sucursal: BRANCH_A, descripcion: 'Nueva' })).statusCode, 200);
+  assert.equal(state.tariffWrites, 0);
+});
+test('QA09 sin tarifa: duración requiere precio y hace rollback', async t => {
+  const { app, state } = await buildApp({ hasTariff: false }); t.after(() => app.close());
+  const response = await patchService(app, { id_sucursal: BRANCH_A, duracion_min: 45 });
+  assert.equal(response.statusCode, 400); assert.equal(response.json().error.code, 'CATALOG_SERVICE_PRICE_REQUIRED');
+  assert.equal(state.tariffWrites, 0); assert.equal(state.rollback, 1); assert.equal(state.commit, 0);
+});
+test('QA09 sin tarifa: precio explícito permite crearla', async t => {
+  const { app, state } = await buildApp({ hasTariff: false }); t.after(() => app.close());
+  assert.equal((await patchService(app, { id_sucursal: BRANCH_A, precio_hnl: 250 })).statusCode, 200);
+  assert.ok(state.tariffWrites > 0); assert.equal(state.commit, 1);
+});
+test('QA09 renombrar maestro compartido conserva clonación sin upsert tarifario', async t => {
+  const { app, state } = await buildApp({ shared: true, tariffActive: false }); t.after(() => app.close());
+  assert.equal((await patchService(app, { id_sucursal: BRANCH_A, nombre_servicio: 'Nuevo nombre' })).statusCode, 200);
+  assert.equal(state.cloneAttempts, 1); assert.equal(state.tariffWrites, 0); assert.equal(state.service.tarifa_activa, false);
+});
+test('QA09 fallo de tarifa hace rollback sin commit', async t => {
+  const { app, state } = await buildApp({ failTariffUpdate: true }); t.after(() => app.close());
+  assert.equal((await patchService(app, { id_sucursal: BRANCH_A, precio_hnl: 250 })).statusCode, 500);
+  assert.equal(state.rollback, 1); assert.equal(state.commit, 0);
 });
