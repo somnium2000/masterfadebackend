@@ -498,7 +498,7 @@ Base de datos debe:
 
 - Si `total_pagar_hnl > 0`, se requiere pago confirmado por backend.
 - El payment intent debe estar asociado a un grupo/cita/hold valido.
-- `GET /v1/public/pagos/estado` debe rechazar intents que no pertenezcan al `id_grupo_cita`, cita anchor, hold, titular o monto vigente.
+- `POST /v1/public/pagos/estado` debe rechazar intents que no pertenezcan al `id_grupo_cita`, cita anchor, hold, titular o monto vigente.
 - `mock-completar` y `simulator/event` deben validar grupo, proveedor, estado y monto antes de confirmar.
 - La confirmacion post-pago debe revalidar estado confirmable, hold activo/no vencido y conflictos de disponibilidad antes de marcar citas como `confirmada`.
 - El intent no debe estar expirado, fallido, cancelado o ya consumido.

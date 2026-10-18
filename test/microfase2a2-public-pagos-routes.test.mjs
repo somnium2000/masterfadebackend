@@ -2751,7 +2751,8 @@ test("dos Status PAID concurrentes producen un payment y una confirmacion efecti
   await app.close();
 });
 
-test("GET estado conserva pendiente_confirmacion despues de liberar el slot", async () => {
+test("POST estado conserva pendiente_confirmacion sin exponer el correo en URL ni logs", async () => {
+  const logs = [];
   const client = createPagosClient({
     providerCode: "pixelpay",
     holdExpiresAt: "2020-01-01T00:00:00.000Z",
@@ -2772,16 +2773,50 @@ test("GET estado conserva pendiente_confirmacion despues de liberar el slot", as
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay" });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", logs });
 
   const response = await app.inject({
-    method: "GET",
-    url: `/v1/public/pagos/estado?id_grupo_cita=${GROUP_A}&id_intent=${INTENT_A}&titular_email=cliente%40example.com`,
+    method: "POST",
+    url: "/v1/public/pagos/estado",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "cliente@example.com",
+    },
   });
 
   assert.equal(response.statusCode, 200, response.body);
   assert.equal(response.json().data.estado_intent_codigo, "pendiente_confirmacion");
   assert.equal(response.json().data.booking_confirmed, false);
+  const output = logs.join("");
+  assert.match(output, /\/v1\/public\/pagos\/estado/);
+  assert.doesNotMatch(output, /cliente@example\.com|titular_email/i);
+  await app.close();
+});
+
+test("estado rechaza GET heredado y un body invalido sin registrar PII", async () => {
+  const logs = [];
+  const client = createPagosClient({ providerCode: "pixelpay" });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", logs });
+
+  const legacyResponse = await app.inject({
+    method: "GET",
+    url: "/v1/public/pagos/estado",
+  });
+  const invalidResponse = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/estado",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "correo-invalido",
+    },
+  });
+
+  assert.equal(legacyResponse.statusCode, 404, legacyResponse.body);
+  assert.equal(invalidResponse.statusCode, 400, invalidResponse.body);
+  const output = logs.join("");
+  assert.doesNotMatch(output, /correo-invalido/i);
   await app.close();
 });
 

@@ -2507,9 +2507,9 @@ export default async function publicPagosRoutes(app) {
     }
   });
 
-  app.get("/estado", {
+  app.post("/estado", {
     schema: {
-      querystring: {
+      body: {
         type: "object",
         required: ["id_grupo_cita", "id_intent", "titular_email"],
         properties: {
@@ -2522,9 +2522,9 @@ export default async function publicPagosRoutes(app) {
     },
   }, async (request, reply) => {
     try {
-      const idGrupoCita = assertUuid(request.query?.id_grupo_cita, "id_grupo_cita");
-      const idIntent = assertUuid(request.query?.id_intent, "id_intent");
-      const titularEmail = normalizeEmail(request.query?.titular_email);
+      const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
+      const idIntent = assertUuid(request.body?.id_intent, "id_intent");
+      const titularEmail = normalizeEmail(request.body?.titular_email);
       const currentTotal = calculateGroupTotalFromRows(await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail }));
       const { groupRows, intent } = await loadPublicIntentForGroup(app.db, {
         groupId: idGrupoCita,
