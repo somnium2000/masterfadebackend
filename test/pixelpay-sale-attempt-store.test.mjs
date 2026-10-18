@@ -166,24 +166,40 @@ test("FINAL uncertain conserva identificadores observados solo como evidencia pr
   })), /P-12345678|TX-UNCERTAIN/);
 });
 
-test("FINAL no uncertain descarta identificadores observados y formatos inseguros", async () => {
-  for (const [outcome, paymentUuid, transactionId] of [
-    ["approved", "P-12345678-1234-4234-8234-123456789abc", "TX-APPROVED"],
-    ["uncertain", "uuid-sin-prefijo", "TX\u0000CONTROL"],
+test("FINAL uncertain conserva payment_uuid opaco seguro sin exigir prefijo ni UUID", async () => {
+  for (const [paymentUuid, expected] of [
+    ["12345678-1234-4234-8234-123456789abc", "12345678-1234-4234-8234-123456789abc"],
+    ["P-12345678-1234-4234-8234-123456789abc", "P-12345678-1234-4234-8234-123456789abc"],
+    ["pixelpay-reference_opaque.v2", "pixelpay-reference_opaque.v2"],
+    [" ", null],
+    ["x".repeat(81), null],
+    ["safe\u0000unsafe", null],
+    ["safe\u007funsafe", null],
   ]) {
     const db = makeMemoryDb();
     await createPixelPaySaleAttemptRecord(db, start);
     await finalizePixelPaySaleAttempt(db, {
       ...start,
-      outcome,
+      outcome: "uncertain",
       observedPaymentUuidUntrusted: paymentUuid,
-      observedTransactionIdUntrusted: transactionId,
-      observedTransactionReferenceUntrusted: " ",
     });
-    assert.equal(db.records[0].observed_payment_uuid_untrusted, null);
-    assert.equal(db.records[0].observed_transaction_id_untrusted, null);
-    assert.equal(db.records[0].observed_transaction_reference_untrusted, null);
+    assert.equal(db.records[0].observed_payment_uuid_untrusted, expected);
   }
+});
+
+test("FINAL no uncertain descarta todos los identificadores observados", async () => {
+  const db = makeMemoryDb();
+  await createPixelPaySaleAttemptRecord(db, start);
+  await finalizePixelPaySaleAttempt(db, {
+    ...start,
+    outcome: "approved",
+    observedPaymentUuidUntrusted: "12345678-1234-4234-8234-123456789abc",
+    observedTransactionIdUntrusted: "TX-APPROVED",
+    observedTransactionReferenceUntrusted: "REF-APPROVED",
+  });
+  assert.equal(db.records[0].observed_payment_uuid_untrusted, null);
+  assert.equal(db.records[0].observed_transaction_id_untrusted, null);
+  assert.equal(db.records[0].observed_transaction_reference_untrusted, null);
 });
 
 test("la frontera del store excluye valores sensibles incluso si un DTO contiene propiedades crudas", async () => {

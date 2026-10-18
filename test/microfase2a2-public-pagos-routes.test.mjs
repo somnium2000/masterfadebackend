@@ -1420,7 +1420,7 @@ for (const scenario of [
 }
 
 test("Sale uncertain persiste evidencia privada sin fuga, pago, referencias confiables ni Status", async () => {
-  const observedPaymentUuid = "P-12345678-1234-4234-8234-123456789abc";
+  const observedPaymentUuid = "12345678-1234-4234-8234-123456789abc";
   const observedTransactionId = "TX-UNCERTAIN-408";
   const observedTransactionReference = "REF-UNCERTAIN-408";
   const logs = [];
