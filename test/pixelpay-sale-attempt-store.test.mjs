@@ -46,7 +46,13 @@ function makeMemoryDb() {
       assert.match(sql, /WHERE payment_attempt_id = \$1::uuid AND finalized_at IS NULL/);
       const record = records.find((row) => row.payment_attempt_id === params[0] && row.finalized_at === null);
       if (!record) return { rows: [] };
-      Object.assign(record, { finalized_at: "2026-10-11T00:00:00Z", finalParameters: structuredClone(params) });
+      Object.assign(record, {
+        finalized_at: "2026-10-11T00:00:00Z",
+        observed_payment_uuid_untrusted: params[31],
+        observed_transaction_id_untrusted: params[32],
+        observed_transaction_reference_untrusted: params[33],
+        finalParameters: structuredClone(params),
+      });
       return { rows: [{ id_sale_attempt: ID_ATTEMPT }] };
     },
   };
@@ -137,6 +143,47 @@ test("segundo finalize no inserta, duplica ni sobrescribe el resultado original"
   assert.deepEqual(db.records, original);
   assert.equal(db.records.length, 1);
   assert.equal(db.calls.filter((call) => call.sql.includes("INSERT")).length, 1);
+});
+
+test("FINAL uncertain conserva identificadores observados solo como evidencia privada", async () => {
+  const db = makeMemoryDb();
+  const paymentUuid = "P-12345678-1234-4234-8234-123456789abc";
+  await createPixelPaySaleAttemptRecord(db, start);
+  await finalizePixelPaySaleAttempt(db, {
+    ...start,
+    outcome: "uncertain",
+    observedPaymentUuidUntrusted: paymentUuid,
+    observedTransactionIdUntrusted: "TX-UNCERTAIN-408",
+    observedTransactionReferenceUntrusted: "REF-UNCERTAIN-408",
+  });
+  assert.equal(db.records[0].observed_payment_uuid_untrusted, paymentUuid);
+  assert.equal(db.records[0].observed_transaction_id_untrusted, "TX-UNCERTAIN-408");
+  assert.equal(db.records[0].observed_transaction_reference_untrusted, "REF-UNCERTAIN-408");
+  assert.doesNotMatch(JSON.stringify(buildSafePixelPaySdkDiagnostics({
+    outcome: "uncertain",
+    observedPaymentUuidUntrusted: paymentUuid,
+    observedTransactionIdUntrusted: "TX-UNCERTAIN-408",
+  })), /P-12345678|TX-UNCERTAIN/);
+});
+
+test("FINAL no uncertain descarta identificadores observados y formatos inseguros", async () => {
+  for (const [outcome, paymentUuid, transactionId] of [
+    ["approved", "P-12345678-1234-4234-8234-123456789abc", "TX-APPROVED"],
+    ["uncertain", "uuid-sin-prefijo", "TX\u0000CONTROL"],
+  ]) {
+    const db = makeMemoryDb();
+    await createPixelPaySaleAttemptRecord(db, start);
+    await finalizePixelPaySaleAttempt(db, {
+      ...start,
+      outcome,
+      observedPaymentUuidUntrusted: paymentUuid,
+      observedTransactionIdUntrusted: transactionId,
+      observedTransactionReferenceUntrusted: " ",
+    });
+    assert.equal(db.records[0].observed_payment_uuid_untrusted, null);
+    assert.equal(db.records[0].observed_transaction_id_untrusted, null);
+    assert.equal(db.records[0].observed_transaction_reference_untrusted, null);
+  }
 });
 
 test("la frontera del store excluye valores sensibles incluso si un DTO contiene propiedades crudas", async () => {
@@ -233,6 +280,7 @@ test("FINAL excedido usa el timer real de pg 8.16.3 y destruye/retira la conexio
 
 test("migration privada define contrato, checks y allowlists identicas a JavaScript", async () => {
   const sql = (await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
+  const evidenceSql = await readFile(new URL("../db/migrations/pixel/20261016010000_pixelpay_uncertain_observed_identifiers.sql", import.meta.url), "utf8");
   assert.match(sql, /CREATE TABLE IF NOT EXISTS app_private\.pixelpay_sale_attempts/);
   assert.match(sql, /payment_attempt_id uuid NOT NULL UNIQUE/);
   assert.match(sql, /REFERENCES public\.payment_intents\(id_intent\)\s+ON UPDATE CASCADE ON DELETE RESTRICT/);
@@ -250,9 +298,17 @@ test("migration privada define contrato, checks y allowlists identicas a JavaScr
   const sqlValues = (name) => [...sql.match(new RegExp(`CONSTRAINT ${name}([\\s\\S]*?)(?:,\\n  CONSTRAINT|\\n\\);)`))[1].matchAll(/'([^']+)'/g)].map((match) => match[1]).sort();
   assert.deepEqual(sqlValues("ck_pixelpay_sale_attempts_inputs"), [...SAFE_PIXELPAY_INPUT_ERROR_FIELDS].sort());
   assert.deepEqual(sqlValues("ck_pixelpay_sale_attempts_outcome"), Object.values(PIXELPAY_SALE_OUTCOME).sort());
-  assert.deepEqual(sqlValues("ck_pixelpay_sale_attempts_message"), [...SAFE_PIXELPAY_SDK_MESSAGE_CODES].sort());
+  assert.deepEqual(sqlValues("ck_pixelpay_sale_attempts_message"),
+    [...SAFE_PIXELPAY_SDK_MESSAGE_CODES].filter((code) => code !== "SDK_UPSTREAM_TIMEOUT").sort());
   assert.deepEqual(sqlValues("ck_pixelpay_sale_attempts_error_code"), [...SAFE_PIXELPAY_ERROR_CODES].sort());
   const columns = [...sql.matchAll(/^ {2}([a-z_]+) (uuid|varchar\([0-9]+\)|timestamptz|integer|smallint|text\[\]|boolean)/gm)];
   assert.equal(columns.length, 36);
   assert.ok(columns.every(([, name, type]) => !["request_id", "cf_ray", "outcome", "safe_message_code", "error_code", "error_name", "sdk_error_name", "error_constructor_name", "sdk_response_class"].includes(name) || /^varchar\(/.test(type)));
+  assert.match(evidenceSql, /observed_payment_uuid_untrusted varchar\(80\)/);
+  assert.match(evidenceSql, /observed_transaction_id_untrusted varchar\(160\)/);
+  assert.match(evidenceSql, /observed_transaction_reference_untrusted varchar\(160\)/);
+  assert.match(evidenceSql, /SDK_UPSTREAM_TIMEOUT/);
+  assert.match(evidenceSql, /no demuestra aprobacion ni identidad financiera confiable/);
+  assert.match(evidenceSql, /REVOKE ALL ON TABLE app_private\.pixelpay_sale_attempts FROM PUBLIC, anon, authenticated, service_role/);
+  assert.doesNotMatch(evidenceSql, /\bGRANT\b|SECURITY DEFINER|provider_session_id|referencia_externa/);
 });

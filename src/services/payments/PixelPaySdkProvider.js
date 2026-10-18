@@ -37,6 +37,9 @@ const SDK_FAILURE_MESSAGE_CODES = new Map([
   ["The merchant credentials are not definied (key/hash).", "SDK_REQUEST_CONFIG_ERROR"],
 ]);
 
+export const STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT =
+  "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT";
+
 function text(value) {
   return String(value ?? "").trim();
 }
@@ -146,6 +149,9 @@ function responseSuccess(response) {
 }
 
 export function classifySdkFailureMessage(response) {
+  if (responseStatus(response) === 408 || safeClassName(response) === "TimeoutResponse") {
+    return "SDK_UPSTREAM_TIMEOUT";
+  }
   const message = typeof response?.message === "string" ? response.message : "";
   if (!message) return "SDK_MESSAGE_ABSENT";
   return SDK_FAILURE_MESSAGE_CODES.get(message) || "SDK_EXCEPTION_OTHER";
@@ -381,9 +387,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
       const metadata = readPixelPayHttpMetadata(error);
       const errorConstructorName = safeClassName(error);
       const errorName = safeIdentifier(error?.name);
+      const classifiedFailure = classifySdkFailureMessage(error);
       const safeMessageCode = error instanceof PixelPaySdkError
         ? error.code
-        : "SDK_NETWORK_ERROR";
+        : classifiedFailure === "SDK_HTTP_TIMEOUT" ? classifiedFailure : "SDK_NETWORK_ERROR";
       const details = {
         durationMs: Date.now() - startedAt,
         statusCode: error?.statusCode ?? metadata.statusCode,
@@ -432,6 +439,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const result = transactionResult.result;
     const paymentUuid = text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
+    const transactionReference = text(result?.transaction_reference) || null;
     const hasPaymentHash = Boolean(text(result?.payment_hash));
     let paymentHashValid = false;
     if (hasPaymentHash) {
@@ -531,6 +539,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       incomplete: normalizedResponse.data.responseIncomplete === true,
       paymentUuid,
       transactionId,
+      transactionReference,
       paymentHashValid,
       amountMatches,
       transactionAmountMatches,

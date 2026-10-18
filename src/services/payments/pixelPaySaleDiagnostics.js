@@ -2,7 +2,7 @@ import { PIXELPAY_SALE_OUTCOME } from "./PixelPayDirectProvider.js";
 import { safePixelPayHeader, safePixelPayInputErrorFields, safePixelPayUuid } from "./pixelPaySaleTelemetry.js";
 
 export const SAFE_PIXELPAY_SDK_MESSAGE_CODES = new Set([
-  "SDK_PUBLIC_KEY_UNAVAILABLE", "SDK_ENCRYPTION_FAILED", "SDK_HTTP_TIMEOUT",
+  "SDK_PUBLIC_KEY_UNAVAILABLE", "SDK_ENCRYPTION_FAILED", "SDK_HTTP_TIMEOUT", "SDK_UPSTREAM_TIMEOUT",
   "SDK_NETWORK_ERROR", "SDK_REQUEST_CONFIG_ERROR", "SDK_EXCEPTION_OTHER", "SDK_MESSAGE_ABSENT",
 ]);
 

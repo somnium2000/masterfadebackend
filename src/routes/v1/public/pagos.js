@@ -2322,6 +2322,12 @@ export default async function publicPagosRoutes(app) {
         outcome: saleResult.outcome,
         statusCode: diagnostics?.statusCode ?? saleResult.statusCode,
         durationMs: Date.now() - saleStartedAt,
+        observedPaymentUuidUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
+          ? saleResult.paymentUuid : null,
+        observedTransactionIdUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
+          ? saleResult.transactionId : null,
+        observedTransactionReferenceUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
+          ? saleResult.transactionReference : null,
       }, request.log);
       dbClient = await app.db.connect();
       if (saleResult.outcome !== PIXELPAY_SALE_OUTCOME.APPROVED) {
@@ -2331,16 +2337,26 @@ export default async function publicPagosRoutes(app) {
           pixelPaySdkDiagnostics: diagnostics,
         }, "Resultado PixelPay SDK no aprobado");
         const { keepPending, intentState } = resolvePixelPaySaleFailureState(saleResult.outcome);
-        const trustedReferences = resolveTrustedPixelPayReferences(saleResult);
-        await dbClient.query(
-          `UPDATE public.payment_intents
-           SET estado_intent_codigo = $2::text,
-               referencia_externa = COALESCE($3::text, referencia_externa),
-               provider_session_id = COALESCE($4::text, provider_session_id),
-               updated_at = now()
-           WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
-          [idIntent, intentState, trustedReferences.transactionId, trustedReferences.paymentUuid]
-        );
+        if (saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) {
+          // AM: STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT; evidencia incierta nunca se promueve.
+          await dbClient.query(
+            `UPDATE public.payment_intents
+             SET estado_intent_codigo = $2::text, updated_at = now()
+             WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
+            [idIntent, intentState]
+          );
+        } else {
+          const trustedReferences = resolveTrustedPixelPayReferences(saleResult);
+          await dbClient.query(
+            `UPDATE public.payment_intents
+             SET estado_intent_codigo = $2::text,
+                 referencia_externa = COALESCE($3::text, referencia_externa),
+                 provider_session_id = COALESCE($4::text, provider_session_id),
+                 updated_at = now()
+             WHERE id_intent = $1::uuid AND estado_intent_codigo = 'pendiente_confirmacion'`,
+            [idIntent, intentState, trustedReferences.transactionId, trustedReferences.paymentUuid]
+          );
+        }
         return sendOk(reply, {
           processed: false,
           pending_confirmation: keepPending,

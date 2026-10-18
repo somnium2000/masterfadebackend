@@ -14,6 +14,26 @@ function requireUuid(value) {
   return uuid;
 }
 
+function safeObservedPaymentUuid(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return /^P-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
+    ? normalized
+    : null;
+}
+
+function safeObservedProviderIdentifier(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  const hasControlCharacter = [...normalized].some((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint <= 31 || codePoint === 127;
+  });
+  return normalized && normalized.length <= 160 && !hasControlCharacter
+    ? normalized
+    : null;
+}
+
 export async function createPixelPaySaleAttemptRecord(transactionClient, dto) {
   const safe = buildSafePixelPaySdkDiagnostics(dto);
   const result = await transactionClient.query(
@@ -58,7 +78,10 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
          transaction_amount_matches = $24::boolean, approved_amount_matches = $25::boolean,
          amount_matches = $26::boolean, cf_ray = $27::varchar(120),
          error_code = $28::varchar(120), error_name = $29::varchar(80),
-         sdk_error_name = $30::varchar(80), error_constructor_name = $31::varchar(80)
+         sdk_error_name = $30::varchar(80), error_constructor_name = $31::varchar(80),
+         observed_payment_uuid_untrusted = $32::varchar(80),
+         observed_transaction_id_untrusted = $33::varchar(160),
+         observed_transaction_reference_untrusted = $34::varchar(160)
      WHERE payment_attempt_id = $1::uuid AND finalized_at IS NULL
      RETURNING id_sale_attempt`,
     values: [
@@ -73,6 +96,12 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
       safe?.paymentHashValid ?? null, safe?.transactionAmountMatches ?? null,
       safe?.approvedAmountMatches ?? null, safe?.amountMatches ?? null, safe?.cfRay ?? null,
       error.errorCode, error.errorName, error.sdkErrorName, error.errorConstructorName,
+      safe?.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
+        ? safeObservedPaymentUuid(dto.observedPaymentUuidUntrusted) : null,
+      safe?.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
+        ? safeObservedProviderIdentifier(dto.observedTransactionIdUntrusted) : null,
+      safe?.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
+        ? safeObservedProviderIdentifier(dto.observedTransactionReferenceUntrusted) : null,
     ]
   });
   return result.rows.length > 0;

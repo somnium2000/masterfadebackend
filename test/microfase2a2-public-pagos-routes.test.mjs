@@ -325,6 +325,9 @@ function createPagosClient({
           finalized_at: new Date().toISOString(), duration_ms: params[1], sdk_response_class: params[2],
           upstream_http_status: params[3], safe_message_code: params[4], outcome: params[5], uncertain: params[6],
           input_error_fields: params[7], input_error_count: params[8], input_error_unknown_count: params[9],
+          observed_payment_uuid_untrusted: params[31],
+          observed_transaction_id_untrusted: params[32],
+          observed_transaction_reference_untrusted: params[33],
           final_parameters: structuredClone(params),
         });
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
@@ -1415,6 +1418,72 @@ for (const scenario of [
     await app.close();
   });
 }
+
+test("Sale uncertain persiste evidencia privada sin fuga, pago, referencias confiables ni Status", async () => {
+  const observedPaymentUuid = "P-12345678-1234-4234-8234-123456789abc";
+  const observedTransactionId = "TX-UNCERTAIN-408";
+  const observedTransactionReference = "REF-UNCERTAIN-408";
+  const logs = [];
+  const client = pixelPayClaimClient();
+  const provider = {
+    saleCalls: 0,
+    statusCalls: 0,
+    async sale(input, context) {
+      this.saleCalls += 1;
+      return {
+        outcome: "uncertain",
+        statusCode: 408,
+        paymentUuid: observedPaymentUuid,
+        transactionId: observedTransactionId,
+        transactionReference: observedTransactionReference,
+        paymentHashValid: false,
+        amountMatches: true,
+        diagnostics: {
+          paymentAttemptId: context.paymentAttemptId,
+          sdkResponseClass: "TimeoutResponse",
+          statusCode: 408,
+          safeMessageCode: "SDK_UPSTREAM_TIMEOUT",
+          outcome: "uncertain",
+          responseSuccess: false,
+          transactionResultValid: true,
+          transactionResultParsed: true,
+          hasPaymentUuid: true,
+          hasTransactionId: true,
+          hasPaymentHash: false,
+          paymentHashValid: false,
+          amountMatches: true,
+        },
+      };
+    },
+    async queryPaymentStatus() {
+      this.statusCalls += 1;
+      throw new Error("STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT");
+    },
+  };
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+  const response = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+  assert.equal(response.statusCode, 202, response.body);
+  const replay = await app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload: pixelPaySalePayload() });
+  assert.equal(replay.statusCode, 409, replay.body);
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(provider.statusCalls, 0);
+  assert.equal(client.getStatusChecks().length, 0);
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+  assert.equal(client.getActiveIntent().provider_session_id || null, null);
+  assert.equal(client.getActiveIntent().referencia_externa || null, null);
+  assert.equal(client.calls.some((call) => call.sql.includes("UPDATE public.payment_intents")
+    && call.sql.includes("provider_session_id = COALESCE")), false);
+  const row = client.getSaleAttempts()[0];
+  assert.equal(row.safe_message_code, "SDK_UPSTREAM_TIMEOUT");
+  assert.equal(row.observed_payment_uuid_untrusted, observedPaymentUuid);
+  assert.equal(row.observed_transaction_id_untrusted, observedTransactionId);
+  assert.equal(row.observed_transaction_reference_untrusted, observedTransactionReference);
+  assert.doesNotMatch(`${response.body}\n${replay.body}`,
+    new RegExp(`${observedPaymentUuid}|${observedTransactionId}|${observedTransactionReference}`));
+  assert.doesNotMatch(logs.join("\n"), new RegExp(`${observedPaymentUuid}|${observedTransactionId}|${observedTransactionReference}`));
+  await app.close();
+});
 
 test("sale SDK no aprobada registra diagnostico seguro una vez y no lo devuelve", async () => {
   const logs = [];

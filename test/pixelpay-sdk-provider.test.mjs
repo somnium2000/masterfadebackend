@@ -9,6 +9,7 @@ import {
   inspectPixelPayCardExpire,
   isPixelPayBillingAddressPlaceholder,
   PixelPaySdkProvider,
+  STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
 } from "../src/services/payments/PixelPaySdkProvider.js";
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
 import envPlugin from "../src/plugins/env.js";
@@ -584,13 +585,36 @@ test("SDK error contractual HTTP 422 es definitivo", async () => {
 
 test("SDK timeout, network y respuesta invalida permanecen uncertain sin retry de Sale", async (t) => {
   await t.test("timeout HTTP 408", async () => {
+    const observedPaymentUuid = "P-12345678-1234-4234-8234-123456789abc";
     const fake = makeFakeSdk({
-      saleResponse: sdkResponse(408, { success: false, data: {}, valid: true }),
+      saleResponse: sdkResponse(408, { success: false, data: approvedData({
+        payment_uuid: observedPaymentUuid,
+        transaction_id: "TX-UNCERTAIN-408",
+        transaction_reference: "REF-UNCERTAIN-408",
+        payment_hash: null,
+      }), valid: true }),
     });
     const result = await makeProvider(fake).sale(saleInput);
     assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
     assert.equal(result.definitive, false);
+    assert.equal(result.diagnostics.safeMessageCode, "SDK_UPSTREAM_TIMEOUT");
+    assert.equal(result.paymentUuid, observedPaymentUuid);
+    assert.equal(result.transactionId, "TX-UNCERTAIN-408");
+    assert.equal(result.transactionReference, "REF-UNCERTAIN-408");
     assert.equal(fake.calls.sale, 1);
+  });
+
+  await t.test("clase TimeoutResponse conserva clasificacion upstream aunque falte HTTP 408", async () => {
+    class TimeoutResponse {}
+    const response = Object.assign(new TimeoutResponse(), sdkResponse(520, {
+      success: false,
+      data: {},
+      valid: true,
+    }));
+    const result = await makeProvider(makeFakeSdk({ saleResponse: response })).sale(saleInput);
+    assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
+    assert.equal(result.diagnostics.sdkResponseClass, "TimeoutResponse");
+    assert.equal(result.diagnostics.safeMessageCode, "SDK_UPSTREAM_TIMEOUT");
   });
 
   await t.test("network exception", async () => {
@@ -701,6 +725,13 @@ test("clasifica FailureResponse 520 sin conservar el mensaje del SDK", async (t)
       if (scenario.message) assert.equal(serialized.includes(scenario.message), false);
     });
   }
+});
+
+test("reconciliacion Status permanece bloqueada por contrato del proveedor", () => {
+  assert.equal(
+    STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
+    "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT"
+  );
 });
 
 test("SDK nunca aprueba hash invalido, amount mismatch ni payment_uuid ausente", async (t) => {
