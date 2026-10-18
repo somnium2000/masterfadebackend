@@ -723,13 +723,32 @@ export async function closeActiveSession(app, request, payload) {
         WHERE id_sesion = $1::uuid
           AND id_usuario = $2::uuid
           AND estado = 'activa'
+          AND cierre_at IS NULL
+          AND revocada_at IS NULL
+          AND expira_at > NOW()
+        RETURNING id_sesion
       `,
       [sid, userId, closedBy || null, motivo, meta.ip, meta.userAgent, meta.requestId]
     );
     if (result.rowCount > 0) {
       publishSecurityRealtimeSignal(app, "security.sessions.changed");
+      return { ok: true, state: "cerrada" };
     }
-    return { ok: true };
+    // AM: Cero filas no demuestra cierre; comprueba que el token ya no sea utilizable.
+    const lookup = await app.db.query(`
+      SELECT estado, cierre_at, revocada_at, expira_at
+      FROM public.seguridad_sesiones
+      WHERE id_sesion = $1::uuid AND id_usuario = $2::uuid
+      LIMIT 1
+    `, [sid, userId]);
+    const row = lookup.rows?.[0];
+    if (!row) return { ok: true, state: "inexistente" };
+    if (row.revocada_at || row.estado === "revocada") return { ok: true, state: "revocada" };
+    if (row.cierre_at || row.estado === "cerrada") return { ok: true, state: "cerrada" };
+    if (row.estado === "expirada" || (row.expira_at && new Date(row.expira_at).getTime() <= Date.now())) {
+      return { ok: true, state: "expirada" };
+    }
+    return { ok: false, code: "AUTH_SESSION_CLOSE_UNCONFIRMED" };
   } catch (_error) {
     request?.log?.error(
       { event: "security_session_close_failed", code: "AUTH_SESSION_CLOSE_ERROR" },
@@ -980,11 +999,11 @@ async function resolveAccessUserByIdentifier(app, identifier) {
 
 export async function checkUserTemporaryLock(app, { idUsuario }) {
   if (!app?.db || !isValidUuid(idUsuario)) {
-    return { ok: false, blocked: false };
+    return { ok: false, blocked: true, code: "AUTH_LOCK_CHECK_UNAVAILABLE" };
   }
 
   try {
-    if (await isProtectedUserId(app, idUsuario)) {
+    if (await isProtectedUserId(app, idUsuario, { failClosed: true })) {
       return { ok: true, blocked: false, lockedUntil: null, bypassed: true, bypassCode: "ROOT_LOGIN_LOCK_BYPASSED" };
     }
 
@@ -1001,7 +1020,7 @@ export async function checkUserTemporaryLock(app, { idUsuario }) {
     const blocked = Boolean(lockedUntil) && new Date(lockedUntil).getTime() > Date.now();
     return { ok: true, blocked, lockedUntil: lockedUntil || null };
   } catch (_error) {
-    return { ok: false, blocked: false };
+    return { ok: false, blocked: true, code: "AUTH_LOCK_CHECK_UNAVAILABLE" };
   }
 }
 

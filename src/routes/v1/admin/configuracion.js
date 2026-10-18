@@ -75,7 +75,9 @@ const COMMUNICATION_SEND_STATUS_PENDING = "pendiente";
 const COMMUNICATION_SEND_STATUS_SENT = "enviado";
 const COMMUNICATION_SEND_STATUS_FAILED = "fallido";
 const COMMUNICATION_FALLBACK_SEND_DELAY_MINUTES = 1440;
-const COMMUNICATION_SEND_ERROR_MAX_LENGTH = 500;
+const COMMUNICATION_SEND_STATUS_OMITTED = "omitido";
+const COMMUNICATION_SEND_ERROR_CODE = "COMM_DELIVERY_FAILED";
+const COMMUNICATION_SEND_SAFE_MESSAGE = "No se pudo enviar el correo. Reintenta más tarde.";
 const COMMUNICATION_MANUAL_EXCLUSION_REASON = "exclusion_manual";
 const COMMUNICATION_SEND_LOCK_NAMESPACE = 82051;
 const COMMUNICATION_SCHEDULER_INTERVAL_MS_DEFAULT = 60000;
@@ -1124,7 +1126,7 @@ async function listCampaignShipments(client, idCampania, options = {}) {
       estado_envio: row.estado_envio,
       enviar_en: row.enviar_en ?? null,
       enviado_at: row.enviado_at ?? null,
-      ultimo_error: row.ultimo_error ?? null,
+      ultimo_error: row.ultimo_error ? normalizeCommunicationSendError(row.ultimo_error) : null,
       intentos: Number(row.intentos ?? 0),
       created_at: row.created_at ?? null,
     })),
@@ -1151,9 +1153,10 @@ async function releaseCommunicationSendLock(client, campaignId) {
 }
 
 function normalizeCommunicationSendError(rawValue) {
-  const message = String(rawValue || "").trim();
-  if (!message) return "No se pudo enviar el correo";
-  return message.slice(0, COMMUNICATION_SEND_ERROR_MAX_LENGTH);
+  if (String(rawValue || "").startsWith("COMM_OMITTED_")) {
+    return "Destinatario omitido tras verificar su elegibilidad actual.";
+  }
+  return COMMUNICATION_SEND_SAFE_MESSAGE;
 }
 
 function escapeHtmlForEmail(input) {
@@ -1261,17 +1264,59 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
   let totalIntentados = 0;
   let totalExitosos = 0;
   let totalFallidos = 0;
+  let totalOmitidos = 0;
 
   for (const row of rows) {
+    // AM: Reutiliza la política vigente y verifica la identidad de la fila en cola.
+    const caps = await getCommunicationSchemaCapabilities(client);
+    const verification = await client.query(`
+      ${buildEligibilityEvaluationCte(caps)}
+      SELECT r.estado_elegibilidad, r.correo_destino AS correo_actual
+      FROM public.comunicaciones_envios ce
+      LEFT JOIN resultado r
+        ON r.id_cliente = ce.id_cliente AND r.id_persona = ce.id_persona
+      WHERE ce.id_envio = $1::uuid AND ce.id_campania = $2::uuid
+        AND ce.estado_envio = $3::text
+    `, [row.id_envio, campaign.id_campania, sourceStatus]);
+    const recipient = verification.rows?.[0];
+    if (!recipient) continue;
+    const reason = recipient.estado_elegibilidad !== "elegible"
+      ? "COMM_OMITTED_INELIGIBLE"
+      : String(recipient.correo_actual || "").trim().toLowerCase() !== String(row.correo_destino || "").trim().toLowerCase()
+        ? "COMM_OMITTED_ADDRESS_CHANGED" : null;
+    if (reason) {
+      // AM: Una sola sentencia conserva exclusiones iniciales y cuenta cada transición una vez.
+      await client.query(`
+        WITH omitido AS (
+          UPDATE public.comunicaciones_envios
+          SET estado_envio = $4::text, ultimo_error = $5::text, updated_at = NOW()
+          WHERE id_envio = $1::uuid AND id_campania = $2::uuid AND estado_envio = $3::text
+          RETURNING id_envio
+        )
+        UPDATE public.comunicaciones_campanias
+        SET total_omitidos = COALESCE(total_omitidos, 0) + (SELECT COUNT(*) FROM omitido),
+            total_pendientes = GREATEST(0, COALESCE(total_pendientes, 0) - CASE WHEN $3::text = 'pendiente' THEN (SELECT COUNT(*) FROM omitido)::int ELSE 0 END),
+            total_fallidos = GREATEST(0, COALESCE(total_fallidos, 0) - CASE WHEN $3::text = 'fallido' THEN (SELECT COUNT(*) FROM omitido)::int ELSE 0 END),
+            updated_at = NOW()
+        WHERE id_campania = $2::uuid
+      `, [row.id_envio, campaign.id_campania, sourceStatus, COMMUNICATION_SEND_STATUS_OMITTED, reason]);
+      totalOmitidos += 1;
+      continue;
+    }
     totalIntentados += 1;
     const emailPayload = buildCommunicationCampaignEmailPayload(campaign, row.nombre_cliente);
-    const mailResult = await mailer.sendMail({
-      to: row.correo_destino,
-      from: COMMUNICATION_EMAIL_FROM_ADDRESS,
-      subject: emailPayload.subject,
-      text: emailPayload.text,
-      html: emailPayload.html,
-    });
+    let mailResult;
+    try {
+      mailResult = await mailer.sendMail({
+        to: row.correo_destino,
+        from: COMMUNICATION_EMAIL_FROM_ADDRESS,
+        subject: emailPayload.subject,
+        text: emailPayload.text,
+        html: emailPayload.html,
+      });
+    } catch {
+      mailResult = { sent: false };
+    }
 
     if (mailResult?.sent) {
       totalExitosos += 1;
@@ -1291,6 +1336,7 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
       );
     } else {
       totalFallidos += 1;
+      options.log?.warn?.({ code: COMMUNICATION_SEND_ERROR_CODE, campaignId: campaign.id_campania, shipmentId: row.id_envio }, "Fallo de entrega de comunicación");
       await client.query(
         `
           UPDATE public.comunicaciones_envios
@@ -1301,12 +1347,12 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
             updated_at = NOW()
           WHERE id_envio = $1::uuid
         `,
-        [row.id_envio, COMMUNICATION_SEND_STATUS_FAILED, normalizeCommunicationSendError(mailResult?.message)]
+        [row.id_envio, COMMUNICATION_SEND_STATUS_FAILED, COMMUNICATION_SEND_ERROR_CODE]
       );
     }
   }
 
-  return { totalIntentados, totalExitosos, totalFallidos };
+  return { totalIntentados, totalExitosos, totalFallidos, totalOmitidos };
 }
 
 async function refreshCommunicationCampaignMetrics(client, campaignId, actorUserId) {
@@ -1411,9 +1457,9 @@ async function runCommunicationScheduledDispatchTick(app) {
           app.mailer,
           { ...campaign, asunto, contenido_texto: contenidoTexto },
           COMMUNICATION_SEND_STATUS_PENDING,
-          { dueOnly: true }
+          { dueOnly: true, log: app.log }
         );
-        if (delivery.totalIntentados <= 0) continue;
+        if (delivery.totalIntentados <= 0 && delivery.totalOmitidos <= 0) continue;
 
         const actorUserId = campaign.actualizada_por || campaign.creada_por;
         if (actorUserId) {
@@ -3083,7 +3129,7 @@ export default async function adminConfiguracionRoutes(app) {
           ...campaign,
           asunto,
           contenido_texto: contenidoTexto,
-        }, COMMUNICATION_SEND_STATUS_PENDING);
+        }, COMMUNICATION_SEND_STATUS_PENDING, { log: app.log });
         const updatedCampaign = await refreshCommunicationCampaignMetrics(client, campaignId, actorUserId) || campaign;
         return sendOk(reply, {
           id_campania: updatedCampaign.id_campania,
@@ -3197,7 +3243,7 @@ export default async function adminConfiguracionRoutes(app) {
           ...campaign,
           asunto,
           contenido_texto: contenidoTexto,
-        }, COMMUNICATION_SEND_STATUS_FAILED);
+        }, COMMUNICATION_SEND_STATUS_FAILED, { log: app.log });
         const updatedCampaign = await refreshCommunicationCampaignMetrics(client, campaignId, actorUserId) || campaign;
 
         return sendOk(reply, {

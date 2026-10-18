@@ -2309,6 +2309,14 @@ async function createCliente(app, request, payload) {
   }
 }
 
+function assertPasswordSetupAccessAllowed(status) {
+  if (![ACCESS_STATUS.ACTIVE, ACCESS_STATUS.PENDING_PASSWORD].includes(status)) {
+    throw new AppError(409, "No se puede enviar configuración de contraseña a una cuenta restringida", {
+      code: "PERSONAS_USER_SETUP_ACCESS_RESTRICTED",
+    });
+  }
+}
+
 async function sendUsuarioPasswordSetup(app, request, userId, body) {
   const markPending = body?.marcar_pendiente_password !== false;
   const client = await app.db.connect();
@@ -2348,6 +2356,7 @@ async function sendUsuarioPasswordSetup(app, request, userId, body) {
 
     const userRow = userResult.rows[0];
     await assertActorCanManagePrivilegedUser(app, request, client, userId, "PASSWORD_SETUP");
+    assertPasswordSetupAccessAllowed(userRow.estado_acceso);
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -2390,7 +2399,26 @@ async function sendUsuarioPasswordSetup(app, request, userId, body) {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    if (markPending) {
+    // AM: Serializa el envío y la transición con bloqueos concurrentes del usuario.
+    const lockedUser = await client.query(
+      `SELECT estado_acceso FROM public.usuarios
+       WHERE id_usuario = $1::uuid AND deleted_at IS NULL
+       FOR UPDATE`,
+      [userId]
+    );
+    if (!lockedUser.rowCount) {
+      throw new AppError(404, "Usuario no encontrado", { code: "PERSONAS_USER_NOT_FOUND" });
+    }
+    const currentStatus = lockedUser.rows[0].estado_acceso;
+    assertPasswordSetupAccessAllowed(currentStatus);
+
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      email,
+      buildFullName(userRow.nombres, userRow.apellidos)
+    );
+
+    if (markPending && setupResult.sent) {
       await client.query(
         `
           UPDATE public.usuarios
@@ -2406,16 +2434,10 @@ async function sendUsuarioPasswordSetup(app, request, userId, body) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    const setupResult = await sendPasswordSetupEmail(
-      app,
-      email,
-      buildFullName(userRow.nombres, userRow.apellidos)
-    );
-
     return {
       id_usuario: userId,
       email,
-      estado_acceso_objetivo: markPending ? ACCESS_STATUS.PENDING_PASSWORD : userRow.estado_acceso,
+      estado_acceso_objetivo: markPending && setupResult.sent ? ACCESS_STATUS.PENDING_PASSWORD : currentStatus,
       setup_password: {
         requerido: true,
         enviado: setupResult.sent,
@@ -2599,6 +2621,11 @@ async function updateUsuario(app, request, userId, payload) {
 
     const nextNombres = hasNewNames ? normalizeRequired(personaPatch.nombres) : normalizeRequired(raw.nombres);
     const nextApellidos = hasNewLastNames ? normalizeRequired(personaPatch.apellidos) : normalizeRequired(raw.apellidos);
+    if ((hasNewNames && !nextNombres) || (hasNewLastNames && !nextApellidos)) {
+      throw new AppError(400, "Nombres y apellidos no pueden quedar vacíos", {
+        code: "PERSONAS_USER_NAME_REQUIRED",
+      });
+    }
     const nextPhone = hasNewPhone ? normalizeOptional(personaPatch.telefono_principal) : normalizeOptional(raw.telefono_principal);
 
     const currentEmail = normalizeEmail(raw.email ?? "");
@@ -3883,6 +3910,12 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/empleados/:id_empleado", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
+      if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(request.params.id_empleado)) {
+        return sendError(reply, 400, "Identificador de empleado inválido", {
+          code: "PERSONAS_EMPLOYEE_ID_INVALID",
+          requestId: request.id,
+        });
+      }
       const { rows } = await app.db.query(EMPLEADO_BY_ID_SQL, [request.params.id_empleado]);
       if (!rows.length) {
         return sendError(reply, 404, "Empleado no encontrado", {
