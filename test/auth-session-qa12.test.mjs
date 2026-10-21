@@ -21,6 +21,8 @@ async function setup(t, options = {}) {
   const queries = [];
   const query = async (sql, params = []) => {
     queries.push({ sql, params });
+    if (sql.includes('has_schema_privilege')) return { rows: [{ allowed: true }] };
+    if (sql.includes('FROM auth.sessions')) return { rows: params[0] === SID && params[1] === USER ? [{ id: SID }] : [] };
     if (sql.includes('app_protected_users')) {
       if (options.protectionError) throw Error('synthetic protected lookup error');
       return { rows: options.protected ? [{}] : [], rowCount: options.protected ? 1 : 0 };
@@ -118,7 +120,7 @@ test('fallo SQL en comprobación posterior tampoco confirma cierre', async () =>
 });
 for (const endpoint of ['exchange', 'social/confirm']) test(`${endpoint} no elude el fallo del bloqueo temporal`, async t => {
   const f = await setup(t, { lockError: true });
-  const payload = endpoint === 'exchange' ? { supabase_token: 'synthetic-provider-token' } : { social_confirm_token: jwt.sign({ sub: USER, email: 'synthetic@example.test', token_type: 'social_confirm' }, process.env.JWT_SECRET, { issuer: 'masterfade-api', audience: 'masterfade-app', expiresIn: '1h' }) };
+  const payload = endpoint === 'exchange' ? { supabase_token: jwt.sign({ sub: USER, session_id: SID }, process.env.JWT_SECRET, { expiresIn: '1h' }) } : { social_confirm_token: jwt.sign({ sub: USER, email: 'synthetic@example.test', token_type: 'social_confirm', session_id: SID }, process.env.JWT_SECRET, { issuer: 'masterfade-api', audience: 'masterfade-app', expiresIn: '1h' }) };
   const r = await f.app.inject({ method: 'POST', url: '/auth/' + endpoint, payload });
   assert.equal(r.statusCode, 503, r.body); assert.equal(r.json().error.code, 'AUTH_LOCK_CHECK_UNAVAILABLE');
   assert.equal(f.stats().sessions, 0); assert.equal(r.headers['set-cookie'], undefined);

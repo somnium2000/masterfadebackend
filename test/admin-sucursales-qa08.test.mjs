@@ -5,7 +5,19 @@ import routes from '../src/routes/v1/admin/sucursales.js';
 
 const ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const COMPANY = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-async function fixture(t, { initial = true, concurrent, dependencies = 0, missing = false, sqlError = false, roles = ['super_admin'] } = {}) {
+for (const name of ['empleados_activos','roles_activos','tarifas_activas','citas_futuras_activas']) test(`dependencia ${name} bloquea DELETE legacy sin borrado físico`,async t=>{
+  const {app,queries}=await fixture(t,{dependencies:{[name]:1}});
+  const r=await app.inject({method:'DELETE',url:`/v1/admin/sucursales/${ID}`});
+  assert.equal(r.statusCode,409,r.body);assert.equal(r.json().error.details[name],1);
+  assert.equal(queries.some(q=>/^(UPDATE|DELETE)/.test(q.text)),false);
+});
+for(const body of [{id_empresa:COMPANY,nombre_sucursal:' '},{id_empresa:COMPANY,nombre_sucursal:'Nueva',telefono:'abcabc'},{id_empresa:'invalid',nombre_sucursal:'Nueva'}])test(`validación creación ${JSON.stringify(body)}`,async t=>{
+  const {app,queries}=await fixture(t);const r=await app.inject({method:'POST',url:'/v1/admin/sucursales',payload:body});assert.equal(r.statusCode,400,r.body);assert.equal(queries.some(q=>q.text.startsWith('INSERT')),false);
+});
+test('empresa inexistente no crea sucursal',async t=>{const {app,queries}=await fixture(t,{missingCompany:true});const r=await app.inject({method:'POST',url:'/v1/admin/sucursales',payload:{id_empresa:COMPANY,nombre_sucursal:'Nueva'}});assert.equal(r.statusCode,400,r.body);assert.equal(queries.some(q=>q.text.startsWith('INSERT')),false);});
+test('23505 concurrente devuelve 409 sin detalle SQL',async t=>{const {app,queries}=await fixture(t,{uniqueError:true});const r=await app.inject({method:'POST',url:'/v1/admin/sucursales',payload:{id_empresa:COMPANY,nombre_sucursal:'Nueva'}});assert.equal(r.statusCode,409,r.body);assert.equal(r.body.includes('SQL_PRIVATE_DETAIL'),false);assert.equal(queries.at(-1).text,'ROLLBACK');});
+test('DELETE legacy exitoso solo actualiza estado de su sucursal',async t=>{const {app,queries}=await fixture(t);const r=await app.inject({method:'DELETE',url:`/v1/admin/sucursales/${ID}`});assert.equal(r.statusCode,200);assert.equal(r.json().data.sucursal.estado,false);assert.equal(queries.some(q=>q.text.startsWith('DELETE')),false);assert.ok(queries.filter(q=>q.text.startsWith('UPDATE')).every(q=>q.params[0]===ID));});
+async function fixture(t, { initial = true, concurrent, dependencies = 0, missing = false, missingCompany = false, uniqueError = false, sqlError = false, roles = ['super_admin'] } = {}) {
   let state = initial;
   const queries = [];
   const row = () => ({ id_sucursal: ID, id_empresa: COMPANY, nombre_sucursal: 'Sucursal', estado: state });
@@ -13,8 +25,9 @@ async function fixture(t, { initial = true, concurrent, dependencies = 0, missin
     const text = sql.replace(/\s+/g, ' ').trim();
     queries.push({ text, params });
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(text)) return { rows: [], rowCount: 0 };
-    if (text.includes('FOR UPDATE')) return { rows: missing ? [] : [row()], rowCount: missing ? 0 : 1 };
-    if (text.includes('AS empleados_activos')) return { rows: [{ empleados_activos: dependencies }], rowCount: 1 };
+    if (text.includes('FOR UPDATE') && !text.includes('FROM public.empresas')) return { rows: missing ? [] : [row()], rowCount: missing ? 0 : 1 };
+    if (text.includes('AS empleados_activos')) return { rows: [typeof dependencies === 'object' ? dependencies : { empleados_activos: dependencies }], rowCount: 1 };
+    if (text.startsWith('INSERT') && uniqueError) throw Object.assign(new Error('SQL_PRIVATE_DETAIL'), { code: '23505' });
     if (text.startsWith('UPDATE')) {
       if (sqlError) throw new Error('SQL_PRIVATE_DETAIL');
       if (concurrent !== undefined) state = concurrent;
@@ -23,7 +36,7 @@ async function fixture(t, { initial = true, concurrent, dependencies = 0, missin
       return { rows: [], rowCount: 1 };
     }
     if (text.includes('LOWER(TRIM')) return { rows: [], rowCount: 0 };
-    if (text.includes('FROM public.empresas')) return { rows: [{}], rowCount: 1 };
+    if (text.includes('FROM public.empresas')) return { rows: missingCompany ? [] : [{}], rowCount: missingCompany ? 0 : 1 };
     return { rows: missing ? [] : [row()], rowCount: missing ? 0 : 1 };
   } };
   const app = Fastify({ logger: false });
@@ -84,28 +97,34 @@ test('error SQL durante transición explícita hace rollback', async t => {
   assert.equal(response.statusCode, 500); assert.equal(queries.at(-1).text, 'ROLLBACK');
   assert.ok(!response.body.includes('SQL_PRIVATE_DETAIL'));
 });
-test('diagnóstico: dos nombres equivalentes superan precheck simultáneo con UNIQUE exacto simulado', async t => {
+test('nombres equivalentes concurrentes se serializan por empresa', async t => {
   const inserted = [];
-  let checks = 0, release;
-  const barrier = new Promise(resolve => { release = resolve; });
+  let tail = Promise.resolve();
   const app = Fastify({ logger: false });
   app.decorate('requireRoles', () => async () => {});
-  app.decorate('db', { async query(sql, params = []) {
-    if (sql.includes('LOWER(TRIM')) {
-      checks += 1; if (checks === 2) release(); await barrier;
-      return { rows: [], rowCount: 0 };
-    }
-    if (/INSERT INTO public.sucursales/.test(sql)) {
-      assert.ok(!inserted.includes(params[1])); inserted.push(params[1]);
-      return { rows: [{ id_sucursal: ID }], rowCount: 1 };
-    }
-    if (sql.includes('FROM public.empresas')) return { rows: [{}], rowCount: 1 };
-    return { rows: [{ id_sucursal: ID, id_empresa: COMPANY, nombre_sucursal: params[1] || 'Sucursal', estado: true }], rowCount: 1 };
+  app.decorate('db', { async connect() {
+    let unlock;
+    return { release() {}, async query(sql, params = []) {
+      if (sql.includes('FROM public.empresas') && sql.includes('FOR UPDATE')) {
+        const previous = tail; tail = new Promise(resolve => { unlock = resolve; }); await previous;
+        return { rows: [{}], rowCount: 1 };
+      }
+      if (/^(COMMIT|ROLLBACK)$/.test(sql)) { unlock?.(); return { rows: [], rowCount: 0 }; }
+      if (sql === 'BEGIN') return { rows: [], rowCount: 0 };
+      if (sql.includes('LOWER(TRIM')) {
+        const found = inserted.some(name => name.trim().toLowerCase() === params[1].trim().toLowerCase());
+        return { rows: found ? [{ id_sucursal: ID }] : [], rowCount: found ? 1 : 0 };
+      }
+      if (/INSERT INTO public.sucursales/.test(sql)) {
+        inserted.push(params[1]); return { rows: [{ id_sucursal: ID }], rowCount: 1 };
+      }
+      return { rows: [{ id_sucursal: ID, id_empresa: COMPANY, nombre_sucursal: 'Sucursal', estado: true }], rowCount: 1 };
+    } };
   } });
   await app.register(routes, { prefix: '/v1/admin/sucursales' }); t.after(() => app.close());
   const responses = await Promise.all(['Sucursal', 'sucursal'].map(nombre_sucursal => app.inject({ method: 'POST', url: '/v1/admin/sucursales', payload: { id_empresa: COMPANY, nombre_sucursal } })));
-  assert.deepEqual(responses.map(r => r.statusCode), [201, 201]);
-  assert.equal(inserted.length, 2); assert.equal(new Set(inserted.map(name => name.trim().toLowerCase())).size, 1);
+  assert.deepEqual(responses.map(r => r.statusCode).sort(), [201, 409]);
+  assert.equal(inserted.length, 1);
 });
 
 test('activación e inactivación concurrentes esperan el bloqueo y releen estado', async t => {
@@ -122,6 +141,7 @@ test('activación e inactivación concurrentes esperan el bloqueo y releen estad
     return { release() {}, async query(sql, params = []) {
       const text = sql.replace(/\s+/g, ' ').trim();
       if (text === 'BEGIN') return { rows: [] };
+      if (text === 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED') return { rows: [] };
       if (text.includes('FOR UPDATE')) {
         if (owner) { waiting = true; await unlocked; }
         owner = number; events.push(`lock${number}`);

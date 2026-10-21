@@ -14,7 +14,17 @@ import {
 const SUPER_ADMIN_ONLY = ["super_admin"];
 const USER_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
 const EMPLOYEE_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const empleadoParamsSchema = {
+  type: "object",
+  required: ["id_empleado"],
+  properties: { id_empleado: { type: "string", format: "uuid" } },
+};
 const CLIENT_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const clienteParamsSchema = {
+  type: "object",
+  required: ["id_cliente"],
+  properties: { id_cliente: { type: "string", format: "uuid" } },
+};
 const ACCESS_STATUS = {
   PENDING_PASSWORD: "pendiente_password",
   ACTIVE: "activo",
@@ -134,6 +144,13 @@ const usuarioSetupBodySchema = {
   properties: {
     marcar_pendiente_password: { type: "boolean" },
   },
+  additionalProperties: false,
+};
+
+const usuarioParamsSchema = {
+  type: "object",
+  properties: { id_usuario: { type: "string", format: "uuid" } },
+  required: ["id_usuario"],
   additionalProperties: false,
 };
 
@@ -1830,6 +1847,10 @@ async function createEmpleado(app, request, payload) {
       }
     }
 
+    if (empleadoRaw.estado === false) {
+      await suspendEmployeeRoles(app, client, authUserId);
+      await blockUserAccessByLifecycle(app, client, authUserId);
+    }
     const detail = await client.query(EMPLEADO_BY_USER_SQL, [authUserId]);
 
     await client.query("COMMIT");
@@ -1892,7 +1913,13 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
     const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero), request.claims);
     const esBarbero = roles.includes("barbero");
-    const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
+    const perfilPublico = normalizeBarberPublicProfile({
+      alias_publico: currentRow.alias_publico,
+      resumen_publico: currentRow.resumen_publico,
+      certificaciones_titulos: currentRow.certificaciones_titulos,
+      visible_en_landing: currentRow.visible_en_landing,
+      ...(payload?.perfil_publico || {}),
+    });
     const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(empleadoRaw, "foto_perfil_asset_id");
     const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
       ? normalizeOptional(empleadoRaw.foto_perfil_asset_id ?? null)
@@ -1975,8 +2002,8 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     await upsertPrimaryEmail(client, currentRow.id_persona, correoPrincipal);
     if (previousEmail !== correoPrincipal) {
-      await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
       authEmailUpdated = true;
+      await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
     }
 
     await client.query(
@@ -2008,6 +2035,14 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
       assignedBy: request.claims?.user?.id_usuario ?? null,
       actorClaims: request.claims,
     });
+
+    const nextEmployeeActive = empleadoRaw.estado ?? currentRow.estado_laboral;
+    if (nextEmployeeActive === false) {
+      await suspendEmployeeRoles(app, client, currentRow.id_usuario);
+      await blockUserAccessByLifecycle(app, client, currentRow.id_usuario);
+    } else if (currentRow.estado_laboral === false && empleadoRaw.estado === true) {
+      await restoreUserAccessByLifecycle(client, currentRow.id_usuario);
+    }
 
     let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
     let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
@@ -2277,6 +2312,10 @@ async function createCliente(app, request, payload) {
         );
 
     const createdClientId = clienteInsert.rows[0].id_cliente;
+    if (cliente.estado === false) {
+      await deactivateUserRolesByNames(app, client, authUserId, ["cliente"]);
+      await blockUserAccessByLifecycle(app, client, authUserId);
+    }
     const detail = await client.query(CLIENTE_BY_ID_SQL, [createdClientId]);
 
     await client.query("COMMIT");
@@ -2536,36 +2575,65 @@ async function restoreUserAccessByLifecycle(client, userId) {
   );
 }
 
+async function employeeLifecycleState(client, userId) {
+  try {
+    return await client.query(
+      `SELECT e.id_empleado, e.roles_reactivacion
+       FROM public.empleados e JOIN public.usuarios u ON u.id_persona = e.id_persona
+       WHERE u.id_usuario = $1::uuid AND e.deleted_at IS NULL
+       FOR UPDATE OF e`,
+      [userId]
+    );
+  } catch (error) {
+    if (error.code === "42703") {
+      throw new AppError(503, "La gestion de reactivacion de empleados no esta disponible", {
+        code: "PERSONAS_EMPLOYEE_LIFECYCLE_UNAVAILABLE",
+      });
+    }
+    throw error;
+  }
+}
+
+async function suspendEmployeeRoles(app, client, userId) {
+  const state = await employeeLifecycleState(client, userId);
+  if (state.rowCount !== 1) {
+    throw new AppError(409, "No se puede determinar el estado del empleado", {
+      code: "PERSONAS_EMPLOYEE_ACTIVATE_ROLES_REQUIRED",
+    });
+  }
+  // AM: Persiste solo las asignaciones vigentes; una inactivacion repetida no pierde la captura.
+  await client.query(
+    `UPDATE public.empleados SET roles_reactivacion = (
+       SELECT jsonb_agg(jsonb_build_object('usuario', ru.id_usuario, 'rol', r.nombre, 'sucursal', ru.id_sucursal))
+       FROM public.roles_usuarios ru JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $2::uuid AND ru.activo IS TRUE AND r.nombre = ANY($3::text[])
+     ) WHERE id_empleado = $1::uuid AND EXISTS (
+       SELECT 1 FROM public.roles_usuarios ru JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $2::uuid AND ru.activo IS TRUE AND r.nombre = ANY($3::text[])
+     )`,
+    [state.rows[0].id_empleado, userId, [...EMPLOYEE_ALLOWED_ROLES]]
+  );
+  await deactivateUserRolesByNames(app, client, userId, [...EMPLOYEE_ALLOWED_ROLES]);
+}
+
 async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, assignedBy, esBarbero, actorClaims }) {
   if (!userId) return;
 
-  const historicalRolesResult = await client.query(
-    `
-      SELECT DISTINCT r.nombre AS role_name
-      FROM public.roles_usuarios ru
-      JOIN public.roles r
-        ON r.id_rol = ru.id_rol
-      WHERE ru.id_usuario = $1::uuid
-        AND r.nombre = ANY($2::text[])
-    `,
-    [userId, [...EMPLOYEE_ALLOWED_ROLES]]
-  );
-
-  const historicalRoleNames = historicalRolesResult.rows
-    .map((row) => String(row.role_name || "").trim().toLowerCase())
-    .filter((value) => EMPLOYEE_ALLOWED_ROLES.has(value));
-
-  let candidateRoles = [...new Set(historicalRoleNames)];
-  if (!esBarbero) {
-    candidateRoles = candidateRoles.filter((role) => role !== "barbero");
+  const state = await employeeLifecycleState(client, userId);
+  const snapshot = state.rowCount === 1 ? state.rows[0].roles_reactivacion : null;
+  if (!Array.isArray(snapshot) || !snapshot.length || snapshot.some((item) =>
+    !item || item.usuario !== userId || !EMPLOYEE_ALLOWED_ROLES.has(item.rol) ||
+    item.sucursal !== (item.rol === "super_admin" ? null : branchId)
+  )) {
+    throw new AppError(409, "No se puede activar un empleado sin roles recuperables verificados", {
+      code: "PERSONAS_EMPLOYEE_ACTIVATE_ROLES_REQUIRED",
+    });
   }
-  if (esBarbero && !candidateRoles.includes("barbero")) {
-    candidateRoles.push("barbero");
-  }
-
-  if (!candidateRoles.length) {
-    // AM: Fallback de seguridad cuando no hay historial de roles internos reutilizable.
-    candidateRoles = esBarbero ? ["barbero"] : ["admin"];
+  const candidateRoles = [...new Set(snapshot.map((item) => item.rol))];
+  if (candidateRoles.includes("barbero") !== esBarbero) {
+    throw new AppError(409, "Los roles recuperables no corresponden al perfil del empleado", {
+      code: "PERSONAS_EMPLOYEE_ACTIVATE_ROLES_REQUIRED",
+    });
   }
 
   const normalizedRoles = parseEmployeeRoleNames(candidateRoles, esBarbero, actorClaims);
@@ -2584,6 +2652,7 @@ async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, 
     assignedBy,
     actorClaims,
   });
+  await client.query("UPDATE public.empleados SET roles_reactivacion = NULL WHERE id_empleado = $1::uuid", [state.rows[0].id_empleado]);
 }
 
 async function updateUsuario(app, request, userId, payload) {
@@ -2990,7 +3059,7 @@ async function inactivateEmpleado(app, request, idEmpleado) {
       [idEmpleado]
     );
 
-    await deactivateUserRolesByNames(app, client, row.id_usuario, [...EMPLOYEE_ALLOWED_ROLES]);
+    await suspendEmployeeRoles(app, client, row.id_usuario);
     await blockUserAccessByLifecycle(app, client, row.id_usuario);
 
     const detail = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
@@ -3086,6 +3155,7 @@ async function updateCliente(app, request, idCliente, payload) {
     }
 
     const currentRow = current.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, currentRow.id_usuario, "CLIENT_UPDATE");
     const persona = buildPersonaPayload(payload?.persona || {});
     const acceso = payload?.acceso || {};
     const cliente = payload?.cliente || {};
@@ -3108,7 +3178,10 @@ async function updateCliente(app, request, idCliente, payload) {
     const idSucursalOrigen = hasSucursalOrigenPatch
       ? await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null)
       : normalizeOptional(currentRow.id_sucursal_origen ?? null);
-    const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
+    const currentFechaIngreso = currentRow.fecha_ingreso instanceof Date
+      ? currentRow.fecha_ingreso.toISOString()
+      : currentRow.fecha_ingreso;
+    const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentFechaIngreso ?? null);
 
     if (!habilitarAcceso) {
       throw new AppError(400, "Los clientes deben conservar acceso habilitado", {
@@ -3250,7 +3323,8 @@ async function updateCliente(app, request, idCliente, payload) {
       );
     }
 
-    if (habilitarAcceso && nextUserId) {
+    const nextClienteActive = cliente.estado ?? currentRow.estado_cliente;
+    if (habilitarAcceso && nextUserId && nextClienteActive !== false) {
       await ensureClienteRoleAssignment(
         app,
         client,
@@ -3335,6 +3409,12 @@ async function updateCliente(app, request, idCliente, payload) {
       );
     }
 
+    if (nextClienteActive === false && nextUserId) {
+      await deactivateUserRolesByNames(app, client, nextUserId, ["cliente"]);
+      await blockUserAccessByLifecycle(app, client, nextUserId);
+    } else if (currentRow.estado_cliente === false && cliente.estado === true && nextUserId) {
+      await restoreUserAccessByLifecycle(client, nextUserId);
+    }
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 
     await client.query("COMMIT");
@@ -3379,7 +3459,7 @@ async function updateCliente(app, request, idCliente, payload) {
   }
 }
 
-async function inactivateCliente(app, idCliente) {
+async function inactivateCliente(app, request, idCliente) {
   const client = await app.db.connect();
   let transactionStarted = false;
 
@@ -3392,6 +3472,7 @@ async function inactivateCliente(app, idCliente) {
     }
 
     const row = current.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "CLIENT_INACTIVATE");
     if (!row.id_usuario) {
       throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_CLIENT_WITHOUT_USER",
@@ -3442,6 +3523,7 @@ async function activateCliente(app, request, idCliente) {
     }
 
     const row = current.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "CLIENT_ACTIVATE");
     if (!row.id_usuario) {
       throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_CLIENT_WITHOUT_USER",
@@ -3774,10 +3856,13 @@ export default async function adminPersonasRoutes(app) {
       schema: { body: roleCreateBodySchema },
     },
     async (request, reply) => {
-      const client = await app.db.connect();
+      let client;
+      let transactionStarted = false;
       try {
         const roleName = normalizeRoleName(request.body?.nombre);
+        client = await app.db.connect();
         await client.query("BEGIN");
+        transactionStarted = true;
 
         const existsResult = await client.query(
           `
@@ -3805,12 +3890,19 @@ export default async function adminPersonasRoutes(app) {
         );
 
         await client.query("COMMIT");
+        transactionStarted = false;
         return sendOk(reply, { rol: insertResult.rows[0] }, { statusCode: 201, requestId: request.id });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        if (transactionStarted) await client.query("ROLLBACK").catch(() => {});
+        if (error?.code === "23505") {
+          return sendError(reply, 409, "Ya existe un rol con ese nombre", {
+            code: "PERSONAS_ROLE_DUPLICATE",
+            requestId: request.id,
+          });
+        }
         return sendHandled(reply, request, error, "No se pudo crear rol", "PERSONAS_ROLE_CREATE_ERROR");
       } finally {
-        client.release();
+        client?.release();
       }
     }
   );
@@ -3827,7 +3919,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/usuarios/:id_usuario",
-    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioUpdateBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioUpdateBodySchema, params: usuarioParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateUsuario(app, request, request.params.id_usuario, request.body || {});
@@ -3840,7 +3932,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/usuarios/:id_usuario/estado-acceso",
-    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioAccessStatusBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioAccessStatusBodySchema, params: usuarioParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, request.body?.estado_acceso);
@@ -3851,7 +3943,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { params: usuarioParamsSchema } }, async (request, reply) => {
     try {
       const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.BLOCKED);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3860,7 +3952,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { params: usuarioParamsSchema } }, async (request, reply) => {
     try {
       const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.ACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3869,7 +3961,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { params: usuarioParamsSchema } }, async (request, reply) => {
     try {
       const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.INACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3888,7 +3980,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.post(
     "/usuarios/:id_usuario/enviar-configuracion-password",
-    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioSetupBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioSetupBodySchema, params: usuarioParamsSchema } },
     async (request, reply) => {
       try {
         const result = await sendUsuarioPasswordSetup(app, request, request.params.id_usuario, request.body || {});
@@ -3940,7 +4032,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/empleados/:id_empleado",
-    { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { body: empleadoCreateBodySchema } },
+    { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { body: empleadoCreateBodySchema, params: empleadoParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateEmpleado(app, request, request.params.id_empleado, request.body || {});
@@ -3951,7 +4043,7 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { params: empleadoParamsSchema } }, async (request, reply) => {
     try {
       const updated = await inactivateEmpleado(app, request, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3960,7 +4052,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.patch("/empleados/:id_empleado/activar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/empleados/:id_empleado/activar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { params: empleadoParamsSchema } }, async (request, reply) => {
     try {
       const updated = await activateEmpleado(app, request, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
@@ -4004,7 +4096,7 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
       const { rows } = await app.db.query(CLIENTE_BY_ID_SQL, [request.params.id_cliente]);
       if (!rows.length) {
@@ -4031,7 +4123,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/clientes/:id_cliente",
-    { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { body: clienteUpdateBodySchema } },
+    { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { body: clienteUpdateBodySchema, params: clienteParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateCliente(app, request, request.params.id_cliente, request.body || {});
@@ -4042,16 +4134,16 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/clientes/:id_cliente/inactivar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/clientes/:id_cliente/inactivar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
-      const updated = await inactivateCliente(app, request.params.id_cliente);
+      const updated = await inactivateCliente(app, request, request.params.id_cliente);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo inactivar cliente", "PERSONAS_CLIENT_INACTIVATE_ERROR");
     }
   });
 
-  app.patch("/clientes/:id_cliente/activar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/clientes/:id_cliente/activar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
       const updated = await activateCliente(app, request, request.params.id_cliente);
       return sendOk(reply, updated, { requestId: request.id });
