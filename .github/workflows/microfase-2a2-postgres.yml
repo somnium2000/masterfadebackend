@@ -87,6 +87,11 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
       - name: Validate idempotency
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
+      - name: Apply and validate payment reconciliation window contract
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924011000_assert_pixelpay_reconciliation_window.sql
       - name: Run tests
         run: npm test
       - name: Run database preflight
