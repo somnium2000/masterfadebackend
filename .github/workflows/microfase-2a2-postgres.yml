@@ -48,6 +48,7 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_migrations_bootstrap.sql
       - name: Load schema and fixtures
         run: |
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
