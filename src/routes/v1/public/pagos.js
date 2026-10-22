@@ -744,7 +744,17 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
         hold.id_hold,
         hold.estado_hold_codigo,
         hold.expires_at,
-        co.direccion_correo
+        co.direccion_correo,
+        co.primary_email_count,
+        c.id_persona_cliente,
+        c.id_cliente AS cita_cliente_id,
+        c.contacto_email,
+        c.id_cita_integrante,
+        ci.id_cita_integrante AS snapshot_integrante_id,
+        ci.id_persona AS snapshot_persona_id,
+        ci.orden_integrante AS snapshot_orden,
+        ci.rol_integrante_codigo AS snapshot_rol,
+        ci.contacto_email_snapshot
       FROM public.citas_grupos cg
       JOIN public.citas c
         ON c.id_grupo_cita = cg.id_grupo_cita
@@ -756,10 +766,17 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
         ORDER BY h.created_at DESC
         LIMIT 1
       ) hold ON TRUE
-      LEFT JOIN public.correos co
-        ON co.id_persona = cg.id_persona_titular
-       AND co.deleted_at IS NULL
-       AND co.es_principal IS TRUE
+      LEFT JOIN public.citas_integrantes ci
+        ON ci.id_cita_integrante = c.id_cita_integrante
+       AND ci.id_grupo_cita = cg.id_grupo_cita
+      LEFT JOIN LATERAL (
+        SELECT min(cr.direccion_correo::text) AS direccion_correo,
+               count(*) AS primary_email_count
+        FROM public.correos cr
+        WHERE cr.id_persona = cg.id_persona_titular
+          AND cr.deleted_at IS NULL
+          AND cr.es_principal IS TRUE
+      ) co ON TRUE
       LEFT JOIN public.personas pt
         ON pt.id_persona = cg.id_persona_titular
        AND pt.deleted_at IS NULL
@@ -772,8 +789,30 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
     throw new AppError(404, "La reserva indicada no existe", { code: "PUBLIC_PAGOS_GROUP_NOT_FOUND" });
   }
   const normalizedTitularEmail = normalizeEmail(titularEmail);
-  const dbTitularEmail = normalizeEmail(result.rows[0]?.direccion_correo || "");
-  if (!normalizedTitularEmail || !dbTitularEmail || normalizedTitularEmail !== dbTitularEmail) {
+  const titulares = result.rows.filter((row) => Number(row.orden_integrante) === 1);
+  const titular = titulares.length === 1 ? titulares[0] : null;
+  const contradictoryTitular = result.rows.some((row) => Number(row.orden_integrante) !== 1
+    && (Number(row.snapshot_orden) === 1 || row.snapshot_rol === "titular"));
+  const personaMatches = titular?.id_persona_titular
+    && titular.id_persona_cliente === titular.id_persona_titular;
+  const clientMatches = !titular?.id_cliente_titular
+    || titular.cita_cliente_id === titular.id_cliente_titular;
+  const snapshotMatches = !titular?.id_cita_integrante || (
+    titular.snapshot_integrante_id === titular.id_cita_integrante
+    && titular.snapshot_persona_id === titular.id_persona_titular
+    && Number(titular.snapshot_orden) === 1
+    && titular.snapshot_rol === "titular"
+  );
+  const persistedEmails = [titular?.contacto_email, titular?.contacto_email_snapshot]
+    .map((email) => normalizeEmail(email || "")).filter(Boolean);
+  const distinctEmails = new Set(persistedEmails);
+  // AM: A legacy fallback requires an unambiguous titular and exactly one current principal email.
+  const dbTitularEmail = distinctEmails.size === 1 ? persistedEmails[0]
+    : distinctEmails.size === 0 && Number(titular?.primary_email_count) === 1
+      ? normalizeEmail(titular.direccion_correo || "") : "";
+  if (contradictoryTitular || !personaMatches || !clientMatches || !snapshotMatches || !normalizedTitularEmail
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(dbTitularEmail)
+    || normalizedTitularEmail !== dbTitularEmail) {
     throw new AppError(403, "No tienes permisos para operar esta reserva", { code: "PUBLIC_PAGOS_GROUP_FORBIDDEN" });
   }
   return result.rows;

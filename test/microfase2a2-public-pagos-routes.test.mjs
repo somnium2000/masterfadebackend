@@ -192,6 +192,8 @@ function makeGroupRow({
     estado_grupo_codigo: "activo",
     id_cliente_titular: null,
     id_persona_titular: USER_A,
+    id_persona_cliente: USER_A,
+    primary_email_count: 1,
     id_cita: idCita,
     orden_integrante: order,
     estado_cita_codigo: citaState,
