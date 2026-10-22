@@ -193,6 +193,11 @@ function mapSucursal(row) {
 }
 
 function sendHandled(reply, request, error, message, code) {
+  if (error?.code === "23505") {
+    return sendError(reply, 409, "Ya existe una sucursal con ese nombre para la empresa seleccionada", {
+      code: "SUCURSALES_DUPLICATE_NAME", requestId: request.id,
+    });
+  }
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
@@ -217,6 +222,7 @@ async function ensureCompanyExists(client, idEmpresa) {
       FROM public.empresas
       WHERE id_empresa = $1::uuid
       LIMIT 1
+      FOR UPDATE
     `,
     [idEmpresa]
   );
@@ -438,14 +444,16 @@ async function withSucursalStateLock(pool, idSucursal, operation) {
   try {
     await client.query("BEGIN");
     started = true;
+    // AM: Tras esperar al escritor, el conteo debe ver su COMMIT y no un snapshot previo heredado.
+    await client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     // AM: Serializa las transiciones de esta sucursal antes de leer su estado.
-    await client.query("SELECT id_sucursal FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL FOR UPDATE", [idSucursal]);
+    if (idSucursal) await client.query("SELECT id_sucursal FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL FOR UPDATE", [idSucursal]);
     const result = await operation(client);
     await client.query("COMMIT");
     started = false;
     return result;
   } catch (error) {
-    if (started) await client.query("ROLLBACK");
+    if (started) await client.query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
     client.release();
@@ -519,7 +527,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const created = await createSucursal(app.db, request.body || {});
+        const created = await withSucursalStateLock(app.db, null, client => createSucursal(client, request.body || {}));
         return sendOk(reply, { sucursal: mapSucursal(created) }, { statusCode: 201, requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo crear sucursal", "SUCURSALES_CREATE_ERROR");
@@ -536,9 +544,7 @@ export default async function adminSucursalesRoutes(app) {
     async (request, reply) => {
       try {
         const patch = request.body || {};
-        const updated = patch.estado === undefined
-          ? await updateSucursal(app.db, request.params.id, patch)
-          : await withSucursalStateLock(app.db, request.params.id, client => updateSucursal(client, request.params.id, patch));
+        const updated = await withSucursalStateLock(app.db, request.params.id, client => updateSucursal(client, request.params.id, patch));
         return sendOk(reply, { sucursal: mapSucursal(updated) }, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo actualizar sucursal", "SUCURSALES_UPDATE_ERROR");

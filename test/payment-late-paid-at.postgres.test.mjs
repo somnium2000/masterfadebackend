@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, mkdtemp, rm, appendFile } from "node:fs/promises";
+import { openSync, closeSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -47,25 +48,61 @@ test("migration late payment conserva definicion QA salvo reloj y condicion lega
   assert.match(migration, /PAYMENT_LATE_TRIGGER_REQUIRED/);
 });
 
-function runBinary(binDir, name, args) {
+function runBinary(binDir, name, args, outputFile) {
   const executable = path.join(binDir, process.platform === "win32" ? `${name}.exe` : name);
-  const result = spawnSync(executable, args, { encoding: "utf8", windowsHide: true, timeout: 30000 });
-  assert.equal(result.status, 0, `${name}: ${result.error?.message || result.stderr || result.stdout}`);
-  return result.stdout.trim();
+  const output = outputFile ? openSync(outputFile, "w") : null;
+  let result;
+  try {
+    result = spawnSync(executable, args, { encoding: "utf8", windowsHide: true, timeout: 30000,
+      stdio: output === null ? ["ignore", "pipe", "pipe"] : ["ignore", output, output] });
+  } finally { if (output !== null) closeSync(output); }
+  const diagnostic = outputFile ? readFileSync(outputFile, "utf8") : result.stderr || result.stdout;
+  assert.equal(result.status, 0, `${name} (exit=${result.status}, signal=${result.signal}): ${result.error?.message || diagnostic}`);
+  return (result.stdout || "").trim();
 }
 
-async function startIsolatedPostgres() {
+async function cleanupPreservingError(stop, primaryError) {
+  try { await stop(); }
+  catch (cleanupError) {
+    if (!primaryError) throw cleanupError;
+    primaryError.cleanupError = cleanupError;
+    primaryError.message += `\nCleanup failed: ${cleanupError.message}`;
+  }
+}
+
+async function startIsolatedPostgres({ serverOptions = [] } = {}) {
   const configured = process.env.MASTERFADE_TEST_PG_BIN;
   const detected = spawnSync("pg_config", ["--bindir"], { encoding: "utf8", windowsHide: true });
   const binDir = configured || (detected.status === 0 ? detected.stdout.trim() : "C:/Program Files/PostgreSQL/17/bin");
   const directory = await mkdtemp(path.join(tmpdir(), "masterfade-late-payment-pg-"));
   const dataDir = path.join(directory, "data");
-  let running = false;
+  const serverLog = path.join(directory, "postgres.log");
+  const startLog = path.join(directory, "pg_ctl-start.log");
+  let client;
+  let cleaned = false;
   const stop = async () => {
-    if (running) { runBinary(binDir, "pg_ctl", ["-D", dataDir, "-m", "fast", "-w", "stop"]); running = false; }
+    if (cleaned) return;
+    const errors = [];
+    if (client) {
+      try { await client.end(); } catch (error) { errors.push(error); }
+      client = null;
+    }
+    // A failed/timed-out start may still have launched our server. Never stop without its PID file.
+    let pid;
+    try { pid = await readFile(path.join(dataDir, "postmaster.pid"), "utf8"); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (pid) {
+      const lines = pid.split(/\r?\n/);
+      assert.match(lines[0], /^[1-9]\d*$/);
+      assert.equal(path.resolve(lines[1]), path.resolve(dataDir));
+      runBinary(binDir, "pg_ctl", ["-D", dataDir, "-m", "fast", "-w", "stop"], path.join(directory, "pg_ctl-stop.log"));
+    }
+    if (errors.length) throw new AggregateError(errors, "PostgreSQL client cleanup failed");
     // AM: Borrar solo el directorio exclusivo creado por mkdtemp, nunca un cluster existente.
-    assert.ok(directory.startsWith(path.join(tmpdir(), "masterfade-late-payment-pg-")));
+    assert.equal(path.dirname(directory), path.resolve(tmpdir()));
+    assert.ok(path.basename(directory).startsWith("masterfade-late-payment-pg-"));
     await rm(directory, { recursive: true, force: true });
+    cleaned = true;
   };
   try {
     runBinary(binDir, "initdb", ["-D", dataDir, "-U", "postgres", "-A", "trust", "--encoding=UTF8", "--locale=C", "--no-sync"]);
@@ -73,17 +110,48 @@ async function startIsolatedPostgres() {
     await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const port = server.address().port;
     await new Promise((resolve) => server.close(resolve));
-    running = true;
-    runBinary(binDir, "pg_ctl", ["-D", dataDir, "-l", path.join(directory, "postgres.log"), "-o", `-h 127.0.0.1 -p ${port}`, "-w", "start"]);
+    // Only this private cluster is configured. TCP-only avoids Ubuntu's shared Unix socket directory.
+    await appendFile(path.join(dataDir, "postgresql.conf"), `\nlisten_addresses = '127.0.0.1'\nport = ${port}\nunix_socket_directories = ''\n`);
+    const startArgs = ["-D", dataDir, "-l", serverLog, "-t", "20", "-w", "start"];
+    if (serverOptions.length) startArgs.push("-o", serverOptions.join(" "));
+    runBinary(binDir, "pg_ctl", startArgs, startLog);
     // AM: No leer DATABASE_URL/PGHOST/credenciales: siempre el cluster temporal propio.
-    const client = new pg.Client({ host: "127.0.0.1", port, user: "postgres", database: "postgres", ssl: false,
+    client = new pg.Client({ host: "127.0.0.1", port, user: "postgres", password: "", database: "postgres", ssl: false,
       connectionTimeoutMillis: 5000, query_timeout: 10000 });
     await client.connect();
     const actual = (await client.query("SHOW data_directory")).rows[0].data_directory;
-    assert.equal(path.resolve(actual).toLowerCase(), path.resolve(dataDir).toLowerCase());
+    assert.equal(path.resolve(actual), path.resolve(dataDir));
+    assert.equal((await client.query("SHOW listen_addresses")).rows[0].listen_addresses, "127.0.0.1");
+    assert.equal((await client.query("SHOW unix_socket_directories")).rows[0].unix_socket_directories, "");
     return { client, stop };
-  } catch (error) { await stop(); throw error; }
+  } catch (error) {
+    for (const log of [startLog, serverLog]) {
+      try { error.message += `\n${path.basename(log)}:\n${await readFile(log, "utf8")}`; }
+      catch (logError) { if (logError.code !== "ENOENT") error.message += `\nCould not read ${path.basename(log)}: ${logError.message}`; }
+    }
+    await cleanupPreservingError(stop, error);
+    throw error;
+  }
 }
+
+test("cleanup conserva el error primario y adjunta el fallo secundario", async () => {
+  const primary = new Error("primary startup failure");
+  const secondary = new Error("secondary cleanup failure");
+  await cleanupPreservingError(async () => { throw secondary; }, primary);
+  assert.equal(primary.cleanupError, secondary);
+  assert.match(primary.message, /^primary startup failure/);
+  assert.match(primary.message, /secondary cleanup failure/);
+  await assert.rejects(cleanupPreservingError(async () => { throw secondary; }), error => error === secondary);
+});
+
+test("PostgreSQL real: fallo de arranque conserva diagnostico sin stop inexistente", { skip: !RUN }, async () => {
+  await assert.rejects(startIsolatedPostgres({ serverOptions: ["-c", "port=not-a-port"] }), error => {
+    assert.match(error.message, /pg_ctl.*exit=/);
+    assert.match(error.message, /not-a-port/);
+    assert.doesNotMatch(error.message, /PID file.*does not exist|Cleanup failed/);
+    return true;
+  });
+});
 
 async function seed(client, { paidAt = PAID_AT, intentExpiry = EXPIRY, holdExpiry = EXPIRY,
   holdState = "expirado", intentState = "pendiente_confirmacion", citaState = "expirada" } = {}) {
@@ -109,8 +177,9 @@ async function insertPayment(client, paidAt, amount = 1, currency = "HNL") {
 test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en cluster aislado", { skip: !RUN }, async (t) => {
   const isolated = await startIsolatedPostgres();
   const { client } = isolated;
-  const historical = await readFile(new URL("../db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql", import.meta.url), "utf8");
+  let primaryError;
   try {
+    const historical = await readFile(new URL("../db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql", import.meta.url), "utf8");
     await client.query(await readFile(new URL("./sql/microfase2a2/pre_2a2_schema.sql", import.meta.url), "utf8"));
     await client.query(await readFile(new URL("./sql/payments/late_payment_support.sql", import.meta.url), "utf8"));
     await client.query(await readFile(baselineUrl, "utf8"));
@@ -208,5 +277,6 @@ test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en clus
         assert.equal(provider.statusCalls, 0);
       } finally { PaymentProviderFactory._instance = previousProvider; }
     });
-  } finally { await client.end(); await isolated.stop(); }
+  } catch (error) { primaryError = error; throw error; }
+  finally { await cleanupPreservingError(isolated.stop, primaryError); }
 });

@@ -17,22 +17,22 @@ jobs:
       postgres:
         image: supabase/postgres:17.4.1.075
         env:
-          POSTGRES_USER: postgres
+          POSTGRES_USER: supabase_admin
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: masterfade_microfase_2a2
+          POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d masterfade_microfase_2a2"
+          --health-cmd "pg_isready -h 127.0.0.1 -U supabase_admin -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
       PGHOST: localhost
       PGPORT: 5432
-      PGUSER: postgres
+      PGUSER: supabase_admin
       PGPASSWORD: postgres
-      PGDATABASE: masterfade_microfase_2a2
+      PGDATABASE: postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -48,6 +48,7 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_cron_bootstrap.sql
+          psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/ci_migrations_bootstrap.sql
       - name: Load schema and fixtures
         run: |
           psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/pre_2a2_schema.sql
@@ -86,11 +87,16 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/20260702_fase_1b1_cierre_reserva_canonica.sql
       - name: Validate idempotency
         run: psql -v ON_ERROR_STOP=1 -f test/sql/microfase2a2/assert_1b1.sql
+      - name: Apply and validate payment reconciliation window contract
+        run: |
+          psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql
+          psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924011000_assert_pixelpay_reconciliation_window.sql
       - name: Run tests
         run: npm test
       - name: Run database preflight
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/masterfade_microfase_2a2
+          DATABASE_URL: postgresql://supabase_admin:postgres@localhost:5432/postgres
           DB_SSL: "false"
         run: npm run db:preflight
       - name: Run app.inject PostgreSQL integration

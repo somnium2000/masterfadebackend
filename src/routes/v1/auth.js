@@ -2,8 +2,9 @@ import crypto from "node:crypto";
 import jwt from "jsonwebtoken";
 import { getAuthClaims } from "../../utils/authClaims.js";
 import { sendOk } from "../../utils/response.js";
-import { sendError } from "../../utils/errors.js";
-import { generateRecoveryActionLink } from "../../services/authRecovery.js";
+import { AppError, sendError } from "../../utils/errors.js";
+import { acquirePasswordOperationLock, generateRecoveryActionLink, resetPasswordWithRecovery } from "../../services/authRecovery.js";
+import { acquireSupabaseSessionGuard, verifySupabaseAccessToken } from "../../services/supabaseSessionGuard.js";
 import {
   applyProgressiveLoginDelay,
   checkUserTemporaryLock,
@@ -1262,6 +1263,7 @@ export default async function authRoutes(app) {
     async (request, reply) => {
       const supabaseToken = extractSupabaseToken(request);
       const replaceActiveSession = request.body?.replace_active_session === true;
+      let providerSessionGuard;
       if (!supabaseToken) {
         return sendError(reply, 400, "Debes enviar el token de Supabase para realizar el exchange.", {
           code: "AUTH_MISSING_TOKEN",
@@ -1288,14 +1290,8 @@ export default async function authRoutes(app) {
       }
 
       try {
-        const authResult = await app.supabaseAdmin.auth.getUser(supabaseToken);
-        const supabaseUser = authResult.data?.user;
-        if (authResult.error || !supabaseUser?.id) {
-          return sendError(reply, 401, "Token de Supabase invalido o expirado.", {
-            code: "AUTH_SUPABASE_INVALID",
-            details: authResult.error?.message || "SUPABASE_GET_USER_FAILED",
-          });
-        }
+        const { user: supabaseUser, sessionId } = await verifySupabaseAccessToken(app, supabaseToken);
+        providerSessionGuard = await acquireSupabaseSessionGuard(app, supabaseUser, sessionId);
 
         const socialAuthUserId = String(supabaseUser.id || "").trim();
         const internalUserExists = await hasInternalUserByAuthId(app.db, socialAuthUserId);
@@ -1319,6 +1315,7 @@ export default async function authRoutes(app) {
             {
               sub: socialAuthUserId,
               token_type: SOCIAL_CONFIRM_TOKEN_TYPE,
+              session_id: sessionId,
               email: socialEmail,
               nombres: socialNames.nombres,
               apellidos: socialNames.apellidos,
@@ -1449,6 +1446,8 @@ export default async function authRoutes(app) {
         return sendError(reply, 500, "No se pudo completar el exchange de autenticacion", {
           code: "AUTH_EXCHANGE_ERROR",
         });
+      } finally {
+        await providerSessionGuard?.release();
       }
     }
   );
@@ -1468,6 +1467,7 @@ export default async function authRoutes(app) {
       },
     },
     async (request, reply) => {
+      let providerSessionGuard;
       if (!app.db) {
         return sendError(reply, 500, "Base de datos no configurada", {
           code: "DB_NOT_CONFIGURED",
@@ -1518,9 +1518,14 @@ export default async function authRoutes(app) {
           });
         }
 
-        const authLookup = await app.supabaseAdmin.auth.admin.getUserById(authUserId);
+        let authLookup;
+        try { authLookup = await app.supabaseAdmin.auth.admin.getUserById(authUserId); }
+        catch { throw new AppError(503, 'No se pudo verificar la sesión. Intenta nuevamente más tarde.', { code: 'AUTH_SUPABASE_SESSION_UNAVAILABLE' }); }
+        if (authLookup?.error && (!Number(authLookup.error.status) || Number(authLookup.error.status) >= 500)) {
+          throw new AppError(503, 'No se pudo verificar la sesión. Intenta nuevamente más tarde.', { code: 'AUTH_SUPABASE_SESSION_UNAVAILABLE' });
+        }
         const supabaseUser = authLookup?.data?.user;
-        if (authLookup?.error || !supabaseUser?.id) {
+        if (authLookup?.error || supabaseUser?.id !== authUserId) {
           return sendError(reply, 401, "No se pudo validar la identidad social para confirmar.", {
             code: "AUTH_SOCIAL_CONFIRM_USER_NOT_FOUND",
           });
@@ -1538,6 +1543,8 @@ export default async function authRoutes(app) {
             code: "AUTH_SOCIAL_CONFIRM_EMAIL_MISMATCH",
           });
         }
+
+        providerSessionGuard = await acquireSupabaseSessionGuard(app, supabaseUser, decoded.session_id);
 
         let claimsUserId = authUserId;
         let provision = null;
@@ -1635,6 +1642,8 @@ export default async function authRoutes(app) {
         return sendError(reply, 500, "No se pudo confirmar el acceso social.", {
           code: "AUTH_SOCIAL_CONFIRM_ERROR",
         });
+      } finally {
+        await providerSessionGuard?.release();
       }
     }
   );
@@ -1873,6 +1882,7 @@ export default async function authRoutes(app) {
     }
   );
 
+
   app.post("/forgot-password", {
     config: {
       rateLimit: {
@@ -1918,7 +1928,7 @@ export default async function authRoutes(app) {
 
     try {
       // AM: Flujo Opcion 2: generar recovery link con Supabase Admin y enviar correo desde backend SMTP.
-      const recovery = await generateRecoveryActionLink(app, email);
+      const recovery = await generateRecoveryActionLink(app, email, { passwordReset: true });
       if (recovery.found) {
         let fullName = null;
         try {
@@ -1935,15 +1945,12 @@ export default async function authRoutes(app) {
         });
 
         if (!delivery.sent) {
-          request.log.error({ email, delivery }, "No se pudo enviar recovery email por SMTP");
+          request.log.warn({ event: 'auth_recovery_delivery_failed' }, "Recovery delivery unavailable");
         }
       }
-    } catch (error) {
-      request.log.error({ err: error, email }, "No se pudo procesar forgot-password");
-      return sendError(reply, 500, "No se pudo iniciar la recuperacion de contrasena", {
-        code: "AUTH_RESET_ERROR",
-        details: error instanceof Error ? error.message : "Unknown forgot-password error",
-      });
+    } catch {
+      request.log.warn({ event: 'auth_recovery_request_failed' }, "Recovery request unavailable");
+      // Keep the public result neutral even when delivery/provider fails for an existing account.
     }
 
     return sendOk(reply, {
@@ -1951,6 +1958,34 @@ export default async function authRoutes(app) {
       rateLimit: rateLimitState.rateLimit,
     });
   });
+
+  app.post(
+    '/reset-password', {
+      config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+      schema: { body: { type: 'object', additionalProperties: false,
+        required: ['token_hash','contrasena','confirmar_contrasena'], properties: {
+          token_hash: { type: 'string', pattern: '^[A-Za-z0-9_-]{20,2048}$' },
+          contrasena: registerBodySchema.properties.contrasena, confirmar_contrasena: registerBodySchema.properties.confirmar_contrasena,
+          id_usuario: false, email: false, access_token: false, supabase_token: false,
+        } } },
+    }, async (request, reply) => {
+      const body = request.body;
+      if (validatePublicPassword(body.contrasena) || body.contrasena !== body.confirmar_contrasena) {
+        return sendError(reply, 400, 'Revisa la contraseña y su confirmación.', { code: 'AUTH_RESET_PASSWORD_INVALID' });
+      }
+      try {
+        const current = verifyManagedAppSessionPayload(getSessionTokenFromRequest(request));
+        const result = await resetPasswordWithRecovery(app, body, current?.sub || null);
+        clearSessionCookies(app, reply);
+        return sendOk(reply, result);
+      } catch (error) {
+        request.log.warn({ event: 'auth_password_reset_failed', code: error instanceof AppError ? error.code : 'TEMPORARY' });
+        return sendError(reply, [401,409].includes(error?.statusCode) ? error.statusCode : 503,
+          error instanceof AppError ? error.message : 'No se pudo confirmar el cambio. Solicita un enlace nuevo.',
+          { code: error instanceof AppError ? error.code : 'AUTH_RESET_UNCONFIRMED' });
+      }
+    }
+  );
 
   app.post(
     "/login",
@@ -1975,6 +2010,7 @@ export default async function authRoutes(app) {
       const contrasena = String(body.contrasena ?? body.password ?? "");
       const remember = body.remember === true;
       const replaceActiveSession = body.replace_active_session === true;
+      let passwordLock;
 
       if (!identifier || !contrasena) {
         return sendError(reply, 400, "Faltan credenciales: se requiere correo y contrasena", {
@@ -2028,6 +2064,7 @@ export default async function authRoutes(app) {
           });
         }
 
+        passwordLock = await acquirePasswordOperationLock(app, identifier);
         const { data, error } = await app.supabase.auth.signInWithPassword({
           email: identifier,
           password: contrasena,
@@ -2111,7 +2148,7 @@ export default async function authRoutes(app) {
             requestId: request.id,
           });
         }
-        if (["AUTH_LOCK_CHECK_UNAVAILABLE", "AUTH_USER_TEMPORARILY_LOCKED"].includes(error?.code)) {
+        if (["AUTH_LOCK_CHECK_UNAVAILABLE", "AUTH_USER_TEMPORARILY_LOCKED", "AUTH_PASSWORD_UNAVAILABLE"].includes(error?.code)) {
           return sendError(reply, error.statusCode, error.message, { code: error.code, requestId: request.id });
         }
         const message = error instanceof Error ? error.message : "Unknown login error";
@@ -2131,6 +2168,8 @@ export default async function authRoutes(app) {
           code: "AUTH_LOGIN_ERROR",
           details: message,
         });
+      } finally {
+        await passwordLock?.release();
       }
     }
   );
