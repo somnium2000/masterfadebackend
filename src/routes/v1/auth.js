@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { classifyRegistrationEmail, requestGuestRegistration, completeGuestRegistration } from "../../services/guestRegistrationService.js";
 import jwt from "jsonwebtoken";
 import { getAuthClaims } from "../../utils/authClaims.js";
 import { sendOk } from "../../utils/response.js";
@@ -379,39 +380,7 @@ function validatePublicPassword(password) {
 }
 
 async function ensureRegisterEmailAvailability(client, email) {
-  const correoResult = await client.query(
-    `
-      SELECT 1
-      FROM public.correos
-      WHERE LOWER(direccion_correo::text) = LOWER($1)
-      LIMIT 1
-    `,
-    [email]
-  );
-  if (correoResult.rowCount) {
-    throw {
-      statusCode: 409,
-      message: "El correo ya esta registrado.",
-      code: "AUTH_REGISTER_EMAIL_EXISTS",
-    };
-  }
-
-  const authResult = await client.query(
-    `
-      SELECT 1
-      FROM auth.users
-      WHERE LOWER(email::text) = LOWER($1)
-      LIMIT 1
-    `,
-    [email]
-  );
-  if (authResult.rowCount) {
-    throw {
-      statusCode: 409,
-      message: "El correo ya esta registrado.",
-      code: "AUTH_REGISTER_EMAIL_EXISTS",
-    };
-  }
+  return classifyRegistrationEmail(client, email);
 }
 
 async function getClienteRoleId(client) {
@@ -1705,12 +1674,26 @@ export default async function authRoutes(app) {
         });
       }
 
-      const client = await app.db.connect();
+      let client = await app.db.connect();
       let authUserId = null;
       let transactionStarted = false;
 
       try {
-        await ensureRegisterEmailAvailability(client, email);
+        const historicalContact = await ensureRegisterEmailAvailability(client, email);
+        if (historicalContact) {
+          // AM: No retener una conexión mientras el registro histórico solicita otra al mismo pool.
+          client.release();
+          client = null;
+          try {
+            const pending = await requestGuestRegistration(app, email);
+            return sendOk(reply, pending, { statusCode: 202, requestId: request.id });
+          } catch (error) {
+            if (error instanceof AppError) throw error;
+            throw new AppError(503, "No se pudo enviar la confirmación en este momento. Intenta más tarde.", {
+              code: "AUTH_REGISTER_TEMPORARY",
+            });
+          }
+        }
         const clienteRoleId = await getClienteRoleId(client);
 
         const authCreateResult = await app.supabaseAdmin.auth.admin.createUser({
@@ -1859,6 +1842,7 @@ export default async function authRoutes(app) {
         }
 
         if (error?.statusCode && error?.code) {
+          if (error.registrationReason) request.log.warn({ event: 'registration_unavailable', reason: error.registrationReason });
           return sendError(reply, error.statusCode, error.message, {
             code: error.code,
             details: error.details,
@@ -1877,11 +1861,56 @@ export default async function authRoutes(app) {
           details: error instanceof Error ? error.message : "Unknown register error",
         });
       } finally {
-        client.release();
+        client?.release();
       }
     }
   );
 
+  app.post('/register/resend', {
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+    schema: { body: { type: 'object', required: ['email'], additionalProperties: false,
+      properties: { email: { type: 'string', minLength: 5, maxLength: 160 } } } },
+  }, async (request, reply) => {
+    try {
+      const email = normalizeEmail(request.body.email);
+      if (!isValidEmail(email)) return sendError(reply, 400, 'Ingresa un correo válido.', { code: 'AUTH_INVALID_EMAIL' });
+      return sendOk(reply, await requestGuestRegistration(app, email), { statusCode: 202 });
+    } catch (error) {
+      request.log.warn({ event: 'guest_registration_resend_failed', code: error?.code || 'TEMPORARY' });
+      if (error?.statusCode === 409) return sendOk(reply, { pending_verification: true,
+        message: 'Si es posible continuar, recibirás un enlace para confirmar tu correo. Revisa tu bandeja de entrada.' }, { statusCode: 202 });
+      return sendError(reply, 503, 'No se pudo enviar la confirmación en este momento. Intenta más tarde.', { code: 'AUTH_REGISTER_TEMPORARY' });
+    }
+  });
+
+  app.post('/register/confirm', {
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+    schema: { body: { type: 'object', additionalProperties: false,
+      required: ['operation', 'token', 'nombres', 'apellidos', 'contrasena', 'confirmar_contrasena', 'acepta_terminos'],
+      properties: {
+        operation: { type: 'string', format: 'uuid' }, token: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        email: false,
+        nombres: registerBodySchema.properties.nombres, apellidos: registerBodySchema.properties.apellidos,
+        contrasena: registerBodySchema.properties.contrasena, confirmar_contrasena: registerBodySchema.properties.confirmar_contrasena,
+        acepta_terminos: { type: 'boolean' }, consentimiento_marketing: { type: 'boolean' },
+      } } },
+  }, async (request, reply) => {
+    const body = request.body;
+    if (!normalizeRequiredText(body.nombres) || !normalizeRequiredText(body.apellidos)
+      || !body.acepta_terminos || validatePublicPassword(body.contrasena)
+      || body.contrasena !== body.confirmar_contrasena) {
+      return sendError(reply, 400, 'Revisa tus datos, contraseña y aceptación de términos.', { code: 'AUTH_REGISTER_CONFIRM_INVALID' });
+    }
+    try {
+      return sendOk(reply, await completeGuestRegistration(app, body, insertClientWithConsents));
+    } catch (error) {
+      request.log.warn({ event: 'guest_registration_confirmation_failed', code: error?.code || 'TEMPORARY' });
+      const status = [401, 409, 410].includes(error?.statusCode) ? error.statusCode : 503;
+      return sendError(reply, status, status === 410 ? 'El enlace expiró. Solicita uno nuevo.'
+        : 'No se pudo completar el registro. Solicita un nuevo enlace o utiliza el acceso existente.',
+      { code: status === 410 ? 'AUTH_REGISTER_LINK_EXPIRED' : 'AUTH_REGISTER_CONFIRM_FAILED' });
+    }
+  });
 
   app.post("/forgot-password", {
     config: {

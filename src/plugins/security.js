@@ -14,6 +14,8 @@ const CSRF_EXEMPT_PATHS = [
   "/v1/auth/exchange",
   "/v1/auth/social/confirm",
   "/v1/auth/register",
+  "/v1/auth/register/confirm",
+  "/v1/auth/register/resend",
   "/v1/auth/forgot-password",
   "/v1/auth/reset-password",
   "/v1/pagos/webhook/mock",
