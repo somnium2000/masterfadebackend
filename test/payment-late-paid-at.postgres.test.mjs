@@ -159,8 +159,8 @@ async function seed(client, { paidAt = PAID_AT, intentExpiry = EXPIRY, holdExpir
   await client.query("INSERT INTO public.correos(id_persona,direccion_correo) VALUES ($1,$2)", [PERSON, EMAIL]);
   await client.query("INSERT INTO public.citas_grupos(id_grupo_cita,id_persona_titular,total_hnl,estado_grupo_codigo) VALUES ($1,$2,1,'cancelado')", [GROUP, PERSON]);
   await client.query(`INSERT INTO public.citas(id_cita,id_grupo_cita,id_sucursal,id_empleado_barbero,inicio_at,fin_at,
-    estado_cita_codigo,orden_integrante,total_pagar_hnl,subtotal_servicios_hnl)
-    VALUES ($1,$2,$3,$4,'2026-10-12 08:00:00-06','2026-10-12 08:15:00-06',$5,1,1,1)`, [CITA, GROUP, PERSON, BARBER, citaState]);
+    estado_cita_codigo,orden_integrante,total_pagar_hnl,subtotal_servicios_hnl,id_persona_cliente,contacto_email)
+    VALUES ($1,$2,$3,$4,'2026-10-12 08:00:00-06','2026-10-12 08:15:00-06',$5,1,1,1,$3,$6)`, [CITA, GROUP, PERSON, BARBER, citaState, EMAIL]);
   await client.query("INSERT INTO public.citas_holds(id_hold,id_cita,expires_at,estado_hold_codigo) VALUES ($1,$2,$3,$4)", [HOLD, CITA, holdExpiry, holdState]);
   await client.query("INSERT INTO public.payment_providers(id_provider,codigo) VALUES ($1,'pixelpay')", [PROVIDER]);
   await client.query(`INSERT INTO public.payment_intents(id_intent,id_cita,id_hold,id_grupo_cita,id_provider,monto_hnl,
