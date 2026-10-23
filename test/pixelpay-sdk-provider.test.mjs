@@ -715,7 +715,9 @@ test("clasifica FailureResponse 520 sin conservar el mensaje del SDK", async (t)
       assert.equal(classifySdkFailureMessage(response), scenario.expected);
 
       const result = await makeProvider(makeFakeSdk({ saleResponse: response })).sale(saleInput);
-      const serialized = JSON.stringify(result.diagnostics);
+      const semanticDiagnostics = { ...result.diagnostics };
+      delete semanticDiagnostics.paymentAttemptId;
+      const serialized = JSON.stringify(semanticDiagnostics);
       assert.equal(result.diagnostics.safeMessageCode, scenario.expected);
       assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.UNCERTAIN);
       assert.equal(result.statusCode, 520);
