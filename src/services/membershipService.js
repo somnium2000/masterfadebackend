@@ -18,6 +18,7 @@ const MEMBERSHIP_CONSUMPTION_TYPES = {
   COURTESY: "cortesia",
 };
 const MEMBERSHIP_CONFIRMABLE_INTENT_STATES = new Set(["creado", "link_generado", "pendiente_confirmacion"]);
+const MEMBERSHIP_SIMULATOR_EVIDENCE = Symbol("membership-simulator-evidence");
 // AM: Lista de errores SQL de compatibilidad de esquema (tabla/columna/tipo ausente).
 const SCHEMA_COMPATIBLE_ERROR_CODES = new Set(["42P01", "42703", "42704"]);
 // AM: Literal SQL seguro para fallback de beneficios cuando no existe la columna snapshot.
@@ -762,57 +763,6 @@ async function lockClienteMembershipScope(client, clienteId) {
   }
 }
 
-async function getSubscriptionPrice(client, { idPlan, idSucursal }) {
-  const capabilities = await getMembershipCapabilities(client);
-  if (!capabilities.hasMembershipPlans || !capabilities.hasMembershipPlansSucursal) return null;
-  const selectCategoria = capabilities.hasPlanCategoriaNivel ? "mp.categoria_nivel" : "1::smallint AS categoria_nivel";
-
-  try {
-    const { rows } = await client.query(
-      `
-        WITH scoped_offers AS (
-          SELECT
-            mps.id_plan,
-            mps.id_sucursal,
-            mps.precio_hnl,
-            mps.activo,
-            mps.visible_publico,
-            ROW_NUMBER() OVER (
-              PARTITION BY mps.id_plan, mps.id_sucursal
-              ORDER BY mps.updated_at DESC, mps.id_plan_sucursal DESC
-            ) AS rn
-          FROM public.membership_plans_sucursal mps
-          WHERE mps.id_plan = $1::uuid
-            AND mps.id_sucursal = $2::uuid
-        )
-        SELECT
-          mp.id_plan,
-          mp.nombre_plan,
-          mp.descripcion,
-          mp.periodo_membresia_codigo,
-          ${selectCategoria},
-          mp.beneficios,
-          mp.activo AS plan_activo,
-          so.id_sucursal,
-          so.precio_hnl,
-          so.activo AS oferta_activa,
-          so.visible_publico
-        FROM public.membership_plans mp
-        JOIN scoped_offers so
-          ON so.id_plan = mp.id_plan
-         AND so.rn = 1
-        WHERE mp.id_plan = $1::uuid
-        LIMIT 1
-      `,
-      [idPlan, idSucursal]
-    );
-    return rows[0] ?? null;
-  } catch (error) {
-    if (isSchemaCompatibilityError(error)) return null;
-    throw error;
-  }
-}
-
 async function getMembershipPurchaseOrderCapabilities(client) {
   if (membershipPurchaseOrderCapabilitiesCache) return membershipPurchaseOrderCapabilitiesCache;
 
@@ -1423,6 +1373,11 @@ export async function createMembershipOrderPaymentIntent(client, {
   }
 
   const configuredProvider = safeText(process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
+  if (configuredProvider === "pixelpay") {
+    throw new AppError(409, "Las compras de membresias con PixelPay aun no estan disponibles", {
+      code: "MEMBERSHIP_PIXELPAY_CHECKOUT_NOT_AVAILABLE",
+    });
+  }
   const provider = await ensureActivePaymentProvider(client, configuredProvider);
   const providerAdapter = PaymentProviderFactory.create();
   const resolvedUsuarioId = await resolveMembershipIntentCreatorUserId(client, {
@@ -1697,6 +1652,7 @@ async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
 export async function confirmMembershipPaymentAndActivateSubscription(client, {
   idPaymentIntent,
   clienteId,
+  financialEvidence = null,
 } = {}) {
   const safeIntentId = normalizeText(idPaymentIntent);
   const safeClienteId = normalizeText(clienteId);
@@ -1764,6 +1720,13 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     });
   }
 
+  if (financialEvidence !== MEMBERSHIP_SIMULATOR_EVIDENCE) {
+    throw new AppError(409, "El pago de la membresia requiere verificacion del proveedor", {
+      code: "MEMBERSHIP_PAYMENT_VERIFICATION_REQUIRED",
+      details: { id_payment_intent: safeIntentId },
+    });
+  }
+
   await client.query(
     `
       UPDATE public.membership_purchase_orders
@@ -1827,7 +1790,21 @@ export async function processMembershipSimulatorEvent(client, {
   idPaymentIntent,
   clienteId,
   montoPruebaHnl = null,
+  serverContext = null,
 } = {}) {
+  const simulatorAllowed = (
+    normalizeText(serverContext?.paymentProvider).toLowerCase() === "todopago"
+    && normalizeText(serverContext?.mode).toLowerCase() === "preprod_simulated"
+    && serverContext?.simulatedEnabled === true
+    && serverContext?.explicitlyEnabled === true
+    && ["development", "test"].includes(normalizeText(serverContext?.nodeEnv).toLowerCase())
+  );
+  if (!simulatorAllowed) {
+    throw new AppError(409, "El simulador de pagos no esta disponible en este entorno", {
+      code: "MEMBERSHIP_PAYMENT_SIMULATOR_DISABLED",
+    });
+  }
+
   const safeIntentId = normalizeText(idPaymentIntent);
   const safeClienteId = normalizeText(clienteId);
   if (!safeIntentId || !safeClienteId) {
@@ -1906,6 +1883,7 @@ export async function processMembershipSimulatorEvent(client, {
     const confirmation = await confirmMembershipPaymentAndActivateSubscription(client, {
       idPaymentIntent: safeIntentId,
       clienteId: safeClienteId,
+      financialEvidence: MEMBERSHIP_SIMULATOR_EVIDENCE,
     });
     return {
       processed: true,
@@ -2175,136 +2153,14 @@ export async function cancelMembershipBySubscription(client, {
 }
 
 export async function acquireMembershipPlan(client, { clienteId, usuarioId, idPlan, idSucursal }) {
-  // AM: Protege entornos con migraci�n parcial devolviendo error de negocio controlado.
-  const capabilities = await getMembershipCapabilities(client);
-  if (!capabilities.hasSubscriptions || !capabilities.hasMembershipPlans || !capabilities.hasMembershipPlansSucursal) {
-    throw new AppError(503, "El m�dulo de membres�as a�n no est� listo. Aplica la migraci�n pendiente.", {
-      code: "MEMBERSHIP_SCHEMA_NOT_READY",
-    });
-  }
-
-  await lockClienteMembershipScope(client, clienteId);
-  const lifecycle = await ensureSubscriptionLifecycle(client, clienteId, {
-    forUpdate: true,
-    idSucursal,
+  void client;
+  void clienteId;
+  void usuarioId;
+  void idPlan;
+  void idSucursal;
+  throw new AppError(409, "La membresia requiere un pago verificado antes de activarse", {
+    code: "MEMBERSHIP_PURCHASE_REQUIRES_VERIFIED_PAYMENT",
   });
-  const previousActive = lifecycle.active || null;
-  let transitionType = "adquisicion";
-  let closedPrevious = null;
-
-  const planOffer = await getSubscriptionPrice(client, { idPlan, idSucursal });
-  if (!planOffer || !planOffer.plan_activo || !planOffer.oferta_activa || !planOffer.visible_publico) {
-    throw new AppError(404, "El plan seleccionado no est� disponible para adquisici�n.", {
-      code: "MEMBERSHIP_PLAN_NOT_AVAILABLE",
-      details: { id_plan: idPlan, id_sucursal: idSucursal },
-    });
-  }
-
-  const snapshot = normalizeBenefitsSnapshot(planOffer.beneficios);
-
-  if (previousActive) {
-    closedPrevious = await closeSubscriptionById(client, previousActive.id_suscripcion, {
-      statusCode: EXPIRED_STATUS,
-      motivoFinCodigo: "reemplazo",
-    });
-    transitionType = previousActive.id_plan === idPlan ? "renovacion" : "cambio_plan";
-  }
-
-  const insertColumns = [
-    "id_cliente",
-    "id_plan",
-    "estado_suscripcion_codigo",
-    "inicio_at",
-    "fin_at",
-    "renovacion_auto",
-    "cancelada_al_fin",
-    "created_by_usuario_id",
-  ];
-  const insertValues = [
-    "$1::uuid",
-    "$2::uuid",
-    "'activa'",
-    "now()",
-    "now() + interval '1 month'",
-    "FALSE",
-    "FALSE",
-    "$3::uuid",
-  ];
-  const insertParams = [clienteId, idPlan, usuarioId ?? null];
-
-  if (capabilities.hasSubsSucursalContratada) {
-    insertColumns.push("id_sucursal_contratada");
-    insertValues.push("$4::uuid");
-    insertParams.push(idSucursal);
-  }
-  if (capabilities.hasSubsBeneficiosSnapshot) {
-    const bindIndex = insertParams.length + 1;
-    insertColumns.push("beneficios_snapshot");
-    insertValues.push(`$${bindIndex}::jsonb`);
-    insertParams.push(JSON.stringify(snapshot));
-  }
-
-  const { rows } = await client.query(
-    `
-      INSERT INTO public.subscriptions (
-        ${insertColumns.join(", ")}
-      )
-      VALUES (
-        ${insertValues.join(", ")}
-      )
-      RETURNING *
-    `,
-    insertParams
-  );
-
-  const subscription = rows[0];
-
-  if (capabilities.hasSubscriptionPayments) {
-    await client.query(
-      `
-        INSERT INTO public.subscription_payments (
-          id_suscripcion,
-          monto_hnl,
-          moneda_codigo,
-          metodo,
-          estado,
-          id_payment,
-          registrado_por_usuario_id
-        )
-        VALUES (
-          $1::uuid,
-          $2::numeric,
-          'HNL',
-          'online',
-          'pendiente',
-          NULL,
-          $3::uuid
-        )
-      `,
-      [subscription.id_suscripcion, toNumber(planOffer.precio_hnl, 0), usuarioId ?? null]
-    );
-  }
-
-  return {
-    subscription,
-    plan: {
-      id_plan: planOffer.id_plan,
-      nombre_plan: planOffer.nombre_plan,
-      descripcion: planOffer.descripcion ?? null,
-      categoria_nivel: toInt(planOffer.categoria_nivel, 1),
-      precio_hnl: toNumber(planOffer.precio_hnl, 0),
-      periodo_membresia_codigo: planOffer.periodo_membresia_codigo,
-    },
-    snapshot,
-    transition: {
-      tipo: transitionType,
-      tenia_plan_activo: Boolean(previousActive),
-      suscripcion_anterior_id: previousActive?.id_suscripcion ?? null,
-      suscripcion_anterior_cerrada_id: closedPrevious?.id_suscripcion ?? null,
-      id_plan_anterior: previousActive?.id_plan ?? null,
-      id_plan_nuevo: idPlan,
-    },
-  };
 }
 
 function mapConsumptionHistory(rows = []) {
