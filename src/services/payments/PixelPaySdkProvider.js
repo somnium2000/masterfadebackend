@@ -12,6 +12,7 @@ import {
   createPixelPayStatusSignature,
   classifyPixelPaySaleResult,
   HONDURAS_ISO_3166_2_CODES,
+  normalizePixelPayStatusResponse,
   PIXELPAY_SALE_OUTCOME,
 } from "./PixelPayDirectProvider.js";
 
@@ -582,18 +583,21 @@ export class PixelPaySdkProvider extends PaymentProvider {
 
     const statusCode = responseStatus(response);
     const transactionResult = this.readTransactionResult(response);
-    const result = transactionResult.result;
-    const status = text(result?.status).toUpperCase() || "UNKNOWN";
+    // AM: sdk-core@2.5.8 no declara `status` en TransactionResult; el contrato
+    // oficial de Status lo entrega en el envelope como `data.status`.
+    const payload = normalizePixelPayStatusResponse({
+      success: responseSuccess(response),
+      data: transactionResult.valid && transactionResult.dataPresent && transactionResult.parsed
+        ? { status: response?.data?.status }
+        : {},
+    });
     return {
       ok: statusCode != null && statusCode >= 200 && statusCode < 300,
       statusCode,
-      success: responseSuccess(response),
+      success: payload.success,
       paymentUuid: normalizedUuid,
-      status,
-      response: {
-        success: responseSuccess(response),
-        data: { status },
-      },
+      status: payload.data.status,
+      response: payload,
     };
   }
 }

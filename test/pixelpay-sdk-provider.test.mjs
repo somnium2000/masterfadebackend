@@ -811,10 +811,10 @@ test("diagnostico SDK identifica campos ausentes, montos y flags de respuesta", 
   }
 });
 
-test("SDK Status valido usa TransactionResult y devuelve PAID", async () => {
+test("SDK Status valido usa data.status del envelope oficial y devuelve PAID", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { data: { status: "raw-no-confiable" }, valid: true }),
-    transactionResult: { status: "paid" },
+    statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
+    transactionResult: {},
   });
   const provider = makeProvider(fake);
   const result = await provider.queryPaymentStatus(PAYMENT_UUID);
@@ -883,7 +883,7 @@ test("SDK Status con fromResponse fallido devuelve UNKNOWN sin filtrar payload",
 test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", async () => {
   const fake = makeFakeSdk({
     statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
-    transactionResult: { status: "paid" },
+    transactionResult: {},
   });
   const provider = makeProvider(fake);
 
