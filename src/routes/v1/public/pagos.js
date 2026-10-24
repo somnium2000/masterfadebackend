@@ -32,6 +32,7 @@ import {
 } from "../../../services/bookingCanonicalReservationService.js";
 
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const AUTHENTICATED_PAYMENT_ROLES = ["cliente"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
 const PIXELPAY_SANDBOX_CARD_NUMBERS = new Set(["4111111111111111", "5555555555554444"]);
 
@@ -727,7 +728,21 @@ async function ensureProvider(client, providerCode) {
   return inserted.rows[0];
 }
 
-async function loadPublicGroup(client, { groupId, titularEmail }) {
+function resolveAuthenticatedPaymentOwner(request) {
+  const owner = {
+    clienteId: safeText(request.claims?.cliente_id),
+    personaId: safeText(request.claims?.user?.id_persona),
+    usuarioId: safeText(request.claims?.user?.id_usuario),
+  };
+  if (!owner.clienteId || !owner.personaId || !owner.usuarioId) {
+    throw new AppError(409, "El usuario autenticado no tiene un perfil cliente activo", {
+      code: "PAGOS_CLIENT_CONTEXT_REQUIRED",
+    });
+  }
+  return owner;
+}
+
+async function loadPublicGroup(client, { groupId, titularEmail, access = null }) {
   const result = await client.query(
     `
       SELECT
@@ -810,9 +825,18 @@ async function loadPublicGroup(client, { groupId, titularEmail }) {
   const dbTitularEmail = distinctEmails.size === 1 ? persistedEmails[0]
     : distinctEmails.size === 0 && Number(titular?.primary_email_count) === 1
       ? normalizeEmail(titular.direccion_correo || "") : "";
+  if (access?.mode === "public" && titular?.id_cliente_titular) {
+    throw new AppError(403, "Debes iniciar sesion para operar esta reserva", {
+      code: "PUBLIC_PAGOS_AUTHENTICATED_GROUP_REQUIRED",
+    });
+  }
+  const authenticatedOwnerMatches = access?.mode !== "authenticated" || (
+    String(titular?.id_cliente_titular || "") === String(access.owner?.clienteId || "")
+    && String(titular?.id_persona_titular || "") === String(access.owner?.personaId || "")
+  );
   if (contradictoryTitular || !personaMatches || !clientMatches || !snapshotMatches || !normalizedTitularEmail
     || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(dbTitularEmail)
-    || normalizedTitularEmail !== dbTitularEmail) {
+    || normalizedTitularEmail !== dbTitularEmail || !authenticatedOwnerMatches) {
     throw new AppError(403, "No tienes permisos para operar esta reserva", { code: "PUBLIC_PAGOS_GROUP_FORBIDDEN" });
   }
   return result.rows;
@@ -838,8 +862,9 @@ async function loadPublicIntentForGroup(client, {
   idIntent,
   titularEmail,
   expectedAmountHnl = null,
+  access = null,
 }) {
-  const groupRows = await loadPublicGroup(client, { groupId, titularEmail });
+  const groupRows = await loadPublicGroup(client, { groupId, titularEmail, access });
   const intentResult = await client.query(
     `
       SELECT
@@ -891,6 +916,12 @@ async function loadPublicIntentForGroup(client, {
   if (intent.id_hold && String(intent.intent_hold_group_id || "").trim() !== groupId) {
     throw new AppError(409, "El hold del intent no pertenece a la reserva indicada", {
       code: "PUBLIC_PAGOS_INTENT_HOLD_MISMATCH",
+    });
+  }
+  if (access?.mode === "authenticated"
+    && String(intent.created_by_usuario_id || "") !== String(access.owner?.usuarioId || "")) {
+    throw new AppError(403, "No tienes permisos para operar este intent", {
+      code: "PAGOS_INTENT_FORBIDDEN",
     });
   }
   if (expectedAmountHnl !== null && !amountsMatch(intent.monto_hnl, expectedAmountHnl)) {
@@ -1810,8 +1841,16 @@ async function activatePixelPayDirectIntent(client, { idGrupoCita, idIntent, ord
   }
 }
 
-export default async function publicPagosRoutes(app) {
+export default async function publicPagosRoutes(app, options = {}) {
+  const authenticated = options.authenticated === true;
+  const routeGuard = authenticated
+    ? { preHandler: app.requireRoles(AUTHENTICATED_PAYMENT_ROLES) }
+    : {};
+  const paymentAccess = (request) => authenticated
+    ? { mode: "authenticated", owner: resolveAuthenticatedPaymentOwner(request) }
+    : { mode: "public" };
   app.post("/crear-intent", {
+    ...routeGuard,
     schema: {
       body: {
         type: "object",
@@ -1842,9 +1881,12 @@ export default async function publicPagosRoutes(app) {
         "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
         [`public-payment-intent:${idGrupoCita}`]
       );
-      const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+      const access = paymentAccess(request);
+      const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail, access });
       const pricing = await recalculateGroupPromotionsForPayment(dbClient, { idGrupoCita, logger: request.log });
-      const createdByUserId = await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
+      const createdByUserId = access.mode === "authenticated"
+        ? access.owner.usuarioId
+        : await resolvePublicIntentCreatorUserId(dbClient, { groupRows });
       assertPublicGroupPayable(groupRows);
       const groupExpiresAt = resolveGroupExpiresAt(groupRows);
       const customerName = resolveCustomerName(groupRows);
@@ -2148,6 +2190,7 @@ export default async function publicPagosRoutes(app) {
   });
 
   app.post("/pixelpay/sale", {
+    ...routeGuard,
     config: {
       rateLimit: buildPixelPaySaleRateLimitConfig(),
     },
@@ -2190,7 +2233,8 @@ export default async function publicPagosRoutes(app) {
         "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
         [`pixelpay-sale:${idIntent}`]
       );
-      const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+      const access = paymentAccess(request);
+      const groupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail, access });
       assertPublicGroupPayable(groupRows);
       resolveGroupExpiresAt(groupRows);
       const pricing = await recalculateGroupPromotionsForPayment(dbClient, {
@@ -2219,6 +2263,7 @@ export default async function publicPagosRoutes(app) {
         idIntent,
         titularEmail,
         expectedAmountHnl: totalHnl,
+        access,
       });
       const intent = loaded.intent;
       if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
@@ -2445,6 +2490,7 @@ export default async function publicPagosRoutes(app) {
   });
 
   app.post("/pixelpay/status", {
+    ...routeGuard,
     schema: {
       body: {
         type: "object",
@@ -2462,14 +2508,16 @@ export default async function publicPagosRoutes(app) {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
       const titularEmail = normalizeEmail(request.body?.titular_email);
+      const access = paymentAccess(request);
       const currentTotal = calculateGroupTotalFromRows(
-        await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail })
+        await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail, access })
       );
       const { intent, groupRows } = await loadPublicIntentForGroup(app.db, {
         groupId: idGrupoCita,
         idIntent,
         titularEmail,
         expectedAmountHnl: currentTotal,
+        access,
       });
       if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
         throw new AppError(409, "El intent no pertenece a PixelPay", {
@@ -2547,6 +2595,7 @@ export default async function publicPagosRoutes(app) {
   });
 
   app.post("/estado", {
+    ...routeGuard,
     schema: {
       body: {
         type: "object",
@@ -2564,12 +2613,14 @@ export default async function publicPagosRoutes(app) {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
       const titularEmail = normalizeEmail(request.body?.titular_email);
-      const currentTotal = calculateGroupTotalFromRows(await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail }));
+      const access = paymentAccess(request);
+      const currentTotal = calculateGroupTotalFromRows(await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail, access }));
       const { groupRows, intent } = await loadPublicIntentForGroup(app.db, {
         groupId: idGrupoCita,
         idIntent,
         titularEmail,
         expectedAmountHnl: currentTotal,
+        access,
       });
       const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "") === "confirmada");
       const intentState = safeText(intent.estado_intent_codigo)?.toLowerCase() || "";
@@ -2616,6 +2667,7 @@ export default async function publicPagosRoutes(app) {
   });
 
   app.post("/mock-completar", {
+    ...routeGuard,
     schema: {
       body: {
         type: "object",
@@ -2638,13 +2690,15 @@ export default async function publicPagosRoutes(app) {
       const status = safeText(request.body?.status)?.toLowerCase() || "paid";
       const providerEventId = safeText(request.body?.provider_event_id) || `mock_${idIntent}_${status}`;
       await dbClient.query("BEGIN");
-      const initialGroupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail: request.body?.titular_email });
+      const access = paymentAccess(request);
+      const initialGroupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail: request.body?.titular_email, access });
       const expectedAmount = calculateGroupTotalFromRows(initialGroupRows);
       const { intent, groupRows } = await loadPublicIntentForGroup(dbClient, {
         groupId: idGrupoCita,
         idIntent,
         titularEmail: request.body?.titular_email,
         expectedAmountHnl: expectedAmount,
+        access,
       });
       if (safeText(intent.provider_code)?.toLowerCase() !== "mock") {
         throw new AppError(409, "El intent no pertenece al proveedor simulado solicitado", {
@@ -2776,6 +2830,7 @@ export default async function publicPagosRoutes(app) {
   });
 
   app.post("/simulator/event", {
+    ...routeGuard,
     schema: {
       body: {
         type: "object",
@@ -2805,13 +2860,15 @@ export default async function publicPagosRoutes(app) {
 
       await dbClient.query("BEGIN");
 
-      const initialGroupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail });
+      const access = paymentAccess(request);
+      const initialGroupRows = await loadPublicGroup(dbClient, { groupId: idGrupoCita, titularEmail, access });
       const expectedAmount = calculateGroupTotalFromRows(initialGroupRows);
       const { intent, groupRows } = await loadPublicIntentForGroup(dbClient, {
         groupId: idGrupoCita,
         idIntent,
         titularEmail,
         expectedAmountHnl: expectedAmount,
+        access,
       });
       if (safeText(intent.provider_code)?.toLowerCase() !== "todopago") {
         throw new AppError(409, "El intent no pertenece al proveedor simulado solicitado", {

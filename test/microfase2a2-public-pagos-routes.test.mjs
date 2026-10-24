@@ -30,6 +30,9 @@ const SERVICE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const DETAIL_A = "12121212-1212-4121-8121-121212121212";
 const PROVIDER_A = "22222222-2222-4222-8222-222222222222";
 const USER_A = "88888888-8888-4888-8888-888888888888";
+const USER_B = "89888888-8888-4888-8888-888888888888";
+const CLIENT_A = "89898989-8989-4989-8989-898989898989";
+const CLIENT_B = "90909090-9090-4090-8090-909090909090";
 const INTENT_A = "99999999-9999-4999-8999-999999999999";
 const PROMO_A = "13131313-1313-4131-8131-131313131313";
 const PROMO_RULE_A = "14141414-1414-4141-8141-141414141414";
@@ -232,6 +235,8 @@ function createPagosClient({
   citaId = CITA_A,
   holdId = HOLD_A,
   amountHnl = 115,
+  groupClientId = null,
+  groupPersonId = USER_A,
 } = {}) {
   const calls = [];
   const statusChecks = [];
@@ -261,6 +266,10 @@ function createPagosClient({
   ];
   for (const row of groupState) {
     row.id_grupo_cita = groupId;
+    row.id_cliente_titular = groupClientId;
+    row.cita_cliente_id = groupClientId;
+    row.id_persona_titular = groupPersonId;
+    row.id_persona_cliente = groupPersonId;
     row.total_pagar_hnl = String(amountHnl);
     row.estado_grupo_codigo = groupStateCode;
   }
@@ -679,6 +688,8 @@ async function createPagosApp(client, {
   providerAdapter = null,
   logs = null,
   connectFactory = null,
+  authenticated = false,
+  claims = null,
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -692,6 +703,9 @@ async function createPagosApp(client, {
       : false,
   });
   app.decorate("config", { paymentProvider: providerCode });
+  app.decorate("requireRoles", () => async (request) => {
+    request.claims = claims;
+  });
   app.decorate("db", {
     async connect() {
       return connectFactory ? connectFactory() : client;
@@ -700,7 +714,10 @@ async function createPagosApp(client, {
       return client.query(sql, params);
     },
   });
-  await app.register(publicPagosRoutes, { prefix: "/v1/public/pagos" });
+  await app.register(publicPagosRoutes, {
+    prefix: authenticated ? "/v1/pagos/reservas" : "/v1/public/pagos",
+    authenticated,
+  });
   return app;
 }
 
@@ -2483,6 +2500,161 @@ test("durable recovery local fixture real QA preserva microsegundos e ignora col
   assert.equal(client.getPayments()[1].monto_hnl, 1);
   assert.equal(client.getActiveIntent().referencia_externa, tx);
   assert.equal(client.getActiveIntent().paid_at, finalizedAt);
+});
+
+test("pagos autenticados exigen propiedad de cliente, persona e intent", async () => {
+  const existingIntent = {
+    id_intent: INTENT_A,
+    id_provider: PROVIDER_A,
+    id_cita: CITA_A,
+    id_hold: HOLD_A,
+    id_grupo_cita: GROUP_A,
+    estado_intent_codigo: "pendiente_confirmacion",
+    expires_at: "2099-01-01T16:00:00.000Z",
+    monto_hnl: "115.00",
+    moneda_codigo: "HNL",
+    created_by_usuario_id: USER_A,
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent,
+    groupClientId: CLIENT_A,
+    groupPersonId: USER_A,
+  });
+  const ownerClaims = {
+    cliente_id: CLIENT_A,
+    user: { id_persona: USER_A, id_usuario: USER_A },
+  };
+  const app = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: ownerClaims,
+  });
+
+  const owned = await app.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(owned.statusCode, 200, owned.body);
+
+  await app.close();
+  const foreignApp = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: { ...ownerClaims, cliente_id: CLIENT_B },
+  });
+  const foreign = await foreignApp.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(foreign.statusCode, 403, foreign.body);
+  assert.equal(foreign.json().error.code, "PUBLIC_PAGOS_GROUP_FORBIDDEN");
+  await foreignApp.close();
+
+  const foreignPersonApp = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: { ...ownerClaims, user: { ...ownerClaims.user, id_persona: USER_B } },
+  });
+  const foreignPerson = await foreignPersonApp.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(foreignPerson.statusCode, 403, foreignPerson.body);
+  assert.equal(foreignPerson.json().error.code, "PUBLIC_PAGOS_GROUP_FORBIDDEN");
+  await foreignPersonApp.close();
+
+  const noContextApp = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: {},
+  });
+  const noContext = await noContextApp.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(noContext.statusCode, 409, noContext.body);
+  assert.equal(noContext.json().error.code, "PAGOS_CLIENT_CONTEXT_REQUIRED");
+  await noContextApp.close();
+
+  const foreignIntentClient = createPagosClient({
+    providerCode: "pixelpay",
+    existingIntent: { ...existingIntent, created_by_usuario_id: USER_B },
+    groupClientId: CLIENT_A,
+    groupPersonId: USER_A,
+  });
+  const foreignIntentApp = await createPagosApp(foreignIntentClient, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: ownerClaims,
+  });
+  const foreignIntent = await foreignIntentApp.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(foreignIntent.statusCode, 403, foreignIntent.body);
+  assert.equal(foreignIntent.json().error.code, "PAGOS_INTENT_FORBIDDEN");
+  await foreignIntentApp.close();
+});
+
+test("crear intent autenticado atribuye el intent al usuario de la sesion", async () => {
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    groupClientId: CLIENT_A,
+    groupPersonId: USER_A,
+  });
+  const app = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: {
+      cliente_id: CLIENT_A,
+      user: { id_persona: USER_A, id_usuario: USER_B },
+    },
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/crear-intent",
+    payload: publicIntentPayload(),
+  });
+
+  assert.equal(response.statusCode, 201, response.body);
+  const intentInsert = client.calls.find((call) => call.sql.includes("INSERT INTO public.payment_intents"));
+  assert.equal(intentInsert?.params[7], USER_B);
+  await app.close();
+});
+
+test("rutas publicas no operan grupos de clientes autenticados", async () => {
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    groupClientId: CLIENT_A,
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay" });
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(response.statusCode, 403, response.body);
+  assert.equal(response.json().error.code, "PUBLIC_PAGOS_AUTHENTICATED_GROUP_REQUIRED");
+  await app.close();
 });
 
 test("status carga intent PixelPay y registra una verificacion con proveedor simulado", async () => {
