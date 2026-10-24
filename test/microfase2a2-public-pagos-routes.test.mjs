@@ -237,6 +237,8 @@ function createPagosClient({
   amountHnl = 115,
   groupClientId = null,
   groupPersonId = USER_A,
+  groupUserId = null,
+  groupOrigin = "publico",
 } = {}) {
   const calls = [];
   const statusChecks = [];
@@ -270,6 +272,8 @@ function createPagosClient({
     row.cita_cliente_id = groupClientId;
     row.id_persona_titular = groupPersonId;
     row.id_persona_cliente = groupPersonId;
+    row.id_usuario_titular = groupUserId;
+    row.origen_codigo = groupOrigin;
     row.total_pagar_hnl = String(amountHnl);
     row.estado_grupo_codigo = groupStateCode;
   }
@@ -1314,6 +1318,8 @@ test("sale guard carga intent PixelPay reclamado y no llama al proveedor", async
   };
   const client = createPagosClient({
     providerCode: "pixelpay",
+    groupClientId: CLIENT_A,
+    groupOrigin: "publico",
     existingIntent: {
       id_intent: INTENT_A,
       id_provider: PROVIDER_A,
@@ -2520,6 +2526,8 @@ test("pagos autenticados exigen propiedad de cliente, persona e intent", async (
     existingIntent,
     groupClientId: CLIENT_A,
     groupPersonId: USER_A,
+    groupUserId: USER_A,
+    groupOrigin: "cliente_autenticado",
   });
   const ownerClaims = {
     cliente_id: CLIENT_A,
@@ -2567,6 +2575,20 @@ test("pagos autenticados exigen propiedad de cliente, persona e intent", async (
   assert.equal(foreignPerson.json().error.code, "PUBLIC_PAGOS_GROUP_FORBIDDEN");
   await foreignPersonApp.close();
 
+  const foreignUserApp = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: { ...ownerClaims, user: { ...ownerClaims.user, id_usuario: USER_B } },
+  });
+  const foreignUser = await foreignUserApp.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(foreignUser.statusCode, 403, foreignUser.body);
+  assert.equal(foreignUser.json().error.code, "PUBLIC_PAGOS_GROUP_FORBIDDEN");
+  await foreignUserApp.close();
+
   const noContextApp = await createPagosApp(client, {
     providerCode: "pixelpay",
     authenticated: true,
@@ -2586,6 +2608,8 @@ test("pagos autenticados exigen propiedad de cliente, persona e intent", async (
     existingIntent: { ...existingIntent, created_by_usuario_id: USER_B },
     groupClientId: CLIENT_A,
     groupPersonId: USER_A,
+    groupUserId: USER_A,
+    groupOrigin: "cliente_autenticado",
   });
   const foreignIntentApp = await createPagosApp(foreignIntentClient, {
     providerCode: "pixelpay",
@@ -2607,6 +2631,8 @@ test("crear intent autenticado atribuye el intent al usuario de la sesion", asyn
     providerCode: "pixelpay",
     groupClientId: CLIENT_A,
     groupPersonId: USER_A,
+    groupUserId: USER_B,
+    groupOrigin: "cliente_autenticado",
   });
   const app = await createPagosApp(client, {
     providerCode: "pixelpay",
@@ -2629,10 +2655,111 @@ test("crear intent autenticado atribuye el intent al usuario de la sesion", asyn
   await app.close();
 });
 
+test("reserva publica con cliente persistido crea y consulta su intent", async () => {
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    groupClientId: CLIENT_A,
+    groupOrigin: "publico",
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay" });
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+  assert.equal(created.statusCode, 201, created.body);
+
+  const status = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/estado",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: created.json().data.id_intent,
+      titular_email: "cliente@example.com",
+    },
+  });
+  assert.equal(status.statusCode, 200, status.body);
+  const groupLoad = client.calls.find((call) => call.sql.includes("FROM public.citas_grupos cg"));
+  assert.match(groupLoad?.sql || "", /cg\.origen_codigo/);
+  assert.match(groupLoad?.sql || "", /cg\.id_usuario_titular/);
+  await app.close();
+});
+
+test("endpoint autenticado rechaza una reserva publica", async () => {
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    groupClientId: CLIENT_A,
+    groupOrigin: "publico",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, {
+    providerCode: "pixelpay",
+    authenticated: true,
+    claims: {
+      cliente_id: CLIENT_A,
+      user: { id_persona: USER_A, id_usuario: USER_A },
+    },
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/pagos/reservas/estado",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+  assert.equal(response.statusCode, 403, response.body);
+  assert.equal(response.json().error.code, "PAGOS_AUTHENTICATED_GROUP_REQUIRED");
+  await app.close();
+});
+
+for (const groupOrigin of [null, "legacy", "admin", "panel", "barbero", "sistema"]) {
+  test(`endpoint publico rechaza origen ambiguo ${groupOrigin ?? "null"}`, async () => {
+    const client = createPagosClient({
+      providerCode: "pixelpay",
+      groupClientId: CLIENT_A,
+      groupOrigin,
+      existingIntent: {
+        id_intent: INTENT_A,
+        id_provider: PROVIDER_A,
+        id_cita: CITA_A,
+        id_hold: HOLD_A,
+        id_grupo_cita: GROUP_A,
+        estado_intent_codigo: "pendiente_confirmacion",
+        expires_at: "2099-01-01T16:00:00.000Z",
+        monto_hnl: "115.00",
+        moneda_codigo: "HNL",
+        created_by_usuario_id: USER_A,
+      },
+    });
+    const app = await createPagosApp(client, { providerCode: "pixelpay" });
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/public/pagos/estado",
+      payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+    });
+    assert.equal(response.statusCode, 403, response.body);
+    assert.equal(response.json().error.code, "PUBLIC_PAGOS_GROUP_ORIGIN_UNSUPPORTED");
+    await app.close();
+  });
+}
+
 test("rutas publicas no operan grupos de clientes autenticados", async () => {
   const client = createPagosClient({
     providerCode: "pixelpay",
     groupClientId: CLIENT_A,
+    groupUserId: USER_A,
+    groupOrigin: "cliente_autenticado",
     existingIntent: {
       id_intent: INTENT_A,
       id_provider: PROVIDER_A,
@@ -2667,6 +2794,8 @@ test("status carga intent PixelPay y registra una verificacion con proveedor sim
   };
   const client = createPagosClient({
     providerCode: "pixelpay",
+    groupClientId: CLIENT_A,
+    groupOrigin: "publico",
     existingIntent: {
       id_intent: INTENT_A,
       id_provider: PROVIDER_A,

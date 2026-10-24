@@ -750,6 +750,8 @@ async function loadPublicGroup(client, { groupId, titularEmail, access = null })
         cg.estado_grupo_codigo,
         cg.id_cliente_titular,
         cg.id_persona_titular,
+        cg.id_usuario_titular,
+        cg.origen_codigo,
         pt.nombres AS titular_nombres,
         pt.apellidos AS titular_apellidos,
         c.id_cita,
@@ -825,14 +827,26 @@ async function loadPublicGroup(client, { groupId, titularEmail, access = null })
   const dbTitularEmail = distinctEmails.size === 1 ? persistedEmails[0]
     : distinctEmails.size === 0 && Number(titular?.primary_email_count) === 1
       ? normalizeEmail(titular.direccion_correo || "") : "";
-  if (access?.mode === "public" && titular?.id_cliente_titular) {
+  const groupOrigin = String(titular?.origen_codigo || "").trim().toLowerCase();
+  if (access?.mode === "public" && groupOrigin === "cliente_autenticado") {
     throw new AppError(403, "Debes iniciar sesion para operar esta reserva", {
       code: "PUBLIC_PAGOS_AUTHENTICATED_GROUP_REQUIRED",
+    });
+  }
+  if (access?.mode === "public" && groupOrigin !== "publico") {
+    throw new AppError(403, "El origen de la reserva no permite pagos publicos", {
+      code: "PUBLIC_PAGOS_GROUP_ORIGIN_UNSUPPORTED",
+    });
+  }
+  if (access?.mode === "authenticated" && groupOrigin !== "cliente_autenticado") {
+    throw new AppError(403, "La reserva no pertenece al flujo autenticado", {
+      code: "PAGOS_AUTHENTICATED_GROUP_REQUIRED",
     });
   }
   const authenticatedOwnerMatches = access?.mode !== "authenticated" || (
     String(titular?.id_cliente_titular || "") === String(access.owner?.clienteId || "")
     && String(titular?.id_persona_titular || "") === String(access.owner?.personaId || "")
+    && String(titular?.id_usuario_titular || "") === String(access.owner?.usuarioId || "")
   );
   if (contradictoryTitular || !personaMatches || !clientMatches || !snapshotMatches || !normalizedTitularEmail
     || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(dbTitularEmail)
