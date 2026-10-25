@@ -1839,6 +1839,36 @@ async function createEmpleado(app, request, payload) {
     }
 
     let idPersona = confirmedPersonaId;
+    if (idPersona) {
+      const historical = await client.query(
+        `SELECT dni, telefono_principal
+         FROM public.personas
+         WHERE id_persona = $1::uuid AND deleted_at IS NULL
+         FOR UPDATE`,
+        [idPersona]
+      );
+      const currentPersona = historical.rows[0];
+      const currentDni = normalizeDigits(currentPersona?.dni);
+      if (!currentPersona || (normalizeOptional(currentPersona.dni) && currentDni !== persona.dni)) {
+        throw new AppError(409, "El DNI no corresponde a la Persona invitada seleccionada", {
+          code: "PERSONAS_GUEST_LINK_MISMATCH",
+        });
+      }
+      await ensurePersonaDocumentAvailability(client, {
+        dni: persona.dni,
+        excludePersonaId: idPersona,
+      });
+      // AM: Completa solo obligatorios ausentes antes del trigger; conserva datos historicos validos.
+      if (!normalizeOptional(currentPersona.dni) || !normalizeOptional(currentPersona.telefono_principal)) {
+        await client.query(
+          `UPDATE public.personas
+           SET dni = $2, telefono_principal = $3, updated_at = NOW()
+           WHERE id_persona = $1::uuid`,
+          [idPersona, normalizeOptional(currentPersona.dni) ? currentPersona.dni : persona.dni,
+            normalizeOptional(currentPersona.telefono_principal) ? currentPersona.telefono_principal : persona.telefono_principal]
+        );
+      }
+    }
     if (!idPersona) {
       const personaInsert = await client.query(
         `

@@ -10,7 +10,7 @@ async function fixture(t,options={}){
   const state={row:{id_empleado:ID,id_persona:PERSON,id_usuario:USER,nombres:'Ana',apellidos:'Sintetica',correo_principal:'ana@example.test',estado_laboral:true,estado_acceso:'activo',es_barbero:false,id_sucursal:BRANCH,...options.row},roles:new Map(options.noHistory?[]:[['admin',true]]),queries:[],auth:[],mail:[],authEmail:'ana@example.test',authUserExists:Boolean(options.authIdentity),otherPrimary:Boolean(options.guestHasOtherPrimary),barberProfileCreated:false};
   async function query(sql,params=[]){
     const text=String(sql).replace(/\s+/g,' ').trim();state.queries.push({text,params});
-    if(text==='BEGIN'){state.snapshot={row:{...state.row},roles:new Map(state.roles),recovery:state.recovery};return rows();}
+    if(text==='BEGIN'){state.snapshot={row:{...state.row},roles:new Map(state.roles),recovery:state.recovery,guestPersona:state.guestPersona?{...state.guestPersona}:null,otherPrimary:state.otherPrimary};return rows();}
     if(text==='COMMIT')return rows();
     if(text==='ROLLBACK'){Object.assign(state,state.snapshot);return rows();}
     if(text.includes('FROM public.app_protected_users'))return rows(options.protected?[{exists:1}]:[]);
@@ -24,6 +24,7 @@ async function fixture(t,options={}){
       return rows(options.missing?[]:[{...state.row,roles:[...state.roles].filter(([,v])=>v).map(([k])=>k)}]);
     }
     if(text.includes('FROM public.sucursales'))return rows(options.inactiveBranch?[]:[{id_sucursal:BRANCH}]);
+    if(text.startsWith('SELECT dni, telefono_principal'))return rows(state.guestPersona?[state.guestPersona]:[{dni:payload().persona.dni,telefono_principal:'99990000'}]);
     if(text.includes('FROM public.personas')&&text.includes('regexp_replace'))return rows(options.duplicateDni?[{id_persona:PERSON}]:[]);
     if(text.startsWith('SELECT id_correo'))return rows(options.guestContact?[{id_correo:'88888888-8888-4888-8888-888888888888'}]:[]);
     if(text.includes('FROM public.correos')&&text.includes('LOWER'))return rows(options.duplicateEmail?[{id_persona:BRANCH}]:[]);
@@ -34,7 +35,7 @@ async function fixture(t,options={}){
     if(text.startsWith('UPDATE public.correos')&&text.includes('es_principal = FALSE')){state.otherPrimary=false;return rows();}
     if(text.startsWith('UPDATE public.correos')&&text.includes('direccion_correo = $2')){if(state.otherPrimary)throw Object.assign(new Error('synthetic principal conflict'),{code:'23505',constraint:'uq_correos_principal_persona'});return rows();}
     if(text.startsWith('INSERT INTO public.usuarios')){state.row.estado_acceso=params[2];return rows();}
-    if(text.startsWith('UPDATE public.personas')){assert.equal(params[0],PERSON);return rows();}
+    if(text.startsWith('UPDATE public.personas')){assert.equal(params[0],PERSON);if(state.guestPersona&&text.includes('SET dni =')){state.guestPersona.dni=params[1];state.guestPersona.telefono_principal=params[2];}return rows();}
     if(text.startsWith('UPDATE public.usuarios')){state.row.estado_acceso=text.includes('estado = FALSE')?'bloqueado':options.pending?'pendiente_password':'activo';return rows();}
     if(text.startsWith('UPDATE public.roles_usuarios')){
       if(text.includes('activo = FALSE')){for(const [k,id] of Object.entries(ROLES))if(state.roles.has(k)&&params[1].includes(id))state.roles.set(k,false);return rows();}
@@ -43,6 +44,7 @@ async function fixture(t,options={}){
     }
     if(text.startsWith('INSERT INTO public.roles_usuarios')){state.roles.set(Object.keys(ROLES).find(k=>ROLES[k]===params[0]),true);return rows();}
     if(text.startsWith('INSERT INTO public.empleados')){
+      if(state.guestPersona&&(!state.guestPersona.dni||!state.guestPersona.telefono_principal))throw Object.assign(new Error('synthetic required persona fields trigger'),{code:'23514'});
       if(options.sqlFailure)throw new Error('synthetic SQL failure');state.row.estado_laboral=params[4];state.row.es_barbero=params[5];return rows([{id_empleado:ID}]);
     }
     if(text.startsWith('UPDATE public.empleados')){
@@ -53,6 +55,8 @@ async function fixture(t,options={}){
     throw new Error('Unexpected SQL: '+text);
   }
   const app=Fastify({logger:false});app.decorate('db',{query,connect:async()=>({query,release(){}})});
+  if(options.guestMissingDni)state.guestPersona={dni:null,telefono_principal:options.guestMissingPhone?null:'88880000',nombres:'Nombre historico',cita:'cita-historica'};
+  if(options.guestExistingDni)state.guestPersona={dni:options.guestExistingDni,telefono_principal:'88880000',nombres:'Nombre historico',cita:'cita-historica'};
   app.decorate('supabaseAdmin',{auth:{admin:{
     createUser:async input=>{state.auth.push(['create',input.email]);if(!options.authFailure)state.authUserExists=true;return options.authFailure?{error:{message:'synthetic'}}:{data:{user:{id:USER}}};},
     generateLink:async input=>{assert.equal(input.type,'recovery');return{data:{properties:{action_link:'http://127.0.0.1:9/synthetic-recovery'}}};},
@@ -98,6 +102,27 @@ test('invitado solo se convierte en empleado con vinculacion explicita',async t=
 test('invitado con otro correo principal se vincula como barbero sin duplicar Persona',async t=>{const s=await fixture(t,{guestContact:true,guestHasOtherPrimary:true});const body=payload();body.acceso.roles=['barbero'];body.empleado.es_barbero=true;body.perfil_publico={alias_publico:'Barbero QA',visible_en_landing:true};body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};const linked=await s.inject('POST','/empleados',body);assert.equal(linked.statusCode,201,linked.body);assert.equal(s.otherPrimary,false);assert.equal(s.barberProfileCreated,true);assert.equal(s.queries.some(q=>q.text.startsWith('INSERT INTO public.personas')),false);assert.deepEqual(s.auth.map(([op])=>op),['create']);assert.ok(s.queries.some(q=>q.text==='COMMIT'));});
 test('alta falla SQL y compensa solamente su Auth',async t=>{const s=await fixture(t,{sqlFailure:true});assert.equal((await s.inject('POST','/empleados',payload())).statusCode,500);assert.deepEqual(s.auth.map(([op])=>op),['create','delete']);assert.ok(s.queries.some(q=>q.text==='ROLLBACK'));});
 test('Auth fallido no abre transacción',async t=>{const s=await fixture(t,{authFailure:true});assert.equal((await s.inject('POST','/empleados',payload())).statusCode,500);assert.equal(s.queries.some(q=>q.text==='BEGIN'),false);});
+for(const guestMissingPhone of [false,true])test(`invitado sin DNI completa obligatorios antes del trigger barbero y preserva historial, telefono faltante: ${guestMissingPhone}`,async t=>{
+  const s=await fixture(t,{guestContact:true,guestMissingDni:true,guestMissingPhone});
+  const body=payload();body.acceso.roles=['barbero'];body.empleado.es_barbero=true;body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};
+  const response=await s.inject('POST','/empleados',body);
+  assert.equal(response.statusCode,201,response.body);
+  assert.deepEqual(s.guestPersona,{dni:body.persona.dni,telefono_principal:guestMissingPhone?body.persona.telefono_principal:'88880000',nombres:'Nombre historico',cita:'cita-historica'});
+  assert.equal(s.queries.some(q=>q.text.startsWith('INSERT INTO public.personas')),false);
+  assert.equal(s.row.es_barbero,true);assert.equal(s.barberProfileCreated,true);
+});
+test('DNI diferente almacenado impide vinculación y compensa Auth',async t=>{
+  const s=await fixture(t,{guestContact:true,guestExistingDni:'0801199012346'});const body=payload();body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};
+  const response=await s.inject('POST','/empleados',body);assert.equal(response.statusCode,409,response.body);assert.equal(response.json().error.code,'PERSONAS_GUEST_LINK_MISMATCH');assert.equal(s.guestPersona.dni,'0801199012346');assert.deepEqual(s.auth.map(([op])=>op),['create','delete']);
+});
+test('invitado con DNI duplicado no crea Auth',async t=>{
+  const s=await fixture(t,{guestContact:true,guestMissingDni:true,duplicateDni:true});const body=payload();body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};
+  assert.equal((await s.inject('POST','/empleados',body)).statusCode,409);assert.equal(s.auth.length,0);assert.equal(s.guestPersona.dni,null);
+});
+test('fallo posterior restaura Persona histórica y compensa solo Auth nuevo',async t=>{
+  const s=await fixture(t,{guestContact:true,guestMissingDni:true,sqlFailure:true});const before={...s.guestPersona};const body=payload();body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};
+  assert.equal((await s.inject('POST','/empleados',body)).statusCode,500);assert.deepEqual(s.guestPersona,before);assert.deepEqual(s.auth.map(([op])=>op),['create','delete']);assert.ok(s.queries.some(q=>q.text==='ROLLBACK'));assert.equal(s.queries.some(q=>q.text==='COMMIT'),false);
+});
 test('sin usuario e inexistente no mutan',async t=>{for(const option of [{row:{id_usuario:null}},{missing:true}]){const s=await fixture(t,option);assert.equal((await s.inject('PATCH',undefined,payload())).statusCode,option.missing?404:409);assert.equal(s.queries.some(q=>q.text==='BEGIN'),false);}});
 test('ciclo conserva pendiente_password y DELETE contractual 410',async t=>{const s=await fixture(t,{pending:true});assert.equal((await s.inject('PATCH',`/empleados/${ID}/inactivar`)).statusCode,200);assert.equal(s.row.estado_acceso,'bloqueado');assert.equal((await s.inject('PATCH',`/empleados/${ID}/activar`)).statusCode,200);assert.equal(s.row.estado_acceso,'pendiente_password');assert.equal((await s.inject('DELETE',`/empleados/${ID}/permanente`)).statusCode,410);});
 test('PATCH sin perfil_publico no borra alias existente del Barbero',async t=>{const s=await fixture(t,{row:{es_barbero:true,alias_publico:'Alias existente',resumen_publico:'Resumen existente',certificaciones_titulos:['Certificacion'],visible_en_landing:true}});const b=payload();b.acceso.roles=['barbero'];b.empleado.es_barbero=true;assert.equal((await s.inject('PATCH',undefined,b)).statusCode,200);const write=s.queries.find(q=>q.text.startsWith('INSERT INTO public.barberos_perfiles_publicos'));assert.equal(write.params[1],'Alias existente');assert.equal(write.params[4],true);});
