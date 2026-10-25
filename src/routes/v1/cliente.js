@@ -271,10 +271,10 @@ async function queryClienteProfileRow(client, clienteId, capabilities) {
 }
 
 function serializePreferenciasForDb(preferenciasText, capabilities) {
-  if (preferenciasText === null || preferenciasText === undefined) return null;
   if (capabilities.preferenciasDbType === "json" || capabilities.preferenciasDbType === "jsonb") {
-    return JSON.stringify(preferenciasText);
+    return JSON.stringify(preferenciasText ?? "");
   }
+  if (preferenciasText === null || preferenciasText === undefined) return null;
   return preferenciasText;
 }
 
