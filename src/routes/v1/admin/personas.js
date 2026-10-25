@@ -1338,6 +1338,17 @@ async function upsertPrimaryEmail(client, personaId, email) {
     await client.query(
       `
         UPDATE public.correos
+        SET es_principal = FALSE,
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+          AND id_correo <> $2::uuid
+          AND es_principal IS TRUE
+      `,
+      [personaId, existing.rows[0].id_correo]
+    );
+    await client.query(
+      `
+        UPDATE public.correos
         SET direccion_correo = $2,
             es_principal = TRUE,
             verificado = TRUE,
@@ -1346,17 +1357,6 @@ async function upsertPrimaryEmail(client, personaId, email) {
         WHERE id_correo = $1::uuid
       `,
       [existing.rows[0].id_correo, email]
-    );
-    await client.query(
-      `
-        UPDATE public.correos
-        SET es_principal = FALSE,
-            updated_at = NOW()
-        WHERE id_persona = $1::uuid
-          AND id_correo <> $2::uuid
-          AND es_principal IS TRUE
-      `,
-      [personaId, existing.rows[0].id_correo]
     );
     return;
   }

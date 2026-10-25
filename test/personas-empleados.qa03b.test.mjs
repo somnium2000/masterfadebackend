@@ -7,7 +7,7 @@ const ROLES={admin:'55555555-5555-4555-8555-555555555555',barbero:'66666666-6666
 const rows=(data=[])=>({rows:data,rowCount:data.length});
 const payload=()=>({persona:{nombres:'Ana',apellidos:'Sintetica',dni:'0801199012345',telefono_principal:'99990000'},acceso:{correo_principal:'ana@example.test',roles:['admin']},empleado:{id_sucursal:BRANCH,es_barbero:false,salario_base:1000}});
 async function fixture(t,options={}){
-  const state={row:{id_empleado:ID,id_persona:PERSON,id_usuario:USER,nombres:'Ana',apellidos:'Sintetica',correo_principal:'ana@example.test',estado_laboral:true,estado_acceso:'activo',es_barbero:false,id_sucursal:BRANCH,...options.row},roles:new Map(options.noHistory?[]:[['admin',true]]),queries:[],auth:[],mail:[],authEmail:'ana@example.test',authUserExists:Boolean(options.authIdentity)};
+  const state={row:{id_empleado:ID,id_persona:PERSON,id_usuario:USER,nombres:'Ana',apellidos:'Sintetica',correo_principal:'ana@example.test',estado_laboral:true,estado_acceso:'activo',es_barbero:false,id_sucursal:BRANCH,...options.row},roles:new Map(options.noHistory?[]:[['admin',true]]),queries:[],auth:[],mail:[],authEmail:'ana@example.test',authUserExists:Boolean(options.authIdentity),otherPrimary:Boolean(options.guestHasOtherPrimary),barberProfileCreated:false};
   async function query(sql,params=[]){
     const text=String(sql).replace(/\s+/g,' ').trim();state.queries.push({text,params});
     if(text==='BEGIN'){state.snapshot={row:{...state.row},roles:new Map(state.roles),recovery:state.recovery};return rows();}
@@ -25,12 +25,14 @@ async function fixture(t,options={}){
     }
     if(text.includes('FROM public.sucursales'))return rows(options.inactiveBranch?[]:[{id_sucursal:BRANCH}]);
     if(text.includes('FROM public.personas')&&text.includes('regexp_replace'))return rows(options.duplicateDni?[{id_persona:PERSON}]:[]);
+    if(text.startsWith('SELECT id_correo'))return rows(options.guestContact?[{id_correo:'88888888-8888-4888-8888-888888888888'}]:[]);
     if(text.includes('FROM public.correos')&&text.includes('LOWER'))return rows(options.duplicateEmail?[{id_persona:BRANCH}]:[]);
     if(text.includes('FROM auth.users'))return rows(state.authUserExists?[{id:options.foreignAuthId||USER}]:[]);
     if(text==='SELECT id_rol, nombre FROM public.roles')return rows(Object.entries(ROLES).map(([nombre,id_rol])=>({nombre,id_rol})));
-    if(text.startsWith('SELECT id_correo'))return rows();
     if(text.startsWith('INSERT INTO public.personas'))return rows([{id_persona:PERSON}]);
     if(text.startsWith('INSERT INTO public.correos'))return rows();
+    if(text.startsWith('UPDATE public.correos')&&text.includes('es_principal = FALSE')){state.otherPrimary=false;return rows();}
+    if(text.startsWith('UPDATE public.correos')&&text.includes('direccion_correo = $2')){if(state.otherPrimary)throw Object.assign(new Error('synthetic principal conflict'),{code:'23505',constraint:'uq_correos_principal_persona'});return rows();}
     if(text.startsWith('INSERT INTO public.usuarios')){state.row.estado_acceso=params[2];return rows();}
     if(text.startsWith('UPDATE public.personas')){assert.equal(params[0],PERSON);return rows();}
     if(text.startsWith('UPDATE public.usuarios')){state.row.estado_acceso=text.includes('estado = FALSE')?'bloqueado':options.pending?'pendiente_password':'activo';return rows();}
@@ -46,6 +48,7 @@ async function fixture(t,options={}){
     if(text.startsWith('UPDATE public.empleados')){
       if(options.sqlFailure)throw new Error('synthetic SQL failure');state.row.estado_laboral=text.includes('estado = FALSE')?false:text.includes('estado = TRUE')?true:params[4]??state.row.estado_laboral;if(params.length>1){state.row.id_sucursal=params[1];state.row.es_barbero=params[5];}return rows();
     }
+    if(text.startsWith('INSERT INTO public.barberos_perfiles_publicos')){state.barberProfileCreated=true;return rows();}
     if(text.includes('public.barberos_perfiles_publicos'))return rows();
     throw new Error('Unexpected SQL: '+text);
   }
@@ -92,6 +95,7 @@ test('roles arbitrarios y salario negativo se rechazan por schema',async t=>{con
 for(const role of ['admin','barbero','super_admin'])test(`alta autorizada rol ${role}, scope parametrizado`,async t=>{const s=await fixture(t);const b=payload();b.acceso.roles=[role];b.empleado.es_barbero=role==='barbero';b.acceso.correo_principal='ANA@EXAMPLE.TEST';const r=await s.inject('POST','/empleados',b,'super_admin,admin');assert.equal(r.statusCode,201,r.body);assert.equal(s.auth[0][1],'ana@example.test');const writes=s.queries.filter(q=>q.text.includes('activo = TRUE')||q.text.startsWith('INSERT INTO public.roles_usuarios'));assert.ok(writes.some(q=>q.params.includes(role==='super_admin'?null:BRANCH)));});
 for(const option of ['duplicateDni','duplicateEmail','inactiveBranch'])test(`alta inválida sin Auth: ${option}`,async t=>{const s=await fixture(t,{[option]:true});const r=await s.inject('POST','/empleados',payload());assert.equal(r.statusCode,option==='inactiveBranch'?400:409,r.body);assert.equal(s.auth.length,0);});
 test('invitado solo se convierte en empleado con vinculacion explicita',async t=>{const s=await fixture(t,{guestContact:true});const first=await s.inject('POST','/empleados',payload());assert.equal(first.statusCode,409);assert.equal(first.json().error.code,'PERSONAS_GUEST_LINK_REQUIRED');assert.equal(first.json().error.details.id_persona,PERSON);const body=payload();body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};const linked=await s.inject('POST','/empleados',body);assert.equal(linked.statusCode,201,linked.body);assert.equal(s.queries.some(q=>q.text.startsWith('INSERT INTO public.personas')),false);});
+test('invitado con otro correo principal se vincula como barbero sin duplicar Persona',async t=>{const s=await fixture(t,{guestContact:true,guestHasOtherPrimary:true});const body=payload();body.acceso.roles=['barbero'];body.empleado.es_barbero=true;body.perfil_publico={alias_publico:'Barbero QA',visible_en_landing:true};body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};const linked=await s.inject('POST','/empleados',body);assert.equal(linked.statusCode,201,linked.body);assert.equal(s.otherPrimary,false);assert.equal(s.barberProfileCreated,true);assert.equal(s.queries.some(q=>q.text.startsWith('INSERT INTO public.personas')),false);assert.deepEqual(s.auth.map(([op])=>op),['create']);assert.ok(s.queries.some(q=>q.text==='COMMIT'));});
 test('alta falla SQL y compensa solamente su Auth',async t=>{const s=await fixture(t,{sqlFailure:true});assert.equal((await s.inject('POST','/empleados',payload())).statusCode,500);assert.deepEqual(s.auth.map(([op])=>op),['create','delete']);assert.ok(s.queries.some(q=>q.text==='ROLLBACK'));});
 test('Auth fallido no abre transacción',async t=>{const s=await fixture(t,{authFailure:true});assert.equal((await s.inject('POST','/empleados',payload())).statusCode,500);assert.equal(s.queries.some(q=>q.text==='BEGIN'),false);});
 test('sin usuario e inexistente no mutan',async t=>{for(const option of [{row:{id_usuario:null}},{missing:true}]){const s=await fixture(t,option);assert.equal((await s.inject('PATCH',undefined,payload())).statusCode,option.missing?404:409);assert.equal(s.queries.some(q=>q.text==='BEGIN'),false);}});
