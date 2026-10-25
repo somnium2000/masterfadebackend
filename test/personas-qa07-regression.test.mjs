@@ -7,7 +7,7 @@ const U = "22222222-2222-4222-8222-222222222222";
 const P = "33333333-3333-4333-8333-333333333333";
 const E = "11111111-1111-4111-8111-111111111111";
 
-async function fixture(t, { state = "activo", lockedState = state, sent = true, privileged = false, protectedUser = false, authError = false, mailError = false } = {}) {
+async function fixture(t, { state = "activo", lockedState = state, sent = true, privileged = false, protectedUser = false, authError = false, mailError = false, missingToken = false, missingAuthUser = false, missingUser = false } = {}) {
   const activity = { writes: [], auth: 0, mail: 0, sql: [], events: [], locked: false };
   const row = { id_usuario: U, id_persona: P, estado_acceso: state, nombres: "Prueba", apellidos: "Sintetica", email: "synthetic@example.test", estado: true, tiene_empleado: true, roles: [{ rol: "admin" }] };
   const query = async (sql, params) => {
@@ -21,21 +21,24 @@ async function fixture(t, { state = "activo", lockedState = state, sent = true, 
     if (text.includes("AS has_empleado")) return { rows: [{ has_empleado: true }], rowCount: 1 };
     if (text.includes("r.nombre = 'super_admin'") && !text.includes("GROUP BY")) return { rows: [], rowCount: privileged ? 1 : 0 };
     if (text.startsWith("UPDATE")) { activity.events.push("UPDATE"); return { rows: [], rowCount: 1 }; }
-    if (text.includes("FROM public.usuarios u")) return { rows: [row], rowCount: 1 };
+    if (text.includes("FROM public.usuarios u")) return { rows: missingUser ? [] : [row], rowCount: missingUser ? 0 : 1 };
     if (text.includes("FROM public.empleados e")) return { rows: [{ id_empleado: E, id_persona: P, estado_laboral: true }], rowCount: 1 };
     throw new Error("Unexpected mocked query");
   };
   const app = Fastify({ logger: false });
   app.decorate("db", { query, connect: async () => ({ query, release() {} }) });
-  app.decorate("supabaseAdmin", { auth: { admin: { async generateLink() {
+  app.decorate("supabaseAdmin", { auth: { admin: { async generateLink(input) {
     assert.equal(activity.locked, true);
     activity.auth++;
+    activity.generated = input;
     if (authError) throw new Error("SQL host token synthetic-private");
-    return { data: { properties: { action_link: "https://example.test/setup" } } };
+    if (missingAuthUser) return { error: { code: 'user_not_found' } };
+    return { data: { properties: { hashed_token: missingToken ? undefined : 'synthetic-setup-hash-not-real', action_link: "https://example.test/auth/v1/verify" } } };
   } } } });
-  app.decorate("mailer", { configured: true, async sendPasswordRecoveryEmail() {
+  app.decorate("mailer", { configured: true, async sendPasswordRecoveryEmail(message) {
     assert.equal(activity.locked, true);
     activity.mail++; activity.events.push("MAIL");
+    activity.delivered = message;
     if (mailError) throw new Error("SMTP host token synthetic-private");
     return { sent };
   } });
@@ -92,6 +95,38 @@ for (const options of [{ privileged: true }, { protectedUser: true }]) test("set
   const { app, activity } = await fixture(t, options);
   const r = await app.inject({ method: "POST", url: `/personas/usuarios/${U}/enviar-configuracion-password`, payload: {} });
   assert.equal(r.statusCode, 403); assert.equal(activity.auth + activity.mail + activity.writes.length, 0);
+});
+test('setup entrega enlace del FRONTEND_URL QA con hash por fragmento sin filtrar en API', async t => {
+  const previous = process.env.FRONTEND_URL;
+  process.env.FRONTEND_URL = 'https://qa-setup.example.test/';
+  t.after(() => { if (previous === undefined) delete process.env.FRONTEND_URL; else process.env.FRONTEND_URL = previous; });
+  const { app, activity } = await fixture(t);
+  const response = await app.inject({ method: 'POST', url: `/personas/usuarios/${U}/enviar-configuracion-password`, payload: {} });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().data.setup_password.enviado, true);
+  const target = new URL(activity.delivered.actionLink);
+  assert.equal(target.origin, 'https://qa-setup.example.test');
+  assert.equal(target.pathname, '/reset-password');
+  assert.equal(target.search, '');
+  assert.deepEqual([...new URLSearchParams(target.hash.slice(1))], [['token_hash', 'synthetic-setup-hash-not-real'], ['type', 'recovery']]);
+  assert.equal(activity.generated.options.redirectTo, 'https://qa-setup.example.test/reset-password');
+  assert.equal(activity.delivered.kind, 'setup');
+  assert.doesNotMatch(response.body, /synthetic-setup|token_hash|auth\/v1\/verify|localhost/);
+});
+for (const options of [{ missingToken: true }, { missingAuthUser: true }]) test('setup sin prueba válida no envía SMTP ni cambia acceso ' + JSON.stringify(options), async t => {
+  const { app, activity } = await fixture(t, options);
+  const response = await app.inject({ method: 'POST', url: `/personas/usuarios/${U}/enviar-configuracion-password`, payload: {} });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().data.setup_password.enviado, false);
+  assert.equal(activity.mail, 0);
+  assert.equal(activity.writes.length, 0);
+  assert.doesNotMatch(response.body, /synthetic-setup|token_hash|auth\/v1\/verify/);
+});
+test('setup de usuario interno inexistente no genera enlace', async t => {
+  const { app, activity } = await fixture(t, { missingUser: true });
+  const response = await app.inject({ method: 'POST', url: `/personas/usuarios/${U}/enviar-configuracion-password`, payload: {} });
+  assert.equal(response.statusCode, 404);
+  assert.equal(activity.auth + activity.mail + activity.writes.length, 0);
 });
 test("UUID inválido no consulta detalle; válido conserva 200", async t => {
   const { app, activity } = await fixture(t);

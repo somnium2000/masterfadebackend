@@ -59,7 +59,7 @@ async function fixture(t,options={}){
   if(options.guestExistingDni)state.guestPersona={dni:options.guestExistingDni,telefono_principal:'88880000',nombres:'Nombre historico',cita:'cita-historica'};
   app.decorate('supabaseAdmin',{auth:{admin:{
     createUser:async input=>{state.auth.push(['create',input.email]);if(!options.authFailure)state.authUserExists=true;return options.authFailure?{error:{message:'synthetic'}}:{data:{user:{id:USER}}};},
-    generateLink:async input=>{assert.equal(input.type,'recovery');return{data:{properties:{action_link:'http://127.0.0.1:9/synthetic-recovery'}}};},
+    generateLink:async input=>{assert.equal(input.type,'recovery');assert.equal(new URL(input.options.redirectTo).pathname,'/reset-password');return{data:{properties:{hashed_token:'synthetic-recovery-hash-not-real',action_link:'http://127.0.0.1:9/synthetic-recovery'}}};},
     deleteUser:async id=>{state.auth.push(['delete',id]);state.authUserExists=false;return{};},
     updateUserById:async(id,input)=>{state.auth.push(['update',id,input.email]);state.authEmail=input.email;if(options.authTimeout&&state.auth.filter(([op])=>op==='update').length===1)throw new Error('synthetic timeout after provider write');return{data:{user:{id}}};}
   }}});

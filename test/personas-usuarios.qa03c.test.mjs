@@ -21,7 +21,7 @@ async function fixture(t,opts={}){
     throw new Error('Unexpected query: '+q);
   }
   const app=Fastify({logger:false});app.decorate('db',{query,connect:async()=>({query,release(){}})});
-  app.decorate('supabaseAdmin',{auth:{admin:{generateLink:async input=>{s.auth.push(input);return {data:{properties:{action_link:'http://127.0.0.1:9/synthetic-secret-link'}}};}}}});
+  app.decorate('supabaseAdmin',{auth:{admin:{generateLink:async input=>{s.auth.push(input);return {data:{properties:{hashed_token:'synthetic-secret-hash-not-real',action_link:'http://127.0.0.1:9/synthetic-secret-link'}}};}}}});
   app.decorate('mailer',{configured:true,sendPasswordRecoveryEmail:async input=>{s.mail.push(input);return {sent:!opts.mailFailure};}});
   app.decorate('requireRoles',allowed=>async(req,reply)=>{const roles=String(req.headers['x-roles']??'').split(',').filter(Boolean);if(!roles.length)return reply.code(401).send({error:{code:'AUTH_REQUIRED'}});if(!roles.some(x=>allowed.includes(x)))return reply.code(403).send({error:{code:'AUTH_FORBIDDEN'}});req.claims={roles,user:{id_usuario:PERSON}};});
   await app.register(routes,{prefix:'/personas'});t.after(()=>app.close());s.call=(method,suffix='',payload,actor='admin',id=USER)=>app.inject({method,url:'/personas/usuarios'+(method==='GET'?'':`/${id}${suffix}`),payload,headers:{'x-roles':actor}});return s;

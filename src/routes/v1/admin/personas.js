@@ -1708,7 +1708,7 @@ async function sendPasswordSetupEmail(app, email, fullName = null) {
 
   try {
     // AM: Flujo Opcion 2: recovery link por Supabase Admin + entrega SMTP backend.
-    const recovery = await generateRecoveryActionLink(app, email);
+    const recovery = await generateRecoveryActionLink(app, email, { passwordReset: true });
     if (!recovery.found || !recovery.action_link) {
       return {
         sent: false,
