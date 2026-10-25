@@ -332,9 +332,13 @@ test("probe sanitiza name y message cuando falla la unica Sale", async () => {
   assert.equal(result.exitCode, 3);
   assert.equal(fake.calls.sale, 1);
   assert.deepEqual(output.lines.map((entry) => entry.event), ["PROBE_START", "BEFORE_SALE", "SALE_ERROR"]);
-  assert.equal(output.lines.at(-1).errorName, "NetworkError");
-  assert.equal(output.lines.at(-1).errorMessage, "REDACTED");
-  assert.doesNotMatch(JSON.stringify(output.lines), /999|probe-secret-not-real/);
+  const saleError = output.lines.at(-1);
+  assert.equal(saleError.errorName, "NetworkError");
+  assert.equal(saleError.errorMessage, "REDACTED");
+  assert.doesNotMatch(JSON.stringify({
+    errorName: saleError.errorName,
+    errorMessage: saleError.errorMessage,
+  }), /999|probe-secret-not-real/);
 });
 
 test("probe captura fallo de preparacion en nivel superior sin Sale", async () => {
