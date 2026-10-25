@@ -12,7 +12,7 @@ const payload = () => ({ persona: { nombres: "Ana", apellidos: "Sintetica", dni:
 const result = (rows = []) => ({ rows, rowCount: rows.length });
 
 async function fixture(t, options = {}) {
-  const state = { row: { id_cliente: ID, id_persona: PERSON, id_usuario: USER, nombres: "Ana", apellidos: "Sintetica", correo_principal: "ana@example.test", estado_cliente: true, tiene_acceso: true, estado_acceso: "activo", id_sucursal_origen: BRANCH, ...options.row }, activeRole: true, queries: [], auth: [], snapshot: null };
+  const state = { row: { id_cliente: ID, id_persona: PERSON, id_usuario: USER, nombres: "Ana", apellidos: "Sintetica", correo_principal: "ana@example.test", estado_cliente: true, tiene_acceso: true, estado_acceso: "activo", id_sucursal_origen: BRANCH, ...options.row }, activeRole: true, queries: [], auth: [], authUserExists: Boolean(options.authIdentity), snapshot: null };
   async function query(sql, params = []) {
     const text = String(sql).replace(/\s+/g, " ").trim();
     state.queries.push({ text, params });
@@ -21,6 +21,9 @@ async function fixture(t, options = {}) {
     if (text === "ROLLBACK") { state.row = state.snapshot; return result(); }
     if (text.includes("FROM public.app_protected_users")) return result(options.protected ? [{ exists: 1 }] : []);
     if (text.includes("r.nombre = 'super_admin'")) return result(options.privileged ? [{ exists: 1 }] : []);
+    if (text.startsWith("SELECT c.id_persona,") && text.includes("FROM public.correos c")) {
+      return result(options.duplicateEmail || options.guestContact ? [{ id_persona: PERSON, nombres: "Ana", apellidos: "Invitada", has_user: false, has_client: false, has_employee: false }] : []);
+    }
     if (text.includes("FROM public.clientes c")) {
       if (params[0] === "invalid") throw Object.assign(new Error("invalid input syntax for uuid"), { code: "22P02" });
       return result(options.missing ? [] : [{ ...state.row }]);
@@ -29,7 +32,7 @@ async function fixture(t, options = {}) {
     if (text.includes("FROM public.empleados")) return result();
     if (text.includes("FROM public.personas") && text.includes("regexp_replace")) return result(options.duplicateDni ? [{ id_persona: PERSON }] : []);
     if (text.includes("FROM public.correos") && text.includes("LOWER")) return result(options.duplicateEmail ? [{ id_persona: BRANCH }] : []);
-    if (text.includes("FROM auth.users")) return result();
+    if (text.includes("FROM auth.users")) return result(state.authUserExists ? [{ id: options.foreignAuthId || USER }] : []);
     if (text === "SELECT id_rol, nombre FROM public.roles") return result([{ id_rol: ROLE, nombre: "cliente" }]);
     if (text.includes("FROM information_schema.columns")) return result([{ column_name: "acepta_terminos_at" }, { column_name: "consentimiento_marketing_at" }]);
     if (text.startsWith("SELECT") && text.includes("FROM public.clientes")) return result([{ consentimiento_marketing: false, acepta_terminos: false }]);
@@ -62,8 +65,8 @@ async function fixture(t, options = {}) {
   const app = Fastify({ logger: false });
   app.decorate("db", { query, connect: async () => ({ query, release() {} }) });
   app.decorate("supabaseAdmin", { auth: { admin: {
-    createUser: async (input) => { state.auth.push(["create", input.email]); return options.authFailure ? { error: new Error("synthetic") } : { data: { user: { id: USER } } }; },
-    deleteUser: async (id) => { state.auth.push(["delete", id]); return {}; },
+    createUser: async (input) => { state.auth.push(["create", input.email]); if (!options.authFailure) state.authUserExists = true; return options.authFailure ? { error: new Error("synthetic") } : { data: { user: { id: USER } } }; },
+    deleteUser: async (id) => { state.auth.push(["delete", id]); state.authUserExists = false; return {}; },
     updateUserById: async (id, input) => { state.auth.push(["update", id, input.email]); return { data: { user: { id } } }; },
   } } });
   app.decorate("requireRoles", (allowed) => async (request, reply) => {
@@ -123,6 +126,26 @@ test("duplicado de correo invitado no fusiona persona ni crea Auth", async (t) =
   assert.equal(r.statusCode, 409);
   assert.equal(s.auth.length, 0);
   assert.equal(s.queries.some(({ text }) => text === "BEGIN"), false);
+});
+test("invitado requiere confirmacion y luego conserva la Persona historica", async (t) => {
+  const s = await fixture(t, { guestContact: true });
+  const first = await s.inject("POST", "/clientes", payload());
+  assert.equal(first.statusCode, 409);
+  assert.equal(first.json().error.code, "PERSONAS_GUEST_LINK_REQUIRED");
+  assert.equal(first.json().error.details.id_persona, PERSON);
+  assert.equal(first.json().error.details.requiere_confirmacion, true);
+  const body = payload();
+  body.vinculacion_persona = { id_persona: PERSON, confirmar_vinculacion: true };
+  const linked = await s.inject("POST", "/clientes", body);
+  assert.equal(linked.statusCode, 201, linked.body);
+  assert.equal(s.queries.some(({ text }) => text.startsWith("INSERT INTO public.personas")), false);
+});
+test("identidad Auth incompleta rechaza alta administrativa", async (t) => {
+  const s = await fixture(t, { authIdentity: true, foreignAuthId: BRANCH });
+  const response = await s.inject("POST", "/clientes", payload());
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.json().error.code, "PERSONAS_AUTH_IDENTITY_INCOMPLETE");
+  assert.equal(s.auth.length, 0);
 });
 test("alta crea identidad independiente y compensa fallo SQL", async (t) => {
   const s = await fixture(t, { sqlFailure: true });

@@ -7,7 +7,7 @@ const ROLES={admin:'55555555-5555-4555-8555-555555555555',barbero:'66666666-6666
 const rows=(data=[])=>({rows:data,rowCount:data.length});
 const payload=()=>({persona:{nombres:'Ana',apellidos:'Sintetica',dni:'0801199012345',telefono_principal:'99990000'},acceso:{correo_principal:'ana@example.test',roles:['admin']},empleado:{id_sucursal:BRANCH,es_barbero:false,salario_base:1000}});
 async function fixture(t,options={}){
-  const state={row:{id_empleado:ID,id_persona:PERSON,id_usuario:USER,nombres:'Ana',apellidos:'Sintetica',correo_principal:'ana@example.test',estado_laboral:true,estado_acceso:'activo',es_barbero:false,id_sucursal:BRANCH,...options.row},roles:new Map(options.noHistory?[]:[['admin',true]]),queries:[],auth:[],mail:[],authEmail:'ana@example.test'};
+  const state={row:{id_empleado:ID,id_persona:PERSON,id_usuario:USER,nombres:'Ana',apellidos:'Sintetica',correo_principal:'ana@example.test',estado_laboral:true,estado_acceso:'activo',es_barbero:false,id_sucursal:BRANCH,...options.row},roles:new Map(options.noHistory?[]:[['admin',true]]),queries:[],auth:[],mail:[],authEmail:'ana@example.test',authUserExists:Boolean(options.authIdentity)};
   async function query(sql,params=[]){
     const text=String(sql).replace(/\s+/g,' ').trim();state.queries.push({text,params});
     if(text==='BEGIN'){state.snapshot={row:{...state.row},roles:new Map(state.roles),recovery:state.recovery};return rows();}
@@ -18,6 +18,7 @@ async function fixture(t,options={}){
     if(text.startsWith('SELECT e.id_empleado, e.roles_reactivacion'))return rows([{id_empleado:ID,roles_reactivacion:state.recovery??null}]);
     if(text.startsWith('UPDATE public.empleados SET roles_reactivacion = (')){const active=[...state.roles].filter(([,v])=>v).map(([rol])=>({usuario:USER,rol,sucursal:rol==='super_admin'?null:state.row.id_sucursal}));if(active.length)state.recovery=active;return rows();}
     if(text.startsWith('UPDATE public.empleados SET roles_reactivacion = NULL')){state.recovery=null;return rows();}
+    if(text.startsWith('SELECT c.id_persona,')&&text.includes('FROM public.correos c'))return rows(options.duplicateEmail||options.guestContact?[{id_persona:PERSON,nombres:'Ana',apellidos:'Invitada',has_user:false,has_client:false,has_employee:false}]:[]);
     if(text.includes('FROM public.empleados e')){
       if(params[0]==='invalid')throw Object.assign(new Error('invalid uuid'),{code:'22P02'});
       return rows(options.missing?[]:[{...state.row,roles:[...state.roles].filter(([,v])=>v).map(([k])=>k)}]);
@@ -25,7 +26,7 @@ async function fixture(t,options={}){
     if(text.includes('FROM public.sucursales'))return rows(options.inactiveBranch?[]:[{id_sucursal:BRANCH}]);
     if(text.includes('FROM public.personas')&&text.includes('regexp_replace'))return rows(options.duplicateDni?[{id_persona:PERSON}]:[]);
     if(text.includes('FROM public.correos')&&text.includes('LOWER'))return rows(options.duplicateEmail?[{id_persona:BRANCH}]:[]);
-    if(text.includes('FROM auth.users'))return rows();
+    if(text.includes('FROM auth.users'))return rows(state.authUserExists?[{id:options.foreignAuthId||USER}]:[]);
     if(text==='SELECT id_rol, nombre FROM public.roles')return rows(Object.entries(ROLES).map(([nombre,id_rol])=>({nombre,id_rol})));
     if(text.startsWith('SELECT id_correo'))return rows();
     if(text.startsWith('INSERT INTO public.personas'))return rows([{id_persona:PERSON}]);
@@ -50,9 +51,9 @@ async function fixture(t,options={}){
   }
   const app=Fastify({logger:false});app.decorate('db',{query,connect:async()=>({query,release(){}})});
   app.decorate('supabaseAdmin',{auth:{admin:{
-    createUser:async input=>{state.auth.push(['create',input.email]);return options.authFailure?{error:{message:'synthetic'}}:{data:{user:{id:USER}}};},
+    createUser:async input=>{state.auth.push(['create',input.email]);if(!options.authFailure)state.authUserExists=true;return options.authFailure?{error:{message:'synthetic'}}:{data:{user:{id:USER}}};},
     generateLink:async input=>{assert.equal(input.type,'recovery');return{data:{properties:{action_link:'http://127.0.0.1:9/synthetic-recovery'}}};},
-    deleteUser:async id=>{state.auth.push(['delete',id]);return{};},
+    deleteUser:async id=>{state.auth.push(['delete',id]);state.authUserExists=false;return{};},
     updateUserById:async(id,input)=>{state.auth.push(['update',id,input.email]);state.authEmail=input.email;if(options.authTimeout&&state.auth.filter(([op])=>op==='update').length===1)throw new Error('synthetic timeout after provider write');return{data:{user:{id}}};}
   }}});
   if(options.mail)app.decorate('mailer',{configured:true,sendPasswordRecoveryEmail:async input=>{state.mail.push({to:input.to,kind:input.kind});return{sent:true};}});
@@ -90,6 +91,7 @@ test('admin no asigna super_admin antes de Auth/SQL',async t=>{const s=await fix
 test('roles arbitrarios y salario negativo se rechazan por schema',async t=>{const s=await fixture(t);for(const value of ['cliente','inventado']){const b=payload();b.acceso.roles=[value];assert.equal((await s.inject('POST','/empleados',b)).statusCode,400);}const b=payload();b.empleado.salario_base=-1;assert.equal((await s.inject('POST','/empleados',b)).statusCode,400);assert.equal(s.queries.length,0);});
 for(const role of ['admin','barbero','super_admin'])test(`alta autorizada rol ${role}, scope parametrizado`,async t=>{const s=await fixture(t);const b=payload();b.acceso.roles=[role];b.empleado.es_barbero=role==='barbero';b.acceso.correo_principal='ANA@EXAMPLE.TEST';const r=await s.inject('POST','/empleados',b,'super_admin,admin');assert.equal(r.statusCode,201,r.body);assert.equal(s.auth[0][1],'ana@example.test');const writes=s.queries.filter(q=>q.text.includes('activo = TRUE')||q.text.startsWith('INSERT INTO public.roles_usuarios'));assert.ok(writes.some(q=>q.params.includes(role==='super_admin'?null:BRANCH)));});
 for(const option of ['duplicateDni','duplicateEmail','inactiveBranch'])test(`alta inválida sin Auth: ${option}`,async t=>{const s=await fixture(t,{[option]:true});const r=await s.inject('POST','/empleados',payload());assert.equal(r.statusCode,option==='inactiveBranch'?400:409,r.body);assert.equal(s.auth.length,0);});
+test('invitado solo se convierte en empleado con vinculacion explicita',async t=>{const s=await fixture(t,{guestContact:true});const first=await s.inject('POST','/empleados',payload());assert.equal(first.statusCode,409);assert.equal(first.json().error.code,'PERSONAS_GUEST_LINK_REQUIRED');assert.equal(first.json().error.details.id_persona,PERSON);const body=payload();body.vinculacion_persona={id_persona:PERSON,confirmar_vinculacion:true};const linked=await s.inject('POST','/empleados',body);assert.equal(linked.statusCode,201,linked.body);assert.equal(s.queries.some(q=>q.text.startsWith('INSERT INTO public.personas')),false);});
 test('alta falla SQL y compensa solamente su Auth',async t=>{const s=await fixture(t,{sqlFailure:true});assert.equal((await s.inject('POST','/empleados',payload())).statusCode,500);assert.deepEqual(s.auth.map(([op])=>op),['create','delete']);assert.ok(s.queries.some(q=>q.text==='ROLLBACK'));});
 test('Auth fallido no abre transacción',async t=>{const s=await fixture(t,{authFailure:true});assert.equal((await s.inject('POST','/empleados',payload())).statusCode,500);assert.equal(s.queries.some(q=>q.text==='BEGIN'),false);});
 test('sin usuario e inexistente no mutan',async t=>{for(const option of [{row:{id_usuario:null}},{missing:true}]){const s=await fixture(t,option);assert.equal((await s.inject('PATCH',undefined,payload())).statusCode,option.missing?404:409);assert.equal(s.queries.some(q=>q.text==='BEGIN'),false);}});

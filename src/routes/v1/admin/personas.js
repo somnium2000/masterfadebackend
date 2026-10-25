@@ -73,6 +73,16 @@ const barberPublicProfileInputSchema = {
   additionalProperties: false,
 };
 
+const personaLinkInputSchema = {
+  type: "object",
+  properties: {
+    id_persona: { type: "string", format: "uuid" },
+    confirmar_vinculacion: { const: true },
+  },
+  required: ["id_persona", "confirmar_vinculacion"],
+  additionalProperties: false,
+};
+
 const empleadoCreateBodySchema = {
   type: "object",
   properties: {
@@ -104,6 +114,7 @@ const empleadoCreateBodySchema = {
       additionalProperties: false,
     },
     perfil_publico: barberPublicProfileInputSchema,
+    vinculacion_persona: personaLinkInputSchema,
   },
   required: ["persona", "acceso", "empleado"],
   additionalProperties: false,
@@ -134,6 +145,7 @@ const clienteCreateBodySchema = {
       },
       additionalProperties: false,
     },
+    vinculacion_persona: personaLinkInputSchema,
   },
   required: ["persona", "acceso"],
   additionalProperties: false,
@@ -794,6 +806,7 @@ function sendHandled(reply, request, error, message, code) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
       ...(safeDetails !== undefined ? { details: safeDetails } : {}),
+      exposeDetails: error.code === "PERSONAS_GUEST_LINK_REQUIRED",
       requestId: request.id,
     });
   }
@@ -1184,6 +1197,87 @@ async function ensureEmailAvailability(client, email, { excludePersonaId = null,
   }
 }
 
+async function resolveAdministrativePersonaLink(client, email, link, { expectedAuthUserId = null } = {}) {
+  const authResult = await client.query(
+    `SELECT id FROM auth.users WHERE LOWER(email::text) = LOWER($1) LIMIT 2`,
+    [email]
+  );
+  const foreignAuth = authResult.rows.find((row) => String(row.id) !== String(expectedAuthUserId || ""));
+
+  const contactResult = await client.query(
+    `
+      SELECT
+        c.id_persona,
+        p.nombres,
+        p.apellidos,
+        EXISTS (
+          SELECT 1 FROM public.usuarios u
+          WHERE u.id_persona = c.id_persona AND u.deleted_at IS NULL
+        ) AS has_user,
+        EXISTS (
+          SELECT 1 FROM public.clientes cl
+          WHERE cl.id_persona = c.id_persona AND cl.deleted_at IS NULL
+        ) AS has_client,
+        EXISTS (
+          SELECT 1 FROM public.empleados e
+          WHERE e.id_persona = c.id_persona AND e.deleted_at IS NULL
+        ) AS has_employee
+      FROM public.correos c
+      JOIN public.personas p ON p.id_persona = c.id_persona AND p.deleted_at IS NULL
+      WHERE LOWER(c.direccion_correo::text) = LOWER($1)
+        AND c.deleted_at IS NULL
+      LIMIT 2
+    `,
+    [email]
+  );
+
+  if (!contactResult.rowCount) {
+    if (foreignAuth) {
+      throw new AppError(409, "El correo ya pertenece a una identidad de acceso incompleta", {
+        code: "PERSONAS_AUTH_IDENTITY_INCOMPLETE",
+      });
+    }
+    return null;
+  }
+  if (contactResult.rowCount !== 1) {
+    throw new AppError(409, "El correo tiene vinculaciones internas ambiguas", {
+      code: "PERSONAS_EMAIL_IDENTITY_CONFLICT",
+    });
+  }
+
+  const contact = contactResult.rows[0];
+  if (contact.has_user || contact.has_client || contact.has_employee) {
+    throw new AppError(409, "El correo ya pertenece a un usuario o perfil existente", {
+      code: "PERSONAS_EXISTING_USER_EMAIL",
+    });
+  }
+
+  if (foreignAuth) {
+    throw new AppError(409, "El correo ya pertenece a una identidad de acceso incompleta", {
+      code: "PERSONAS_AUTH_IDENTITY_INCOMPLETE",
+    });
+  }
+
+  if (!link) {
+    throw new AppError(409, "Existe una Persona invitada con este correo. Confirma su vinculacion para continuar", {
+      code: "PERSONAS_GUEST_LINK_REQUIRED",
+      details: {
+        id_persona: contact.id_persona,
+        nombre_completo: buildFullName(contact.nombres, contact.apellidos),
+        requiere_confirmacion: true,
+      },
+    });
+  }
+
+  if (link.confirmar_vinculacion !== true || String(link.id_persona) !== String(contact.id_persona)) {
+    throw new AppError(409, "La Persona confirmada no corresponde al correo indicado", {
+      code: "PERSONAS_GUEST_LINK_MISMATCH",
+    });
+  }
+
+  return contact.id_persona;
+}
+
 async function ensurePersonaDocumentAvailability(client, { dni = null, rtn = null, excludePersonaId = null } = {}) {
   if (dni) {
     const dniResult = await client.query(
@@ -1232,10 +1326,12 @@ async function upsertPrimaryEmail(client, personaId, email) {
       SELECT id_correo
       FROM public.correos
       WHERE id_persona = $1::uuid
-      ORDER BY es_principal DESC NULLS LAST, created_at ASC
+      ORDER BY (LOWER(direccion_correo::text) = LOWER($2)) DESC,
+               es_principal DESC NULLS LAST,
+               created_at ASC
       LIMIT 1
     `,
-    [personaId]
+    [personaId, email]
   );
 
   if (existing.rowCount) {
@@ -1695,12 +1791,17 @@ async function createEmpleado(app, request, payload) {
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
     assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles });
 
+    assertValidEmail(correoPrincipal);
+    const linkedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null
+    );
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
       rtn: persona.rtn,
+      excludePersonaId: linkedPersonaId,
     });
-    assertValidEmail(correoPrincipal);
-    await ensureEmailAvailability(client, correoPrincipal);
 
     const roleIdsByName = await loadRoleIdByName(client);
     for (const role of roles) {
@@ -1725,36 +1826,37 @@ async function createEmpleado(app, request, payload) {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    const personaInsert = await client.query(
-      `
-        INSERT INTO public.personas (
-          nombres,
-          apellidos,
-          fecha_nacimiento,
-          genero_codigo,
-          dni,
-          rtn,
-          telefono_principal,
-          direccion_texto,
-          observaciones
-        )
-        VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
-        RETURNING id_persona
-      `,
-      [
-        persona.nombres,
-        persona.apellidos,
-        persona.fecha_nacimiento,
-        persona.genero_codigo,
-        persona.dni,
-        persona.rtn,
-        persona.telefono_principal,
-        persona.direccion_texto,
-        persona.observaciones,
-      ]
+    const confirmedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null,
+      { expectedAuthUserId: authUserId }
     );
+    if (String(confirmedPersonaId || "") !== String(linkedPersonaId || "")) {
+      throw new AppError(409, "La identidad del correo cambio durante la operacion", {
+        code: "PERSONAS_EMAIL_IDENTITY_CONFLICT",
+      });
+    }
 
-    const idPersona = personaInsert.rows[0].id_persona;
+    let idPersona = confirmedPersonaId;
+    if (!idPersona) {
+      const personaInsert = await client.query(
+        `
+          INSERT INTO public.personas (
+            nombres, apellidos, fecha_nacimiento, genero_codigo, dni, rtn,
+            telefono_principal, direccion_texto, observaciones
+          )
+          VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
+          RETURNING id_persona
+        `,
+        [
+          persona.nombres, persona.apellidos, persona.fecha_nacimiento,
+          persona.genero_codigo, persona.dni, persona.rtn,
+          persona.telefono_principal, persona.direccion_texto, persona.observaciones,
+        ]
+      );
+      idPersona = personaInsert.rows[0].id_persona;
+    }
 
     await upsertPrimaryEmail(client, idPersona, correoPrincipal);
 
@@ -2156,12 +2258,17 @@ async function createCliente(app, request, payload) {
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
     assertRequiredClientBusinessFields({ persona, correoPrincipal });
+    assertValidEmail(correoPrincipal);
+    const linkedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null
+    );
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
       rtn: persona.rtn,
+      excludePersonaId: linkedPersonaId,
     });
-    assertValidEmail(correoPrincipal);
-    await ensureEmailAvailability(client, correoPrincipal);
     if (!habilitarAcceso) {
       throw new AppError(400, "Los clientes deben crearse con acceso habilitado", {
         code: "PERSONAS_CLIENT_ACCESS_REQUIRED",
@@ -2178,36 +2285,37 @@ async function createCliente(app, request, payload) {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    const personaInsert = await client.query(
-      `
-        INSERT INTO public.personas (
-          nombres,
-          apellidos,
-          fecha_nacimiento,
-          genero_codigo,
-          dni,
-          rtn,
-          telefono_principal,
-          direccion_texto,
-          observaciones
-        )
-        VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
-        RETURNING id_persona
-      `,
-      [
-        persona.nombres,
-        persona.apellidos,
-        persona.fecha_nacimiento,
-        persona.genero_codigo,
-        persona.dni,
-        persona.rtn,
-        persona.telefono_principal,
-        persona.direccion_texto,
-        persona.observaciones,
-      ]
+    const confirmedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null,
+      { expectedAuthUserId: authUserId }
     );
+    if (String(confirmedPersonaId || "") !== String(linkedPersonaId || "")) {
+      throw new AppError(409, "La identidad del correo cambio durante la operacion", {
+        code: "PERSONAS_EMAIL_IDENTITY_CONFLICT",
+      });
+    }
 
-    const idPersona = personaInsert.rows[0].id_persona;
+    let idPersona = confirmedPersonaId;
+    if (!idPersona) {
+      const personaInsert = await client.query(
+        `
+          INSERT INTO public.personas (
+            nombres, apellidos, fecha_nacimiento, genero_codigo, dni, rtn,
+            telefono_principal, direccion_texto, observaciones
+          )
+          VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
+          RETURNING id_persona
+        `,
+        [
+          persona.nombres, persona.apellidos, persona.fecha_nacimiento,
+          persona.genero_codigo, persona.dni, persona.rtn,
+          persona.telefono_principal, persona.direccion_texto, persona.observaciones,
+        ]
+      );
+      idPersona = personaInsert.rows[0].id_persona;
+    }
     await assertPersonaNotEmpleado(client, idPersona);
 
     if (correoPrincipal) {
