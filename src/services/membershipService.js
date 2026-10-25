@@ -1,6 +1,17 @@
 import crypto from "node:crypto";
 import { AppError } from "../utils/errors.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
+import { PIXELPAY_SALE_OUTCOME } from "./payments/PixelPayDirectProvider.js";
+import { inspectPixelPayCardExpire } from "./payments/PixelPaySdkProvider.js";
+import {
+  buildSafePixelPaySdkDiagnostics,
+  buildSafeProviderErrorDiagnostic,
+  safePixelPayRequestId,
+} from "./payments/pixelPaySaleDiagnostics.js";
+import {
+  createPixelPaySaleAttemptRecord,
+  finalizePixelPaySaleAttemptBestEffort,
+} from "./payments/pixelPaySaleAttemptStore.js";
 import { resolveTodoPagoSimulatedResponse } from "./payments/todopagoSimulatedResponses.js";
 
 const ACTIVE_STATUS = "activa";
@@ -19,6 +30,7 @@ const MEMBERSHIP_CONSUMPTION_TYPES = {
 };
 const MEMBERSHIP_CONFIRMABLE_INTENT_STATES = new Set(["creado", "link_generado", "pendiente_confirmacion"]);
 const MEMBERSHIP_SIMULATOR_EVIDENCE = Symbol("membership-simulator-evidence");
+const MEMBERSHIP_PIXELPAY_EVIDENCE = Symbol("membership-pixelpay-evidence");
 // AM: Lista de errores SQL de compatibilidad de esquema (tabla/columna/tipo ausente).
 const SCHEMA_COMPATIBLE_ERROR_CODES = new Set(["42P01", "42703", "42704"]);
 // AM: Literal SQL seguro para fallback de beneficios cuando no existe la columna snapshot.
@@ -1373,31 +1385,54 @@ export async function createMembershipOrderPaymentIntent(client, {
   }
 
   const configuredProvider = safeText(process.env.PAYMENT_PROVIDER)?.toLowerCase() || "mock";
-  if (configuredProvider === "pixelpay") {
-    throw new AppError(409, "Las compras de membresias con PixelPay aun no estan disponibles", {
-      code: "MEMBERSHIP_PIXELPAY_CHECKOUT_NOT_AVAILABLE",
-    });
-  }
   const provider = await ensureActivePaymentProvider(client, configuredProvider);
-  const providerAdapter = PaymentProviderFactory.create();
   const resolvedUsuarioId = await resolveMembershipIntentCreatorUserId(client, {
     clienteId: safeClienteId,
     preferredUserId: safeText(usuarioId) || safeText(order.id_usuario) || null,
   });
-  const idempotencyKey = `mf_membership_${safeOrderId}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  const idempotencyKey = `mf_membership_${safeOrderId}`;
+  const existingIntent = await client.query(
+    `SELECT id_intent, id_membership_order, origen_pago_codigo, monto_hnl, moneda_codigo, referencia_externa,
+            estado_intent_codigo, expires_at
+       FROM public.payment_intents
+      WHERE id_provider = $1::uuid AND idempotency_key = $2::text
+      LIMIT 1
+      FOR UPDATE`,
+    [provider.id_provider, idempotencyKey]
+  );
+  if (existingIntent.rows[0]) {
+    const existing = existingIntent.rows[0];
+    if (safeText(existing.id_membership_order) !== safeOrderId
+      || toNumber(existing.monto_hnl, -1) !== amount
+      || safeText(existing.moneda_codigo).toUpperCase() !== safeText(order.moneda_codigo).toUpperCase()) {
+      throw new AppError(409, "El intent existente no coincide con la orden de membresia", {
+        code: "MEMBERSHIP_PAYMENT_INTENT_CONFLICT",
+      });
+    }
+    return {
+      id_payment_intent: existing.id_intent,
+      id_order: existing.id_membership_order,
+      origen_pago_codigo: existing.origen_pago_codigo,
+      estado_intent_codigo: existing.estado_intent_codigo,
+      monto: toNumber(existing.monto_hnl, amount),
+      moneda_codigo: existing.moneda_codigo,
+      client_secret: safeText(existing.referencia_externa) || idempotencyKey,
+      reused: true,
+    };
+  }
+
   const callbackUrl = buildMembershipPaymentCallbackUrl(safeOrderId);
   const currency = safeText(order.moneda_codigo) || "HNL";
-  const providerIntent = await providerAdapter.createIntent({
-    idempotencyKey,
-    montoHnl: amount,
-    moneda: currency,
-    descripcion: `Compra de plan ${safeOrderId}`,
-    callbackUrl,
-    metadata: {
-      id_order: safeOrderId,
-      id_cliente: safeClienteId,
-    },
-  });
+  const providerIntent = configuredProvider === "pixelpay"
+    ? { paymentUrl: null, providerIntentId: null }
+    : await PaymentProviderFactory.create().createIntent({
+      idempotencyKey,
+      montoHnl: amount,
+      moneda: currency,
+      descripcion: `Compra de plan ${safeOrderId}`,
+      callbackUrl,
+      metadata: { id_order: safeOrderId, id_cliente: safeClienteId },
+    });
 
   const intentExpiry = (expiresAt && !Number.isNaN(expiresAt.getTime()))
     ? expiresAt.toISOString()
@@ -1479,7 +1514,11 @@ async function getMembershipIntentForConfirmation(client, idPaymentIntent) {
         pi.monto_hnl,
         pi.moneda_codigo,
         pi.referencia_externa,
+        pi.provider_session_id,
+        pi.orden_compra,
+        pi.expires_at AS intent_expires_at,
         pi.created_by_usuario_id,
+        pp.codigo AS provider_code,
         mpo.id_order,
         mpo.id_cliente,
         mpo.id_usuario,
@@ -1491,6 +1530,8 @@ async function getMembershipIntentForConfirmation(client, idPaymentIntent) {
         mpo.moneda_codigo AS order_moneda_codigo,
         mpo.expires_at AS order_expires_at,
         mpo.id_suscripcion,
+        mpo.plan_snapshot,
+        mpo.cliente_snapshot,
         mp.periodo_membresia_codigo,
         mp.beneficios,
         mp.nombre_plan,
@@ -1498,6 +1539,8 @@ async function getMembershipIntentForConfirmation(client, idPaymentIntent) {
       FROM public.payment_intents pi
       JOIN public.membership_purchase_orders mpo
         ON mpo.id_order = pi.id_membership_order
+      JOIN public.payment_providers pp
+        ON pp.id_provider = pi.id_provider
       LEFT JOIN public.membership_plans mp
         ON mp.id_plan = mpo.id_plan
       LEFT JOIN public.sucursales s
@@ -1613,12 +1656,13 @@ async function createSubscriptionFromPaidMembershipOrder(client, {
 }
 
 async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
-  const providerTxId = safeText(intentRow?.referencia_externa) || `membership_${intentRow?.id_intent}`;
+  const providerTxId = safeText(intentRow?.provider_transaction_id)
+    || safeText(intentRow?.referencia_externa) || `membership_${intentRow?.id_intent}`;
   const creatorUserId = safeText(intentRow?.created_by_usuario_id) || safeText(intentRow?.id_usuario) || null;
   const amount = toNumber(intentRow?.monto_hnl, toNumber(intentRow?.total_hnl, 0));
   const currency = safeText(intentRow?.moneda_codigo) || safeText(intentRow?.order_moneda_codigo) || "HNL";
 
-  await client.query(
+  const result = await client.query(
     `
       INSERT INTO public.payments (
         id_intent,
@@ -1644,9 +1688,17 @@ async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
       )
       ON CONFLICT (provider_tx_id)
       DO UPDATE SET updated_at = now()
+      WHERE public.payments.id_intent = EXCLUDED.id_intent
+      RETURNING id_payment, pago_tardio
     `,
     [intentRow.id_intent, providerTxId, amount, currency, creatorUserId]
   );
+  if (!result.rows?.[0]) {
+    throw new AppError(409, "La referencia del proveedor ya pertenece a otro pago", {
+      code: "MEMBERSHIP_PAYMENT_PROVIDER_TX_CONFLICT",
+    });
+  }
+  return result.rows[0];
 }
 
 export async function confirmMembershipPaymentAndActivateSubscription(client, {
@@ -1720,10 +1772,42 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     });
   }
 
-  if (financialEvidence !== MEMBERSHIP_SIMULATOR_EVIDENCE) {
+  const simulatorEvidence = financialEvidence === MEMBERSHIP_SIMULATOR_EVIDENCE;
+  const pixelPayEvidence = financialEvidence?.kind === MEMBERSHIP_PIXELPAY_EVIDENCE
+    ? financialEvidence : null;
+  if (!simulatorEvidence && !pixelPayEvidence) {
     throw new AppError(409, "El pago de la membresia requiere verificacion del proveedor", {
       code: "MEMBERSHIP_PAYMENT_VERIFICATION_REQUIRED",
       details: { id_payment_intent: safeIntentId },
+    });
+  }
+  if (pixelPayEvidence) {
+    const expectedAmount = toNumber(intent.monto_hnl, -1);
+    if (pixelPayEvidence.approved !== true
+      || pixelPayEvidence.paymentHashValid !== true
+      || pixelPayEvidence.amountMatches !== true
+      || toNumber(pixelPayEvidence.amount, -2) !== expectedAmount
+      || safeText(pixelPayEvidence.currency).toUpperCase() !== safeText(intent.moneda_codigo).toUpperCase()
+      || !safeText(pixelPayEvidence.paymentUuid)
+      || !safeText(pixelPayEvidence.transactionId)) {
+      throw new AppError(409, "La evidencia financiera de PixelPay no es valida", {
+        code: "MEMBERSHIP_PIXELPAY_EVIDENCE_INVALID",
+      });
+    }
+    intent.provider_transaction_id = pixelPayEvidence.transactionId;
+  }
+
+  let orderPlanSnapshot;
+  try {
+    orderPlanSnapshot = typeof intent.plan_snapshot === "string"
+      ? JSON.parse(intent.plan_snapshot) : intent.plan_snapshot;
+  } catch {
+    orderPlanSnapshot = null;
+  }
+  if (!orderPlanSnapshot || typeof orderPlanSnapshot !== "object"
+    || !orderPlanSnapshot.beneficios || !safeText(orderPlanSnapshot.periodo_membresia_codigo)) {
+    throw new AppError(409, "La orden no contiene un snapshot de plan valido", {
+      code: "MEMBERSHIP_PAYMENT_ORDER_SNAPSHOT_INVALID",
     });
   }
 
@@ -1747,8 +1831,8 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     clienteId: intent.id_cliente,
     planId: intent.id_plan,
     sucursalId: orderBranchId,
-    periodoMembresiaCodigo: intent.periodo_membresia_codigo,
-    beneficiosRaw: intent.beneficios,
+    periodoMembresiaCodigo: orderPlanSnapshot.periodo_membresia_codigo,
+    beneficiosRaw: orderPlanSnapshot.beneficios,
     usuarioCreadorId: safeText(intent.id_usuario) || safeText(intent.created_by_usuario_id) || null,
   });
 
@@ -1778,12 +1862,328 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     [intent.id_intent]
   );
 
-  await insertCapturedPaymentForMembershipIntent(client, intent);
+  const capturedPayment = await insertCapturedPaymentForMembershipIntent(client, intent);
+  if (!capturedPayment?.id_payment) {
+    throw new AppError(500, "No se pudo registrar el pago de la membresia", {
+      code: "MEMBERSHIP_PAYMENT_RECORD_FAILED",
+    });
+  }
+  if (capturedPayment.pago_tardio === true) {
+    throw new AppError(409, "El pago requiere conciliacion antes de activar la membresia", {
+      code: "MEMBERSHIP_PAYMENT_LATE_RECONCILIATION_REQUIRED",
+    });
+  }
+  await client.query(
+    `INSERT INTO public.subscription_payments (
+       id_suscripcion, monto_hnl, moneda_codigo, metodo, estado, paid_at,
+       id_payment, registrado_por_usuario_id
+     )
+     SELECT $1::uuid, $2::numeric, $3::text, 'online', 'pagado', now(), $4::uuid, $5::uuid
+     WHERE NOT EXISTS (
+       SELECT 1 FROM public.subscription_payments WHERE id_payment = $4::uuid
+     )`,
+    [
+      createdSubscription.id_suscripcion,
+      toNumber(intent.monto_hnl, 0),
+      safeText(intent.moneda_codigo) || "HNL",
+      capturedPayment.id_payment,
+      safeText(intent.id_usuario) || safeText(intent.created_by_usuario_id) || null,
+    ]
+  );
 
   return {
     id_suscripcion: createdSubscription.id_suscripcion,
     estado: createdSubscription.estado_suscripcion_codigo || "activa",
   };
+}
+
+async function persistVerifiedMembershipPixelPayEvidence(app, {
+  intent,
+  saleResult,
+  paymentAttemptId,
+  requestId,
+} = {}) {
+  const client = await app.db.connect();
+  let txStarted = false;
+  try {
+    await client.query("BEGIN");
+    txStarted = true;
+    await client.query(
+      `UPDATE public.payment_intents
+          SET referencia_externa = $2::text,
+              provider_session_id = $3::text,
+              updated_at = now()
+        WHERE id_intent = $1::uuid
+          AND estado_intent_codigo = 'pendiente_confirmacion'`,
+      [intent.id_intent, saleResult.transactionId, saleResult.paymentUuid]
+    );
+    await client.query(
+      `INSERT INTO public.payment_events (
+         id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+       ) VALUES ($1::uuid, $2::text, 'membership.pixelpay.approved_verified', TRUE, $3::jsonb, $4::uuid)
+       ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+      [
+        intent.id_provider,
+        `pixelpay_membership_${paymentAttemptId}`,
+        {
+          id_order: intent.id_order,
+          id_intent: intent.id_intent,
+          provider: "pixelpay",
+          payment_uuid: saleResult.paymentUuid,
+          transaction_id: saleResult.transactionId,
+          amount: toNumber(intent.monto_hnl, 0),
+          currency: safeText(intent.moneda_codigo) || "HNL",
+          payment_hash_valid: true,
+          amount_matches: true,
+          request_id: safePixelPayRequestId(requestId),
+          payment_attempt_id: paymentAttemptId,
+        },
+        intent.id_intent,
+      ]
+    );
+    await client.query("COMMIT");
+    txStarted = false;
+  } catch (error) {
+    if (txStarted) await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function processMembershipPixelPaySale(app, {
+  idPaymentIntent,
+  clienteId,
+  card,
+  billing,
+  requestId,
+  logger,
+} = {}) {
+  const safeIntentId = normalizeText(idPaymentIntent);
+  const safeClienteId = normalizeText(clienteId);
+  const paymentAttemptId = crypto.randomUUID();
+  let claimClient = await app.db.connect();
+  let intent;
+  try {
+    await claimClient.query("BEGIN");
+    await claimClient.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
+      `pixelpay-sale:${safeIntentId}`,
+    ]);
+    intent = await getMembershipIntentForConfirmation(claimClient, safeIntentId);
+    if (!intent) throw new AppError(404, "Intent de pago no encontrado", { code: "MEMBERSHIP_PAYMENT_INTENT_NOT_FOUND" });
+    if (normalizeText(intent.id_cliente) !== safeClienteId) {
+      throw new AppError(403, "La orden de membresia no pertenece al cliente autenticado", {
+        code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+      });
+    }
+    if (normalizeText(intent.provider_code).toLowerCase() !== "pixelpay") {
+      throw new AppError(409, "El intent no pertenece a PixelPay", { code: "MEMBERSHIP_PAYMENT_PROVIDER_MISMATCH" });
+    }
+    if (normalizeText(intent.estado_intent_codigo).toLowerCase() === "confirmado") {
+      await claimClient.query("COMMIT");
+      return { processed: false, duplicate: true, estado_intent_codigo: "confirmado", id_suscripcion: intent.id_suscripcion };
+    }
+    await claimClient.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
+      `pixelpay-membership-scope:${safeClienteId}:${normalizeText(intent.id_sucursal)}`,
+    ]);
+    const pendingInScope = await claimClient.query(
+      `SELECT pi.id_intent
+         FROM public.payment_intents pi
+         JOIN public.membership_purchase_orders mpo
+           ON mpo.id_order = pi.id_membership_order
+        WHERE pi.id_provider = $1::uuid
+          AND pi.origen_pago_codigo = 'membership'
+          AND pi.estado_intent_codigo = 'pendiente_confirmacion'
+          AND mpo.id_cliente = $2::uuid
+          AND mpo.id_sucursal = $3::uuid
+          AND pi.id_intent <> $4::uuid
+        LIMIT 1`,
+      [intent.id_provider, safeClienteId, intent.id_sucursal, safeIntentId]
+    );
+    if (pendingInScope.rows[0]) {
+      throw new AppError(409, "Existe un pago anterior pendiente de conciliacion", {
+        code: "MEMBERSHIP_PIXELPAY_PENDING_SCOPE_CONFLICT",
+      });
+    }
+    if (normalizeText(intent.estado_intent_codigo).toLowerCase() !== "link_generado") {
+      throw new AppError(409, "Ya existe un cobro en curso para este intent", {
+        code: "MEMBERSHIP_PIXELPAY_SALE_ALREADY_IN_PROGRESS",
+      });
+    }
+    const expiryMs = Math.min(
+      new Date(intent.intent_expires_at).getTime(),
+      new Date(intent.order_expires_at).getTime()
+    );
+    if (!Number.isFinite(expiryMs) || expiryMs <= Date.now()) {
+      throw new AppError(409, "La orden de membresia ya no esta disponible para pago", {
+        code: "MEMBERSHIP_PAYMENT_INTENT_EXPIRED",
+      });
+    }
+    const expiry = inspectPixelPayCardExpire(card?.expire);
+    if (!expiry.formatValid || !expiry.future) {
+      throw new AppError(400, "La fecha de vencimiento de la tarjeta no es valida", {
+        code: "MEMBERSHIP_PIXELPAY_CARD_EXPIRE_INVALID",
+      });
+    }
+    await createPixelPaySaleAttemptRecord(claimClient, {
+      idIntent: safeIntentId,
+      paymentAttemptId,
+      requestId: safePixelPayRequestId(requestId),
+      cardExpireFormatValid: expiry.formatValid,
+      cardExpireFuture: expiry.future,
+      billingAddressLength: normalizeText(billing?.address).length,
+    });
+    const updated = await claimClient.query(
+      `UPDATE public.payment_intents
+          SET estado_intent_codigo = 'pendiente_confirmacion', updated_at = now()
+        WHERE id_intent = $1::uuid AND estado_intent_codigo = 'link_generado'
+        RETURNING id_intent`,
+      [safeIntentId]
+    );
+    if (!updated.rows[0]) throw new AppError(409, "Ya existe un cobro en curso para este intent", {
+      code: "MEMBERSHIP_PIXELPAY_SALE_ALREADY_IN_PROGRESS",
+    });
+    await claimClient.query("COMMIT");
+  } catch (error) {
+    await claimClient.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    claimClient.release();
+  }
+
+  let saleResult;
+  const saleStartedAt = Date.now();
+  try {
+    const planSnapshot = typeof intent.plan_snapshot === "string" ? JSON.parse(intent.plan_snapshot) : intent.plan_snapshot;
+    const clienteSnapshot = typeof intent.cliente_snapshot === "string" ? JSON.parse(intent.cliente_snapshot) : intent.cliente_snapshot;
+    const amount = toNumber(intent.monto_hnl, -1);
+    saleResult = await PaymentProviderFactory.create().sale({
+      orderId: `VIP-${intent.id_order}`,
+      currency: safeText(intent.moneda_codigo) || "HNL",
+      amount,
+      items: [{ code: safeText(intent.id_plan), title: safeText(planSnapshot?.nombre_plan) || "Membresia VIP", price: amount, qty: 1 }],
+      customer: { name: safeText(clienteSnapshot?.nombre_completo) || "Cliente", email: safeText(clienteSnapshot?.email) },
+      card,
+      billing,
+    }, { requestId, idIntent: safeIntentId, paymentAttemptId, logger });
+  } catch (providerError) {
+    const diagnostic = buildSafeProviderErrorDiagnostic(providerError, requestId);
+    await finalizePixelPaySaleAttemptBestEffort(app.db, {
+      ...diagnostic,
+      idIntent: safeIntentId,
+      paymentAttemptId,
+      outcome: providerError?.uncertain === true
+        ? PIXELPAY_SALE_OUTCOME.UNCERTAIN : PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE,
+      durationMs: Date.now() - saleStartedAt,
+    }, logger);
+    const client = await app.db.connect();
+    let errorTxStarted = false;
+    try {
+      await client.query("BEGIN");
+      errorTxStarted = true;
+      const nextState = providerError?.uncertain === true ? "pendiente_confirmacion" : "fallido";
+      await client.query(
+        `INSERT INTO public.payment_events (
+           id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+         ) VALUES ($1::uuid, $2::text, $3::text, FALSE, $4::jsonb, $5::uuid)
+         ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+        [
+          intent.id_provider,
+          `pixelpay_membership_${paymentAttemptId}`,
+          `membership.pixelpay.${nextState}`,
+          {
+            outcome: providerError?.uncertain === true ? PIXELPAY_SALE_OUTCOME.UNCERTAIN : PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE,
+            request_id: safePixelPayRequestId(requestId),
+            payment_attempt_id: paymentAttemptId,
+          },
+          safeIntentId,
+        ]
+      );
+      await client.query(
+        `UPDATE public.payment_intents SET estado_intent_codigo=$2::text, updated_at=now()
+          WHERE id_intent=$1::uuid AND estado_intent_codigo='pendiente_confirmacion'`,
+        [safeIntentId, nextState]
+      );
+      await client.query("COMMIT");
+      errorTxStarted = false;
+      return { processed: false, pending_confirmation: nextState === "pendiente_confirmacion", estado_intent_codigo: nextState };
+    } catch (error) {
+      if (errorTxStarted) await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally { client.release(); }
+  }
+
+  const diagnostics = buildSafePixelPaySdkDiagnostics(saleResult.diagnostics);
+  await finalizePixelPaySaleAttemptBestEffort(app.db, {
+    ...diagnostics,
+    idIntent: safeIntentId,
+    paymentAttemptId,
+    outcome: saleResult.outcome,
+    statusCode: diagnostics?.statusCode ?? saleResult.statusCode,
+    durationMs: Date.now() - saleStartedAt,
+    observedPaymentUuidUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN ? saleResult.paymentUuid : null,
+    observedTransactionIdUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN ? saleResult.transactionId : null,
+    observedTransactionReferenceUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN ? saleResult.transactionReference : null,
+  }, logger);
+
+  if (saleResult.outcome === PIXELPAY_SALE_OUTCOME.APPROVED) {
+    await persistVerifiedMembershipPixelPayEvidence(app, {
+      intent,
+      saleResult,
+      paymentAttemptId,
+      requestId,
+    });
+  }
+
+  const finalClient = await app.db.connect();
+  let txStarted = false;
+  try {
+    await finalClient.query("BEGIN");
+    txStarted = true;
+    if (saleResult.outcome !== PIXELPAY_SALE_OUTCOME.APPROVED) {
+      await finalClient.query(
+        `INSERT INTO public.payment_events (
+           id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+         ) VALUES ($1::uuid, $2::text, $3::text, FALSE, $4::jsonb, $5::uuid)
+         ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+        [intent.id_provider, `pixelpay_membership_${paymentAttemptId}`,
+          `membership.pixelpay.${saleResult.outcome}`,
+          { outcome: saleResult.outcome, request_id: safePixelPayRequestId(requestId), payment_attempt_id: paymentAttemptId },
+          safeIntentId]
+      );
+      const nextState = saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN ? "pendiente_confirmacion" : "fallido";
+      await finalClient.query(
+        `UPDATE public.payment_intents SET estado_intent_codigo=$2::text, updated_at=now()
+          WHERE id_intent=$1::uuid AND estado_intent_codigo='pendiente_confirmacion'`,
+        [safeIntentId, nextState]
+      );
+      await finalClient.query("COMMIT");
+      txStarted = false;
+      return { processed: false, pending_confirmation: nextState === "pendiente_confirmacion", estado_intent_codigo: nextState };
+    }
+    const confirmation = await confirmMembershipPaymentAndActivateSubscription(finalClient, {
+      idPaymentIntent: safeIntentId,
+      clienteId: safeClienteId,
+      financialEvidence: {
+        kind: MEMBERSHIP_PIXELPAY_EVIDENCE,
+        approved: saleResult.approved,
+        paymentHashValid: saleResult.paymentHashValid,
+        amountMatches: saleResult.amountMatches,
+        amount: toNumber(intent.monto_hnl, -1),
+        currency: intent.moneda_codigo,
+        paymentUuid: saleResult.paymentUuid,
+        transactionId: saleResult.transactionId,
+      },
+    });
+    await finalClient.query("COMMIT");
+    txStarted = false;
+    return { processed: true, duplicate: false, estado_intent_codigo: "confirmado", confirmation };
+  } catch (error) {
+    if (txStarted) await finalClient.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    finalClient.release();
+  }
 }
 
 export async function processMembershipSimulatorEvent(client, {

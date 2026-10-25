@@ -10,6 +10,7 @@ import {
 import {
   createMembershipPurchaseOrder,
   createMembershipOrderPaymentIntent,
+  processMembershipPixelPaySale,
   processMembershipSimulatorEvent,
   cancelMembership,
   cancelMembershipBySubscription,
@@ -1194,41 +1195,62 @@ export default async function clienteRoutes(app) {
       schema: {
         body: {
           type: "object",
-          required: ["id_payment_intent"],
+          required: ["id_payment_intent", "card", "billing"],
           properties: {
             id_payment_intent: { type: "string", format: "uuid" },
+            card: {
+              type: "object",
+              required: ["number", "holder", "expire", "cvv"],
+              properties: {
+                number: { type: "string", pattern: "^[0-9 ]{13,23}$" },
+                holder: { type: "string", minLength: 2, maxLength: 120 },
+                expire: { type: "string", pattern: "^[0-9]{2}(0[1-9]|1[0-2])$" },
+                cvv: { type: "string", pattern: "^[0-9]{3,4}$" },
+              },
+              additionalProperties: false,
+            },
+            billing: {
+              type: "object",
+              required: ["address", "country", "state", "city", "phone"],
+              properties: {
+                address: { type: "string", minLength: 2, maxLength: 180 },
+                country: { type: "string", const: "HN" },
+                state: { type: "string", pattern: "^HN-[A-Z]{2}$" },
+                city: { type: "string", minLength: 1, maxLength: 80 },
+                phone: { type: "string", pattern: "^[0-9]{8,15}$" },
+              },
+              additionalProperties: false,
+            },
           },
           additionalProperties: false,
         },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: {
-                type: "object",
-                properties: {
-                  id_suscripcion: { type: "string", format: "uuid" },
-                  estado: { type: "string" },
-                  email_enviado: { type: "boolean" },
-                },
-                required: ["id_suscripcion", "estado", "email_enviado"],
-                additionalProperties: false,
-              },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-        },
+        response: { 200: { type: "object", additionalProperties: true }, 202: { type: "object", additionalProperties: true } },
       },
     },
     async (request, reply) => {
-      ensureClienteContext(request);
-      return sendError(reply, 409, "El pago de la membresia requiere verificacion del proveedor", {
-        code: "MEMBERSHIP_PAYMENT_VERIFICATION_REQUIRED",
-        requestId: request.id,
-      });
+      const context = ensureClienteContext(request);
+      if (!request.body?.card || !request.body?.billing) {
+        return sendError(reply, 400, "Faltan los datos requeridos para procesar el pago", {
+          code: "MEMBERSHIP_PIXELPAY_PAYMENT_DATA_REQUIRED",
+          requestId: request.id,
+        });
+      }
+      try {
+        const result = await processMembershipPixelPaySale(app, {
+          idPaymentIntent: request.body.id_payment_intent,
+          clienteId: context.clienteId,
+          card: request.body.card,
+          billing: request.body.billing,
+          requestId: request.id,
+          logger: request.log,
+        });
+        return sendOk(reply, result, {
+          statusCode: result.pending_confirmation ? 202 : 200,
+          requestId: request.id,
+        });
+      } catch (error) {
+        return sendHandled(reply, request, error, "No se pudo procesar el pago de la membresia", "MEMBERSHIP_PIXELPAY_SALE_ERROR");
+      }
     }
   );
 
