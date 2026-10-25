@@ -1656,11 +1656,13 @@ async function createSubscriptionFromPaidMembershipOrder(client, {
 }
 
 async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
-  const providerTxId = safeText(intentRow?.provider_transaction_id)
+  const providerTxId = safeText(intentRow?.provider_payment_uuid)
+    || safeText(intentRow?.provider_transaction_id)
     || safeText(intentRow?.referencia_externa) || `membership_${intentRow?.id_intent}`;
   const creatorUserId = safeText(intentRow?.created_by_usuario_id) || safeText(intentRow?.id_usuario) || null;
   const amount = toNumber(intentRow?.monto_hnl, toNumber(intentRow?.total_hnl, 0));
   const currency = safeText(intentRow?.moneda_codigo) || safeText(intentRow?.order_moneda_codigo) || "HNL";
+  const providerPaidAt = safeText(intentRow?.provider_paid_at) || null;
 
   const result = await client.query(
     `
@@ -1681,7 +1683,7 @@ async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
         $2::text,
         $3::numeric,
         $4::text,
-        now(),
+        COALESCE($6::timestamptz, now()),
         FALSE,
         FALSE,
         $5::uuid
@@ -1691,7 +1693,7 @@ async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
       WHERE public.payments.id_intent = EXCLUDED.id_intent
       RETURNING id_payment, pago_tardio
     `,
-    [intentRow.id_intent, providerTxId, amount, currency, creatorUserId]
+    [intentRow.id_intent, providerTxId, amount, currency, creatorUserId, providerPaidAt]
   );
   if (!result.rows?.[0]) {
     throw new AppError(409, "La referencia del proveedor ya pertenece a otro pago", {
@@ -1794,7 +1796,9 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
         code: "MEMBERSHIP_PIXELPAY_EVIDENCE_INVALID",
       });
     }
+    intent.provider_payment_uuid = pixelPayEvidence.paymentUuid;
     intent.provider_transaction_id = pixelPayEvidence.transactionId;
+    intent.provider_paid_at = safeText(pixelPayEvidence.verifiedAt) || null;
   }
 
   let orderPlanSnapshot;
@@ -1895,6 +1899,106 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     id_suscripcion: createdSubscription.id_suscripcion,
     estado: createdSubscription.estado_suscripcion_codigo || "activa",
   };
+}
+
+export async function recoverMembershipPixelPayApproval(client, {
+  idPaymentIntent,
+  clienteId,
+} = {}) {
+  const safeIntentId = normalizeText(idPaymentIntent);
+  const safeClienteId = normalizeText(clienteId);
+  if (!safeIntentId || !safeClienteId) {
+    throw new AppError(400, "El intent y el cliente son obligatorios para recuperar el pago", {
+      code: "MEMBERSHIP_PIXELPAY_RECOVERY_INVALID_INPUT",
+    });
+  }
+  const { rows } = await client.query(
+    `SELECT pi.id_intent, pi.id_provider, pi.id_membership_order, pi.estado_intent_codigo,
+            pi.monto_hnl, pi.moneda_codigo, pi.expires_at AS intent_expires_at,
+            mpo.id_cliente, mpo.expires_at AS order_expires_at,
+            mpo.estado_orden_codigo, mpo.id_suscripcion,
+            pp.codigo AS provider_code,
+            pe.payload_esencial, pe.recibido_at AS verified_at
+       FROM public.payment_intents pi
+       JOIN public.membership_purchase_orders mpo
+         ON mpo.id_order = pi.id_membership_order
+       JOIN public.payment_providers pp
+         ON pp.id_provider = pi.id_provider
+       JOIN public.payment_events pe
+         ON pe.id_intent = pi.id_intent
+        AND pe.id_provider = pi.id_provider
+      WHERE pi.id_intent = $1::uuid
+        AND pi.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado')
+        AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
+        AND pe.firma_valida = TRUE
+      ORDER BY pe.recibido_at DESC
+      LIMIT 1
+      FOR UPDATE OF pi`,
+    [safeIntentId]
+  );
+  const durable = rows?.[0];
+  if (durable && safeText(durable.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "No tienes permiso para recuperar este pago", {
+      code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+    });
+  }
+  if (durable && safeText(durable.provider_code).toLowerCase() !== "pixelpay") {
+    throw new AppError(409, "El proveedor del pago no coincide con PixelPay", {
+      code: "MEMBERSHIP_PAYMENT_PROVIDER_MISMATCH",
+    });
+  }
+  let evidence = durable?.payload_esencial;
+  if (typeof evidence === "string") {
+    try { evidence = JSON.parse(evidence); } catch { evidence = null; }
+  }
+  if (!durable || !evidence
+    || safeText(evidence.id_intent) !== safeIntentId
+    || safeText(evidence.id_order) !== safeText(durable.id_membership_order)
+    || safeText(evidence.provider).toLowerCase() !== "pixelpay"
+    || evidence.payment_hash_valid !== true
+    || evidence.amount_matches !== true
+    || toNumber(evidence.amount, -1) !== toNumber(durable.monto_hnl, -2)
+    || safeText(evidence.currency).toUpperCase() !== safeText(durable.moneda_codigo).toUpperCase()
+    || !safeText(evidence.payment_uuid)
+    || !safeText(evidence.transaction_id)) {
+    throw new AppError(409, "No existe evidencia durable suficiente para recuperar el pago", {
+      code: "MEMBERSHIP_PIXELPAY_RECOVERY_EVIDENCE_INVALID",
+    });
+  }
+  const verifiedAtMs = new Date(durable.verified_at).getTime();
+  const expiries = [durable.intent_expires_at, durable.order_expires_at]
+    .map((value) => new Date(value).getTime())
+    .filter(Number.isFinite);
+  if (!Number.isFinite(verifiedAtMs) || expiries.length !== 2 || verifiedAtMs > Math.min(...expiries)) {
+    throw new AppError(409, "La aprobación durable no fue verificada dentro de la vigencia", {
+      code: "MEMBERSHIP_PIXELPAY_RECOVERY_VERIFIED_AFTER_EXPIRY",
+    });
+  }
+  if (normalizeText(durable.estado_intent_codigo).toLowerCase() === "confirmado"
+    && normalizeText(durable.estado_orden_codigo).toLowerCase() === "pagada"
+    && safeText(durable.id_suscripcion)) {
+    return {
+      processed: false,
+      duplicate: true,
+      estado_intent_codigo: "confirmado",
+      id_suscripcion: durable.id_suscripcion,
+    };
+  }
+  return confirmMembershipPaymentAndActivateSubscription(client, {
+    idPaymentIntent: safeIntentId,
+    clienteId: safeClienteId,
+    financialEvidence: {
+      kind: MEMBERSHIP_PIXELPAY_EVIDENCE,
+      approved: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      amount: evidence.amount,
+      currency: evidence.currency,
+      paymentUuid: evidence.payment_uuid,
+      transactionId: evidence.transaction_id,
+      verifiedAt: durable.verified_at,
+    },
+  });
 }
 
 async function persistVerifiedMembershipPixelPayEvidence(app, {
