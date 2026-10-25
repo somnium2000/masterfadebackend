@@ -888,12 +888,31 @@ async function getMembershipPurchaseOrderByKey(client, clienteId, idempotencyKey
   try {
     const { rows } = await client.query(
       `
-        SELECT id_order, id_cliente, id_plan_sucursal, estado_orden_codigo,
-               moneda_codigo, subtotal_hnl, descuento_hnl, total_hnl,
-               plan_snapshot, cliente_snapshot, factura_snapshot, expires_at,
-               (expires_at IS NOT NULL AND expires_at > clock_timestamp()) AS unexpired
-        FROM public.membership_purchase_orders
-        WHERE id_cliente = $1::uuid AND idempotency_key = $2::text
+        SELECT mpo.id_order, mpo.id_cliente, mpo.id_plan_sucursal, mpo.estado_orden_codigo,
+               mpo.moneda_codigo, mpo.subtotal_hnl, mpo.descuento_hnl, mpo.total_hnl,
+               mpo.plan_snapshot, mpo.cliente_snapshot, mpo.factura_snapshot, mpo.expires_at,
+               (mpo.expires_at IS NOT NULL AND mpo.expires_at > clock_timestamp()) AS unexpired,
+               recovery.id_payment_intent,
+               COALESCE(recovery.has_verified_approval, FALSE) AS has_verified_approval
+        FROM public.membership_purchase_orders mpo
+        LEFT JOIN LATERAL (
+          SELECT pi.id_intent AS id_payment_intent,
+                 EXISTS (
+                   SELECT 1
+                   FROM public.payment_events pe
+                   WHERE pe.id_intent = pi.id_intent
+                     AND pe.id_provider = pi.id_provider
+                     AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
+                     AND pe.firma_valida = TRUE
+                     AND pe.recibido_at <= LEAST(pi.expires_at, mpo.expires_at)
+                 ) AS has_verified_approval
+          FROM public.payment_intents pi
+          WHERE pi.id_membership_order = mpo.id_order
+            AND pi.origen_pago_codigo = 'membership'
+          ORDER BY pi.created_at DESC
+          LIMIT 1
+        ) recovery ON TRUE
+        WHERE mpo.id_cliente = $1::uuid AND mpo.idempotency_key = $2::text
       `,
       [clienteId, idempotencyKey]
     );
@@ -914,7 +933,9 @@ function mapIdempotentMembershipPurchaseOrder(order, clienteId, idPlanSucursal) 
   const unavailable = () => new AppError(409, "Esta operación ya no puede retomarse. Inicia una nueva compra con otra clave.", {
     code: "MEMBERSHIP_PURCHASE_IDEMPOTENCY_ORDER_UNAVAILABLE",
   });
-  if (normalizeText(order.estado_orden_codigo).toLowerCase() !== "pendiente_pago" || order.unexpired !== true) {
+  const recoverableApproval = order.has_verified_approval === true && Boolean(safeText(order.id_payment_intent));
+  if (normalizeText(order.estado_orden_codigo).toLowerCase() !== "pendiente_pago"
+    || (order.unexpired !== true && !recoverableApproval)) {
     throw unavailable();
   }
   let planSnapshot;
@@ -950,6 +971,10 @@ function mapIdempotentMembershipPurchaseOrder(order, clienteId, idPlanSucursal) 
       moneda_codigo: order.moneda_codigo,
     },
     cliente: { id_cliente: order.id_cliente, email: clienteSnapshot.email ?? null },
+    ...(recoverableApproval ? {
+      pending_reconciliation: true,
+      id_payment_intent: order.id_payment_intent,
+    } : {}),
   };
 }
 
@@ -1707,6 +1732,7 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
   idPaymentIntent,
   clienteId,
   financialEvidence = null,
+  allowExpiredVerifiedRecovery = false,
 } = {}) {
   const safeIntentId = normalizeText(idPaymentIntent);
   const safeClienteId = normalizeText(clienteId);
@@ -1764,7 +1790,9 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
       },
     });
   }
-  if (!MEMBERSHIP_CONFIRMABLE_INTENT_STATES.has(intentState)) {
+  if (!MEMBERSHIP_CONFIRMABLE_INTENT_STATES.has(intentState)
+    && !(allowExpiredVerifiedRecovery === true && intentState === "expirado"
+      && financialEvidence?.kind === MEMBERSHIP_PIXELPAY_EVIDENCE)) {
     throw new AppError(409, "El intent no esta en un estado valido para confirmar", {
       code: "MEMBERSHIP_PAYMENT_INTENT_STATE_INVALID",
       details: {
@@ -1928,7 +1956,7 @@ export async function recoverMembershipPixelPayApproval(client, {
          ON pe.id_intent = pi.id_intent
         AND pe.id_provider = pi.id_provider
       WHERE pi.id_intent = $1::uuid
-        AND pi.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado')
+        AND pi.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado', 'expirado')
         AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
         AND pe.firma_valida = TRUE
       ORDER BY pe.recibido_at DESC
@@ -1998,7 +2026,158 @@ export async function recoverMembershipPixelPayApproval(client, {
       transactionId: evidence.transaction_id,
       verifiedAt: durable.verified_at,
     },
+    allowExpiredVerifiedRecovery: true,
   });
+}
+
+export async function reconcileMembershipPixelPayStatus(app, {
+  idPaymentIntent,
+  clienteId,
+  requestId,
+} = {}) {
+  const safeIntentId = normalizeText(idPaymentIntent);
+  const safeClienteId = normalizeText(clienteId);
+  if (!safeIntentId || !safeClienteId) {
+    throw new AppError(400, "El intent y el cliente son obligatorios", {
+      code: "MEMBERSHIP_PIXELPAY_STATUS_INVALID_INPUT",
+    });
+  }
+
+  let client = await app.db.connect();
+  let intent;
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
+      `pixelpay-membership-status:${safeIntentId}`,
+    ]);
+    try {
+      const recovered = await recoverMembershipPixelPayApproval(client, {
+        idPaymentIntent: safeIntentId,
+        clienteId: safeClienteId,
+      });
+      await client.query("COMMIT");
+      return { normalized_status: "PAGADO", ...recovered };
+    } catch (error) {
+      if (error?.code !== "MEMBERSHIP_PIXELPAY_RECOVERY_EVIDENCE_INVALID") throw error;
+    }
+
+    intent = await getMembershipIntentForConfirmation(client, safeIntentId);
+    if (!intent) throw new AppError(404, "Intent de pago no encontrado", { code: "MEMBERSHIP_PAYMENT_INTENT_NOT_FOUND" });
+    if (normalizeText(intent.id_cliente) !== safeClienteId) {
+      throw new AppError(403, "La compra no pertenece al cliente autenticado", {
+        code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+      });
+    }
+    if (normalizeText(intent.provider_code).toLowerCase() !== "pixelpay") {
+      throw new AppError(409, "El intent no pertenece a PixelPay", {
+        code: "MEMBERSHIP_PAYMENT_PROVIDER_MISMATCH",
+      });
+    }
+    const intentState = normalizeText(intent.estado_intent_codigo).toLowerCase();
+    if (intentState === "confirmado" || normalizeText(intent.estado_orden_codigo).toLowerCase() === "pagada") {
+      await client.query("COMMIT");
+      return { normalized_status: "PAGADO", estado_intent_codigo: "confirmado", id_suscripcion: intent.id_suscripcion };
+    }
+    if (intentState === "fallido") {
+      await client.query("COMMIT");
+      return { normalized_status: "RECHAZADO", estado_intent_codigo: "fallido" };
+    }
+    const paymentUuid = safeText(intent.provider_session_id);
+    if (!paymentUuid) {
+      await client.query("COMMIT");
+      return { normalized_status: "PENDIENTE", estado_intent_codigo: intentState, reconciliation_required: true };
+    }
+    const claimed = await client.query(
+      `UPDATE public.payment_intents
+          SET last_verified_at = now(), verification_attempts = COALESCE(verification_attempts, 0) + 1,
+              updated_at = now()
+        WHERE id_intent = $1::uuid
+          AND (last_verified_at IS NULL OR last_verified_at <= now() - interval '25 seconds')
+        RETURNING id_intent`,
+      [safeIntentId]
+    );
+    await client.query("COMMIT");
+    if (!claimed.rows?.[0]) {
+      return { normalized_status: "PENDIENTE", estado_intent_codigo: intentState, throttled: true };
+    }
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  let providerStatus;
+  try {
+    providerStatus = await PaymentProviderFactory.create().queryPaymentStatus(
+      intent.provider_session_id,
+      { orderId: `VIP-${intent.id_order}`, amount: toNumber(intent.monto_hnl, -1) }
+    );
+  } catch {
+    return { normalized_status: "PENDIENTE", estado_intent_codigo: intent.estado_intent_codigo, provider_uncertain: true };
+  }
+  const status = normalizeText(providerStatus?.status).toUpperCase() || "UNKNOWN";
+  if (providerStatus?.definitiveRejected === true) {
+    await app.db.query(
+      `UPDATE public.payment_intents SET estado_intent_codigo='fallido', updated_at=now()
+        WHERE id_intent=$1::uuid AND estado_intent_codigo IN ('pendiente_confirmacion','expirado')`,
+      [safeIntentId]
+    );
+    return { normalized_status: "RECHAZADO", estado_intent_codigo: "fallido" };
+  }
+  const fullyVerifiedPaid = providerStatus?.ok === true
+    && providerStatus?.success === true
+    && providerStatus?.approved === true
+    && providerStatus?.incomplete !== true
+    && providerStatus?.paymentHashValid === true
+    && providerStatus?.amountMatches === true
+    && safeText(providerStatus?.resultPaymentUuid) === safeText(intent.provider_session_id)
+    && Boolean(safeText(providerStatus?.transactionId));
+  const beforeExpiry = Date.now() <= Math.min(
+    new Date(intent.intent_expires_at).getTime(),
+    new Date(intent.order_expires_at).getTime()
+  );
+  if (!fullyVerifiedPaid || !beforeExpiry) {
+    return {
+      normalized_status: "PENDIENTE",
+      estado_intent_codigo: intent.estado_intent_codigo,
+      reconciliation_required: providerStatus?.approved === true || status === "UNKNOWN",
+    };
+  }
+
+  client = await app.db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `INSERT INTO public.payment_events (
+         id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+       ) VALUES ($1::uuid, $2::text, 'membership.pixelpay.approved_verified', TRUE, $3::jsonb, $4::uuid)
+       ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+      [intent.id_provider, `pixelpay_membership_status_${intent.provider_session_id}`, {
+        id_order: intent.id_order,
+        id_intent: intent.id_intent,
+        provider: "pixelpay",
+        payment_uuid: intent.provider_session_id,
+        transaction_id: providerStatus.transactionId,
+        amount: toNumber(intent.monto_hnl, 0),
+        currency: safeText(intent.moneda_codigo) || "HNL",
+        payment_hash_valid: true,
+        amount_matches: true,
+        request_id: safePixelPayRequestId(requestId),
+      }, safeIntentId]
+    );
+    const recovered = await recoverMembershipPixelPayApproval(client, {
+      idPaymentIntent: safeIntentId,
+      clienteId: safeClienteId,
+    });
+    await client.query("COMMIT");
+    return { normalized_status: "PAGADO", ...recovered };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function persistVerifiedMembershipPixelPayEvidence(app, {

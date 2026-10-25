@@ -94,6 +94,8 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
     estado_intent_codigo text,
     monto_hnl numeric(12,2),
     moneda_codigo text,
+    last_verified_at timestamptz,
+    verification_attempts integer NOT NULL DEFAULT 0,
     expires_at timestamptz NOT NULL
   )`);
   await pool.query(`CREATE TABLE ${schema}.payments (
@@ -162,6 +164,18 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
   const results = await Promise.all([insert(collisionIntentA), insert(collisionIntentB)]);
   assert.deepEqual(results.map((result) => result.rowCount).sort(), [0, 1]);
   assert.equal((await pool.query(`SELECT count(*)::int count FROM ${schema}.payments WHERE provider_tx_id=$1`, [reusedPaymentUuid])).rows[0].count, 1);
+
+  const statusIntent = crypto.randomUUID();
+  await pool.query(`INSERT INTO ${schema}.payment_intents(id_intent,id_provider,expires_at)
+    VALUES ($1,$2,now() + interval '5 minutes')`, [statusIntent, providerId]);
+  const claimStatus = () => pool.query(`UPDATE ${schema}.payment_intents
+    SET last_verified_at=now(), verification_attempts=verification_attempts+1
+    WHERE id_intent=$1 AND (last_verified_at IS NULL OR last_verified_at <= now() - interval '25 seconds')
+    RETURNING id_intent`, [statusIntent]);
+  const statusClaims = await Promise.all([claimStatus(), claimStatus()]);
+  assert.deepEqual(statusClaims.map((result) => result.rowCount).sort(), [0, 1]);
+  assert.equal((await pool.query(`SELECT verification_attempts FROM ${schema}.payment_intents WHERE id_intent=$1`,
+    [statusIntent])).rows[0].verification_attempts, 1);
 
   const rollbackClient = await pool.connect();
   try {

@@ -830,6 +830,39 @@ test("SDK Status valido usa data.status del envelope oficial y devuelve PAID", a
   assert.match(fake.calls.settings[0].headers["x-client-signature"], /^[a-f0-9]{128}$/);
 });
 
+test("SDK Status solo entrega evidencia financiera cuando hash e importes son validos", async () => {
+  const resultData = approvedData();
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(200, { data: { status: "paid", ...resultData }, valid: true }),
+    transactionResult: resultData,
+  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, {
+    orderId: saleInput.orderId,
+    amount: saleInput.amount,
+  });
+  assert.equal(result.status, "PAID");
+  assert.equal(result.approved, true);
+  assert.equal(result.paymentHashValid, true);
+  assert.equal(result.amountMatches, true);
+  assert.equal(result.resultPaymentUuid, PAYMENT_UUID);
+  assert.ok(result.transactionId);
+});
+
+test("SDK Status solo marca rechazo definitivo desde TransactionResult valido y no incompleto", async () => {
+  const resultData = approvedData({ response_approved: false, response_incomplete: false });
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(200, { data: { status: "declined", ...resultData }, valid: true }),
+    transactionResult: resultData,
+  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, {
+    orderId: saleInput.orderId,
+    amount: saleInput.amount,
+  });
+  assert.equal(result.status, "DECLINED");
+  assert.equal(result.approved, false);
+  assert.equal(result.definitiveRejected, true);
+});
+
 test("SDK Status con validateResponse=false devuelve UNKNOWN", async () => {
   const fake = makeFakeSdk({
     statusResponse: sdkResponse(200, { success: true, data: {}, valid: false }),

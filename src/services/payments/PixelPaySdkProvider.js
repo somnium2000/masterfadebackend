@@ -552,7 +552,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     };
   }
 
-  async queryPaymentStatus(paymentUuid) {
+  async queryPaymentStatus(paymentUuid, expected = {}) {
     const normalizedUuid = text(paymentUuid);
     if (!normalizedUuid) {
       throw new PixelPaySdkError(
@@ -583,6 +583,29 @@ export class PixelPaySdkProvider extends PaymentProvider {
 
     const statusCode = responseStatus(response);
     const transactionResult = this.readTransactionResult(response);
+    const result = transactionResult.result;
+    const resultPaymentUuid = text(result?.payment_uuid) || null;
+    const transactionId = text(result?.transaction_id) || null;
+    const expectedOrderId = text(expected?.orderId);
+    const expectedAmount = expected?.amount;
+    const hasPaymentHash = Boolean(text(result?.payment_hash));
+    let paymentHashValid = false;
+    if (hasPaymentHash && expectedOrderId) {
+      try {
+        paymentHashValid = transaction.verifyPaymentHash(
+          result.payment_hash,
+          expectedOrderId,
+          this.secretKey
+        ) === true;
+      } catch {
+        paymentHashValid = false;
+      }
+    }
+    const transactionAmountMatches = valuePresent(result?.transaction_amount)
+      && money(result.transaction_amount) === money(expectedAmount);
+    const approvedAmountMatches = valuePresent(result?.transaction_approved_amount)
+      && money(result.transaction_approved_amount) === money(expectedAmount);
+    const amountMatches = transactionAmountMatches && approvedAmountMatches;
     // AM: sdk-core@2.5.8 no declara `status` en TransactionResult; el contrato
     // oficial de Status lo entrega en el envelope como `data.status`.
     const payload = normalizePixelPayStatusResponse({
@@ -597,6 +620,17 @@ export class PixelPaySdkProvider extends PaymentProvider {
       success: payload.success,
       paymentUuid: normalizedUuid,
       status: payload.data.status,
+      approved: result?.response_approved === true && result?.response_incomplete !== true,
+      incomplete: result?.response_incomplete === true,
+      definitiveRejected: transactionResult.valid === true
+        && transactionResult.parsed === true
+        && result?.response_approved === false
+        && result?.response_incomplete === false
+        && resultPaymentUuid === normalizedUuid,
+      transactionId,
+      resultPaymentUuid,
+      paymentHashValid,
+      amountMatches,
       response: payload,
     };
   }

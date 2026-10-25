@@ -10,6 +10,7 @@ import {
   processMembershipPixelPaySale,
   processMembershipSimulatorEvent,
   recoverMembershipPixelPayApproval,
+  reconcileMembershipPixelPayStatus,
 } from "../src/services/membershipService.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
@@ -105,6 +106,26 @@ test("adquisicion directa se bloquea y los contratos HTTP fallan cerrado antes d
   assert.equal(simulator.statusCode, 409);
   assert.equal(simulator.json().error.code, "CLIENTE_MEMBERSHIP_SIMULATOR_DISABLED");
   assert.equal(getConnects(), 0);
+});
+
+test("HTTP estado VIP rechaza usuario no autenticado antes de consultar BD", async (t) => {
+  let connects = 0;
+  const app = Fastify();
+  app.decorate("requireRoles", () => async (_request, reply) => reply.code(401).send({
+    ok: false, error: { code: "AUTH_REQUIRED", message: "Autenticacion requerida" },
+  }));
+  app.decorate("db", { connect: async () => { connects += 1; throw new Error("DB must not be reached"); } });
+  app.decorate("config", { nodeEnv: "test", paymentProvider: "pixelpay", todoPago: {} });
+  await app.register(clienteRoutes, { prefix: "/v1/cliente" });
+  await app.ready();
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST",
+    url: `/v1/cliente/planes/pago-intent/${INTENT}/estado`,
+    payload: {},
+  });
+  assert.equal(response.statusCode, 401);
+  assert.equal(connects, 0);
 });
 
 test("servicio de adquisicion directa falla cerrado sin consultar ni escribir", async () => {
@@ -231,6 +252,7 @@ function pixelPayProcessHarness({
   initialIntentState = "link_generado",
   durableEvidence = null,
   durableVerifiedAt = null,
+  providerSessionId = null,
   amount = 800,
 } = {}) {
   const state = {
@@ -238,6 +260,7 @@ function pixelPayProcessHarness({
     orderState: "pendiente_pago", idSubscription: null,
     subscriptions: 0, payments: 0, subscriptionPayments: 0,
     verifiedEvidenceEvents: 0, verifiedReferenceWrites: 0, subscriptionInsertParams: null,
+    statusClaimed: false, dynamicDurableEvidence: null, dynamicVerifiedAt: null,
     paymentProviderTxIds: [], paymentAmounts: [], paymentPaidAts: [],
   };
   const row = {
@@ -245,7 +268,7 @@ function pixelPayProcessHarness({
     monto_hnl: amount,
     total_hnl: amount,
     provider_code: "pixelpay",
-    provider_session_id: null,
+    provider_session_id: providerSessionId,
     intent_expires_at: new Date(Date.now() + (expired ? -60_000 : 60_000)).toISOString(),
     order_expires_at: new Date(Date.now() + (expired ? -60_000 : 60_000)).toISOString(),
     plan_snapshot: planSnapshot || {
@@ -265,7 +288,8 @@ function pixelPayProcessHarness({
         return { rows: pendingScopeIntent ? [{ id_intent: pendingScopeIntent }] : [] };
       }
       if (text.includes("FROM public.payment_intents pi") && text.includes("JOIN public.payment_events pe")) {
-        return { rows: durableEvidence ? [{
+        const currentEvidence = durableEvidence || state.dynamicDurableEvidence;
+        return { rows: currentEvidence ? [{
           id_intent: INTENT,
           id_provider: row.id_provider,
           id_membership_order: ORDER,
@@ -278,8 +302,8 @@ function pixelPayProcessHarness({
           order_expires_at: row.order_expires_at,
           estado_orden_codigo: state.orderState,
           id_suscripcion: state.idSubscription,
-          payload_esencial: durableEvidence,
-          verified_at: durableVerifiedAt,
+          payload_esencial: currentEvidence,
+          verified_at: durableVerifiedAt || state.dynamicVerifiedAt,
         }] : [] };
       }
       if (text.includes("FROM public.payment_intents pi")) {
@@ -296,7 +320,16 @@ function pixelPayProcessHarness({
       }
       if (text.startsWith("INSERT INTO public.payment_events")) {
         if (text.includes("membership.pixelpay.approved_verified")) state.verifiedEvidenceEvents += 1;
+        if (values[2]?.payment_hash_valid === true) {
+          state.dynamicDurableEvidence = values[2];
+          state.dynamicVerifiedAt = new Date().toISOString();
+        }
         return { rows: [{ id_event: crypto.randomUUID() }] };
+      }
+      if (text.includes("SET last_verified_at = now()")) {
+        if (state.statusClaimed) return { rows: [] };
+        state.statusClaimed = true;
+        return { rows: [{ id_intent: INTENT }] };
       }
       if (text.includes("SET referencia_externa = $2::text")) {
         state.verifiedReferenceWrites += 1;
@@ -357,6 +390,10 @@ function pixelPayProcessHarness({
     async query(query) {
       const text = String(query?.text || query);
       if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) return { rows: [{ id_sale_attempt: crypto.randomUUID() }] };
+      if (text.includes("SET estado_intent_codigo='fallido'")) {
+        state.intentState = "fallido";
+        return { rows: [{ id_intent: INTENT }] };
+      }
       throw new Error(`Unexpected pool query: ${text.slice(0, 120)}`);
     },
   };
@@ -366,6 +403,7 @@ function pixelPayProcessHarness({
       return provider.sale(...args);
     },
     async queryPaymentStatus(...args) {
+      state.statusCalls = (state.statusCalls || 0) + 1;
       return provider.queryPaymentStatus?.(...args);
     },
   };
@@ -751,6 +789,38 @@ test("recuperacion durable activa sin ejecutar un segundo Sale", async (t) => {
   assert.equal(state.subscriptionPayments, 1);
 });
 
+test("recuperacion protegida acepta intent expirado solo con evidencia durable previa", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const verifiedAt = new Date(Date.now() - 120_000).toISOString();
+  const { app, state } = pixelPayProcessHarness({
+    expired: true,
+    initialIntentState: "expirado",
+    durableVerifiedAt: verifiedAt,
+    durableEvidence: {
+      id_order: ORDER,
+      id_intent: INTENT,
+      provider: "pixelpay",
+      payment_uuid: "e6666666-6666-4666-8666-666666666666",
+      transaction_id: "expired-durable-approved",
+      amount: 800,
+      currency: "HNL",
+      payment_hash_valid: true,
+      amount_matches: true,
+    },
+    provider: { sale: async () => { throw new Error("Sale must not run during recovery"); } },
+  });
+  const result = await recoverMembershipPixelPayApproval(await app.db.connect(), {
+    idPaymentIntent: INTENT,
+    clienteId: CLIENT,
+  });
+  assert.equal(result.estado, "activa");
+  assert.equal(state.saleCalls, 0);
+  assert.deepEqual(state.paymentPaidAts, [verifiedAt]);
+  assert.equal(state.payments, 1);
+  assert.equal(state.subscriptions, 1);
+  assert.equal(state.subscriptionPayments, 1);
+});
+
 test("recuperacion duplicate vuelve a validar cliente y proveedor persistidos", async (t) => {
   t.after(() => PaymentProviderFactory.reset());
   const durableEvidence = {
@@ -822,6 +892,93 @@ test("recuperacion rechaza evidencia verificada despues del vencimiento", async 
   assert.equal(state.saleCalls, 0);
   assert.equal(state.payments, 0);
   assert.equal(state.subscriptions, 0);
+});
+
+test("consulta VIP sin payment_uuid permanece pendiente y nunca llama Status", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const { app, state } = pixelPayProcessHarness({
+    initialIntentState: "pendiente_confirmacion",
+    provider: { queryPaymentStatus: async () => { throw new Error("Status must not run"); } },
+  });
+  const result = await reconcileMembershipPixelPayStatus(app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT,
+  });
+  assert.equal(result.normalized_status, "PENDIENTE");
+  assert.equal(result.reconciliation_required, true);
+  assert.equal(state.statusCalls || 0, 0);
+});
+
+test("consulta VIP rechaza IDOR antes de consultar PixelPay", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const { app, state } = pixelPayProcessHarness({
+    owner: "f9999999-9999-4999-8999-999999999999",
+    providerSessionId: "P-11111111-1111-4111-8111-111111111111",
+    provider: { queryPaymentStatus: async () => ({ status: "PAID" }) },
+  });
+  await assert.rejects(reconcileMembershipPixelPayStatus(app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT,
+  }), { statusCode: 403, code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN" });
+  assert.equal(state.statusCalls || 0, 0);
+});
+
+test("dos consultas simultaneas ejecutan un solo Status y conservan pendiente", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const { app, state } = pixelPayProcessHarness({
+    initialIntentState: "pendiente_confirmacion",
+    providerSessionId: "P-11111111-1111-4111-8111-111111111111",
+    provider: { queryPaymentStatus: async () => ({ ok: true, success: true, status: "PENDING" }) },
+  });
+  const results = await Promise.all([
+    reconcileMembershipPixelPayStatus(app, { idPaymentIntent: INTENT, clienteId: CLIENT }),
+    reconcileMembershipPixelPayStatus(app, { idPaymentIntent: INTENT, clienteId: CLIENT }),
+  ]);
+  assert.deepEqual(results.map((item) => item.normalized_status), ["PENDIENTE", "PENDIENTE"]);
+  assert.equal(state.statusCalls, 1);
+});
+
+test("Status aprobado con evidencia completa contabiliza una sola vez", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const paymentUuid = "P-22222222-2222-4222-8222-222222222222";
+  const { app, state } = pixelPayProcessHarness({
+    initialIntentState: "pendiente_confirmacion",
+    providerSessionId: paymentUuid,
+    provider: { queryPaymentStatus: async () => ({
+      ok: true, success: true, status: "PAID", approved: true, incomplete: false,
+      paymentHashValid: true, amountMatches: true, resultPaymentUuid: paymentUuid,
+      transactionId: "status-approved-transaction",
+    }) },
+  });
+  const result = await reconcileMembershipPixelPayStatus(app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT,
+  });
+  assert.equal(result.normalized_status, "PAGADO");
+  assert.equal(state.statusCalls, 1);
+  assert.equal(state.payments, 1);
+  assert.equal(state.subscriptions, 1);
+  assert.equal(state.subscriptionPayments, 1);
+});
+
+test("Status rechazado definitivo marca RECHAZADO; UNKNOWN permanece PENDIENTE", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const rejected = pixelPayProcessHarness({
+    initialIntentState: "pendiente_confirmacion",
+    providerSessionId: "P-33333333-3333-4333-8333-333333333333",
+    provider: { queryPaymentStatus: async () => ({
+      ok: true, success: true, status: "DECLINED", definitiveRejected: true,
+    }) },
+  });
+  assert.equal((await reconcileMembershipPixelPayStatus(rejected.app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT,
+  })).normalized_status, "RECHAZADO");
+
+  const unknown = pixelPayProcessHarness({
+    initialIntentState: "pendiente_confirmacion",
+    providerSessionId: "P-44444444-4444-4444-8444-444444444444",
+    provider: { queryPaymentStatus: async () => ({ ok: true, success: true, status: "UNKNOWN" }) },
+  });
+  assert.equal((await reconcileMembershipPixelPayStatus(unknown.app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT,
+  })).normalized_status, "PENDIENTE");
 });
 
 test("operacion pendiente de otra orden del mismo cliente y sucursal bloquea Sale", async (t) => {

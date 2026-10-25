@@ -72,8 +72,8 @@ function store({ hasKeyColumn = true, hasIndex = true, concurrent = false, failF
         : [{ table_name: "membership_plans", column_name: "categoria_nivel" }]);
       if (text.includes("FROM public.membership_purchase_orders") && text.includes("idempotency_key = $2::text")) {
         if (!hasKeyColumn) { session.aborted = true; throw Object.assign(new Error("Missing mock column"), { code: "42703" }); }
-        assert.match(text, /WHERE id_cliente = \$1::uuid AND idempotency_key = \$2::text/);
-        assert.match(text, /expires_at > clock_timestamp\(\)/);
+        assert.match(text, /WHERE mpo\.id_cliente = \$1::uuid AND mpo\.idempotency_key = \$2::text/);
+        assert.match(text, /mpo\.expires_at > clock_timestamp\(\)/);
         const row = data.orders.find((order) => order.id_cliente === params[0] && order.idempotency_key === params[1]);
         session.reads += 1;
         if (concurrent && session.reads === 1) {
@@ -81,7 +81,12 @@ function store({ hasKeyColumn = true, hasIndex = true, concurrent = false, failF
           if (data.initialReads === 2) initialBarrier.resolve();
           await initialBarrier.promise;
         }
-        return result(row ? [{ ...structuredClone(row), unexpired: row.expires_at != null && new Date(row.expires_at).getTime() > Date.now() }] : []);
+        return result(row ? [{
+          ...structuredClone(row),
+          unexpired: row.expires_at != null && new Date(row.expires_at).getTime() > Date.now(),
+          id_payment_intent: null,
+          has_verified_approval: false,
+        }] : []);
       }
       if (text.includes("FROM public.membership_plans_sucursal mps") && text.includes("WHERE mps.id_plan_sucursal = $1::uuid")) {
         data.catalogReads += 1;

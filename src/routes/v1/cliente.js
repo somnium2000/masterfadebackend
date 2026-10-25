@@ -11,6 +11,7 @@ import {
   createMembershipPurchaseOrder,
   createMembershipOrderPaymentIntent,
   processMembershipPixelPaySale,
+  reconcileMembershipPixelPayStatus,
   processMembershipSimulatorEvent,
   cancelMembership,
   cancelMembershipBySubscription,
@@ -1250,6 +1251,44 @@ export default async function clienteRoutes(app) {
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo procesar el pago de la membresia", "MEMBERSHIP_PIXELPAY_SALE_ERROR");
+      }
+    }
+  );
+
+  app.post(
+    "/planes/pago-intent/:id_payment_intent/estado",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      config: {
+        rateLimit: { max: 3, timeWindow: "1 minute", groupId: "membership-pixelpay-status" },
+      },
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_payment_intent"],
+          properties: { id_payment_intent: { type: "string", format: "uuid" } },
+          additionalProperties: false,
+        },
+        response: { 200: { type: "object", additionalProperties: true } },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      try {
+        const result = await reconcileMembershipPixelPayStatus(app, {
+          idPaymentIntent: request.params.id_payment_intent,
+          clienteId: context.clienteId,
+          requestId: request.id,
+        });
+        return sendOk(reply, result, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo verificar el estado del pago de la membresia",
+          "MEMBERSHIP_PIXELPAY_STATUS_ERROR"
+        );
       }
     }
   );
