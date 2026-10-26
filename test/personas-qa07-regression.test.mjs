@@ -11,7 +11,9 @@ async function fixture(t, { state = "activo", lockedState = state, sent = true, 
   const activity = { writes: [], auth: 0, mail: 0, sql: [], events: [], locked: false };
   const row = { id_usuario: U, id_persona: P, estado_acceso: state, nombres: "Prueba", apellidos: "Sintetica", email: "synthetic@example.test", estado: true, tiene_empleado: true, roles: [{ rol: "admin" }] };
   const query = async (sql, params) => {
-    const text = String(sql).replace(/\s+/g, " ").trim();
+    if (String(sql).includes("AM: PERSONAS_ADMIN_BRANCHES")) return { rows: [{ id_sucursal: P }], rowCount: 1 };
+    if (String(sql).includes("AM: PERSONAS_SCOPE_TARGET")) return { rows: missingUser ? [] : [{ id_persona: P }], rowCount: missingUser ? 0 : 1 };
+    const text = String(sql).replace(/ AND \/\* AM: PERSONAS_SCOPE_BEGIN \*\/[\s\S]*?\/\* AM: PERSONAS_SCOPE_END \*\//g, "").replace("/* AM: PERSONAS_SCOPE_READ */ ", "").replace(/\s+/g, " ").trim();
     activity.sql.push(text);
     if (/^(UPDATE|INSERT|DELETE)/.test(text)) activity.writes.push({ text, params });
     if (text === "COMMIT" || text === "ROLLBACK") { activity.events.push(text); activity.locked = false; return { rows: [], rowCount: 0 }; }

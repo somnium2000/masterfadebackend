@@ -4,6 +4,12 @@ import { sendOk } from "../../../utils/response.js";
 import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
 import { assertUserNotProtected } from "../../../services/protectedUsersService.js";
 import {
+  authorizePersonasMutation,
+  assertPersonasTargetScope,
+  getPersonasAdminScope,
+  scopePersonasQuery,
+} from "../../../services/personasAdminScope.js";
+import {
   activateAssetForEntity,
   buildPersonasClientProfileReadUrl,
   replaceAssetIfNeeded,
@@ -1197,7 +1203,7 @@ async function ensureEmailAvailability(client, email, { excludePersonaId = null,
   }
 }
 
-async function resolveAdministrativePersonaLink(client, email, link, { expectedAuthUserId = null } = {}) {
+async function resolveAdministrativePersonaLink(client, email, link, { expectedAuthUserId = null, scope, lock = false } = {}) {
   const authResult = await client.query(
     `SELECT id FROM auth.users WHERE LOWER(email::text) = LOWER($1) LIMIT 2`,
     [email]
@@ -1246,6 +1252,7 @@ async function resolveAdministrativePersonaLink(client, email, link, { expectedA
   }
 
   const contact = contactResult.rows[0];
+  if (scope) await assertPersonasTargetScope(client, scope, "persona", contact.id_persona, { lock });
   if (contact.has_user || contact.has_client || contact.has_employee) {
     throw new AppError(409, "El correo ya pertenece a un usuario o perfil existente", {
       code: "PERSONAS_EXISTING_USER_EMAIL",
@@ -1791,11 +1798,13 @@ async function createEmpleado(app, request, payload) {
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
     assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles });
 
+    const adminScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursal });
     assertValidEmail(correoPrincipal);
     const linkedPersonaId = await resolveAdministrativePersonaLink(
       client,
       correoPrincipal,
-      payload?.vinculacion_persona || null
+      payload?.vinculacion_persona || null,
+      { scope: adminScope }
     );
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
@@ -1826,11 +1835,12 @@ async function createEmpleado(app, request, payload) {
     await client.query("BEGIN");
     transactionStarted = true;
 
+    const confirmedScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursal, lock: true });
     const confirmedPersonaId = await resolveAdministrativePersonaLink(
       client,
       correoPrincipal,
       payload?.vinculacion_persona || null,
-      { expectedAuthUserId: authUserId }
+      { expectedAuthUserId: authUserId, scope: confirmedScope, lock: true }
     );
     if (String(confirmedPersonaId || "") !== String(linkedPersonaId || "")) {
       throw new AppError(409, "La identidad del correo cambio durante la operacion", {
@@ -2032,12 +2042,14 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     const currentRow = current.rows[0];
     if (!currentRow.id_usuario) {
+      await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
       throw new AppError(409, "El empleado no tiene usuario interno vinculado", {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
 
     await assertActorCanManagePrivilegedUser(app, request, client, currentRow.id_usuario, "EMPLOYEE_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, branchId: payload?.empleado?.id_sucursal });
 
     const persona = buildPersonaPayload(payload?.persona || {});
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
@@ -2102,6 +2114,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, branchId: payload?.empleado?.id_sucursal, lock: true });
 
     await client.query(
       `
@@ -2288,11 +2301,13 @@ async function createCliente(app, request, payload) {
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
     assertRequiredClientBusinessFields({ persona, correoPrincipal });
+    const adminScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursalOrigen });
     assertValidEmail(correoPrincipal);
     const linkedPersonaId = await resolveAdministrativePersonaLink(
       client,
       correoPrincipal,
-      payload?.vinculacion_persona || null
+      payload?.vinculacion_persona || null,
+      { scope: adminScope }
     );
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
@@ -2315,11 +2330,12 @@ async function createCliente(app, request, payload) {
     await client.query("BEGIN");
     transactionStarted = true;
 
+    const confirmedScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursalOrigen, lock: true });
     const confirmedPersonaId = await resolveAdministrativePersonaLink(
       client,
       correoPrincipal,
       payload?.vinculacion_persona || null,
-      { expectedAuthUserId: authUserId }
+      { expectedAuthUserId: authUserId, scope: confirmedScope, lock: true }
     );
     if (String(confirmedPersonaId || "") !== String(linkedPersonaId || "")) {
       throw new AppError(409, "La identidad del correo cambio durante la operacion", {
@@ -2533,6 +2549,7 @@ async function sendUsuarioPasswordSetup(app, request, userId, body) {
 
     const userRow = userResult.rows[0];
     await assertActorCanManagePrivilegedUser(app, request, client, userId, "PASSWORD_SETUP");
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId });
     assertPasswordSetupAccessAllowed(userRow.estado_acceso);
     const relationshipGuard = await client.query(
       `
@@ -2575,6 +2592,7 @@ async function sendUsuarioPasswordSetup(app, request, userId, body) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId, lock: true });
 
     // AM: Serializa el envío y la transición con bloqueos concurrentes del usuario.
     const lockedUser = await client.query(
@@ -2631,8 +2649,12 @@ async function sendUsuarioPasswordSetup(app, request, userId, body) {
   }
 }
 
-async function getUsuarioOrThrow(client, userId) {
-  const detail = await client.query(USUARIO_BY_ID_SQL, [userId]);
+async function getUsuarioOrThrow(client, userId, claims) {
+  // AM: El alcance administrativo también contempla cuentas acreditadas por asignaciones admin.
+  const sql = isAdminWithoutSuperAdmin(claims)
+    ? USUARIO_BY_ID_SQL.replace("AND r_sa.nombre = 'super_admin'", "AND r_sa.nombre IN ('super_admin', 'admin')")
+    : USUARIO_BY_ID_SQL;
+  const detail = await client.query(sql, [userId]);
   if (!detail.rowCount) {
     throw new AppError(404, "Usuario no encontrado", { code: "PERSONAS_USER_NOT_FOUND" });
   }
@@ -2798,10 +2820,11 @@ async function updateUsuario(app, request, userId, payload) {
   let transactionStarted = false;
 
   try {
-    const current = await getUsuarioOrThrow(client, userId);
+    const current = await getUsuarioOrThrow(client, userId, request.claims);
     const raw = current.raw;
     const currentUsuario = current.usuario;
     await assertActorCanManagePrivilegedUser(app, request, client, raw.id_usuario, "USER_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId });
 
     const personaPatch = payload?.persona || {};
     const accesoPatch = payload?.acceso || {};
@@ -2896,6 +2919,7 @@ async function updateUsuario(app, request, userId, payload) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId, lock: true });
 
     if (hasPersonaPatch) {
       await client.query(
@@ -3002,7 +3026,7 @@ async function updateUsuario(app, request, userId, payload) {
       }
     }
 
-    const detail = await getUsuarioOrThrow(client, userId);
+    const detail = await getUsuarioOrThrow(client, userId, request.claims);
 
     await client.query("COMMIT");
     transactionStarted = false;
@@ -3029,8 +3053,9 @@ async function updateUsuarioAccessStatus(app, request, userId, status) {
   let transactionStarted = false;
 
   try {
-    await getUsuarioOrThrow(client, userId);
+    await getUsuarioOrThrow(client, userId, request.claims);
     await assertActorCanManagePrivilegedUser(app, request, client, userId, "ACCESS_STATUS_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId });
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -3131,6 +3156,7 @@ async function updateUsuarioAccessStatus(app, request, userId, status) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId, lock: true });
 
     await client.query(
       `
@@ -3147,7 +3173,7 @@ async function updateUsuarioAccessStatus(app, request, userId, status) {
       [userId, status, ACCESS_STATUS.PENDING_PASSWORD, ACCESS_STATUS.ACTIVE]
     );
 
-    const detail = await getUsuarioOrThrow(client, userId);
+    const detail = await getUsuarioOrThrow(client, userId, request.claims);
 
     await client.query("COMMIT");
     transactionStarted = false;
@@ -3177,15 +3203,18 @@ async function inactivateEmpleado(app, request, idEmpleado) {
 
     const row = current.rows[0];
     if (!row.id_usuario) {
+      await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
       throw new AppError(409, "Empleado inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
 
     await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "EMPLOYEE_INACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, lock: true });
 
     await client.query(
       `
@@ -3230,15 +3259,18 @@ async function activateEmpleado(app, request, idEmpleado) {
 
     const row = current.rows[0];
     if (!row.id_usuario) {
+      await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
       throw new AppError(409, "Empleado inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
 
     await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "EMPLOYEE_ACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, lock: true });
 
     await client.query(
       `
@@ -3294,6 +3326,7 @@ async function updateCliente(app, request, idCliente, payload) {
 
     const currentRow = current.rows[0];
     await assertActorCanManagePrivilegedUser(app, request, client, currentRow.id_usuario, "CLIENT_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, branchId: payload?.cliente?.id_sucursal_origen });
     const persona = buildPersonaPayload(payload?.persona || {});
     const acceso = payload?.acceso || {};
     const cliente = payload?.cliente || {};
@@ -3408,6 +3441,7 @@ async function updateCliente(app, request, idCliente, payload) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, branchId: payload?.cliente?.id_sucursal_origen, lock: true });
 
     await client.query(
       `
@@ -3611,6 +3645,7 @@ async function inactivateCliente(app, request, idCliente) {
 
     const row = current.rows[0];
     await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "CLIENT_INACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente });
     if (!row.id_usuario) {
       throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_CLIENT_WITHOUT_USER",
@@ -3618,6 +3653,7 @@ async function inactivateCliente(app, request, idCliente) {
     }
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, lock: true });
 
     await client.query(
       `
@@ -3662,6 +3698,7 @@ async function activateCliente(app, request, idCliente) {
 
     const row = current.rows[0];
     await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "CLIENT_ACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente });
     if (!row.id_usuario) {
       throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_CLIENT_WITHOUT_USER",
@@ -3669,6 +3706,7 @@ async function activateCliente(app, request, idCliente) {
     }
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, lock: true });
 
     await client.query(
       `
@@ -3954,17 +3992,16 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/catalogos", { preHandler: app.requireRoles(["super_admin", "admin"]) }, async (request, reply) => {
     try {
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const branches = scopePersonasQuery(`
+        SELECT id_sucursal, nombre_sucursal FROM public.sucursales
+        WHERE deleted_at IS NULL AND estado IS TRUE ORDER BY nombre_sucursal ASC
+      `, [], scope, "catalogo");
       const [rolesResult, sucursalesResult] = await Promise.all([
-        app.db.query("SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"),
-        app.db.query(
-          `
-            SELECT id_sucursal, nombre_sucursal
-            FROM public.sucursales
-            WHERE deleted_at IS NULL
-              AND estado IS TRUE
-            ORDER BY nombre_sucursal ASC
-          `
-        ),
+        app.db.query(scope.global
+          ? "SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"
+          : "SELECT id_rol, nombre FROM public.roles WHERE nombre IN ('admin', 'barbero', 'cliente') ORDER BY nombre ASC"),
+        app.db.query(branches.text, branches.values),
       ]);
       return sendOk(reply, { roles: rolesResult.rows, sucursales: sucursalesResult.rows });
     } catch (error) {
@@ -4047,7 +4084,9 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/usuarios", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_USUARIOS_SQL);
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const query = scopePersonasQuery(LIST_USUARIOS_SQL, [], scope, "usuario");
+      const { rows } = await app.db.query(query.text, query.values);
       const usuarios = filterUsuariosForActor(rows.map(mapUsuario), request.claims);
       return sendOk(reply, { usuarios });
     } catch (error) {
@@ -4131,7 +4170,9 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/empleados", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_EMPLEADOS_SQL);
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const query = scopePersonasQuery(LIST_EMPLEADOS_SQL, [], scope, "empleado");
+      const { rows } = await app.db.query(query.text, query.values);
       return sendOk(reply, { empleados: rows.map(mapEmpleado) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar empleados", "PERSONAS_EMPLOYEES_LIST_ERROR");
@@ -4146,7 +4187,10 @@ export default async function adminPersonasRoutes(app) {
           requestId: request.id,
         });
       }
-      const { rows } = await app.db.query(EMPLEADO_BY_ID_SQL, [request.params.id_empleado]);
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      await assertPersonasTargetScope(app.db, scope, "empleado", request.params.id_empleado);
+      const query = scopePersonasQuery(EMPLEADO_BY_ID_SQL, [request.params.id_empleado], scope, "empleado");
+      const { rows } = await app.db.query(query.text, query.values);
       if (!rows.length) {
         return sendError(reply, 404, "Empleado no encontrado", {
           code: "PERSONAS_EMPLOYEE_NOT_FOUND",
@@ -4214,10 +4258,15 @@ export default async function adminPersonasRoutes(app) {
       const limit = Math.min(50, Math.max(1, Number.parseInt(request.query?.limit, 10) || 20));
       const page = Math.max(1, Number.parseInt(request.query?.page, 10) || 1);
       const offset = (page - 1) * limit;
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const paginated = q || request.query?.limit || request.query?.page;
+      const query = scopePersonasQuery(paginated ? SEARCH_CLIENTES_SQL : LIST_CLIENTES_SQL,
+        paginated ? [q, limit, offset] : [], scope, "cliente");
+      const countQuery = scopePersonasQuery(COUNT_CLIENTES_SQL, [q], scope, "cliente");
       const [{ rows }, totalResult] = await Promise.all([
-        app.db.query(q || request.query?.limit || request.query?.page ? SEARCH_CLIENTES_SQL : LIST_CLIENTES_SQL, q || request.query?.limit || request.query?.page ? [q, limit, offset] : []),
+        app.db.query(query.text, query.values),
         q || request.query?.limit || request.query?.page
-          ? app.db.query(COUNT_CLIENTES_SQL, [q])
+          ? app.db.query(countQuery.text, countQuery.values)
           : Promise.resolve({ rows: [{ total: 0 }] }),
       ]);
       return sendOk(reply, {
@@ -4236,7 +4285,10 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(CLIENTE_BY_ID_SQL, [request.params.id_cliente]);
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      await assertPersonasTargetScope(app.db, scope, "cliente", request.params.id_cliente);
+      const query = scopePersonasQuery(CLIENTE_BY_ID_SQL, [request.params.id_cliente], scope, "cliente");
+      const { rows } = await app.db.query(query.text, query.values);
       if (!rows.length) {
         return sendError(reply, 404, "Cliente no encontrado", {
           code: "PERSONAS_CLIENT_NOT_FOUND",

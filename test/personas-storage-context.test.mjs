@@ -530,6 +530,8 @@ async function buildEmployeeUpdateApp({ failCleanup = false, failBeforeCommit = 
   ]);
   const dbClient = {
     async query(sql, params = []) {
+      if (String(sql).includes("AM: PERSONAS_ADMIN_BRANCHES")) return { rows: [{ id_sucursal: BRANCH_ID }], rowCount: 1 };
+      if (String(sql).includes("AM: PERSONAS_SCOPE_TARGET")) return { rows: [{ id_persona: OTHER_CLIENT_ID }], rowCount: 1 };
       const text = String(sql).replace(/\s+/g, " ").trim();
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(text)) {
         activity.commands.push(text);
@@ -669,6 +671,8 @@ async function buildNewBarberCreationApp({ assetOverrides = {} } = {}) {
   });
   const dbClient = {
     async query(sql) {
+      if (String(sql).includes("AM: PERSONAS_ADMIN_BRANCHES")) return { rows: [{ id_sucursal: BRANCH_ID }], rowCount: 1 };
+      if (String(sql).includes("AM: PERSONAS_SCOPE_TARGET")) return { rows: [{ id_persona: OTHER_CLIENT_ID }], rowCount: 1 };
       const text = String(sql).replace(/\s+/g, " ").trim();
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(text)) {
         activity.commands.push(text);
@@ -755,7 +759,7 @@ async function buildNewBarberCreationApp({ assetOverrides = {} } = {}) {
   return { app, activity };
 }
 
-test("admin crea barbero transversal y asocia su asset temporal propio antes del COMMIT", async (t) => {
+test("admin crea barbero en su asignación administrativa y asocia su asset antes del COMMIT", async (t) => {
   const { app, activity } = await buildNewBarberCreationApp();
   t.after(() => app.close());
   const response = await app.inject({

@@ -8,13 +8,16 @@ const PERSON = "22222222-2222-4222-8222-222222222222";
 const USER = "33333333-3333-4333-8333-333333333333";
 const ROLE = "44444444-4444-4444-8444-444444444444";
 const BRANCH = "55555555-5555-4555-8555-555555555555";
-const payload = () => ({ persona: { nombres: "Ana", apellidos: "Sintetica", dni: "0801199012345", telefono_principal: "99990000" }, acceso: { correo_principal: "ana@example.test", habilitar_acceso: true }, cliente: {} });
+const payload = () => ({ persona: { nombres: "Ana", apellidos: "Sintetica", dni: "0801199012345", telefono_principal: "99990000" }, acceso: { correo_principal: "ana@example.test", habilitar_acceso: true }, cliente: { id_sucursal_origen: BRANCH } });
 const result = (rows = []) => ({ rows, rowCount: rows.length });
 
+// AM: Invitados sin pertenencia requieren Super Admin explícito; el rechazo Admin se cubre en personas-admin-scope.
 async function fixture(t, options = {}) {
   const state = { row: { id_cliente: ID, id_persona: PERSON, id_usuario: USER, nombres: "Ana", apellidos: "Sintetica", correo_principal: "ana@example.test", estado_cliente: true, tiene_acceso: true, estado_acceso: "activo", id_sucursal_origen: BRANCH, ...options.row }, activeRole: true, queries: [], auth: [], authUserExists: Boolean(options.authIdentity), snapshot: null };
   async function query(sql, params = []) {
-    const text = String(sql).replace(/\s+/g, " ").trim();
+    if (String(sql).includes("AM: PERSONAS_ADMIN_BRANCHES")) return result([{ id_sucursal: BRANCH }]);
+    if (String(sql).includes("AM: PERSONAS_SCOPE_TARGET")) return result(options.missing || Boolean(options.guestContact) || state.row.id_sucursal_origen !== BRANCH ? [] : [{ id_persona: params[0] }]);
+    const text = String(sql).replace(/ AND \/\* AM: PERSONAS_SCOPE_BEGIN \*\/[\s\S]*?\/\* AM: PERSONAS_SCOPE_END \*\//g, "").replace("/* AM: PERSONAS_SCOPE_READ */ ", "").replace(/\s+/g, " ").trim();
     state.queries.push({ text, params });
     if (text === "BEGIN") { state.snapshot = { ...state.row }; return result(); }
     if (text === "COMMIT") return result();
@@ -77,7 +80,7 @@ async function fixture(t, options = {}) {
   });
   await app.register(routes, { prefix: "/personas" });
   t.after(() => app.close());
-  state.inject = (method, path = `/clientes/${ID}`, body, roles = "admin") => app.inject({ method, url: `/personas${path}`, payload: body, headers: { "x-roles": roles } });
+  state.inject = (method, path = `/clientes/${ID}`, body, roles = (options.actor ?? "admin")) => app.inject({ method, url: `/personas${path}`, payload: body, headers: { "x-roles": roles } });
   return state;
 }
 
@@ -107,7 +110,7 @@ for (const method of ["POST", "PATCH"]) test(`${method} estado inactivo bloquea 
   assert.equal(s.activeRole, false);
 });
 
-for (const roles of ["admin", "super_admin", "super_admin,admin"]) test(`listado global contractual y edición ordinaria: ${roles}`, async (t) => {
+for (const roles of ["admin", "super_admin", "super_admin,admin"]) test(`listado según alcance y edición ordinaria: ${roles}`, async (t) => {
   const s = await fixture(t);
   assert.equal((await s.inject("GET", "/clientes", undefined, roles)).statusCode, 200);
   assert.equal((await s.inject("PATCH", `/clientes/${ID}`, payload(), roles)).statusCode, 200);
@@ -121,14 +124,14 @@ for (const roles of ["", "cliente", "barbero"]) test(`rechazo previo a DB: ${rol
   assert.equal(s.queries.length, 0);
 });
 test("duplicado de correo invitado no fusiona persona ni crea Auth", async (t) => {
-  const s = await fixture(t, { duplicateEmail: true });
+  const s = await fixture(t, { actor: "super_admin", duplicateEmail: true });
   const r = await s.inject("POST", "/clientes", payload());
   assert.equal(r.statusCode, 409);
   assert.equal(s.auth.length, 0);
   assert.equal(s.queries.some(({ text }) => text === "BEGIN"), false);
 });
 test("invitado requiere confirmacion y luego conserva la Persona historica", async (t) => {
-  const s = await fixture(t, { guestContact: true });
+  const s = await fixture(t, { actor: "super_admin", guestContact: true });
   const first = await s.inject("POST", "/clientes", payload());
   assert.equal(first.statusCode, 409);
   assert.equal(first.json().error.code, "PERSONAS_GUEST_LINK_REQUIRED");

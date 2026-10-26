@@ -35,6 +35,7 @@ async function createApp() {
   app.decorate("db", {
     async query(sql) {
       activity.dbQueries += 1;
+      if (String(sql).includes("AM: PERSONAS_ADMIN_BRANCHES")) return { rows: [{ id_sucursal: BRANCH_ID }], rowCount: 1 };
       if (String(sql).includes("FROM public.empleados e")) {
         return { rows: [], rowCount: 0 };
       }
@@ -73,7 +74,7 @@ async function createApp() {
           error: { code: "AUTH_FORBIDDEN" },
         });
       }
-      request.claims = { roles };
+      request.claims = { roles, user: { id_usuario: EMPLOYEE_ID } };
       if (request.headers["x-test-guard-only"] === "true") {
         return reply.code(204).send();
       }
@@ -163,7 +164,7 @@ test("admin y super_admin conservan acceso al catalogo compartido", async (t) =>
     assert.equal(response.json().data.sucursales[0].id_sucursal, BRANCH_ID, role);
   }
 
-  assert.equal(activity.dbQueries, 4);
+  assert.equal(activity.dbQueries, 5);
   assert.equal(activity.dbConnections, 0);
   assert.equal(activity.authCalls, 0);
 });

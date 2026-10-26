@@ -56,12 +56,15 @@ async function buildApp({
   listRows = [],
   protectedTarget = false,
   privilegedTarget = false,
+  adminBranchIds = [OTHER_BRANCH_ID],
   clientQuery,
 } = {}) {
   const activity = { mutations: [], authCalls: 0, mailCalls: 0 };
   const client = {
     async query(sql, params) {
       const text = String(sql).replace(/\s+/g, " ").trim();
+      if (text.includes("AM: PERSONAS_ADMIN_BRANCHES")) return { rows: adminBranchIds.map((id_sucursal) => ({ id_sucursal })), rowCount: adminBranchIds.length };
+      if (text.includes("AM: PERSONAS_SCOPE_TARGET")) return { rows: [], rowCount: adminBranchIds.includes(OTHER_BRANCH_ID) ? 1 : 0 };
       if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(text) || /^(INSERT|UPDATE|DELETE) /i.test(text)) {
         activity.mutations.push(text);
       }
@@ -82,10 +85,14 @@ async function buildApp({
 
   const app = Fastify({ logger: false });
   app.decorate("db", {
-    async query(sql) {
+    async query(sql, params = []) {
       const text = String(sql);
-      if (text.includes("FROM public.usuarios u")) return { rows: listRows, rowCount: listRows.length };
-      if (text.includes("FROM public.empleados e")) return { rows: listRows, rowCount: listRows.length };
+      if (text.includes("AM: PERSONAS_ADMIN_BRANCHES")) return { rows: adminBranchIds.map((id_sucursal) => ({ id_sucursal })), rowCount: adminBranchIds.length };
+      const visibleRows = text.includes("AM: PERSONAS_SCOPE_READ")
+        ? listRows.filter((row) => params.at(-1).includes(row.id_sucursal || row.roles?.[0]?.id_sucursal))
+        : listRows;
+      if (text.includes("FROM public.usuarios u")) return { rows: visibleRows, rowCount: visibleRows.length };
+      if (text.includes("FROM public.empleados e")) return { rows: visibleRows, rowCount: visibleRows.length };
       throw new Error("Unexpected pool query");
     },
     async connect() {
@@ -125,8 +132,8 @@ async function buildApp({
   return { app, activity };
 }
 
-test("admin consulta empleados ordinarios de una sucursal fuera de sus claims", async (t) => {
-  const { app } = await buildApp({ listRows: [employeeRow] });
+test("admin no consulta empleados fuera de sus asignaciones administrativas", async (t) => {
+  const { app } = await buildApp({ listRows: [employeeRow], adminBranchIds: ["55555555-5555-4555-8555-555555555555"] });
   t.after(() => app.close());
 
   const response = await app.inject({
@@ -136,7 +143,7 @@ test("admin consulta empleados ordinarios de una sucursal fuera de sus claims", 
   });
 
   assert.equal(response.statusCode, 200);
-  assert.equal(response.json().data.empleados[0].id_sucursal, OTHER_BRANCH_ID);
+  assert.deepEqual(response.json().data.empleados, []);
 });
 
 test("listado de admin oculta super_admin y protegidos; super_admin conserva listado completo", async (t) => {
@@ -298,8 +305,9 @@ for (const markPending of [true, false]) {
   });
 }
 
-test("admin gestiona la inactivacion de empleado ordinario de otra sucursal", async (t) => {
+test("admin no inactiva empleado ordinario de otra sucursal", async (t) => {
   const { app, activity } = await buildApp({
+    adminBranchIds: ["55555555-5555-4555-8555-555555555555"],
     clientQuery(text) {
       if (text.includes("FROM public.empleados e")) return { rows: [employeeRow], rowCount: 1 };
       if (text.includes("SELECT id_rol, nombre") && text.includes("FROM public.roles")) {
@@ -316,8 +324,9 @@ test("admin gestiona la inactivacion de empleado ordinario de otra sucursal", as
     url: `/personas/empleados/${EMPLOYEE_ID}/inactivar`,
     headers: { "x-test-roles": "admin" },
   });
-  assert.equal(response.statusCode, 200);
-  assert.ok(activity.mutations.some((sql) => sql.startsWith("UPDATE public.empleados")));
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.json().error.code, "AUTH_FORBIDDEN_BRANCH");
+  assert.deepEqual(activity.mutations, []);
 });
 
 test("admin conserva la edicion de usuarios ordinarios", async (t) => {
