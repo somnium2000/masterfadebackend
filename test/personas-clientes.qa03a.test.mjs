@@ -13,15 +13,15 @@ const result = (rows = []) => ({ rows, rowCount: rows.length });
 
 // AM: Invitados sin pertenencia requieren Super Admin explícito; el rechazo Admin se cubre en personas-admin-scope.
 async function fixture(t, options = {}) {
-  const state = { row: { id_cliente: ID, id_persona: PERSON, id_usuario: USER, nombres: "Ana", apellidos: "Sintetica", correo_principal: "ana@example.test", estado_cliente: true, tiene_acceso: true, estado_acceso: "activo", id_sucursal_origen: BRANCH, ...options.row }, activeRole: true, queries: [], auth: [], authUserExists: Boolean(options.authIdentity), snapshot: null };
+  const state = { row: { id_cliente: ID, id_persona: PERSON, id_usuario: USER, nombres: "Ana", apellidos: "Sintetica", correo_principal: "ana@example.test", estado_cliente: true, tiene_acceso: true, estado_acceso: "activo", id_sucursal_origen: BRANCH, ...options.row }, activeRole: options.roleExists !== false, roleExists: options.roleExists !== false, queries: [], auth: [], authUserExists: Boolean(options.authIdentity), snapshot: null };
   async function query(sql, params = []) {
     if (String(sql).includes("AM: PERSONAS_ADMIN_BRANCHES")) return result([{ id_sucursal: BRANCH }]);
     if (String(sql).includes("AM: PERSONAS_SCOPE_TARGET")) return result(options.missing || Boolean(options.guestContact) || state.row.id_sucursal_origen !== BRANCH ? [] : [{ id_persona: params[0] }]);
     const text = String(sql).replace(/ AND \/\* AM: PERSONAS_SCOPE_BEGIN \*\/[\s\S]*?\/\* AM: PERSONAS_SCOPE_END \*\//g, "").replace("/* AM: PERSONAS_SCOPE_READ */ ", "").replace(/\s+/g, " ").trim();
     state.queries.push({ text, params });
-    if (text === "BEGIN") { state.snapshot = { ...state.row }; return result(); }
+    if (text === "BEGIN") { state.snapshot = { row: { ...state.row }, activeRole: state.activeRole, roleExists: state.roleExists }; return result(); }
     if (text === "COMMIT") return result();
-    if (text === "ROLLBACK") { state.row = state.snapshot; return result(); }
+    if (text === "ROLLBACK") { Object.assign(state, state.snapshot); return result(); }
     if (text.includes("FROM public.app_protected_users")) return result(options.protected ? [{ exists: 1 }] : []);
     if (text.includes("r.nombre = 'super_admin'")) return result(options.privileged ? [{ exists: 1 }] : []);
     if (text.startsWith("SELECT c.id_persona,") && text.includes("FROM public.correos c")) {
@@ -50,16 +50,25 @@ async function fixture(t, options = {}) {
       else if (state.row.estado_acceso === params[1]) state.row.estado_acceso = params[2];
       return result();
     }
-    if (text.startsWith("UPDATE public.roles_usuarios")) { state.activeRole = !text.includes("activo = FALSE"); return { rows: [], rowCount: 1 }; }
-    if (text.startsWith("INSERT INTO public.roles_usuarios")) { state.activeRole = true; return result(); }
+    if (text.startsWith("UPDATE public.roles_usuarios")) {
+      if (!text.includes("activo = FALSE") && params[2] !== null) throw Object.assign(new Error("ROL_GLOBAL_NO_DEBE_TENER_SUCURSAL"), { code: "P0001" });
+      if (!state.roleExists) return result();
+      state.activeRole = !text.includes("activo = FALSE"); return { rows: [], rowCount: 1 };
+    }
+    if (text.startsWith("INSERT INTO public.roles_usuarios")) {
+      if (params[2] !== null) throw Object.assign(new Error("ROL_GLOBAL_NO_DEBE_TENER_SUCURSAL"), { code: "P0001" });
+      state.roleExists = true; state.activeRole = true; return result();
+    }
     if (text.startsWith("INSERT INTO public.clientes")) {
       if (options.sqlFailure) throw new Error("synthetic insert failure");
+      state.row.id_sucursal_origen = params[3];
       state.row.estado_cliente = params[4] ?? true;
       return result([{ id_cliente: ID }]);
     }
     if (text.startsWith("UPDATE public.clientes")) {
       if (options.fechaIngreso) assert.equal(params[2], options.fechaIngreso.toISOString());
       if (options.sqlFailure) throw new Error("synthetic update failure");
+      if (text.includes("id_sucursal_origen =")) state.row.id_sucursal_origen = params[3];
       state.row.estado_cliente = text.includes("estado = FALSE") ? false : text.includes("estado = TRUE") ? true : params[4] ?? state.row.estado_cliente;
       return result();
     }
@@ -227,4 +236,69 @@ test("PATCH que omite fecha_ingreso conserva Date de pg como ISO válido", async
   const date = new Date('2026-10-19T12:00:00Z');
   const s = await fixture(t, { row: { fecha_ingreso: date }, fechaIngreso: date });
   assert.equal((await s.inject('PATCH', `/clientes/${ID}`, payload())).statusCode, 200);
+});
+
+for (const actor of ["admin", "super_admin"]) {
+  for (const scenario of ["crear", "editar", "reactivar", "reactivar sin rol"]) {
+    test(`CLIENT-CREATE-01 ${actor}: ${scenario} usa rol global y conserva origen`, async (t) => {
+      const creating = scenario === "crear";
+      const activating = scenario.startsWith("reactivar");
+      const s = await fixture(t, {
+        roleExists: !creating && scenario !== "reactivar sin rol",
+        ...(activating ? { row: { estado_cliente: false, estado_acceso: "bloqueado" } } : {}),
+      });
+      if (activating) s.activeRole = false;
+      const response = await s.inject(creating ? "POST" : "PATCH", creating ? "/clientes" : `/clientes/${ID}${activating ? "/activar" : ""}`, activating ? undefined : payload(), actor);
+      assert.equal(response.statusCode, creating ? 201 : 200, response.body);
+      const roleWrites = s.queries.filter(({ text }) => /^(UPDATE|INSERT INTO) public.roles_usuarios/.test(text) && !text.includes("activo = FALSE"));
+      assert.ok(roleWrites.length > 0);
+      for (const { params } of roleWrites) {
+        assert.equal(params[2], null, "El trigger real exige sucursal NULL para el rol cliente");
+        assert.equal(params[3], ROLE, "Conserva la autoría administrativa");
+      }
+      assert.equal(roleWrites.some(({ text }) => text.startsWith("INSERT")), creating || scenario === "reactivar sin rol");
+      assert.equal(response.json().data.cliente.id_sucursal_origen, BRANCH);
+      assert.equal(s.row.id_sucursal_origen, BRANCH);
+      assert.equal(s.activeRole, true);
+      assert.ok(s.queries.some(({ text }) => text === "COMMIT"));
+    });
+  }
+}
+
+test("CLIENT-CREATE-01 rol global no concede autorización sobre otra sucursal", async (t) => {
+  const otherBranch = "99999999-9999-4999-8999-999999999999";
+  const s = await fixture(t);
+  const body = payload(); body.cliente.id_sucursal_origen = otherBranch;
+  for (const [method, path] of [["POST", "/clientes"], ["PATCH", `/clientes/${ID}`]]) {
+    const response = await s.inject(method, path, body);
+    assert.equal(response.statusCode, 403, response.body);
+    assert.equal(response.json().error.code, "AUTH_FORBIDDEN_BRANCH");
+  }
+  assert.equal(s.auth.length, 0);
+  assert.equal(s.queries.some(({ text }) => /^(BEGIN|INSERT|UPDATE)/.test(text)), false);
+  assert.equal(s.row.id_sucursal_origen, BRANCH);
+});
+
+test("CLIENT-CREATE-01 fallo posterior revierte rol nuevo y compensa Auth", async (t) => {
+  const s = await fixture(t, { roleExists: false, sqlFailure: true });
+  const response = await s.inject("POST", "/clientes", payload());
+  assert.equal(response.statusCode, 500);
+  assert.ok(s.queries.some(({ text }) => text.startsWith("INSERT INTO public.roles_usuarios")));
+  assert.ok(s.queries.some(({ text }) => text === "ROLLBACK"));
+  assert.equal(s.roleExists, false);
+  assert.equal(s.activeRole, false);
+  assert.equal(s.authUserExists, false);
+  assert.deepEqual(s.auth.map(([operation]) => operation), ["create", "delete"]);
+  assert.equal(s.row.id_sucursal_origen, BRANCH);
+});
+
+test("CLIENT-CREATE-01 reactivación repetida conserva un único rol global", async (t) => {
+  const s = await fixture(t, { roleExists: false, row: { estado_cliente: false, estado_acceso: "bloqueado" } });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await s.inject("PATCH", `/clientes/${ID}/activar`);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().data.cliente.id_sucursal_origen, BRANCH);
+  }
+  assert.equal(s.queries.filter(({ text }) => text.startsWith("INSERT INTO public.roles_usuarios")).length, 1);
+  assert.equal(s.activeRole, true);
 });

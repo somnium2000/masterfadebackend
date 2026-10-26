@@ -1625,7 +1625,7 @@ async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleName
   }
 }
 
-async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, branchId, assignedBy) {
+async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, _branchId, assignedBy) {
   await assertUserNotProtected(app, userId, "ROLE_CLIENT_ASSIGNMENT_UPDATE", { client });
 
   const roleId = roleIdsByName.get("cliente");
@@ -1635,6 +1635,7 @@ async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, b
     });
   }
 
+  // AM: El rol cliente es global; la sucursal operativa permanece en clientes.id_sucursal_origen.
   const revived = await client.query(
     `
       UPDATE public.roles_usuarios
@@ -1645,7 +1646,7 @@ async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, b
       WHERE id_usuario = $1::uuid
         AND id_rol = $2::uuid
     `,
-    [userId, roleId, branchId, assignedBy]
+    [userId, roleId, null, assignedBy]
   );
 
   if (!revived.rowCount) {
@@ -1654,7 +1655,7 @@ async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, b
         INSERT INTO public.roles_usuarios (id_rol, id_usuario, id_sucursal, activo, asignado_por)
         VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE, $4::uuid)
       `,
-      [roleId, userId, branchId, assignedBy]
+      [roleId, userId, null, assignedBy]
     );
   }
 }
