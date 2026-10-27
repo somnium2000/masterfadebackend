@@ -32,12 +32,14 @@ function assetRow(overrides = {}) {
   return {
     id_asset: ASSET_ID,
     bucket_name: "imagenes_privadas",
-    object_path: "clientes/avatar.png",
+    object_path: `clientes/${CLIENTE_ID}/perfil/2026/10/avatar/1790000000-avatar-aabbcc.png`,
+    // AM: Metadata real del scope privado; el cargador no acredita propiedad.
+    scope_key: "private_client_profile", entity_type: "cliente", visibility: "private", metadata: {}, public_url: null,
     status: "activo",
     deleted_at: null,
     owner_cliente_id: CLIENTE_ID,
     owner_user_id: USUARIO_ID,
-    entity_id: PERSONA_ID,
+    entity_id: CLIENTE_ID,
     ...overrides,
   };
 }
@@ -73,6 +75,9 @@ function createClient({
   assets = [assetRow()],
   objectAbsent = [false, true],
   throwOn = null,
+  persistAssets = false,
+  references = [], identityMatches = true, duplicateLocation = false, unresolvedPhoto = false,
+  currentAssets = assets.filter(asset => asset.status !== "eliminado" && !asset.deleted_at),
 } = {}) {
   const calls = [];
   const updatedAssets = [];
@@ -118,6 +123,18 @@ function createClient({
       if (text.includes("AS client_ready") && text.includes("AS user_ready")) {
         return { rows: [preconditions] };
       }
+      // AM: Resultados de las consultas productivas de identidad, referencias y snapshot.
+      if (text.includes('AS client_storage_identity_matches')) return { rows: [{ client_storage_identity_matches: identityMatches, duplicate_location: duplicateLocation }] };
+      if (text.includes('AS client_storage_unresolved_photo')) return { rows: [{ client_storage_unresolved_photo: unresolvedPhoto }] };
+      if (text.includes('AS reference_persona_id')) return { rows: references };
+      if (text.includes('AS path_ambiguous')) return { rows: [{ path_ambiguous: false }] };
+      if (text.includes('SELECT sa.*')) return { rows: currentAssets.filter(asset => !asset.deleted_at && asset.status !== 'eliminado') };
+      if (text.includes('UPDATE public.storage_assets') && text.includes('account_deletion_storage') && !text.includes("'status', 'failed'")) {
+        if (persistAssets) for (const asset of assets) if (asset.status !== 'eliminado') {
+          asset.status = 'fallido'; asset.metadata = { ...asset.metadata, account_deletion_storage: { request_id: params[1], status: 'quarantined' } };
+        }
+        return { rows: [], rowCount: assets.length };
+      }
       if (text.includes("FROM public.storage_assets") && text.includes("FOR UPDATE")) {
         return { rows: assets };
       }
@@ -128,14 +145,20 @@ function createClient({
       }
       if (text.includes("UPDATE public.storage_assets") && text.includes("status = 'eliminado'")) {
         updatedAssets.push({ status: "eliminado", params, sql: text });
+        if (persistAssets) Object.assign(assets.find(asset => asset.id_asset === params[0]), { status: 'eliminado', deleted_at: params[2],
+          entity_id: null, owner_cliente_id: null, owner_user_id: null, public_url: null,
+          object_path: 'deleted/account-deletion/' + params[0].replace(/-/g, ''),
+          metadata: { account_deletion: { status: 'deleted', deletion_request_id: params[4] } } });
         return { rowCount: 1, rows: [] };
       }
       if (text.includes("UPDATE public.storage_assets") && text.includes("status = 'fallido'")) {
         updatedAssets.push({ status: "fallido", params, sql: text });
+        if (persistAssets) Object.assign(assets.find(asset => asset.id_asset === params[0]), { status: 'fallido' });
         return { rowCount: 1, rows: [] };
       }
       if (text.includes("UPDATE app_private.solicitudes_eliminacion_cuenta")) {
         const estado = text.includes("SET estado_codigo = 'auth_pendiente'") ? "auth_pendiente" : params[1];
+        if (persistAssets) { request.estado_codigo = estado; if (params[2]) request.resumen_impacto = JSON.parse(params[2]); }
         return {
           rowCount: 1,
           rows: [{
@@ -292,7 +315,10 @@ test("objeto ya ausente se considera exito", async () => {
 });
 
 test("activo ya eliminado se omite y cuenta already_deleted", async () => {
-  const client = createClient({ assets: [assetRow({ status: "eliminado", deleted_at: new Date().toISOString() })] });
+  const client = createClient({ assets: [assetRow({ status: "eliminado", deleted_at: new Date().toISOString(),
+    owner_cliente_id: null, owner_user_id: null, entity_id: null,
+    object_path: 'deleted/account-deletion/' + ASSET_ID.replace(/-/g, ''),
+    metadata: { account_deletion: { status: 'deleted', deletion_request_id: REQUEST_ID } } })] });
   const supabase = makeSupabase();
   const result = await cleanup(client, makeApp(client, supabase));
 
@@ -442,11 +468,80 @@ test("procesa solo IDs de la solicitud privada", async () => {
     request: requestRow({
       resumen_impacto: { internal_anonymization: { storage_asset_ids: [ASSET_ID, ASSET_ID_2] } },
     }),
-    assets: [assetRow(), assetRow({ id_asset: ASSET_ID_2, object_path: "clientes/otro.png" })],
+    assets: [assetRow(), assetRow({ id_asset: ASSET_ID_2, object_path: `clientes/${CLIENTE_ID}/perfil/2026/10/avatar/1790000000-otro-aabbcc.png` })],
     objectAbsent: [true, true],
   });
   await cleanup(client);
   const storageQuery = client.calls.find((call) => String(call.sql).includes("FROM public.storage_assets"));
 
   assert.deepEqual(storageQuery.params[0], [ASSET_ID, ASSET_ID_2]);
+});
+
+// AM: Estas regresiones llaman al ejecutor productivo y observan Storage y los assets, no aserciones constantes.
+const photoRef = (asset, persona = PERSONA_ID) => ({ reference_persona_id: persona, reference_asset_id: asset.id_asset,
+  reference_path: asset.object_path, reference_bucket: asset.bucket_name, resolved_path: asset.object_path });
+const rejectWithoutDeleting = async options => {
+  const client = createClient(options), supabase = makeSupabase();
+  const original = structuredClone(options.assets || []);
+  await assert.rejects(cleanup(client, makeApp(client, supabase)), { code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID' });
+  assert.equal(supabase.calls.length, 0); assert.deepEqual(client.updatedAssets, []);
+  assert.deepEqual(options.assets || [], original);
+  assert.ok(client.calls.some(call => call.sql === 'ROLLBACK'));
+};
+test('AM: foto privada propia cargada por administrador se elimina legitimamente', async () => {
+  const asset = assetRow({ owner_user_id: ASSET_ID_2 }), client = createClient({ assets: [asset], references: [photoRef(asset)] });
+  const supabase = makeSupabase();
+  assert.equal((await cleanup(client, makeApp(client, supabase))).storage_processed, true);
+  assert.equal(supabase.calls.filter(call => call.type === 'remove').length, 1);
+});
+for (const change of [
+  { owner_cliente_id: ASSET_ID_2, entity_id: ASSET_ID_2 },
+  { owner_cliente_id: null, entity_id: null },
+  { entity_id: PERSONA_ID }, { owner_cliente_id: ASSET_ID_2 },
+  { scope_key: 'public_promotion_main' }, { entity_type: 'promocion' }, { visibility: 'public' },
+  { object_path: 'clientes/' + ASSET_ID_2 + '/perfil/2026/10/avatar/1790000000-avatar-aabbcc.png' },
+  { public_url: 'https://synthetic.invalid/storage/v1/object/public/other/image.png' },
+  { metadata: { account_deletion_storage: { request_id: ASSET_ID_2 } } },
+]) test('AM: cargador propio no autoriza metadata ajena/contradictoria ' + JSON.stringify(change), async () => {
+  await rejectWithoutDeleting({ assets: [assetRow(change)] });
+});
+for (const persona of [ASSET_ID_2, null]) test('AM: referencia de tercero o comercial impide todo borrado ' + persona, async () => {
+  const asset = assetRow(); await rejectWithoutDeleting({ assets: [asset], references: [photoRef(asset, persona)] });
+});
+test('AM: referencia heredada compartida por ruta no autoriza borrar', async () => {
+  const asset = assetRow(); await rejectWithoutDeleting({ assets: [asset], references: [{ reference_persona_id: ASSET_ID_2,
+    reference_path: asset.object_path, reference_asset_id: null }] });
+});
+for (const flags of [{ identityMatches: false }, { duplicateLocation: true }, { unresolvedPhoto: true }]) {
+  test('AM: identidad, ubicacion o foto ambigua bloquean ' + JSON.stringify(flags), async () => {
+    await rejectWithoutDeleting({ assets: [assetRow()], ...flags });
+  });
+}
+test('AM: snapshot no permite borrar asset ajeno ya eliminado', async () => {
+  await rejectWithoutDeleting({ assets: [assetRow({ status: 'eliminado', deleted_at: new Date().toISOString(),
+    metadata: { account_deletion: { status: 'deleted', deletion_request_id: ASSET_ID_2 } } })] });
+});
+test('AM: archivo nuevo fuera del snapshot bloquea antes del primer remove', async () => {
+  await rejectWithoutDeleting({ assets: [assetRow()], currentAssets: [assetRow(), assetRow({ id_asset: ASSET_ID_2 })] });
+});
+test('AM: uploader de terceros sin archivos propios no invoca Storage', async () => {
+  const client = createClient({ assets: [], request: requestRow({ resumen_impacto: { internal_anonymization: { storage_asset_ids: [] } } }) });
+  const supabase = makeSupabase(); assert.equal((await cleanup(client, makeApp(client, supabase))).storage_processed, true);
+  assert.deepEqual(supabase.calls, []);
+  const selection = client.calls.find(call => call.sql.includes('SELECT sa.*'));
+  assert.ok(selection); assert.doesNotMatch(selection.sql, /owner_user_id/);
+});
+test('AM: fallo parcial y reintento validan recibo propio sin repetir archivo eliminado', async () => {
+  const first = assetRow(), second = assetRow({ id_asset: ASSET_ID_2,
+    object_path: 'clientes/' + CLIENTE_ID + '/perfil/2026/10/avatar/1790000000-otro-aabbcc.png' });
+  const client = createClient({ persistAssets: true, assets: [first, second],
+    request: requestRow({ resumen_impacto: { internal_anonymization: { storage_asset_ids: [ASSET_ID, ASSET_ID_2] } } }),
+    objectAbsent: [false, true, false, false, false, true] });
+  const supabase = makeSupabase();
+  assert.equal((await cleanup(client, makeApp(client, supabase))).storage_processed, false);
+  assert.equal(first.status, 'eliminado'); assert.equal(first.metadata.account_deletion.deletion_request_id, REQUEST_ID);
+  assert.equal(second.status, 'fallido'); assert.equal(second.metadata.account_deletion_storage.request_id, REQUEST_ID);
+  assert.equal((await cleanup(client, makeApp(client, supabase))).storage_processed, true);
+  assert.equal(supabase.calls.filter(call => call.type === 'remove' && call.paths[0].includes('-avatar-')).length, 1);
+  assert.equal((await cleanup(client, makeApp(client, supabase))).idempotent_replay, true);
 });

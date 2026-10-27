@@ -2280,23 +2280,10 @@ async function prepareAccountDeletionAnonymizationScope(client, {
     ) ON COMMIT DROP
   `);
 
-  await client.query(
-    `
-      INSERT INTO mf_ad_storage_assets (id_asset)
-      SELECT DISTINCT sa.id_asset
-      FROM public.storage_assets sa
-      LEFT JOIN public.personas p ON p.id_persona = $1::uuid
-      WHERE sa.deleted_at IS NULL
-        AND sa.status <> 'eliminado'
-        AND (
-          sa.owner_cliente_id = $2::uuid
-          OR sa.owner_user_id = $3::uuid
-          OR sa.entity_id IN ($1::uuid, $2::uuid, $3::uuid)
-          OR sa.id_asset = p.foto_perfil_asset_id
-        )
-    `,
-    [personaId, clienteId, usuarioId]
-  );
+  // AM: Congelar solo archivos cuya pertenencia fue validada; el cargador no acredita propiedad.
+  const ownAssets = await selectClientAccountDeletionStorageAssets(client, { clienteId, personaId, usuarioId });
+  await client.query('INSERT INTO mf_ad_storage_assets (id_asset) SELECT unnest($1::uuid[])',
+    [ownAssets.map(asset => asset.id_asset)]);
 
   await client.query(`
     CREATE TEMP TABLE mf_ad_citas (
@@ -3387,7 +3374,8 @@ async function fetchAccountDeletionStorageAssets(client, assetIds) {
         entity_type,
         visibility,
         id_sucursal,
-        public_url
+        public_url,
+        metadata
       FROM public.storage_assets
       WHERE id_asset = ANY($1::uuid[])
       FOR UPDATE
@@ -3405,20 +3393,85 @@ async function fetchAccountDeletionStorageAssets(client, assetIds) {
   return assetIds.map((id) => byId.get(String(id).toLowerCase()));
 }
 
-function assertStorageAssetBelongsToAccount(asset, {
-  clienteId,
-  personaId,
-  usuarioId,
-}) {
-  if (asset?.status === "eliminado" && asset?.deleted_at) return;
-  const belongs = [personaId, clienteId, usuarioId].some((id) => String(asset?.entity_id || "") === String(id))
-    || String(asset?.owner_cliente_id || "") === String(clienteId)
-    || String(asset?.owner_user_id || "") === String(usuarioId);
-  if (!belongs) {
-    throw new AppError(403, "Un archivo no corresponde a la cuenta que se esta procesando.", {
-      code: "CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID",
-    });
+// AM: El cliente/entidad/scope/ruta deben coincidir; owner_user_id solo identifica al cargador.
+function assertStorageAssetBelongsToAccount(asset, { clienteId, deletionRequestId } = {}) {
+  const scope = getStorageScope('private_client_profile');
+  const invalid = () => new AppError(409, 'No se pudo verificar la propiedad exclusiva de un archivo. Requiere revision.', {
+    code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID',
+  });
+  if (!asset || asset.scope_key !== scope.key || asset.entity_type !== scope.entityType
+    || asset.bucket_name !== scope.bucket || asset.visibility !== scope.visibility || asset.public_url) throw invalid();
+  if (asset.status === 'eliminado' && asset.deleted_at) {
+    // AM: Un snapshot no autoriza saltarse la pertenencia de un tombstone ajeno.
+    const receipt = normalizeJsonObject(asset.metadata, {}).account_deletion;
+    if (!deletionRequestId || receipt?.status !== 'deleted' || receipt.deletion_request_id !== deletionRequestId
+      || asset.entity_id || asset.owner_cliente_id || asset.owner_user_id
+      || asset.object_path !== 'deleted/account-deletion/' + String(asset.id_asset).replace(/-/g, '')) throw invalid();
+    return;
   }
+  const parts = String(asset.object_path || '').split('/');
+  if (asset.deleted_at || asset.owner_cliente_id !== clienteId || asset.entity_id !== clienteId
+    || !['temporal', 'activo', 'reemplazado', 'fallido'].includes(asset.status)
+    || parts.length !== 7 || parts[0] !== scope.prefix || parts[1] !== clienteId || parts[2] !== 'perfil'
+    || !/^\d{4}$/.test(parts[3]) || !/^(0[1-9]|1[0-2])$/.test(parts[4]) || parts[5] !== scope.variant
+    || !/^\d+-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{6}\.(jpg|png|webp)$/.test(parts[6])) throw invalid();
+  const quarantine = normalizeJsonObject(asset.metadata, {}).account_deletion_storage;
+  if (quarantine && quarantine.request_id !== deletionRequestId) throw invalid();
+}
+
+// AM: Reutilizar la comparacion certificada UUID/bucket/ruta sin cambiar el flujo del personal.
+async function validateClientAccountDeletionStorageAssets(client, assets, context) {
+  for (const asset of assets) {
+    assertStorageAssetLocation(asset);
+    assertStorageAssetBelongsToAccount(asset, context);
+    const { rows } = await client.query(`
+      SELECT EXISTS (SELECT 1 FROM public.clientes c JOIN public.usuarios u
+        ON u.id_usuario = c.id_usuario AND u.id_persona = c.id_persona
+        WHERE c.id_cliente = $1::uuid AND c.id_persona = $2::uuid AND u.id_usuario = $3::uuid)
+        AND NOT EXISTS (SELECT 1 FROM public.clientes c WHERE c.id_persona = $2::uuid AND c.id_cliente <> $1::uuid)
+        AS client_storage_identity_matches,
+        EXISTS (SELECT 1 FROM public.storage_assets sa WHERE sa.id_asset <> $4::uuid
+          AND sa.bucket_name = $5::text AND sa.object_path = $6::text) AS duplicate_location
+    `, [context.clienteId, context.personaId, context.usuarioId, asset.id_asset, asset.bucket_name, asset.object_path]);
+    if (rows?.[0]?.client_storage_identity_matches !== true || rows?.[0]?.duplicate_location !== false) {
+      throw new AppError(409, 'No se pudo verificar la propiedad exclusiva de un archivo.', {
+        code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID',
+      });
+    }
+    try { await assertInternalStorageReferences(client, { id_persona: context.personaId }, asset); }
+    catch (error) {
+      if (error?.code !== 'ADMIN_ACCOUNT_DELETION_STORAGE_OWNERSHIP_AMBIGUOUS') throw error;
+      throw new AppError(409, 'El archivo tiene referencias compartidas o contradictorias. Requiere revision.', {
+        code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID',
+      });
+    }
+  }
+}
+
+// AM: Incluir referencias propias contradictorias para bloquearlas, nunca seleccionar por uploader.
+async function selectClientAccountDeletionStorageAssets(client, context) {
+  const { rows } = await client.query(`
+    SELECT sa.* FROM public.storage_assets sa
+    WHERE sa.deleted_at IS NULL AND sa.status <> 'eliminado' AND (
+      sa.owner_cliente_id = $2::uuid OR sa.entity_id IN ($1::uuid, $2::uuid, $3::uuid)
+      OR EXISTS (SELECT 1 FROM public.personas p WHERE p.id_persona = $1::uuid
+        AND (p.foto_perfil_asset_id = sa.id_asset OR p.foto_perfil_path = sa.object_path)))
+    ORDER BY sa.id_asset FOR UPDATE OF sa
+  `, [context.personaId, context.clienteId, context.usuarioId]);
+  const legacy = await client.query(`
+    SELECT EXISTS (SELECT 1 FROM public.personas p WHERE p.id_persona = $1::uuid AND (
+      (p.foto_perfil_asset_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM public.storage_assets sa WHERE sa.id_asset = p.foto_perfil_asset_id))
+      OR (p.foto_perfil_asset_id IS NULL AND NULLIF(p.foto_perfil_path, '') IS NOT NULL AND (
+        (SELECT COUNT(*) FROM public.storage_assets sa WHERE sa.object_path = p.foto_perfil_path) <> 1
+        OR (SELECT COUNT(DISTINCT bucket_name) FROM (
+          SELECT bucket_name FROM public.storage_assets WHERE object_path = p.foto_perfil_path
+          UNION SELECT bucket_id FROM storage.objects WHERE name = p.foto_perfil_path
+        ) locations) <> 1)))) AS client_storage_unresolved_photo
+  `, [context.personaId]);
+  if (legacy.rows?.[0]?.client_storage_unresolved_photo !== false) throw new AppError(409,
+    'No se pudo resolver la fotografia de forma inequivoca.', { code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID' });
+  await validateClientAccountDeletionStorageAssets(client, rows, context);
+  return rows;
 }
 
 function assertStorageAssetLocation(asset) {
@@ -3488,12 +3541,17 @@ async function prepareAccountDeletionStorageCleanup(client, {
   const assetIds = readStorageAssetIdsFromRequest(request);
   const assets = await fetchAccountDeletionStorageAssets(client, assetIds);
 
-  for (const asset of assets) {
-    assertStorageAssetBelongsToAccount(asset, { clienteId, personaId, usuarioId });
-    if (!(asset.status === "eliminado" && asset.deleted_at)) {
-      assertStorageAssetLocation(asset);
-    }
-  }
+  // AM: Revalidar snapshot y referencias antes de cualquier llamada a Storage.
+  const context = { clienteId, personaId, usuarioId, deletionRequestId };
+  await validateClientAccountDeletionStorageAssets(client, assets, context);
+  const current = await selectClientAccountDeletionStorageAssets(client, context);
+  if (current.some(asset => !assetIds.includes(asset.id_asset))) throw new AppError(409,
+    'Los archivos de la cuenta cambiaron. Requiere revision.', { code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID' });
+  // AM: La cuarentena bloquea los escritores atomicos existentes mientras se elimina el objeto.
+  if (assetIds.length) await client.query(`UPDATE public.storage_assets SET status = 'fallido',
+    metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('account_deletion_storage',
+      jsonb_build_object('request_id', $2::text, 'status', 'quarantined')), updated_at = NOW()
+    WHERE id_asset = ANY($1::uuid[]) AND status <> 'eliminado'`, [assetIds, deletionRequestId]);
 
   return { replay: false, request, assetIds, assets };
 }
@@ -3607,7 +3665,9 @@ async function finalizeAccountDeletionStorageCleanup(client, {
   }
 
   const assetIds = readStorageAssetIdsFromRequest(request);
-  await fetchAccountDeletionStorageAssets(client, assetIds);
+  const assets = await fetchAccountDeletionStorageAssets(client, assetIds);
+  // AM: Ninguna referencia nueva o contradictoria puede avanzar a Auth tras Storage.
+  await validateClientAccountDeletionStorageAssets(client, assets, { clienteId, personaId, usuarioId, deletionRequestId });
 
   const timestamp = new Date().toISOString();
   const deleted = results.filter((item) => item.status === "deleted");
@@ -3627,6 +3687,7 @@ async function finalizeAccountDeletionStorageCleanup(client, {
               'account_deletion',
               jsonb_build_object(
                 'status', 'deleted',
+                'deletion_request_id', $5::text,
                 'deleted_at', $3::text,
                 'request_id', $4::text
               )
@@ -3640,7 +3701,7 @@ async function finalizeAccountDeletionStorageCleanup(client, {
         WHERE id_asset = $1::uuid
           AND id_asset = ANY($2::uuid[])
       `,
-      [item.idAsset, assetIds, timestamp, traceRequestId]
+      [item.idAsset, assetIds, timestamp, traceRequestId, deletionRequestId]
     );
   }
 
@@ -3651,7 +3712,7 @@ async function finalizeAccountDeletionStorageCleanup(client, {
         SET status = 'fallido',
             public_url = NULL,
             original_filename = NULL,
-            metadata = jsonb_build_object(
+            metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
               'account_deletion',
               jsonb_build_object(
                 'status', 'failed',

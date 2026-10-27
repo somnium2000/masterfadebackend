@@ -60,6 +60,8 @@ function createClient({
   preconditionRow = preconditions(),
   verifyRow = verification(),
   storageAssets = [],
+  // AM: Referencias sinteticas adversarias para bloquear antes de borrar PII o capturar assets.
+  candidateAssets = null, references = [], unresolvedPhoto = false,
   throwOn = null,
 } = {}) {
   const calls = [];
@@ -96,6 +98,14 @@ function createClient({
       if (text.includes("AS user_ready") && text.includes("AS points_ready")) {
         return { rows: [preconditionRow] };
       }
+      // AM: Assets sinteticos con pertenencia completa para la captura de snapshot.
+      if (text.includes('SELECT sa.*')) return { rows: candidateAssets || storageAssets.map(id_asset => ({ id_asset,
+        scope_key: 'private_client_profile', entity_type: 'cliente', bucket_name: 'imagenes_privadas', visibility: 'private',
+        status: 'activo', entity_id: CLIENTE_ID, owner_cliente_id: CLIENTE_ID, deleted_at: null,
+        object_path: `clientes/${CLIENTE_ID}/perfil/2026/10/avatar/1790000000-avatar-aabbcc.png` })) };
+      if (text.includes('AS reference_persona_id')) return { rows: references };
+      if (text.includes('AS client_storage_unresolved_photo')) return { rows: [{ client_storage_unresolved_photo: unresolvedPhoto }] };
+      if (text.includes('AS client_storage_identity_matches')) return { rows: [{ client_storage_identity_matches: true, duplicate_location: false }] };
       if (text.includes("array_agg(id_asset")) {
         return { rows: [{ asset_ids: storageAssets, asset_count: storageAssets.length }] };
       }
@@ -433,4 +443,21 @@ test("wrapper usa serializable y advisory lock", async () => {
   assert.equal(client.calls[0].sql, "BEGIN ISOLATION LEVEL SERIALIZABLE");
   assert.ok(client.calls[1].sql.includes("pg_advisory_xact_lock"));
   assert.equal(client.calls[1].params[0], USUARIO_ID);
+});
+
+// AM: El snapshot se construye por el codigo productivo y solo despues de probar la pertenencia.
+test('AM: captura de Storage no selecciona por cargador ni anonimiza ante metadatos contradictorios', async () => {
+  const client = createClient({ candidateAssets: [{ id_asset: REQUEST_ID, owner_user_id: USUARIO_ID,
+    owner_cliente_id: CLIENTE_ID, entity_id: CLIENTE_ID, scope_key: 'public_promotion_main',
+    entity_type: 'promocion', bucket_name: 'imagenes_publicas', object_path: 'promociones/ajena.png', visibility: 'public', status: 'activo' }] });
+  await assert.rejects(runInternal(client), { code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID' });
+  const selection = client.calls.find(call => call.sql.includes('SELECT sa.*'));
+  assert.ok(selection); assert.doesNotMatch(selection.sql, /owner_user_id/);
+  assert.equal(client.calls.some(call => call.sql.includes('UPDATE public.personas')), false);
+  assert.equal(client.calls.some(call => call.sql.includes('INSERT INTO mf_ad_storage_assets')), false);
+});
+test('AM: foto irresoluble bloquea incluso snapshot inicialmente vacio', async () => {
+  const client = createClient({ unresolvedPhoto: true });
+  await assert.rejects(runInternal(client), { code: 'CLIENT_ACCOUNT_DELETION_STORAGE_ASSET_OWNERSHIP_INVALID' });
+  assert.equal(client.calls.some(call => call.sql.includes('UPDATE public.personas')), false);
 });
