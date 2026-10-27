@@ -85,11 +85,21 @@ export async function bindAndActivateAsset(client, {
         metadata = COALESCE(metadata, '{}'::jsonb) || $6::jsonb,
         updated_at = NOW()
       WHERE id_asset = $1::uuid
+        -- AM: Validar el estado vigente bajo el lock del UPDATE, no una lectura anterior.
+        AND status IN ('temporal', 'activo')
+        AND deleted_at IS NULL
+        AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'account_deletion_storage')
       RETURNING *
     `,
     [idAsset, entityId, idSucursal, ownerUserId, ownerClienteId, JSON.stringify(metadata || {})]
   );
   if (!rows[0]) {
+    // AM: Distinguir inexistencia de conflicto sin revelar metadatos ni errores SQL.
+    if (await getAssetById(client, idAsset)) {
+      throw new AppError(409, "El archivo no esta disponible para vincular. Actualiza e intenta nuevamente.", {
+        code: "STORAGE_ASSET_STATUS_INVALID",
+      });
+    }
     throw new AppError(404, "Asset no encontrado para activar", {
       code: "STORAGE_ASSET_NOT_FOUND",
     });
@@ -115,10 +125,19 @@ export async function markAssetStatus(client, {
         END,
         updated_at = NOW()
       WHERE id_asset = $1::uuid
+        -- AM: Un escritor de estado tampoco puede sobrescribir una cuarentena de eliminacion.
+        AND deleted_at IS NULL
+        AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'account_deletion_storage')
       RETURNING *
     `,
     [idAsset, status, JSON.stringify(metadata || {}), deletedAt]
   );
+  // AM: Conservar el contrato null para inexistentes; conflictos requieren rollback del llamador.
+  if (!rows[0] && await getAssetById(client, idAsset)) {
+    throw new AppError(409, "El archivo no esta disponible para modificar. Actualiza e intenta nuevamente.", {
+      code: "STORAGE_ASSET_STATUS_INVALID",
+    });
+  }
   return rows[0] ?? null;
 }
 

@@ -504,8 +504,9 @@ test("admin no obtiene escrituras sobre fotografia privada de cliente", async ()
   }), { code: "STORAGE_SCOPE_FORBIDDEN" });
 });
 
-async function buildEmployeeUpdateApp({ failCleanup = false, failBeforeCommit = false } = {}) {
-  const activity = { commands: [], authEmails: [], cleanupAttempts: 0 };
+// AM: La carrera se inyecta en el UPDATE atomico, despues de la validacion previa real.
+async function buildEmployeeUpdateApp({ failCleanup = false, failBeforeCommit = false, quarantineBeforeActivation = false } = {}) {
+  const activity = { commands: [], authEmails: [], cleanupAttempts: 0, quarantineRejections: 0, photoReferenceWrites: 0 };
   const employee = {
     id_empleado: EMPLOYEE_ID,
     id_persona: OTHER_CLIENT_ID,
@@ -570,6 +571,15 @@ async function buildEmployeeUpdateApp({ failCleanup = false, failBeforeCommit = 
         throw new Error("precommit failure");
       }
       if (text.startsWith("UPDATE public.storage_assets")) {
+        // AM: Otro escritor confirmo la cuarentena mientras este conservaba una lectura antigua.
+        if (quarantineBeforeActivation && params[0] === ASSET_ID && text.includes("status = 'activo'")) {
+          assert.match(text, /AND status IN \('temporal', 'activo'\)/);
+          assert.match(text, /AND deleted_at IS NULL/);
+          assets.set(ASSET_ID, { ...assets.get(ASSET_ID), status: "fallido",
+            metadata: { account_deletion_storage: { request_id: "synthetic-deletion" } } });
+          activity.quarantineRejections += 1;
+          return { rows: [], rowCount: 0 };
+        }
         if (params[0] === OLD_ASSET_ID) {
           activity.cleanupAttempts += 1;
           if (failCleanup) throw new Error("cleanup failure");
@@ -580,6 +590,8 @@ async function buildEmployeeUpdateApp({ failCleanup = false, failBeforeCommit = 
         return { rows: [updated], rowCount: 1 };
       }
       if (text.includes("FROM public.barberos_perfiles_publicos")) return { rows: [], rowCount: 0 };
+      // AM: El rechazo de vinculacion debe preceder a la escritura de la referencia fotografica.
+      if (text.startsWith("UPDATE public.personas") && text.includes("foto_perfil_asset_id")) activity.photoReferenceWrites += 1;
       if (text.startsWith("UPDATE public.roles_usuarios")) return { rows: [], rowCount: 0 };
       if (text.startsWith("INSERT INTO public.roles_usuarios")) return { rows: [], rowCount: 1 };
       if (/^(UPDATE|INSERT) /i.test(text)) return { rows: [], rowCount: 1 };
@@ -822,4 +834,17 @@ test("creacion transversal rechaza asset temporal ajeno y compensa antes del COM
   assert.equal(activity.authCreated, 1);
   assert.equal(activity.authDeleted, 1);
   assert.equal(activity.assetActivated, 0);
+});
+// AM: Ruta productiva y rollback real del controlador ante un escritor de Storage obsoleto.
+test('AM: cuarentena concurrente de foto rechaza PATCH y ejecuta ROLLBACK sin COMMIT', async t => {
+  const { app, activity } = await buildEmployeeUpdateApp({ quarantineBeforeActivation: true });
+  t.after(() => app.close());
+  const payload = employeeUpdatePayload(); payload.acceso.correo_principal = 'anterior@example.test';
+  const response = await app.inject({ method: 'PATCH', url: `/personas/empleados/${EMPLOYEE_ID}`, payload });
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json().error.code, 'STORAGE_ASSET_STATUS_INVALID');
+  assert.equal(activity.quarantineRejections, 1);
+  assert.deepEqual(activity.commands, ['BEGIN', 'ROLLBACK']);
+  assert.equal(activity.photoReferenceWrites, 0); assert.equal(activity.cleanupAttempts, 0);
+  assert.deepEqual(activity.authEmails, []);
 });

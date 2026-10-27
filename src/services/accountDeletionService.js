@@ -1,7 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { AppError } from "../utils/errors.js";
-import { STORAGE_PRIVATE_BUCKET, STORAGE_PUBLIC_BUCKET } from "./storage/storageScopes.js";
+// AM: Las rutas laborales siguen el registro oficial de scopes.
+import { getStorageScope, STORAGE_PRIVATE_BUCKET, STORAGE_PUBLIC_BUCKET } from "./storage/storageScopes.js";
 
 const TERMINAL_REQUEST_STATES = ["completada", "rechazada", "cancelada"];
 const REQUEST_CONFIRMABLE_STATES = ["pendiente_confirmacion", "bloqueada"];
@@ -3348,6 +3349,7 @@ async function assertAccountDeletionStoragePreconditions(client, {
 
 async function fetchAccountDeletionStorageAssets(client, assetIds) {
   if (!assetIds.length) return [];
+  // AM: Los campos de contexto permiten verificar pertenencia laboral sin confiar en el cargador.
   const { rows } = await client.query(
     `
       SELECT
@@ -3358,7 +3360,12 @@ async function fetchAccountDeletionStorageAssets(client, assetIds) {
         deleted_at,
         owner_cliente_id,
         owner_user_id,
-        entity_id
+        entity_id,
+        scope_key,
+        entity_type,
+        visibility,
+        id_sucursal,
+        public_url
       FROM public.storage_assets
       WHERE id_asset = ANY($1::uuid[])
       FOR UPDATE
@@ -5641,22 +5648,9 @@ export async function executeApprovedInternalAccountDeletionInternal(client, {
   }
 
   const employeeIds = dependencies.employee_ids || [];
-  const storageResult = await client.query(
-    `
-      SELECT COALESCE(array_agg(DISTINCT sa.id_asset ORDER BY sa.id_asset), ARRAY[]::uuid[]) AS asset_ids
-      FROM public.storage_assets sa
-      LEFT JOIN public.personas p ON p.id_persona = $1::uuid
-      WHERE sa.deleted_at IS NULL
-        AND sa.status <> 'eliminado'
-        AND (
-          sa.owner_user_id = $2::uuid
-          OR sa.entity_id = ANY($3::uuid[])
-          OR sa.id_asset = p.foto_perfil_asset_id
-        )
-    `,
-    [row.id_persona, row.id_usuario, [row.id_persona, row.id_usuario, ...employeeIds]]
-  );
-  const storageAssetIds = storageResult.rows?.[0]?.asset_ids || [];
+  // AM: Capturar solo relaciones verificables; el cargador no acredita propiedad.
+  const storageAssets = await selectApprovedInternalAccountDeletionStorageAssets(client, row, employeeIds);
+  const storageAssetIds = storageAssets.map((asset) => asset.id_asset);
 
   await client.query(
     `
@@ -5837,7 +5831,8 @@ export async function anonymizeApprovedInternalAccountDeletion(client, {
   const impact = normalizeJsonObject(row.resumen_impacto, {});
   const internalExecution = normalizeJsonObject(impact.internal_execution, {}) || {};
   const storageAssetIds = Array.isArray(internalExecution.storage_asset_ids) ? internalExecution.storage_asset_ids : [];
-  const nextState = storageAssetIds.length > 0 ? "storage_pendiente" : "auth_pendiente";
+  // AM: Tambien el snapshot vacio debe revalidarse en Storage antes de avanzar a Auth.
+  const nextState = "storage_pendiente";
   const summary = mergeAdminInternalSummary(row.resumen_impacto, "internal_anonymization", {
     processed_at: new Date().toISOString(),
     pii_anonymized: true,
@@ -5876,63 +5871,309 @@ export async function runApprovedInternalAccountDeletionAnonymization(app, {
   }));
 }
 
+// AM: Solo los retratos laborales vinculados tienen propiedad demostrable en este flujo.
+function internalStorageOwnershipError(assetIds = []) {
+  return new AppError(409, "No se pudo verificar la propiedad exclusiva de los archivos. Requiere revision administrativa.", {
+    code: "ADMIN_ACCOUNT_DELETION_STORAGE_OWNERSHIP_AMBIGUOUS",
+    details: { asset_ids: assetIds },
+  });
+}
+
+// AM: Resolver URLs heredadas solo si contienen una ubicacion Storage explicita.
+function internalStorageUrlLocation(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    const match = url.pathname.match(/^\/storage\/v1\/object\/(?:public|sign|authenticated)\/([^/]+)\/(.+)$/);
+    return match ? { bucket: decodeURIComponent(match[1]), path: decodeURIComponent(match[2]) } : null;
+  } catch {
+    return null;
+  }
+}
+
+// AM: Comparar referencias resueltas por asset o bucket/ruta, sin equiparar buckets distintos.
+async function assertInternalStorageReferences(client, row, asset) {
+  const { rows } = await client.query(`
+    -- AM: Los JOIN aportan el bucket que las referencias por UUID no almacenan directamente.
+    SELECT p.id_persona AS reference_persona_id, p.foto_perfil_asset_id AS reference_asset_id,
+      p.foto_perfil_path AS reference_path, NULL::text AS reference_url,
+      linked.bucket_name AS reference_bucket, linked.object_path AS resolved_path
+    FROM public.personas p LEFT JOIN public.storage_assets linked ON linked.id_asset = p.foto_perfil_asset_id
+    WHERE p.foto_perfil_asset_id = $1::uuid OR p.foto_perfil_path = $2::text
+      OR (linked.bucket_name = $3::text AND linked.object_path = $2::text)
+    UNION ALL
+    SELECT NULL::uuid, ref.asset_id, ref.path, ref.url, linked.bucket_name, linked.object_path
+    FROM public.promociones p
+    CROSS JOIN LATERAL (VALUES
+      (p.imagen_principal_asset_id, p.imagen_principal_path, p.imagen_principal_url),
+      (p.imagen_mobile_asset_id, p.imagen_mobile_path, p.imagen_mobile_url)
+    ) ref(asset_id, path, url)
+    LEFT JOIN public.storage_assets linked ON linked.id_asset = ref.asset_id
+    WHERE ref.asset_id = $1::uuid OR ref.path = $2::text
+      OR (linked.bucket_name = $3::text AND linked.object_path = $2::text)
+      -- AM: Resolver tambien URLs codificadas; no filtrarlas por una ruta sin codificar.
+      OR ref.url = $4::text OR ref.url IS NOT NULL
+  `, [asset.id_asset, asset.object_path, asset.bucket_name, asset.public_url || null]);
+  for (const reference of rows) {
+    const linked = reference.reference_asset_id && reference.reference_bucket && reference.resolved_path
+      ? { bucket: reference.reference_bucket, path: reference.resolved_path } : null;
+    const url = internalStorageUrlLocation(reference.reference_url);
+    const matches = location => location?.bucket === asset.bucket_name && location?.path === asset.object_path;
+    const idMatches = reference.reference_asset_id === asset.id_asset;
+    const pathMatches = reference.reference_path === asset.object_path;
+    const urlMatches = matches(url) || Boolean(asset.public_url && reference.reference_url === asset.public_url);
+    // AM: UUID inexistente o datos que se contradicen nunca autorizan una inferencia por ruta.
+    if ((reference.reference_asset_id && !linked && (idMatches || pathMatches || urlMatches))
+      || (linked && reference.reference_path && reference.reference_path !== linked.path && (idMatches || pathMatches || matches(linked)))
+      || (linked && url && (linked.bucket !== url.bucket || linked.path !== url.path) && (pathMatches || idMatches || urlMatches))) {
+      throw internalStorageOwnershipError([asset.id_asset]);
+    }
+    if (linked && !matches(linked) && !urlMatches) continue;
+    if (!linked && url && !matches(url) && !urlMatches) {
+      if (pathMatches && reference.reference_path !== url.path) throw internalStorageOwnershipError([asset.id_asset]);
+      continue;
+    }
+    if (!idMatches && !matches(linked) && !urlMatches && !pathMatches) continue;
+    const ownPhoto = reference.reference_persona_id === row.id_persona;
+    if (!ownPhoto) throw internalStorageOwnershipError([asset.id_asset]);
+    if (!linked && !url) {
+      // AM: Una ruta sola solo se acepta para la foto propia si existe en un unico bucket.
+      const ambiguity = await client.query(`
+        SELECT COUNT(DISTINCT bucket_name) <> 1 AS path_ambiguous
+        FROM (
+          SELECT bucket_name FROM public.storage_assets WHERE object_path = $1::text
+          UNION SELECT bucket_id FROM storage.objects WHERE name = $1::text
+        ) locations
+      `, [asset.object_path]);
+      if (ambiguity.rows?.[0]?.path_ambiguous !== false) throw internalStorageOwnershipError([asset.id_asset]);
+    }
+  }
+}
+
+// AM: Revalidar referencias actuales, incluso para assets marcados eliminados anteriormente.
+async function validateInternalStorageAssets(client, row, assets, employeeIds) {
+  const scope = getStorageScope("public_barber_profile");
+  for (const asset of assets) {
+    assertStorageAssetLocation(asset);
+    const parts = String(asset.object_path).split("/");
+    // AM: storagePath.js define prefix/sucursal/UUID/YYYY/MM/variant/filename.
+    if (asset.scope_key !== scope.key || asset.entity_type !== scope.entityType
+      || asset.bucket_name !== scope.bucket || asset.visibility !== scope.visibility
+      || !isValidUuid(asset.id_sucursal) || parts.length !== 7
+      || parts[0] !== scope.prefix || parts[1] !== "sucursal" || parts[2] !== asset.id_sucursal
+      || !/^\d{4}$/.test(parts[3]) || !/^(0[1-9]|1[0-2])$/.test(parts[4]) || parts[5] !== scope.variant
+      || !/^\d+-[a-z0-9]+(?:-[a-z0-9]+)*-[a-f0-9]{6}\.(jpg|png|webp)$/.test(parts[6])
+      || asset.owner_cliente_id || !employeeIds.includes(String(asset.entity_id))) {
+      throw internalStorageOwnershipError([asset.id_asset]);
+    }
+    const { rows } = await client.query(`
+      -- AM: Conservar la pertenencia Empleado/Persona/sucursal y el rechazo a Clientes.
+      SELECT EXISTS (
+        SELECT 1 FROM public.empleados e WHERE e.id_empleado = $3::uuid
+          AND e.id_persona = $2::uuid AND e.id_sucursal = $5::uuid
+      ) AS employee_matches,
+      (EXISTS (SELECT 1 FROM public.clientes c WHERE c.id_persona = $2::uuid)
+       OR EXISTS (SELECT 1 FROM public.storage_assets sa WHERE sa.id_asset <> $1::uuid
+         AND sa.bucket_name = $6::text AND sa.object_path = $4::text)) AS shared_reference
+    `, [asset.id_asset, row.id_persona, asset.entity_id, asset.object_path,
+      asset.id_sucursal, asset.bucket_name]);
+    if (rows?.[0]?.employee_matches !== true || rows?.[0]?.shared_reference !== false) {
+      throw internalStorageOwnershipError([asset.id_asset]);
+    }
+    await assertInternalStorageReferences(client, row, asset);
+  }
+}
+
+// AM: La coincidencia de uploader solo detecta temporales ambiguos; nunca autoriza borrado.
+export async function selectApprovedInternalAccountDeletionStorageAssets(client, row, employeeIds) {
+  const { rows } = await client.query(`
+    -- AM: Incluir la foto por referencia/ruta permite detectar metadatos contradictorios.
+    SELECT sa.* FROM public.storage_assets sa
+    WHERE sa.entity_id = ANY($3::uuid[])
+      OR EXISTS (SELECT 1 FROM public.personas p WHERE p.id_persona = $1::uuid
+        AND (p.foto_perfil_asset_id = sa.id_asset
+          OR (p.foto_perfil_asset_id IS NULL AND p.foto_perfil_path = sa.object_path)))
+      OR (sa.entity_id IS NULL AND sa.scope_key = 'public_barber_profile'
+        AND sa.owner_user_id = $2::uuid AND sa.status <> 'eliminado')
+    ORDER BY sa.id_asset FOR UPDATE OF sa
+  `, [row.id_persona, row.id_usuario, [row.id_persona, row.id_usuario, ...employeeIds]]);
+  const legacy = await client.query(`
+    -- AM: El UUID resuelve bucket/ruta; sin UUID, varias ubicaciones son ambiguas.
+    SELECT EXISTS (SELECT 1 FROM public.personas p WHERE p.id_persona = $1::uuid
+      AND ((p.foto_perfil_asset_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM public.storage_assets sa WHERE sa.id_asset = p.foto_perfil_asset_id))
+      OR (p.foto_perfil_asset_id IS NULL AND NULLIF(p.foto_perfil_path, '') IS NOT NULL
+        AND ((SELECT COUNT(*) FROM public.storage_assets sa WHERE sa.object_path = p.foto_perfil_path) <> 1
+          OR (SELECT COUNT(DISTINCT bucket_name) FROM (
+            SELECT sa.bucket_name FROM public.storage_assets sa WHERE sa.object_path = p.foto_perfil_path
+            UNION SELECT o.bucket_id FROM storage.objects o WHERE o.name = p.foto_perfil_path
+          ) locations) <> 1)))) AS unresolved_photo
+  `, [row.id_persona]);
+  if (legacy.rows?.[0]?.unresolved_photo !== false) throw internalStorageOwnershipError();
+  await validateInternalStorageAssets(client, row, rows, employeeIds.map(String));
+  return rows;
+}
+
+// AM: Conservar los identificadores capturados y rechazar snapshots incompletos o manipulados.
 async function loadInternalStorageRequest(client, deletionRequestId) {
-  const row = await loadApprovedInternalExecutionRequest(client, deletionRequestId, "storage_pendiente");
+  const row = await loadApprovedInternalExecutionRequest(client, deletionRequestId);
   const impact = normalizeJsonObject(row.resumen_impacto, {});
-  const internal = normalizeJsonObject(impact.internal_anonymization, {}) || normalizeJsonObject(impact.internal_execution, {}) || {};
-  const assetIds = Array.isArray(internal.storage_asset_ids) ? internal.storage_asset_ids : [];
+  const internal = impact.internal_anonymization ?? impact.internal_execution;
+  const assetIds = internal?.storage_asset_ids;
+  if (!Array.isArray(assetIds) || assetIds.some((id) => !isValidUuid(id))
+    || new Set(assetIds.map((id) => id.toLowerCase())).size !== assetIds.length) {
+    throw internalStorageOwnershipError();
+  }
   return { row, assetIds };
 }
 
+// AM: Sin prueba de ausencia actual no se modifica el estado ni el objeto de otra identidad.
 export async function finalizeApprovedInternalAccountDeletionStorage(client, {
   deletionRequestId,
   traceRequestId,
 } = {}) {
   const { row, assetIds } = await loadInternalStorageRequest(client, deletionRequestId);
-  await client.query(
-    `
-      UPDATE public.storage_assets
-      SET status = 'eliminado',
-          public_url = NULL,
-          deleted_at = COALESCE(deleted_at, NOW()),
-          updated_at = NOW()
-      WHERE id_asset = ANY($1::uuid[])
-    `,
-    [assetIds]
-  );
+  if (row.estado_codigo !== "storage_pendiente") {
+    throw new AppError(409, "La solicitud no esta pendiente de limpieza de archivos.", {
+      code: "ADMIN_ACCOUNT_DELETION_STORAGE_STATE_INVALID",
+    });
+  }
+  const assets = await fetchAccountDeletionStorageAssets(client, assetIds);
+  const employeeIds = await loadEmployeeIdsForPerson(client, row.id_persona);
+  await validateInternalStorageAssets(client, row, assets, employeeIds.map(String));
+  // AM: Un archivo aparecido durante Storage no puede quedar fuera al avanzar a Auth.
+  const current = await selectApprovedInternalAccountDeletionStorageAssets(client, row, employeeIds);
+  if (current.some((asset) => !assetIds.includes(asset.id_asset))) {
+    throw internalStorageOwnershipError(current.map((asset) => asset.id_asset));
+  }
+  const absent = [];
+  for (const asset of assets) {
+    if (await isStorageObjectAbsent(client, asset.bucket_name, asset.object_path)) absent.push(asset.id_asset);
+  }
+  // AM: Un fallo parcial conserva rutas, pertenencia y snapshot para reintentar.
+  if (absent.length) await client.query(`
+    UPDATE public.storage_assets SET status = 'eliminado', public_url = NULL,
+      deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW()
+    WHERE id_asset = ANY($1::uuid[])
+  `, [absent]);
+  const processed = absent.length === assets.length;
   const summary = mergeAdminInternalSummary(row.resumen_impacto, "storage_cleanup", {
-    processed_at: new Date().toISOString(),
-    storage_processed: true,
-    asset_count: assetIds.length,
+    storage_processed: processed, asset_count: assetIds.length,
+    verified_absent_asset_ids: absent, pending_asset_ids: assetIds.filter((id) => !absent.includes(id)),
+    last_attempt_at: new Date().toISOString(),
   });
-  const updated = await client.query(
-    `
-      UPDATE app_private.solicitudes_eliminacion_cuenta
-      SET estado_codigo = 'auth_pendiente',
-          resumen_impacto = $2::jsonb,
-          error_codigo = NULL,
-          error_detalle_tecnico = NULL,
-          request_id = $3::text,
-          updated_at = NOW()
-      WHERE id_solicitud = $1::uuid
-      RETURNING id_solicitud, referencia_publica, estado_codigo
-    `,
-    [row.id_solicitud, JSON.stringify(summary), traceRequestId]
-  );
-  return {
-    storage_processed: true,
-    request: updated.rows?.[0],
-  };
+  const updated = await client.query(`
+    -- AM: Solo todas las ausencias verificadas permiten avanzar a Auth.
+    UPDATE app_private.solicitudes_eliminacion_cuenta
+    SET estado_codigo = $2::text, resumen_impacto = $3::jsonb, error_codigo = $4::text,
+      error_detalle_tecnico = NULL, request_id = $5::text, updated_at = NOW()
+    WHERE id_solicitud = $1::uuid RETURNING id_solicitud, referencia_publica, estado_codigo
+  `, [row.id_solicitud, processed ? "auth_pendiente" : "storage_pendiente", JSON.stringify(summary),
+    processed ? null : "ADMIN_ACCOUNT_DELETION_STORAGE_INCOMPLETE", traceRequestId]);
+  return { storage_processed: processed, request: updated.rows?.[0] };
 }
 
+// AM: Serializar por identidad sin mantener transacciones abiertas durante Storage.
 export async function runApprovedInternalAccountDeletionStorageCleanup(app, {
   deletionRequestId,
   traceRequestId,
 } = {}) {
-  return withAdminAccountDeletionTransaction(app, (client) => finalizeApprovedInternalAccountDeletionStorage(client, {
-    deletionRequestId,
-    traceRequestId,
-  }));
+  const client = await app.db.connect();
+  let lockUserId;
+  let transactionStarted = false;
+  let discardConnection;
+  // AM: Una respuesta perdida de COMMIT exige reconciliar el estado persistido.
+  let commitPending = false;
+  try {
+    const context = await loadAdminRequestBase(client, deletionRequestId);
+    if (!context?.id_usuario) throw internalStorageOwnershipError();
+    await acquireAccountDeletionSessionLock(client, context.id_usuario);
+    lockUserId = context.id_usuario;
+    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    transactionStarted = true;
+    const { row, assetIds } = await loadInternalStorageRequest(client, deletionRequestId);
+    if (["auth_pendiente", "completada"].includes(row.estado_codigo)) {
+      commitPending = true;
+      await client.query("COMMIT");
+      commitPending = false;
+      transactionStarted = false;
+      return { storage_processed: true, idempotent_replay: true };
+    }
+    if (row.estado_codigo !== "storage_pendiente" || row.id_usuario !== lockUserId
+      || row.usuario_estado !== false || row.estado_acceso !== "inactivo" || !row.usuario_deleted_at) {
+      throw internalStorageOwnershipError(assetIds);
+    }
+    const employeeIds = await loadEmployeeIdsForPerson(client, row.id_persona);
+    const assets = await fetchAccountDeletionStorageAssets(client, assetIds);
+    await validateInternalStorageAssets(client, row, assets, employeeIds.map(String));
+    // AM: Detectar nuevas relaciones propias o ambiguas antes de cualquier llamada externa.
+    const current = await selectApprovedInternalAccountDeletionStorageAssets(client, row, employeeIds);
+    if (current.some((asset) => !assetIds.includes(asset.id_asset))) {
+      throw internalStorageOwnershipError(current.map((asset) => asset.id_asset));
+    }
+    // AM: El marcador protege tambien frente a escritores genericos de estado.
+    if (assetIds.length) await client.query(`
+      UPDATE public.storage_assets SET status = 'fallido', updated_at = NOW(),
+        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+          'account_deletion_storage', jsonb_build_object('request_id', $2::text, 'status', 'quarantined'))
+      WHERE id_asset = ANY($1::uuid[]) AND status <> 'eliminado'
+    `, [assetIds, deletionRequestId]);
+    commitPending = true;
+    await client.query("COMMIT");
+    commitPending = false;
+    transactionStarted = false;
+    if (assets.length) assertAccountDeletionStorageAvailable(app);
+    for (const asset of assets) {
+      // AM: Revalidar pertenencia antes de cada intento, tambien tras respuesta perdida.
+      await validateInternalStorageAssets(client, row, [asset], employeeIds.map(String));
+      const verifiedAsset = { ...asset, status: "fallido", deleted_at: null };
+      try {
+        await processAccountDeletionStorageAsset(app, client, verifiedAsset);
+      } catch {
+        // AM: Incluso si remove lanza tras borrar, la ausencia decide el resultado final.
+      }
+    }
+    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    transactionStarted = true;
+    const result = await finalizeApprovedInternalAccountDeletionStorage(client, { deletionRequestId, traceRequestId });
+    commitPending = true;
+    await client.query("COMMIT");
+    commitPending = false;
+    transactionStarted = false;
+    return result;
+  } catch (error) {
+    if (transactionStarted) {
+      try { await client.query("ROLLBACK"); } catch { discardConnection = true; }
+    }
+    if (discardConnection) throw new AppError(503, "No fue posible confirmar la limpieza de archivos. Reintenta.", {
+      code: "ADMIN_ACCOUNT_DELETION_STORAGE_TEMPORARY_FAILURE",
+    });
+    if (commitPending) {
+      // AM: Nunca devolver fracaso ni retroceder una etapa cuyo COMMIT si fue confirmado en BD.
+      const recovered = await loadInternalStorageRequest(client, deletionRequestId);
+      if (["auth_pendiente", "completada"].includes(recovered.row.estado_codigo)
+        && recovered.row.resumen_impacto?.storage_cleanup?.storage_processed === true) {
+        return { storage_processed: true, idempotent_replay: true };
+      }
+    }
+    // AM: Evidencia funcional sin rutas, errores tecnicos ni avance de estado.
+    const code = error instanceof AppError && error.statusCode === 409
+      ? error.code : "ADMIN_ACCOUNT_DELETION_STORAGE_TEMPORARY_FAILURE";
+    await client.query(`
+      UPDATE app_private.solicitudes_eliminacion_cuenta
+      SET error_codigo = $2::text, error_detalle_tecnico = NULL, request_id = $3::text,
+        resumen_impacto = jsonb_set(COALESCE(resumen_impacto, '{}'::jsonb), '{storage_cleanup}', $4::jsonb),
+        updated_at = NOW()
+      WHERE id_solicitud = $1::uuid AND estado_codigo = 'storage_pendiente'
+    `, [deletionRequestId, code, traceRequestId, JSON.stringify({ storage_processed: false,
+      blocked_asset_ids: error instanceof AppError ? error.details?.asset_ids || [] : [], error_code: code })]);
+    return { storage_processed: false };
+  } finally {
+    if (lockUserId) {
+      try { await releaseAccountDeletionSessionLock(client, lockUserId); } catch { discardConnection = true; }
+    }
+    client.release(discardConnection ? new Error("AM: Storage cleanup connection discarded") : undefined);
+  }
 }
 
 export async function finalizeApprovedInternalAccountDeletionAuthCleanup(client, {

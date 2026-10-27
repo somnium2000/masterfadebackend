@@ -882,12 +882,15 @@ export async function validateAssetReplacement(client, {
   }
   let barberContext = null;
   if (hasContext) {
-    if (scopeKey !== "public_barber_profile" || entityType !== "barbero") {
+    // AM: Promociones admite contexto estricto, conservando permisos normales sin excepcion transversal.
+    const promotionContext = ["public_promotion_main", "public_promotion_mobile"].includes(scopeKey)
+      && entityType === "promocion";
+    if (!promotionContext && (scopeKey !== "public_barber_profile" || entityType !== "barbero")) {
       throw new AppError(403, "El contexto no permite una excepcion transversal de Storage", {
         code: "STORAGE_REPLACEMENT_CONTEXT_FORBIDDEN",
       });
     }
-    barberContext = await assertBarberProfileContext(client, { claims, entityId, idSucursal });
+    if (!promotionContext) barberContext = await assertBarberProfileContext(client, { claims, entityId, idSucursal });
   }
   if (claims) {
     assertContextualAssetAccess(claims, previous, barberContext ? {

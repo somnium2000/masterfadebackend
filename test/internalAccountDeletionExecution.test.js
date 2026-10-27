@@ -82,17 +82,11 @@ test("usuario interno no se elimina", () => assert.doesNotMatch("UPDATE public.u
 test("persona queda Empleado eliminado", () => assert.equal("Empleado eliminado", "Empleado eliminado"));
 test("DNI y telefono quedan nulos", () => assert.equal(null, null));
 test("correos tombstone", () => assert.match("abc@anon.masterfade.invalid", /@anon\.masterfade\.invalid$/));
-test("storage IDs se capturan antes de separar foto", () => assert.equal(["asset"].length, 1));
-test("assets de otro usuario no se capturan", () => assert.equal(false, false));
 test("bitacoras se redactan", () => assert.equal(null, null));
 test("seguridad se sanea", () => assert.equal(null, null));
 test("historial laboral se conserva", () => assert.equal("fecha_ingreso", "fecha_ingreso"));
 test("salario historico se conserva", () => assert.equal("salario_base", "salario_base"));
 test("citas historicas conservan empleado", () => assert.equal("id_empleado_barbero", "id_empleado_barbero"));
-test("con activos pasa a storage_pendiente", () => assert.equal("storage_pendiente", "storage_pendiente"));
-test("sin activos pasa a auth_pendiente", () => assert.equal("auth_pendiente", "auth_pendiente"));
-test("storage personal valida pertenencia", () => assert.equal(true, true));
-test("storage personal es idempotente", () => assert.equal(true, true));
 test("auth personal usa hard delete", () => assert.equal(false, false));
 test("auth ya ausente es exito", () => assert.equal(true, true));
 test("exito pasa a completada", () => assert.equal("completada", "completada"));
@@ -103,13 +97,10 @@ test("replay completado", async () => {
   assert.equal(result.completed, true);
 });
 
-test("fallo Storage reintentable", () => assert.equal("storage_pendiente", "storage_pendiente"));
 test("fallo Auth reintentable", () => assert.equal("auth_pendiente", "auth_pendiente"));
 test("no se restaura la identidad", () => assert.equal(false, false));
 test("admin retry personal funciona", () => assert.equal(true, true));
 test("admin retry cliente funciona", () => assert.equal(true, true));
 test("admin no inicia cliente desde evaluada", () => assert.equal(false, false));
 test("limite de orquestacion", () => assert.equal(6, 6));
-test("advisory locks liberados", () => assert.equal(true, true));
 test("rollback no deja cambios parciales", () => assert.equal(true, true));
-test("auth y storage no se llaman dentro de transaccion prolongada", () => assert.equal(true, true));

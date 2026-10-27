@@ -2,9 +2,15 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import {
   activateAssetForEntity,
-  replaceAssetIfNeeded,
+  removeStorageObjectBestEffort,
+  validateAssetReplacement,
   resolveAssetForBinding,
 } from "../../../services/storage/storageService.js";
+
+// AM: Obtener bucket, scope y visibilidad desde el registro existente.
+import { getStorageScope } from "../../../services/storage/storageScopes.js";
+// AM: Reclamar el estado antes de retirar una imagen sustituida.
+import { markAssetStatus } from "../../../services/storage/storageAssetsRepo.js";
 
 const CONFIG_COMMUNICATION_ALLOWED_ROLES = ["super_admin", "admin"];
 const requestIdSchema = { type: "string" };
@@ -105,6 +111,170 @@ const COMMUNICATION_EMAIL_FROM_ADDRESS =
 const COMMUNICATION_EMAIL_BANNER_URL = String(process.env.COMMUNICATION_EMAIL_BANNER_URL || "").trim();
 const STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN = "public_promotion_main";
 const STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE = "public_promotion_mobile";
+
+// AM: Solo HTTPS; una referencia al proyecto local nunca se trata como URL externa.
+function parsePromotionImageUrl(app, value) {
+  if (!value) return { url: null, location: null, base: null };
+  let url;
+  try { url = new URL(value); } catch { throw promotionImageError(); }
+  if (url.protocol !== "https:" || url.username || url.password) throw promotionImageError();
+  const configured = app.supabaseAdmin?.supabaseUrl || app.supabase?.supabaseUrl || process.env.SUPABASE_URL;
+  let base;
+  try { base = configured ? new URL(configured) : null; } catch { throw promotionImageError(); }
+  if (!base) {
+    if (url.pathname.startsWith("/storage/v1/")) throw promotionImageError();
+    return { url: value, location: null, base: null };
+  }
+  const match = url.pathname.match(/^\/storage\/v1\/(?:object\/(?:public|sign|authenticated)|render\/image\/public)\/([^/]+)\/(.+)$/);
+  if (!match) {
+    if (url.origin === base.origin) throw promotionImageError();
+    return { url: value, location: null, candidateLocation: null, base };
+  }
+  let bucket, path;
+  try { bucket = decodeURIComponent(match[1]); path = decodeURIComponent(match[2]); } catch { throw promotionImageError(); }
+  if (!bucket || bucket.includes("/") || !path || path.startsWith("/") || path.includes("\\")
+    || path.split("/").some(part => !part || part === "." || part === "..")) throw promotionImageError();
+  // AM: Una ruta sintacticamente valida en otro origen no demuestra equivalencia entre proyectos.
+  const candidateLocation = { bucket, path };
+  return { url: value, location: url.origin === base.origin ? candidateLocation : null, candidateLocation, base };
+}
+
+// AM: Error funcional sin rutas, tokens ni detalles de la identidad propietaria.
+function promotionImageError() {
+  return new AppError(409, "La imagen no esta disponible para esta promocion. Selecciona otra imagen.", {
+    code: "CONFIG_PROMOTION_IMAGE_UNAVAILABLE",
+  });
+}
+
+// AM: Las referencias historicas de otras identidades nunca se reasignan ni se eliminan.
+async function assertPromotionImageNotShared(client, app, asset, promotionId) {
+  const shared = await client.query(`
+    SELECT (EXISTS (SELECT 1 FROM public.personas p
+      WHERE p.foto_perfil_asset_id = $1::uuid OR (p.foto_perfil_asset_id IS NULL AND p.foto_perfil_path = $2::text))
+      OR EXISTS (SELECT 1 FROM public.promociones p WHERE ($3::uuid IS NULL OR p.id_promocion <> $3::uuid)
+        AND (p.imagen_principal_asset_id = $1::uuid OR p.imagen_mobile_asset_id = $1::uuid
+          OR (p.imagen_principal_asset_id IS NULL AND p.imagen_principal_path = $2::text)
+          OR (p.imagen_mobile_asset_id IS NULL AND p.imagen_mobile_path = $2::text)))) AS image_shared
+  `, [asset.id_asset, asset.object_path, promotionId]);
+  if (shared.rows?.[0]?.image_shared !== false) throw promotionImageError();
+  const references = await client.query(`
+    -- AM: Incluir URLs heredadas sin asset_id, tambien enlaces firmados o codificados.
+    SELECT id_promocion AS image_reference_id, imagen_principal_url, imagen_mobile_url
+    FROM public.promociones WHERE ($1::uuid IS NULL OR id_promocion <> $1::uuid)
+      AND (imagen_principal_url IS NOT NULL OR imagen_mobile_url IS NOT NULL)
+  `, [promotionId]);
+  for (const reference of references.rows) {
+    for (const value of [reference.imagen_principal_url, reference.imagen_mobile_url].filter(Boolean)) {
+      let parsed;
+      try { parsed = parsePromotionImageUrl(app, value); } catch { parsed = null; }
+      if ((asset.public_url && value === asset.public_url)
+        || (parsed?.location?.bucket === asset.bucket_name && parsed.location.path === asset.object_path)
+        // AM: Una coincidencia de ruta en otro origen es ambigua para borrar, no prueba de equivalencia.
+        || (parsed?.candidateLocation?.bucket === asset.bucket_name && parsed.candidateLocation.path === asset.object_path)) {
+        throw promotionImageError();
+      }
+    }
+  }
+}
+
+// AM: El llamador ya inicio la transaccion; el bloqueo dura hasta persistir y confirmar la promocion.
+async function resolvePromotionImage(client, app, { assetId, url, scopeKey, promotionId, branchId, claims, preserveExternalUrl = false }) {
+  const parsed = parsePromotionImageUrl(app, url);
+  // AM: public_url es procedencia registrada, no una lista de dominios de confianza.
+  const registered = parsed.url ? await client.query(`
+    SELECT * FROM public.storage_assets WHERE public_url = $1::text ORDER BY id_asset FOR UPDATE
+  `, [parsed.url]) : { rows: [] };
+  if (registered.rows.length > 1) throw promotionImageError();
+  const exact = registered.rows[0];
+  if (exact && assetId && exact.id_asset !== assetId) throw promotionImageError();
+  if (!exact && !assetId && !parsed.location) return { asset: null, url: parsed.url, path: null };
+  const result = exact ? { rows: [exact] } : assetId ? await client.query(`
+    -- AM: No confiar en el estado observado fuera de la transaccion.
+    SELECT * FROM public.storage_assets WHERE id_asset = $1::uuid FOR UPDATE
+  `, [assetId]) : await client.query(`
+    -- AM: La URL interna identifica bucket y ruta, nunca solamente la ruta.
+    SELECT * FROM public.storage_assets WHERE bucket_name = $1::text AND object_path = $2::text FOR UPDATE
+  `, [parsed.location.bucket, parsed.location.path]);
+  if (result.rows.length !== 1) throw promotionImageError();
+  const asset = result.rows[0], scope = getStorageScope(scopeKey);
+  const candidate = parsed.location || parsed.candidateLocation;
+  // AM: El UUID por si solo tampoco autoriza migrar una public_url historica a otro origen.
+  const provenance = asset.public_url ? parsePromotionImageUrl(app, asset.public_url) : null;
+  const provenanceLocation = provenance?.location || provenance?.candidateLocation;
+  if (provenanceLocation && (provenanceLocation.bucket !== asset.bucket_name || provenanceLocation.path !== asset.object_path)) throw promotionImageError();
+  const unverifiedOrigin = Boolean((exact && !parsed.location) || (provenance && !provenance.location));
+  // AM: UUID mas URL Storage ajena no registrada es contradictorio aunque coincidan bucket y ruta.
+  if ((!exact && parsed.candidateLocation && !parsed.location)
+    || (candidate && (candidate.bucket !== asset.bucket_name || candidate.path !== asset.object_path))) throw promotionImageError();
+  const owners = [asset.owner_user_id, asset.uploaded_by].filter(Boolean);
+  if (asset.deleted_at || !["temporal", "activo"].includes(asset.status) || Object.prototype.hasOwnProperty.call(asset.metadata || {}, "account_deletion_storage")
+    || asset.scope_key !== scope.key || asset.entity_type !== scope.entityType || asset.bucket_name !== scope.bucket
+    || asset.visibility !== scope.visibility || asset.id_sucursal !== branchId || asset.owner_cliente_id
+    || (asset.entity_id && asset.entity_id !== promotionId)
+    || (!asset.entity_id && (!owners.length || owners.some(owner => owner !== claims?.user?.id_usuario)))
+    || (parsed.location && (parsed.location.bucket !== asset.bucket_name || parsed.location.path !== asset.object_path))) {
+    throw promotionImageError();
+  }
+  // AM: No construir enlaces que interpreten una ruta registrada como navegacion o como otro scope.
+  if (typeof asset.object_path !== "string" || !asset.object_path.startsWith(`${scope.prefix}/`)
+    || asset.object_path.includes("\\") || asset.object_path.split("/").some(part => !part || part === "." || part === "..")) {
+    throw promotionImageError();
+  }
+  if (unverifiedOrigin) {
+    // AM: Conservar solamente una referencia existente; nunca apropiarse ni migrar el objeto ajeno.
+    if (!preserveExternalUrl || !promotionId || asset.entity_id !== promotionId || parsed.url !== asset.public_url) throw promotionImageError();
+    const physical = await client.query(`
+      SELECT EXISTS (SELECT 1 FROM storage.objects WHERE bucket_id = $1::text AND name = $2::text) AS image_object_exists
+    `, [asset.bucket_name, asset.object_path]);
+    if (physical.rows?.[0]?.image_object_exists !== true) throw promotionImageError();
+  }
+  await assertPromotionImageNotShared(client, app, asset, promotionId);
+  await resolveAssetForBinding(client, { assetId: asset.id_asset, scopeKey, entityType: "promocion",
+    entityId: promotionId, idSucursal: branchId, claims, allowUnboundEntity: true, allowedStatuses: ["temporal", "activo"] });
+  // AM: El origen historico no verificado no se canonicaliza ni modifica la propiedad del asset.
+  if (unverifiedOrigin) return { asset, url: parsed.url, path: asset.object_path, retainOnly: true };
+  // AM: Persistir URL publica canonica, sin tokens temporales de enlaces firmados.
+  const configured = app.supabaseAdmin?.supabaseUrl || app.supabase?.supabaseUrl || process.env.SUPABASE_URL;
+  let base;
+  try { base = new URL(configured); } catch { throw promotionImageError(); }
+  const canonical = `${base.origin}/storage/v1/object/public/${encodeURIComponent(asset.bucket_name)}/${asset.object_path.split("/").map(encodeURIComponent).join("/")}`;
+  // AM: Un PATCH no sustituye una URL externa historica que no cambio efectivamente.
+  return { asset, url: preserveExternalUrl && parsed.url && !parsed.location ? parsed.url : canonical, path: asset.object_path };
+}
+
+// AM: La limpieza posterior al COMMIT nunca elimina una imagen ajena ni convierte exito en fracaso.
+async function cleanupPromotionImage(app, client, request, previousAssetId, nextAssetId, scopeKey, branchId) {
+  if (!previousAssetId || previousAssetId === nextAssetId) return;
+  let transactionStarted = false;
+  try {
+    // AM: Reclamar la imagen antigua bajo lock evita borrarla si otro PATCH acaba de reutilizarla.
+    await client.query("BEGIN");
+    transactionStarted = true;
+    const previous = await client.query("SELECT * FROM public.storage_assets WHERE id_asset = $1::uuid FOR UPDATE", [previousAssetId]);
+    const asset = previous.rows[0];
+    if (!asset || asset.deleted_at || !["activo", "temporal"].includes(asset.status) || Object.prototype.hasOwnProperty.call(asset.metadata || {}, "account_deletion_storage")) {
+      throw promotionImageError();
+    }
+    // AM: Una public_url de origen desconocido impide cualquier retirada fisica automatica.
+    if (asset.public_url) {
+      const provenance = parsePromotionImageUrl(app, asset.public_url);
+      if (!provenance.location || provenance.location.bucket !== asset.bucket_name || provenance.location.path !== asset.object_path) throw promotionImageError();
+    }
+    // AM: Incluir la propia promocion: otro escritor puede haber restaurado esta imagen tras nuestro COMMIT.
+    await assertPromotionImageNotShared(client, app, asset, null);
+    await validateAssetReplacement(client, { previousAssetId, nextAssetId, scopeKey, entityType: "promocion",
+      entityId: request.params.id, idSucursal: branchId, claims: request.claims, asset });
+    await markAssetStatus(client, { idAsset: previousAssetId, status: "reemplazado",
+      metadata: { replaced_by_asset_id: nextAssetId || null, replaced_at: new Date().toISOString() } });
+    await client.query("COMMIT");
+    transactionStarted = false;
+    // AM: La retirada fisica queda fuera de la transaccion; reemplazado ya impide nuevas vinculaciones.
+    await removeStorageObjectBestEffort(app, asset.bucket_name, asset.object_path);
+  } catch {
+    if (transactionStarted) await client.query("ROLLBACK").catch(() => {});
+    request.log.warn({ requestId: request.id, code: "CONFIG_PROMOTION_IMAGE_CLEANUP_PENDING" }, "Limpieza de imagen pendiente de revision");
+  }
+}
 
 const promotionParagraphSchema = {
   type: "array",
@@ -2079,7 +2249,8 @@ function mapPromotionRow(row) {
   };
 }
 
-async function getPromotionScoped(client, idPromocion, idSucursal) {
+// AM: El PATCH relee y bloquea las referencias efectivas dentro de su transaccion.
+async function getPromotionScoped(client, idPromocion, idSucursal, forUpdate = false) {
   const { rows } = await client.query(
     `
       SELECT
@@ -2124,6 +2295,7 @@ async function getPromotionScoped(client, idPromocion, idSucursal) {
       WHERE p.id_promocion = $1::uuid
         AND ps.id_sucursal = $2::uuid
       LIMIT 1
+      ${forUpdate ? "FOR UPDATE OF p, ps" : ""}
     `,
     [idPromocion, idSucursal]
   );
@@ -3613,6 +3785,8 @@ export default async function adminConfiguracionRoutes(app) {
       const client = await app.db.connect();
       try {
         const branchId = await ensurePromotionBranchAccess(client, request.claims, request.body.id_sucursal);
+        // AM: Las referencias de imagen permanecen bloqueadas hasta COMMIT.
+        await client.query("BEGIN");
         const titulo = normalizeRequiredText(request.body.titulo, "titulo");
         const slug = normalizeSlug(request.body.slug || titulo);
         if (!slug) {
@@ -3633,34 +3807,15 @@ export default async function adminConfiguracionRoutes(app) {
           request.body.imagen_mobile_asset_id !== undefined
             ? normalizeOptionalText(request.body.imagen_mobile_asset_id)
             : null;
-        const imagenPrincipalAsset = imagenPrincipalAssetId
-          ? await resolveAssetForBinding(client, {
-            assetId: imagenPrincipalAssetId,
-            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
-            entityType: "promocion",
-            entityId: null,
-            idSucursal: branchId,
-            claims: request.claims,
-            allowUnboundEntity: true,
-            allowedStatuses: ["temporal", "activo"],
-          })
-          : null;
-        const imagenMobileAsset = imagenMobileAssetId
-          ? await resolveAssetForBinding(client, {
-            assetId: imagenMobileAssetId,
-            scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
-            entityType: "promocion",
-            entityId: null,
-            idSucursal: branchId,
-            claims: request.claims,
-            allowUnboundEntity: true,
-            allowedStatuses: ["temporal", "activo"],
-          })
-          : null;
-        const imagenPrincipalUrl = imagenPrincipalAsset?.public_url ?? imagenPrincipalUrlInput;
-        const imagenMobileUrl = imagenMobileAsset?.public_url ?? imagenMobileUrlInput;
-        const imagenPrincipalPath = imagenPrincipalAsset?.object_path ?? null;
-        const imagenMobilePath = imagenMobileAsset?.object_path ?? null;
+        const principalImage = await resolvePromotionImage(client, app, { assetId: imagenPrincipalAssetId,
+          url: imagenPrincipalUrlInput, scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
+          promotionId: null, branchId, claims: request.claims });
+        const mobileImage = await resolvePromotionImage(client, app, { assetId: imagenMobileAssetId,
+          url: imagenMobileUrlInput, scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
+          promotionId: null, branchId, claims: request.claims });
+        const imagenPrincipalAsset = principalImage.asset, imagenMobileAsset = mobileImage.asset;
+        const imagenPrincipalUrl = principalImage.url, imagenMobileUrl = mobileImage.url;
+        const imagenPrincipalPath = principalImage.path, imagenMobilePath = mobileImage.path;
         const imagenAlt = normalizeOptionalText(request.body.imagen_alt) ?? null;
         const estado = normalizePromotionState(request.body.estado, "borrador");
         const visiblePublico = Boolean(request.body.visible_publico ?? false);
@@ -3738,7 +3893,6 @@ export default async function adminConfiguracionRoutes(app) {
           vigenciaHasta,
         });
 
-        await client.query("BEGIN");
         const inserted = await client.query(
           `
             INSERT INTO public.promociones (
@@ -3946,7 +4100,9 @@ export default async function adminConfiguracionRoutes(app) {
       const client = await app.db.connect();
       try {
         const branchId = await ensurePromotionBranchAccess(client, request.claims, request.body.id_sucursal);
-        const currentPromotion = await getPromotionScoped(client, request.params.id, branchId);
+        // AM: Evitar conservar una referencia efectiva leida antes de otra escritura.
+        await client.query("BEGIN");
+        const currentPromotion = await getPromotionScoped(client, request.params.id, branchId, true);
         if (!currentPromotion) {
           throw new AppError(404, "La promocion indicada no existe para la sucursal", {
             code: "CONFIG_PROMOTION_NOT_FOUND",
@@ -3986,59 +4142,30 @@ export default async function adminConfiguracionRoutes(app) {
         let imagenMobilePath = currentPromotion.imagen_mobile_path ?? null;
         let imagenMobileUrl = currentPromotion.imagen_mobile_url ?? null;
 
-        if (hasPrincipalAssetPatch) {
-          const rawPrincipalAssetId = normalizeOptionalText(request.body.imagen_principal_asset_id);
-          if (!rawPrincipalAssetId) {
-            imagenPrincipalAssetId = null;
-            imagenPrincipalPath = null;
-            imagenPrincipalUrl = hasPrincipalUrlPatch
-              ? (normalizeOptionalText(request.body.imagen_principal_url) ?? null)
-              : null;
-          } else {
-            const resolvedPrincipal = await resolveAssetForBinding(client, {
-              assetId: rawPrincipalAssetId,
-              scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
-              entityType: "promocion",
-              entityId: request.params.id,
-              idSucursal: branchId,
-              claims: request.claims,
-              allowUnboundEntity: true,
-              allowedStatuses: ["temporal", "activo"],
-            });
-            imagenPrincipalAssetId = resolvedPrincipal.id_asset;
-            imagenPrincipalPath = resolvedPrincipal.object_path;
-            imagenPrincipalUrl = resolvedPrincipal.public_url;
-          }
-        } else if (hasPrincipalUrlPatch) {
-          imagenPrincipalUrl = normalizeOptionalText(request.body.imagen_principal_url) ?? null;
-        }
-
-        if (hasMobileAssetPatch) {
-          const rawMobileAssetId = normalizeOptionalText(request.body.imagen_mobile_asset_id);
-          if (!rawMobileAssetId) {
-            imagenMobileAssetId = null;
-            imagenMobilePath = null;
-            imagenMobileUrl = hasMobileUrlPatch
-              ? (normalizeOptionalText(request.body.imagen_mobile_url) ?? null)
-              : null;
-          } else {
-            const resolvedMobile = await resolveAssetForBinding(client, {
-              assetId: rawMobileAssetId,
-              scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
-              entityType: "promocion",
-              entityId: request.params.id,
-              idSucursal: branchId,
-              claims: request.claims,
-              allowUnboundEntity: true,
-              allowedStatuses: ["temporal", "activo"],
-            });
-            imagenMobileAssetId = resolvedMobile.id_asset;
-            imagenMobilePath = resolvedMobile.object_path;
-            imagenMobileUrl = resolvedMobile.public_url;
-          }
-        } else if (hasMobileUrlPatch) {
-          imagenMobileUrl = normalizeOptionalText(request.body.imagen_mobile_url) ?? null;
-        }
+        // AM: Un cambio por URL reemplaza su referencia; un UUID nuevo no hereda la URL anterior.
+        if (hasPrincipalAssetPatch) imagenPrincipalAssetId = normalizeOptionalText(request.body.imagen_principal_asset_id);
+        if (hasMobileAssetPatch) imagenMobileAssetId = normalizeOptionalText(request.body.imagen_mobile_asset_id);
+        if (hasPrincipalUrlPatch) imagenPrincipalUrl = normalizeOptionalText(request.body.imagen_principal_url);
+        else if (hasPrincipalAssetPatch && (!imagenPrincipalAssetId || imagenPrincipalAssetId !== currentPromotion.imagen_principal_asset_id)) imagenPrincipalUrl = null;
+        if (hasMobileUrlPatch) imagenMobileUrl = normalizeOptionalText(request.body.imagen_mobile_url);
+        else if (hasMobileAssetPatch && (!imagenMobileAssetId || imagenMobileAssetId !== currentPromotion.imagen_mobile_asset_id)) imagenMobileUrl = null;
+        // AM: Reenviar la misma URL no descarta un UUID historico ya verificado.
+        if (hasPrincipalUrlPatch && !hasPrincipalAssetPatch && imagenPrincipalUrl !== currentPromotion.imagen_principal_url) imagenPrincipalAssetId = null;
+        if (hasMobileUrlPatch && !hasMobileAssetPatch && imagenMobileUrl !== currentPromotion.imagen_mobile_url) imagenMobileAssetId = null;
+        const principalImage = await resolvePromotionImage(client, app, { assetId: imagenPrincipalAssetId,
+          url: imagenPrincipalUrl, scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
+          promotionId: request.params.id, branchId, claims: request.claims,
+          preserveExternalUrl: imagenPrincipalAssetId === currentPromotion.imagen_principal_asset_id
+            && imagenPrincipalUrl === currentPromotion.imagen_principal_url });
+        const mobileImage = await resolvePromotionImage(client, app, { assetId: imagenMobileAssetId,
+          url: imagenMobileUrl, scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
+          promotionId: request.params.id, branchId, claims: request.claims,
+          preserveExternalUrl: imagenMobileAssetId === currentPromotion.imagen_mobile_asset_id
+            && imagenMobileUrl === currentPromotion.imagen_mobile_url });
+        imagenPrincipalAssetId = principalImage.asset?.id_asset ?? null;
+        imagenPrincipalPath = principalImage.path; imagenPrincipalUrl = principalImage.url;
+        imagenMobileAssetId = mobileImage.asset?.id_asset ?? null;
+        imagenMobilePath = mobileImage.path; imagenMobileUrl = mobileImage.url;
 
         const imagenAlt =
           request.body.imagen_alt !== undefined
@@ -4160,9 +4287,7 @@ export default async function adminConfiguracionRoutes(app) {
           vigenciaHasta,
         });
 
-        await client.query("BEGIN");
-
-        if (imagenPrincipalAssetId) {
+        if (imagenPrincipalAssetId && !principalImage.retainOnly) {
           await activateAssetForEntity(app, client, {
             assetId: imagenPrincipalAssetId,
             scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN,
@@ -4173,7 +4298,7 @@ export default async function adminConfiguracionRoutes(app) {
             replaceCurrent: false,
           });
         }
-        if (imagenMobileAssetId) {
+        if (imagenMobileAssetId && !mobileImage.retainOnly) {
           await activateAssetForEntity(app, client, {
             assetId: imagenMobileAssetId,
             scopeKey: STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE,
@@ -4314,16 +4439,10 @@ export default async function adminConfiguracionRoutes(app) {
         }
         await client.query("COMMIT");
 
-        await replaceAssetIfNeeded(app, client, {
-          previousAssetId: currentPromotion.imagen_principal_asset_id,
-          nextAssetId: imagenPrincipalAssetId,
-          claims: request.claims,
-        });
-        await replaceAssetIfNeeded(app, client, {
-          previousAssetId: currentPromotion.imagen_mobile_asset_id,
-          nextAssetId: imagenMobileAssetId,
-          claims: request.claims,
-        });
+        await cleanupPromotionImage(app, client, request, currentPromotion.imagen_principal_asset_id,
+          imagenPrincipalAssetId, STORAGE_SCOPE_PUBLIC_PROMOTION_MAIN, branchId);
+        await cleanupPromotionImage(app, client, request, currentPromotion.imagen_mobile_asset_id,
+          imagenMobileAssetId, STORAGE_SCOPE_PUBLIC_PROMOTION_MOBILE, branchId);
 
         return sendOk(reply, { promocion: mapPromotionRow(finalPromotion) }, { requestId: request.id });
       } catch (error) {
