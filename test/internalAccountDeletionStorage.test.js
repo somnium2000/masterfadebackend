@@ -310,6 +310,8 @@ test('AM: anonimizar sin archivos pasa por Storage antes de Auth', async () => {
   const client = { async query(sql, params = []) {
     if (sql.includes('FROM app_private.solicitudes_eliminacion_cuenta')) return { rows: [f.request] };
     if (sql.includes('SELECT id_correo')) return { rows: [] };
+    // AM: La anonimización identifica todos los expedientes propios, no al actor de terceros.
+    if (sql.includes('SELECT id_empleado')) return { rows: [] };
     if (sql.includes('UPDATE app_private.solicitudes_eliminacion_cuenta')) {
       nextState = params[1]; return { rows: [{ estado_codigo: nextState }] };
     }

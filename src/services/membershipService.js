@@ -1742,6 +1742,12 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     });
   }
 
+  // AM: El caller mantiene la transaccion; serializar antes de bloquear intent/orden, igual que eliminacion.
+  const identityLock = await client.query(`SELECT pg_try_advisory_xact_lock(hashtext('masterfade.account_deletion'), hashtext(c.id_usuario::text)) AS deletion_identity_lock
+    FROM public.clientes c WHERE c.id_cliente = $1::uuid AND c.id_usuario IS NOT NULL`, [safeClienteId]);
+  // AM: No esperar reteniendo locks de pagos: otra eliminacion puede necesitar la misma orden.
+  if (identityLock.rows?.[0]?.deletion_identity_lock !== true) throw new AppError(409,
+    "La cuenta no esta disponible. El pago conserva su evidencia para conciliacion.", { code: "MEMBERSHIP_PAYMENT_ACCOUNT_UNAVAILABLE" });
   const intent = await getMembershipIntentForConfirmation(client, safeIntentId);
   if (!intent) {
     throw new AppError(404, "Intent de pago no encontrado", {
@@ -1843,6 +1849,27 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     });
   }
 
+  // AM: Bloquear identidad vigente antes de conceder beneficios; no modificar evidencia de un cobro real.
+  const identity = await client.query(`
+    SELECT c.estado AS cliente_activo, c.deleted_at AS cliente_deleted_at, c.anonimizado,
+      u.estado AS usuario_activo, u.deleted_at AS usuario_deleted_at, u.estado_acceso,
+      EXISTS (SELECT 1 FROM app_private.solicitudes_eliminacion_cuenta d
+        WHERE (d.id_cliente = c.id_cliente OR d.id_usuario = u.id_usuario OR d.id_persona = c.id_persona)
+          AND d.estado_codigo IN ('procesando', 'storage_pendiente', 'auth_pendiente', 'completada')) AS eliminacion_en_curso
+    FROM public.clientes c JOIN public.usuarios u ON u.id_usuario = c.id_usuario AND u.id_persona = c.id_persona
+    WHERE c.id_cliente = $1::uuid AND u.id_usuario = $2::uuid
+    FOR UPDATE OF c, u
+  `, [safeClienteId, intent.id_usuario]);
+  const owner = identity.rows?.[0];
+  if (!owner || owner.cliente_activo !== true || owner.cliente_deleted_at || owner.anonimizado !== false
+    || owner.usuario_activo !== true || owner.usuario_deleted_at
+    || !owner.estado_acceso || ['inactivo', 'bloqueado'].includes(owner.estado_acceso) || owner.eliminacion_en_curso !== false
+    || normalizeText(intent.estado_orden_codigo).toLowerCase() === 'cancelada') {
+    throw new AppError(409, "El pago requiere conciliacion; esta cuenta no puede recibir beneficios.", {
+      code: "MEMBERSHIP_PAYMENT_ACCOUNT_UNAVAILABLE",
+    });
+  }
+
   await client.query(
     `
       UPDATE public.membership_purchase_orders
@@ -1940,6 +1967,12 @@ export async function recoverMembershipPixelPayApproval(client, {
       code: "MEMBERSHIP_PIXELPAY_RECOVERY_INVALID_INPUT",
     });
   }
+  // AM: Mismo orden de locks que confirmacion y eliminacion; la evidencia durable permanece intacta.
+  const identityLock = await client.query(`SELECT pg_try_advisory_xact_lock(hashtext('masterfade.account_deletion'), hashtext(c.id_usuario::text)) AS deletion_identity_lock
+    FROM public.clientes c WHERE c.id_cliente = $1::uuid AND c.id_usuario IS NOT NULL`, [safeClienteId]);
+  // AM: No esperar reteniendo locks de pagos: otra eliminacion puede necesitar la misma orden.
+  if (identityLock.rows?.[0]?.deletion_identity_lock !== true) throw new AppError(409,
+    "La cuenta no esta disponible. El pago conserva su evidencia para conciliacion.", { code: "MEMBERSHIP_PAYMENT_ACCOUNT_UNAVAILABLE" });
   const { rows } = await client.query(
     `SELECT pi.id_intent, pi.id_provider, pi.id_membership_order, pi.estado_intent_codigo,
             pi.monto_hnl, pi.moneda_codigo, pi.expires_at AS intent_expires_at,

@@ -57,6 +57,8 @@ function readOnlyIntentClient(row) {
     async query(sql) {
       const text = String(sql).replace(/\s+/g, " ").trim();
       calls.push(text);
+      // AM: Lock transaccional compartido con eliminacion, sin escrituras de negocio.
+      if (text.includes("AS deletion_identity_lock")) return { rows: [{ deletion_identity_lock: true }] };
       if (text.includes("FROM public.payment_intents pi")) return { rows: [row], rowCount: 1 };
       throw new Error(`Unexpected write or query: ${text.slice(0, 100)}`);
     },
@@ -144,7 +146,7 @@ for (const state of ["creado", "pendiente_confirmacion", "fallido", "expirado"])
     }), { statusCode: 409, code: state === "creado" || state === "pendiente_confirmacion"
       ? "MEMBERSHIP_PAYMENT_VERIFICATION_REQUIRED"
       : "MEMBERSHIP_PAYMENT_INTENT_STATE_INVALID" });
-    assert.equal(client.calls.length, 1);
+    assert.equal(client.calls.filter(sql => !sql.includes("AS deletion_identity_lock")).length, 1);
   });
 }
 
@@ -156,7 +158,7 @@ test("repetir confirmacion sin evidencia no crea pagos ni suscripciones", async 
       clienteId: CLIENT,
     }), { code: "MEMBERSHIP_PAYMENT_VERIFICATION_REQUIRED" });
   }
-  assert.equal(client.calls.length, 2);
+  assert.equal(client.calls.filter(sql => !sql.includes("AS deletion_identity_lock")).length, 2);
   assert.ok(client.calls.every((sql) => sql.startsWith("SELECT")));
 });
 
@@ -166,7 +168,7 @@ test("un cliente no puede confirmar la orden de otro cliente", async () => {
     idPaymentIntent: INTENT,
     clienteId: CLIENT,
   }), { statusCode: 403, code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN" });
-  assert.equal(client.calls.length, 1);
+  assert.equal(client.calls.filter(sql => !sql.includes("AS deletion_identity_lock")).length, 1);
 });
 
 test("simulador rechaza PixelPay y entornos no locales antes de consultar BD", async () => {
@@ -255,6 +257,8 @@ function pixelPayProcessHarness({
   providerSessionId = null,
   amount = 800,
   rejectNonIsoPaidAt = false,
+  // AM: Estados sinteticos de identidad y contencion del lock de eliminacion.
+  identity = {}, lockAvailable = true,
 } = {}) {
   const state = {
     intentState: initialIntentState, saleCalls: 0, commits: 0, rollbacks: 0,
@@ -282,6 +286,9 @@ function pixelPayProcessHarness({
   const client = {
     async query(sql, values = []) {
       const text = String(sql?.text || sql).replace(/\s+/g, " ").trim();
+      // AM: Fixtures activas verificadas para el guard de cuenta vigente.
+      if (text.includes("AS deletion_identity_lock")) return { rows: [{ deletion_identity_lock: lockAvailable }] };
+      if (text.includes("AS cliente_activo")) return { rows: [{ cliente_activo: true, cliente_deleted_at: null, anonimizado: false, usuario_activo: true, usuario_deleted_at: null, estado_acceso: "activo", eliminacion_en_curso: false, ...identity }] };
       if (text === "BEGIN" || text.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
       if (text === "COMMIT") { state.commits += 1; return { rows: [] }; }
       if (text === "ROLLBACK") { state.rollbacks += 1; return { rows: [] }; }
@@ -1065,3 +1072,38 @@ test("activacion usa beneficios y periodo del snapshot aunque cambie el catalogo
     }],
   });
 });
+
+// AM: Un Sale verificado conserva evidencia durable aunque la cuenta ya no admita beneficios.
+for (const identity of [{ cliente_activo: false }, { cliente_deleted_at: '2026-01-01' }, { anonimizado: true },
+  { usuario_activo: false }, { usuario_deleted_at: '2026-01-01' }, { estado_acceso: 'inactivo' },
+  { estado_acceso: 'bloqueado' }, { eliminacion_en_curso: true }]) {
+  test('AM: aprobacion financiera no reactiva identidad ' + JSON.stringify(identity), async t => {
+    t.after(() => PaymentProviderFactory.reset());
+    const { app, state } = pixelPayProcessHarness({ identity, provider: { sale: async () => ({
+      outcome: PIXELPAY_SALE_OUTCOME.APPROVED, approved: true, paymentHashValid: true, amountMatches: true,
+      paymentUuid: 'synthetic-payment', transactionId: 'synthetic-transaction', diagnostics: {},
+    }) } });
+    await assert.rejects(processMembershipPixelPaySale(app, { idPaymentIntent: INTENT, clienteId: CLIENT,
+      card: validCard, billing: validBilling }), { code: 'MEMBERSHIP_PAYMENT_ACCOUNT_UNAVAILABLE' });
+    assert.equal(state.verifiedEvidenceEvents, 1);
+    assert.equal(state.subscriptions, 0); assert.equal(state.payments, 0);
+    assert.equal(state.orderState, 'pendiente_pago'); assert.notEqual(state.intentState, 'fallido');
+    assert.ok(state.rollbacks > 0);
+  });
+}
+for (const options of [{ canceled: true }, { lockAvailable: false }]) {
+  test('AM: recuperacion bloquea orden cancelada o eliminacion concurrente ' + JSON.stringify(options), async t => {
+    t.after(() => PaymentProviderFactory.reset());
+    const evidence = { id_order: ORDER, id_intent: INTENT, provider: 'pixelpay', payment_uuid: 'synthetic-payment',
+      transaction_id: 'synthetic-transaction', amount: 800, currency: 'HNL', payment_hash_valid: true, amount_matches: true };
+    const { app, state } = pixelPayProcessHarness({ ...options, expired: true, initialIntentState: 'expirado',
+      durableEvidence: evidence, durableVerifiedAt: new Date(Date.now() - 120000).toISOString() });
+    if (options.canceled) state.orderState = 'cancelada';
+    await assert.rejects(recoverMembershipPixelPayApproval(await app.db.connect(), { idPaymentIntent: INTENT, clienteId: CLIENT }),
+      { code: 'MEMBERSHIP_PAYMENT_ACCOUNT_UNAVAILABLE' });
+    assert.equal(state.subscriptions, 0); assert.equal(state.payments, 0); assert.equal(state.saleCalls, 0);
+    assert.equal(state.intentState, 'expirado');
+    assert.equal(state.orderState, options.canceled ? 'cancelada' : 'pendiente_pago');
+    assert.equal(evidence.payment_hash_valid, true);
+  });
+}

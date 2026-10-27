@@ -151,7 +151,8 @@ function makeRunners(calls, overrides = {}) {
 
 function makeJwt({ sub = USUARIO_ID, iat = Math.floor(Date.now() / 1000) } = {}) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sub, iat })}.signature`;
+  // AM: La confirmacion requiere autenticacion real reciente, no solo emision del JWT.
+  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sub, iat, amr: [{ method: "password", timestamp: iat }] })}.signature`;
 }
 
 async function orchestrateWith({ states, token = generateAccountDeletionExecutionToken(), runners = null } = {}) {

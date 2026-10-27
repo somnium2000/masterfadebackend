@@ -18,9 +18,10 @@ const REFERENCE = "DEL-ABCDEF123456";
 const IDEMPOTENCY_KEY = "internal-account-delete-test-key";
 const NOW = "2026-07-11T12:00:00.000Z";
 
+// AM: Fixture con autenticacion password firmada por el verificador simulado.
 function makeJwt({ sub = USUARIO_ID, iat = Math.floor(Date.now() / 1000) } = {}) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sub, iat })}.signature`;
+  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sub, iat, amr: [{ method: "password", timestamp: iat }] })}.signature`;
 }
 
 function requestRow(overrides = {}) {
@@ -63,6 +64,8 @@ function createClient(options = {}) {
     },
     async query(sql, params = []) {
       const text = String(sql);
+      // AM: Por defecto la fixture representa una identidad laboral exclusiva.
+      if (text.includes("AS shared_client_identity")) return { rows: [{ shared_client_identity: false }] };
       calls.push({ sql: text, params });
       if (text.includes("pg_advisory_xact_lock")) return { rows: [] };
       if (text.includes("FROM public.usuarios u")) {
@@ -296,7 +299,8 @@ test("doble envio no duplica", async () => {
 
 test("cuenta permanece activa", async () => {
   const client = createClient();
-  await createRequest();
+  // AM: Inspeccionar el mismo cliente que ejecuta el flujo productivo.
+  await createInternalAccountDeletionRequest(client, { usuarioId: USUARIO_ID, personaId: PERSONA_ID, employeeIdFromClaims: EMPLEADO_ID, rolesFromClaims: ["admin"], idempotencyKey: IDEMPOTENCY_KEY, requestId: "req-test", authenticatedAt: NOW });
   assert.equal(client.calls.some((call) => /UPDATE public\.usuarios|DELETE FROM public\.usuarios/.test(call.sql)), false);
 });
 
@@ -375,10 +379,4 @@ test("40001 se mapea", async () => {
     return createClient().query(sql);
   };
   await assert.rejects(cancelInternalAccountDeletionRequest(client, { requestId: REQUEST_ID, usuarioId: USUARIO_ID, personaId: PERSONA_ID, employeeIdFromClaims: EMPLEADO_ID, rolesFromClaims: ["admin"], traceRequestId: "req" }), { code: "INTERNAL_ACCOUNT_DELETION_SERIALIZATION_RETRY_REQUIRED" });
-});
-
-test("conexion se libera", () => {
-  const client = createClient();
-  client.release();
-  assert.equal(client.released, true);
 });

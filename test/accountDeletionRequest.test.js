@@ -99,9 +99,10 @@ async function confirmRequest(client) {
   });
 }
 
+// AM: Fixture con autenticacion password firmada por el verificador simulado.
 function makeJwt({ sub = USUARIO_ID, iat = Math.floor(Date.now() / 1000) } = {}) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sub, iat })}.signature`;
+  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sub, iat, amr: [{ method: "password", timestamp: iat }] })}.signature`;
 }
 
 test("crea solicitud pendiente de confirmacion cuando no hay bloqueos", async () => {

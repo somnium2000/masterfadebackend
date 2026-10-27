@@ -114,6 +114,27 @@ function decodeInternalJwtPayload(token) {
   }
 }
 
+// AM: iat acredita emision del JWT; solo AMR firmado acredita una autenticacion real reciente.
+function recentAccountDeletionAuthentication(payload, authUser, invalidCode, expiredCode) {
+  const now = Math.floor(Date.now() / 1000), issuedAt = Number(payload?.iat);
+  const invalid = () => new AppError(401, "Debes autenticarte nuevamente con tu contrasena o Google para continuar.", { code: invalidCode });
+  if (payload?.sub !== authUser.id || !Number.isFinite(issuedAt) || issuedAt <= 0
+    || issuedAt > now + REAUTH_FUTURE_TOLERANCE_SECONDS) throw invalid();
+  const google = authUser.app_metadata?.provider === "google"
+    || authUser.identities?.some(identity => identity.provider === "google");
+  const events = Array.isArray(payload.amr) ? payload.amr.filter(event =>
+    (event?.method === "password" || event?.method === "oauth" && google)
+    && typeof event.timestamp === "number" && Number.isInteger(event.timestamp) && event.timestamp > 0
+    && event.timestamp <= issuedAt + REAUTH_FUTURE_TOLERANCE_SECONDS
+    && event.timestamp <= now + REAUTH_FUTURE_TOLERANCE_SECONDS) : [];
+  if (!events.length) throw invalid();
+  const authenticatedAt = Math.max(...events.map(event => event.timestamp));
+  if (now - authenticatedAt > REAUTH_MAX_AGE_SECONDS || now - issuedAt > REAUTH_MAX_AGE_SECONDS) {
+    throw new AppError(401, "La autenticacion expiro. Autenticate nuevamente para continuar.", { code: expiredCode });
+  }
+  return new Date(authenticatedAt * 1000).toISOString();
+}
+
 export async function verifyRecentInternalAccountDeletionReauthentication(app, {
   reauthToken,
   expectedUserId,
@@ -145,24 +166,10 @@ export async function verifyRecentInternalAccountDeletionReauthentication(app, {
     });
   }
 
-  const payload = decodeInternalJwtPayload(token);
-  const issuedAt = Number(payload?.iat);
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  if (!Number.isFinite(issuedAt) || issuedAt <= 0 || issuedAt - nowSeconds > REAUTH_FUTURE_TOLERANCE_SECONDS) {
-    throw new AppError(401, "Debes volver a autenticarte antes de enviar la solicitud.", {
-      code: "INTERNAL_ACCOUNT_DELETION_REAUTH_REQUIRED",
-    });
-  }
-  if (nowSeconds - issuedAt > REAUTH_MAX_AGE_SECONDS) {
-    throw new AppError(401, "La reautenticacion expiro. Vuelve a confirmar tu identidad.", {
-      code: "INTERNAL_ACCOUNT_DELETION_REAUTH_EXPIRED",
-    });
-  }
-
-  return {
-    authUserId: authUser.id,
-    authenticatedAt: new Date(issuedAt * 1000).toISOString(),
-  };
+  // AM: getUser verifica el JWT con Supabase antes de inspeccionar sus metodos firmados.
+  const authenticatedAt = recentAccountDeletionAuthentication(decodeInternalJwtPayload(token), authUser,
+    "INTERNAL_ACCOUNT_DELETION_REAUTH_REQUIRED", "INTERNAL_ACCOUNT_DELETION_REAUTH_EXPIRED");
+  return { authUserId: authUser.id, authenticatedAt };
 }
 
 const ACCOUNT_DELETION_PREVIEW_SQL = `
@@ -1272,6 +1279,17 @@ async function isProtectedInternalAccount(client, usuarioId) {
   return result.rowCount > 0;
 }
 
+// AM: Una Persona compartida no puede anonimizarse desde el recorrido laboral aislado.
+async function hasSharedInternalDeletionIdentity(client, personaId, usuarioId) {
+  const result = await client.query(`
+    SELECT (EXISTS (SELECT 1 FROM public.clientes c WHERE c.id_persona = $1::uuid OR c.id_usuario = $2::uuid)
+      OR EXISTS (SELECT 1 FROM public.usuarios u WHERE u.id_persona = $1::uuid
+        AND u.id_usuario <> $2::uuid AND u.deleted_at IS NULL)) AS shared_client_identity
+  `, [personaId, usuarioId]);
+  // AM: Datos incompletos tampoco acreditan exclusividad de la identidad.
+  return result.rows?.[0]?.shared_client_identity !== false;
+}
+
 async function countInternalDependencies(client, employeeIds) {
   const ids = Array.isArray(employeeIds) ? employeeIds.map((id) => String(id || "").trim()).filter(Boolean) : [];
   if (!ids.length) {
@@ -1295,7 +1313,7 @@ async function countInternalDependencies(client, employeeIds) {
         FROM public.citas c
         JOIN employee_ids e ON e.id_empleado = c.id_empleado_barbero
         WHERE c.deleted_at IS NULL
-          AND c.inicio_at >= NOW()
+          AND (c.inicio_at >= NOW() OR c.estado_cita_codigo IN ('en_salon', 'en_atencion'))
           AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada', 'en_salon', 'en_atencion')
       ),
       weekly_schedules AS (
@@ -1412,6 +1430,10 @@ export async function evaluateInternalAccountDeletionRequest(client, {
     blockingReasons.push(identity.hardBlock);
   }
 
+  if (identity.personaId && await hasSharedInternalDeletionIdentity(client, identity.personaId, usuarioId)) {
+    blockingReasons.push({ code: "INTERNAL_ACCOUNT_DELETION_SHARED_IDENTITY",
+      message: "La identidad tambien pertenece a otro acceso o Cliente y requiere revision conjunta." });
+  }
   const activeEmployees = identity.activeEmployees || [];
   const employeeIds = activeEmployees.map((employee) => employee.id_empleado);
   const dependencyCounts = await countInternalDependencies(client, employeeIds);
@@ -1956,7 +1978,7 @@ export async function executeClientAccountDeletionInternal(client, {
           motivo_fin_codigo = 'eliminacion_cuenta',
           updated_at = NOW()
       WHERE id_cliente = $1::uuid
-        AND estado_suscripcion_codigo = 'activa'
+        AND estado_suscripcion_codigo IN ('activa', 'pendiente_renovacion')
     `,
     [clienteId]
   );
@@ -2211,7 +2233,7 @@ async function assertAccountDeletionAnonymizationPreconditions(client, {
           SELECT 1
           FROM public.subscriptions s
           WHERE s.id_cliente = $2::uuid
-            AND s.estado_suscripcion_codigo = 'activa'
+            AND s.estado_suscripcion_codigo IN ('activa', 'pendiente_renovacion')
         ) AS memberships_ready,
         COALESCE((
           SELECT vpb.balance_puntos
@@ -3898,12 +3920,9 @@ function isSupabaseAuthUserNotFoundError(error) {
   const code = String(error.code || error.error_code || "").trim().toLowerCase();
   const name = String(error.name || "").trim().toLowerCase();
   const message = String(error.message || "").trim().toLowerCase();
-  return status === 404
-    || code === "user_not_found"
-    || code === "not_found"
-    || name === "authapierror" && message.includes("user not found")
-    || message.includes("user not found")
-    || message.includes("user_not_found");
+  // AM: Exigir la respuesta 404 de usuario ausente, no errores de transporte o rutas inexistentes.
+  return status === 404 && (code === "user_not_found" || message === "user not found"
+    || name === "authapierror" && message.includes("user not found"));
 }
 
 function sanitizeAuthFailureCode(code) {
@@ -4051,7 +4070,7 @@ async function assertAccountDeletionAuthPreconditions(client, {
           SELECT 1
           FROM public.subscriptions s, params p
           WHERE s.id_cliente = p.cliente_id
-            AND s.estado_suscripcion_codigo = 'activa'
+            AND s.estado_suscripcion_codigo IN ('activa', 'pendiente_renovacion')
         ) AS memberships_ready,
         COALESCE((
           SELECT vpb.balance_puntos
@@ -4153,9 +4172,13 @@ async function findAuthUserById(app, authUserId) {
 }
 
 async function deleteAuthUserById(app, authUserId) {
-  const { error } = await app.supabaseAdmin.auth.admin.deleteUser(authUserId, false);
-  if (!error) return { deleted: true };
-  return { deleted: false, error };
+  try {
+    const { error } = await app.supabaseAdmin.auth.admin.deleteUser(authUserId, false);
+    return error ? { deleted: false, error } : { deleted: true };
+  } catch {
+    // AM: La operacion pudo confirmarse antes del fallo de transporte; verificar siempre.
+    return { deleted: false };
+  }
 }
 
 async function verifyAuthUserAbsent(app, authUserId) {
@@ -4167,7 +4190,14 @@ async function verifyAuthUserAbsent(app, authUserId) {
       details: { causeCode: "CLIENT_ACCOUNT_DELETION_AUTH_LOOKUP_FAILED" },
     });
   }
-  return !data?.user?.id;
+  // AM: Una respuesta vacia sin error no demuestra que Auth elimino la identidad.
+  if (!data?.user?.id || String(data.user.id) !== String(authUserId)) {
+    throw new AppError(503, "No fue posible verificar la ausencia de la identidad. Reintenta.", {
+      code: "CLIENT_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE",
+      details: { causeCode: "CLIENT_ACCOUNT_DELETION_AUTH_LOOKUP_FAILED" },
+    });
+  }
+  return false;
 }
 
 function mergeAuthFailureSummary(resumenImpacto, {
@@ -4769,30 +4799,10 @@ export async function verifyRecentAccountDeletionReauthentication(app, {
     });
   }
 
-  const payload = decodeJwtPayload(token);
-  const issuedAt = Number(payload?.iat);
-  if (!Number.isFinite(issuedAt) || issuedAt <= 0) {
-    throw new AppError(401, "Debes volver a autenticarte antes de confirmar la eliminación.", {
-      code: "CLIENT_ACCOUNT_DELETION_REAUTH_INVALID",
-    });
-  }
-
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  if (issuedAt - nowSeconds > REAUTH_FUTURE_TOLERANCE_SECONDS) {
-    throw new AppError(401, "Debes volver a autenticarte antes de confirmar la eliminación.", {
-      code: "CLIENT_ACCOUNT_DELETION_REAUTH_INVALID",
-    });
-  }
-  if (nowSeconds - issuedAt > REAUTH_MAX_AGE_SECONDS) {
-    throw new AppError(401, "La reautenticación expiró. Vuelve a confirmar tu identidad.", {
-      code: "CLIENT_ACCOUNT_DELETION_REAUTH_EXPIRED",
-    });
-  }
-
-  return {
-    authUserId,
-    authenticatedAt: new Date(issuedAt * 1000).toISOString(),
-  };
+  // AM: Renovar el token no renueva la fecha del evento password/oauth de AMR.
+  const authenticatedAt = recentAccountDeletionAuthentication(decodeJwtPayload(token), authUser,
+    "CLIENT_ACCOUNT_DELETION_REAUTH_INVALID", "CLIENT_ACCOUNT_DELETION_REAUTH_EXPIRED");
+  return { authUserId, authenticatedAt };
 }
 
 const ADMIN_ACCOUNT_DELETION_READ_ROLES = ["admin", "root", "security_admin", "security_auditor", "super_admin"];
@@ -5088,7 +5098,10 @@ export async function evaluateAdminInternalAccountDeletionDependencies(client, {
   empleadoId,
 } = {}) {
   void deletionRequestId;
-  void usuarioId;
+  // AM: Revalidar la identidad compartida en aprobacion y ejecucion, no solo en preview.
+  const sharedIdentity = await hasSharedInternalDeletionIdentity(client, personaId, usuarioId);
+  const sharedReason = { code: "INTERNAL_ACCOUNT_DELETION_SHARED_IDENTITY",
+    message: "La identidad compartida requiere revision conjunta antes de eliminarse." };
   const employeeIds = await loadEmployeeIdsForPerson(client, personaId);
   if (empleadoId && !employeeIds.map(String).includes(String(empleadoId))) {
     employeeIds.push(empleadoId);
@@ -5101,7 +5114,7 @@ export async function evaluateAdminInternalAccountDeletionDependencies(client, {
       public_barber_profiles: 0,
       active_employee_service_rates: 0,
       active_promotion_references: 0,
-      blocking_reasons: [],
+      blocking_reasons: sharedIdentity ? [sharedReason] : [],
       employee_ids: [],
     };
   }
@@ -5116,7 +5129,7 @@ export async function evaluateAdminInternalAccountDeletionDependencies(client, {
         FROM public.citas c
         JOIN employee_ids e ON e.id_empleado = c.id_empleado_barbero
         WHERE c.deleted_at IS NULL
-          AND c.inicio_at >= NOW()
+          AND (c.inicio_at >= NOW() OR c.estado_cita_codigo IN ('en_salon', 'en_atencion'))
           AND c.estado_cita_codigo IN ('en_espera', 'pendiente_pago', 'confirmada', 'en_salon', 'en_atencion')
       ),
       weekly_schedules AS (
@@ -5186,7 +5199,7 @@ export async function evaluateAdminInternalAccountDeletionDependencies(client, {
     active_promotion_references: toNumber(row.active_promotion_references, 0),
     employee_ids: employeeIds,
   };
-  const blockingReasons = [];
+  const blockingReasons = sharedIdentity ? [sharedReason] : [];
   if (dependencies.future_operational_appointments > 0) {
     blockingReasons.push({
       code: "INTERNAL_ACCOUNT_DELETION_FUTURE_APPOINTMENTS_PENDING",
@@ -5621,6 +5634,10 @@ export async function executeApprovedInternalAccountDeletionInternal(client, {
   traceRequestId,
 } = {}) {
   const row = await loadApprovedInternalExecutionRequest(client, deletionRequestId, "aprobada");
+  // AM: Las cuentas protegidas siguen protegidas aunque exista una aprobacion antigua.
+  if (row.active_roles?.some(role => INTERNAL_PROTECTED_ROLES.includes(role)) || await isAdminProtectedAccount(client, row.id_usuario)) {
+    throw new AppError(403, INTERNAL_PROTECTED_MESSAGE, { code: "ADMIN_ACCOUNT_DELETION_PROTECTED_ACCOUNT" });
+  }
   await acquireAccountDeletionUserLock(client, row.id_usuario);
   const dependencies = await evaluateAdminInternalAccountDeletionDependencies(client, {
     deletionRequestId: row.id_solicitud,
@@ -5809,25 +5826,31 @@ export async function anonymizeApprovedInternalAccountDeletion(client, {
     `,
     [row.id_persona]
   );
-  await client.query(
-    `
-      UPDATE public.seguridad_audit_logs
-      SET ip = NULL,
-          metadata = COALESCE(metadata, '{}'::jsonb) - 'email' - 'telefono' - 'dni' - 'rtn'
-      WHERE id_usuario = $1::uuid
-    `,
-    [row.id_usuario]
-  );
-  await client.query(
-    `
-      UPDATE public.bitacoras
-      SET datos_antes = NULL,
-          datos_despues = NULL
-      WHERE id_usuario = $1::uuid
-         OR registro_id IN ($2::uuid, $3::uuid)
-    `,
-    [row.id_usuario, row.id_persona, row.id_empleado]
-  );
+  // AM: La IP del actor es su dato; snapshots de entidades ajenas permanecen intactos.
+  const employeeIds = await loadEmployeeIdsForPerson(client, row.id_persona);
+  await client.query(`
+    UPDATE public.seguridad_audit_logs
+    SET ip = CASE WHEN id_usuario = $1::uuid THEN NULL ELSE ip END,
+      metadata = CASE WHEN
+        (entidad IN ('persona', 'personas', 'public.personas') AND entidad_id = $2::text)
+        OR (entidad IN ('usuario', 'usuarios', 'public.usuarios') AND entidad_id = $1::text)
+        OR (entidad IN ('empleado', 'empleados', 'public.empleados') AND entidad_id = ANY($3::text[]))
+        THEN app_private.fn_redact_account_pii_jsonb_v1(metadata) ELSE metadata END
+    WHERE id_usuario = $1::uuid
+      OR (entidad IN ('persona', 'personas', 'public.personas') AND entidad_id = $2::text)
+      OR (entidad IN ('usuario', 'usuarios', 'public.usuarios') AND entidad_id = $1::text)
+      OR (entidad IN ('empleado', 'empleados', 'public.empleados') AND entidad_id = ANY($3::text[]))
+  `, [row.id_usuario, row.id_persona, employeeIds]);
+  // AM: Limitar la redaccion a la entidad borrada; conservar accion, actor, fecha e historial laboral.
+  await client.query(`
+    UPDATE public.bitacoras
+    SET datos_antes = app_private.fn_redact_account_pii_jsonb_v1(datos_antes),
+      datos_despues = app_private.fn_redact_account_pii_jsonb_v1(datos_despues),
+      descripcion = 'Trazabilidad conservada tras anonimizacion de cuenta'
+    WHERE (tabla IN ('personas', 'public.personas') AND registro_id = $1::uuid)
+      OR (tabla IN ('usuarios', 'public.usuarios') AND registro_id = $2::uuid)
+      OR (tabla IN ('empleados', 'public.empleados') AND registro_id = ANY($3::uuid[]))
+  `, [row.id_persona, row.id_usuario, employeeIds]);
   const impact = normalizeJsonObject(row.resumen_impacto, {});
   const internalExecution = normalizeJsonObject(impact.internal_execution, {}) || {};
   const storageAssetIds = Array.isArray(internalExecution.storage_asset_ids) ? internalExecution.storage_asset_ids : [];
@@ -6180,7 +6203,12 @@ export async function finalizeApprovedInternalAccountDeletionAuthCleanup(client,
   deletionRequestId,
   traceRequestId,
   authUserAlreadyAbsent = false,
+  authAbsenceVerified = false,
 } = {}) {
+  // AM: El cierre requiere evidencia del ejecutor, nunca el resultado optimista de deleteUser.
+  if (!authAbsenceVerified) throw new AppError(409, "No se verifico la eliminacion de la identidad.", {
+    code: "ADMIN_ACCOUNT_DELETION_AUTH_VERIFICATION_REQUIRED",
+  });
   const row = await loadApprovedInternalExecutionRequest(client, deletionRequestId, "auth_pendiente");
   const summary = mergeAdminInternalSummary(row.resumen_impacto, "auth_cleanup", {
     processed_at: new Date().toISOString(),
@@ -6211,72 +6239,68 @@ export async function finalizeApprovedInternalAccountDeletionAuthCleanup(client,
   };
 }
 
-export async function runApprovedInternalAccountDeletionAuthCleanup(app, {
-  deletionRequestId,
-  traceRequestId,
-} = {}) {
+// AM: El lock de identidad cubre lookup/delete/verificacion; ninguna llamada externa mantiene una transaccion.
+export async function runApprovedInternalAccountDeletionAuthCleanup(app, { deletionRequestId, traceRequestId } = {}) {
   assertAccountDeletionAuthAvailable(app);
   const client = await app.db.connect();
-  let transactionStarted = false;
+  let lockUserId, transactionStarted = false, discardConnection = false, commitPending = false;
   try {
-    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
-    transactionStarted = true;
-    const row = await loadApprovedInternalExecutionRequest(client, deletionRequestId, "auth_pendiente");
-    await client.query("COMMIT");
-    transactionStarted = false;
-
-    const authUserId = row.auth_user_id_pendiente || row.id_usuario;
-    let authUserAlreadyAbsent = false;
-    try {
-      const lookup = await findAuthUserById(app, authUserId);
-      authUserAlreadyAbsent = !lookup.exists;
-      if (lookup.exists) {
-        const deleted = await deleteAuthUserById(app, authUserId);
-        if (!deleted.deleted) {
-          const absent = await verifyAuthUserAbsent(app, authUserId);
-          if (!absent) {
-            throw new AppError(503, "No fue posible completar la eliminacion de Auth. Intenta nuevamente.", {
-              code: "ADMIN_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE",
-            });
-          }
-        }
-      }
-    } catch (error) {
-      if (error instanceof AppError && error.statusCode === 503) {
-        await withAdminAccountDeletionTransaction(app, async (failureClient) => {
-          await failureClient.query(
-            `
-              UPDATE app_private.solicitudes_eliminacion_cuenta
-              SET estado_codigo = 'auth_pendiente',
-                  error_codigo = $2::text,
-                  error_detalle_tecnico = NULL,
-                  request_id = $3::text,
-                  updated_at = NOW()
-              WHERE id_solicitud = $1::uuid
-            `,
-            [deletionRequestId, error.code || "ADMIN_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE", traceRequestId]
-          );
-        });
-      }
-      throw error;
+    const context = await loadAdminRequestBase(client, deletionRequestId);
+    if (!context?.id_usuario) throw new AppError(409, "No se pudo validar la identidad de la solicitud.", { code: "ADMIN_ACCOUNT_DELETION_AUTH_IDENTITY_INVALID" });
+    await acquireAccountDeletionSessionLock(client, context.id_usuario);
+    lockUserId = context.id_usuario;
+    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE"); transactionStarted = true;
+    const row = await loadApprovedInternalExecutionRequest(client, deletionRequestId);
+    if (row.id_usuario !== lockUserId) throw new AppError(409, "La identidad de la solicitud cambio.", { code: "ADMIN_ACCOUNT_DELETION_AUTH_IDENTITY_INVALID" });
+    if (row.estado_codigo === "completada") {
+      await client.query("COMMIT"); transactionStarted = false;
+      return { completed: true, auth_processed: true, idempotent_replay: true };
     }
-
-    return withAdminAccountDeletionTransaction(app, (finalClient) => finalizeApprovedInternalAccountDeletionAuthCleanup(finalClient, {
-      deletionRequestId,
-      traceRequestId,
-      authUserAlreadyAbsent,
-    }));
+    if (row.estado_codigo !== "auth_pendiente") throw new AppError(409, "La solicitud no esta pendiente de Auth.", { code: "ADMIN_ACCOUNT_DELETION_STATE_INVALID" });
+    const ready = await client.query(`
+      -- AM: No eliminar Auth si acceso, roles, sesiones o identidades compartidas siguen activos.
+      SELECT (EXISTS (SELECT 1 FROM public.usuarios u WHERE u.id_usuario = $1::uuid
+        AND u.id_persona = $2::uuid AND u.estado IS FALSE AND u.estado_acceso = 'inactivo' AND u.deleted_at IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM public.roles_usuarios ru WHERE ru.id_usuario = $1::uuid AND ru.activo IS TRUE)
+        AND NOT EXISTS (SELECT 1 FROM public.seguridad_sesiones ss WHERE ss.id_usuario = $1::uuid AND ss.estado = 'activa')
+        AND NOT EXISTS (SELECT 1 FROM public.empleados e WHERE e.id_persona = $2::uuid AND (e.estado IS TRUE OR e.deleted_at IS NULL))
+        AND NOT EXISTS (SELECT 1 FROM public.clientes c WHERE c.id_persona = $2::uuid OR c.id_usuario = $1::uuid)
+        AND NOT EXISTS (SELECT 1 FROM public.usuarios other_user WHERE other_user.id_persona = $2::uuid AND other_user.id_usuario <> $1::uuid AND other_user.deleted_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM public.app_protected_users ap WHERE ap.id_usuario = $1::uuid AND ap.activo IS TRUE)
+      ) AS internal_auth_ready
+    `, [row.id_usuario, row.id_persona]);
+    if (ready.rows?.[0]?.internal_auth_ready !== true) throw new AppError(409, "La cuenta no esta preparada para eliminar Auth.", { code: "ADMIN_ACCOUNT_DELETION_AUTH_PRECONDITION_FAILED" });
+    await client.query("COMMIT"); transactionStarted = false;
+    const lookup = await findAuthUserById(app, row.id_usuario);
+    if (lookup.exists) {
+      await deleteAuthUserById(app, row.id_usuario);
+      if (!await verifyAuthUserAbsent(app, row.id_usuario)) throw new AppError(503, "No fue posible verificar la eliminacion de Auth. Reintenta.", { code: "ADMIN_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE" });
+    }
+    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE"); transactionStarted = true;
+    const result = await finalizeApprovedInternalAccountDeletionAuthCleanup(client, {
+      deletionRequestId, traceRequestId, authUserAlreadyAbsent: !lookup.exists, authAbsenceVerified: true,
+    });
+    commitPending = true; await client.query("COMMIT"); transactionStarted = false;
+    return result;
   } catch (error) {
-    if (transactionStarted) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {
-        // La excepcion original conserva el motivo funcional.
+    if (transactionStarted) { try { await client.query("ROLLBACK"); } catch { discardConnection = true; } }
+    if (!discardConnection && commitPending) {
+      // AM: Reconciliar una respuesta perdida del COMMIT sin resucitar acceso ni repetir Auth.
+      const recovered = await loadAdminRequestBase(client, deletionRequestId);
+      if (recovered?.estado_codigo === "completada" && normalizeJsonObject(recovered.resumen_impacto, {}).auth_cleanup?.auth_processed === true) {
+        return { completed: true, auth_processed: true, idempotent_replay: true };
       }
     }
-    throw mapAdminSerializationConflict(error);
+    if (!discardConnection) await client.query(`
+      UPDATE app_private.solicitudes_eliminacion_cuenta SET error_codigo = $2::text,
+        error_detalle_tecnico = NULL, request_id = $3::text, updated_at = NOW()
+      WHERE id_solicitud = $1::uuid AND estado_codigo = 'auth_pendiente'
+    `, [deletionRequestId, error instanceof AppError ? error.code : "ADMIN_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE", traceRequestId]);
+    if (error instanceof AppError && !discardConnection) throw error;
+    throw new AppError(503, "No fue posible confirmar la eliminacion de Auth. Reintenta.", { code: "ADMIN_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE" });
   } finally {
-    client.release();
+    if (lockUserId) { try { await releaseAccountDeletionSessionLock(client, lockUserId); } catch { discardConnection = true; } }
+    client.release(discardConnection ? new Error("AM: Auth cleanup connection discarded") : undefined);
   }
 }
 
@@ -6376,6 +6400,10 @@ export async function retryAdminAccountDeletionRequest(app, {
   try {
     const protectedAccount = await isAdminProtectedAccount(client, row.id_usuario);
     const permissions = computeAdminPermissions(row, actor, { protectedAccount });
+    // AM: Una respuesta perdida permite consultar el resultado terminal sin repetir etapas.
+    if (row.estado_codigo === "completada" && !permissions.reason_code) {
+      return buildAdminExecutionResponse(row, { idempotentReplay: true });
+    }
     assertAdminCanRetry(row, permissions);
   } finally {
     client.release();
@@ -6395,46 +6423,27 @@ export async function retryAdminAccountDeletionRequest(app, {
         code: "ADMIN_ACCOUNT_DELETION_CLIENT_RETRY_STATE_INVALID",
       });
     }
-    const result = await orchestrateClientAccountDeletion(app, {
-      reference: row.referencia_publica,
-      executionToken: "admin-retry-bypass",
-      traceRequestId,
-      stageRunners: {
-        internal: async () => ({ processed: true }),
-      },
-    }).catch(async (error) => {
-      if (error instanceof AppError && error.code === "CLIENT_ACCOUNT_DELETION_EXECUTION_CREDENTIAL_INVALID") {
-        if (row.estado_codigo === "procesando") {
-          await runClientAccountDeletionAnonymization(app, {
-            deletionRequestId: row.id_solicitud,
-            clienteId: row.id_cliente,
-            personaId: row.id_persona,
-            usuarioId: row.id_usuario,
-            traceRequestId,
-          });
-        } else if (row.estado_codigo === "storage_pendiente") {
-          await runClientAccountDeletionStorageCleanup(app, {
-            deletionRequestId: row.id_solicitud,
-            clienteId: row.id_cliente,
-            personaId: row.id_persona,
-            usuarioId: row.id_usuario,
-            traceRequestId,
-          });
-        } else if (row.estado_codigo === "auth_pendiente") {
-          await runClientAccountDeletionAuthCleanup(app, {
-            deletionRequestId: row.id_solicitud,
-            clienteId: row.id_cliente,
-            personaId: row.id_persona,
-            usuarioId: row.id_usuario,
-            traceRequestId,
-          });
-        }
-        const next = await loadAdminOrchestrationContext(app, requestId);
-        return buildAdminExecutionResponse(next);
+    const lock = await app.db.connect();
+    let held = false, discard = false;
+    try {
+      await lock.query("SELECT pg_advisory_lock(hashtext('masterfade.account_deletion.admin_retry'), hashtext($1::text))", [requestId]); held = true;
+      for (let attempt = 0; attempt < MAX_ACCOUNT_DELETION_ORCHESTRATION_ITERATIONS; attempt++) {
+        const current = await loadAdminOrchestrationContext(app, requestId);
+        if (current.tipo_sujeto !== "cliente" || current.id_usuario !== row.id_usuario
+          || current.id_persona !== row.id_persona || current.id_cliente !== row.id_cliente) throw new AppError(409, "La identidad de la solicitud cambio.", { code: "ADMIN_ACCOUNT_DELETION_RETRY_IDENTITY_CHANGED" });
+        if (current.estado_codigo === "completada") return buildAdminExecutionResponse(current);
+        if (!ADMIN_CLIENT_RETRY_STATES.includes(current.estado_codigo)) throw new AppError(409, "La solicitud no permite reintento.", { code: "ADMIN_ACCOUNT_DELETION_CLIENT_RETRY_STATE_INVALID" });
+        const options = { deletionRequestId: current.id_solicitud, clienteId: current.id_cliente,
+          personaId: current.id_persona, usuarioId: current.id_usuario, traceRequestId };
+        const stages = { procesando: runClientAccountDeletionAnonymization,
+          storage_pendiente: runClientAccountDeletionStorageCleanup, auth_pendiente: runClientAccountDeletionAuthCleanup };
+        await stages[current.estado_codigo](app, options);
       }
-      throw error;
-    });
-    return result;
+      return buildAdminExecutionResponse(await loadAdminOrchestrationContext(app, requestId));
+    } finally {
+      if (held) { try { await lock.query("SELECT pg_advisory_unlock(hashtext('masterfade.account_deletion.admin_retry'), hashtext($1::text))", [requestId]); } catch { discard = true; } }
+      lock.release(discard ? new Error("AM: Admin retry connection discarded") : undefined);
+    }
   }
 
   throw new AppError(409, "Tipo de solicitud no reintentable.", {

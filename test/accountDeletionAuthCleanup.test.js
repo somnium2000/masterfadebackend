@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   finalizeClientAccountDeletionAuthCleanup,
   runClientAccountDeletionAuthCleanup,
+  retryAdminAccountDeletionRequest,
 } from "../src/services/accountDeletionService.js";
 
 const CLIENTE_ID = "11111111-1111-4111-8111-111111111111";
@@ -196,6 +197,28 @@ function allSql(client) {
   return client.calls.map((call) => call.sql).join("\n");
 }
 
+// AM: El reintento administrativo ejecuta Auth real del servicio, sin token publico fabricado.
+test('AM: admin retry cliente auth_pendiente completa sin admin-retry-bypass', async () => {
+  const row = requestRow({ tipo_sujeto: 'cliente', id_usuario: USUARIO_ID, id_persona: PERSONA_ID,
+    id_cliente: CLIENTE_ID, active_roles: [] });
+  const client = createClient({ request: row });
+  const original = client.query.bind(client);
+  client.query = async (sql, params) => {
+    if (sql.includes('FROM app_private.solicitudes_eliminacion_cuenta') && !sql.includes('FOR UPDATE')) return { rows: [row] };
+    const result = await original(sql, params);
+    if (sql.includes("SET estado_codigo = 'completada'")) row.estado_codigo = 'completada';
+    return result;
+  };
+  const supabase = makeSupabase(makeAuth({ getResults: [{ error: notFoundError() }] }));
+  const result = await retryAdminAccountDeletionRequest(makeApp(client, supabase), {
+    requestId: REQUEST_ID, actor: { usuarioId: ASSET_ID, roles: ['super_admin'], highestRank: 90 },
+  });
+  assert.equal(result.completed, true);
+  assert.equal(row.estado_codigo, 'completada');
+  assert.equal(client.calls.some(call => call.params.includes('admin-retry-bypass')), false);
+  assert.equal(authCalls(supabase, 'getUserById').length, 1);
+});
+
 function authCalls(supabase, type) {
   return supabase.auth.calls.filter((call) => call.type === type);
 }
@@ -349,11 +372,14 @@ test("Auth ya inexistente se trata como exito", async () => {
   assert.equal(authCalls(supabase, "deleteUser").length, 0);
 });
 
-test("error 404 se clasifica como inexistente", async () => {
+// AM: Un 404 de infraestructura no demuestra ausencia en Auth.
+test("error 404 desconocido conserva Auth pendiente", async () => {
   const client = createClient();
   const supabase = makeSupabase(makeAuth({ getResults: [{ error: { status: 404, message: "missing" } }] }));
-  const result = await cleanup(client, makeApp(client, supabase));
-  assert.equal(result.completed, true);
+  await assert.rejects(cleanup(client, makeApp(client, supabase)), {
+    code: "CLIENT_ACCOUNT_DELETION_AUTH_TEMPORARY_FAILURE",
+  });
+  assert.equal(authCalls(supabase, "deleteUser").length, 0);
 });
 
 test("error Auth generico no se clasifica como inexistente", async () => {
