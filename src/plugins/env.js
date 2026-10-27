@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import fp from "fastify-plugin";
 import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
 import { resolveTodoPagoConfig } from "../services/payments/todopago/todoPagoConfig.js";
+import { validatePixelPaySdkConfig } from "../services/payments/PixelPaySdkProvider.js";
 
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -107,21 +108,34 @@ async function envPlugin(app) {
     if (!["direct", "sdk"].includes(pixelPayImplementation)) {
       throw new Error("PIXELPAY_IMPLEMENTATION invalido. Usa direct o sdk.");
     }
-    if (nodeEnv === "production" || nodeEnv === "staging") {
-      throw new Error("PixelPay solo esta habilitado para QA.");
+    const pixelPayEnv = String(process.env.PIXELPAY_ENV || "").trim().toLowerCase();
+    if (nodeEnv === "production" && pixelPayEnv !== "live") {
+      throw new Error("PixelPay en produccion requiere PIXELPAY_ENV=live.");
     }
-    if (String(process.env.PIXELPAY_ENV || "").trim().toLowerCase() !== "sandbox") {
-      throw new Error("PIXELPAY_ENV debe ser sandbox para PixelPay.");
+    if (nodeEnv !== "production" && pixelPayEnv !== "sandbox") {
+      throw new Error("PixelPay fuera de produccion requiere PIXELPAY_ENV=sandbox.");
     }
-    if (String(process.env.PIXELPAY_ENDPOINT || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
-      throw new Error("PIXELPAY_ENDPOINT debe apuntar al sandbox oficial de PixelPay.");
+    if (pixelPayEnv === "live" && pixelPayImplementation !== "sdk") {
+      throw new Error("PixelPay live requiere PIXELPAY_IMPLEMENTATION=sdk.");
     }
-    if (String(process.env.PIXELPAY_APP_URL || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
-      throw new Error("PIXELPAY_APP_URL debe ser https://pixelpay.dev en Sandbox.");
-    }
-    readRequired("PIXELPAY_KEY_ID");
-    readRequired("PIXELPAY_SECRET_KEY");
-    if (pixelPayImplementation === "direct") {
+    if (pixelPayImplementation === "sdk") {
+      validatePixelPaySdkConfig({
+        endpoint: process.env.PIXELPAY_ENDPOINT,
+        env: pixelPayEnv,
+        keyId: process.env.PIXELPAY_KEY_ID,
+        secretKey: process.env.PIXELPAY_SECRET_KEY,
+        authHash: process.env.PIXELPAY_AUTH_HASH,
+        appUrl: process.env.PIXELPAY_APP_URL,
+      });
+    } else {
+      if (String(process.env.PIXELPAY_ENDPOINT || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
+        throw new Error("PIXELPAY_ENDPOINT debe apuntar al sandbox oficial de PixelPay.");
+      }
+      if (String(process.env.PIXELPAY_APP_URL || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
+        throw new Error("PIXELPAY_APP_URL debe ser https://pixelpay.dev en Sandbox.");
+      }
+      readRequired("PIXELPAY_KEY_ID");
+      readRequired("PIXELPAY_SECRET_KEY");
       readRequired("PIXELPAY_AUTH_HASH");
     }
     parseIntegerInRange(process.env.PIXELPAY_HTTP_TIMEOUT_MS, "PIXELPAY_HTTP_TIMEOUT_MS", {

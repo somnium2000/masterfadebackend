@@ -174,8 +174,18 @@ function makeProvider(fake, overrides = {}) {
     env: "sandbox",
     keyId: KEY_ID,
     secretKey: SECRET,
+    authHash: AUTH_HASH,
     appUrl: "https://pixelpay.dev",
     sdk: fake.sdk,
+    ...overrides,
+  });
+}
+
+function makeLiveProvider(fake, overrides = {}) {
+  return makeProvider(fake, {
+    endpoint: "https://merchant.pixelpay.app",
+    env: "live",
+    appUrl: "https://masterfadeapp.com",
     ...overrides,
   });
 }
@@ -280,6 +290,44 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   assert.equal(fake.calls.setupCredentials, 0);
   assert.equal(fake.calls.setupEnvironment, 0);
   assert.equal(fake.calls.setupHeaders.length, 1);
+});
+
+test("SDK live configura endpoint, credenciales, ambiente y headers oficiales para Sale y Status", async () => {
+  const resultData = approvedData();
+  const fake = makeFakeSdk({
+    saleResponse: sdkResponse(200, { data: resultData }),
+    statusResponse: sdkResponse(200, { data: { status: "paid", ...resultData } }),
+    transactionResult: resultData,
+  });
+  const provider = makeLiveProvider(fake);
+
+  await provider.sale(saleInput);
+  await provider.queryPaymentStatus(PAYMENT_UUID, { orderId: ORDER_ID, amount: 1 });
+
+  assert.equal(fake.calls.sale, 1);
+  assert.equal(fake.calls.status, 1);
+  assert.equal(fake.calls.setupSandbox, 0);
+  assert.equal(fake.calls.setupEndpoint, 2);
+  assert.equal(fake.calls.setupCredentials, 2);
+  assert.equal(fake.calls.setupEnvironment, 2);
+  assert.equal(fake.calls.setupHeaders.length, 2);
+  for (const settings of fake.calls.settings) {
+    assert.equal(settings.endpoint, "https://merchant.pixelpay.app");
+    assert.equal(settings.environment, "live");
+    assert.equal(settings.auth_key, KEY_ID);
+    assert.equal(settings.auth_hash, AUTH_HASH);
+    assert.match(settings.headers["x-client-signature"], /^[a-f0-9]{128}$/);
+  }
+});
+
+test("SDK bloquea credenciales faltantes y combinaciones cruzadas Sandbox/live", () => {
+  const fake = makeFakeSdk();
+  assert.throws(() => makeLiveProvider(fake, { authHash: "" }), /PIXELPAY_AUTH_HASH/);
+  assert.throws(() => makeLiveProvider(fake, { endpoint: "https://pixelpay.dev" }), /endpoint live/i);
+  assert.throws(() => makeLiveProvider(fake, { appUrl: "https://pixelpay.dev" }), /APP_URL live/i);
+  assert.throws(() => makeProvider(fake, { endpoint: "https://merchant.pixelpay.app" }), /endpoint Sandbox/i);
+  assert.throws(() => makeProvider(fake, { appUrl: "https://masterfadeapp.com" }), /APP_URL Sandbox/i);
+  assert.throws(() => makeProvider(fake, { env: "production" }), /PIXELPAY_ENV/);
 });
 
 test("telemetria correlaciona STARTED, HTTP_STARTED y RESPONSE_RECEIVED en Sale simulada", async () => {
@@ -1043,7 +1091,19 @@ test("PaymentProviderFactory conserva direct por default y permite sdk explicito
     PaymentProviderFactory.reset();
     const sdkProvider = PaymentProviderFactory.create();
     assert.ok(sdkProvider instanceof PixelPaySdkProvider);
-    assert.equal(Object.hasOwn(sdkProvider, "authHash"), false);
+    assert.equal(sdkProvider.authHash, "");
+
+    Object.assign(process.env, {
+      PIXELPAY_ENV: "live",
+      PIXELPAY_ENDPOINT: "https://merchant.pixelpay.app",
+      PIXELPAY_APP_URL: "https://masterfadeapp.com",
+      PIXELPAY_AUTH_HASH: AUTH_HASH,
+    });
+    PaymentProviderFactory.reset();
+    const liveSdkProvider = PaymentProviderFactory.create();
+    assert.ok(liveSdkProvider instanceof PixelPaySdkProvider);
+    assert.equal(liveSdkProvider.authHash, AUTH_HASH);
+    assert.equal(liveSdkProvider.env, "live");
 
     process.env.PIXELPAY_IMPLEMENTATION = "invalid";
     PaymentProviderFactory.reset();
@@ -1057,7 +1117,7 @@ test("PaymentProviderFactory conserva direct por default y permite sdk explicito
   }
 });
 
-test("configuracion QA SDK no requiere PIXELPAY_AUTH_HASH y Direct lo conserva obligatorio", async () => {
+test("configuracion QA SDK usa exclusivamente Sandbox y Direct conserva AUTH_HASH obligatorio", async () => {
   const names = [
     "NODE_ENV", "FRONTEND_URL", "JWT_SECRET", "COOKIE_SECRET", "CSRF_SECRET",
     "PAYMENT_PROVIDER", "PIXELPAY_IMPLEMENTATION", "PIXELPAY_ENV", "PIXELPAY_ENDPOINT",
@@ -1091,6 +1151,61 @@ test("configuracion QA SDK no requiere PIXELPAY_AUTH_HASH y Direct lo conserva o
     directApp.register(envPlugin);
     await assert.rejects(directApp.ready(), /PIXELPAY_AUTH_HASH/);
     await directApp.close();
+  } finally {
+    for (const name of names) {
+      if (previous[name] == null) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
+
+test("configuracion produccion SDK exige live completo y rechaza cruces con Sandbox", async () => {
+  const names = [
+    "NODE_ENV", "ENTORNO", "FRONTEND_URL", "JWT_SECRET", "COOKIE_SECRET", "CSRF_SECRET",
+    "AUTH_COOKIE_SECURE", "BOOKING_RELEASE_TOKEN_SECRET", "PAYMENT_PROVIDER", "PIXELPAY_IMPLEMENTATION",
+    "PIXELPAY_ENV", "PIXELPAY_ENDPOINT", "PIXELPAY_APP_URL", "PIXELPAY_KEY_ID",
+    "PIXELPAY_SECRET_KEY", "PIXELPAY_AUTH_HASH",
+  ];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, {
+    NODE_ENV: "production",
+    ENTORNO: "production",
+    FRONTEND_URL: "https://masterfadeapp.com",
+    JWT_SECRET: "production-jwt-secret-at-least-24",
+    COOKIE_SECRET: "production-cookie-secret-at-least-24",
+    CSRF_SECRET: "production-csrf-secret-at-least-24",
+    AUTH_COOKIE_SECURE: "true",
+    BOOKING_RELEASE_TOKEN_SECRET: "p".repeat(64),
+    PAYMENT_PROVIDER: "pixelpay",
+    PIXELPAY_IMPLEMENTATION: "sdk",
+    PIXELPAY_ENV: "live",
+    PIXELPAY_ENDPOINT: "https://merchant.pixelpay.app",
+    PIXELPAY_APP_URL: "https://masterfadeapp.com",
+    PIXELPAY_KEY_ID: "live-key-not-real",
+    PIXELPAY_SECRET_KEY: "live-secret-not-real",
+    PIXELPAY_AUTH_HASH: "live-auth-hash-not-real",
+  });
+
+  async function ready() {
+    const app = Fastify();
+    app.register(envPlugin);
+    try { await app.ready(); } finally { await app.close(); }
+  }
+
+  try {
+    await ready();
+    process.env.PIXELPAY_AUTH_HASH = "";
+    await assert.rejects(ready(), /PIXELPAY_AUTH_HASH/);
+    process.env.PIXELPAY_AUTH_HASH = "live-auth-hash-not-real";
+    process.env.PIXELPAY_ENV = "sandbox";
+    process.env.PIXELPAY_ENDPOINT = "https://pixelpay.dev";
+    process.env.PIXELPAY_APP_URL = "https://pixelpay.dev";
+    await assert.rejects(ready(), /produccion.*live/i);
+    process.env.PIXELPAY_ENV = "live";
+    process.env.PIXELPAY_ENDPOINT = "https://merchant.pixelpay.app";
+    process.env.PIXELPAY_APP_URL = "https://masterfadeapp.com";
+    process.env.PIXELPAY_IMPLEMENTATION = "direct";
+    await assert.rejects(ready(), /live.*sdk/i);
   } finally {
     for (const name of names) {
       if (previous[name] == null) delete process.env[name];

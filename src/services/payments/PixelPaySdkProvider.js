@@ -26,6 +26,8 @@ const PIXELPAY_BILLING_ADDRESS_PLACEHOLDERS = new Set([
   "NONE",
   "NULL",
 ]);
+const PIXELPAY_SANDBOX_URL = "https://pixelpay.dev";
+const PIXELPAY_ENVIRONMENTS = new Set(["sandbox", "live"]);
 
 const SDK_FAILURE_MESSAGE_CODES = new Map([
   ["Could not obtain necessary credentials for transaction.", "SDK_PUBLIC_KEY_UNAVAILABLE"],
@@ -65,6 +67,63 @@ function safeIdentifier(value) {
 
 function valuePresent(value) {
   return value !== null && value !== undefined && text(value) !== "";
+}
+
+function normalizeHttpsUrl(value, name) {
+  const normalized = text(value).replace(/\/+$/, "");
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new Error(`${name} debe ser una URL HTTPS valida.`);
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error(`${name} debe ser una URL HTTPS valida.`);
+  }
+  return normalized;
+}
+
+export function validatePixelPaySdkConfig({ endpoint, env, keyId, secretKey, authHash, appUrl } = {}) {
+  const normalizedEnv = text(env).toLowerCase();
+  const normalizedEndpoint = normalizeHttpsUrl(endpoint, "PIXELPAY_ENDPOINT");
+  const normalizedAppUrl = normalizeHttpsUrl(appUrl, "PIXELPAY_APP_URL");
+  const normalizedKeyId = text(keyId);
+  const normalizedSecretKey = text(secretKey);
+  const normalizedAuthHash = text(authHash);
+
+  if (!PIXELPAY_ENVIRONMENTS.has(normalizedEnv)) {
+    throw new Error("PIXELPAY_ENV invalido. Usa sandbox o live.");
+  }
+  if (!normalizedKeyId) throw new Error("Configuracion PixelPay SDK incompleta: PIXELPAY_KEY_ID.");
+  if (!normalizedSecretKey) throw new Error("Configuracion PixelPay SDK incompleta: PIXELPAY_SECRET_KEY.");
+
+  if (normalizedEnv === "sandbox") {
+    if (normalizedEndpoint !== PIXELPAY_SANDBOX_URL) {
+      throw new Error("PIXELPAY_ENDPOINT Sandbox debe ser https://pixelpay.dev.");
+    }
+    if (normalizedAppUrl !== PIXELPAY_SANDBOX_URL) {
+      throw new Error("PIXELPAY_APP_URL Sandbox debe ser https://pixelpay.dev.");
+    }
+  } else {
+    if (normalizedEndpoint === PIXELPAY_SANDBOX_URL) {
+      throw new Error("PIXELPAY_ENDPOINT live no puede usar el endpoint Sandbox.");
+    }
+    if (normalizedAppUrl === PIXELPAY_SANDBOX_URL) {
+      throw new Error("PIXELPAY_APP_URL live no puede usar la URL Sandbox.");
+    }
+    if (!normalizedAuthHash) {
+      throw new Error("Configuracion PixelPay SDK live incompleta: PIXELPAY_AUTH_HASH.");
+    }
+  }
+
+  return {
+    endpoint: normalizedEndpoint,
+    env: normalizedEnv,
+    keyId: normalizedKeyId,
+    secretKey: normalizedSecretKey,
+    authHash: normalizedAuthHash,
+    appUrl: normalizedAppUrl,
+  };
 }
 
 export function inspectPixelPayCardExpire(value, referenceDate = new Date()) {
@@ -120,7 +179,7 @@ function normalizeBillingCountry(value) {
   if (normalized !== "HN") {
     throw new PixelPaySdkError(
       "PIXELPAY_BILLING_COUNTRY_INVALID",
-      "El pais de facturacion no es valido para QA."
+      "El pais de facturacion debe ser HN."
     );
   }
   return normalized;
@@ -179,9 +238,12 @@ function assertSdkShape(sdk) {
   const settingsPrototype = sdk.Models.Settings.prototype;
   if (
     typeof settingsPrototype?.setupSandbox !== "function"
+    || typeof settingsPrototype?.setupEndpoint !== "function"
+    || typeof settingsPrototype?.setupCredentials !== "function"
+    || typeof settingsPrototype?.setupEnvironment !== "function"
     || typeof settingsPrototype?.setupHeaders !== "function"
   ) {
-    throw new Error("@pixelpay/sdk-core no expone Settings Sandbox requerido.");
+    throw new Error("@pixelpay/sdk-core no expone los metodos Settings requeridos.");
   }
 }
 
@@ -234,29 +296,22 @@ export class PixelPaySdkProvider extends PaymentProvider {
     env,
     keyId,
     secretKey,
+    authHash,
     appUrl,
     sdk = PixelPaySdk,
     now = () => new Date(),
   } = {}) {
     super();
-    this.endpoint = text(endpoint).replace(/\/+$/, "");
-    this.env = text(env).toLowerCase();
-    this.keyId = text(keyId);
-    this.secretKey = text(secretKey);
-    this.appUrl = text(appUrl).replace(/\/+$/, "");
+    const config = validatePixelPaySdkConfig({ endpoint, env, keyId, secretKey, authHash, appUrl });
+    this.endpoint = config.endpoint;
+    this.env = config.env;
+    this.keyId = config.keyId;
+    this.secretKey = config.secretKey;
+    this.authHash = config.authHash;
+    this.appUrl = config.appUrl;
     this.sdk = sdk;
     this.now = now;
 
-    if (
-      this.env !== "sandbox"
-      || this.endpoint !== "https://pixelpay.dev"
-      || this.appUrl !== "https://pixelpay.dev"
-    ) {
-      throw new Error("PixelPay SDK solo esta habilitado para sandbox QA.");
-    }
-    if (!this.keyId || !this.secretKey || !this.appUrl) {
-      throw new Error("Configuracion PixelPay SDK incompleta.");
-    }
     assertSdkShape(this.sdk);
     if (typeof this.now !== "function") throw new Error("Reloj PixelPay invalido.");
 
@@ -267,7 +322,13 @@ export class PixelPaySdkProvider extends PaymentProvider {
 
   createTransaction(signature) {
     const settings = new this.sdk.Models.Settings();
-    settings.setupSandbox();
+    if (this.env === "sandbox") {
+      settings.setupSandbox();
+    } else {
+      settings.setupEndpoint(this.endpoint);
+      settings.setupCredentials(this.keyId, this.authHash);
+      settings.setupEnvironment("live");
+    }
     settings.setupHeaders({ "x-client-signature": signature });
     return new this.sdk.Services.Transaction(settings);
   }
