@@ -161,14 +161,13 @@ function normalizeOptionalText(value) {
   return normalized || null;
 }
 
-function normalizeOptionalDigits(value, field) {
-  if (value === undefined) return undefined;
-  const normalized = String(value ?? "").replace(/\D/g, "");
-  if (!normalized) return null;
-  if (normalized.length > 32) {
-    throw new AppError(422, `${field} excede la longitud permitida`, {
-      code: "BARBER_PROFILE_DIGITS_TOO_LONG",
-      details: { field },
+function normalizeProfilePhone(value) {
+  const raw = String(value ?? "").trim();
+  // AM: Conserva el mínimo de ocho dígitos y normalización internacional del contacto existente.
+  const normalized = raw.replace(/[()\s.-]/g, "");
+  if (!/^[+()\s.\d-]+$/.test(raw) || !/^\+?\d{8,20}$/.test(normalized) || normalized.length > 20) {
+    throw new AppError(422, "El telefono principal es obligatorio y debe tener un formato valido", {
+      code: "BARBER_PROFILE_PHONE_INVALID",
     });
   }
   return normalized;
@@ -179,14 +178,12 @@ function normalizeDateOnly(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
   const parsed = new Date(`${raw}T00:00:00.000Z`);
-  if (Number.isNaN(parsed.getTime())) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) {
     throw new AppError(400, "fecha_nacimiento invalida", {
       code: "BARBER_PROFILE_DATE_INVALID",
     });
   }
-  const today = new Date();
-  const todayUtc = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
-  if (parsed.getTime() > todayUtc) {
+  if (raw > getCurrentDateInTimeZone()) {
     throw new AppError(400, "fecha_nacimiento no puede estar en el futuro", {
       code: "BARBER_PROFILE_DATE_FUTURE",
     });
@@ -299,7 +296,7 @@ function mapOfferedServiceRow(row) {
   };
 }
 
-async function buildBarberProfilePayload(app, request, userId) {
+async function buildBarberProfilePayload(app, request, userId, db = app.db) {
   const operationalDate = getCurrentDateInTimeZone();
   if (!userId || !operationalDate) {
     throw new AppError(500, "No se pudo resolver el contexto del perfil del barbero", {
@@ -307,7 +304,7 @@ async function buildBarberProfilePayload(app, request, userId) {
     });
   }
 
-  const { rows } = await app.db.query(BARBER_PROFILE_SQL, [userId]);
+  const { rows } = await db.query(BARBER_PROFILE_SQL, [userId]);
   if (!rows.length) {
     throw new AppError(404, "No se encontro un perfil activo de barbero para este usuario", {
       code: "BARBER_PROFILE_NOT_FOUND",
@@ -316,12 +313,12 @@ async function buildBarberProfilePayload(app, request, userId) {
 
   const baseProfile = rows[0];
   const [summaryResult, offeredServicesResult] = await Promise.all([
-    app.db.query(BARBER_SUMMARY_SQL, [
+    db.query(BARBER_SUMMARY_SQL, [
       baseProfile.id_empleado,
       operationalDate,
       PENDING_APPOINTMENT_STATES,
     ]),
-    app.db.query(BARBER_OFFERED_SERVICES_SQL, [baseProfile.id_empleado]),
+    db.query(BARBER_OFFERED_SERVICES_SQL, [baseProfile.id_empleado]),
   ]);
 
   let fotoPerfilSignedUrl = null;
@@ -366,6 +363,15 @@ export default async function barberoRoutes(app) {
     "/perfil",
     {
       preHandler: app.requireRoles(BARBER_ALLOWED_ROLES),
+      preValidation: async (request) => {
+        // AM: Rechaza explícitamente campos ajenos antes de que AJV elimine propiedades adicionales.
+        const allowed = new Set(["telefono_principal", "fecha_nacimiento", "genero_codigo", "direccion_texto"]);
+        if (Object.keys(request.body || {}).some((key) => !allowed.has(key))) {
+          throw new AppError(400, "Solo puedes editar telefono, fecha de nacimiento, genero y direccion", {
+            code: "BARBER_PROFILE_FIELDS_FORBIDDEN",
+          });
+        }
+      },
       schema: {
         body: {
           type: "object",
@@ -373,10 +379,7 @@ export default async function barberoRoutes(app) {
             telefono_principal: { type: ["string", "null"], maxLength: 40 },
             fecha_nacimiento: { type: ["string", "null"], format: "date" },
             genero_codigo: { type: ["string", "null"], maxLength: 40 },
-            dni: { type: ["string", "null"], maxLength: 32 },
-            rtn: { type: ["string", "null"], maxLength: 32 },
             direccion_texto: { type: ["string", "null"], maxLength: 300 },
-            observaciones: { type: ["string", "null"], maxLength: 1000 },
           },
           additionalProperties: false,
         },
@@ -389,10 +392,7 @@ export default async function barberoRoutes(app) {
         "telefono_principal",
         "fecha_nacimiento",
         "genero_codigo",
-        "dni",
-        "rtn",
         "direccion_texto",
-        "observaciones",
       ].some((key) => Object.prototype.hasOwnProperty.call(body, key));
 
       if (!hasAnyPatch) {
@@ -402,10 +402,14 @@ export default async function barberoRoutes(app) {
         });
       }
 
-      const client = await app.db.connect();
+      let client;
+      let releaseError;
       let transactionStarted = false;
       try {
-        const { rows } = await client.query(BARBER_PROFILE_SQL, [userId]);
+        client = await app.db.connect();
+        await client.query("BEGIN");
+        transactionStarted = true;
+        const { rows } = await client.query(`${BARBER_PROFILE_SQL}\n FOR UPDATE OF e, p, u`, [userId]);
         if (!rows.length) {
           throw new AppError(404, "No se encontro un perfil activo de barbero para este usuario", {
             code: "BARBER_PROFILE_NOT_FOUND",
@@ -413,66 +417,49 @@ export default async function barberoRoutes(app) {
         }
 
         const current = rows[0];
-        const nextTelefono = Object.prototype.hasOwnProperty.call(body, "telefono_principal")
-          ? normalizeOptionalText(body.telefono_principal)
-          : current.telefono_principal;
-        const nextFechaNacimiento = Object.prototype.hasOwnProperty.call(body, "fecha_nacimiento")
-          ? normalizeDateOnly(body.fecha_nacimiento)
-          : current.fecha_nacimiento;
-        const nextGenero = Object.prototype.hasOwnProperty.call(body, "genero_codigo")
-          ? await resolveGeneroCodigoForUpdate(client, body.genero_codigo)
-          : current.genero_codigo;
-        const nextDni = Object.prototype.hasOwnProperty.call(body, "dni")
-          ? normalizeOptionalDigits(body.dni, "dni")
-          : current.dni;
-        const nextRtn = Object.prototype.hasOwnProperty.call(body, "rtn")
-          ? normalizeOptionalDigits(body.rtn, "rtn")
-          : current.rtn;
-        const nextDireccion = Object.prototype.hasOwnProperty.call(body, "direccion_texto")
-          ? normalizeOptionalText(body.direccion_texto)
-          : current.direccion_texto;
-        const nextObservaciones = Object.prototype.hasOwnProperty.call(body, "observaciones")
-          ? normalizeOptionalText(body.observaciones)
-          : current.observaciones;
-
-        await client.query("BEGIN");
-        transactionStarted = true;
-        await client.query(
+        const assignments = [];
+        const params = [current.id_persona];
+        for (const field of ["telefono_principal", "fecha_nacimiento", "genero_codigo", "direccion_texto"]) {
+          if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+          const value = field === "telefono_principal" ? normalizeProfilePhone(body[field])
+            : field === "fecha_nacimiento" ? normalizeDateOnly(body[field])
+              : field === "genero_codigo" ? await resolveGeneroCodigoForUpdate(client, body[field])
+                : normalizeOptionalText(body[field]);
+          params.push(value);
+          assignments.push(`${field} = $${params.length}${field === "fecha_nacimiento" ? "::date" : ""}`);
+        }
+        // AM: Cada PATCH escribe solamente sus campos; las identidades quedan bloqueadas hasta COMMIT.
+        const updated = await client.query(
           `
             UPDATE public.personas
-            SET telefono_principal = $2,
-                fecha_nacimiento = $3::date,
-                genero_codigo = $4,
-                dni = $5,
-                rtn = $6,
-                direccion_texto = $7,
-                observaciones = $8,
+            SET ${assignments.join(", ")},
                 updated_at = NOW()
             WHERE id_persona = $1::uuid
           `,
-          [
-            current.id_persona,
-            nextTelefono,
-            nextFechaNacimiento,
-            nextGenero,
-            nextDni,
-            nextRtn,
-            nextDireccion,
-            nextObservaciones,
-          ]
+          params
         );
+        if (updated.rowCount !== 1) throw new AppError(404, "No se encontro el perfil para actualizar", { code: "BARBER_PROFILE_NOT_FOUND" });
+
+        // AM: La respuesta se prepara en la misma transacción; no hay lecturas que fallen tras confirmar.
+        const payload = await buildBarberProfilePayload(app, request, userId, client);
         await client.query("COMMIT");
         transactionStarted = false;
-
-        const payload = await buildBarberProfilePayload(app, request, userId);
         return sendOk(reply, payload, { requestId: request.id });
       } catch (error) {
         if (transactionStarted) {
-          await client.query("ROLLBACK").catch(() => {});
+          // AM: Un cliente cuyo ROLLBACK falla no debe regresar disponible al pool.
+          await client.query("ROLLBACK").catch((rollbackError) => { releaseError = rollbackError; });
         }
-        return sendHandled(reply, request, error, "No se pudo actualizar el perfil del barbero", "BARBER_PROFILE_PATCH_ERROR");
+        const code = String(error?.code || "");
+        if (code.startsWith("08") || code === "57P01") releaseError = error;
+        const controlled = code === "23505" ? new AppError(409, "Existe un dato duplicado. Revisa el perfil.", { code: "BARBER_PROFILE_CONFLICT" })
+          : ["23514", "23502", "23503", "22001", "22007", "22008", "22P02"].includes(code) ? new AppError(422, "Los datos no cumplen las reglas del perfil. Revisa los valores.", { code: "BARBER_PROFILE_CONSTRAINT" })
+            : ["40001", "40P01"].includes(code) ? new AppError(409, "El perfil cambio durante la operacion. Intenta nuevamente.", { code: "BARBER_PROFILE_CONCURRENT_UPDATE" })
+              : code.startsWith("08") || code === "57P01" ? new AppError(503, "No se pudo guardar el perfil. Intenta nuevamente.", { code: "BARBER_PROFILE_UNAVAILABLE" })
+                : error;
+        return sendHandled(reply, request, controlled, "No se pudo actualizar el perfil del barbero", "BARBER_PROFILE_PATCH_ERROR");
       } finally {
-        client.release();
+        client?.release(releaseError);
       }
     }
   );
