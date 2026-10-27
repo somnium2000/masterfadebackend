@@ -194,6 +194,7 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
   const recoveryClient = crypto.randomUUID();
   const expiry = new Date(Date.now() - 60_000);
   const verifiedAt = new Date(expiry.getTime() - 60_000);
+  const verifiedAtWithMicroseconds = "2026-10-25T14:52:59.661234Z";
   await pool.query(`INSERT INTO ${schema}.membership_purchase_orders
     (id_order,id_cliente,expires_at,estado_orden_codigo) VALUES ($1,$2,$3,'pendiente_pago')`,
   [recoveryOrder, recoveryClient, expiry]);
@@ -207,7 +208,7 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
     recoveryIntent,
     JSON.stringify({ provider: "pixelpay", payment_uuid: recoveryPaymentUuid,
       transaction_id: repeatedTransactionId, verified_at: verifiedAt.toISOString() }),
-    verifiedAt,
+    verifiedAtWithMicroseconds,
   ]);
   const qaColumns = await pool.query(`SELECT column_name, data_type, column_default
     FROM information_schema.columns WHERE table_schema=$1 AND table_name='payment_events'
@@ -223,7 +224,8 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
       pi.estado_intent_codigo, pi.monto_hnl, pi.moneda_codigo, pi.expires_at AS intent_expires_at,
       mpo.id_cliente, mpo.expires_at AS order_expires_at, mpo.estado_orden_codigo,
       mpo.id_suscripcion, pp.codigo AS provider_code,
-      pe.payload_esencial, pe.recibido_at AS verified_at
+      pe.payload_esencial,
+      to_char(pe.recibido_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS verified_at
     FROM ${schema}.payment_intents pi
     JOIN ${schema}.membership_purchase_orders mpo ON mpo.id_order = pi.id_membership_order
     JOIN ${schema}.payment_providers pp ON pp.id_provider = pi.id_provider
@@ -235,7 +237,13 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
     ORDER BY pe.recibido_at DESC LIMIT 1 FOR UPDATE OF pi`, [recoveryIntent]);
   assert.equal(durableResult.rows[0].provider_code, "pixelpay");
   assert.equal(durableResult.rows[0].id_cliente, recoveryClient);
-  assert.equal(new Date(durableResult.rows[0].verified_at).toISOString(), verifiedAt.toISOString());
+  assert.equal(durableResult.rows[0].verified_at, verifiedAtWithMicroseconds);
+  const rawVerifiedAt = (await pool.query(`SELECT recibido_at FROM ${schema}.payment_events
+    WHERE id_intent=$1`, [recoveryIntent])).rows[0].recibido_at;
+  await assert.rejects(
+    pool.query("SELECT $1::timestamptz", [String(rawVerifiedAt)]),
+    { code: "22007" },
+  );
   const recover = async () => {
     const client = await pool.connect();
     try {
@@ -244,7 +252,7 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
         (id_intent,provider_tx_id,monto_hnl,moneda_codigo,paid_at)
         VALUES ($1,$2,1,'HNL',$3) ON CONFLICT(provider_tx_id) DO UPDATE SET monto_hnl=EXCLUDED.monto_hnl
         WHERE ${schema}.payments.id_intent=EXCLUDED.id_intent RETURNING id_payment,pago_tardio,paid_at`,
-      [recoveryIntent, recoveryPaymentUuid, verifiedAt]);
+      [recoveryIntent, recoveryPaymentUuid, durableResult.rows[0].verified_at]);
       assert.equal(paymentResult.rows[0].pago_tardio, false);
       const subscription = await client.query(`INSERT INTO ${schema}.subscriptions(id_intent) VALUES ($1)
         ON CONFLICT(id_intent) DO UPDATE SET id_intent=EXCLUDED.id_intent RETURNING id_suscripcion`, [recoveryIntent]);
@@ -264,8 +272,10 @@ test("PostgreSQL 17 aislado: payment_uuid separa colisiones Sandbox y bloquea re
   assert.equal((await pool.query(`SELECT count(*)::int count FROM ${schema}.subscriptions WHERE id_intent=$1`, [recoveryIntent])).rows[0].count, 1);
   assert.equal((await pool.query(`SELECT count(*)::int count FROM ${schema}.subscription_payments sp
     JOIN ${schema}.subscriptions s USING(id_suscripcion) WHERE s.id_intent=$1`, [recoveryIntent])).rows[0].count, 1);
-  const persisted = (await pool.query(`SELECT paid_at FROM ${schema}.payments WHERE id_intent=$1`, [recoveryIntent])).rows[0];
-  assert.equal(new Date(persisted.paid_at).toISOString(), verifiedAt.toISOString());
+  const persisted = (await pool.query(`SELECT
+    to_char(paid_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS paid_at
+    FROM ${schema}.payments WHERE id_intent=$1`, [recoveryIntent])).rows[0];
+  assert.equal(persisted.paid_at, verifiedAtWithMicroseconds);
 
   const invalidIntent = crypto.randomUUID();
   await pool.query(`INSERT INTO ${schema}.payment_intents(id_intent,id_provider,expires_at) VALUES ($1,$2,$3)`,

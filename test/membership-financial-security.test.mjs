@@ -254,6 +254,7 @@ function pixelPayProcessHarness({
   durableVerifiedAt = null,
   providerSessionId = null,
   amount = 800,
+  rejectNonIsoPaidAt = false,
 } = {}) {
   const state = {
     intentState: initialIntentState, saleCalls: 0, commits: 0, rollbacks: 0,
@@ -289,6 +290,7 @@ function pixelPayProcessHarness({
       }
       if (text.includes("FROM public.payment_intents pi") && text.includes("JOIN public.payment_events pe")) {
         const currentEvidence = durableEvidence || state.dynamicDurableEvidence;
+        const currentVerifiedAt = durableVerifiedAt || state.dynamicVerifiedAt;
         return { rows: currentEvidence ? [{
           id_intent: INTENT,
           id_provider: row.id_provider,
@@ -303,7 +305,10 @@ function pixelPayProcessHarness({
           estado_orden_codigo: state.orderState,
           id_suscripcion: state.idSubscription,
           payload_esencial: currentEvidence,
-          verified_at: durableVerifiedAt || state.dynamicVerifiedAt,
+          verified_at: currentVerifiedAt instanceof Date
+            && text.includes("to_char(pe.recibido_at AT TIME ZONE 'UTC'")
+            ? currentVerifiedAt.toISOString()
+            : currentVerifiedAt,
         }] : [] };
       }
       if (text.includes("FROM public.payment_intents pi")) {
@@ -365,6 +370,11 @@ function pixelPayProcessHarness({
         return { rows: [{ id_intent: INTENT }] };
       }
       if (text.startsWith("INSERT INTO public.payments")) {
+        if (rejectNonIsoPaidAt && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3,6}Z$/.test(values[5])) {
+          const error = new Error(`invalid input syntax for type timestamp with time zone: "${values[5]}"`);
+          error.code = "22007";
+          throw error;
+        }
         state.payments += 1;
         state.paymentProviderTxIds.push(values[1]);
         state.paymentAmounts.push(values[2]);
@@ -787,6 +797,38 @@ test("recuperacion durable activa sin ejecutar un segundo Sale", async (t) => {
   assert.equal(state.payments, 1);
   assert.equal(state.subscriptions, 1);
   assert.equal(state.subscriptionPayments, 1);
+});
+
+test("recuperacion normaliza recibido_at Date a ISO antes de persistir paid_at", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const durableEvidence = {
+    id_order: ORDER,
+    id_intent: INTENT,
+    provider: "pixelpay",
+    payment_uuid: "e7777777-7777-4777-8777-777777777777",
+    transaction_id: "verified-at-date-object",
+    amount: 800,
+    currency: "HNL",
+    payment_hash_valid: true,
+    amount_matches: true,
+  };
+  const verifiedAt = new Date(Date.now() - 120_000);
+  const { app, state } = pixelPayProcessHarness({
+    expired: true,
+    initialIntentState: "expirado",
+    durableEvidence,
+    durableVerifiedAt: verifiedAt,
+    rejectNonIsoPaidAt: true,
+    provider: { sale: async () => { throw new Error("Sale must not run during recovery"); } },
+  });
+
+  await recoverMembershipPixelPayApproval(await app.db.connect(), {
+    idPaymentIntent: INTENT,
+    clienteId: CLIENT,
+  });
+
+  assert.deepEqual(state.paymentPaidAts, [verifiedAt.toISOString()]);
+  assert.equal(state.payments, 1);
 });
 
 test("recuperacion protegida acepta intent expirado solo con evidencia durable previa", async (t) => {

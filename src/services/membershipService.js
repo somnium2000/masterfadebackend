@@ -1946,7 +1946,8 @@ export async function recoverMembershipPixelPayApproval(client, {
             mpo.id_cliente, mpo.expires_at AS order_expires_at,
             mpo.estado_orden_codigo, mpo.id_suscripcion,
             pp.codigo AS provider_code,
-            pe.payload_esencial, pe.recibido_at AS verified_at
+            pe.payload_esencial,
+            to_char(pe.recibido_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS verified_at
        FROM public.payment_intents pi
        JOIN public.membership_purchase_orders mpo
          ON mpo.id_order = pi.id_membership_order
