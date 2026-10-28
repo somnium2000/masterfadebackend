@@ -305,6 +305,11 @@ function startOfDay(dateString) {
   return buildDateInTimeZone(parseDateOnly(dateString, "fecha"), 0, 0, 0, AGENDA_DEFAULT_TIME_ZONE);
 }
 
+function operationalWeekday(dateString) {
+  // A calendar date has a weekday independent of the host's timezone.
+  return new Date(`${parseDateOnly(dateString, "fecha")}T12:00:00.000Z`).getUTCDay();
+}
+
 export function buildOperationalDayRange(dateString) {
   const fecha = parseDateOnly(dateString, "fecha");
   const startAt = startOfDay(fecha);
@@ -378,7 +383,9 @@ function getDateTimePartsInTimeZone(dateValue, timeZone) {
   if (Number.isNaN(parsed.getTime())) return null;
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
-    hour12: false,
+    // h23 avoids ICU versions that represent midnight as 24:00 (the same day).
+    // Treating that value as Date.UTC(..., 24) shifts the offset by an entire day.
+    hourCycle: "h23",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -1432,7 +1439,7 @@ export async function getBookingSelectionDetails(client, {
 
 async function getSchedulesForBarberOnDate(client, empleadoId, dateString) {
   const targetDate = parseDateOnly(dateString, "fecha");
-  const dayOfWeek = startOfDay(targetDate).getDay();
+  const dayOfWeek = operationalWeekday(targetDate);
   const branchSchedule = await client.query(
     `
       WITH target_branch AS (
@@ -1890,11 +1897,11 @@ function buildSlotsFromIntervals(
 
   function alignIntervalStartToStep(dateValue) {
     const aligned = new Date(dateValue);
-    aligned.setSeconds(0, 0);
-    const minutesFromDayStart = aligned.getHours() * 60 + aligned.getMinutes();
+    aligned.setTime(Math.floor(aligned.getTime() / 60000) * 60000);
+    const minutesFromDayStart = getMinutesFromDayStart(aligned);
     const remainder = minutesFromDayStart % stepMinutes;
     if (remainder > 0) {
-      aligned.setMinutes(aligned.getMinutes() + (stepMinutes - remainder));
+      aligned.setTime(aligned.getTime() + (stepMinutes - remainder) * 60000);
     }
     return aligned;
   }
@@ -2426,7 +2433,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     const serviceTotalMinutes = serviceSelection.duracion_total_min + serviceSelection.buffer_total_min;
     const sampleDateByWeekday = new Map();
     for (const dateKey of dateKeys) {
-      const weekday = startOfDay(dateKey).getDay();
+      const weekday = operationalWeekday(dateKey);
       if (!sampleDateByWeekday.has(weekday)) {
         sampleDateByWeekday.set(weekday, dateKey);
       }
@@ -2444,7 +2451,7 @@ export async function listAvailabilityByDateRange(client, branchId, serviceSelec
     for (const dateKey of dateKeys) {
       const dayStart = startOfDay(dateKey);
       const dayEnd = endOfDay(dateKey);
-      const weekday = dayStart.getDay();
+      const weekday = operationalWeekday(dateKey);
       const schedules = schedulesByWeekday.get(weekday) || [];
 
       const baseIntervals = buildBaseIntervalsFromSchedules(dateKey, schedules);
@@ -2793,7 +2800,8 @@ const CURATED_PERIOD_SEGMENTS = {
 
 function getMinutesFromDayStart(dateValue) {
   if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return null;
-  return (dateValue.getHours() * 60) + dateValue.getMinutes();
+  const parts = getDateTimePartsInTimeZone(dateValue, AGENDA_DEFAULT_TIME_ZONE);
+  return (parts.hour * 60) + parts.minute;
 }
 
 function parseSlotDate(value) {
@@ -2807,7 +2815,12 @@ function resolveOperationalPeriodMembership(slot) {
   if (!startAt || !endAt || endAt.getTime() <= startAt.getTime()) return null;
 
   const startMin = getMinutesFromDayStart(startAt);
-  const endMin = getMinutesFromDayStart(endAt);
+  // AM: Unwrap the end on the operational calendar, including midnight.
+  const startParts = getDateTimePartsInTimeZone(startAt, AGENDA_DEFAULT_TIME_ZONE);
+  const endParts = getDateTimePartsInTimeZone(endAt, AGENDA_DEFAULT_TIME_ZONE);
+  const dayOffset = (Date.UTC(endParts.year, endParts.month - 1, endParts.day)
+    - Date.UTC(startParts.year, startParts.month - 1, startParts.day)) / 86400000;
+  const endMin = getMinutesFromDayStart(endAt) + dayOffset * 1440;
   if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) return null;
 
   for (const [periodKey, segments] of Object.entries(CURATED_PERIOD_SEGMENTS)) {

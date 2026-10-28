@@ -27,6 +27,10 @@ const SESSION_TOUCH_THROTTLE_SECONDS = Math.max(
   30,
   Number(process.env.AUTH_SESSION_TOUCH_THROTTLE_SECONDS || 60)
 );
+const SESSION_IDLE_TIMEOUT_SECONDS = Math.max(
+  60,
+  Number(process.env.AUTH_SESSION_IDLE_TIMEOUT_SECONDS || 1200)
+);
 const ALERT_DEDUP_MINUTES = Math.max(1, Number(process.env.AUTH_SESSION_LIMIT_ALERT_DEDUP_MINUTES || 5));
 const LOGIN_WINDOW_MINUTES = Math.max(1, Number(process.env.AUTH_LOGIN_WINDOW_MINUTES || 15));
 const LOGIN_RATE_LIMIT_IP_MAX = Math.max(1, Number(process.env.AUTH_LOGIN_RATE_LIMIT_IP_MAX || 20));
@@ -45,7 +49,7 @@ const DEFAULT_SESSION_POLICY = {
   collisionAction: "allow",
 };
 const ADMIN_PAGE_SIZE_MAX = 100;
-const SECURITY_PRIVILEGED_ROLES = new Set(["super_admin", "security_admin"]);
+const SECURITY_PRIVILEGED_ROLES = new Set(["super_admin", "security_admin", "root"]);
 const RESOLVED_ALERT_STATES = new Set(["resuelta", "descartada"]);
 const ALERT_STATE_UPDATE_SET = new Set(["resuelta", "descartada"]);
 const ALERT_RESOLUTION_COMMENT_MAX = 700;
@@ -634,6 +638,34 @@ export async function validateActiveSession(app, request, payload) {
       return { ok: false, statusCode: 401, code: "AUTH_SESSION_INVALID" };
     }
 
+    const ultimoUsoMs = row.ultimo_uso_at ? new Date(row.ultimo_uso_at).getTime() : NaN;
+    const idleExpired = Number.isFinite(ultimoUsoMs)
+      ? Date.now() - ultimoUsoMs > SESSION_IDLE_TIMEOUT_SECONDS * 1000
+      : true;
+
+    if (idleExpired) {
+      await app.db
+        .query(
+          `
+            UPDATE public.seguridad_sesiones
+            SET
+              estado = 'expirada',
+              cierre_at = COALESCE(cierre_at, NOW()),
+              motivo_cierre = 'inactividad_20_minutos',
+              ultimo_uso_at = NOW(),
+              ip_ultimo_uso = COALESCE($2::inet, ip_ultimo_uso),
+              user_agent = COALESCE($3::text, user_agent),
+              request_id = COALESCE($4::text, request_id)
+            WHERE id_sesion = $1::uuid
+              AND estado = 'activa'
+          `,
+          [sid, meta.ip, meta.userAgent, meta.requestId]
+        )
+        .catch(() => {});
+      publishSecurityRealtimeSignal(app, "security.sessions.changed");
+      return { ok: false, statusCode: 401, code: "AUTH_SESSION_IDLE_EXPIRED" };
+    }
+
     await app.db
       .query(
         `
@@ -691,13 +723,32 @@ export async function closeActiveSession(app, request, payload) {
         WHERE id_sesion = $1::uuid
           AND id_usuario = $2::uuid
           AND estado = 'activa'
+          AND cierre_at IS NULL
+          AND revocada_at IS NULL
+          AND expira_at > NOW()
+        RETURNING id_sesion
       `,
       [sid, userId, closedBy || null, motivo, meta.ip, meta.userAgent, meta.requestId]
     );
     if (result.rowCount > 0) {
       publishSecurityRealtimeSignal(app, "security.sessions.changed");
+      return { ok: true, state: "cerrada" };
     }
-    return { ok: true };
+    // AM: Cero filas no demuestra cierre; comprueba que el token ya no sea utilizable.
+    const lookup = await app.db.query(`
+      SELECT estado, cierre_at, revocada_at, expira_at
+      FROM public.seguridad_sesiones
+      WHERE id_sesion = $1::uuid AND id_usuario = $2::uuid
+      LIMIT 1
+    `, [sid, userId]);
+    const row = lookup.rows?.[0];
+    if (!row) return { ok: true, state: "inexistente" };
+    if (row.revocada_at || row.estado === "revocada") return { ok: true, state: "revocada" };
+    if (row.cierre_at || row.estado === "cerrada") return { ok: true, state: "cerrada" };
+    if (row.estado === "expirada" || (row.expira_at && new Date(row.expira_at).getTime() <= Date.now())) {
+      return { ok: true, state: "expirada" };
+    }
+    return { ok: false, code: "AUTH_SESSION_CLOSE_UNCONFIRMED" };
   } catch (_error) {
     request?.log?.error(
       { event: "security_session_close_failed", code: "AUTH_SESSION_CLOSE_ERROR" },
@@ -948,11 +999,11 @@ async function resolveAccessUserByIdentifier(app, identifier) {
 
 export async function checkUserTemporaryLock(app, { idUsuario }) {
   if (!app?.db || !isValidUuid(idUsuario)) {
-    return { ok: false, blocked: false };
+    return { ok: false, blocked: true, code: "AUTH_LOCK_CHECK_UNAVAILABLE" };
   }
 
   try {
-    if (await isProtectedUserId(app, idUsuario)) {
+    if (await isProtectedUserId(app, idUsuario, { failClosed: true })) {
       return { ok: true, blocked: false, lockedUntil: null, bypassed: true, bypassCode: "ROOT_LOGIN_LOCK_BYPASSED" };
     }
 
@@ -969,7 +1020,7 @@ export async function checkUserTemporaryLock(app, { idUsuario }) {
     const blocked = Boolean(lockedUntil) && new Date(lockedUntil).getTime() > Date.now();
     return { ok: true, blocked, lockedUntil: lockedUntil || null };
   } catch (_error) {
-    return { ok: false, blocked: false };
+    return { ok: false, blocked: true, code: "AUTH_LOCK_CHECK_UNAVAILABLE" };
   }
 }
 
@@ -1716,6 +1767,72 @@ export async function revokeAdminSecuritySession(app, request, {
   };
 }
 
+export async function revokeAllAdminSecuritySessions(app, request, {
+  actorUserId,
+  actorSessionId,
+}) {
+  if (!app?.db || !isValidUuid(actorUserId) || !isValidUuid(actorSessionId)) {
+    return { ok: false, code: "SECURITY_SESSIONS_REVOKE_ALL_INVALID" };
+  }
+
+  const meta = getRequestMeta(request);
+  const client = await app.db.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
+      `
+        UPDATE public.seguridad_sesiones
+        SET
+          estado = 'revocada',
+          revocada_at = NOW(),
+          cierre_at = NOW(),
+          cerrada_por = $1::uuid,
+          motivo_cierre = 'cierre_masivo_seguridad',
+          ip_ultimo_uso = COALESCE($3::inet, ip_ultimo_uso),
+          request_id = COALESCE($4::text, request_id),
+          ultimo_uso_at = NOW()
+        WHERE estado = 'activa'
+          AND id_sesion <> $2::uuid
+        RETURNING id_sesion, id_usuario
+      `,
+      [actorUserId, actorSessionId, meta.ip, meta.requestId]
+    );
+
+    await insertAdminAuditLog(app, {
+      client,
+      actorUserId,
+      accion: "SECURITY_SESSIONS_REVOKE_ALL",
+      entidad: "seguridad_sesiones",
+      entidadId: null,
+      resultado: "ok",
+      motivoCodigo: "SECURITY_SESSIONS_REVOKED_ALL",
+      request,
+      metadata: {
+        revocadas: Number(result.rowCount || 0),
+        excluded_current_session: true,
+      },
+    });
+
+    await client.query("COMMIT");
+    publishSecurityRealtimeSignal(app, "security.sessions.changed");
+
+    return {
+      ok: true,
+      revocadas: Number(result.rowCount || 0),
+      excluded_current_session: true,
+    };
+  } catch (_error) {
+    await client.query("ROLLBACK").catch(() => {});
+    request?.log?.error(
+      { event: "security_sessions_revoke_all_failed", code: "SECURITY_SESSIONS_REVOKE_ALL_ERROR" },
+      "Could not revoke all active security sessions"
+    );
+    return { ok: false, code: "SECURITY_SESSIONS_REVOKE_ALL_ERROR" };
+  } finally {
+    client.release();
+  }
+}
+
 export async function listAdminSecurityUsers(app, options = {}) {
   if (!app?.db) return { items: [], pagination: buildPagination(0, 1, 20) };
 
@@ -1780,6 +1897,12 @@ export async function listAdminSecurityUsers(app, options = {}) {
         sua.last_login_ip,
         sua.force_password_change,
         sua.updated_at,
+        EXISTS (
+          SELECT 1
+          FROM public.app_protected_users apu
+          WHERE apu.id_usuario = u.id_usuario
+            AND apu.activo IS TRUE
+        ) AS is_protected,
         COALESCE(
           array_agg(DISTINCT r.nombre ORDER BY r.nombre) FILTER (WHERE r.nombre IS NOT NULL),
           ARRAY[]::text[]
@@ -1832,6 +1955,7 @@ export async function listAdminSecurityUsers(app, options = {}) {
     last_login_at: row.last_login_at ? new Date(row.last_login_at).toISOString() : null,
     last_login_ip: maskIpAddress(row.last_login_ip),
     force_password_change: row.force_password_change === null ? null : Boolean(row.force_password_change),
+    is_protected: Boolean(row.is_protected),
     updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : null,
   }));
 
@@ -1870,6 +1994,10 @@ export async function updateAdminUserAccessState(app, request, {
   }
 
   const nextState = String(estadoAcceso || "").trim().toLowerCase();
+  const allowedAccessStates = new Set(["pendiente_password", "activo", "bloqueado", "inactivo"]);
+  if (!allowedAccessStates.has(nextState)) {
+    return { ok: false, code: "SECURITY_USER_ACCESS_STATE_INVALID" };
+  }
   const disableStates = new Set(["bloqueado", "inactivo"]);
   const protectedAccessStates = new Set(["bloqueado", "inactivo", "pendiente_password"]);
   const isDisabling = disableStates.has(nextState);

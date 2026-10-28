@@ -1,5 +1,6 @@
-import { sendError } from "../../../utils/errors.js";
+import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
+import { getPersonasAdminScope, scopePersonasQuery } from "../../../services/personasAdminScope.js";
 
 const ADMIN_ALLOWED_ROLES = ["super_admin", "admin"];
 
@@ -110,7 +111,9 @@ export default async function adminEmpleadosRoutes(app) {
         },
         async (request, reply) => {
             try {
-                const { rows } = await app.db.query(LIST_EMPLEADOS_SQL);
+                const scope = await getPersonasAdminScope(app.db, request.claims);
+                const query = scopePersonasQuery(LIST_EMPLEADOS_SQL, [], scope, "empleado");
+                const { rows } = await app.db.query(query.text, query.values);
                 return sendOk(reply, {
                     empleados: rows.map((row) => ({
                         id_empleado: row.id_empleado,
@@ -123,6 +126,12 @@ export default async function adminEmpleadosRoutes(app) {
                     })),
                 });
             } catch (error) {
+                if (error instanceof AppError) {
+                    return sendError(reply, error.statusCode, error.message, {
+                        code: error.code,
+                        requestId: request.id,
+                    });
+                }
                 request.log.error({ err: error }, "Admin empleados list error");
                 return sendError(reply, 500, "No se pudo consultar la lista de empleados", {
                     code: "ADMIN_EMPLEADOS_LIST_ERROR",

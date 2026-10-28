@@ -9,12 +9,15 @@ import {
   listAdminSecuritySessions,
   listAdminSecurityUsers,
   revokeAdminSecuritySession,
+  revokeAllAdminSecuritySessions,
   updateAdminAlertState,
   updateAdminUserAccessState,
 } from "../../../services/securityService.js";
 
-const SECURITY_READ_ROLES = ["super_admin", "security_admin", "security_auditor"];
-const SECURITY_WRITE_ROLES = ["super_admin", "security_admin"];
+const SECURITY_READ_ROLES = ["super_admin", "security_admin", "security_auditor", "root"];
+const SECURITY_WRITE_ROLES = ["super_admin", "security_admin", "root"];
+const SECURITY_ALERTS_READ_ROLES = ["root"];
+const SECURITY_ALERTS_WRITE_ROLES = ["root"];
 const SSE_HEARTBEAT_MS = 25_000;
 
 const listQuerySchemaBase = {
@@ -312,6 +315,53 @@ export default async function adminSeguridadRoutes(app) {
     }
   );
 
+  app.post(
+    "/sesiones/revocar-todas",
+    {
+      preHandler: app.requireRoles(SECURITY_WRITE_ROLES),
+    },
+    async (request, reply) => {
+      try {
+        const actorUserId = request.claims?.user?.id_usuario || null;
+        const actorSessionId = request.user?.sid || request.auth?.sid || null;
+        const action = await revokeAllAdminSecuritySessions(app, request, {
+          actorUserId,
+          actorSessionId,
+        });
+
+        if (!action.ok && action.code === "SECURITY_SESSIONS_REVOKE_ALL_INVALID") {
+          return sendError(reply, 400, "No se pudo identificar la sesion actual para excluirla.", {
+            code: "SECURITY_SESSIONS_REVOKE_ALL_INVALID",
+            requestId: request.id,
+          });
+        }
+        if (!action.ok) {
+          return sendError(reply, 500, "No se pudieron revocar las sesiones activas.", {
+            code: action.code || "SECURITY_SESSIONS_REVOKE_ALL_ERROR",
+            requestId: request.id,
+          });
+        }
+
+        return sendOk(
+          reply,
+          {
+            revocadas: action.revocadas,
+            excluded_current_session: true,
+          },
+          { requestId: request.id }
+        );
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudieron revocar las sesiones activas",
+          "SECURITY_ADMIN_SESSIONS_REVOKE_ALL_ERROR"
+        );
+      }
+    }
+  );
+
   app.get(
     "/sesiones/:id_sesion",
     {
@@ -460,6 +510,18 @@ export default async function adminSeguridadRoutes(app) {
             requestId: request.id,
           });
         }
+        if (!action.ok && action.code === "ROOT_USER_PROTECTED") {
+          return sendError(reply, 403, "El usuario root protegido no puede ser bloqueado ni inactivado.", {
+            code: "ROOT_USER_PROTECTED",
+            requestId: request.id,
+          });
+        }
+        if (!action.ok && action.code === "ROOT_USER_PROTECTION_CHECK_FAILED") {
+          return sendError(reply, 500, "No se pudo validar si el usuario esta protegido.", {
+            code: "ROOT_USER_PROTECTION_CHECK_FAILED",
+            requestId: request.id,
+          });
+        }
         if (!action.ok) {
           return sendError(reply, 500, "No se pudo actualizar estado de acceso.", {
             code: "SECURITY_USER_ACCESS_UPDATE_ERROR",
@@ -490,7 +552,7 @@ export default async function adminSeguridadRoutes(app) {
   app.get(
     "/alertas",
     {
-      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      preHandler: app.requireRoles(SECURITY_ALERTS_READ_ROLES),
       schema: { querystring: alertasQuerySchema },
     },
     async (request, reply) => {
@@ -512,7 +574,7 @@ export default async function adminSeguridadRoutes(app) {
   app.get(
     "/alertas/:id_alerta",
     {
-      preHandler: app.requireRoles(SECURITY_READ_ROLES),
+      preHandler: app.requireRoles(SECURITY_ALERTS_READ_ROLES),
       schema: { params: idAlertaParamSchema },
     },
     async (request, reply) => {
@@ -550,7 +612,7 @@ export default async function adminSeguridadRoutes(app) {
   app.patch(
     "/alertas/:id_alerta/estado",
     {
-      preHandler: app.requireRoles(SECURITY_WRITE_ROLES),
+      preHandler: app.requireRoles(SECURITY_ALERTS_WRITE_ROLES),
       schema: {
         params: idAlertaParamSchema,
         body: estadoAlertaBodySchema,

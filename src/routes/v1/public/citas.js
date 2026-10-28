@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { AppError, sendError, toDatabaseSchemaOutdatedError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
+import { resolvePublicCitasHoldRateLimit } from "../../../config/publicCitasRateLimitConfig.js";
 import {
   assertUuid,
   ensureActiveBranch,
@@ -581,43 +582,6 @@ function collectDuplicateContactConflicts(contactos = []) {
   return conflicts;
 }
 
-async function collectExistingActiveEmailConflicts(client, contactos = []) {
-  const emails = Array.from(new Set(contactos.map((entry) => entry.email).filter(Boolean)));
-  if (!client || emails.length === 0) return [];
-
-  const existingUserRows = await client.query(
-    `
-      SELECT DISTINCT lower(co.direccion_correo::text) AS email
-      FROM public.usuarios u
-      JOIN public.personas p
-        ON p.id_persona = u.id_persona
-       AND p.deleted_at IS NULL
-      JOIN public.correos co
-        ON co.id_persona = p.id_persona
-       AND co.deleted_at IS NULL
-      WHERE u.deleted_at IS NULL
-        AND COALESCE(u.estado, TRUE) IS TRUE
-        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
-        AND lower(co.direccion_correo::text) = ANY($1::text[])
-    `,
-    [emails]
-  );
-
-  const activeUserEmails = new Set(existingUserRows.rows.map((row) => normalizeEmail(row.email)));
-  return contactos
-    .filter((entry) => entry.email && activeUserEmails.has(entry.email))
-    .map((entry) => ({
-      blockIndex: entry.blockIndex,
-      alias: entry.alias,
-      rol_integrante_codigo: entry.rol_integrante_codigo,
-      field: "contacto.email",
-      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-      email: entry.email,
-      message: entry.blockIndex === 0
-        ? "Este correo ya pertenece a una cuenta activa. Inicia sesion para continuar."
-        : `El correo de ${entry.alias} pertenece a una cuenta activa. Ese acompanante debe iniciar sesion o usar otro correo.`,
-    }));
-}
 
 function parseIsoDateAndTime(rawDateTime) {
   try {
@@ -1102,121 +1066,23 @@ async function resolveRequestedPromotionsForPublicHold(client, {
 }
 
 async function resolveOrCreatePublicClient(client, payload) {
-  const { nombre, nombres, apellidos, telefono, email, idSucursal } = payload;
-
-  const existingActiveUserByEmailResult = await client.query(
+  const { nombre, nombres, apellidos, telefono } = payload;
+  const resolvedName = buildFullName(nombres, apellidos) || nombre;
+  const splitName = splitFullName(resolvedName);
+  // AM: Guest contact belongs to this reservation, never to an account found by email.
+  const personaInsert = await client.query(
     `
-      SELECT u.id_usuario
-      FROM public.usuarios u
-      JOIN public.personas p
-        ON p.id_persona = u.id_persona
-       AND p.deleted_at IS NULL
-      JOIN public.correos co
-        ON co.id_persona = p.id_persona
-       AND co.deleted_at IS NULL
-      WHERE u.deleted_at IS NULL
-        AND COALESCE(u.estado, TRUE) IS TRUE
-        AND COALESCE(u.estado_acceso, 'activo') = 'activo'
-        AND lower(co.direccion_correo::text) = lower($1)
-      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-      LIMIT 1
+      INSERT INTO public.personas (nombres, apellidos, telefono_principal)
+      VALUES ($1, $2, $3)
+      RETURNING id_persona
     `,
-    [email]
+    [splitName.nombres, splitName.apellidos, telefono || null]
   );
-
-  if (existingActiveUserByEmailResult.rows[0]) {
-    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesión para continuar.", {
-      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-      details: { field: "titular.email" },
-    });
-  }
-
-  const existingUserClientResult = await client.query(
-    `
-      SELECT c.id_cliente, c.id_persona
-      FROM public.clientes c
-      JOIN public.personas p
-        ON p.id_persona = c.id_persona
-       AND p.deleted_at IS NULL
-      JOIN public.correos co
-        ON co.id_persona = p.id_persona
-       AND co.deleted_at IS NULL
-      WHERE c.deleted_at IS NULL
-        AND c.estado IS TRUE
-        AND lower(co.direccion_correo::text) = lower($1)
-      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-      LIMIT 1
-    `,
-    [email]
-  );
-
-  if (existingUserClientResult.rows[0]) {
-    throw new AppError(409, "Este correo ya pertenece a una cuenta activa. Inicia sesión para continuar.", {
-      code: "EMAIL_BELONGS_TO_ACTIVE_USER",
-      details: { field: "titular.email" },
-    });
-  }
-
-  const existingPersonaResult = await client.query(
-    `
-      SELECT p.id_persona
-      FROM public.personas p
-      JOIN public.correos co
-        ON co.id_persona = p.id_persona
-       AND co.deleted_at IS NULL
-      WHERE p.deleted_at IS NULL
-        AND lower(co.direccion_correo::text) = lower($1)
-      ORDER BY co.verificado DESC, co.es_principal DESC, co.created_at ASC
-      LIMIT 1
-    `,
-    [email]
-  );
-
-  let idPersona = existingPersonaResult.rows[0]?.id_persona || null;
-
-  if (!idPersona) {
-    const resolvedName = buildFullName(nombres, apellidos) || nombre;
-    const splitName = splitFullName(resolvedName);
-
-    const personaInsert = await client.query(
-      `
-        INSERT INTO public.personas (nombres, apellidos, telefono_principal)
-        VALUES ($1, $2, $3)
-        RETURNING id_persona
-      `,
-      [splitName.nombres, splitName.apellidos, telefono || null]
-    );
-    idPersona = personaInsert.rows[0].id_persona;
-  } else if (telefono) {
-    await client.query(
-      `
-        UPDATE public.personas
-        SET telefono_principal = COALESCE(NULLIF(telefono_principal, ''), $2),
-            updated_at = NOW()
-        WHERE id_persona = $1::uuid
-      `,
-      [idPersona, telefono]
-    );
-  }
-
-  void idSucursal;
-
-  await client.query(
-    `
-      INSERT INTO public.correos (id_persona, direccion_correo, es_principal, verificado)
-      VALUES ($1::uuid, $2, TRUE, FALSE)
-      ON CONFLICT DO NOTHING
-    `,
-    [idPersona, email]
-  );
-
-  return {
-    id_cliente: null,
-    id_persona: idPersona,
-  };
+  return { id_cliente: null, id_persona: personaInsert.rows[0].id_persona };
 }
 
 export default async function publicCitasRoutes(app) {
+  const holdRateLimit = resolvePublicCitasHoldRateLimit();
   app.post(
     "/validar-contactos",
     {
@@ -1259,19 +1125,11 @@ export default async function publicCitasRoutes(app) {
         }
 
         const duplicateConflicts = collectDuplicateContactConflicts(contactos);
-        const activeEmailConflicts = app.db
-          ? await collectExistingActiveEmailConflicts(app.db, contactos)
-          : [];
-        const conflicts = [...duplicateConflicts, ...activeEmailConflicts];
+        const conflicts = duplicateConflicts;
 
         if (conflicts.length > 0) {
-          const hasActiveUserConflict = conflicts.some((conflict) => conflict.code === "EMAIL_BELONGS_TO_ACTIVE_USER");
-          const errorCode = hasActiveUserConflict
-            ? "PUBLIC_CITAS_CONTACT_EMAIL_CONFLICT"
-            : "PUBLIC_CITAS_CONTACT_DUPLICATE_CONFLICT";
-          const errorMessage = hasActiveUserConflict
-            ? "Hay contactos que ya pertenecen a cuentas activas."
-            : "Hay contactos repetidos en la reserva.";
+          const errorCode = "PUBLIC_CITAS_CONTACT_DUPLICATE_CONFLICT";
+          const errorMessage = "Hay contactos repetidos en la reserva.";
 
           return reply.code(409).send({
             ok: false,
@@ -1376,8 +1234,8 @@ export default async function publicCitasRoutes(app) {
     {
       config: {
         rateLimit: {
-          max: 5,
-          timeWindow: "15 minutes",
+          max: holdRateLimit.max,
+          timeWindow: holdRateLimit.timeWindow,
         },
       },
       schema: {

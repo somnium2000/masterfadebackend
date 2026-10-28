@@ -1,16 +1,37 @@
 import { AppError, DB_SCHEMA_OUTDATED_CODE } from "../utils/errors.js";
 
 const REQUIRED_FUNCTIONS = [
+  {
+    schema: "public",
+    name: "fn_auditar_bitacora",
+    args: "",
+    securityDefiner: false,
+    searchPath: "pg_catalog, public",
+  },
   { schema: "app_private", name: "crear_reserva_canonica_v1", args: "jsonb" },
   { schema: "app_private", name: "obtener_reserva_idempotente_v1", args: "uuid, text, text" },
   { schema: "app_private", name: "finalizar_reserva_idempotente_v1", args: "uuid, text, text, jsonb" },
   { schema: "app_private", name: "confirmar_reserva_pagada_v1", args: "uuid, text, timestamp with time zone" },
   {
     schema: "app_private",
+    name: "proteger_reserva_pago_v1",
+    args: "uuid, uuid",
+    securityDefiner: true,
+    searchPath: "pg_catalog, app_private",
+  },
+  {
+    schema: "app_private",
     name: "registrar_evento_agenda_v1",
     args: "text, uuid, text, text, uuid, uuid, date, date, timestamp with time zone, timestamp with time zone",
   },
   { schema: "app_private", name: "limpiar_agenda_eventos_outbox_v1", args: "interval, integer" },
+  {
+    schema: "app_private",
+    name: "registrar_payment_status_check_v1",
+    args: "uuid, text, text, text, text, smallint, text, integer, text, timestamp with time zone",
+    securityDefiner: true,
+    searchPath: "pg_catalog, app_private",
+  },
 ];
 
 const REQUIRED_COLUMNS = [
@@ -34,8 +55,29 @@ const REQUIRED_COLUMNS = [
   ["public", "citas_admin_beneficios_resumen", "cortesia_aplicada", "boolean"],
   ["public", "citas_admin_beneficios_resumen", "membresia_aplicada", "boolean"],
   ["public", "citas_admin_beneficios_resumen", "recompensa_aplicada", "boolean"],
-  ["public", "payment_intents", "monto_hnl"],
-  ["public", "payment_intents", "idempotency_key"],
+  ["public", "payment_intents", "id_intent", "uuid"],
+  ["public", "payment_intents", "id_provider", "uuid"],
+  ["public", "payment_intents", "id_cita", "uuid"],
+  ["public", "payment_intents", "id_hold", "uuid"],
+  ["public", "payment_intents", "estado_intent_codigo", "text"],
+  ["public", "payment_intents", "monto_hnl", "numeric"],
+  ["public", "payment_intents", "moneda_codigo", "text"],
+  ["public", "payment_intents", "link_pago_url", "text"],
+  ["public", "payment_intents", "referencia_externa", "text"],
+  ["public", "payment_intents", "idempotency_key", "text"],
+  ["public", "payment_intents", "expires_at", "timestamp with time zone"],
+  ["public", "payment_intents", "created_by_usuario_id", "uuid"],
+  ["public", "payment_intents", "created_at", "timestamp with time zone"],
+  ["public", "payment_intents", "updated_at", "timestamp with time zone"],
+  ["public", "payment_intents", "id_membership_order", "uuid"],
+  ["public", "payment_intents", "origen_pago_codigo", "text"],
+  ["public", "payment_intents", "id_grupo_cita", "uuid"],
+  ["public", "payment_intents", "paid_at", "timestamp with time zone"],
+  ["public", "payment_intents", "orden_compra", "text"],
+  ["public", "payment_intents", "provider_session_id", "text"],
+  ["public", "payment_intents", "launch_expires_at", "timestamp with time zone"],
+  ["public", "payment_intents", "last_verified_at", "timestamp with time zone"],
+  ["public", "payment_intents", "verification_attempts", "integer"],
   ["public", "notificaciones_email", "estado_notificacion_codigo"],
   ["public", "notificaciones_email", "evento"],
   ["public", "notificaciones_email", "id_cita"],
@@ -59,6 +101,26 @@ const REQUIRED_COLUMNS = [
   ["app_private", "agenda_eventos_outbox", "txid_origen", "bigint"],
   ["app_private", "agenda_eventos_outbox", "payload", "jsonb"],
   ["app_private", "agenda_eventos_outbox", "created_at", "timestamp with time zone"],
+  ["app_private", "payment_status_checks", "id_status_check", "uuid"],
+  ["app_private", "payment_status_checks", "id_intent", "uuid"],
+  ["app_private", "payment_status_checks", "provider_reference", "text"],
+  ["app_private", "payment_status_checks", "origen_consulta_codigo", "text"],
+  ["app_private", "payment_status_checks", "provider_status", "text"],
+  ["app_private", "payment_status_checks", "resultado_consulta_codigo", "text"],
+  ["app_private", "payment_status_checks", "http_status", "smallint"],
+  ["app_private", "payment_status_checks", "error_code", "text"],
+  ["app_private", "payment_status_checks", "duration_ms", "integer"],
+  ["app_private", "payment_status_checks", "request_id", "text"],
+  ["app_private", "payment_status_checks", "checked_at", "timestamp with time zone"],
+];
+
+const REQUIRED_COLUMN_CONTRACTS = [
+  { schema: "public", table: "payment_intents", column: "verification_attempts", nullable: "NO", defaultPattern: /^0(?:::[a-z ]+)?$/i },
+  { schema: "app_private", table: "payment_status_checks", column: "id_status_check", nullable: "NO" },
+  { schema: "app_private", table: "payment_status_checks", column: "id_intent", nullable: "NO" },
+  { schema: "app_private", table: "payment_status_checks", column: "origen_consulta_codigo", nullable: "NO", defaultPattern: /^'manual'(?:::[a-z ]+)?$/i },
+  { schema: "app_private", table: "payment_status_checks", column: "resultado_consulta_codigo", nullable: "NO" },
+  { schema: "app_private", table: "payment_status_checks", column: "checked_at", nullable: "NO" },
 ];
 
 const REQUIRED_INDEXES = [
@@ -68,17 +130,48 @@ const REQUIRED_INDEXES = [
   { schema: "public", name: "citas_admin_beneficios_resumen_pkey" },
   { schema: "public", name: "idx_citas_admin_beneficios_resumen_recompensa" },
   { schema: "public", name: "idx_payment_intents_activos_expires" },
+  { schema: "public", name: "idx_payment_intents_provider_order" },
+  { schema: "public", name: "idx_payment_intents_provider_session" },
   { schema: "app_private", name: "agenda_eventos_outbox_pkey" },
   { schema: "app_private", name: "idx_agenda_eventos_outbox_created_at" },
   { schema: "app_private", name: "idx_agenda_eventos_outbox_sucursal_evento" },
   { schema: "app_private", name: "idx_agenda_eventos_outbox_sucursal_barbero_evento" },
+  { schema: "app_private", name: "idx_payment_status_checks_intent_checked_at" },
+  { schema: "app_private", name: "idx_payment_status_checks_result_checked_at" },
 ];
 
 const REQUIRED_RELATIONS = [
   { schema: "app_private", name: "agenda_eventos_outbox", type: "BASE TABLE" },
+  { schema: "app_private", name: "payment_status_checks", type: "BASE TABLE" },
 ];
 
 const REQUIRED_CONSTRAINTS = [
+  {
+    schema: "public",
+    table: "payment_intents",
+    name: "ck_payment_intents_verification_attempts_nonnegative",
+    requiredFragments: ["verification_attempts", ">=", "0"],
+  },
+  {
+    schema: "app_private",
+    table: "payment_status_checks",
+    name: "fk_payment_status_checks_intent",
+    requiredFragments: ["FOREIGN KEY (id_intent)", "REFERENCES"],
+  },
+  {
+    schema: "app_private",
+    table: "payment_status_checks",
+    name: "ck_payment_status_checks_origen",
+    requiredValues: ["manual", "automatico", "reconciliacion", "post_venta"],
+  },
+  {
+    schema: "app_private",
+    table: "payment_status_checks",
+    name: "ck_payment_status_checks_resultado",
+    requiredValues: ["ok", "timeout", "error_red", "error_proveedor", "respuesta_invalida"],
+  },
+  { schema: "app_private", table: "payment_status_checks", name: "ck_payment_status_checks_http_status" },
+  { schema: "app_private", table: "payment_status_checks", name: "ck_payment_status_checks_duration" },
   {
     schema: "app_private",
     table: "agenda_eventos_outbox",
@@ -134,6 +227,13 @@ function normalizeType(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function getFunctionSetting(config, settingName) {
+  const prefix = `${settingName}=`;
+  return (Array.isArray(config) ? config : [])
+    .find((value) => String(value || "").startsWith(prefix))
+    ?.slice(prefix.length) || null;
+}
+
 async function queryRows(client, sql, params = []) {
   const result = await client.query(sql, params);
   return result.rows || [];
@@ -156,7 +256,9 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
         SELECT
           n.nspname AS schema_name,
           p.proname AS function_name,
-          oidvectortypes(p.proargtypes) AS identity_args
+          oidvectortypes(p.proargtypes) AS identity_args,
+          p.prosecdef AS security_definer,
+          p.proconfig AS config
         FROM pg_catalog.pg_proc p
         JOIN pg_catalog.pg_namespace n
           ON n.oid = p.pronamespace
@@ -167,9 +269,23 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
     const functionKeys = new Set(functions.map((row) => (
       `${row.schema_name}.${row.function_name}(${normalizeArgs(row.identity_args)})`
     )));
+    const functionByKey = new Map(functions.map((row) => [
+      `${row.schema_name}.${row.function_name}(${normalizeArgs(row.identity_args)})`,
+      row,
+    ]));
     for (const fn of REQUIRED_FUNCTIONS) {
       const key = `${fn.schema}.${fn.name}(${normalizeArgs(fn.args)})`;
-      if (!functionKeys.has(key)) missing.push({ type: "function", name: key });
+      if (!functionKeys.has(key)) {
+        missing.push({ type: "function", name: key });
+        continue;
+      }
+      const row = functionByKey.get(key);
+      if (typeof fn.securityDefiner === "boolean" && row?.security_definer !== fn.securityDefiner) {
+        missing.push({ type: "function_security", name: `${key}:security_definer` });
+      }
+      if (fn.searchPath && getFunctionSetting(row?.config, "search_path") !== fn.searchPath) {
+        missing.push({ type: "function_security", name: `${key}:search_path=${fn.searchPath}` });
+      }
     }
 
     const relationSchemas = unique(REQUIRED_RELATIONS.map((relation) => relation.schema));
@@ -194,7 +310,7 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
     const columns = await queryRows(
       client,
       `
-        SELECT table_schema, table_name, column_name, data_type
+        SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default
         FROM information_schema.columns
         WHERE table_schema = ANY($1::text[])
       `,
@@ -205,12 +321,30 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
       `${row.table_schema}.${row.table_name}.${row.column_name}`,
       normalizeType(row.data_type),
     ]));
+    const columnByKey = new Map(columns.map((row) => [
+      `${row.table_schema}.${row.table_name}.${row.column_name}`,
+      row,
+    ]));
     for (const [schema, table, column, dataType] of REQUIRED_COLUMNS) {
       const key = `${schema}.${table}.${column}`;
       if (!columnKeys.has(key)) {
         missing.push({ type: "column", name: key });
       } else if (dataType && columnTypeByKey.get(key) !== normalizeType(dataType)) {
         missing.push({ type: "column", name: `${key}:${dataType}` });
+      }
+    }
+    for (const contract of REQUIRED_COLUMN_CONTRACTS) {
+      const key = `${contract.schema}.${contract.table}.${contract.column}`;
+      const row = columnByKey.get(key);
+      if (!row) continue;
+      if (contract.nullable && row.is_nullable !== contract.nullable) {
+        missing.push({ type: "column_contract", name: `${key}:nullable=${contract.nullable}` });
+      }
+      if (contract.defaultPattern) {
+        const normalizedDefault = String(row.column_default || "").replace(/[()\s]/g, "");
+        if (!contract.defaultPattern.test(normalizedDefault)) {
+          missing.push({ type: "column_contract", name: `${key}:default` });
+        }
       }
     }
 
@@ -261,6 +395,11 @@ export async function runDatabaseSchemaPreflight(pool, logger = null) {
       for (const value of constraint.requiredValues || []) {
         if (!definition.includes(`'${value}'`)) {
           missing.push({ type: "constraint", name: `${key}:${value}` });
+        }
+      }
+      for (const fragment of constraint.requiredFragments || []) {
+        if (!definition.includes(fragment)) {
+          missing.push({ type: "constraint", name: `${key}:${fragment}` });
         }
       }
     }

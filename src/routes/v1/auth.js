@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
+import { classifyRegistrationEmail, requestGuestRegistration, completeGuestRegistration } from "../../services/guestRegistrationService.js";
 import jwt from "jsonwebtoken";
 import { getAuthClaims } from "../../utils/authClaims.js";
 import { sendOk } from "../../utils/response.js";
-import { sendError } from "../../utils/errors.js";
-import { generateRecoveryActionLink } from "../../services/authRecovery.js";
+import { AppError, sendError } from "../../utils/errors.js";
+import { acquirePasswordOperationLock, generateRecoveryActionLink, resetPasswordWithRecovery } from "../../services/authRecovery.js";
+import { acquireSupabaseSessionGuard, verifySupabaseAccessToken } from "../../services/supabaseSessionGuard.js";
 import {
   applyProgressiveLoginDelay,
   checkUserTemporaryLock,
@@ -378,39 +380,7 @@ function validatePublicPassword(password) {
 }
 
 async function ensureRegisterEmailAvailability(client, email) {
-  const correoResult = await client.query(
-    `
-      SELECT 1
-      FROM public.correos
-      WHERE LOWER(direccion_correo::text) = LOWER($1)
-      LIMIT 1
-    `,
-    [email]
-  );
-  if (correoResult.rowCount) {
-    throw {
-      statusCode: 409,
-      message: "El correo ya esta registrado.",
-      code: "AUTH_REGISTER_EMAIL_EXISTS",
-    };
-  }
-
-  const authResult = await client.query(
-    `
-      SELECT 1
-      FROM auth.users
-      WHERE LOWER(email::text) = LOWER($1)
-      LIMIT 1
-    `,
-    [email]
-  );
-  if (authResult.rowCount) {
-    throw {
-      statusCode: 409,
-      message: "El correo ya esta registrado.",
-      code: "AUTH_REGISTER_EMAIL_EXISTS",
-    };
-  }
+  return classifyRegistrationEmail(client, email);
 }
 
 async function getClienteRoleId(client) {
@@ -658,6 +628,18 @@ function decodeJwtExpiryUnix(token) {
 }
 
 async function issueManagedAppSession(app, request, { jwtSecret, claims, email, roles, branchIds, remember = false, replaceActiveSession = false, identifier = null, provider = "supabase_password" }) {
+  // AM: Todos los accesos (incluido OAuth) verifican el bloqueo antes de emitir sesión.
+  const tempLock = await checkUserTemporaryLock(app, { idUsuario: claims.user.id_usuario });
+  if (!tempLock.ok) {
+    throw { statusCode: 503, code: "AUTH_LOCK_CHECK_UNAVAILABLE", message: "No se pudo verificar el acceso. Intenta nuevamente más tarde." };
+  }
+  if (tempLock.blocked) {
+    await logLoginAttempt(app, request, {
+      id_usuario: claims.user.id_usuario, identifier, provider, resultado: "blocked",
+      motivo_codigo: "LOGIN_TEMPORARILY_LOCKED", metadata: { auth_stage: "app_session" },
+    });
+    throw { statusCode: 429, code: "AUTH_USER_TEMPORARILY_LOCKED", message: "No fue posible iniciar sesion en este momento. Intenta nuevamente mas tarde." };
+  }
   const sid = crypto.randomUUID();
   const jti = crypto.randomUUID();
   const token = signAppToken(
@@ -765,6 +747,30 @@ function clearSessionCookies(app, reply) {
   const options = buildCookieOptions(app, { remember: false });
   reply.clearCookie(AUTH_SESSION_COOKIE, options);
   reply.clearCookie(AUTH_CSRF_COOKIE, { ...options, httpOnly: false });
+}
+
+function getSessionTokenFromRequest(request) {
+  return String(request.cookies?.[AUTH_SESSION_COOKIE] || "").trim();
+}
+
+function verifyManagedAppSessionPayload(token) {
+  const jwtSecret = process.env.JWT_SECRET?.trim();
+  if (!token || !jwtSecret) return null;
+
+  try {
+    const payload = jwt.verify(token, jwtSecret, {
+      issuer: process.env.APP_JWT_ISSUER || "masterfade-api",
+      audience: process.env.APP_JWT_AUDIENCE || "masterfade-app",
+    });
+
+    if (!payload || typeof payload !== "object") return null;
+    if (payload.token_type !== "app") return null;
+    if (!UUID_REGEX.test(String(payload.sub || ""))) return null;
+    if (!UUID_REGEX.test(String(payload.sid || ""))) return null;
+    return payload;
+  } catch {
+    return null;
+  }
 }
 
 function signSocialConfirmToken(payload, jwtSecret) {
@@ -1226,6 +1232,7 @@ export default async function authRoutes(app) {
     async (request, reply) => {
       const supabaseToken = extractSupabaseToken(request);
       const replaceActiveSession = request.body?.replace_active_session === true;
+      let providerSessionGuard;
       if (!supabaseToken) {
         return sendError(reply, 400, "Debes enviar el token de Supabase para realizar el exchange.", {
           code: "AUTH_MISSING_TOKEN",
@@ -1252,14 +1259,8 @@ export default async function authRoutes(app) {
       }
 
       try {
-        const authResult = await app.supabaseAdmin.auth.getUser(supabaseToken);
-        const supabaseUser = authResult.data?.user;
-        if (authResult.error || !supabaseUser?.id) {
-          return sendError(reply, 401, "Token de Supabase invalido o expirado.", {
-            code: "AUTH_SUPABASE_INVALID",
-            details: authResult.error?.message || "SUPABASE_GET_USER_FAILED",
-          });
-        }
+        const { user: supabaseUser, sessionId } = await verifySupabaseAccessToken(app, supabaseToken);
+        providerSessionGuard = await acquireSupabaseSessionGuard(app, supabaseUser, sessionId);
 
         const socialAuthUserId = String(supabaseUser.id || "").trim();
         const internalUserExists = await hasInternalUserByAuthId(app.db, socialAuthUserId);
@@ -1283,6 +1284,7 @@ export default async function authRoutes(app) {
             {
               sub: socialAuthUserId,
               token_type: SOCIAL_CONFIRM_TOKEN_TYPE,
+              session_id: sessionId,
               email: socialEmail,
               nombres: socialNames.nombres,
               apellidos: socialNames.apellidos,
@@ -1413,6 +1415,8 @@ export default async function authRoutes(app) {
         return sendError(reply, 500, "No se pudo completar el exchange de autenticacion", {
           code: "AUTH_EXCHANGE_ERROR",
         });
+      } finally {
+        await providerSessionGuard?.release();
       }
     }
   );
@@ -1432,6 +1436,7 @@ export default async function authRoutes(app) {
       },
     },
     async (request, reply) => {
+      let providerSessionGuard;
       if (!app.db) {
         return sendError(reply, 500, "Base de datos no configurada", {
           code: "DB_NOT_CONFIGURED",
@@ -1482,9 +1487,14 @@ export default async function authRoutes(app) {
           });
         }
 
-        const authLookup = await app.supabaseAdmin.auth.admin.getUserById(authUserId);
+        let authLookup;
+        try { authLookup = await app.supabaseAdmin.auth.admin.getUserById(authUserId); }
+        catch { throw new AppError(503, 'No se pudo verificar la sesión. Intenta nuevamente más tarde.', { code: 'AUTH_SUPABASE_SESSION_UNAVAILABLE' }); }
+        if (authLookup?.error && (!Number(authLookup.error.status) || Number(authLookup.error.status) >= 500)) {
+          throw new AppError(503, 'No se pudo verificar la sesión. Intenta nuevamente más tarde.', { code: 'AUTH_SUPABASE_SESSION_UNAVAILABLE' });
+        }
         const supabaseUser = authLookup?.data?.user;
-        if (authLookup?.error || !supabaseUser?.id) {
+        if (authLookup?.error || supabaseUser?.id !== authUserId) {
           return sendError(reply, 401, "No se pudo validar la identidad social para confirmar.", {
             code: "AUTH_SOCIAL_CONFIRM_USER_NOT_FOUND",
           });
@@ -1502,6 +1512,8 @@ export default async function authRoutes(app) {
             code: "AUTH_SOCIAL_CONFIRM_EMAIL_MISMATCH",
           });
         }
+
+        providerSessionGuard = await acquireSupabaseSessionGuard(app, supabaseUser, decoded.session_id);
 
         let claimsUserId = authUserId;
         let provision = null;
@@ -1599,6 +1611,8 @@ export default async function authRoutes(app) {
         return sendError(reply, 500, "No se pudo confirmar el acceso social.", {
           code: "AUTH_SOCIAL_CONFIRM_ERROR",
         });
+      } finally {
+        await providerSessionGuard?.release();
       }
     }
   );
@@ -1660,12 +1674,26 @@ export default async function authRoutes(app) {
         });
       }
 
-      const client = await app.db.connect();
+      let client = await app.db.connect();
       let authUserId = null;
       let transactionStarted = false;
 
       try {
-        await ensureRegisterEmailAvailability(client, email);
+        const historicalContact = await ensureRegisterEmailAvailability(client, email);
+        if (historicalContact) {
+          // AM: No retener una conexión mientras el registro histórico solicita otra al mismo pool.
+          client.release();
+          client = null;
+          try {
+            const pending = await requestGuestRegistration(app, email);
+            return sendOk(reply, pending, { statusCode: 202, requestId: request.id });
+          } catch (error) {
+            if (error instanceof AppError) throw error;
+            throw new AppError(503, "No se pudo enviar la confirmación en este momento. Intenta más tarde.", {
+              code: "AUTH_REGISTER_TEMPORARY",
+            });
+          }
+        }
         const clienteRoleId = await getClienteRoleId(client);
 
         const authCreateResult = await app.supabaseAdmin.auth.admin.createUser({
@@ -1814,6 +1842,7 @@ export default async function authRoutes(app) {
         }
 
         if (error?.statusCode && error?.code) {
+          if (error.registrationReason) request.log.warn({ event: 'registration_unavailable', reason: error.registrationReason });
           return sendError(reply, error.statusCode, error.message, {
             code: error.code,
             details: error.details,
@@ -1832,10 +1861,56 @@ export default async function authRoutes(app) {
           details: error instanceof Error ? error.message : "Unknown register error",
         });
       } finally {
-        client.release();
+        client?.release();
       }
     }
   );
+
+  app.post('/register/resend', {
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+    schema: { body: { type: 'object', required: ['email'], additionalProperties: false,
+      properties: { email: { type: 'string', minLength: 5, maxLength: 160 } } } },
+  }, async (request, reply) => {
+    try {
+      const email = normalizeEmail(request.body.email);
+      if (!isValidEmail(email)) return sendError(reply, 400, 'Ingresa un correo válido.', { code: 'AUTH_INVALID_EMAIL' });
+      return sendOk(reply, await requestGuestRegistration(app, email), { statusCode: 202 });
+    } catch (error) {
+      request.log.warn({ event: 'guest_registration_resend_failed', code: error?.code || 'TEMPORARY' });
+      if (error?.statusCode === 409) return sendOk(reply, { pending_verification: true,
+        message: 'Si es posible continuar, recibirás un enlace para confirmar tu correo. Revisa tu bandeja de entrada.' }, { statusCode: 202 });
+      return sendError(reply, 503, 'No se pudo enviar la confirmación en este momento. Intenta más tarde.', { code: 'AUTH_REGISTER_TEMPORARY' });
+    }
+  });
+
+  app.post('/register/confirm', {
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+    schema: { body: { type: 'object', additionalProperties: false,
+      required: ['operation', 'token', 'nombres', 'apellidos', 'contrasena', 'confirmar_contrasena', 'acepta_terminos'],
+      properties: {
+        operation: { type: 'string', format: 'uuid' }, token: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+        email: false,
+        nombres: registerBodySchema.properties.nombres, apellidos: registerBodySchema.properties.apellidos,
+        contrasena: registerBodySchema.properties.contrasena, confirmar_contrasena: registerBodySchema.properties.confirmar_contrasena,
+        acepta_terminos: { type: 'boolean' }, consentimiento_marketing: { type: 'boolean' },
+      } } },
+  }, async (request, reply) => {
+    const body = request.body;
+    if (!normalizeRequiredText(body.nombres) || !normalizeRequiredText(body.apellidos)
+      || !body.acepta_terminos || validatePublicPassword(body.contrasena)
+      || body.contrasena !== body.confirmar_contrasena) {
+      return sendError(reply, 400, 'Revisa tus datos, contraseña y aceptación de términos.', { code: 'AUTH_REGISTER_CONFIRM_INVALID' });
+    }
+    try {
+      return sendOk(reply, await completeGuestRegistration(app, body, insertClientWithConsents));
+    } catch (error) {
+      request.log.warn({ event: 'guest_registration_confirmation_failed', code: error?.code || 'TEMPORARY' });
+      const status = [401, 409, 410].includes(error?.statusCode) ? error.statusCode : 503;
+      return sendError(reply, status, status === 410 ? 'El enlace expiró. Solicita uno nuevo.'
+        : 'No se pudo completar el registro. Solicita un nuevo enlace o utiliza el acceso existente.',
+      { code: status === 410 ? 'AUTH_REGISTER_LINK_EXPIRED' : 'AUTH_REGISTER_CONFIRM_FAILED' });
+    }
+  });
 
   app.post("/forgot-password", {
     config: {
@@ -1882,7 +1957,7 @@ export default async function authRoutes(app) {
 
     try {
       // AM: Flujo Opcion 2: generar recovery link con Supabase Admin y enviar correo desde backend SMTP.
-      const recovery = await generateRecoveryActionLink(app, email);
+      const recovery = await generateRecoveryActionLink(app, email, { passwordReset: true });
       if (recovery.found) {
         let fullName = null;
         try {
@@ -1899,15 +1974,12 @@ export default async function authRoutes(app) {
         });
 
         if (!delivery.sent) {
-          request.log.error({ email, delivery }, "No se pudo enviar recovery email por SMTP");
+          request.log.warn({ event: 'auth_recovery_delivery_failed' }, "Recovery delivery unavailable");
         }
       }
-    } catch (error) {
-      request.log.error({ err: error, email }, "No se pudo procesar forgot-password");
-      return sendError(reply, 500, "No se pudo iniciar la recuperacion de contrasena", {
-        code: "AUTH_RESET_ERROR",
-        details: error instanceof Error ? error.message : "Unknown forgot-password error",
-      });
+    } catch {
+      request.log.warn({ event: 'auth_recovery_request_failed' }, "Recovery request unavailable");
+      // Keep the public result neutral even when delivery/provider fails for an existing account.
     }
 
     return sendOk(reply, {
@@ -1915,6 +1987,34 @@ export default async function authRoutes(app) {
       rateLimit: rateLimitState.rateLimit,
     });
   });
+
+  app.post(
+    '/reset-password', {
+      config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+      schema: { body: { type: 'object', additionalProperties: false,
+        required: ['token_hash','contrasena','confirmar_contrasena'], properties: {
+          token_hash: { type: 'string', pattern: '^[A-Za-z0-9_-]{20,2048}$' },
+          contrasena: registerBodySchema.properties.contrasena, confirmar_contrasena: registerBodySchema.properties.confirmar_contrasena,
+          id_usuario: false, email: false, access_token: false, supabase_token: false,
+        } } },
+    }, async (request, reply) => {
+      const body = request.body;
+      if (validatePublicPassword(body.contrasena) || body.contrasena !== body.confirmar_contrasena) {
+        return sendError(reply, 400, 'Revisa la contraseña y su confirmación.', { code: 'AUTH_RESET_PASSWORD_INVALID' });
+      }
+      try {
+        const current = verifyManagedAppSessionPayload(getSessionTokenFromRequest(request));
+        const result = await resetPasswordWithRecovery(app, body, current?.sub || null);
+        clearSessionCookies(app, reply);
+        return sendOk(reply, result);
+      } catch (error) {
+        request.log.warn({ event: 'auth_password_reset_failed', code: error instanceof AppError ? error.code : 'TEMPORARY' });
+        return sendError(reply, [401,409].includes(error?.statusCode) ? error.statusCode : 503,
+          error instanceof AppError ? error.message : 'No se pudo confirmar el cambio. Solicita un enlace nuevo.',
+          { code: error instanceof AppError ? error.code : 'AUTH_RESET_UNCONFIRMED' });
+      }
+    }
+  );
 
   app.post(
     "/login",
@@ -1939,6 +2039,7 @@ export default async function authRoutes(app) {
       const contrasena = String(body.contrasena ?? body.password ?? "");
       const remember = body.remember === true;
       const replaceActiveSession = body.replace_active_session === true;
+      let passwordLock;
 
       if (!identifier || !contrasena) {
         return sendError(reply, 400, "Faltan credenciales: se requiere correo y contrasena", {
@@ -1992,6 +2093,7 @@ export default async function authRoutes(app) {
           });
         }
 
+        passwordLock = await acquirePasswordOperationLock(app, identifier);
         const { data, error } = await app.supabase.auth.signInWithPassword({
           email: identifier,
           password: contrasena,
@@ -2025,25 +2127,6 @@ export default async function authRoutes(app) {
           });
         }
 
-        const tempLock = await checkUserTemporaryLock(app, { idUsuario: claims.user.id_usuario });
-        if (tempLock.ok && tempLock.blocked) {
-          await logLoginAttempt(app, request, {
-            id_usuario: claims.user.id_usuario,
-            identifier,
-            provider: "supabase_password",
-            resultado: "blocked",
-            motivo_codigo: "LOGIN_TEMPORARILY_LOCKED",
-            metadata: {
-              auth_stage: "password_login",
-            },
-          });
-          return sendError(reply, 429, "No fue posible iniciar sesion en este momento. Intenta nuevamente mas tarde.", {
-            code: "AUTH_USER_TEMPORARILY_LOCKED",
-          });
-        }
-
-        await registerSuccessfulLogin(app, request, { idUsuario: claims.user.id_usuario });
-
         const user = {
           ...claims.user,
           roles: claims.roles,
@@ -2068,6 +2151,7 @@ export default async function authRoutes(app) {
           provider: "supabase_password",
         });
 
+        await registerSuccessfulLogin(app, request, { idUsuario: claims.user.id_usuario });
         const csrfToken = issueSessionCookies(app, reply, session.token, { remember });
         await logLoginAttempt(app, request, {
           id_usuario: claims.user.id_usuario,
@@ -2093,6 +2177,9 @@ export default async function authRoutes(app) {
             requestId: request.id,
           });
         }
+        if (["AUTH_LOCK_CHECK_UNAVAILABLE", "AUTH_USER_TEMPORARILY_LOCKED", "AUTH_PASSWORD_UNAVAILABLE"].includes(error?.code)) {
+          return sendError(reply, error.statusCode, error.message, { code: error.code, requestId: request.id });
+        }
         const message = error instanceof Error ? error.message : "Unknown login error";
         await logLoginAttempt(app, request, {
           id_usuario: null,
@@ -2110,14 +2197,47 @@ export default async function authRoutes(app) {
           code: "AUTH_LOGIN_ERROR",
           details: message,
         });
+      } finally {
+        await passwordLock?.release();
       }
+    }
+  );
+
+  app.post(
+    "/session/touch",
+    {
+      preHandler: app.authenticate,
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  touched: { type: "boolean" },
+                },
+                required: ["touched"],
+                additionalProperties: false,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          401: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      return sendOk(reply, { touched: true }, { requestId: request.id });
     }
   );
 
   app.post(
     "/logout",
     {
-      preHandler: app.authenticate,
       schema: {
         response: {
           200: {
@@ -2142,20 +2262,27 @@ export default async function authRoutes(app) {
       },
     },
     async (request, reply) => {
-      clearSessionCookies(app, reply);
-      const closed = await closeActiveSession(app, request, {
-        sid: String(request.auth?.sid || ""),
-        id_usuario: String(request.auth?.sub || ""),
-        cerrada_por: String(request.auth?.sub || ""),
-        motivo_cierre: "logout_usuario",
-      });
-      if (!closed.ok) {
-        request.log.error(
-          { event: "auth_logout_session_close_failed", code: closed.code || "AUTH_SESSION_CLOSE_ERROR" },
-          "Logout session close failed"
-        );
+      const token = getSessionTokenFromRequest(request);
+      const payload = verifyManagedAppSessionPayload(token);
+      if (payload) {
+        const closed = await closeActiveSession(app, request, {
+          sid: String(payload.sid || ""),
+          id_usuario: String(payload.sub || ""),
+          cerrada_por: String(payload.sub || ""),
+          motivo_cierre: "logout_usuario",
+        });
+        if (!closed.ok) {
+          request.log.warn(
+            { event: "auth_logout_session_close_skipped", code: closed.code || "AUTH_SESSION_CLOSE_ERROR" },
+            "Logout session close skipped"
+          );
+          return sendError(reply, 503, "No se pudo confirmar el cierre de sesión. Intenta nuevamente.", {
+            code: "AUTH_LOGOUT_UNCONFIRMED", requestId: request.id,
+          });
+        }
       }
-      request.log.info({ event: "auth_logout", userId: request.auth?.sub || null }, "Logout success");
+      clearSessionCookies(app, reply);
+      request.log.info({ event: "auth_logout", userId: payload?.sub || null }, "Logout success");
       return sendOk(reply, { logged_out: true }, { requestId: request.id });
     }
   );

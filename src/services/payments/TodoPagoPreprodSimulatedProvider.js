@@ -1,4 +1,9 @@
 import { PaymentProvider } from "./PaymentProvider.js";
+import {
+  normalizeCreateIntentResult,
+  PAYMENT_LAUNCH_METHODS,
+  PAYMENT_LAUNCH_TYPES,
+} from "./paymentProviderContract.js";
 import { resolveTodoPagoSimulatedResponse } from "./todopagoSimulatedResponses.js";
 
 function safeText(value) {
@@ -29,9 +34,18 @@ export class TodoPagoPreprodSimulatedProvider extends PaymentProvider {
     const amountKey = Number(montoHnl || 0).toFixed(2).replace(".", "_");
     const providerIntentId = `todopago_sim_${idempotencyKey}_amt_${amountKey}`;
     const simulation = resolveTodoPagoSimulatedResponse(montoHnl);
-    return {
+    const paymentUrl = buildPaymentUrl(callbackUrl, providerIntentId, simulation);
+    return normalizeCreateIntentResult({
       providerIntentId,
-      paymentUrl: buildPaymentUrl(callbackUrl, providerIntentId, simulation),
+      paymentUrl,
+      launch: {
+        type: PAYMENT_LAUNCH_TYPES.REDIRECT,
+        action: paymentUrl,
+        method: PAYMENT_LAUNCH_METHODS.GET,
+        fields: {},
+        allowedMessageOrigin: null,
+        expiresAt: null,
+      },
       raw: {
         simulated: true,
         provider: "todopago",
@@ -41,7 +55,7 @@ export class TodoPagoPreprodSimulatedProvider extends PaymentProvider {
         metadata: metadata && typeof metadata === "object" ? metadata : {},
         simulation,
       },
-    };
+    });
   }
 
   async queryStatus(providerIntentId) {

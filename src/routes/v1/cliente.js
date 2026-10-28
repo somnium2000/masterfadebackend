@@ -10,17 +10,24 @@ import {
 import {
   createMembershipPurchaseOrder,
   createMembershipOrderPaymentIntent,
-  confirmMembershipPaymentAndActivateSubscription,
+  processMembershipPixelPaySale,
+  reconcileMembershipPixelPayStatus,
   processMembershipSimulatorEvent,
-  acquireMembershipPlan,
   cancelMembership,
   cancelMembershipBySubscription,
   getClienteMembershipState,
-  registerSubscriptionAlertEvent,
 } from "../../services/membershipService.js";
+import {
+  confirmClientAccountDeletionRequest,
+  createClientAccountDeletionRequest,
+  evaluateClientAccountDeletion,
+  validateClientAccountDeletionConfirmationBody,
+  verifyRecentAccountDeletionReauthentication,
+} from "../../services/accountDeletionService.js";
 
 const CLIENT_ROLES = ["cliente"];
 const requestIdSchema = { type: "string" };
+const ACCOUNT_DELETION_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{16,160}$/;
 
 let clienteProfileCapabilitiesCache = null;
 
@@ -266,10 +273,10 @@ async function queryClienteProfileRow(client, clienteId, capabilities) {
 }
 
 function serializePreferenciasForDb(preferenciasText, capabilities) {
-  if (preferenciasText === null || preferenciasText === undefined) return null;
   if (capabilities.preferenciasDbType === "json" || capabilities.preferenciasDbType === "jsonb") {
-    return JSON.stringify(preferenciasText);
+    return JSON.stringify(preferenciasText ?? "");
   }
+  if (preferenciasText === null || preferenciasText === undefined) return null;
   return preferenciasText;
 }
 
@@ -388,70 +395,6 @@ async function buildClienteMePayload(app, claims, { expiresIn = 300 } = {}) {
   }
 }
 
-async function getClienteMailContext(client, clienteId) {
-  const { rows } = await client.query(
-    `
-      SELECT
-        c.id_cliente,
-        COALESCE(NULLIF(TRIM(CONCAT(p.nombres, ' ', p.apellidos)), ''), 'Cliente') AS nombre_completo,
-        cp.email AS correo_principal
-      FROM public.clientes c
-      JOIN public.personas p
-        ON p.id_persona = c.id_persona
-      LEFT JOIN LATERAL (
-        SELECT c2.direccion_correo::text AS email
-        FROM public.correos c2
-        WHERE c2.id_persona = c.id_persona
-          AND c2.deleted_at IS NULL
-        ORDER BY c2.es_principal DESC NULLS LAST, c2.verificado DESC NULLS LAST, c2.id_correo ASC
-        LIMIT 1
-      ) cp ON TRUE
-      WHERE c.id_cliente = $1::uuid
-        AND c.deleted_at IS NULL
-      LIMIT 1
-    `,
-    [clienteId]
-  );
-
-  return rows?.[0] ?? null;
-}
-
-async function getMembershipSubscriptionMailSummary(client, {
-  clienteId,
-  idSuscripcion,
-} = {}) {
-  const safeClienteId = String(clienteId || "").trim();
-  const safeSubscriptionId = String(idSuscripcion || "").trim();
-  if (!safeClienteId || !safeSubscriptionId) return null;
-
-  const { rows } = await client.query(
-    `
-      SELECT
-        s.id_suscripcion,
-        s.inicio_at,
-        s.fin_at,
-        mp.nombre_plan,
-        COALESCE(mpo.total_hnl, mpo.subtotal_hnl, 0)::numeric AS total_pagado_hnl
-      FROM public.subscriptions s
-      JOIN public.membership_plans mp
-        ON mp.id_plan = s.id_plan
-      LEFT JOIN LATERAL (
-        SELECT mo.total_hnl, mo.subtotal_hnl
-        FROM public.membership_purchase_orders mo
-        WHERE mo.id_suscripcion = s.id_suscripcion
-        ORDER BY mo.created_at DESC
-        LIMIT 1
-      ) mpo ON TRUE
-      WHERE s.id_suscripcion = $1::uuid
-        AND s.id_cliente = $2::uuid
-      LIMIT 1
-    `,
-    [safeSubscriptionId, safeClienteId]
-  );
-
-  return rows?.[0] ?? null;
-}
-
 function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
@@ -466,6 +409,26 @@ function sendHandled(reply, request, error, fallbackMessage, fallbackCode) {
     code: fallbackCode,
     requestId: request.id,
   });
+}
+
+function ensureCompleteAccountDeletionContext(request) {
+  const context = ensureClienteContext(request);
+  if (!context.clienteId || !context.personaId || !context.userId) {
+    throw new AppError(409, "No se pudo determinar la identidad completa del cliente autenticado.", {
+      code: "CLIENT_ACCOUNT_DELETION_IDENTITY_CONTEXT_REQUIRED",
+    });
+  }
+  return context;
+}
+
+function assertAccountDeletionIdempotencyKey(value) {
+  const normalized = String(value || "").trim();
+  if (!ACCOUNT_DELETION_IDEMPOTENCY_KEY_PATTERN.test(normalized)) {
+    throw new AppError(400, "La clave de idempotencia para la solicitud no es válida.", {
+      code: "CLIENT_ACCOUNT_DELETION_IDEMPOTENCY_KEY_INVALID",
+    });
+  }
+  return normalized;
 }
 
 export default async function clienteRoutes(app) {
@@ -502,6 +465,261 @@ export default async function clienteRoutes(app) {
         return sendOk(reply, payload, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo consultar el perfil del cliente", "CLIENTE_ME_ERROR");
+      }
+    }
+  );
+
+  app.get(
+    "/me/account-deletion/preview",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      schema: {
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: {
+                type: "object",
+                properties: {
+                  can_delete: { type: "boolean" },
+                  account_mode: { type: "string" },
+                  requires_approval: { type: "boolean" },
+                  blocking_reasons: { type: "array", items: { type: "object", additionalProperties: true } },
+                  consequences: { type: "array", items: { type: "object", additionalProperties: true } },
+                  blocking_appointments: { type: "object", additionalProperties: true },
+                  active_holds: { type: "object", additionalProperties: true },
+                  pending_payments: { type: "object", additionalProperties: true },
+                  masterpoints: { type: "object", additionalProperties: true },
+                  membership: { type: "object", additionalProperties: true },
+                  pending_membership_orders: { type: "object", additionalProperties: true },
+                  retained_history: { type: "object", additionalProperties: true },
+                  evaluated_at: { type: "string" },
+                },
+                required: [
+                  "can_delete",
+                  "account_mode",
+                  "requires_approval",
+                  "blocking_reasons",
+                  "consequences",
+                  "blocking_appointments",
+                  "active_holds",
+                  "pending_payments",
+                  "masterpoints",
+                  "membership",
+                  "pending_membership_orders",
+                  "retained_history",
+                  "evaluated_at",
+                ],
+                additionalProperties: true,
+              },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      let client;
+      try {
+        const context = ensureCompleteAccountDeletionContext(request);
+
+        client = await app.db.connect();
+        const preview = await evaluateClientAccountDeletion(client, {
+          clienteId: context.clienteId,
+          personaId: context.personaId,
+          usuarioId: context.userId,
+        });
+        return sendOk(reply, preview, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo evaluar la eliminación de la cuenta.",
+          "CLIENT_ACCOUNT_DELETION_PREVIEW_ERROR"
+        );
+      } finally {
+        client?.release();
+      }
+    }
+  );
+
+  app.post(
+    "/me/account-deletion/requests",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "15 minutes",
+          groupId: "account-deletion-create",
+        },
+      },
+      schema: {
+        body: {
+          type: "object",
+          properties: {
+            idempotency_key: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+          201: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureCompleteAccountDeletionContext(request);
+      const idempotencyKey = assertAccountDeletionIdempotencyKey(request.body?.idempotency_key);
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const result = await createClientAccountDeletionRequest(client, {
+          clienteId: context.clienteId,
+          personaId: context.personaId,
+          usuarioId: context.userId,
+          idempotencyKey,
+          requestId: request.id,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, result, {
+          statusCode: result.idempotent_replay ? 200 : 201,
+          requestId: request.id,
+        });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo registrar la solicitud de eliminación de cuenta.",
+          "CLIENT_ACCOUNT_DELETION_REQUEST_CREATE_ERROR"
+        );
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  app.post(
+    "/me/account-deletion/requests/:requestId/confirm",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "15 minutes",
+          groupId: "account-deletion-confirm",
+        },
+      },
+      schema: {
+        params: {
+          type: "object",
+          required: ["requestId"],
+          properties: {
+            requestId: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
+        body: {
+          type: "object",
+          properties: {
+            reauth_token: { type: "string" },
+            confirmacion_texto: { type: "string" },
+            acepta_perder_masterpuntos: { type: "boolean" },
+            acepta_cancelar_membresia: { type: "boolean" },
+            acepta_historial_anonimizado: { type: "boolean" },
+            acepta_irreversibilidad: { type: "boolean" },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: {
+            type: "object",
+            properties: {
+              ok: { type: "boolean" },
+              data: { type: "object", additionalProperties: true },
+              requestId: requestIdSchema,
+            },
+            required: ["ok", "data"],
+            additionalProperties: true,
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureCompleteAccountDeletionContext(request);
+      validateClientAccountDeletionConfirmationBody(request.body || {});
+
+      const reauth = await verifyRecentAccountDeletionReauthentication(app, {
+        reauthToken: request.body?.reauth_token,
+        expectedUserId: context.userId,
+      });
+
+      const client = await app.db.connect();
+      let txStarted = false;
+
+      try {
+        await client.query("BEGIN");
+        txStarted = true;
+
+        const result = await confirmClientAccountDeletionRequest(client, {
+          requestId: request.params.requestId,
+          clienteId: context.clienteId,
+          personaId: context.personaId,
+          usuarioId: context.userId,
+          authenticatedAt: reauth.authenticatedAt,
+          traceRequestId: request.id,
+        });
+
+        await client.query("COMMIT");
+        txStarted = false;
+
+        return sendOk(reply, result, { requestId: request.id });
+      } catch (error) {
+        if (txStarted) {
+          await client.query("ROLLBACK").catch(() => {});
+        }
+        return sendHandled(
+          reply,
+          request,
+          error,
+          "No se pudo confirmar la solicitud de eliminación de cuenta.",
+          "CLIENT_ACCOUNT_DELETION_REQUEST_CONFIRM_ERROR"
+        );
+      } finally {
+        client.release();
       }
     }
   );
@@ -747,6 +965,7 @@ export default async function clienteRoutes(app) {
           required: ["id_plan_sucursal"],
           properties: {
             id_plan_sucursal: { type: "string", format: "uuid" },
+            idempotency_key: { type: "string", format: "uuid", minLength: 36, maxLength: 36 },
           },
           additionalProperties: false,
         },
@@ -788,6 +1007,7 @@ export default async function clienteRoutes(app) {
           clienteId: context.clienteId,
           usuarioId: context.userId ?? null,
           idPlanSucursal: request.body.id_plan_sucursal,
+          idempotencyKey: request.body.idempotency_key,
         });
 
         await client.query("COMMIT");
@@ -918,6 +1138,8 @@ export default async function clienteRoutes(app) {
         app.config?.paymentProvider !== "todopago"
         || app.config?.todoPago?.mode !== "preprod_simulated"
         || app.config?.todoPago?.simulatedEnabled !== true
+        || !["development", "test"].includes(String(app.config?.nodeEnv || "").toLowerCase())
+        || process.env.MEMBERSHIP_PAYMENT_SIMULATOR_ENABLED !== "true"
       ) {
         return sendError(reply, 409, "El simulador de pagos no esta disponible en este entorno.", {
           code: "CLIENTE_MEMBERSHIP_SIMULATOR_DISABLED",
@@ -937,6 +1159,13 @@ export default async function clienteRoutes(app) {
           idPaymentIntent: request.body.id_payment_intent,
           clienteId: context.clienteId,
           montoPruebaHnl: request.body?.monto_prueba_hnl ?? null,
+          serverContext: {
+            paymentProvider: app.config.paymentProvider,
+            mode: app.config.todoPago.mode,
+            simulatedEnabled: app.config.todoPago.simulatedEnabled,
+            explicitlyEnabled: process.env.MEMBERSHIP_PAYMENT_SIMULATOR_ENABLED === "true",
+            nodeEnv: app.config.nodeEnv,
+          },
         });
 
         await client.query("COMMIT");
@@ -967,100 +1196,99 @@ export default async function clienteRoutes(app) {
       schema: {
         body: {
           type: "object",
-          required: ["id_payment_intent"],
+          required: ["id_payment_intent", "card", "billing"],
           properties: {
             id_payment_intent: { type: "string", format: "uuid" },
+            card: {
+              type: "object",
+              required: ["number", "holder", "expire", "cvv"],
+              properties: {
+                number: { type: "string", pattern: "^[0-9 ]{13,23}$" },
+                holder: { type: "string", minLength: 2, maxLength: 120 },
+                expire: { type: "string", pattern: "^[0-9]{2}(0[1-9]|1[0-2])$" },
+                cvv: { type: "string", pattern: "^[0-9]{3,4}$" },
+              },
+              additionalProperties: false,
+            },
+            billing: {
+              type: "object",
+              required: ["address", "country", "state", "city", "phone"],
+              properties: {
+                address: { type: "string", minLength: 2, maxLength: 180 },
+                country: { type: "string", const: "HN" },
+                state: { type: "string", pattern: "^HN-[A-Z]{2}$" },
+                city: { type: "string", minLength: 1, maxLength: 80 },
+                phone: { type: "string", pattern: "^[0-9]{8,15}$" },
+              },
+              additionalProperties: false,
+            },
           },
           additionalProperties: false,
         },
-        response: {
-          200: {
-            type: "object",
-            properties: {
-              ok: { type: "boolean" },
-              data: {
-                type: "object",
-                properties: {
-                  id_suscripcion: { type: "string", format: "uuid" },
-                  estado: { type: "string" },
-                  email_enviado: { type: "boolean" },
-                },
-                required: ["id_suscripcion", "estado", "email_enviado"],
-                additionalProperties: false,
-              },
-              requestId: requestIdSchema,
-            },
-            required: ["ok", "data"],
-            additionalProperties: true,
-          },
-        },
+        response: { 200: { type: "object", additionalProperties: true }, 202: { type: "object", additionalProperties: true } },
       },
     },
     async (request, reply) => {
       const context = ensureClienteContext(request);
-      const client = await app.db.connect();
-      let txStarted = false;
-
+      if (!request.body?.card || !request.body?.billing) {
+        return sendError(reply, 400, "Faltan los datos requeridos para procesar el pago", {
+          code: "MEMBERSHIP_PIXELPAY_PAYMENT_DATA_REQUIRED",
+          requestId: request.id,
+        });
+      }
       try {
-        await client.query("BEGIN");
-        txStarted = true;
-
-        const confirmation = await confirmMembershipPaymentAndActivateSubscription(client, {
+        const result = await processMembershipPixelPaySale(app, {
           idPaymentIntent: request.body.id_payment_intent,
           clienteId: context.clienteId,
+          card: request.body.card,
+          billing: request.body.billing,
+          requestId: request.id,
+          logger: request.log,
         });
-
-        await client.query("COMMIT");
-        txStarted = false;
-
-        let emailEnviado = false;
-        try {
-          if (app.mailer?.configured && confirmation?.id_suscripcion) {
-            const [mailContext, summary] = await Promise.all([
-              getClienteMailContext(client, context.clienteId),
-              getMembershipSubscriptionMailSummary(client, {
-                clienteId: context.clienteId,
-                idSuscripcion: confirmation.id_suscripcion,
-              }),
-            ]);
-
-            if (mailContext?.correo_principal && summary?.nombre_plan) {
-              const delivery = await app.mailer.sendMembershipPlanAcquiredEmail({
-                to: mailContext.correo_principal,
-                fullName: mailContext.nombre_completo,
-                planName: summary.nombre_plan,
-                startAt: summary.inicio_at,
-                endAt: summary.fin_at,
-                amountHnl: Number(summary.total_pagado_hnl || 0),
-              });
-              emailEnviado = Boolean(delivery?.sent);
-            }
-          }
-        } catch (mailError) {
-          request.log.warn(
-            { err: mailError, id_suscripcion: confirmation?.id_suscripcion, id_cliente: context.clienteId },
-            "No se pudo enviar correo de activacion de plan"
-          );
-          emailEnviado = false;
-        }
-
-        return sendOk(reply, {
-          ...confirmation,
-          email_enviado: emailEnviado,
-        }, { requestId: request.id });
+        return sendOk(reply, result, {
+          statusCode: result.pending_confirmation ? 202 : 200,
+          requestId: request.id,
+        });
       } catch (error) {
-        if (txStarted) {
-          await client.query("ROLLBACK").catch(() => {});
-        }
+        return sendHandled(reply, request, error, "No se pudo procesar el pago de la membresia", "MEMBERSHIP_PIXELPAY_SALE_ERROR");
+      }
+    }
+  );
+
+  app.post(
+    "/planes/pago-intent/:id_payment_intent/estado",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      config: {
+        rateLimit: { max: 3, timeWindow: "1 minute", groupId: "membership-pixelpay-status" },
+      },
+      schema: {
+        params: {
+          type: "object",
+          required: ["id_payment_intent"],
+          properties: { id_payment_intent: { type: "string", format: "uuid" } },
+          additionalProperties: false,
+        },
+        response: { 200: { type: "object", additionalProperties: true } },
+      },
+    },
+    async (request, reply) => {
+      const context = ensureClienteContext(request);
+      try {
+        const result = await reconcileMembershipPixelPayStatus(app, {
+          idPaymentIntent: request.params.id_payment_intent,
+          clienteId: context.clienteId,
+          requestId: request.id,
+        });
+        return sendOk(reply, result, { requestId: request.id });
+      } catch (error) {
         return sendHandled(
           reply,
           request,
           error,
-          "No se pudo confirmar el pago del plan",
-          "CLIENTE_MEMBERSHIP_PAYMENT_CONFIRM_ERROR"
+          "No se pudo verificar el estado del pago de la membresia",
+          "MEMBERSHIP_PIXELPAY_STATUS_ERROR"
         );
-      } finally {
-        client.release();
       }
     }
   );
@@ -1094,92 +1322,11 @@ export default async function clienteRoutes(app) {
       },
     },
     async (request, reply) => {
-      const context = ensureClienteContext(request);
-      const client = await app.db.connect();
-      let txStarted = false;
-
-      try {
-        const idPlan = String(request.body?.id_plan || "").trim();
-        const idSucursal = String(request.body?.id_sucursal || "").trim();
-
-        if (!idPlan || !idSucursal) {
-          throw new AppError(400, "Debes indicar id_plan e id_sucursal para adquirir el plan", {
-            code: "CLIENTE_MEMBERSHIP_ACQUIRE_INVALID_BODY",
-          });
-        }
-
-        await client.query("BEGIN");
-        txStarted = true;
-
-        const acquisition = await acquireMembershipPlan(client, {
-          clienteId: context.clienteId,
-          usuarioId: context.userId,
-          idPlan,
-          idSucursal,
-        });
-
-        const alertPayload = {
-          tipo: "adquisicion",
-          id_plan: acquisition?.plan?.id_plan || idPlan,
-          nombre_plan: acquisition?.plan?.nombre_plan || null,
-          precio_hnl: acquisition?.plan?.precio_hnl ?? null,
-        };
-        const shouldSendAcquisitionMail = await registerSubscriptionAlertEvent(client, {
-          idSuscripcion: acquisition.subscription.id_suscripcion,
-          alertType: "adquisicion",
-          payload: alertPayload,
-        });
-
-        await client.query("COMMIT");
-        txStarted = false;
-
-        const estado = await getClienteMembershipState(client, context.clienteId);
-        const mailContext = shouldSendAcquisitionMail
-          ? await getClienteMailContext(client, context.clienteId)
-          : null;
-
-        if (shouldSendAcquisitionMail && app.mailer?.configured && mailContext?.correo_principal) {
-          void app.mailer.sendMembershipPlanAcquiredEmail({
-            to: mailContext.correo_principal,
-            fullName: mailContext.nombre_completo,
-            planName: acquisition?.plan?.nombre_plan || "Plan MasterFade",
-            startAt: acquisition?.subscription?.inicio_at,
-            endAt: acquisition?.subscription?.fin_at,
-            amountHnl: acquisition?.plan?.precio_hnl ?? null,
-          });
-        }
-
-        return sendOk(
-          reply,
-          {
-            adquisicion: {
-              id_suscripcion: acquisition.subscription.id_suscripcion,
-              id_plan: acquisition.plan.id_plan,
-              nombre_plan: acquisition.plan.nombre_plan,
-              categoria_nivel: acquisition.plan.categoria_nivel,
-              precio_hnl: acquisition.plan.precio_hnl,
-              inicio_at: acquisition.subscription.inicio_at,
-              fin_at: acquisition.subscription.fin_at,
-              transicion: acquisition.transition || null,
-            },
-            estado_plan: estado,
-          },
-          { statusCode: 201, requestId: request.id }
-        );
-      } catch (error) {
-        if (txStarted) {
-          await client.query("ROLLBACK").catch(() => {});
-        }
-        return sendHandled(
-          reply,
-          request,
-          error,
-          "No se pudo adquirir el plan de membresía",
-          "CLIENTE_MEMBERSHIP_ACQUIRE_ERROR"
-        );
-      } finally {
-        client.release();
-      }
+      ensureClienteContext(request);
+      return sendError(reply, 409, "La membresia requiere un pago verificado antes de activarse", {
+        code: "MEMBERSHIP_PURCHASE_REQUIRES_VERIFIED_PAYMENT",
+        requestId: request.id,
+      });
     }
   );
 

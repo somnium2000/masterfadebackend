@@ -1,5 +1,6 @@
 node_modules/
 .env
+.env.todopago.local
 .DS_Store
 npm-debug.log*
 *.log

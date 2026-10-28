@@ -31,6 +31,7 @@ import {
 import {
   applyPersistedPromotionDiscounts,
   buildPaymentDetailRows,
+  buildPixelPayOrderItems,
 } from "../src/routes/v1/public/pagos.js";
 import {
   buildCanonicalReservationPayload,
@@ -910,6 +911,31 @@ test("pago recalcula descuentos usando snapshots persistidos sin tocar entorno",
   }]);
   assert.equal(included[0].isv_hnl, 13.04);
   assert.equal(included[0].total_linea_hnl, 100);
+});
+
+test("items PixelPay reflejan servicios y paquetes canonicos con total post-promocion", () => {
+  const items = buildPixelPayOrderItems([
+    {
+      id_servicio: SERVICE_A,
+      id_cita_paquete: null,
+      nombre_servicio_snapshot: "Corte",
+      nombre_paquete_snapshot: null,
+      total_linea_hnl: 90,
+    },
+    {
+      id_servicio: SERVICE_B,
+      id_cita_paquete: PACKAGE_A,
+      nombre_servicio_snapshot: "Barba",
+      nombre_paquete_snapshot: "MasterPaquete Pro",
+      total_linea_hnl: 25,
+    },
+  ]);
+
+  assert.deepEqual(items, [
+    { code: SERVICE_A, title: "Corte", price: 90, qty: 1 },
+    { code: PACKAGE_A, title: "MasterPaquete Pro: Barba", price: 25, qty: 1 },
+  ]);
+  assert.equal(items.reduce((sum, item) => sum + (item.price * item.qty), 0), 115);
 });
 
 test("reinicio logico con BOOKING_ISV_ENABLED=true activa ISV sin nueva migracion", async () => {

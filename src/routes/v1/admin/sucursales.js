@@ -193,6 +193,11 @@ function mapSucursal(row) {
 }
 
 function sendHandled(reply, request, error, message, code) {
+  if (error?.code === "23505") {
+    return sendError(reply, 409, "Ya existe una sucursal con ese nombre para la empresa seleccionada", {
+      code: "SUCURSALES_DUPLICATE_NAME", requestId: request.id,
+    });
+  }
   if (error instanceof AppError) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
@@ -217,6 +222,7 @@ async function ensureCompanyExists(client, idEmpresa) {
       FROM public.empresas
       WHERE id_empresa = $1::uuid
       LIMIT 1
+      FOR UPDATE
     `,
     [idEmpresa]
   );
@@ -350,8 +356,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
       patch.fecha_inauguracion !== undefined
         ? normalizeDateOnly(patch.fecha_inauguracion)
         : current.fecha_inauguracion,
-    estado:
-      patch.estado !== undefined ? Boolean(patch.estado) : Boolean(current.estado),
+    estado: patch.estado !== undefined ? Boolean(patch.estado) : undefined,
   };
 
   await ensureCompanyExists(client, next.id_empresa);
@@ -361,7 +366,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
     excludeId: idSucursal,
   });
 
-  if (Boolean(current.estado) && !next.estado) {
+  if (Boolean(current.estado) && next.estado === false) {
     await assertCanDeactivateBranch(client, idSucursal);
   }
 
@@ -374,7 +379,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
         direccion_texto = $4::text,
         telefono_texto = $5::text,
         fecha_inauguracion = $6::date,
-        estado = $7::boolean,
+        ${next.estado !== undefined ? "estado = $7::boolean," : ""}
         updated_at = NOW()
       WHERE id_sucursal = $1::uuid
         AND deleted_at IS NULL
@@ -386,7 +391,7 @@ async function updateSucursal(client, idSucursal, patch = {}) {
       next.direccion ?? null,
       next.telefono ?? null,
       next.fecha_inauguracion ?? null,
-      next.estado,
+      ...(next.estado !== undefined ? [next.estado] : []),
     ]
   );
 
@@ -433,12 +438,54 @@ async function setSucursalState(client, idSucursal, targetState) {
   };
 }
 
+async function withSucursalStateLock(pool, idSucursal, operation) {
+  const client = await pool.connect();
+  let started = false;
+  try {
+    await client.query("BEGIN");
+    started = true;
+    // AM: Tras esperar al escritor, el conteo debe ver su COMMIT y no un snapshot previo heredado.
+    await client.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    // AM: Serializa las transiciones de esta sucursal antes de leer su estado.
+    if (idSucursal) await client.query("SELECT id_sucursal FROM public.sucursales WHERE id_sucursal = $1::uuid AND deleted_at IS NULL FOR UPDATE", [idSucursal]);
+    const result = await operation(client);
+    await client.query("COMMIT");
+    started = false;
+    return result;
+  } catch (error) {
+    if (started) await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export default async function adminSucursalesRoutes(app) {
-  // JK: Listado principal para el modulo SUCURSALES, restringido a SUPER_ADMIN en esta fase.
-  app.get("/", { preHandler: app.requireRoles(SUPER_ADMIN_ONLY), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
+  // AM: El alcance del listado requiere una asignacion admin activa; las demas rutas siguen exclusivas de super_admin.
+  app.get("/", { preHandler: app.requireRoles(["super_admin", "admin"]), schema: { querystring: listSucursalesQuerySchema } }, async (request, reply) => {
     try {
       const onlyActive = request.query?.solo_activas === true || request.query?.solo_activas === "true";
-      const { rows } = await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL);
+      const isSuperAdmin = Array.isArray(request.claims?.roles) && request.claims.roles.includes("super_admin");
+      const userId = request.claims?.user?.id_usuario;
+      if (!isSuperAdmin && (!Array.isArray(request.claims?.roles) || !request.claims.roles.includes("admin")
+        || typeof userId !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId))) {
+        return sendOk(reply, { sucursales: [] });
+      }
+      const { rows } = isSuperAdmin
+        ? await app.db.query(onlyActive ? LIST_ACTIVE_SUCURSALES_SQL : LIST_SUCURSALES_SQL)
+        : await app.db.query(`${SUCURSAL_SELECT_SQL}
+            AND EXISTS (
+              SELECT 1
+              FROM public.roles_usuarios ru
+              JOIN public.roles r ON r.id_rol = ru.id_rol
+              WHERE ru.id_usuario = $1::uuid
+                AND ru.id_sucursal = s.id_sucursal
+                AND ru.activo IS TRUE
+                AND r.nombre = 'admin'
+            )
+            ${onlyActive ? "AND COALESCE(s.estado, TRUE) IS TRUE" : ""}
+            ORDER BY s.nombre_sucursal ASC
+          `, [userId]);
       return sendOk(reply, { sucursales: rows.map(mapSucursal) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar sucursales", "SUCURSALES_LIST_ERROR");
@@ -480,7 +527,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const created = await createSucursal(app.db, request.body || {});
+        const created = await withSucursalStateLock(app.db, null, client => createSucursal(client, request.body || {}));
         return sendOk(reply, { sucursal: mapSucursal(created) }, { statusCode: 201, requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo crear sucursal", "SUCURSALES_CREATE_ERROR");
@@ -496,7 +543,8 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const updated = await updateSucursal(app.db, request.params.id, request.body || {});
+        const patch = request.body || {};
+        const updated = await withSucursalStateLock(app.db, request.params.id, client => updateSucursal(client, request.params.id, patch));
         return sendOk(reply, { sucursal: mapSucursal(updated) }, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo actualizar sucursal", "SUCURSALES_UPDATE_ERROR");
@@ -512,7 +560,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const result = await setSucursalState(app.db, request.params.id, false);
+        const result = await withSucursalStateLock(app.db, request.params.id, client => setSucursalState(client, request.params.id, false));
         return sendOk(
           reply,
           {
@@ -536,7 +584,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const result = await setSucursalState(app.db, request.params.id, true);
+        const result = await withSucursalStateLock(app.db, request.params.id, client => setSucursalState(client, request.params.id, true));
         return sendOk(
           reply,
           {
@@ -561,7 +609,7 @@ export default async function adminSucursalesRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const result = await setSucursalState(app.db, request.params.id, false);
+        const result = await withSucursalStateLock(app.db, request.params.id, client => setSucursalState(client, request.params.id, false));
         return sendOk(
           reply,
           {

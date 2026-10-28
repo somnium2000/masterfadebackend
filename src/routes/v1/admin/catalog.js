@@ -1048,6 +1048,35 @@ const GET_PACKAGE_OFFER_SQL = `
   FOR UPDATE
 `;
 
+const GET_ACTIVE_PACKAGE_OFFER_BRANCHES_SQL = `
+  -- AM: package_active_offers toma solo la version vigente de cada oferta por sucursal.
+  WITH ranked_offers AS (
+    SELECT
+      ps.id_sucursal,
+      ps.activo,
+      ROW_NUMBER() OVER (
+        PARTITION BY ps.id_sucursal
+        ORDER BY ps.updated_at DESC, ps.id_paquete_sucursal DESC
+      ) AS rn
+    FROM public.paquetes_sucursal ps
+    WHERE ps.id_paquete = $1::uuid
+  )
+  SELECT ro.id_sucursal
+  FROM ranked_offers ro
+  WHERE ro.rn = 1
+    AND ro.activo IS TRUE
+  ORDER BY ro.id_sucursal ASC
+`;
+
+const LOCK_PACKAGE_COMPOSITION_SQL = `
+  -- AM: package_composition_lock serializa validacion y reemplazo del mismo paquete.
+  SELECT p.id_paquete
+  FROM public.paquetes p
+  WHERE p.id_paquete = $1::uuid
+    AND p.deleted_at IS NULL
+  FOR UPDATE
+`;
+
 function normalizeOptionalText(value) {
   if (value === undefined) {
     return undefined;
@@ -1248,6 +1277,54 @@ async function resolveBranchId(client, claims, requestedBranchId, allowAllForSup
   });
 }
 
+// AM: Servicios usa solo asignaciones admin; Paquetes conserva su resolver y contrato actuales.
+async function resolveServiceBranchId(client, claims, requestedBranchId, allowAllForSuperAdmin = false) {
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) {
+    return resolveBranchId(client, claims, requestedBranchId, allowAllForSuperAdmin);
+  }
+
+  const userId = claims?.user?.id_usuario;
+  let branchIds = [];
+  if (Array.isArray(claims?.roles) && claims.roles.includes("admin")
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rows } = await client.query(
+      `SELECT DISTINCT ru.id_sucursal
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+         AND ru.id_sucursal IS NOT NULL`,
+      [userId]
+    );
+    branchIds = rows.map((row) => row.id_sucursal);
+  }
+
+  return resolveBranchId(client, { ...claims, branch_ids: branchIds }, requestedBranchId, allowAllForSuperAdmin);
+}
+
+// AM: Paquetes resuelve su alcance administrativo sin alterar claims globales ni Servicios.
+async function resolvePackageClaims(client, claims) {
+  if (Array.isArray(claims?.roles) && claims.roles.includes("super_admin")) return claims;
+  const userId = claims?.user?.id_usuario;
+  let branchIds = [];
+  if (Array.isArray(claims?.roles) && claims.roles.includes("admin")
+    && typeof userId === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(userId)) {
+    const { rows } = await client.query(
+      `SELECT DISTINCT ru.id_sucursal
+       FROM public.roles_usuarios ru
+       JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $1::uuid
+         AND ru.activo IS TRUE
+         AND r.nombre = 'admin'
+         AND ru.id_sucursal IS NOT NULL`,
+      [userId]
+    );
+    branchIds = rows.map((row) => row.id_sucursal);
+  }
+  return { ...claims, branch_ids: branchIds };
+}
+
 const PACKAGE_DUPLICATE_MESSAGE = "Ya existe un paquete con ese nombre. Usa el paquete existente o cambia el nombre.";
 
 async function ensureUniquePackageNameGlobal(client, packageId, nombrePaquete) {
@@ -1309,6 +1386,15 @@ function normalizePackageItems(items) {
       cantidad,
     };
   });
+}
+
+function packageItemsAreEquivalent(currentItems, nextItems) {
+  const canonicalize = (items) => items
+    .map((item) => `${String(item.id_servicio || "").trim()}:${Number(item.cantidad)}`)
+    .sort();
+  const current = canonicalize(currentItems);
+  const next = canonicalize(nextItems);
+  return current.length === next.length && current.every((value, index) => value === next[index]);
 }
 
 async function normalizeInitialPackageOffers(client, claims, body = {}) {
@@ -1435,7 +1521,7 @@ async function ensureServiceBranchesAccessible(client, claims, branchTariffs) {
   // AM: Valida sucursales seleccionadas y alcance del admin antes de crear tarifas.
   const branchIds = [...new Set(branchTariffs.map((item) => item.id_sucursal))];
   for (const branchId of branchIds) {
-    await resolveBranchId(client, claims, branchId);
+    await resolveServiceBranchId(client, claims, branchId);
   }
 }
 
@@ -1494,6 +1580,29 @@ async function ensurePackageItemsAccessible(client, claims, items, branchId = nu
       throw new AppError(403, "Uno o mas servicios del paquete no estan tarifados dentro del alcance del administrador", {
         code: "AUTH_FORBIDDEN_BRANCH",
       });
+    }
+  }
+}
+
+async function ensurePackageCompositionAcrossActiveOffers(client, claims, idPaquete, items, operationBranchId) {
+  const { rows } = await client.query(GET_ACTIVE_PACKAGE_OFFER_BRANCHES_SQL, [idPaquete]);
+  const branchIds = new Set(rows.map((row) => row.id_sucursal).filter(Boolean));
+  if (operationBranchId) branchIds.add(operationBranchId);
+
+  // AM: Verifica disponibilidad en todas las ofertas; no concede permisos para operar sus sucursales.
+  for (const branchId of branchIds) {
+    try {
+      await ensurePackageItemsAccessible(client, claims, items, branchId);
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      throw new AppError(
+        409,
+        "No se puede actualizar la composición del paquete porque uno o más servicios no están disponibles en todas las sucursales donde se ofrece actualmente.",
+        {
+          code: "CATALOG_PACKAGE_COMPOSITION_BRANCH_CONFLICT",
+          details: { id_sucursal: branchId },
+        }
+      );
     }
   }
 }
@@ -2550,7 +2659,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_SERVICES_SQL, [branchId]);
 
         return sendOk(reply, {
@@ -2607,7 +2716,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_GROUPED_SERVICES_SQL, [branchId]);
         return sendOk(reply, {
           id_sucursal: branchId,
@@ -2771,7 +2880,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.body?.id_sucursal ?? null);
 
         await client.query("BEGIN");
 
@@ -2818,7 +2927,11 @@ export default async function adminCatalogRoutes(app) {
           (requestedAgendable !== undefined && requestedAgendable !== currentAgendable);
         let targetServiceId = request.params.id;
 
-        if (shouldMutateServiceBase && requestedNombreServicio !== undefined) {
+        if (
+          shouldMutateServiceBase &&
+          requestedNombreServicio !== undefined &&
+          requestedNombreServicio !== currentNombreServicio
+        ) {
           await ensureUniqueServiceNameByBranch(client, request.params.id, branchId, requestedNombreServicio);
           const serviceSharedAcrossBranches = await hasServiceTariffsInOtherBranches(client, request.params.id, branchId);
           if (serviceSharedAcrossBranches) {
@@ -2899,7 +3012,6 @@ export default async function adminCatalogRoutes(app) {
                 orden_visual = $5::int,
                 visible_publico = $6::boolean,
                 agendable = $7::boolean,
-                activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
@@ -2912,7 +3024,6 @@ export default async function adminCatalogRoutes(app) {
               UPDATE public.servicios
               SET
                 agendable = $2::boolean,
-                activo = TRUE,
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_servicio = $1::uuid
@@ -2922,7 +3033,7 @@ export default async function adminCatalogRoutes(app) {
         }
 
         if (
-          precioHnl !== null ||
+          request.body.precio_hnl !== undefined ||
           request.body.duracion_min !== undefined ||
           request.body.servicio_informativo !== undefined
         ) {
@@ -2998,7 +3109,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.params.id_sucursal);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.params.id_sucursal);
         await client.query("BEGIN");
 
         const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id_servicio]);
@@ -3089,7 +3200,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body.id_sucursal);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.body.id_sucursal);
         await client.query("BEGIN");
 
         const serviceResult = await client.query(GET_SERVICE_BASE_SQL, [request.params.id_servicio]);
@@ -3179,7 +3290,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.params.id_sucursal);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.params.id_sucursal);
         await client.query("BEGIN");
 
         // AM: Quitar de sucursal es cierre de tarifa vigente, nunca borrado duro.
@@ -3209,7 +3320,7 @@ export default async function adminCatalogRoutes(app) {
   app.patch(
     "/servicios/:id/desactivar-global",
     {
-      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(SUPER_ADMIN_ONLY),
       schema: {
         params: {
           type: "object",
@@ -3316,7 +3427,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.body?.id_sucursal ?? null);
         const requestedState = Boolean(request.body?.activo);
         const precioHnl =
           request.body?.precio_hnl === undefined || request.body?.precio_hnl === null
@@ -3534,7 +3645,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         const baseResult = await client.query(GET_PACKAGE_BASE_SQL, [request.params.id]);
@@ -3549,7 +3661,7 @@ export default async function adminCatalogRoutes(app) {
         if (nextActivo) {
           // AM: Solo se reactiva una oferta de sucursal si su composicion sigue disponible en esa sucursal.
           const currentItems = normalizePackageItems(basePackage.items || []);
-          await ensurePackageItemsAccessible(client, request.claims, currentItems, branchId);
+          await ensurePackageItemsAccessible(client, scopedClaims, currentItems, branchId);
           await upsertPackageBranchOffer(client, request.params.id, branchId, {
             activo: true,
           });
@@ -3642,7 +3754,7 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
+        const branchId = await resolveServiceBranchId(client, request.claims, request.query?.id_sucursal ?? null);
 
         await client.query("BEGIN");
 
@@ -3713,7 +3825,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null, true);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.query?.id_sucursal ?? null, true);
         const { rows } = await client.query(LIST_PACKAGES_SQL, [branchId]);
         return sendOk(reply, {
           id_sucursal: branchId,
@@ -3765,12 +3878,13 @@ export default async function adminCatalogRoutes(app) {
         const nombrePaquete = normalizeRequiredText(request.body.nombre_paquete);
         const descripcion = normalizeOptionalText(request.body.descripcion);
         const items = normalizePackageItems(request.body.items);
-        const offers = await normalizeInitialPackageOffers(client, request.claims, request.body);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const offers = await normalizeInitialPackageOffers(client, scopedClaims, request.body);
         const firstOffer = offers[0];
 
         await ensureUniquePackageNameGlobal(client, null, nombrePaquete);
         for (const offer of offers) {
-          await ensurePackageItemsAccessible(client, request.claims, items, offer.idSucursal);
+          await ensurePackageItemsAccessible(client, scopedClaims, items, offer.idSucursal);
         }
 
         await client.query("BEGIN");
@@ -3861,8 +3975,11 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.body?.id_sucursal ?? null);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.body?.id_sucursal ?? null);
         await client.query("BEGIN");
+
+        await client.query(LOCK_PACKAGE_COMPOSITION_SQL, [request.params.id]);
 
         const baseResult = await client.query(GET_PACKAGE_BASE_SQL, [request.params.id]);
         const basePackage = baseResult.rows[0];
@@ -3875,10 +3992,12 @@ export default async function adminCatalogRoutes(app) {
           });
         }
 
-        const shouldMutatePackageBase =
-          request.body.nombre_paquete !== undefined ||
-          request.body.descripcion !== undefined ||
-          request.body.items !== undefined;
+        const hasNombre = request.body.nombre_paquete !== undefined;
+        const hasDescripcion = request.body.descripcion !== undefined;
+        const shouldMutateOffer =
+          request.body.precio_hnl !== undefined ||
+          request.body.visible_publico !== undefined ||
+          request.body.orden_visual !== undefined;
 
         const nombrePaquete =
           request.body.nombre_paquete !== undefined
@@ -3910,39 +4029,70 @@ export default async function adminCatalogRoutes(app) {
         const nextActivo = normalizeBoolean(scopedPackage?.activo, true);
         const nextItems = request.body.items !== undefined ? normalizePackageItems(request.body.items) : null;
 
-        await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
-
-        const itemsForScopeValidation = nextItems ?? await getCurrentPackageItems(client, request.params.id);
-        if (itemsForScopeValidation.length > 0) {
-          await ensurePackageItemsAccessible(client, request.claims, itemsForScopeValidation, branchId);
+        if (hasNombre) {
+          await ensureUniquePackageNameGlobal(client, request.params.id, nombrePaquete);
         }
 
-        if (shouldMutatePackageBase) {
+        let compositionChanged = false;
+        let currentItems = null;
+        if (nextItems) {
+          currentItems = await getCurrentPackageItems(client, request.params.id);
+          compositionChanged = !packageItemsAreEquivalent(currentItems, nextItems);
+          if (compositionChanged) {
+            await ensurePackageCompositionAcrossActiveOffers(
+              client,
+              scopedClaims,
+              request.params.id,
+              nextItems,
+              branchId
+            );
+          }
+        }
+
+        if (shouldMutateOffer && !compositionChanged) {
+          currentItems ??= await getCurrentPackageItems(client, request.params.id);
+          if (currentItems.length > 0) {
+            await ensurePackageItemsAccessible(client, scopedClaims, currentItems, branchId);
+          }
+        }
+
+        if (hasNombre || hasDescripcion) {
+          const assignments = [];
+          const params = [request.params.id];
+          if (hasNombre) {
+            params.push(nombrePaquete);
+            assignments.push(`nombre_paquete = $${params.length}`);
+          }
+          if (hasDescripcion) {
+            params.push(descripcion ?? null);
+            assignments.push(`descripcion = $${params.length}`);
+          }
           await client.query(
             `
               UPDATE public.paquetes
               SET
-                nombre_paquete = $2,
-                descripcion = $3,
+                ${assignments.join(",\n                ")},
                 deleted_at = NULL,
                 updated_at = NOW()
               WHERE id_paquete = $1::uuid
             `,
-            [request.params.id, nombrePaquete, descripcion ?? null]
+            params
           );
         }
 
-        if (nextItems) {
+        if (compositionChanged) {
           await replacePackageItems(client, request.params.id, nextItems);
         }
 
-        // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
-        await upsertPackageBranchOffer(client, request.params.id, branchId, {
-          precioHnl,
-          activo: nextActivo,
-          visiblePublico,
-          ordenVisual,
-        });
+        if (shouldMutateOffer) {
+          // AM: Mantiene precio/estado/visibilidad por sucursal sin duplicar paquetes globales.
+          await upsertPackageBranchOffer(client, request.params.id, branchId, {
+            precioHnl,
+            activo: nextActivo,
+            visiblePublico,
+            ordenVisual,
+          });
+        }
 
         const finalResult = await client.query(GET_PACKAGE_SCOPED_SQL, [request.params.id, branchId]);
         await client.query("COMMIT");
@@ -4009,7 +4159,8 @@ export default async function adminCatalogRoutes(app) {
       const client = await app.db.connect();
 
       try {
-        const branchId = await resolveBranchId(client, request.claims, request.query?.id_sucursal ?? null);
+        const scopedClaims = await resolvePackageClaims(client, request.claims);
+        const branchId = await resolveBranchId(client, scopedClaims, request.query?.id_sucursal ?? null);
         await client.query("BEGIN");
 
         const baseResult = await client.query(GET_PACKAGE_BASE_SQL, [request.params.id]);

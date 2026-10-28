@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
 import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
+import { resolveTodoPagoConfig } from "../services/payments/todopago/todoPagoConfig.js";
+import { validatePixelPaySdkConfig } from "../services/payments/PixelPaySdkProvider.js";
 
 function normalizeNodeEnv(raw) {
   const value = String(raw || "").trim().toLowerCase();
@@ -85,51 +87,65 @@ function parseCorsOrigins(rawValue, fallback = "http://localhost:5173") {
     .filter(Boolean);
 }
 
-function normalizeTodoPagoMode(raw) {
-  const value = String(raw || "").trim().toLowerCase();
-  if (!value) return "preprod_simulated";
-  if (["preprod_simulated", "preprod_real", "prod_real"].includes(value)) return value;
-  throw new Error("TODOPAGO_MODE invalido. Usa preprod_simulated, preprod_real o prod_real.");
-}
-
-function assertTodoPagoConfig(config) {
-  if (config.paymentProvider !== "todopago") return;
-
-  if (config.todoPago.mode === "preprod_simulated") {
-    if (config.nodeEnv === "production" || config.nodeEnv === "staging") {
-      throw new Error("TODOPAGO_MODE=preprod_simulated no esta permitido en produccion/staging.");
-    }
-    return;
-  }
-
-  const requiredFields = [
-    "baseUrl",
-    "username",
-    "password",
-    "commerceId",
-    "tenant",
-    "terminal",
-  ];
-  for (const field of requiredFields) {
-    if (!String(config.todoPago[field] || "").trim()) {
-      throw new Error(`Configuracion TodoPago incompleta: ${field}`);
-    }
-  }
-}
-
 async function envPlugin(app) {
   dotenv.config();
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
   const paymentProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
-  if (!["mock", "todopago"].includes(paymentProvider)) {
-    throw new Error("PAYMENT_PROVIDER invalido. Usa mock o todopago.");
+  const pixelPayEnv = String(process.env.PIXELPAY_ENV || "").trim().toLowerCase();
+  if (!["mock", "todopago", "pixelpay"].includes(paymentProvider)) {
+    throw new Error("PAYMENT_PROVIDER invalido. Usa mock, todopago o pixelpay.");
   }
   const frontendUrl = readRequired("FRONTEND_URL");
   const jwtSecret = readRequired("JWT_SECRET", { minLength: 24 });
   const cookieSecret = readRequired("COOKIE_SECRET", { minLength: 24 });
   const csrfSecret = readRequired("CSRF_SECRET", { minLength: 24 });
-  const todoPagoMode = normalizeTodoPagoMode(process.env.TODOPAGO_MODE);
+  const todoPago = resolveTodoPagoConfig(process.env, {
+    active: paymentProvider === "todopago",
+    nodeEnv,
+  });
+  if (paymentProvider === "pixelpay") {
+    const pixelPayImplementation = String(process.env.PIXELPAY_IMPLEMENTATION || "direct").trim().toLowerCase();
+    if (!["direct", "sdk"].includes(pixelPayImplementation)) {
+      throw new Error("PIXELPAY_IMPLEMENTATION invalido. Usa direct o sdk.");
+    }
+    const deploymentEnvironment = String(process.env.ENTORNO || nodeEnv).trim().toLowerCase();
+    const isLiveDeployment = ["production", "prod"].includes(deploymentEnvironment);
+    if (isLiveDeployment && pixelPayEnv !== "live") {
+      throw new Error("PixelPay en produccion requiere PIXELPAY_ENV=live.");
+    }
+    if (!isLiveDeployment && pixelPayEnv !== "sandbox") {
+      throw new Error("PixelPay fuera de produccion requiere PIXELPAY_ENV=sandbox.");
+    }
+    if (pixelPayEnv === "live" && pixelPayImplementation !== "sdk") {
+      throw new Error("PixelPay live requiere PIXELPAY_IMPLEMENTATION=sdk.");
+    }
+    if (pixelPayImplementation === "sdk") {
+      validatePixelPaySdkConfig({
+        endpoint: process.env.PIXELPAY_ENDPOINT,
+        env: pixelPayEnv,
+        keyId: process.env.PIXELPAY_KEY_ID,
+        secretKey: process.env.PIXELPAY_SECRET_KEY,
+        authHash: process.env.PIXELPAY_AUTH_HASH,
+        appUrl: process.env.PIXELPAY_APP_URL,
+      });
+    } else {
+      if (String(process.env.PIXELPAY_ENDPOINT || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
+        throw new Error("PIXELPAY_ENDPOINT debe apuntar al sandbox oficial de PixelPay.");
+      }
+      if (String(process.env.PIXELPAY_APP_URL || "").trim().replace(/\/+$/, "") !== "https://pixelpay.dev") {
+        throw new Error("PIXELPAY_APP_URL debe ser https://pixelpay.dev en Sandbox.");
+      }
+      readRequired("PIXELPAY_KEY_ID");
+      readRequired("PIXELPAY_SECRET_KEY");
+      readRequired("PIXELPAY_AUTH_HASH");
+    }
+    parseIntegerInRange(process.env.PIXELPAY_HTTP_TIMEOUT_MS, "PIXELPAY_HTTP_TIMEOUT_MS", {
+      fallback: 12000,
+      min: 1000,
+      max: 60000,
+    });
+  }
   
   const isProdOrStaging = nodeEnv === "production" || nodeEnv === "staging";
 
@@ -142,16 +158,8 @@ async function envPlugin(app) {
     csrfSecret,
     bookingReleaseTokenSecret: resolveBookingReleaseTokenSecret(nodeEnv),
     paymentProvider,
-    todoPago: {
-      mode: todoPagoMode,
-      simulatedEnabled: parseBoolean(process.env.TODOPAGO_SIMULATED_ENABLED, todoPagoMode === "preprod_simulated"),
-      baseUrl: String(process.env.TODOPAGO_BASE_URL || "").trim(),
-      username: String(process.env.TODOPAGO_USERNAME || "").trim(),
-      password: String(process.env.TODOPAGO_PASSWORD || "").trim(),
-      commerceId: String(process.env.TODOPAGO_COMMERCE_ID || "").trim(),
-      tenant: String(process.env.TODOPAGO_TENANT || "").trim(),
-      terminal: String(process.env.TODOPAGO_TERMINAL || "").trim(),
-    },
+    pixelPayEnv,
+    todoPago,
     trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),
     cookieSameSite: String(process.env.AUTH_COOKIE_SAMESITE || "lax").trim().toLowerCase() || "lax",
@@ -222,8 +230,6 @@ async function envPlugin(app) {
   }
 
   assertSecureProductionConfig(config);
-  assertTodoPagoConfig(config);
-
   app.decorate("config", config);
 }
 

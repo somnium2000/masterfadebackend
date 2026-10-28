@@ -4,16 +4,33 @@ import { sendOk } from "../../../utils/response.js";
 import { generateRecoveryActionLink } from "../../../services/authRecovery.js";
 import { assertUserNotProtected } from "../../../services/protectedUsersService.js";
 import {
+  authorizePersonasMutation,
+  assertPersonasTargetScope,
+  getPersonasAdminScope,
+  scopePersonasQuery,
+} from "../../../services/personasAdminScope.js";
+import {
   activateAssetForEntity,
-  buildAssetReadUrl,
+  buildPersonasClientProfileReadUrl,
   replaceAssetIfNeeded,
   resolveAssetForBinding,
+  validateAssetReplacement,
 } from "../../../services/storage/storageService.js";
 
 const SUPER_ADMIN_ONLY = ["super_admin"];
 const USER_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
 const EMPLOYEE_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const empleadoParamsSchema = {
+  type: "object",
+  required: ["id_empleado"],
+  properties: { id_empleado: { type: "string", format: "uuid" } },
+};
 const CLIENT_ROUTE_ALLOWED_ROLES = ["super_admin", "admin"];
+const clienteParamsSchema = {
+  type: "object",
+  required: ["id_cliente"],
+  properties: { id_cliente: { type: "string", format: "uuid" } },
+};
 const ACCESS_STATUS = {
   PENDING_PASSWORD: "pendiente_password",
   ACTIVE: "activo",
@@ -26,7 +43,6 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // AM: Regla operativa de identidad hondurena para esta fase (13 digitos).
 const DNI_PATTERN = /^\d{13}$/;
 const RTN_PATTERN = /^\d{14}$/;
-const STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE = "private_client_profile";
 const STORAGE_SCOPE_PUBLIC_BARBER_PROFILE = "public_barber_profile";
 const BARBER_PUBLIC_ALIAS_MAX = 80;
 const BARBER_PUBLIC_SUMMARY_MAX = 500;
@@ -63,6 +79,16 @@ const barberPublicProfileInputSchema = {
   additionalProperties: false,
 };
 
+const personaLinkInputSchema = {
+  type: "object",
+  properties: {
+    id_persona: { type: "string", format: "uuid" },
+    confirmar_vinculacion: { const: true },
+  },
+  required: ["id_persona", "confirmar_vinculacion"],
+  additionalProperties: false,
+};
+
 const empleadoCreateBodySchema = {
   type: "object",
   properties: {
@@ -94,6 +120,7 @@ const empleadoCreateBodySchema = {
       additionalProperties: false,
     },
     perfil_publico: barberPublicProfileInputSchema,
+    vinculacion_persona: personaLinkInputSchema,
   },
   required: ["persona", "acceso", "empleado"],
   additionalProperties: false,
@@ -124,6 +151,7 @@ const clienteCreateBodySchema = {
       },
       additionalProperties: false,
     },
+    vinculacion_persona: personaLinkInputSchema,
   },
   required: ["persona", "acceso"],
   additionalProperties: false,
@@ -134,6 +162,13 @@ const usuarioSetupBodySchema = {
   properties: {
     marcar_pendiente_password: { type: "boolean" },
   },
+  additionalProperties: false,
+};
+
+const usuarioParamsSchema = {
+  type: "object",
+  properties: { id_usuario: { type: "string", format: "uuid" } },
+  required: ["id_usuario"],
   additionalProperties: false,
 };
 
@@ -392,6 +427,8 @@ const CLIENTE_BASE_SQL = `
     p.telefono_principal,
     p.direccion_texto,
     p.observaciones,
+    p.foto_perfil_asset_id,
+    p.foto_perfil_path,
     COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo_principal,
     c.fecha_ingreso,
     COALESCE(c.estado, TRUE) AS estado_cliente,
@@ -651,6 +688,14 @@ function mapUsuario(row) {
   };
 }
 
+function filterUsuariosForActor(usuarios, claims) {
+  if (!isAdminWithoutSuperAdmin(claims)) return usuarios;
+  return usuarios.filter((usuario) => (
+    !usuario.is_protected
+    && !usuario.roles.some((role) => role?.rol === "super_admin")
+  ));
+}
+
 function mapEmpleado(row) {
   return {
     id_empleado: row.id_empleado,
@@ -704,6 +749,8 @@ function mapCliente(row) {
     telefono_principal: row.telefono_principal ?? null,
     direccion_texto: row.direccion_texto ?? null,
     observaciones: row.observaciones ?? null,
+    foto_perfil_asset_id: row.foto_perfil_asset_id ?? null,
+    foto_perfil_path: row.foto_perfil_path ?? null,
     correo_principal: row.correo_principal ?? null,
     fecha_ingreso: row.fecha_ingreso ?? null,
     estado_cliente: Boolean(row.estado_cliente),
@@ -718,13 +765,22 @@ function mapCliente(row) {
   };
 }
 
+function assertAdminClientPhotoUnchanged(payload) {
+  if (Object.prototype.hasOwnProperty.call(payload?.cliente || {}, "foto_perfil_asset_id")) {
+    throw new AppError(400, "La fotografía de perfil solo puede ser modificada por el cliente", {
+      code: "PERSONAS_CLIENT_PHOTO_SELF_SERVICE_ONLY",
+    });
+  }
+}
+
 async function enrichClienteProfilePhotoSignedUrl(app, claims, cliente) {
   if (!cliente?.foto_perfil_asset_id) {
     return cliente;
   }
   try {
-    const readUrl = await buildAssetReadUrl(app, {
+    const readUrl = await buildPersonasClientProfileReadUrl(app, {
       claims,
+      clientId: cliente.id_cliente,
       assetId: cliente.foto_perfil_asset_id,
     });
     return {
@@ -756,6 +812,7 @@ function sendHandled(reply, request, error, message, code) {
     return sendError(reply, error.statusCode, error.message, {
       code: error.code,
       ...(safeDetails !== undefined ? { details: safeDetails } : {}),
+      exposeDetails: error.code === "PERSONAS_GUEST_LINK_REQUIRED",
       requestId: request.id,
     });
   }
@@ -1146,6 +1203,88 @@ async function ensureEmailAvailability(client, email, { excludePersonaId = null,
   }
 }
 
+async function resolveAdministrativePersonaLink(client, email, link, { expectedAuthUserId = null, scope, lock = false } = {}) {
+  const authResult = await client.query(
+    `SELECT id FROM auth.users WHERE LOWER(email::text) = LOWER($1) LIMIT 2`,
+    [email]
+  );
+  const foreignAuth = authResult.rows.find((row) => String(row.id) !== String(expectedAuthUserId || ""));
+
+  const contactResult = await client.query(
+    `
+      SELECT
+        c.id_persona,
+        p.nombres,
+        p.apellidos,
+        EXISTS (
+          SELECT 1 FROM public.usuarios u
+          WHERE u.id_persona = c.id_persona AND u.deleted_at IS NULL
+        ) AS has_user,
+        EXISTS (
+          SELECT 1 FROM public.clientes cl
+          WHERE cl.id_persona = c.id_persona AND cl.deleted_at IS NULL
+        ) AS has_client,
+        EXISTS (
+          SELECT 1 FROM public.empleados e
+          WHERE e.id_persona = c.id_persona AND e.deleted_at IS NULL
+        ) AS has_employee
+      FROM public.correos c
+      JOIN public.personas p ON p.id_persona = c.id_persona AND p.deleted_at IS NULL
+      WHERE LOWER(c.direccion_correo::text) = LOWER($1)
+        AND c.deleted_at IS NULL
+      LIMIT 2
+    `,
+    [email]
+  );
+
+  if (!contactResult.rowCount) {
+    if (foreignAuth) {
+      throw new AppError(409, "El correo ya pertenece a una identidad de acceso incompleta", {
+        code: "PERSONAS_AUTH_IDENTITY_INCOMPLETE",
+      });
+    }
+    return null;
+  }
+  if (contactResult.rowCount !== 1) {
+    throw new AppError(409, "El correo tiene vinculaciones internas ambiguas", {
+      code: "PERSONAS_EMAIL_IDENTITY_CONFLICT",
+    });
+  }
+
+  const contact = contactResult.rows[0];
+  if (scope) await assertPersonasTargetScope(client, scope, "persona", contact.id_persona, { lock });
+  if (contact.has_user || contact.has_client || contact.has_employee) {
+    throw new AppError(409, "El correo ya pertenece a un usuario o perfil existente", {
+      code: "PERSONAS_EXISTING_USER_EMAIL",
+    });
+  }
+
+  if (foreignAuth) {
+    throw new AppError(409, "El correo ya pertenece a una identidad de acceso incompleta", {
+      code: "PERSONAS_AUTH_IDENTITY_INCOMPLETE",
+    });
+  }
+
+  if (!link) {
+    throw new AppError(409, "Existe una Persona invitada con este correo. Confirma su vinculacion para continuar", {
+      code: "PERSONAS_GUEST_LINK_REQUIRED",
+      details: {
+        id_persona: contact.id_persona,
+        nombre_completo: buildFullName(contact.nombres, contact.apellidos),
+        requiere_confirmacion: true,
+      },
+    });
+  }
+
+  if (link.confirmar_vinculacion !== true || String(link.id_persona) !== String(contact.id_persona)) {
+    throw new AppError(409, "La Persona confirmada no corresponde al correo indicado", {
+      code: "PERSONAS_GUEST_LINK_MISMATCH",
+    });
+  }
+
+  return contact.id_persona;
+}
+
 async function ensurePersonaDocumentAvailability(client, { dni = null, rtn = null, excludePersonaId = null } = {}) {
   if (dni) {
     const dniResult = await client.query(
@@ -1194,13 +1333,26 @@ async function upsertPrimaryEmail(client, personaId, email) {
       SELECT id_correo
       FROM public.correos
       WHERE id_persona = $1::uuid
-      ORDER BY es_principal DESC NULLS LAST, created_at ASC
+      ORDER BY (LOWER(direccion_correo::text) = LOWER($2)) DESC,
+               es_principal DESC NULLS LAST,
+               created_at ASC
       LIMIT 1
     `,
-    [personaId]
+    [personaId, email]
   );
 
   if (existing.rowCount) {
+    await client.query(
+      `
+        UPDATE public.correos
+        SET es_principal = FALSE,
+            updated_at = NOW()
+        WHERE id_persona = $1::uuid
+          AND id_correo <> $2::uuid
+          AND es_principal IS TRUE
+      `,
+      [personaId, existing.rows[0].id_correo]
+    );
     await client.query(
       `
         UPDATE public.correos
@@ -1212,17 +1364,6 @@ async function upsertPrimaryEmail(client, personaId, email) {
         WHERE id_correo = $1::uuid
       `,
       [existing.rows[0].id_correo, email]
-    );
-    await client.query(
-      `
-        UPDATE public.correos
-        SET es_principal = FALSE,
-            updated_at = NOW()
-        WHERE id_persona = $1::uuid
-          AND id_correo <> $2::uuid
-          AND es_principal IS TRUE
-      `,
-      [personaId, existing.rows[0].id_correo]
     );
     return;
   }
@@ -1299,7 +1440,43 @@ async function upsertBarberPublicProfile(client, { idEmpleado, profile }) {
   );
 }
 
-function parseEmployeeRoleNames(rawRoles, esBarbero) {
+function isAdminWithoutSuperAdmin(claims) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  return roles.includes("admin") && !roles.includes("super_admin");
+}
+
+function assertActorCanAssignEmployeeRoles(claims, roleNames) {
+  if (isAdminWithoutSuperAdmin(claims) && roleNames.includes("super_admin")) {
+    throw new AppError(403, "Un administrador no puede asignar el rol super_admin", {
+      code: "PERSONAS_SUPER_ADMIN_ROLE_FORBIDDEN",
+    });
+  }
+}
+
+async function assertActorCanManagePrivilegedUser(app, request, client, userId, actionCode) {
+  await assertUserNotProtected(app, userId, actionCode, { client });
+  if (!isAdminWithoutSuperAdmin(request?.claims)) return;
+
+  const privilegedRole = await client.query(
+    `
+      SELECT 1
+      FROM public.roles_usuarios ru
+      JOIN public.roles r ON r.id_rol = ru.id_rol
+      WHERE ru.id_usuario = $1::uuid
+        AND r.nombre = 'super_admin'
+      LIMIT 1
+    `,
+    [userId]
+  );
+  if (privilegedRole.rowCount > 0) {
+    throw new AppError(403, "Un administrador no puede gestionar cuentas super_admin", {
+      code: "PERSONAS_SUPER_ADMIN_TARGET_FORBIDDEN",
+      details: { action: actionCode || "UNKNOWN_ACTION" },
+    });
+  }
+}
+
+function parseEmployeeRoleNames(rawRoles, esBarbero, claims = null) {
   const normalizedRoles = Array.isArray(rawRoles)
     ? rawRoles.map((value) => normalizeRequired(value).toLowerCase()).filter(Boolean)
     : [];
@@ -1321,6 +1498,8 @@ function parseEmployeeRoleNames(rawRoles, esBarbero) {
   }
 
   if (esBarbero && !uniqueRoles.includes("barbero")) uniqueRoles.push("barbero");
+
+  assertActorCanAssignEmployeeRoles(claims, uniqueRoles);
 
   return uniqueRoles;
 }
@@ -1390,7 +1569,8 @@ async function assertPersonaNotEmpleado(client, personaId) {
   }
 }
 
-async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleNames, userId, branchId, assignedBy }) {
+async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleNames, userId, branchId, assignedBy, actorClaims }) {
+  assertActorCanAssignEmployeeRoles(actorClaims, roleNames);
   await assertUserNotProtected(app, userId, "ROLE_ASSIGNMENT_UPDATE", { client });
 
   const employeeRoleIds = [];
@@ -1445,7 +1625,7 @@ async function setEmployeeRoleAssignments(app, client, { roleIdsByName, roleName
   }
 }
 
-async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, branchId, assignedBy) {
+async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, _branchId, assignedBy) {
   await assertUserNotProtected(app, userId, "ROLE_CLIENT_ASSIGNMENT_UPDATE", { client });
 
   const roleId = roleIdsByName.get("cliente");
@@ -1455,6 +1635,7 @@ async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, b
     });
   }
 
+  // AM: El rol cliente es global; la sucursal operativa permanece en clientes.id_sucursal_origen.
   const revived = await client.query(
     `
       UPDATE public.roles_usuarios
@@ -1465,7 +1646,7 @@ async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, b
       WHERE id_usuario = $1::uuid
         AND id_rol = $2::uuid
     `,
-    [userId, roleId, branchId, assignedBy]
+    [userId, roleId, null, assignedBy]
   );
 
   if (!revived.rowCount) {
@@ -1474,7 +1655,7 @@ async function ensureClienteRoleAssignment(app, client, roleIdsByName, userId, b
         INSERT INTO public.roles_usuarios (id_rol, id_usuario, id_sucursal, activo, asignado_por)
         VALUES ($1::uuid, $2::uuid, $3::uuid, TRUE, $4::uuid)
       `,
-      [roleId, userId, branchId, assignedBy]
+      [roleId, userId, null, assignedBy]
     );
   }
 }
@@ -1535,7 +1716,7 @@ async function sendPasswordSetupEmail(app, email, fullName = null) {
 
   try {
     // AM: Flujo Opcion 2: recovery link por Supabase Admin + entrega SMTP backend.
-    const recovery = await generateRecoveryActionLink(app, email);
+    const recovery = await generateRecoveryActionLink(app, email, { passwordReset: true });
     if (!recovery.found || !recovery.action_link) {
       return {
         sent: false,
@@ -1611,19 +1792,26 @@ async function createEmpleado(app, request, payload) {
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
     const empleadoRaw = payload?.empleado || {};
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
-    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
+    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero), request.claims);
     const esBarbero = roles.includes("barbero");
     const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
     const fotoPerfilAssetIdRaw = normalizeOptional(empleadoRaw.foto_perfil_asset_id ?? null);
     const salarioBase = normalizeMoney(empleadoRaw.salario_base);
     assertRequiredEmployeeBusinessFields({ persona, correoPrincipal, idSucursal, roles });
 
+    const adminScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursal });
+    assertValidEmail(correoPrincipal);
+    const linkedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null,
+      { scope: adminScope }
+    );
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
       rtn: persona.rtn,
+      excludePersonaId: linkedPersonaId,
     });
-    assertValidEmail(correoPrincipal);
-    await ensureEmailAvailability(client, correoPrincipal);
 
     const roleIdsByName = await loadRoleIdByName(client);
     for (const role of roles) {
@@ -1648,36 +1836,68 @@ async function createEmpleado(app, request, payload) {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    const personaInsert = await client.query(
-      `
-        INSERT INTO public.personas (
-          nombres,
-          apellidos,
-          fecha_nacimiento,
-          genero_codigo,
-          dni,
-          rtn,
-          telefono_principal,
-          direccion_texto,
-          observaciones
-        )
-        VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
-        RETURNING id_persona
-      `,
-      [
-        persona.nombres,
-        persona.apellidos,
-        persona.fecha_nacimiento,
-        persona.genero_codigo,
-        persona.dni,
-        persona.rtn,
-        persona.telefono_principal,
-        persona.direccion_texto,
-        persona.observaciones,
-      ]
+    const confirmedScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursal, lock: true });
+    const confirmedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null,
+      { expectedAuthUserId: authUserId, scope: confirmedScope, lock: true }
     );
+    if (String(confirmedPersonaId || "") !== String(linkedPersonaId || "")) {
+      throw new AppError(409, "La identidad del correo cambio durante la operacion", {
+        code: "PERSONAS_EMAIL_IDENTITY_CONFLICT",
+      });
+    }
 
-    const idPersona = personaInsert.rows[0].id_persona;
+    let idPersona = confirmedPersonaId;
+    if (idPersona) {
+      const historical = await client.query(
+        `SELECT dni, telefono_principal
+         FROM public.personas
+         WHERE id_persona = $1::uuid AND deleted_at IS NULL
+         FOR UPDATE`,
+        [idPersona]
+      );
+      const currentPersona = historical.rows[0];
+      const currentDni = normalizeDigits(currentPersona?.dni);
+      if (!currentPersona || (normalizeOptional(currentPersona.dni) && currentDni !== persona.dni)) {
+        throw new AppError(409, "El DNI no corresponde a la Persona invitada seleccionada", {
+          code: "PERSONAS_GUEST_LINK_MISMATCH",
+        });
+      }
+      await ensurePersonaDocumentAvailability(client, {
+        dni: persona.dni,
+        excludePersonaId: idPersona,
+      });
+      // AM: Completa solo obligatorios ausentes antes del trigger; conserva datos historicos validos.
+      if (!normalizeOptional(currentPersona.dni) || !normalizeOptional(currentPersona.telefono_principal)) {
+        await client.query(
+          `UPDATE public.personas
+           SET dni = $2, telefono_principal = $3, updated_at = NOW()
+           WHERE id_persona = $1::uuid`,
+          [idPersona, normalizeOptional(currentPersona.dni) ? currentPersona.dni : persona.dni,
+            normalizeOptional(currentPersona.telefono_principal) ? currentPersona.telefono_principal : persona.telefono_principal]
+        );
+      }
+    }
+    if (!idPersona) {
+      const personaInsert = await client.query(
+        `
+          INSERT INTO public.personas (
+            nombres, apellidos, fecha_nacimiento, genero_codigo, dni, rtn,
+            telefono_principal, direccion_texto, observaciones
+          )
+          VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
+          RETURNING id_persona
+        `,
+        [
+          persona.nombres, persona.apellidos, persona.fecha_nacimiento,
+          persona.genero_codigo, persona.dni, persona.rtn,
+          persona.telefono_principal, persona.direccion_texto, persona.observaciones,
+        ]
+      );
+      idPersona = personaInsert.rows[0].id_persona;
+    }
 
     await upsertPrimaryEmail(client, idPersona, correoPrincipal);
 
@@ -1702,6 +1922,7 @@ async function createEmpleado(app, request, payload) {
       userId: authUserId,
       branchId: idSucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
+      actorClaims: request.claims,
     });
 
     const fechaIngreso = normalizeOptional(empleadoRaw.fecha_ingreso ?? null);
@@ -1769,6 +1990,10 @@ async function createEmpleado(app, request, payload) {
       }
     }
 
+    if (empleadoRaw.estado === false) {
+      await suspendEmployeeRoles(app, client, authUserId);
+      await blockUserAccessByLifecycle(app, client, authUserId);
+    }
     const detail = await client.query(EMPLEADO_BY_USER_SQL, [authUserId]);
 
     await client.query("COMMIT");
@@ -1806,6 +2031,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
   let authEmailUpdated = false;
   let authEmailPrevious = null;
   let authUserIdForCompensation = null;
+  let transactionCommitted = false;
 
   try {
     const current = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
@@ -1817,18 +2043,28 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     const currentRow = current.rows[0];
     if (!currentRow.id_usuario) {
+      await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
       throw new AppError(409, "El empleado no tiene usuario interno vinculado", {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
 
+    await assertActorCanManagePrivilegedUser(app, request, client, currentRow.id_usuario, "EMPLOYEE_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, branchId: payload?.empleado?.id_sucursal });
+
     const persona = buildPersonaPayload(payload?.persona || {});
     const correoPrincipal = normalizeEmail(payload?.acceso?.correo_principal);
     const empleadoRaw = payload?.empleado || {};
     const idSucursal = await ensureActiveBranch(client, empleadoRaw.id_sucursal);
-    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero));
+    const roles = parseEmployeeRoleNames(payload?.acceso?.roles, Boolean(empleadoRaw.es_barbero), request.claims);
     const esBarbero = roles.includes("barbero");
-    const perfilPublico = normalizeBarberPublicProfile(payload?.perfil_publico || {});
+    const perfilPublico = normalizeBarberPublicProfile({
+      alias_publico: currentRow.alias_publico,
+      resumen_publico: currentRow.resumen_publico,
+      certificaciones_titulos: currentRow.certificaciones_titulos,
+      visible_en_landing: currentRow.visible_en_landing,
+      ...(payload?.perfil_publico || {}),
+    });
     const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(empleadoRaw, "foto_perfil_asset_id");
     const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
       ? normalizeOptional(empleadoRaw.foto_perfil_asset_id ?? null)
@@ -1865,9 +2101,21 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
         allowedStatuses: ["temporal", "activo"],
       })
       : null;
+    const previousFotoPerfilAsset = fotoPerfilChanged && esBarbero
+      ? await validateAssetReplacement(client, {
+        previousAssetId: currentRow.foto_perfil_asset_id,
+        nextAssetId: nextFotoPerfilAssetIdRaw,
+        scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+        entityType: "barbero",
+        entityId: idEmpleado,
+        idSucursal: currentRow.id_sucursal,
+        claims: request.claims,
+      })
+      : null;
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, branchId: payload?.empleado?.id_sucursal, lock: true });
 
     await client.query(
       `
@@ -1900,8 +2148,8 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     await upsertPrimaryEmail(client, currentRow.id_persona, correoPrincipal);
     if (previousEmail !== correoPrincipal) {
-      await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
       authEmailUpdated = true;
+      await syncAuthUserEmail(app, currentRow.id_usuario, correoPrincipal);
     }
 
     await client.query(
@@ -1931,7 +2179,16 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
       userId: currentRow.id_usuario,
       branchId: idSucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
+      actorClaims: request.claims,
     });
+
+    const nextEmployeeActive = empleadoRaw.estado ?? currentRow.estado_laboral;
+    if (nextEmployeeActive === false) {
+      await suspendEmployeeRoles(app, client, currentRow.id_usuario);
+      await blockUserAccessByLifecycle(app, client, currentRow.id_usuario);
+    } else if (currentRow.estado_laboral === false && empleadoRaw.estado === true) {
+      await restoreUserAccessByLifecycle(client, currentRow.id_usuario);
+    }
 
     let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
     let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
@@ -1976,13 +2233,31 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 
     await client.query("COMMIT");
     transactionStarted = false;
+    transactionCommitted = true;
 
     if (fotoPerfilChanged && esBarbero) {
-      await replaceAssetIfNeeded(app, client, {
-        previousAssetId: currentRow.foto_perfil_asset_id,
-        nextAssetId: nextFotoPerfilAssetIdRaw,
-        claims: request.claims,
-      });
+      try {
+        await replaceAssetIfNeeded(app, client, {
+          previousAssetId: currentRow.foto_perfil_asset_id,
+          nextAssetId: nextFotoPerfilAssetIdRaw,
+          claims: request.claims,
+          scopeKey: STORAGE_SCOPE_PUBLIC_BARBER_PROFILE,
+          entityType: "barbero",
+          entityId: idEmpleado,
+          idSucursal: currentRow.id_sucursal,
+          prevalidatedAsset: previousFotoPerfilAsset,
+          logger: request.log,
+        });
+      } catch (cleanupError) {
+        request.log.warn(
+          {
+            err: cleanupError,
+            id_empleado: idEmpleado,
+            id_asset_anterior: currentRow.foto_perfil_asset_id,
+          },
+          "No se pudo limpiar la fotografia anterior despues de actualizar el empleado"
+        );
+      }
     }
 
     return { empleado: mapEmpleado(detail.rows[0]) };
@@ -1990,7 +2265,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
     if (transactionStarted) {
       await client.query("ROLLBACK").catch(() => {});
     }
-    if (authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
+    if (!transactionCommitted && authEmailUpdated && authEmailPrevious && authUserIdForCompensation) {
       try {
         await syncAuthUserEmail(app, authUserIdForCompensation, authEmailPrevious);
       } catch (compensationError) {
@@ -2007,6 +2282,7 @@ async function updateEmpleado(app, request, idEmpleado, payload) {
 }
 
 async function createCliente(app, request, payload) {
+  assertAdminClientPhotoUnchanged(payload);
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
@@ -2021,18 +2297,24 @@ async function createCliente(app, request, payload) {
     const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? null);
     const consentimientoMarketing = Boolean(cliente.consentimiento_marketing);
     const aceptaTerminos = Boolean(cliente.acepta_terminos);
-    const fotoPerfilAssetId = normalizeOptional(cliente.foto_perfil_asset_id ?? null);
     const consentimientosAt = new Date().toISOString();
     const consentimientoMarketingAt = consentimientoMarketing ? consentimientosAt : null;
     const aceptaTerminosAt = aceptaTerminos ? consentimientosAt : null;
 
     assertRequiredClientBusinessFields({ persona, correoPrincipal });
+    const adminScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursalOrigen });
+    assertValidEmail(correoPrincipal);
+    const linkedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null,
+      { scope: adminScope }
+    );
     await ensurePersonaDocumentAvailability(client, {
       dni: persona.dni,
       rtn: persona.rtn,
+      excludePersonaId: linkedPersonaId,
     });
-    assertValidEmail(correoPrincipal);
-    await ensureEmailAvailability(client, correoPrincipal);
     if (!habilitarAcceso) {
       throw new AppError(400, "Los clientes deben crearse con acceso habilitado", {
         code: "PERSONAS_CLIENT_ACCESS_REQUIRED",
@@ -2049,36 +2331,38 @@ async function createCliente(app, request, payload) {
     await client.query("BEGIN");
     transactionStarted = true;
 
-    const personaInsert = await client.query(
-      `
-        INSERT INTO public.personas (
-          nombres,
-          apellidos,
-          fecha_nacimiento,
-          genero_codigo,
-          dni,
-          rtn,
-          telefono_principal,
-          direccion_texto,
-          observaciones
-        )
-        VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
-        RETURNING id_persona
-      `,
-      [
-        persona.nombres,
-        persona.apellidos,
-        persona.fecha_nacimiento,
-        persona.genero_codigo,
-        persona.dni,
-        persona.rtn,
-        persona.telefono_principal,
-        persona.direccion_texto,
-        persona.observaciones,
-      ]
+    const confirmedScope = await authorizePersonasMutation(client, request.claims, { branchId: idSucursalOrigen, lock: true });
+    const confirmedPersonaId = await resolveAdministrativePersonaLink(
+      client,
+      correoPrincipal,
+      payload?.vinculacion_persona || null,
+      { expectedAuthUserId: authUserId, scope: confirmedScope, lock: true }
     );
+    if (String(confirmedPersonaId || "") !== String(linkedPersonaId || "")) {
+      throw new AppError(409, "La identidad del correo cambio durante la operacion", {
+        code: "PERSONAS_EMAIL_IDENTITY_CONFLICT",
+      });
+    }
 
-    const idPersona = personaInsert.rows[0].id_persona;
+    let idPersona = confirmedPersonaId;
+    if (!idPersona) {
+      const personaInsert = await client.query(
+        `
+          INSERT INTO public.personas (
+            nombres, apellidos, fecha_nacimiento, genero_codigo, dni, rtn,
+            telefono_principal, direccion_texto, observaciones
+          )
+          VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9)
+          RETURNING id_persona
+        `,
+        [
+          persona.nombres, persona.apellidos, persona.fecha_nacimiento,
+          persona.genero_codigo, persona.dni, persona.rtn,
+          persona.telefono_principal, persona.direccion_texto, persona.observaciones,
+        ]
+      );
+      idPersona = personaInsert.rows[0].id_persona;
+    }
     await assertPersonaNotEmpleado(client, idPersona);
 
     if (correoPrincipal) {
@@ -2183,40 +2467,10 @@ async function createCliente(app, request, payload) {
         );
 
     const createdClientId = clienteInsert.rows[0].id_cliente;
-    if (fotoPerfilAssetId) {
-      const fotoAsset = await resolveAssetForBinding(client, {
-        assetId: fotoPerfilAssetId,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: createdClientId,
-        idSucursal: idSucursalOrigen,
-        claims: request.claims,
-        allowUnboundEntity: true,
-        allowedStatuses: ["temporal", "activo"],
-      });
-      const activatedPhoto = await activateAssetForEntity(app, client, {
-        assetId: fotoAsset.id_asset,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: createdClientId,
-        idSucursal: idSucursalOrigen,
-        ownerClienteId: createdClientId,
-        claims: request.claims,
-        replaceCurrent: false,
-      });
-      await client.query(
-        `
-          UPDATE public.personas
-          SET
-            foto_perfil_asset_id = $2::uuid,
-            foto_perfil_path = $3,
-            updated_at = NOW()
-          WHERE id_persona = $1::uuid
-        `,
-        [idPersona, activatedPhoto.asset.id_asset, activatedPhoto.asset.object_path]
-      );
+    if (cliente.estado === false) {
+      await deactivateUserRolesByNames(app, client, authUserId, ["cliente"]);
+      await blockUserAccessByLifecycle(app, client, authUserId);
     }
-
     const detail = await client.query(CLIENTE_BY_ID_SQL, [createdClientId]);
 
     await client.query("COMMIT");
@@ -2249,7 +2503,15 @@ async function createCliente(app, request, payload) {
   }
 }
 
-async function sendUsuarioPasswordSetup(app, userId, body) {
+function assertPasswordSetupAccessAllowed(status) {
+  if (![ACCESS_STATUS.ACTIVE, ACCESS_STATUS.PENDING_PASSWORD].includes(status)) {
+    throw new AppError(409, "No se puede enviar configuración de contraseña a una cuenta restringida", {
+      code: "PERSONAS_USER_SETUP_ACCESS_RESTRICTED",
+    });
+  }
+}
+
+async function sendUsuarioPasswordSetup(app, request, userId, body) {
   const markPending = body?.marcar_pendiente_password !== false;
   const client = await app.db.connect();
   let transactionStarted = false;
@@ -2287,6 +2549,9 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     }
 
     const userRow = userResult.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, userId, "PASSWORD_SETUP");
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId });
+    assertPasswordSetupAccessAllowed(userRow.estado_acceso);
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -2326,14 +2591,30 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
       throw new AppError(409, "El usuario no tiene correo principal", { code: "PERSONAS_USER_EMAIL_MISSING" });
     }
 
-    if (markPending) {
-      await assertUserNotProtected(app, userId, "ACCESS_STATUS_PENDING_PASSWORD", { client });
-    }
-
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId, lock: true });
 
-    if (markPending) {
+    // AM: Serializa el envío y la transición con bloqueos concurrentes del usuario.
+    const lockedUser = await client.query(
+      `SELECT estado_acceso FROM public.usuarios
+       WHERE id_usuario = $1::uuid AND deleted_at IS NULL
+       FOR UPDATE`,
+      [userId]
+    );
+    if (!lockedUser.rowCount) {
+      throw new AppError(404, "Usuario no encontrado", { code: "PERSONAS_USER_NOT_FOUND" });
+    }
+    const currentStatus = lockedUser.rows[0].estado_acceso;
+    assertPasswordSetupAccessAllowed(currentStatus);
+
+    const setupResult = await sendPasswordSetupEmail(
+      app,
+      email,
+      buildFullName(userRow.nombres, userRow.apellidos)
+    );
+
+    if (markPending && setupResult.sent) {
       await client.query(
         `
           UPDATE public.usuarios
@@ -2349,16 +2630,10 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
     await client.query("COMMIT");
     transactionStarted = false;
 
-    const setupResult = await sendPasswordSetupEmail(
-      app,
-      email,
-      buildFullName(userRow.nombres, userRow.apellidos)
-    );
-
     return {
       id_usuario: userId,
       email,
-      estado_acceso_objetivo: markPending ? ACCESS_STATUS.PENDING_PASSWORD : userRow.estado_acceso,
+      estado_acceso_objetivo: markPending && setupResult.sent ? ACCESS_STATUS.PENDING_PASSWORD : currentStatus,
       setup_password: {
         requerido: true,
         enviado: setupResult.sent,
@@ -2375,8 +2650,12 @@ async function sendUsuarioPasswordSetup(app, userId, body) {
   }
 }
 
-async function getUsuarioOrThrow(client, userId) {
-  const detail = await client.query(USUARIO_BY_ID_SQL, [userId]);
+async function getUsuarioOrThrow(client, userId, claims) {
+  // AM: El alcance administrativo también contempla cuentas acreditadas por asignaciones admin.
+  const sql = isAdminWithoutSuperAdmin(claims)
+    ? USUARIO_BY_ID_SQL.replace("AND r_sa.nombre = 'super_admin'", "AND r_sa.nombre IN ('super_admin', 'admin')")
+    : USUARIO_BY_ID_SQL;
+  const detail = await client.query(sql, [userId]);
   if (!detail.rowCount) {
     throw new AppError(404, "Usuario no encontrado", { code: "PERSONAS_USER_NOT_FOUND" });
   }
@@ -2457,39 +2736,68 @@ async function restoreUserAccessByLifecycle(client, userId) {
   );
 }
 
-async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, assignedBy, esBarbero }) {
+async function employeeLifecycleState(client, userId) {
+  try {
+    return await client.query(
+      `SELECT e.id_empleado, e.roles_reactivacion
+       FROM public.empleados e JOIN public.usuarios u ON u.id_persona = e.id_persona
+       WHERE u.id_usuario = $1::uuid AND e.deleted_at IS NULL
+       FOR UPDATE OF e`,
+      [userId]
+    );
+  } catch (error) {
+    if (error.code === "42703") {
+      throw new AppError(503, "La gestion de reactivacion de empleados no esta disponible", {
+        code: "PERSONAS_EMPLOYEE_LIFECYCLE_UNAVAILABLE",
+      });
+    }
+    throw error;
+  }
+}
+
+async function suspendEmployeeRoles(app, client, userId) {
+  const state = await employeeLifecycleState(client, userId);
+  if (state.rowCount !== 1) {
+    throw new AppError(409, "No se puede determinar el estado del empleado", {
+      code: "PERSONAS_EMPLOYEE_ACTIVATE_ROLES_REQUIRED",
+    });
+  }
+  // AM: Persiste solo las asignaciones vigentes; una inactivacion repetida no pierde la captura.
+  await client.query(
+    `UPDATE public.empleados SET roles_reactivacion = (
+       SELECT jsonb_agg(jsonb_build_object('usuario', ru.id_usuario, 'rol', r.nombre, 'sucursal', ru.id_sucursal))
+       FROM public.roles_usuarios ru JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $2::uuid AND ru.activo IS TRUE AND r.nombre = ANY($3::text[])
+     ) WHERE id_empleado = $1::uuid AND EXISTS (
+       SELECT 1 FROM public.roles_usuarios ru JOIN public.roles r ON r.id_rol = ru.id_rol
+       WHERE ru.id_usuario = $2::uuid AND ru.activo IS TRUE AND r.nombre = ANY($3::text[])
+     )`,
+    [state.rows[0].id_empleado, userId, [...EMPLOYEE_ALLOWED_ROLES]]
+  );
+  await deactivateUserRolesByNames(app, client, userId, [...EMPLOYEE_ALLOWED_ROLES]);
+}
+
+async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, assignedBy, esBarbero, actorClaims }) {
   if (!userId) return;
 
-  const historicalRolesResult = await client.query(
-    `
-      SELECT DISTINCT r.nombre AS role_name
-      FROM public.roles_usuarios ru
-      JOIN public.roles r
-        ON r.id_rol = ru.id_rol
-      WHERE ru.id_usuario = $1::uuid
-        AND r.nombre = ANY($2::text[])
-    `,
-    [userId, [...EMPLOYEE_ALLOWED_ROLES]]
-  );
-
-  const historicalRoleNames = historicalRolesResult.rows
-    .map((row) => String(row.role_name || "").trim().toLowerCase())
-    .filter((value) => EMPLOYEE_ALLOWED_ROLES.has(value));
-
-  let candidateRoles = [...new Set(historicalRoleNames)];
-  if (!esBarbero) {
-    candidateRoles = candidateRoles.filter((role) => role !== "barbero");
+  const state = await employeeLifecycleState(client, userId);
+  const snapshot = state.rowCount === 1 ? state.rows[0].roles_reactivacion : null;
+  if (!Array.isArray(snapshot) || !snapshot.length || snapshot.some((item) =>
+    !item || item.usuario !== userId || !EMPLOYEE_ALLOWED_ROLES.has(item.rol) ||
+    item.sucursal !== (item.rol === "super_admin" ? null : branchId)
+  )) {
+    throw new AppError(409, "No se puede activar un empleado sin roles recuperables verificados", {
+      code: "PERSONAS_EMPLOYEE_ACTIVATE_ROLES_REQUIRED",
+    });
   }
-  if (esBarbero && !candidateRoles.includes("barbero")) {
-    candidateRoles.push("barbero");
+  const candidateRoles = [...new Set(snapshot.map((item) => item.rol))];
+  if (candidateRoles.includes("barbero") !== esBarbero) {
+    throw new AppError(409, "Los roles recuperables no corresponden al perfil del empleado", {
+      code: "PERSONAS_EMPLOYEE_ACTIVATE_ROLES_REQUIRED",
+    });
   }
 
-  if (!candidateRoles.length) {
-    // AM: Fallback de seguridad cuando no hay historial de roles internos reutilizable.
-    candidateRoles = esBarbero ? ["barbero"] : ["admin"];
-  }
-
-  const normalizedRoles = parseEmployeeRoleNames(candidateRoles, esBarbero);
+  const normalizedRoles = parseEmployeeRoleNames(candidateRoles, esBarbero, actorClaims);
   if (normalizedRoles.some((role) => BRANCH_REQUIRED_ROLES.has(role)) && !branchId) {
     throw new AppError(409, "No se puede activar empleado sin sucursal valida para sus roles internos", {
       code: "PERSONAS_EMPLOYEE_ACTIVATE_BRANCH_REQUIRED",
@@ -2503,7 +2811,9 @@ async function restoreEmployeeRolesByLifecycle(app, client, { userId, branchId, 
     userId,
     branchId,
     assignedBy,
+    actorClaims,
   });
+  await client.query("UPDATE public.empleados SET roles_reactivacion = NULL WHERE id_empleado = $1::uuid", [state.rows[0].id_empleado]);
 }
 
 async function updateUsuario(app, request, userId, payload) {
@@ -2511,9 +2821,11 @@ async function updateUsuario(app, request, userId, payload) {
   let transactionStarted = false;
 
   try {
-    const current = await getUsuarioOrThrow(client, userId);
+    const current = await getUsuarioOrThrow(client, userId, request.claims);
     const raw = current.raw;
     const currentUsuario = current.usuario;
+    await assertActorCanManagePrivilegedUser(app, request, client, raw.id_usuario, "USER_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId });
 
     const personaPatch = payload?.persona || {};
     const accesoPatch = payload?.acceso || {};
@@ -2540,6 +2852,11 @@ async function updateUsuario(app, request, userId, payload) {
 
     const nextNombres = hasNewNames ? normalizeRequired(personaPatch.nombres) : normalizeRequired(raw.nombres);
     const nextApellidos = hasNewLastNames ? normalizeRequired(personaPatch.apellidos) : normalizeRequired(raw.apellidos);
+    if ((hasNewNames && !nextNombres) || (hasNewLastNames && !nextApellidos)) {
+      throw new AppError(400, "Nombres y apellidos no pueden quedar vacíos", {
+        code: "PERSONAS_USER_NAME_REQUIRED",
+      });
+    }
     const nextPhone = hasNewPhone ? normalizeOptional(personaPatch.telefono_principal) : normalizeOptional(raw.telefono_principal);
 
     const currentEmail = normalizeEmail(raw.email ?? "");
@@ -2603,6 +2920,7 @@ async function updateUsuario(app, request, userId, payload) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId, lock: true });
 
     if (hasPersonaPatch) {
       await client.query(
@@ -2709,7 +3027,7 @@ async function updateUsuario(app, request, userId, payload) {
       }
     }
 
-    const detail = await getUsuarioOrThrow(client, userId);
+    const detail = await getUsuarioOrThrow(client, userId, request.claims);
 
     await client.query("COMMIT");
     transactionStarted = false;
@@ -2725,7 +3043,7 @@ async function updateUsuario(app, request, userId, payload) {
   }
 }
 
-async function updateUsuarioAccessStatus(app, userId, status) {
+async function updateUsuarioAccessStatus(app, request, userId, status) {
   if (!Object.values(ACCESS_STATUS).includes(status)) {
     throw new AppError(400, `estado_acceso invalido: ${status}`, {
       code: "PERSONAS_USER_ACCESS_STATUS_INVALID",
@@ -2736,10 +3054,9 @@ async function updateUsuarioAccessStatus(app, userId, status) {
   let transactionStarted = false;
 
   try {
-    await getUsuarioOrThrow(client, userId);
-    if ([ACCESS_STATUS.PENDING_PASSWORD, ACCESS_STATUS.BLOCKED, ACCESS_STATUS.INACTIVE].includes(status)) {
-      await assertUserNotProtected(app, userId, "ACCESS_STATUS_UPDATE", { client });
-    }
+    await getUsuarioOrThrow(client, userId, request.claims);
+    await assertActorCanManagePrivilegedUser(app, request, client, userId, "ACCESS_STATUS_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId });
     const relationshipGuard = await client.query(
       `
         SELECT
@@ -2840,6 +3157,7 @@ async function updateUsuarioAccessStatus(app, userId, status) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "usuario", id: userId, lock: true });
 
     await client.query(
       `
@@ -2856,7 +3174,7 @@ async function updateUsuarioAccessStatus(app, userId, status) {
       [userId, status, ACCESS_STATUS.PENDING_PASSWORD, ACCESS_STATUS.ACTIVE]
     );
 
-    const detail = await getUsuarioOrThrow(client, userId);
+    const detail = await getUsuarioOrThrow(client, userId, request.claims);
 
     await client.query("COMMIT");
     transactionStarted = false;
@@ -2872,7 +3190,7 @@ async function updateUsuarioAccessStatus(app, userId, status) {
   }
 }
 
-async function inactivateEmpleado(app, idEmpleado) {
+async function inactivateEmpleado(app, request, idEmpleado) {
   const client = await app.db.connect();
   let transactionStarted = false;
 
@@ -2886,13 +3204,18 @@ async function inactivateEmpleado(app, idEmpleado) {
 
     const row = current.rows[0];
     if (!row.id_usuario) {
+      await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
       throw new AppError(409, "Empleado inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
 
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "EMPLOYEE_INACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
+
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, lock: true });
 
     await client.query(
       `
@@ -2904,7 +3227,7 @@ async function inactivateEmpleado(app, idEmpleado) {
       [idEmpleado]
     );
 
-    await deactivateUserRolesByNames(app, client, row.id_usuario, [...EMPLOYEE_ALLOWED_ROLES]);
+    await suspendEmployeeRoles(app, client, row.id_usuario);
     await blockUserAccessByLifecycle(app, client, row.id_usuario);
 
     const detail = await client.query(EMPLEADO_BY_ID_SQL, [idEmpleado]);
@@ -2937,13 +3260,18 @@ async function activateEmpleado(app, request, idEmpleado) {
 
     const row = current.rows[0];
     if (!row.id_usuario) {
+      await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
       throw new AppError(409, "Empleado inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_EMPLOYEE_WITHOUT_USER",
       });
     }
 
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "EMPLOYEE_ACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado });
+
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "empleado", id: idEmpleado, lock: true });
 
     await client.query(
       `
@@ -2960,6 +3288,7 @@ async function activateEmpleado(app, request, idEmpleado) {
       branchId: row.id_sucursal,
       assignedBy: request.claims?.user?.id_usuario ?? null,
       esBarbero: Boolean(row.es_barbero),
+      actorClaims: request.claims,
     });
     await restoreUserAccessByLifecycle(client, row.id_usuario);
 
@@ -2980,6 +3309,7 @@ async function activateEmpleado(app, request, idEmpleado) {
 }
 
 async function updateCliente(app, request, idCliente, payload) {
+  assertAdminClientPhotoUnchanged(payload);
   const client = await app.db.connect();
   let authUserId = null;
   let transactionStarted = false;
@@ -2996,6 +3326,8 @@ async function updateCliente(app, request, idCliente, payload) {
     }
 
     const currentRow = current.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, currentRow.id_usuario, "CLIENT_UPDATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, branchId: payload?.cliente?.id_sucursal_origen });
     const persona = buildPersonaPayload(payload?.persona || {});
     const acceso = payload?.acceso || {};
     const cliente = payload?.cliente || {};
@@ -3018,11 +3350,10 @@ async function updateCliente(app, request, idCliente, payload) {
     const idSucursalOrigen = hasSucursalOrigenPatch
       ? await ensureActiveBranch(client, cliente.id_sucursal_origen ?? null)
       : normalizeOptional(currentRow.id_sucursal_origen ?? null);
-    const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentRow.fecha_ingreso ?? null);
-    const hasFotoPerfilPatch = Object.prototype.hasOwnProperty.call(cliente, "foto_perfil_asset_id");
-    const nextFotoPerfilAssetIdRaw = hasFotoPerfilPatch
-      ? normalizeOptional(cliente.foto_perfil_asset_id ?? null)
-      : normalizeOptional(currentRow.foto_perfil_asset_id ?? null);
+    const currentFechaIngreso = currentRow.fecha_ingreso instanceof Date
+      ? currentRow.fecha_ingreso.toISOString()
+      : currentRow.fecha_ingreso;
+    const fechaIngreso = normalizeOptional(cliente.fecha_ingreso ?? currentFechaIngreso ?? null);
 
     if (!habilitarAcceso) {
       throw new AppError(400, "Los clientes deben conservar acceso habilitado", {
@@ -3101,18 +3432,6 @@ async function updateCliente(app, request, idCliente, payload) {
       : null;
 
     const roleIdsByName = await loadRoleIdByName(client);
-    const nextFotoPerfilAsset = nextFotoPerfilAssetIdRaw
-      ? await resolveAssetForBinding(client, {
-        assetId: nextFotoPerfilAssetIdRaw,
-        scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-        entityType: "cliente",
-        entityId: idCliente,
-        idSucursal: idSucursalOrigen,
-        claims: request.claims,
-        allowUnboundEntity: true,
-        allowedStatuses: ["temporal", "activo"],
-      })
-      : null;
     if (habilitarAcceso && !currentRow.id_usuario) {
       authUserId = await createAuthIdentity(app, {
         email: correoPrincipal,
@@ -3123,6 +3442,7 @@ async function updateCliente(app, request, idCliente, payload) {
 
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, branchId: payload?.cliente?.id_sucursal_origen, lock: true });
 
     await client.query(
       `
@@ -3176,7 +3496,8 @@ async function updateCliente(app, request, idCliente, payload) {
       );
     }
 
-    if (habilitarAcceso && nextUserId) {
+    const nextClienteActive = cliente.estado ?? currentRow.estado_cliente;
+    if (habilitarAcceso && nextUserId && nextClienteActive !== false) {
       await ensureClienteRoleAssignment(
         app,
         client,
@@ -3207,40 +3528,6 @@ async function updateCliente(app, request, idCliente, payload) {
         authUserIdForCompensation = nextUserId;
         await syncAuthUserEmail(app, nextUserId, correoPrincipal);
       }
-    }
-
-    let nextFotoPerfilAssetId = currentRow.foto_perfil_asset_id ?? null;
-    let nextFotoPerfilPath = currentRow.foto_perfil_path ?? null;
-    if (hasFotoPerfilPatch) {
-      if (!nextFotoPerfilAsset) {
-        nextFotoPerfilAssetId = null;
-        nextFotoPerfilPath = null;
-      } else {
-        const activatedPhoto = await activateAssetForEntity(app, client, {
-          assetId: nextFotoPerfilAsset.id_asset,
-          scopeKey: STORAGE_SCOPE_PRIVATE_CLIENT_PROFILE,
-          entityType: "cliente",
-          entityId: idCliente,
-          idSucursal: idSucursalOrigen,
-          ownerClienteId: idCliente,
-          claims: request.claims,
-          replaceCurrent: false,
-        });
-        nextFotoPerfilAssetId = activatedPhoto.asset.id_asset;
-        nextFotoPerfilPath = activatedPhoto.asset.object_path;
-      }
-
-      await client.query(
-        `
-          UPDATE public.personas
-          SET
-            foto_perfil_asset_id = $2::uuid,
-            foto_perfil_path = $3,
-            updated_at = NOW()
-          WHERE id_persona = $1::uuid
-        `,
-        [currentRow.id_persona, nextFotoPerfilAssetId, nextFotoPerfilPath]
-      );
     }
 
     if (hasConsentTimestampColumns) {
@@ -3295,18 +3582,16 @@ async function updateCliente(app, request, idCliente, payload) {
       );
     }
 
+    if (nextClienteActive === false && nextUserId) {
+      await deactivateUserRolesByNames(app, client, nextUserId, ["cliente"]);
+      await blockUserAccessByLifecycle(app, client, nextUserId);
+    } else if (currentRow.estado_cliente === false && cliente.estado === true && nextUserId) {
+      await restoreUserAccessByLifecycle(client, nextUserId);
+    }
     const detail = await client.query(CLIENTE_BY_ID_SQL, [idCliente]);
 
     await client.query("COMMIT");
     transactionStarted = false;
-
-    if (hasFotoPerfilPatch) {
-      await replaceAssetIfNeeded(app, client, {
-        previousAssetId: currentRow.foto_perfil_asset_id,
-        nextAssetId: nextFotoPerfilAssetIdRaw,
-        claims: request.claims,
-      });
-    }
 
     let setupPassword = null;
     if (habilitarAcceso && !currentRow.id_usuario) {
@@ -3347,7 +3632,7 @@ async function updateCliente(app, request, idCliente, payload) {
   }
 }
 
-async function inactivateCliente(app, idCliente) {
+async function inactivateCliente(app, request, idCliente) {
   const client = await app.db.connect();
   let transactionStarted = false;
 
@@ -3360,6 +3645,8 @@ async function inactivateCliente(app, idCliente) {
     }
 
     const row = current.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "CLIENT_INACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente });
     if (!row.id_usuario) {
       throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_CLIENT_WITHOUT_USER",
@@ -3367,6 +3654,7 @@ async function inactivateCliente(app, idCliente) {
     }
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, lock: true });
 
     await client.query(
       `
@@ -3410,6 +3698,8 @@ async function activateCliente(app, request, idCliente) {
     }
 
     const row = current.rows[0];
+    await assertActorCanManagePrivilegedUser(app, request, client, row.id_usuario, "CLIENT_ACTIVATE");
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente });
     if (!row.id_usuario) {
       throw new AppError(409, "Cliente inconsistente: no tiene usuario vinculado", {
         code: "PERSONAS_CLIENT_WITHOUT_USER",
@@ -3417,6 +3707,7 @@ async function activateCliente(app, request, idCliente) {
     }
     await client.query("BEGIN");
     transactionStarted = true;
+    await authorizePersonasMutation(client, request.claims, { kind: "cliente", id: idCliente, lock: true });
 
     await client.query(
       `
@@ -3700,19 +3991,18 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/catalogos", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/catalogos", { preHandler: app.requireRoles(["super_admin", "admin"]) }, async (request, reply) => {
     try {
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const branches = scopePersonasQuery(`
+        SELECT id_sucursal, nombre_sucursal FROM public.sucursales
+        WHERE deleted_at IS NULL AND estado IS TRUE ORDER BY nombre_sucursal ASC
+      `, [], scope, "catalogo");
       const [rolesResult, sucursalesResult] = await Promise.all([
-        app.db.query("SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"),
-        app.db.query(
-          `
-            SELECT id_sucursal, nombre_sucursal
-            FROM public.sucursales
-            WHERE deleted_at IS NULL
-              AND estado IS TRUE
-            ORDER BY nombre_sucursal ASC
-          `
-        ),
+        app.db.query(scope.global
+          ? "SELECT id_rol, nombre FROM public.roles ORDER BY nombre ASC"
+          : "SELECT id_rol, nombre FROM public.roles WHERE nombre IN ('admin', 'barbero', 'cliente') ORDER BY nombre ASC"),
+        app.db.query(branches.text, branches.values),
       ]);
       return sendOk(reply, { roles: rolesResult.rows, sucursales: sucursalesResult.rows });
     } catch (error) {
@@ -3742,10 +4032,13 @@ export default async function adminPersonasRoutes(app) {
       schema: { body: roleCreateBodySchema },
     },
     async (request, reply) => {
-      const client = await app.db.connect();
+      let client;
+      let transactionStarted = false;
       try {
         const roleName = normalizeRoleName(request.body?.nombre);
+        client = await app.db.connect();
         await client.query("BEGIN");
+        transactionStarted = true;
 
         const existsResult = await client.query(
           `
@@ -3773,20 +4066,30 @@ export default async function adminPersonasRoutes(app) {
         );
 
         await client.query("COMMIT");
+        transactionStarted = false;
         return sendOk(reply, { rol: insertResult.rows[0] }, { statusCode: 201, requestId: request.id });
       } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
+        if (transactionStarted) await client.query("ROLLBACK").catch(() => {});
+        if (error?.code === "23505") {
+          return sendError(reply, 409, "Ya existe un rol con ese nombre", {
+            code: "PERSONAS_ROLE_DUPLICATE",
+            requestId: request.id,
+          });
+        }
         return sendHandled(reply, request, error, "No se pudo crear rol", "PERSONAS_ROLE_CREATE_ERROR");
       } finally {
-        client.release();
+        client?.release();
       }
     }
   );
 
   app.get("/usuarios", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_USUARIOS_SQL);
-      return sendOk(reply, { usuarios: rows.map(mapUsuario) });
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const query = scopePersonasQuery(LIST_USUARIOS_SQL, [], scope, "usuario");
+      const { rows } = await app.db.query(query.text, query.values);
+      const usuarios = filterUsuariosForActor(rows.map(mapUsuario), request.claims);
+      return sendOk(reply, { usuarios });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar usuarios", "PERSONAS_USERS_LIST_ERROR");
     }
@@ -3794,7 +4097,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/usuarios/:id_usuario",
-    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioUpdateBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioUpdateBodySchema, params: usuarioParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateUsuario(app, request, request.params.id_usuario, request.body || {});
@@ -3807,10 +4110,10 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/usuarios/:id_usuario/estado-acceso",
-    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioAccessStatusBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioAccessStatusBodySchema, params: usuarioParamsSchema } },
     async (request, reply) => {
       try {
-        const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, request.body?.estado_acceso);
+        const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, request.body?.estado_acceso);
         return sendOk(reply, updated, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo actualizar estado de acceso", "PERSONAS_USER_STATUS_UPDATE_ERROR");
@@ -3818,27 +4121,27 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/bloquear", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { params: usuarioParamsSchema } }, async (request, reply) => {
     try {
-      const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.BLOCKED);
+      const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.BLOCKED);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo bloquear usuario", "PERSONAS_USER_BLOCK_ERROR");
     }
   });
 
-  app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/activar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { params: usuarioParamsSchema } }, async (request, reply) => {
     try {
-      const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.ACTIVE);
+      const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.ACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo activar usuario", "PERSONAS_USER_ACTIVATE_ERROR");
     }
   });
 
-  app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/usuarios/:id_usuario/inactivar", { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { params: usuarioParamsSchema } }, async (request, reply) => {
     try {
-      const updated = await updateUsuarioAccessStatus(app, request.params.id_usuario, ACCESS_STATUS.INACTIVE);
+      const updated = await updateUsuarioAccessStatus(app, request, request.params.id_usuario, ACCESS_STATUS.INACTIVE);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo inactivar usuario", "PERSONAS_USER_INACTIVATE_ERROR");
@@ -3855,10 +4158,10 @@ export default async function adminPersonasRoutes(app) {
 
   app.post(
     "/usuarios/:id_usuario/enviar-configuracion-password",
-    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioSetupBodySchema } },
+    { preHandler: app.requireRoles(USER_ROUTE_ALLOWED_ROLES), schema: { body: usuarioSetupBodySchema, params: usuarioParamsSchema } },
     async (request, reply) => {
       try {
-        const result = await sendUsuarioPasswordSetup(app, request.params.id_usuario, request.body || {});
+        const result = await sendUsuarioPasswordSetup(app, request, request.params.id_usuario, request.body || {});
         return sendOk(reply, result, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo enviar configuracion de password", "PERSONAS_USER_SETUP_PASSWORD_ERROR");
@@ -3868,7 +4171,9 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/empleados", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(LIST_EMPLEADOS_SQL);
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const query = scopePersonasQuery(LIST_EMPLEADOS_SQL, [], scope, "empleado");
+      const { rows } = await app.db.query(query.text, query.values);
       return sendOk(reply, { empleados: rows.map(mapEmpleado) });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar empleados", "PERSONAS_EMPLOYEES_LIST_ERROR");
@@ -3877,7 +4182,16 @@ export default async function adminPersonasRoutes(app) {
 
   app.get("/empleados/:id_empleado", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(EMPLEADO_BY_ID_SQL, [request.params.id_empleado]);
+      if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(request.params.id_empleado)) {
+        return sendError(reply, 400, "Identificador de empleado inválido", {
+          code: "PERSONAS_EMPLOYEE_ID_INVALID",
+          requestId: request.id,
+        });
+      }
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      await assertPersonasTargetScope(app.db, scope, "empleado", request.params.id_empleado);
+      const query = scopePersonasQuery(EMPLEADO_BY_ID_SQL, [request.params.id_empleado], scope, "empleado");
+      const { rows } = await app.db.query(query.text, query.values);
       if (!rows.length) {
         return sendError(reply, 404, "Empleado no encontrado", {
           code: "PERSONAS_EMPLOYEE_NOT_FOUND",
@@ -3901,7 +4215,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/empleados/:id_empleado",
-    { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { body: empleadoCreateBodySchema } },
+    { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { body: empleadoCreateBodySchema, params: empleadoParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateEmpleado(app, request, request.params.id_empleado, request.body || {});
@@ -3912,16 +4226,16 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/empleados/:id_empleado/inactivar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { params: empleadoParamsSchema } }, async (request, reply) => {
     try {
-      const updated = await inactivateEmpleado(app, request.params.id_empleado);
+      const updated = await inactivateEmpleado(app, request, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo inactivar empleado", "PERSONAS_EMPLOYEE_INACTIVATE_ERROR");
     }
   });
 
-  app.patch("/empleados/:id_empleado/activar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/empleados/:id_empleado/activar", { preHandler: app.requireRoles(EMPLOYEE_ROUTE_ALLOWED_ROLES), schema: { params: empleadoParamsSchema } }, async (request, reply) => {
     try {
       const updated = await activateEmpleado(app, request, request.params.id_empleado);
       return sendOk(reply, updated, { requestId: request.id });
@@ -3945,10 +4259,15 @@ export default async function adminPersonasRoutes(app) {
       const limit = Math.min(50, Math.max(1, Number.parseInt(request.query?.limit, 10) || 20));
       const page = Math.max(1, Number.parseInt(request.query?.page, 10) || 1);
       const offset = (page - 1) * limit;
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      const paginated = q || request.query?.limit || request.query?.page;
+      const query = scopePersonasQuery(paginated ? SEARCH_CLIENTES_SQL : LIST_CLIENTES_SQL,
+        paginated ? [q, limit, offset] : [], scope, "cliente");
+      const countQuery = scopePersonasQuery(COUNT_CLIENTES_SQL, [q], scope, "cliente");
       const [{ rows }, totalResult] = await Promise.all([
-        app.db.query(q || request.query?.limit || request.query?.page ? SEARCH_CLIENTES_SQL : LIST_CLIENTES_SQL, q || request.query?.limit || request.query?.page ? [q, limit, offset] : []),
+        app.db.query(query.text, query.values),
         q || request.query?.limit || request.query?.page
-          ? app.db.query(COUNT_CLIENTES_SQL, [q])
+          ? app.db.query(countQuery.text, countQuery.values)
           : Promise.resolve({ rows: [{ total: 0 }] }),
       ]);
       return sendOk(reply, {
@@ -3965,9 +4284,12 @@ export default async function adminPersonasRoutes(app) {
     }
   });
 
-  app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.get("/clientes/:id_cliente", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
-      const { rows } = await app.db.query(CLIENTE_BY_ID_SQL, [request.params.id_cliente]);
+      const scope = await getPersonasAdminScope(app.db, request.claims);
+      await assertPersonasTargetScope(app.db, scope, "cliente", request.params.id_cliente);
+      const query = scopePersonasQuery(CLIENTE_BY_ID_SQL, [request.params.id_cliente], scope, "cliente");
+      const { rows } = await app.db.query(query.text, query.values);
       if (!rows.length) {
         return sendError(reply, 404, "Cliente no encontrado", {
           code: "PERSONAS_CLIENT_NOT_FOUND",
@@ -3992,7 +4314,7 @@ export default async function adminPersonasRoutes(app) {
 
   app.patch(
     "/clientes/:id_cliente",
-    { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { body: clienteUpdateBodySchema } },
+    { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { body: clienteUpdateBodySchema, params: clienteParamsSchema } },
     async (request, reply) => {
       try {
         const updated = await updateCliente(app, request, request.params.id_cliente, request.body || {});
@@ -4003,16 +4325,16 @@ export default async function adminPersonasRoutes(app) {
     }
   );
 
-  app.patch("/clientes/:id_cliente/inactivar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/clientes/:id_cliente/inactivar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
-      const updated = await inactivateCliente(app, request.params.id_cliente);
+      const updated = await inactivateCliente(app, request, request.params.id_cliente);
       return sendOk(reply, updated, { requestId: request.id });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo inactivar cliente", "PERSONAS_CLIENT_INACTIVATE_ERROR");
     }
   });
 
-  app.patch("/clientes/:id_cliente/activar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES) }, async (request, reply) => {
+  app.patch("/clientes/:id_cliente/activar", { preHandler: app.requireRoles(CLIENT_ROUTE_ALLOWED_ROLES), schema: { params: clienteParamsSchema } }, async (request, reply) => {
     try {
       const updated = await activateCliente(app, request, request.params.id_cliente);
       return sendOk(reply, updated, { requestId: request.id });
