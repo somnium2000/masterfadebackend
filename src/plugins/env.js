@@ -92,6 +92,7 @@ async function envPlugin(app) {
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
   const paymentProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
+  const pixelPayEnv = String(process.env.PIXELPAY_ENV || "").trim().toLowerCase();
   if (!["mock", "todopago", "pixelpay"].includes(paymentProvider)) {
     throw new Error("PAYMENT_PROVIDER invalido. Usa mock, todopago o pixelpay.");
   }
@@ -108,11 +109,12 @@ async function envPlugin(app) {
     if (!["direct", "sdk"].includes(pixelPayImplementation)) {
       throw new Error("PIXELPAY_IMPLEMENTATION invalido. Usa direct o sdk.");
     }
-    const pixelPayEnv = String(process.env.PIXELPAY_ENV || "").trim().toLowerCase();
-    if (nodeEnv === "production" && pixelPayEnv !== "live") {
+    const deploymentEnvironment = String(process.env.ENTORNO || nodeEnv).trim().toLowerCase();
+    const isLiveDeployment = ["production", "prod"].includes(deploymentEnvironment);
+    if (isLiveDeployment && pixelPayEnv !== "live") {
       throw new Error("PixelPay en produccion requiere PIXELPAY_ENV=live.");
     }
-    if (nodeEnv !== "production" && pixelPayEnv !== "sandbox") {
+    if (!isLiveDeployment && pixelPayEnv !== "sandbox") {
       throw new Error("PixelPay fuera de produccion requiere PIXELPAY_ENV=sandbox.");
     }
     if (pixelPayEnv === "live" && pixelPayImplementation !== "sdk") {
@@ -156,6 +158,7 @@ async function envPlugin(app) {
     csrfSecret,
     bookingReleaseTokenSecret: resolveBookingReleaseTokenSecret(nodeEnv),
     paymentProvider,
+    pixelPayEnv,
     todoPago,
     trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),

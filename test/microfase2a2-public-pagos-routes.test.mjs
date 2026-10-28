@@ -706,7 +706,7 @@ async function createPagosApp(client, {
         }
       : false,
   });
-  app.decorate("config", { paymentProvider: providerCode });
+  app.decorate("config", { paymentProvider: providerCode, pixelPayEnv: "sandbox" });
   app.decorate("requireRoles", () => async (request) => {
     request.claims = claims;
   });
@@ -1366,7 +1366,10 @@ test("sale guard carga intent PixelPay reclamado y no llama al proveedor", async
 
 for (const scenario of [
   { name: "incierto", uncertain: true, expectedHttp: 202, expectedState: "pendiente_confirmacion" },
-  { name: "definitivo", uncertain: false, expectedHttp: 502, expectedState: "fallido" },
+  { name: "definitivo", uncertain: false, statusCode: 422, expectedHttp: 502, expectedState: "fallido",
+    expectedCode: "PIXELPAY_PAYMENT_DATA_INVALID" },
+  { name: "precondicion 412", uncertain: false, statusCode: 412, expectedHttp: 502, expectedState: "fallido",
+    expectedCode: "PIXELPAY_PRECONDITION_FAILED" },
 ]) {
   test(`sale con error de respuesta ${scenario.name} conserva la semantica y no consulta status`, async () => {
     const logs = [];
@@ -1379,7 +1382,7 @@ for (const scenario of [
         Object.assign(error, {
           code: "PIXELPAY_RESPONSE_INVALID",
           uncertain: scenario.uncertain,
-          statusCode: scenario.uncertain ? 200 : 422,
+          statusCode: scenario.uncertain ? 200 : scenario.statusCode,
           upstreamContentType: "text/html",
           upstreamContentLength: 321,
         });
@@ -1433,7 +1436,7 @@ for (const scenario of [
 
     assert.equal(response.statusCode, scenario.expectedHttp, response.body);
     if (!scenario.uncertain) {
-      assert.equal(response.json().error.code, "PIXELPAY_REQUEST_REJECTED");
+      assert.equal(response.json().error.code, scenario.expectedCode);
     }
     assert.equal(client.getActiveIntent().estado_intent_codigo, scenario.expectedState);
     assert.equal(provider.saleCalls, 1);

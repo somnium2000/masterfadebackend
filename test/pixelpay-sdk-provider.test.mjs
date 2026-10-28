@@ -1159,6 +1159,46 @@ test("configuracion QA SDK usa exclusivamente Sandbox y Direct conserva AUTH_HAS
   }
 });
 
+test("ENTORNO=qa conserva Sandbox aunque NODE_ENV=production sea interno del contenedor", async () => {
+  const names = [
+    "NODE_ENV", "ENTORNO", "FRONTEND_URL", "JWT_SECRET", "COOKIE_SECRET", "CSRF_SECRET",
+    "AUTH_COOKIE_SECURE", "BOOKING_RELEASE_TOKEN_SECRET", "PAYMENT_PROVIDER", "PIXELPAY_IMPLEMENTATION",
+    "PIXELPAY_ENV", "PIXELPAY_ENDPOINT", "PIXELPAY_APP_URL", "PIXELPAY_KEY_ID",
+    "PIXELPAY_SECRET_KEY", "PIXELPAY_AUTH_HASH",
+  ];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, {
+    NODE_ENV: "production",
+    ENTORNO: "qa",
+    FRONTEND_URL: "https://qa.masterfadeapp.com",
+    JWT_SECRET: "qa-jwt-secret-at-least-24",
+    COOKIE_SECRET: "qa-cookie-secret-at-least-24",
+    CSRF_SECRET: "qa-csrf-secret-at-least-24",
+    AUTH_COOKIE_SECURE: "true",
+    BOOKING_RELEASE_TOKEN_SECRET: "q".repeat(64),
+    PAYMENT_PROVIDER: "pixelpay",
+    PIXELPAY_IMPLEMENTATION: "sdk",
+    PIXELPAY_ENV: "sandbox",
+    PIXELPAY_ENDPOINT: "https://pixelpay.dev",
+    PIXELPAY_APP_URL: "https://pixelpay.dev",
+    PIXELPAY_KEY_ID: KEY_ID,
+    PIXELPAY_SECRET_KEY: SECRET,
+    PIXELPAY_AUTH_HASH: "",
+  });
+
+  const app = Fastify();
+  app.register(envPlugin);
+  try {
+    await app.ready();
+  } finally {
+    await app.close();
+    for (const name of names) {
+      if (previous[name] == null) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
+
 test("configuracion produccion SDK exige live completo y rechaza cruces con Sandbox", async () => {
   const names = [
     "NODE_ENV", "ENTORNO", "FRONTEND_URL", "JWT_SECRET", "COOKIE_SECRET", "CSRF_SECRET",

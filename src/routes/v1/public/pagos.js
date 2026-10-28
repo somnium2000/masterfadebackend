@@ -5,6 +5,7 @@ import { PaymentProviderFactory } from "../../../services/payments/PaymentProvid
 import {
   HONDURAS_ISO_3166_2_CODES,
   PIXELPAY_SALE_OUTCOME,
+  resolvePixelPayCustomerErrorCode,
 } from "../../../services/payments/PixelPayDirectProvider.js";
 import {
   buildSafeProviderErrorDiagnostic,
@@ -17,6 +18,11 @@ import {
 } from "../../../services/payments/pixelPaySaleAttemptStore.js";
 import { inspectPixelPayCardExpire } from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
+import {
+  assertPixelPayCardAllowedForEnvironment,
+  assertPixelPaySandboxCardAllowed,
+} from "../../../services/payments/pixelPayCardEnvironment.js";
+export { assertPixelPayCardAllowedForEnvironment, assertPixelPaySandboxCardAllowed };
 export { buildSafeProviderErrorDiagnostic, buildSafePixelPaySdkDiagnostics };
 import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
@@ -34,7 +40,6 @@ import {
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const AUTHENTICATED_PAYMENT_ROLES = ["cliente"];
 const PUBLIC_PAYMENT_CONFIRMABLE_STATES = new Set(ACTIVE_INTENT_STATES);
-const PIXELPAY_SANDBOX_CARD_NUMBERS = new Set(["4111111111111111", "5555555555554444"]);
 
 export const PIXELPAY_SALE_RATE_LIMIT = Object.freeze({
   max: 5,
@@ -71,16 +76,6 @@ export function buildProviderOrderReference({ providerCode, idIntent } = {}) {
 
 export function canStartPixelPaySale(intentState) {
   return String(intentState || "").trim().toLowerCase() === "link_generado";
-}
-
-export function assertPixelPaySandboxCardAllowed(cardNumber) {
-  const normalized = String(cardNumber || "").replace(/\D+/g, "");
-  if (!PIXELPAY_SANDBOX_CARD_NUMBERS.has(normalized)) {
-    throw new AppError(422, "La tarjeta no pertenece al set permitido de PixelPay Sandbox", {
-      code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
-    });
-  }
-  return normalized;
 }
 
 export function resolvePixelPaySaleFailureState(outcome) {
@@ -2306,7 +2301,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PIXELPAY_ORDER_ID_MISSING",
         });
       }
-      assertPixelPaySandboxCardAllowed(request.body.card_number);
+      assertPixelPayCardAllowedForEnvironment(request.body.card_number, app.config?.pixelPayEnv);
       const claimed = await dbClient.query(
         `SELECT app_private.proteger_reserva_pago_v1(
            $1::uuid, $2::uuid
@@ -2405,8 +2400,11 @@ export default async function publicPagosRoutes(app, options = {}) {
             estado_intent_codigo: "pendiente_confirmacion",
           }, { statusCode: 202 });
         }
-        return sendError(reply, 502, "PixelPay no pudo procesar la solicitud", {
-          code: "PIXELPAY_REQUEST_REJECTED",
+        return sendError(reply, 502, "No fue posible procesar el pago", {
+          code: resolvePixelPayCustomerErrorCode({
+            outcome: PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE,
+            statusCode: diagnostic.upstreamStatusCode,
+          }),
           requestId: request.id,
         });
       }
@@ -2459,6 +2457,10 @@ export default async function publicPagosRoutes(app, options = {}) {
           processed: false,
           pending_confirmation: keepPending,
           estado_intent_codigo: intentState,
+          customer_error_code: resolvePixelPayCustomerErrorCode({
+            outcome: saleResult.outcome,
+            statusCode: diagnostics?.statusCode ?? saleResult.statusCode,
+          }),
         }, { statusCode: keepPending ? 202 : 200 });
       }
 

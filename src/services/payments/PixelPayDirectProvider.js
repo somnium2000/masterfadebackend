@@ -166,6 +166,18 @@ export function classifyPixelPaySaleResult({
   return PIXELPAY_SALE_OUTCOME.UNCERTAIN;
 }
 
+export function resolvePixelPayCustomerErrorCode({ outcome, statusCode } = {}) {
+  const normalizedStatus = Number(statusCode);
+  if (outcome === PIXELPAY_SALE_OUTCOME.APPROVED) return null;
+  if (outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN) return "PIXELPAY_PAYMENT_PENDING";
+  if (normalizedStatus === 412) return "PIXELPAY_PRECONDITION_FAILED";
+  if ([400, 422].includes(normalizedStatus)) return "PIXELPAY_PAYMENT_DATA_INVALID";
+  if (outcome === PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED || normalizedStatus === 402) {
+    return "PIXELPAY_PAYMENT_DECLINED";
+  }
+  return "PIXELPAY_PAYMENT_PROCESSING_FAILED";
+}
+
 export class PixelPayDirectError extends Error {
   constructor(code, message, {
     uncertain = false,

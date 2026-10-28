@@ -424,11 +424,29 @@ function pixelPayProcessHarness({
       return provider.queryPaymentStatus?.(...args);
     },
   };
-  return { app: { db }, state };
+  return { app: { db, config: { pixelPayEnv: "sandbox" } }, state };
 }
 
 const validCard = { number: "4111111111111111", holder: "Cliente QA", expire: "3012", cvv: "123" };
 const validBilling = { address: "Calle 1", country: "HN", state: "HN-FM", city: "Tegucigalpa", phone: "99999999" };
+
+test("membresia live rechaza tarjetas oficiales Sandbox antes de abrir una transaccion", async () => {
+  let connections = 0;
+  const app = {
+    config: { pixelPayEnv: "live" },
+    db: { connect: async () => { connections += 1; throw new Error("DB no debe abrirse"); } },
+  };
+  await assert.rejects(
+    processMembershipPixelPaySale(app, {
+      idPaymentIntent: INTENT,
+      clienteId: CLIENT,
+      card: validCard,
+      billing: validBilling,
+    }),
+    { code: "PIXELPAY_TEST_CARD_FORBIDDEN_IN_LIVE" }
+  );
+  assert.equal(connections, 0);
+});
 
 async function buildPixelPayRouteApp(t, harnessOptions) {
   const harness = pixelPayProcessHarness(harnessOptions);
@@ -440,6 +458,7 @@ async function buildPixelPayRouteApp(t, harnessOptions) {
   server.decorate("config", {
     nodeEnv: "test",
     paymentProvider: "pixelpay",
+    pixelPayEnv: "sandbox",
     todoPago: { mode: "disabled", simulatedEnabled: false },
   });
   await server.register(clienteRoutes, { prefix: "/v1/cliente" });

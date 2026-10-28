@@ -1,8 +1,12 @@
 import crypto from "node:crypto";
 import { AppError } from "../utils/errors.js";
 import { PaymentProviderFactory } from "./payments/PaymentProviderFactory.js";
-import { PIXELPAY_SALE_OUTCOME } from "./payments/PixelPayDirectProvider.js";
+import {
+  PIXELPAY_SALE_OUTCOME,
+  resolvePixelPayCustomerErrorCode,
+} from "./payments/PixelPayDirectProvider.js";
 import { inspectPixelPayCardExpire } from "./payments/PixelPaySdkProvider.js";
+import { assertPixelPayCardAllowedForEnvironment } from "./payments/pixelPayCardEnvironment.js";
 import {
   buildSafePixelPaySdkDiagnostics,
   buildSafeProviderErrorDiagnostic,
@@ -2278,6 +2282,7 @@ export async function processMembershipPixelPaySale(app, {
 } = {}) {
   const safeIntentId = normalizeText(idPaymentIntent);
   const safeClienteId = normalizeText(clienteId);
+  assertPixelPayCardAllowedForEnvironment(card?.number, app.config?.pixelPayEnv);
   const paymentAttemptId = crypto.randomUUID();
   let claimClient = await app.db.connect();
   let intent;
@@ -2423,7 +2428,16 @@ export async function processMembershipPixelPaySale(app, {
       );
       await client.query("COMMIT");
       errorTxStarted = false;
-      return { processed: false, pending_confirmation: nextState === "pendiente_confirmacion", estado_intent_codigo: nextState };
+      return {
+        processed: false,
+        pending_confirmation: nextState === "pendiente_confirmacion",
+        estado_intent_codigo: nextState,
+        customer_error_code: resolvePixelPayCustomerErrorCode({
+          outcome: providerError?.uncertain === true
+            ? PIXELPAY_SALE_OUTCOME.UNCERTAIN : PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE,
+          statusCode: diagnostic.upstreamStatusCode,
+        }),
+      };
     } catch (error) {
       if (errorTxStarted) await client.query("ROLLBACK").catch(() => {});
       throw error;
@@ -2476,7 +2490,15 @@ export async function processMembershipPixelPaySale(app, {
       );
       await finalClient.query("COMMIT");
       txStarted = false;
-      return { processed: false, pending_confirmation: nextState === "pendiente_confirmacion", estado_intent_codigo: nextState };
+      return {
+        processed: false,
+        pending_confirmation: nextState === "pendiente_confirmacion",
+        estado_intent_codigo: nextState,
+        customer_error_code: resolvePixelPayCustomerErrorCode({
+          outcome: saleResult.outcome,
+          statusCode: diagnostics?.statusCode ?? saleResult.statusCode,
+        }),
+      };
     }
     const confirmation = await confirmMembershipPaymentAndActivateSubscription(finalClient, {
       idPaymentIntent: safeIntentId,
