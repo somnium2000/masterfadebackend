@@ -62,7 +62,7 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
     code: dto.errorCode, name: dto.errorName, sdkErrorName: dto.sdkErrorName,
     errorConstructorName: dto.errorConstructorName,
   });
-  const result = await pool.query({
+  const query = {
     // AM: El timeout nativo de pg-pool retira la conexion fallida; no afecta START ni finanzas.
     query_timeout: PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS,
     text: `UPDATE app_private.pixelpay_sale_attempts
@@ -85,7 +85,8 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
          sdk_error_name = $30::varchar(80), error_constructor_name = $31::varchar(80),
          observed_payment_uuid_untrusted = $32::varchar(80),
          observed_transaction_id_untrusted = $33::varchar(160),
-         observed_transaction_reference_untrusted = $34::varchar(160)
+         observed_transaction_reference_untrusted = $34::varchar(160),
+         provider_response_code = $35::varchar(16)
      WHERE payment_attempt_id = $1::uuid AND finalized_at IS NULL
      RETURNING id_sale_attempt`,
     values: [
@@ -106,8 +107,23 @@ export async function finalizePixelPaySaleAttempt(pool, dto) {
         ? safeObservedProviderIdentifier(dto.observedTransactionIdUntrusted) : null,
       safe?.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN
         ? safeObservedProviderIdentifier(dto.observedTransactionReferenceUntrusted) : null,
+      safe?.providerResponseCode ?? null,
     ]
-  });
+  };
+  let result;
+  try {
+    result = await pool.query(query);
+  } catch (error) {
+    const missingNewColumn = error?.code === "42703"
+      && String(error?.message || "").includes("provider_response_code");
+    if (!missingNewColumn) throw error;
+    // AM: Compatibilidad temporal durante el orden migracion -> runtime; nunca repite Sale ni finanzas.
+    result = await pool.query({
+      ...query,
+      text: query.text.replace(",\n         provider_response_code = $35::varchar(16)", ""),
+      values: query.values.slice(0, -1),
+    });
+  }
   return result.rows.length > 0;
 }
 

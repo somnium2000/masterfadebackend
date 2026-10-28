@@ -135,6 +135,13 @@ export function safePixelPayUuid(value) {
     : null;
 }
 
+export function safePixelPayProviderResponseCode(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!/^[A-Z0-9][A-Z0-9._:-]{0,15}$/.test(normalized)) return null;
+  return /^\d{13,19}$/.test(normalized) ? null : normalized;
+}
+
 export function buildPixelPaySaleEvent(event, attempt, details = {}) {
   const inputErrorFields = safePixelPayInputErrorFields(details.inputErrorFields);
   return {

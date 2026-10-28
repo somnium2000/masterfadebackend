@@ -87,6 +87,7 @@ for (const outcome of Object.values(PIXELPAY_SALE_OUTCOME)) {
       sdkResponseClass: "InputErrorResponse", safeMessageCode: "SDK_MESSAGE_ABSENT",
       responseSuccess: false, transactionResultValid: false, transactionResultParsed: false,
       responseApproved: false, responseIncomplete: false, responseCodePresent: false,
+      providerResponseCode: outcome === "payment_declined" ? "05" : null,
       hasPaymentUuid: false, hasTransactionId: false, hasPaymentHash: false, paymentHashValid: false,
       transactionAmountMatches: false, approvedAmountMatches: false, amountMatches: false,
       durationMs: 12, cfRay: "aabbccddeeff0011-MIA",
@@ -97,6 +98,7 @@ for (const outcome of Object.values(PIXELPAY_SALE_OUTCOME)) {
     assert.equal(params[6], outcome === "uncertain");
     assert.ok(params.slice(13, 26).every((value) => value === false));
     assert.equal(params[26], "aabbccddeeff0011-MIA");
+    assert.equal(params[34], outcome === "payment_declined" ? "05" : null);
     assert.doesNotMatch(sql, /BEGIN|COMMIT|ROLLBACK|INSERT/);
   });
 }
@@ -217,6 +219,7 @@ test("la frontera del store excluye valores sensibles incluso si un DTO contiene
     sdkErrorName: privateValues[6], errorConstructorName: privateValues[8], safeMessageCode: privateValues[14],
     outcome: privateValues[14], cfRay: privateValues[12],
     inputErrorFields: ["order_id", ...privateValues],
+    providerResponseCode: privateValues[0],
   };
   await createPixelPaySaleAttemptRecord(db, unsafe);
   await finalizePixelPaySaleAttempt(db, unsafe);
@@ -225,6 +228,48 @@ test("la frontera del store excluye valores sensibles incluso si un DTO contiene
   assert.deepEqual(db.calls[1].params[7], ["order_id"]);
   assert.equal(db.calls[1].params[27], null);
   assert.equal(db.calls[1].params[2], null);
+  assert.equal(db.calls[1].params[34], null);
+});
+
+test("FINAL persiste response_code seguro y descarta valores sospechosos", async () => {
+  for (const [providerResponseCode, expected] of [
+    ["00", "00"], ["N7", "N7"], ["X-1", "X-1"],
+    ["4111111111111111", null], ["DECLINED BY ISSUER", null],
+    ["05\nsecret", null], ["A".repeat(17), null], [null, null],
+  ]) {
+    const db = makeMemoryDb();
+    await createPixelPaySaleAttemptRecord(db, start);
+    await finalizePixelPaySaleAttempt(db, {
+      ...start,
+      outcome: "payment_declined",
+      responseCodePresent: providerResponseCode != null,
+      providerResponseCode,
+    });
+    assert.equal(db.calls[1].params[34], expected);
+  }
+});
+
+test("FINAL conserva diagnosticos previos si el runtime inicia antes de aplicar la migracion", async () => {
+  const db = makeMemoryDb();
+  await createPixelPaySaleAttemptRecord(db, start);
+  const originalQuery = db.query.bind(db);
+  let missingColumnRaised = false;
+  db.query = async (query, params) => {
+    const sql = typeof query === "object" ? query.text : query;
+    if (!missingColumnRaised && sql.includes("provider_response_code")) {
+      missingColumnRaised = true;
+      throw Object.assign(new Error("column provider_response_code does not exist"), { code: "42703" });
+    }
+    return originalQuery(query, params);
+  };
+
+  assert.equal(await finalizePixelPaySaleAttempt(db, {
+    ...start, outcome: "payment_declined", providerResponseCode: "05",
+  }), true);
+  assert.equal(missingColumnRaised, true);
+  assert.equal(db.calls.length, 2);
+  assert.doesNotMatch(db.calls[1].sql, /provider_response_code/);
+  assert.equal(db.records[0].finalized_at, "2026-10-11T00:00:00Z");
 });
 
 test("errores locales conocidos se preservan; codigos desconocidos y textos arbitrarios se descartan", async () => {
@@ -297,6 +342,7 @@ test("FINAL excedido usa el timer real de pg 8.16.3 y destruye/retira la conexio
 test("migration privada define contrato, checks y allowlists identicas a JavaScript", async () => {
   const sql = (await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
   const evidenceSql = await readFile(new URL("../db/migrations/pixel/20261016010000_pixelpay_uncertain_observed_identifiers.sql", import.meta.url), "utf8");
+  const responseCodeSql = await readFile(new URL("../db/migrations/pixel/20261028010000_pixelpay_provider_response_code.sql", import.meta.url), "utf8");
   assert.match(sql, /CREATE TABLE IF NOT EXISTS app_private\.pixelpay_sale_attempts/);
   assert.match(sql, /payment_attempt_id uuid NOT NULL UNIQUE/);
   assert.match(sql, /REFERENCES public\.payment_intents\(id_intent\)\s+ON UPDATE CASCADE ON DELETE RESTRICT/);
@@ -327,4 +373,9 @@ test("migration privada define contrato, checks y allowlists identicas a JavaScr
   assert.match(evidenceSql, /no demuestra aprobacion ni identidad financiera confiable/);
   assert.match(evidenceSql, /REVOKE ALL ON TABLE app_private\.pixelpay_sale_attempts FROM PUBLIC, anon, authenticated, service_role/);
   assert.doesNotMatch(evidenceSql, /\bGRANT\b|SECURITY DEFINER|provider_session_id|referencia_externa/);
+  assert.match(responseCodeSql, /ADD COLUMN IF NOT EXISTS provider_response_code varchar\(16\)/);
+  assert.match(responseCodeSql, /provider_response_code ~ '\^\[A-Z0-9\]\[A-Z0-9\._:-\]\{0,15\}\$'/);
+  assert.match(responseCodeSql, /provider_response_code !~ '\^\[0-9\]\{13,19\}\$'/);
+  assert.match(responseCodeSql, /REVOKE ALL ON TABLE app_private\.pixelpay_sale_attempts FROM PUBLIC, anon, authenticated, service_role/);
+  assert.doesNotMatch(responseCodeSql, /\bGRANT\b|SECURITY DEFINER|response_reason/);
 });

@@ -223,6 +223,7 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
     responseApproved: true,
     responseIncomplete: false,
     responseCodePresent: true,
+    providerResponseCode: "00",
     hasPaymentUuid: true,
     hasTransactionId: true,
     hasPaymentHash: true,
@@ -620,6 +621,18 @@ test("SDK declined HTTP 402 es definitivo", async () => {
   assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED);
   assert.equal(result.approved, false);
   assert.equal(result.definitive, true);
+  assert.equal(result.diagnostics.providerResponseCode, null);
+});
+
+test("SDK HTTP 412 sin TransactionResult conserva HTTP y no inventa codigo financiero", async () => {
+  const fake = makeFakeSdk({
+    saleResponse: sdkResponse(412, { success: false, data: null, valid: false }),
+  });
+  const result = await makeProvider(fake).sale(saleInput);
+  assert.equal(result.statusCode, 412);
+  assert.equal(result.outcome, PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE);
+  assert.equal(result.diagnostics.providerResponseCode, null);
+  assert.equal(fake.calls.sale, 1);
 });
 
 test("SDK error contractual HTTP 422 es definitivo", async () => {
@@ -649,6 +662,7 @@ test("SDK timeout, network y respuesta invalida permanecen uncertain sin retry d
     assert.equal(result.paymentUuid, observedPaymentUuid);
     assert.equal(result.transactionId, "TX-UNCERTAIN-408");
     assert.equal(result.transactionReference, "REF-UNCERTAIN-408");
+    assert.equal(result.diagnostics.providerResponseCode, "00");
     assert.equal(fake.calls.sale, 1);
   });
 
@@ -725,6 +739,36 @@ test("diagnostico SDK distingue parse fallido sin exponer la excepcion", async (
   assert.equal(result.diagnostics.transactionResultParsed, false);
   assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(SECRET));
   assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(AUTH_HASH));
+});
+
+test("SDK conserva solo response_code de formato seguro y nunca response_reason", async (t) => {
+  for (const scenario of [
+    { name: "codigo alfanumerico oficial", responseCode: "05", expected: "05" },
+    { name: "codigo desconocido pero seguro", responseCode: "N7", expected: "N7" },
+    { name: "PAN de 16 digitos", responseCode: "4111111111111111", expected: null },
+    { name: "texto con espacios", responseCode: "DECLINED BY ISSUER", expected: null },
+    { name: "control incrustado", responseCode: "05\nsecret", expected: null },
+    { name: "demasiado largo", responseCode: "A".repeat(17), expected: null },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const fake = makeFakeSdk({
+        saleResponse: sdkResponse(402, {
+          success: false,
+          data: approvedData({
+            response_approved: false,
+            response_code: scenario.responseCode,
+            response_reason: `${SECRET} ${saleInput.card.number} ${saleInput.card.cvv}`,
+          }),
+        }),
+      });
+      const result = await makeProvider(fake).sale(saleInput);
+      assert.equal(result.diagnostics.providerResponseCode, scenario.expected);
+      assert.equal(JSON.stringify(result.diagnostics).includes("response_reason"), false);
+      assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(SECRET));
+      assert.doesNotMatch(JSON.stringify(result.diagnostics), /4111111111111111|999/);
+      assert.equal(fake.calls.sale, 1);
+    });
+  }
 });
 
 test("clasifica FailureResponse 520 sin conservar el mensaje del SDK", async (t) => {
@@ -843,7 +887,7 @@ test("diagnostico SDK identifica campos ausentes, montos y flags de respuesta", 
     {
       name: "response_incomplete true",
       data: { response_incomplete: true },
-      expected: { responseIncomplete: true },
+      expected: { responseIncomplete: true, providerResponseCode: "00" },
     },
   ]) {
     await t.test(scenario.name, async () => {
@@ -1035,6 +1079,7 @@ test("diagnostics contiene solo metadata y nunca valores sensibles ni payload cr
     "outcome",
     "paymentAttemptId",
     "paymentHashValid",
+    "providerResponseCode",
     "responseApproved",
     "responseCodePresent",
     "responseIncomplete",
