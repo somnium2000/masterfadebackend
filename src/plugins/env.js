@@ -91,16 +91,21 @@ async function envPlugin(app) {
   dotenv.config();
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
+  // AM: Administrative mode and disabled provider are a fail-closed configuration pair.
+  const adminDataEntryMode = parseRequiredBoolean(process.env.ADMIN_DATA_ENTRY_MODE, "ADMIN_DATA_ENTRY_MODE", false);
   const paymentProvider = String(process.env.PAYMENT_PROVIDER || "mock").trim().toLowerCase();
   const pixelPayEnv = String(process.env.PIXELPAY_ENV || "").trim().toLowerCase();
-  if (!["mock", "todopago", "pixelpay"].includes(paymentProvider)) {
-    throw new Error("PAYMENT_PROVIDER invalido. Usa mock, todopago o pixelpay.");
+  if (!["mock", "todopago", "pixelpay", "disabled"].includes(paymentProvider)) {
+    throw new Error("PAYMENT_PROVIDER invalido. Usa mock, todopago, pixelpay o disabled.");
+  }
+  if (adminDataEntryMode !== (paymentProvider === "disabled")) {
+    throw new Error("ADMIN_DATA_ENTRY_MODE=true requiere PAYMENT_PROVIDER=disabled y viceversa.");
   }
   const frontendUrl = readRequired("FRONTEND_URL");
   const jwtSecret = readRequired("JWT_SECRET", { minLength: 24 });
   const cookieSecret = readRequired("COOKIE_SECRET", { minLength: 24 });
   const csrfSecret = readRequired("CSRF_SECRET", { minLength: 24 });
-  const todoPago = resolveTodoPagoConfig(process.env, {
+  const todoPago = paymentProvider === "disabled" ? null : resolveTodoPagoConfig(process.env, {
     active: paymentProvider === "todopago",
     nodeEnv,
   });
@@ -151,6 +156,7 @@ async function envPlugin(app) {
 
   const config = {
     nodeEnv,
+    adminDataEntryMode,
     isProduction: isProdOrStaging,
     frontendUrl,
     jwtSecret,
@@ -176,7 +182,7 @@ async function envPlugin(app) {
       defaultValue: false,
     }),
     agendaSse: {
-      enabled: parseRequiredBoolean(process.env.AGENDA_SSE_ENABLED, "AGENDA_SSE_ENABLED", true),
+      enabled: adminDataEntryMode ? false : parseRequiredBoolean(process.env.AGENDA_SSE_ENABLED, "AGENDA_SSE_ENABLED", true),
       heartbeatMs: parseIntegerInRange(process.env.AGENDA_SSE_HEARTBEAT_MS, "AGENDA_SSE_HEARTBEAT_MS", {
         fallback: 20000,
         min: 10000,

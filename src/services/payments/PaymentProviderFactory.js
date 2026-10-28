@@ -1,3 +1,4 @@
+import { AppError } from "../../utils/errors.js";
 import { MockPaymentProvider } from "./MockPaymentProvider.js";
 import { TodoPagoPreprodSimulatedProvider } from "./TodoPagoPreprodSimulatedProvider.js";
 import { PixelPayDirectProvider } from "./PixelPayDirectProvider.js";
@@ -23,6 +24,10 @@ export class PaymentProviderFactory {
      * @returns {import('./PaymentProvider.js').PaymentProvider}
      */
     static create() {
+        // AM: Check before cache lookup: disabled mode never returns a previously initialized provider.
+        if (String(process.env.PAYMENT_PROVIDER || "").trim().toLowerCase() === "disabled" || String(process.env.ADMIN_DATA_ENTRY_MODE || "").trim().toLowerCase() === "true") {
+            throw new AppError(503, "Los pagos no están disponibles.", { code: "PAYMENTS_DISABLED" });
+        }
         if (PaymentProviderFactory._instance) {
             return PaymentProviderFactory._instance;
         }
