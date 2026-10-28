@@ -91,4 +91,3 @@ test("PostgreSQL 17: codigo publico, colisiones y aislamiento de reserva", { ski
   assert.ok(matches.includes(collision[0]) && matches.includes(collision[1]));
   assert.deepEqual(await findReservationGroupIds(pool, { code: collision[2], branchIds: [branch], barberId: crypto.randomUUID() }), []);
 });
-
