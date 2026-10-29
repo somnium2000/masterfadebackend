@@ -4110,6 +4110,12 @@ async function assertAccountDeletionAuthPreconditions(client, {
         ) AS roles_ready,
         NOT EXISTS (
           SELECT 1
+          FROM public.seguridad_sesiones ss, params p
+          WHERE ss.id_usuario = p.usuario_id
+            AND ss.estado = 'activa'
+        ) AS sessions_ready,
+        NOT EXISTS (
+          SELECT 1
           FROM public.app_protected_users apu, params p
           WHERE apu.id_usuario = p.usuario_id
             AND apu.activo IS TRUE
