@@ -6,6 +6,8 @@ Bases revisadas: backend `70ec425a8197927f57359c70fda43d28c8e29655`, frontend `a
 
 La version original requiere correccion antes del merge: su expansion recursiva genera 37 filas por grupo y el frontend publico acumula referencias de grupo e individuales. Se prepararon dos correcciones minimas, sin migraciones, cambios financieros ni despliegue.
 
+Cierre definitivo de equivalencia: PASS para reservas nuevas con grupo. El UUID de grupo valido define el unico codigo canonico; un codigo_cita divergente ya no lo sustituye. Historicas sin grupo valido conservan la evidencia explicita, y sin evidencia no se genera un codigo. La aprobacion de integracion/merge sigue pendiente y fuera de esta intervencion.
+
 ## Metodo reproducible
 
 PostgreSQL 17.9 aislado, Windows, AMD Ryzen 7 7730U (16 procesadores logicos). Una cita por grupo con UUID determinista md5; indice local de sucursal; ANALYZE despues de cargar cada volumen. No replica la distribucion ni el hardware de Supabase QA.
@@ -56,10 +58,16 @@ Expresion polinomica equivalente al hash int32 para UUID de 36 caracteres, con c
 
 - Publica pagada: el endpoint de estado devuelve id_grupo_cita; el correo calcula buildBookingShortCode(id_grupo_cita,5). El fallback publico y Administracion usan ese mismo grupo.
 - Autenticada y membresia: confirmar-sin-pago entrega codigo_cita del grupo y citas_confirmadas con codigos individuales. La interfaz anterior concatenaba ambos tipos: defecto de presentacion verificado con prueba que fallaba antes de corregirlo.
-- Correccion: priorizar codigo_cita explicito de nivel reserva; si falta, derivar del grupo antes de considerar listas individuales. No cambiar montos, confirmacion ni navegacion.
+- Correccion definitiva: con UUID de grupo valido, la referencia canonica SIEMPRE es buildBookingShortCode(id_grupo_cita,5), incluso si codigo_cita explicito es diferente. Solo sin grupo valido se conserva el codigo explicito historico antes de considerar listas individuales. No cambiar montos, confirmacion ni navegacion.
 - Multiples integrantes: una referencia de grupo, estados y acciones independientes por id_cita.
 - Historicas con grupo y contrato estandar: derivacion estable, independiente de fecha y estado. La integracion PostgreSQL devuelve citas completadas y confirmadas juntas.
-- Limite historico: no hay evidencia durable del texto mostrado en todas las sesiones antiguas. Una referencia explicita antigua distinta del hash o una referencia individual sin grupo se conserva en el cliente; no se puede prometer que sea localizable por la busqueda de grupos. No se reemplaza evidencia explicita de API por una suposicion. No se han agregado aliases historicos, persistencia ni migraciones sin autorizacion.
+- Limite historico: no hay evidencia durable del texto mostrado en todas las sesiones antiguas. Sin grupo valido, una referencia explicita antigua o individual se conserva; no se puede prometer que sea localizable por la busqueda de grupos. No se inventa un grupo ni se agregan aliases, persistencia o migraciones. Para reservas nuevas con grupo, el UUID prevalece sobre codigo_cita divergente conforme al contrato canonico aprobado.
+
+### Evidencia del cierre canonico
+
+Caso de regresion: grupo `11111111-2222-4333-8444-555555555555` -> `S64WZ`; API explicita `API01`/`OTRO1` no sustituye ese codigo. Dos pruebas de render fallaron antes del cambio y pasan despues. Render conjunto de confirmacion real y tarjeta administrativa real verifica ambas referencias `S64WZ` y ausencia de codigos individuales de los integrantes.
+
+Los helpers reales de correo pagado y de membresia se ejecutan en VM con transporte/DB de notificaciones simulados: asunto, texto y HTML usan S64WZ para padre e hijo, sin enviar mensajes. Sus funciones se leen directamente del codigo productivo; no se modifican los modulos de pagos. PostgreSQL 17 verifica que el algoritmo optimizado encuentra el grupo a partir de ese mismo codigo del correo. Casos sin grupo valido conservan el codigo historico, sin generar nuevas referencias.
 
 ## Seguridad y alcance contractual
 

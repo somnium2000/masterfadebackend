@@ -10,6 +10,7 @@ import test from "node:test";
 import pg from "pg";
 import Fastify from 'fastify';
 import adminCitasRoutes from '../src/routes/v1/admin/citas.js';
+import { loadReservationMailContracts } from './helpers/reservationMailContract.mjs';
 
 const RUN = process.env.RUN_ADMIN_RESERVATION_PG === "true";
 
@@ -68,13 +69,17 @@ test("PostgreSQL 17: codigo publico, colisiones y aislamiento de reserva", { ski
   assert.ok(Number((await pool.query("SHOW server_version_num")).rows[0].server_version_num) >= 170000);
   await pool.query("CREATE TABLE public.citas (id_cita uuid PRIMARY KEY, id_grupo_cita uuid, id_sucursal uuid, id_empleado_barbero uuid, deleted_at timestamptz, estado_cita_codigo text)");
   const branch = crypto.randomUUID(), otherBranch = crypto.randomUUID(), barber = crypto.randomUUID();
-  const groups = Array.from({ length: 100 }, () => crypto.randomUUID());
+  const groups = ['11111111-2222-4333-8444-555555555555', ...Array.from({ length: 99 }, () => crypto.randomUUID())];
   function publicCode(id) {
     let h = 0;
     for (const char of id.toUpperCase()) h = ((h << 5) - h + char.charCodeAt(0)) | 0;
     return (Math.abs(h) % (36 ** 5)).toString(36).toUpperCase().padStart(5, "0");
   }
   for (const id of groups) await pool.query("INSERT INTO public.citas VALUES ($1,$2,$3,$4,NULL,'completada')", [crypto.randomUUID(), id, branch, barber]);
+  const mailContracts = await loadReservationMailContracts();
+  const mailCode = mailContracts.buildBookingShortCode(groups[0], 5);
+  assert.equal(mailCode, 'S64WZ');
+  assert.ok((await findReservationGroupIds(pool, { code: mailCode, branchIds: [branch] })).includes(groups[0]));
   for (const group of groups) {
     const matches = await findReservationGroupIds(pool, { code: publicCode(group), branchIds: [branch], barberId: barber });
     assert.ok(matches.includes(group));
