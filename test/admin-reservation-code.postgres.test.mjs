@@ -8,6 +8,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import pg from "pg";
+import Fastify from 'fastify';
+import adminCitasRoutes from '../src/routes/v1/admin/citas.js';
 
 const RUN = process.env.RUN_ADMIN_RESERVATION_PG === "true";
 
@@ -90,4 +92,55 @@ test("PostgreSQL 17: codigo publico, colisiones y aislamiento de reserva", { ski
   const matches = await findReservationGroupIds(pool, { code: collision[2], branchIds: [branch] });
   assert.ok(matches.includes(collision[0]) && matches.includes(collision[1]));
   assert.deepEqual(await findReservationGroupIds(pool, { code: collision[2], branchIds: [branch], barberId: crypto.randomUUID() }), []);
+
+  await pool.query(`ALTER TABLE public.citas
+    ADD COLUMN orden_integrante int, ADD COLUMN alias_integrante text DEFAULT 'Integrante aislado',
+    ADD COLUMN id_persona_cliente uuid, ADD COLUMN id_cliente uuid,
+    ADD COLUMN inicio_at timestamptz DEFAULT now(), ADD COLUMN fin_at timestamptz DEFAULT now(),
+    ADD COLUMN atencion_iniciada_at timestamptz, ADD COLUMN atencion_finalizada_at timestamptz,
+    ADD COLUMN retraso_inicio_min int, ADD COLUMN duracion_total_min int, ADD COLUMN buffer_total_min int,
+    ADD COLUMN selection_type text, ADD COLUMN id_paquete uuid, ADD COLUMN total_pagar_hnl numeric,
+    ADD COLUMN moneda_codigo text, ADD COLUMN asignada_automaticamente boolean, ADD COLUMN notas text;
+    CREATE TABLE public.sucursales(id_sucursal uuid, nombre_sucursal text, deleted_at timestamptz, estado boolean);
+    CREATE TABLE public.personas(id_persona uuid, nombres text, apellidos text, telefono_principal text);
+    CREATE TABLE public.empleados(id_empleado uuid, id_persona uuid);
+    CREATE TABLE public.correos(id_correo uuid, id_persona uuid, direccion_correo text, deleted_at timestamptz, es_principal boolean, verificado boolean);
+    CREATE TABLE public.citas_detalles(id_cita_detalle uuid, id_cita uuid, id_servicio uuid);
+    CREATE TABLE public.servicios(id_servicio uuid, nombre_servicio text);
+    CREATE TABLE public.citas_holds(id_cita uuid, estado_hold_codigo text, expires_at timestamptz, created_at timestamptz);
+    CREATE TABLE public.payment_intents(id_cita uuid, estado_intent_codigo text, expires_at timestamptz, created_at timestamptz);
+    CREATE TABLE public.citas_reagendaciones(id_cita uuid, id_lote_reagendacion uuid, id_cita_causante uuid, retraso_min int, tipo_reagendacion_codigo text, created_at timestamptz, id_reagendacion uuid);`);
+  const person = crypto.randomUUID(), otherBarber = crypto.randomUUID();
+  await pool.query("INSERT INTO public.sucursales VALUES ($1,'Sucursal autorizada',NULL,true),($2,'Otra sucursal',NULL,true)", [branch, otherBranch]);
+  await pool.query("INSERT INTO public.personas VALUES ($1,'Persona','aislada','00000000')", [person]);
+  await pool.query("INSERT INTO public.empleados VALUES ($1,$3),($2,$3)", [barber, otherBarber, person]);
+  await pool.query("UPDATE public.citas SET id_persona_cliente=$1", [person]);
+  await pool.query(`INSERT INTO public.citas(id_cita,id_grupo_cita,id_sucursal,id_empleado_barbero,id_persona_cliente,estado_cita_codigo)
+    VALUES ($1,$3,$4,$6,$7,'completada'),($2,$3,$5,$6,$7,'completada'),($8,$3,$4,$9,$7,'confirmada')`,
+  [crypto.randomUUID(),crypto.randomUUID(),collision[0],branch,otherBranch,barber,person,crypto.randomUUID(),otherBarber]);
+  const snapshot = async () => (await pool.query("SELECT id_cita,estado_cita_codigo FROM public.citas ORDER BY id_cita")).rows;
+  const before = await snapshot();
+  for (const role of ['admin','barbero']) {
+    const app = Fastify();
+    app.decorate('db', { query(sql, params) {
+      assert.match(typeof sql === 'string' ? sql.trim() : sql.text.trim(), /^(SELECT|WITH)\b/i);
+      return pool.query(sql, params);
+    } });
+    app.decorate('requireRoles', () => async (request) => { request.claims = { roles:[role],branch_ids:[branch],empleado_id:barber }; });
+    await app.register(adminCitasRoutes, { prefix:'/v1/admin/citas' });
+    try {
+      const response = await app.inject({url:`/v1/admin/citas/reservas/buscar?codigo=${collision[2]}`});
+      assert.equal(response.statusCode,200,response.body);
+      const result=response.json().data.reservas;
+      assert.ok(result.some(group=>group.id_grupo_cita===collision[0]) && result.some(group=>group.id_grupo_cita===collision[1]));
+      for(const group of result) for(const cita of group.citas) {
+        assert.equal(cita.id_grupo_cita,group.id_grupo_cita);
+        assert.equal(cita.id_sucursal,branch);
+        if(role==='barbero') assert.equal(cita.id_empleado_barbero,barber);
+      }
+      assert.ok(result.flatMap(group=>group.citas).some(cita=>cita.estado_cita_codigo==='completada'));
+    } finally { await app.close(); }
+  }
+  assert.deepEqual(await snapshot(),before);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM public.payment_intents')).rows[0].n,0);
 });

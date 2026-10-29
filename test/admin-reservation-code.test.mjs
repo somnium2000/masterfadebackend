@@ -9,7 +9,7 @@ async function makeApp(roles = ['admin'], appointments = []) {
   const app = Fastify();
   app.decorate('db', { async query(sql) {
     if (sql.includes('FROM public.sucursales')) return { rows: [{ id_sucursal: branch }] };
-    if (sql.includes('WITH RECURSIVE')) return { rows: [...new Set(appointments.map((cita) => cita.id_grupo_cita))].map((id_grupo_cita) => ({ id_grupo_cita })) };
+    if (sql.includes('WITH scoped')) return { rows: [...new Set(appointments.map((cita) => cita.id_grupo_cita))].map((id_grupo_cita) => ({ id_grupo_cita })) };
     if (sql.includes('information_schema.columns')) return { rows: [] };
     if (sql.includes('FROM public.citas c')) {
       assert.match(sql, /c.id_grupo_cita = ANY/);
