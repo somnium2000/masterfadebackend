@@ -10,6 +10,7 @@ async function setup(t, options = {}) {
   const providerSecret = randomBytes(40).toString('hex');
   const authSessions = new Map(), appSessions = new Map(), calls = [];
   const other = randomUUID(), oldSid = randomUUID();
+  let internalUserProbeCount = 0;
   authSessions.set(oldSid, { user_id: USER, not_after: null });
   const sign = (overrides = {}, secret = providerSecret) => jwt.sign({ sub: USER, session_id: oldSid, ...overrides }, secret, overrides.exp === undefined ? { expiresIn: '1h' } : {});
   const oldToken = sign();
@@ -18,7 +19,23 @@ async function setup(t, options = {}) {
   const originalConnect = f.app.db.connect.bind(f.app.db);
   async function intercept(sql, params, fallback) {
     calls.push({ sql, params });
+    if (options.concurrentProvision && /SELECT\s+1\s+FROM public\.usuarios/.test(sql)) {
+      internalUserProbeCount++;
+      return internalUserProbeCount === 1 ? { rows: [], rowCount: 0 } : { rows: [{ exists: 1 }], rowCount: 1 };
+    }
     if (options.newSocial && /SELECT\s+1\s+FROM public\.usuarios/.test(sql)) return { rows: [] };
+    if (options.concurrentProvision && /SELECT\s+id_usuario\s+FROM public\.usuarios/.test(sql)) return { rows: [], rowCount: 0 };
+    if (options.concurrentProvision && /SELECT\s+id_rol\s+FROM public\.roles/.test(sql)) {
+      return { rows: [{ id_rol: randomUUID() }], rowCount: 1 };
+    }
+    if (options.concurrentProvision && /INSERT INTO public\.personas/.test(sql)) {
+      return { rows: [{ id_persona: randomUUID() }], rowCount: 1 };
+    }
+    if (options.concurrentProvision && /INSERT INTO public\.usuarios/.test(sql)) {
+      const conflict = new Error('synthetic concurrent user');
+      conflict.code = '23505'; conflict.constraint = 'usuarios_pkey';
+      throw conflict;
+    }
     if (sql.includes('WITH base_user') && options.roles) return { rows: [{ id_usuario: USER, roles: options.roles, branch_ids: [] }] };
     if (sql.includes('has_schema_privilege')) {
       if (options.permissionError) throw Error('private privilege diagnostic');
@@ -102,6 +119,36 @@ function rejected(response, f, before = 0) {
   assert.equal(cookie(response), undefined); assert.equal(f.stats().inserts, before);
   assert.doesNotMatch(response.body, /private|diagnostic|SELECT|auth\.sessions/);
 }
+const consentWrites = calls => calls.filter(({ sql }) =>
+  /UPDATE\s+public\.clientes/i.test(sql)
+  && /(?:acepta_terminos|consentimiento_marketing)/i.test(sql));
+
+for (const priorState of [
+  'marketing rechazado',
+  'marketing revocado',
+  'terminos no aceptados',
+  'consentimientos aceptados con fechas existentes',
+]) test(`exchange social conserva ${priorState} sin reescribir consentimientos`, async t => {
+  const f = await setup(t);
+  const response = await f.exchange();
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(consentWrites(f.calls), []);
+});
+
+test('confirmacion social de cuenta interna existente no reescribe consentimientos', async t => {
+  const f = await setup(t);
+  const response = await f.social(f.oldSid);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(consentWrites(f.calls), []);
+});
+
+test('carrera de aprovisionamiento que encuentra usuario concurrente no reescribe consentimientos', async t => {
+  const f = await setup(t, { concurrentProvision: true });
+  const response = await f.social(f.oldSid);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.ok(f.calls.some(({ sql }) => /INSERT INTO public\.usuarios/.test(sql)));
+  assert.deepEqual(consentWrites(f.calls), []);
+});
 
 test('P1: reset rechaza reexchange anterior; nuevo login y token legítimos conservan roles y otra identidad', async t => {
   const f = await setup(t);

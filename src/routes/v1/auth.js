@@ -503,41 +503,6 @@ async function insertClientWithConsents(client, params) {
   return insertLegacy.rows[0].id_cliente;
 }
 
-async function enforceExchangeClientConsents(client, authUserId) {
-  const safeAuthUserId = String(authUserId || "").trim();
-  if (!safeAuthUserId) return;
-
-  const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
-  if (hasConsentTimestampColumns) {
-    await client.query(
-      `
-        UPDATE public.clientes
-        SET
-          acepta_terminos = TRUE,
-          consentimiento_marketing = TRUE,
-          acepta_terminos_at = COALESCE(acepta_terminos_at, NOW()),
-          consentimiento_marketing_at = COALESCE(consentimiento_marketing_at, NOW())
-        WHERE id_usuario = $1::uuid
-          AND deleted_at IS NULL
-      `,
-      [safeAuthUserId]
-    );
-    return;
-  }
-
-  await client.query(
-    `
-      UPDATE public.clientes
-      SET
-        acepta_terminos = TRUE,
-        consentimiento_marketing = TRUE
-      WHERE id_usuario = $1::uuid
-        AND deleted_at IS NULL
-    `,
-    [safeAuthUserId]
-  );
-}
-
 function registerResetAttempt(emailKey) {
   const now = Date.now();
   let record = resetAttemptsByEmail.get(emailKey);
@@ -971,7 +936,6 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
     [authUserId]
   );
   if (existing.rowCount) {
-    await enforceExchangeClientConsents(app.db, authUserId);
     return { created: false, authUserId, email: null, fullName: null };
   }
 
@@ -1087,7 +1051,6 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
         );
 
         if (userNowExists.rowCount) {
-          await enforceExchangeClientConsents(app.db, authUserId);
           return { created: false, authUserId, email: null, fullName: null };
         }
       }
