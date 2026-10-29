@@ -174,7 +174,8 @@ for (const endpoint of endpoints) {
       "s.activo IS TRUE", "s.agendable IS TRUE", "s.visible_publico IS TRUE",
       "st.id_servicio = pd.id_servicio", "st.id_sucursal = eo.id_sucursal",
       "st.deleted_at IS NULL", "st.activo IS TRUE", "st.precio_hnl > 0",
-      "st.vigente_desde <= CURRENT_DATE", "st.vigente_hasta >= CURRENT_DATE",
+      "st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date",
+      "st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date",
       "'cantidad', pd.cantidad",
     ]) assert.ok(call.sql.includes(clause), `Clausula conservada: ${clause}`);
     assert.deepEqual(call.params, endpoint.search ? [A, "%corte%", null] : [A, null]);
@@ -365,3 +366,108 @@ test("busqueda: texto sin coincidencia no devuelve paquetes", async (t) => {
   const response = await app.inject(requestUrl(endpoints[1], A, null, "inexistente"));
   assert.deepEqual(response.json().data.paquetes, []);
 });
+
+const BUSINESS_BOUNDARY_NOW = "2026-10-30T02:00:00Z";
+const UTC_SESSION_DATE = "2026-10-30";
+const TEGUCIGALPA_DATE = "2026-10-29";
+
+function sqlEffectiveDate(sql) {
+  // Simula la semantica de PostgreSQL en una sesion UTC para el instante fijo.
+  // CURRENT_DATE usa la fecha de sesion; AT TIME ZONE usa la fecha empresarial.
+  return sql.includes("AT TIME ZONE 'America/Tegucigalpa'") ? TEGUCIGALPA_DATE : UTC_SESSION_DATE;
+}
+
+function boundaryTariffEligible(sql, { vigente_desde, vigente_hasta = null }) {
+  const businessDate = sqlEffectiveDate(sql);
+  return vigente_desde <= businessDate && (!vigente_hasta || vigente_hasta >= businessDate);
+}
+
+function boundaryService(id, overrides = {}) {
+  return {
+    id_servicio: id,
+    nombre_servicio: `Servicio ${id.slice(0, 4)}`,
+    descripcion: null,
+    duracion_min: 30,
+    buffer_min: 5,
+    precio_hnl: 200,
+    grupo_catalogo: "barberia",
+    activo: true,
+    agendable: true,
+    servicio_informativo: false,
+    orden_visual: 10,
+    vigente_desde: TEGUCIGALPA_DATE,
+    vigente_hasta: null,
+    ...overrides,
+  };
+}
+
+async function buildBoundaryApp(t, tariffRows) {
+  const app = Fastify();
+  app.decorate("db", {
+    query: async (sql) => {
+      const text = clean(sql);
+      assert.doesNotMatch(text, /\b(?:INSERT|UPDATE|DELETE|COMMIT|ROLLBACK)\b/i);
+      if (text.includes("FROM public.membership_plans mp")) return { rows: [], rowCount: 0 };
+      const eligible = tariffRows.filter((row) => boundaryTariffEligible(text, row));
+      if (text.includes("FROM public.paquetes p")) {
+        const rows = eligible.length === tariffRows.length ? [{
+          id_paquete: P,
+          nombre_paquete: "Paquete limite",
+          descripcion: null,
+          precio_hnl: 500,
+          orden_visual: 10,
+          items: eligible.map((row) => ({ id_servicio: row.id_servicio, nombre_servicio: row.nombre_servicio, cantidad: 1 })),
+        }] : [];
+        return { rows, rowCount: rows.length };
+      }
+      return { rows: eligible, rowCount: eligible.length };
+    },
+  });
+  await app.register(routes, { prefix: "/v1/public/catalog" });
+  await app.ready();
+  t.after(() => app.close());
+  return app;
+}
+
+test("vigencias: sesion UTC conserva la fecha empresarial de Tegucigalpa en servicios globales, por sucursal y busqueda", async (t) => {
+  assert.equal(new Intl.DateTimeFormat("en-CA", { timeZone: "UTC" }).format(new Date(BUSINESS_BOUNDARY_NOW)), UTC_SESSION_DATE);
+  assert.equal(new Intl.DateTimeFormat("en-CA", { timeZone: "America/Tegucigalpa" }).format(new Date(BUSINESS_BOUNDARY_NOW)), TEGUCIGALPA_DATE);
+  const rows = [
+    boundaryService("51111111-1111-4111-8111-111111111111", { vigente_desde: "2026-10-30" }),
+    boundaryService("52222222-2222-4222-8222-222222222222", { vigente_hasta: "2026-10-29" }),
+    boundaryService("53333333-3333-4333-8333-333333333333", { vigente_hasta: "2026-10-28" }),
+    boundaryService("54444444-4444-4444-8444-444444444444"),
+  ];
+  const app = await buildBoundaryApp(t, rows);
+  const expected = [rows[1].id_servicio, rows[3].id_servicio];
+  for (const url of [
+    "/v1/public/catalog/servicios",
+    `/v1/public/catalog/servicios?id_sucursal=${A}`,
+    `/v1/public/catalog/busqueda?q=servicio&id_sucursal=${A}`,
+  ]) {
+    const response = await app.inject({ method: "GET", url });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().data.servicios.map((row) => row.id_servicio), expected);
+  }
+});
+
+for (const [name, dates, visible] of [
+  ["inicio hoy", { vigente_desde: "2026-10-29" }, true],
+  ["inicio manana", { vigente_desde: "2026-10-30" }, false],
+  ["finaliza hoy", { vigente_desde: "2026-10-01", vigente_hasta: "2026-10-29" }, true],
+  ["finalizo ayer", { vigente_desde: "2026-10-01", vigente_hasta: "2026-10-28" }, false],
+  ["sin fecha final", { vigente_desde: "2026-10-01", vigente_hasta: null }, true],
+]) {
+  test(`vigencias: paquete ${name} coincide entre listado y busqueda`, async (t) => {
+    const row = boundaryService("55555555-5555-4555-8555-555555555555", dates);
+    const app = await buildBoundaryApp(t, [row]);
+    for (const url of [
+      `/v1/public/catalog/paquetes?id_sucursal=${A}`,
+      `/v1/public/catalog/busqueda?q=paquete&id_sucursal=${A}`,
+    ]) {
+      const response = await app.inject({ method: "GET", url });
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().data.paquetes.length > 0, visible);
+    }
+  });
+}

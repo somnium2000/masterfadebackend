@@ -197,8 +197,8 @@ const PUBLIC_SERVICES_SQL = `
         ($2::uuid IS NULL AND st.id_empleado IS NULL)
         OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
       )
-      AND st.vigente_desde <= CURRENT_DATE
-      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+      AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
       AND st.precio_hnl > 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
@@ -358,8 +358,8 @@ const PUBLIC_PACKAGES_SQL = `
               ($2::uuid IS NULL AND st.id_empleado IS NULL)
               OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
             )
-            AND st.vigente_desde <= CURRENT_DATE
-            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+            AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
             AND st.precio_hnl > 0
           ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
           LIMIT 1
@@ -392,8 +392,8 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
         ($2::uuid IS NULL AND st.id_empleado IS NULL)
         OR ($2::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $2::uuid))
       )
-      AND st.vigente_desde <= CURRENT_DATE
-      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+      AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+      AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
       AND st.precio_hnl > 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
@@ -552,8 +552,8 @@ const PUBLIC_PACKAGES_SEARCH_SQL = `
               ($3::uuid IS NULL AND st.id_empleado IS NULL)
               OR ($3::uuid IS NOT NULL AND (st.id_empleado IS NULL OR st.id_empleado = $3::uuid))
             )
-            AND st.vigente_desde <= CURRENT_DATE
-            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
+            AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+            AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
             AND st.precio_hnl > 0
           ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
           LIMIT 1
