@@ -11,6 +11,7 @@ async function setup(t, options = {}) {
   const authSessions = new Map(), appSessions = new Map(), calls = [];
   const other = randomUUID(), oldSid = randomUUID();
   let internalUserProbeCount = 0;
+  let provisioned = false;
   authSessions.set(oldSid, { user_id: USER, not_after: null });
   const sign = (overrides = {}, secret = providerSecret) => jwt.sign({ sub: USER, session_id: oldSid, ...overrides }, secret, overrides.exp === undefined ? { expiresIn: '1h' } : {});
   const oldToken = sign();
@@ -19,11 +20,36 @@ async function setup(t, options = {}) {
   const originalConnect = f.app.db.connect.bind(f.app.db);
   async function intercept(sql, params, fallback) {
     calls.push({ sql, params });
+    if (options.newProvision && /SELECT\s+1\s+FROM public\.usuarios/.test(sql)) {
+      return provisioned ? { rows: [{ exists: 1 }], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
     if (options.concurrentProvision && /SELECT\s+1\s+FROM public\.usuarios/.test(sql)) {
       internalUserProbeCount++;
       return internalUserProbeCount === 1 ? { rows: [], rowCount: 0 } : { rows: [{ exists: 1 }], rowCount: 1 };
     }
     if (options.newSocial && /SELECT\s+1\s+FROM public\.usuarios/.test(sql)) return { rows: [] };
+    if (options.existingByEmail && /FROM public\.correos c\s+JOIN public\.usuarios/.test(sql)) {
+      return { rows: [{ id_usuario: USER }], rowCount: 1 };
+    }
+    if (options.newProvision && /SELECT\s+id_usuario\s+FROM public\.usuarios/.test(sql)) {
+      return provisioned ? { rows: [{ id_usuario: USER }], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
+    if (options.newProvision && /SELECT\s+id_rol\s+FROM public\.roles/.test(sql)) {
+      return { rows: [{ id_rol: randomUUID() }], rowCount: 1 };
+    }
+    if (options.newProvision && /INSERT INTO public\.personas/.test(sql)) {
+      return { rows: [{ id_persona: randomUUID() }], rowCount: 1 };
+    }
+    if (options.newProvision && /INSERT INTO public\.usuarios/.test(sql)) {
+      provisioned = true;
+      return { rows: [], rowCount: 1 };
+    }
+    if (options.newProvision && /FROM information_schema\.columns/.test(sql)) {
+      return { rows: [{ column_name: 'acepta_terminos_at' }, { column_name: 'consentimiento_marketing_at' }], rowCount: 2 };
+    }
+    if (options.newProvision && /INSERT INTO public\.clientes/.test(sql)) {
+      return { rows: [{ id_cliente: randomUUID() }], rowCount: 1 };
+    }
     if (options.concurrentProvision && /SELECT\s+id_usuario\s+FROM public\.usuarios/.test(sql)) return { rows: [], rowCount: 0 };
     if (options.concurrentProvision && /SELECT\s+id_rol\s+FROM public\.roles/.test(sql)) {
       return { rows: [{ id_rol: randomUUID() }], rowCount: 1 };
@@ -107,7 +133,7 @@ async function setup(t, options = {}) {
   const exchange = token => f.app.inject({ method: 'POST', url: '/v1/auth/exchange', payload: { supabase_token: token || oldToken } });
   const login = password => f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { identifier: 'qa02i@example.test', contrasena: password } });
   return { ...f, authSessions, appSessions, other, oldSid, oldToken, sign, calls, exchange, login, stats: () => ({ inserts, providerCalls }),
-    social: sessionId => f.app.inject({ method: 'POST', url: '/v1/auth/social/confirm', payload: { social_confirm_token: jwt.sign({ sub: USER, email: 'qa02i@example.test', token_type: 'social_confirm', session_id: sessionId }, process.env.JWT_SECRET, { issuer: 'masterfade-api', audience: 'masterfade-app', expiresIn: '30m' }) } }) };
+    social: (sessionId, decisions = {}) => f.app.inject({ method: 'POST', url: '/v1/auth/social/confirm', payload: { social_confirm_token: jwt.sign({ sub: USER, email: 'qa02i@example.test', token_type: 'social_confirm', session_id: sessionId }, process.env.JWT_SECRET, { issuer: 'masterfade-api', audience: 'masterfade-app', expiresIn: '30m' }), ...decisions } }) };
 }
 function cookie(response) {
   const values = response.headers['set-cookie'];
@@ -144,9 +170,61 @@ test('confirmacion social de cuenta interna existente no reescribe consentimient
 
 test('carrera de aprovisionamiento que encuentra usuario concurrente no reescribe consentimientos', async t => {
   const f = await setup(t, { concurrentProvision: true });
-  const response = await f.social(f.oldSid);
+  const response = await f.social(f.oldSid, { acepta_terminos: true, consentimiento_marketing: false });
   assert.equal(response.statusCode, 200, response.body);
   assert.ok(f.calls.some(({ sql }) => /INSERT INTO public\.usuarios/.test(sql)));
+  assert.deepEqual(consentWrites(f.calls), []);
+});
+
+test('alta social nueva sin decisiones no crea perfil ni sesion', async t => {
+  const f = await setup(t, { newProvision: true });
+  const response = await f.social(f.oldSid);
+  assert.equal(response.statusCode, 400, response.body);
+  assert.equal(response.json().error.code, 'AUTH_SOCIAL_CONSENT_REQUIRED');
+  assert.equal(f.calls.some(({ sql }) => /INSERT INTO public\.(?:personas|usuarios|clientes)/.test(sql)), false);
+  assert.equal(cookie(response), undefined);
+});
+
+test('alta social nueva exige terminos y conserva marketing rechazado sin fecha', async t => {
+  const f = await setup(t, { newProvision: true });
+  const rejected = await f.social(f.oldSid, { acepta_terminos: false, consentimiento_marketing: true });
+  assert.equal(rejected.statusCode, 400, rejected.body);
+  assert.equal(f.calls.some(({ sql }) => /INSERT INTO public\.(?:personas|usuarios|clientes)/.test(sql)), false);
+  const accepted = await f.social(f.oldSid, { acepta_terminos: true, consentimiento_marketing: false });
+  assert.equal(accepted.statusCode, 200, accepted.body);
+  const insert = f.calls.find(({ sql }) => /INSERT INTO public\.clientes/.test(sql));
+  assert.equal(insert.params[3], false);
+  assert.equal(insert.params[4], true);
+  assert.equal(insert.params[5], null);
+  assert.ok(insert.params[6]);
+});
+
+test('alta social nueva guarda marketing y ambas fechas solo tras decision expresa', async t => {
+  const f = await setup(t, { newProvision: true });
+  const response = await f.social(f.oldSid, { acepta_terminos: true, consentimiento_marketing: true });
+  assert.equal(response.statusCode, 200, response.body);
+  const insert = f.calls.find(({ sql }) => /INSERT INTO public\.clientes/.test(sql));
+  assert.equal(insert.params[3], true);
+  assert.equal(insert.params[4], true);
+  assert.ok(insert.params[5]);
+  assert.ok(insert.params[6]);
+});
+
+test('cuenta existente por correo verificado entra sin decisiones ni reescrituras', async t => {
+  const f = await setup(t, { newSocial: true, existingByEmail: true });
+  const response = await f.social(f.oldSid);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(f.calls.some(({ sql }) => /INSERT INTO public\.(?:personas|usuarios|clientes)/.test(sql)), false);
+  assert.deepEqual(consentWrites(f.calls), []);
+});
+
+test('token valido reutilizado despues del alta no duplica perfil ni consentimiento', async t => {
+  const f = await setup(t, { newProvision: true });
+  const first = await f.social(f.oldSid, { acepta_terminos: true, consentimiento_marketing: false });
+  assert.equal(first.statusCode, 200, first.body);
+  const second = await f.social(f.oldSid, { acepta_terminos: true, consentimiento_marketing: true });
+  assert.equal(second.statusCode, 200, second.body);
+  assert.equal(f.calls.filter(({ sql }) => /INSERT INTO public\.clientes/.test(sql)).length, 1);
   assert.deepEqual(consentWrites(f.calls), []);
 });
 

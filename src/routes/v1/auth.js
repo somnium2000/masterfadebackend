@@ -55,6 +55,8 @@ const socialConfirmBodySchema = {
   type: "object",
   properties: {
     social_confirm_token: { type: "string", minLength: 16 },
+    acepta_terminos: { type: "boolean" },
+    consentimiento_marketing: { type: "boolean", default: false },
   },
   required: ["social_confirm_token"],
   additionalProperties: false,
@@ -915,7 +917,7 @@ async function findActiveInternalUserByConfirmedEmail(db, email) {
   return existing.rows?.[0]?.id_usuario || null;
 }
 
-async function ensureExchangeInternalUser(app, supabaseUser) {
+async function ensureExchangeInternalUser(app, supabaseUser, consent = null) {
   const authUserId = String(supabaseUser?.id || "").trim();
   if (!authUserId) {
     throw {
@@ -949,6 +951,15 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
   }
 
   const { nombres, apellidos } = buildSocialPersonaNames(supabaseUser);
+  if (consent?.aceptaTerminos !== true) {
+    throw {
+      statusCode: 400,
+      message: "Debes aceptar terminos y condiciones para crear la cuenta.",
+      code: "AUTH_SOCIAL_CONSENT_REQUIRED",
+    };
+  }
+  const consentimientoMarketing = consent?.consentimientoMarketing === true;
+  const aceptaTerminosAt = new Date().toISOString();
   const client = await app.db.connect();
   let transactionStarted = false;
 
@@ -1009,10 +1020,10 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
       idPersona,
       authUserId,
       branchId: null,
-      consentimientoMarketing: true,
+      consentimientoMarketing,
       aceptaTerminos: true,
-      aceptaTerminosAt: new Date().toISOString(),
-      consentimientoMarketingAt: new Date().toISOString(),
+      aceptaTerminosAt,
+      consentimientoMarketingAt: consentimientoMarketing ? aceptaTerminosAt : null,
     });
 
     await client.query("COMMIT");
@@ -1495,7 +1506,10 @@ export default async function authRoutes(app) {
               "Confirmacion social resuelta contra usuario interno existente por correo verificado"
             );
           } else {
-            provision = await ensureExchangeInternalUser(app, supabaseUser);
+            provision = await ensureExchangeInternalUser(app, supabaseUser, {
+              aceptaTerminos: request.body?.acepta_terminos === true,
+              consentimientoMarketing: request.body?.consentimiento_marketing === true,
+            });
           }
         }
 
