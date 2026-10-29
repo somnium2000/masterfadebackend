@@ -182,6 +182,7 @@ export default async function adminPointsRoutes(app) {
         const data = await searchActiveClientesForAdminPoints(app, {
           q: request.query?.q,
           limit: request.query?.limit,
+          claims: request.claims,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
@@ -212,7 +213,10 @@ export default async function adminPointsRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const data = await getClientePointsSummary(app, request.params.id_cliente, { historyLimit: 20 });
+        const data = await getClientePointsSummary(app, request.params.id_cliente, {
+          historyLimit: 20,
+          claims: request.claims,
+        });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo obtener el resumen del cliente", "ADMIN_POINTS_SUMMARY_ERROR");
@@ -249,6 +253,7 @@ export default async function adminPointsRoutes(app) {
           puntos: request.body?.puntos,
           motivo: request.body?.motivo,
           usuarioAdmin: request.claims?.user,
+          claims: request.claims,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {

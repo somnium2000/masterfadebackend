@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { AppError } from "../utils/errors.js";
-import { assertUuid } from "./agendaService.js";
+import { assertUuid, resolveBranchIdsForClaims } from "./agendaService.js";
 
 const DEFAULT_PUNTOS_PARA_PREMIO = 10;
 const HISTORIAL_DEFAULT_LIMIT = 20;
@@ -643,7 +643,35 @@ function assertAjusteAccion(value) {
   return action;
 }
 
-export async function searchActiveClientesForAdminPoints(app, { q, limit } = {}) {
+async function resolveAdminPointsScope(app, claims) {
+  if (!claims || typeof claims !== "object") return null;
+  const branchIds = await resolveBranchIdsForClaims(app, claims);
+  const isSuperAdmin = Array.isArray(claims?.roles) && claims.roles.includes("super_admin");
+  return { branchIds, isSuperAdmin };
+}
+
+async function assertClienteInAdminPointsScope(client, idCliente, scope) {
+  if (!scope || scope.isSuperAdmin) return;
+  const { rows } = await client.query(
+    `
+      SELECT c.id_cliente
+      FROM public.clientes c
+      WHERE c.id_cliente = $1::uuid
+        AND c.deleted_at IS NULL
+        AND COALESCE(c.estado, TRUE) IS TRUE
+        AND c.id_sucursal_origen = ANY($2::uuid[])
+      LIMIT 1
+    `,
+    [idCliente, scope.branchIds]
+  );
+  if (!rows[0]) {
+    throw new AppError(403, "El cliente no pertenece al alcance autorizado", {
+      code: "POINTS_CLIENT_BRANCH_FORBIDDEN",
+    });
+  }
+}
+
+export async function searchActiveClientesForAdminPoints(app, { q, limit, claims } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
   }
@@ -663,6 +691,7 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit } = {})
   const queryLower = query.toLowerCase();
   const containsPattern = `%${queryLower}%`;
   const startsWithPattern = `${queryLower}%`;
+  const scope = await resolveAdminPointsScope(app, claims);
 
   const { rows } = await app.db.query(
     `
@@ -693,6 +722,7 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit } = {})
         AND c.id_usuario IS NOT NULL
         AND COALESCE(u.estado, TRUE) IS TRUE
         AND COALESCE(u.estado_acceso, 'pendiente_password') NOT IN ('bloqueado', 'inactivo')
+        AND ($4::boolean IS TRUE OR c.id_sucursal_origen = ANY($3::uuid[]))
         AND (
           LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $1::text
           OR LOWER(COALESCE(p.telefono_principal, '')) LIKE $1::text
@@ -708,9 +738,9 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit } = {})
         END,
         LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) ASC,
         c.id_cliente ASC
-      LIMIT $3::int
+      LIMIT $5::int
     `,
-    [containsPattern, startsWithPattern, safeLimit]
+    [containsPattern, startsWithPattern, scope?.branchIds || [], scope?.isSuperAdmin ?? true, safeLimit]
   );
 
   return {
@@ -1197,14 +1227,19 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
   };
 }
 
-export async function getClientePointsSummary(app, idCliente, { historyLimit = HISTORIAL_DEFAULT_LIMIT } = {}) {
+export async function getClientePointsSummary(app, idCliente, {
+  historyLimit = HISTORIAL_DEFAULT_LIMIT,
+  claims,
+} = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
   }
 
   const safeClienteId = assertUuid(idCliente, "id_cliente");
+  const scope = await resolveAdminPointsScope(app, claims);
   const client = await app.db.connect();
   try {
+    await assertClienteInAdminPointsScope(client, safeClienteId, scope);
     await materializeCyclesIfAvailable(client, safeClienteId);
     const cliente = await ensureClienteActivo(client, safeClienteId, { requireRegisteredUser: false });
     const agregados = await getAgregadosPuntos(client, safeClienteId);
@@ -1315,6 +1350,7 @@ export async function addManualPointsAdjustment(app, {
   puntos,
   motivo,
   usuarioAdmin,
+  claims,
 } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
@@ -1325,11 +1361,13 @@ export async function addManualPointsAdjustment(app, {
   const safePuntos = assertPositiveIntegerPoints(puntos);
   const safeMotivo = assertMotivoObligatorio(motivo);
   const adminUserId = assertAdminUserId(usuarioAdmin);
+  const scope = await resolveAdminPointsScope(app, claims);
   const dbClient = await app.db.connect();
 
   try {
     await dbClient.query("BEGIN");
     await lockClientePointsScope(dbClient, safeClienteId);
+    await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
     const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: true });
     await ensureClienteHasActiveAccessUser(dbClient, cliente.id_usuario, safeClienteId);
     const adjustmentTypes = await resolveManualAdjustmentTypes(dbClient);
