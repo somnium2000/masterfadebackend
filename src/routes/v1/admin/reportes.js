@@ -314,9 +314,42 @@ function appendCsvSection(lines, title, columns, rows) {
   lines.push("");
 }
 
+const SPREADSHEET_FORMULA_CHARACTERS = new Set(["=", "+", "-", "@", "\uff1d", "\uff0b", "\uff0d", "\u2212", "\uff20"]);
+const SPREADSHEET_NUMERIC_VALUE = /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?$/i;
+
+function isSpreadsheetPrefixCharacter(character) {
+  const codePoint = character.codePointAt(0);
+  return codePoint <= 0x20
+    || (codePoint >= 0x7f && codePoint <= 0x9f)
+    || [0xa0, 0x1680, 0x180e, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff].includes(codePoint)
+    || (codePoint >= 0x2000 && codePoint <= 0x200f)
+    || (codePoint >= 0x2060 && codePoint <= 0x206f);
+}
+
+function hasSpreadsheetFormulaPrefix(value) {
+  for (const character of value) {
+    if (isSpreadsheetPrefixCharacter(character)) continue;
+    return SPREADSHEET_FORMULA_CHARACTERS.has(character);
+  }
+  return false;
+}
+
+function isSpreadsheetNumericValue(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "bigint") return true;
+  if (typeof value !== "string" || /[\t\r\n]/.test(value)) return false;
+  return SPREADSHEET_NUMERIC_VALUE.test(value.trim());
+}
+
+function neutralizeSpreadsheetCell(value) {
+  if (value === null || value === undefined || isSpreadsheetNumericValue(value)) return value;
+  const normalized = String(value);
+  return hasSpreadsheetFormulaPrefix(normalized) ? `'${normalized}` : normalized;
+}
+
 function csvEscape(value) {
   if (value === null || value === undefined) return "";
-  const normalized = String(value);
+  const normalized = String(neutralizeSpreadsheetCell(value));
   if (/["\r\n,]/.test(normalized)) {
     return `"${normalized.replace(/"/g, "\"\"")}"`;
   }
@@ -329,7 +362,11 @@ function createHtmlTable(title, columns, rows) {
     ? rows
         .map(
           (row) =>
-            `<tr>${columns.map((column) => `<td>${escapeHtml(row?.[column] ?? "")}</td>`).join("")}</tr>`
+            `<tr>${columns.map((column) => {
+              const value = row?.[column] ?? "";
+              const textStyle = isSpreadsheetNumericValue(value) ? "" : ` style="mso-number-format:'\\@';"`;
+              return `<td${textStyle}>${escapeHtml(neutralizeSpreadsheetCell(value))}</td>`;
+            }).join("")}</tr>`
         )
         .join("")
     : `<tr><td colspan="${columns.length}">sin datos</td></tr>`;

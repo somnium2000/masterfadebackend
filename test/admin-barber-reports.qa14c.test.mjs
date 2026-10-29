@@ -7,7 +7,7 @@ const B = '22222222-2222-4222-8222-222222222222';
 const BARBER = '33333333-3333-4333-8333-333333333333';
 const UNKNOWN = '44444444-4444-4444-8444-444444444444';
 const range = `fecha_desde=2026-10-01&fecha_hasta=2026-10-20&id_sucursal=${A}&id_barbero=${BARBER}&commission_rate=10`;
-async function setup(t, { branch = A, empty = false } = {}) {
+async function setup(t, { branch = A, empty = false, barberName = 'Barbero sintético', income = '150.00' } = {}) {
   const calls = [];
   let releases = 0;
   const query = async (sql, params = []) => {
@@ -15,14 +15,14 @@ async function setup(t, { branch = A, empty = false } = {}) {
     if (/SELECT id_sucursal\s+FROM public\.sucursales/.test(sql)) return { rows: [{ id_sucursal: A }, { id_sucursal: B }] };
     if (sql.includes('WHERE e.id_empleado = $1')) {
       assert.deepEqual(params[1], [A, B]);
-      return { rows: params[0] === BARBER ? [{ id_empleado: BARBER, id_sucursal: branch, nombre_barbero: 'Barbero sintético' }] : [] };
+      return { rows: params[0] === BARBER ? [{ id_empleado: BARBER, id_sucursal: branch, nombre_barbero: barberName }] : [] };
     }
     if (empty) return { rows: [] };
     if (sql.includes('GROUP BY c.id_empleado_barbero') && sql.includes('AS servicios_realizados')) {
-      return { rows: [{ id_empleado: BARBER, nombre_barbero: 'Barbero sintético', servicios_realizados: 3, citas_completadas: 2, no_show: 1 }] };
+      return { rows: [{ id_empleado: BARBER, nombre_barbero: barberName, servicios_realizados: 3, citas_completadas: 2, no_show: 1 }] };
     }
     if (sql.includes('GROUP BY c.id_empleado_barbero') && sql.includes('AS ingresos_hnl')) {
-      return { rows: [{ id_empleado: BARBER, nombre_barbero: 'Barbero sintético', ingresos_hnl: '150.00', citas_pagadas: 2 }] };
+      return { rows: [{ id_empleado: BARBER, nombre_barbero: barberName, ingresos_hnl: income, citas_pagadas: 2 }] };
     }
     return { rows: [] };
   };
@@ -74,4 +74,57 @@ test('sin movimientos conserva un resumen vacío', async (t) => {
   const response = await app.inject(`/reportes/dashboard?${range}`);
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.json().data.productividad_barberos.resumen, []);
+});
+
+const formulaPayloads = [
+  '=1+1',
+  '+1+1',
+  '-1+1',
+  '@SUM(1,1)',
+  '=HYPERLINK("https://invalid.example")',
+  '  =1+1',
+  '\t=1+1',
+  '\n=1+1',
+  '\ufeff=1+1',
+  '\u200b\uff1d1+1',
+  '  \t\n@SUM("a,b";1)',
+];
+
+function escapeExpectedCsv(value) {
+  return String(value).replace(/"/g, '""');
+}
+
+function escapeExpectedHtml(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+for (const exportType of ['productividad', 'resumen']) {
+  test(`csv ${exportType} neutraliza fórmulas y conserva delimitadores`, async (t) => {
+    for (const payload of formulaPayloads) {
+      const { app } = await setup(t, { barberName: payload });
+      const response = await app.inject(`/reportes/export/csv?${range}&export_type=${exportType}`);
+      assert.equal(response.statusCode, 200);
+      assert.ok(response.body.includes(`'${escapeExpectedCsv(payload)}`), payload);
+    }
+  });
+
+  test(`excel ${exportType} neutraliza fórmulas y fuerza texto`, async (t) => {
+    for (const payload of formulaPayloads) {
+      const { app } = await setup(t, { barberName: payload });
+      const response = await app.inject(`/reportes/export/excel?${range}&export_type=${exportType}`);
+      assert.equal(response.statusCode, 200);
+      assert.ok(response.body.includes(`&#39;${escapeExpectedHtml(payload)}`), payload);
+      assert.match(response.body, /mso-number-format:'\\@'/);
+    }
+  });
+}
+
+test('CSV y Excel conservan nombres, fechas y montos negativos legítimos', async (t) => {
+  const { app } = await setup(t, { income: '-150.25' });
+  const csv = await app.inject(`/reportes/export/csv?${range}&export_type=productividad`);
+  const excel = await app.inject(`/reportes/export/excel?${range}&export_type=productividad`);
+  assert.equal(csv.statusCode, 200); assert.equal(excel.statusCode, 200);
+  assert.match(csv.body, /Barbero sintético/); assert.match(csv.body, /2026-10-01/);
+  assert.match(csv.body, /,-150\.25,-15\.02/); assert.doesNotMatch(csv.body, /,'-150\.25/);
+  assert.match(excel.body, /<td>-150\.25<\/td><td>-15\.02<\/td>/);
 });
