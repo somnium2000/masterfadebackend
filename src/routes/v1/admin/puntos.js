@@ -11,6 +11,7 @@ import {
 } from "../../../services/masterPuntosService.js";
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const GLOBAL_REWARDS_WRITE_ROLES = ["super_admin"];
 const requestIdSchema = { type: "string" };
 
 const idClienteParamSchema = {
@@ -109,7 +110,7 @@ export default async function adminPointsRoutes(app) {
   app.patch(
     "/regalias",
     {
-      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(GLOBAL_REWARDS_WRITE_ROLES),
       schema: {
         body: regaliasBodySchema,
         response: {
@@ -128,7 +129,7 @@ export default async function adminPointsRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const data = await updateMasterPuntosRewardServicesConfig(app, request.body || {});
+        const data = await updateMasterPuntosRewardServicesConfig(app, request.claims, request.body || {});
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo guardar la configuracion de regalias", "ADMIN_POINTS_REWARDS_SAVE_ERROR");

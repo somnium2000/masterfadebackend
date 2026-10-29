@@ -724,7 +724,13 @@ export async function getMasterPuntosRewardServicesConfig(app) {
   }
 }
 
-export async function updateMasterPuntosRewardServicesConfig(app, payload = {}) {
+export async function updateMasterPuntosRewardServicesConfig(app, claims, payload = {}) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  if (!roles.includes("super_admin")) {
+    throw new AppError(403, "Solo super_admin puede actualizar la regla global", {
+      code: "MASTERPUNTOS_GLOBAL_RULE_FORBIDDEN",
+    });
+  }
   const noMembershipIds = parseUuidArray(payload?.[REWARD_CONDITION_NO_MEMBERSHIP], REWARD_CONDITION_NO_MEMBERSHIP);
   const withMembershipIds = parseUuidArray(payload?.[REWARD_CONDITION_WITH_MEMBERSHIP], REWARD_CONDITION_WITH_MEMBERSHIP);
   const client = await app.db.connect();
