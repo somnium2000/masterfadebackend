@@ -33,12 +33,30 @@ test('dashboard conserva tráfico por día, hora pico y alcance de sucursal', as
   assert.deepEqual(data.concurrencia_clientes.trafico_por_dia_semana[0], { dia_semana_num: 1, dia_semana_label: 'Lunes', total_citas: 5, no_show: 1, completadas: 3 });
   assert.deepEqual(data.concurrencia_clientes.horas_pico[0], { hora: 10, total_citas: 5, no_show: 1, completadas: 3 });
   assert.equal(data.filtros_aplicados.id_sucursal, A);
-  for (const { sql, params } of calls.filter(({ sql }) => sql.includes('GROUP BY EXTRACT'))) {
+  const concurrencyQueries = calls.filter(({ sql }) => sql.includes('GROUP BY EXTRACT'));
+  assert.equal(concurrencyQueries.length, 2);
+  for (const { sql, params } of concurrencyQueries) {
     assert.ok(params.includes(A)); assert.match(sql, /c.id_sucursal = ANY/);
     assert.ok(params.includes('2026-10-01T06:00:00.000Z'));
     assert.ok(params.includes('2026-10-21T06:00:00.000Z'));
+    const selectExpression = sql.match(/EXTRACT\((ISODOW|HOUR) FROM \(c\.inicio_at AT TIME ZONE 'America\/Tegucigalpa'\)\)::int/);
+    assert.ok(selectExpression, sql);
+    const escapedPart = selectExpression[1];
+    const occurrences = sql.match(new RegExp(`EXTRACT\\(${escapedPart} FROM \\(c\\.inicio_at AT TIME ZONE 'America/Tegucigalpa'\\)\\)::int`, 'g')) || [];
+    assert.equal(occurrences.length, 2, 'SELECT y GROUP BY deben usar la misma expresion local');
   }
   assert.equal(releases(), 1);
+});
+
+test('instante UTC se clasifica en el dia y hora empresarial de Honduras sin cambiar el total', () => {
+  const instant = new Date('2026-10-02T00:30:00Z');
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Tegucigalpa',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(instant).filter(({ type }) => type !== 'literal').map(({ type, value }) => [type, value]));
+  assert.deepEqual(parts, { month: '10', day: '01', year: '2026', hour: '18', minute: '30' });
+  assert.equal([instant].length, 1);
 });
 for (const format of ['csv', 'excel']) for (const type of ['concurrencia_dias', 'concurrencia_horas']) {
   test(`${format}/${type} conserva rango y datos del dashboard`, async (t) => {

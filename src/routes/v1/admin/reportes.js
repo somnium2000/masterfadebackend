@@ -143,10 +143,28 @@ function normalizeCommissionRate(value) {
   return parsed;
 }
 
+function parseReportDateOnly(value, field) {
+  const dateOnly = parseDateOnly(value, field);
+  const [year, month, day] = dateOnly.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  const isValid = parsed.getUTCFullYear() === year
+    && parsed.getUTCMonth() === month - 1
+    && parsed.getUTCDate() === day;
+
+  if (!isValid) {
+    throw new AppError(400, `${field} debe ser una fecha calendario valida`, {
+      code: "REPORTES_DATE_INVALID",
+      details: { field, value: dateOnly },
+    });
+  }
+
+  return dateOnly;
+}
+
 function normalizeDateRange(query = {}) {
   const defaults = getDefaultDateRange(30);
-  const fechaDesde = parseDateOnly(query.fecha_desde || defaults.fechaDesde, "fecha_desde");
-  const fechaHasta = parseDateOnly(query.fecha_hasta || defaults.fechaHasta, "fecha_hasta");
+  const fechaDesde = parseReportDateOnly(query.fecha_desde || defaults.fechaDesde, "fecha_desde");
+  const fechaHasta = parseReportDateOnly(query.fecha_hasta || defaults.fechaHasta, "fecha_hasta");
 
   if (fechaDesde > fechaHasta) {
     throw new AppError(400, "fecha_desde no puede ser mayor que fecha_hasta", {
@@ -794,7 +812,7 @@ async function buildReportsSnapshot(client, params) {
     client.query(
       `
         SELECT
-          EXTRACT(ISODOW FROM c.inicio_at)::int AS dia_semana_num,
+          EXTRACT(ISODOW FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int AS dia_semana_num,
           COUNT(*)::int AS total_citas,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'no_show')::int AS no_show,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'completada')::int AS completadas
@@ -805,7 +823,7 @@ async function buildReportsSnapshot(client, params) {
           AND c.id_sucursal = ANY($3::uuid[])
           AND ($4::uuid IS NULL OR c.id_sucursal = $4::uuid)
           AND ($5::uuid IS NULL OR c.id_empleado_barbero = $5::uuid)
-        GROUP BY EXTRACT(ISODOW FROM c.inicio_at)::int
+        GROUP BY EXTRACT(ISODOW FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int
         ORDER BY dia_semana_num ASC
       `,
       [fromIso, toIsoExclusive, branchIds, selectedBranchId, selectedBarberId]
@@ -813,7 +831,7 @@ async function buildReportsSnapshot(client, params) {
     client.query(
       `
         SELECT
-          EXTRACT(HOUR FROM c.inicio_at)::int AS hora,
+          EXTRACT(HOUR FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int AS hora,
           COUNT(*)::int AS total_citas,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'no_show')::int AS no_show,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'completada')::int AS completadas
@@ -824,7 +842,7 @@ async function buildReportsSnapshot(client, params) {
           AND c.id_sucursal = ANY($3::uuid[])
           AND ($4::uuid IS NULL OR c.id_sucursal = $4::uuid)
           AND ($5::uuid IS NULL OR c.id_empleado_barbero = $5::uuid)
-        GROUP BY EXTRACT(HOUR FROM c.inicio_at)::int
+        GROUP BY EXTRACT(HOUR FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int
         ORDER BY total_citas DESC, hora ASC
       `,
       [fromIso, toIsoExclusive, branchIds, selectedBranchId, selectedBarberId]
