@@ -84,11 +84,13 @@ function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 20
 }
 
 test('admin A busca y consulta cliente A', async () => {
-  const { app, actorClaims } = fixture();
+  const { app, calls, actorClaims } = fixture();
   const search = await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims });
   assert.deepEqual(search.clientes.map((row) => row.id_cliente), [CLIENT]);
   const summary = await getClientePointsSummary(app, CLIENT, { claims: actorClaims });
   assert.equal(summary.id_cliente, CLIENT); assert.equal(summary.saldo_total, 20);
+  assert.equal(calls.some(({ sql }) => sql.includes('fn_points_materialize_expired_cycles')), false);
+  assert.ok(calls.some(({ sql }) => sql.includes('FROM public.vw_points_balance')));
 });
 
 test('admin A no obtiene ni materializa cliente B', async () => {

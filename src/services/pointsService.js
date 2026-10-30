@@ -464,7 +464,11 @@ async function getAgregadosPuntos(client, idCliente) {
   const { rows } = await client.query(
     `
       SELECT
-        COALESCE(SUM(pt.puntos), 0)::int AS saldo_total,
+        COALESCE((
+          SELECT vpb.balance_puntos
+          FROM public.vw_points_balance vpb
+          WHERE vpb.id_cliente = $1::uuid
+        ), 0)::int AS saldo_total,
         COALESCE(SUM(CASE
           WHEN pt.puntos > 0 AND COALESCE(pt.origen_punto_codigo, 'titular') = 'titular'
             THEN pt.puntos
@@ -1240,7 +1244,6 @@ export async function getClientePointsSummary(app, idCliente, {
   const client = await app.db.connect();
   try {
     await assertClienteInAdminPointsScope(client, safeClienteId, scope);
-    await materializeCyclesIfAvailable(client, safeClienteId);
     const cliente = await ensureClienteActivo(client, safeClienteId, { requireRegisteredUser: false });
     const agregados = await getAgregadosPuntos(client, safeClienteId);
     const puntosParaPremio = await resolvePuntosParaPremio(client, cliente.id_sucursal_origen || null);

@@ -864,8 +864,6 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
       countWhere.push(`c.id_sucursal_origen = ${idx}::uuid`);
     }
 
-    await materializeExpiredCycles(client, null);
-
     const countQuerySql = `
       WITH rules_by_branch AS (
         SELECT DISTINCT ON (COALESCE(pr.id_sucursal, $2::uuid))
@@ -1093,7 +1091,6 @@ export async function getMasterPuntosClienteMovimientos(app, claims, idCliente, 
   const client = await app.db.connect();
   try {
     await ensureClientInScope(client, safeId, branchIds);
-    await materializeExpiredCycles(client, safeId);
 
     const page = Math.max(1, Number(query.page) || 1);
     const limit = Math.max(1, Math.min(100, Number(query.limit) || 50));

@@ -57,6 +57,7 @@ function createExecutionClient({
   preview = basePreviewRow(),
   balances = [0, 0],
   activeCycleId = null,
+  expiredCycleBalance = null,
   rowCounts = {},
   throwOn = null,
 } = {}) {
@@ -65,6 +66,10 @@ function createExecutionClient({
   const counters = {
     pointsInserts: 0,
     queryIndex: 0,
+  };
+  const pointsState = {
+    materialized: false,
+    closed: false,
   };
   const defaultRowCounts = {
     subscriptions: 0,
@@ -104,6 +109,10 @@ function createExecutionClient({
       if (/^COMMIT$/i.test(text)) return { rows: [] };
       if (/^ROLLBACK$/i.test(text)) return { rows: [] };
       if (text.includes("pg_advisory_xact_lock")) return { rows: [{ locked: true }] };
+      if (text.includes("fn_points_materialize_expired_cycles")) {
+        pointsState.materialized = true;
+        return { rows: [{ fn_points_materialize_expired_cycles: 1 }] };
+      }
       if (text.includes("WITH params AS")) return { rows: [preview] };
       if (text.includes("FROM app_private.solicitudes_eliminacion_cuenta") && text.includes("FOR UPDATE")) {
         return { rows: request ? [request] : [] };
@@ -124,6 +133,12 @@ function createExecutionClient({
         };
       }
       if (text.includes("FROM public.vw_points_balance")) {
+        if (expiredCycleBalance !== null) {
+          const balance = pointsState.materialized
+            ? 0
+            : (pointsState.closed ? expiredCycleBalance : 0);
+          return { rows: [{ balance_puntos: balance }] };
+        }
         return { rows: [{ balance_puntos: balances.length ? balances.shift() : 0 }] };
       }
       if (text.includes("FROM public.points_cycles") && text.includes("LIMIT 1")) {
@@ -135,7 +150,10 @@ function createExecutionClient({
       }
       if (text.includes("UPDATE public.subscriptions")) return { rowCount: defaultRowCounts.subscriptions, rows: [] };
       if (text.includes("UPDATE public.membership_purchase_orders")) return { rowCount: defaultRowCounts.orders, rows: [] };
-      if (text.includes("UPDATE public.points_cycles")) return { rowCount: defaultRowCounts.cycles, rows: [] };
+      if (text.includes("UPDATE public.points_cycles")) {
+        pointsState.closed = true;
+        return { rowCount: defaultRowCounts.cycles, rows: [] };
+      }
       if (text.includes("UPDATE public.seguridad_sesiones")) return { rowCount: defaultRowCounts.sessions, rows: [] };
       if (text.includes("UPDATE public.roles_usuarios")) return { rowCount: defaultRowCounts.roles, rows: [] };
       if (text.includes("UPDATE public.usuarios")) return { rowCount: defaultRowCounts.user, rows: [] };
@@ -327,6 +345,42 @@ test("ciclo activo se cierra", async () => {
 
   assert.equal(result.internal_execution.points_cycles_closed, 2);
   assert.ok(client.calls.some((call) => call.sql.includes("estado_ciclo_codigo = 'cerrado'")));
+});
+
+test("eliminacion bloquea y materializa puntos antes de conciliar y cerrar ciclos", async () => {
+  const client = createExecutionClient({ balances: [0, 0], rowCounts: { cycles: 1 } });
+
+  await execute(client);
+
+  const pointsLockIndex = client.calls.findIndex((call) => (
+    call.sql.includes("pg_advisory_xact_lock(hashtext") && call.params[0] === CLIENTE_ID
+  ));
+  const materializeIndex = client.calls.findIndex((call) => call.sql.includes("fn_points_materialize_expired_cycles"));
+  const firstBalanceIndex = client.calls.findIndex((call, index) => (
+    index > materializeIndex && call.sql.includes("FROM public.vw_points_balance")
+  ));
+  const closeCyclesIndex = client.calls.findIndex((call) => call.sql.includes("UPDATE public.points_cycles"));
+
+  assert.ok(pointsLockIndex >= 0);
+  assert.ok(pointsLockIndex < materializeIndex);
+  assert.ok(materializeIndex < firstBalanceIndex);
+  assert.ok(firstBalanceIndex < closeCyclesIndex);
+});
+
+test("ciclo vencido no recupera saldo positivo despues de cerrarse", async () => {
+  const client = createExecutionClient({
+    expiredCycleBalance: 7,
+    rowCounts: { cycles: 1 },
+  });
+
+  await execute(client);
+  const afterClose = await client.query(
+    "SELECT balance_puntos FROM public.vw_points_balance WHERE id_cliente = $1::uuid",
+    [CLIENTE_ID]
+  );
+
+  assert.equal(afterClose.rows[0].balance_puntos, 0);
+  assert.equal(client.calls.filter((call) => call.sql.includes("fn_points_materialize_expired_cycles")).length, 1);
 });
 
 test("sesiones activas se revocan", async () => {

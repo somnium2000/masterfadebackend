@@ -1823,6 +1823,8 @@ async function reconcileAccountDeletionPoints(client, {
   usuarioId,
   referenciaPublica,
 }) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [clienteId]);
+  await client.query("SELECT public.fn_points_materialize_expired_cycles($1::uuid)", [clienteId]);
   const pointsBalanceBefore = await getCurrentPointsBalance(client, clienteId);
   let pointsForfeited = 0;
 
