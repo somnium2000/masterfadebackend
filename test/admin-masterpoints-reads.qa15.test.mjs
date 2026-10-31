@@ -101,12 +101,14 @@ test('rutas de búsqueda, resumen y ajuste pasan claims completos al servicio', 
   const adjustment = await app.inject({
     method: 'POST',
     url: `/puntos/clientes/${A}/ajuste`,
+    headers: { 'x-idempotency-key': '99999999-9999-4999-8999-999999999999' },
     payload: { accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético' },
   });
   assert.equal(adjustment.statusCode, 200);
   assert.deepEqual(calls.find(({ name }) => name === 'search').args[1].claims.branch_ids, [A]);
   assert.deepEqual(calls.find(({ name }) => name === 'summary').args[2].claims.branch_ids, [A]);
   assert.deepEqual(calls.find(({ name }) => name === 'adjustment').args[1].claims.branch_ids, [A]);
+  assert.equal(calls.find(({ name }) => name === 'adjustment').args[1].idempotencyKey, '99999999-9999-4999-8999-999999999999');
 });
 
 for (const role of ['cliente', 'barbero']) test(`${role} no puede invocar ajuste administrativo`, async (t) => {
@@ -114,6 +116,7 @@ for (const role of ['cliente', 'barbero']) test(`${role} no puede invocar ajuste
   const response = await app.inject({
     method: 'POST',
     url: `/puntos/clientes/${A}/ajuste`,
+    headers: { 'x-idempotency-key': '99999999-9999-4999-8999-999999999999' },
     payload: { accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético' },
   });
   assert.equal(response.statusCode, 403); assert.equal(calls.length, 0);

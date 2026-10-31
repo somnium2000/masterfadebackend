@@ -14,6 +14,7 @@ const BRANCH_B = '22222222-2222-4222-8222-222222222222';
 const CLIENT = '33333333-3333-4333-8333-333333333333';
 const USER = '44444444-4444-4444-8444-444444444444';
 const ADMIN = '55555555-5555-4555-8555-555555555555';
+const IDEMPOTENCY_KEY = '66666666-6666-4666-8666-666666666666';
 
 function claims(roles = ['admin'], branchIds = [BRANCH_A]) {
   return { roles, branch_ids: branchIds, user: { id_usuario: ADMIN } };
@@ -56,6 +57,8 @@ function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 20
         balanceReads += 1;
         return { rows: [{ saldo_total: balanceReads === 1 ? balance : balance + 5 }] };
       }
+      if (text.includes('INSERT INTO app_private.points_manual_adjustment_idempotency')) return { rows: [{ idempotency_key: params[0], payload_hash: params[1], response_payload: null }], rowCount: 1 };
+      if (text.includes('UPDATE app_private.points_manual_adjustment_idempotency')) return { rows: [], rowCount: 1 };
       if (text.includes('INSERT INTO public.points_transactions')) return { rows: [{
         id_points_tx: USER, id_cliente: CLIENT, tipo_puntos_codigo: 'ajustar', origen_punto_codigo: 'sistema',
         puntos: 5, motivo: 'Ajuste sintético', created_at: '2026-10-29T12:00:00.000Z',
@@ -115,6 +118,7 @@ test('Fastify inject rechaza cliente B sin exponer identidad, saldo ni movimient
   const summary = await app.inject(`/puntos/clientes/${CLIENT}/resumen`);
   const adjustment = await app.inject({
     method: 'POST', url: `/puntos/clientes/${CLIENT}/ajuste`,
+    headers: { 'x-idempotency-key': IDEMPOTENCY_KEY },
     payload: { accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético' },
   });
 
@@ -141,7 +145,7 @@ test('cliente sin sucursal no es accesible para admin', async () => {
   });
   await assert.rejects(addManualPointsAdjustment(app, {
     idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
-    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   }), { statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
 });
@@ -158,7 +162,7 @@ test('super_admin conserva ajuste global para cliente B', async () => {
   const { app, calls } = fixture({ actorClaims, clientBranch: BRANCH_B });
   const result = await addManualPointsAdjustment(app, {
     idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
-    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   });
   assert.equal(result.id_cliente, CLIENT);
   assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
@@ -174,7 +178,7 @@ test('ajuste fuera de alcance revierte sin insertar ni modificar puntos', async 
   const { app, calls, actorClaims } = fixture({ clientBranch: BRANCH_B });
   await assert.rejects(addManualPointsAdjustment(app, {
     idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
-    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   }), { statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN' });
   assert.equal(calls.some(({ sql }) => /INSERT INTO|UPDATE public\./.test(sql)), false);
   assert.equal(calls.some(({ sql }) => sql === 'COMMIT'), false);
@@ -185,7 +189,7 @@ test('ajuste autorizado conserva la transacción y el saldo', async () => {
   const { app, calls, actorClaims } = fixture();
   const result = await addManualPointsAdjustment(app, {
     idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
-    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   });
   assert.equal(result.saldo_actual, 25); assert.equal(result.saldo_siguiente, 25);
   assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
@@ -200,7 +204,7 @@ test('saldo insuficiente autorizado conserva rollback e integridad', async () =>
   const { app, calls, actorClaims } = fixture({ balance: 2 });
   await assert.rejects(addManualPointsAdjustment(app, {
     idCliente: CLIENT, accion: 'restar', puntos: 5, motivo: 'Ajuste sintético',
-    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   }), { statusCode: 422, code: 'POINTS_INSUFFICIENT_BALANCE' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
   assert.equal(calls.filter(({ sql }) => sql === 'ROLLBACK').length, 1);

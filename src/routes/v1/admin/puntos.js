@@ -13,6 +13,13 @@ import {
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
 const GLOBAL_REWARDS_WRITE_ROLES = ["super_admin"];
 const requestIdSchema = { type: "string" };
+const idempotencyHeadersSchema = {
+  type: "object",
+  properties: {
+    "x-idempotency-key": { type: "string", format: "uuid" },
+  },
+  additionalProperties: true,
+};
 
 const idClienteParamSchema = {
   type: "object",
@@ -231,6 +238,7 @@ export default async function adminPointsRoutes(app) {
       preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
       schema: {
         params: idClienteParamSchema,
+        headers: idempotencyHeadersSchema,
         body: ajusteBodySchema,
         response: {
           200: {
@@ -247,6 +255,8 @@ export default async function adminPointsRoutes(app) {
       },
     },
     async (request, reply) => {
+      const idempotencyKey = request.headers?.["x-idempotency-key"];
+      reply.header("x-idempotency-key", idempotencyKey);
       try {
         const data = await addManualPointsAdjustment(app, {
           idCliente: request.params.id_cliente,
@@ -255,6 +265,7 @@ export default async function adminPointsRoutes(app) {
           motivo: request.body?.motivo,
           usuarioAdmin: request.claims?.user,
           claims: request.claims,
+          idempotencyKey,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
