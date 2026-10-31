@@ -14,3 +14,4 @@ tmp_*
 *.tmp
 debug_*
 repro_*
+tests/load/artillery/reports/
