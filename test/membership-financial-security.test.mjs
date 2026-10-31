@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import Fastify from "fastify";
 import clienteRoutes from "../src/routes/v1/cliente.js";
@@ -254,6 +255,7 @@ function pixelPayProcessHarness({
   initialIntentState = "link_generado",
   durableEvidence = null,
   durableVerifiedAt = null,
+  verifiedReceiptAt = null,
   providerSessionId = null,
   amount = 800,
   rejectNonIsoPaidAt = false,
@@ -267,6 +269,7 @@ function pixelPayProcessHarness({
     verifiedEvidenceEvents: 0, verifiedReferenceWrites: 0, subscriptionInsertParams: null,
     statusClaimed: false, dynamicDurableEvidence: null, dynamicVerifiedAt: null,
     paymentProviderTxIds: [], paymentAmounts: [], paymentPaidAts: [],
+    orderPaidAts: [], subscriptionPaymentPaidAts: [], verifiedEventQueries: [],
   };
   const row = {
     ...intentRow("link_generado", owner),
@@ -318,6 +321,10 @@ function pixelPayProcessHarness({
             : currentVerifiedAt,
         }] : [] };
       }
+      if (text.includes("SELECT to_char(min(pe.recibido_at)") && text.includes("FROM public.payment_events pe")) {
+        state.verifiedEventQueries.push(text);
+        return { rows: [{ verified_at: state.dynamicVerifiedAt }] };
+      }
       if (text.includes("FROM public.payment_intents pi")) {
         return { rows: [{ ...row, estado_intent_codigo: state.intentState,
           estado_orden_codigo: state.orderState, id_suscripcion: state.idSubscription }], rowCount: 1 };
@@ -331,12 +338,13 @@ function pixelPayProcessHarness({
         return { rows: [{ id_intent: INTENT }] };
       }
       if (text.startsWith("INSERT INTO public.payment_events")) {
+        state.verifiedEventQueries.push(text);
         if (text.includes("membership.pixelpay.approved_verified")) state.verifiedEvidenceEvents += 1;
         if (values[2]?.payment_hash_valid === true) {
           state.dynamicDurableEvidence = values[2];
-          state.dynamicVerifiedAt = new Date().toISOString();
+          state.dynamicVerifiedAt = verifiedReceiptAt || new Date().toISOString();
         }
-        return { rows: [{ id_event: crypto.randomUUID() }] };
+        return { rows: [{ id_event: crypto.randomUUID(), verified_at: state.dynamicVerifiedAt }] };
       }
       if (text.includes("SET last_verified_at = now()")) {
         if (state.statusClaimed) return { rows: [] };
@@ -362,7 +370,10 @@ function pixelPayProcessHarness({
         { table_name: "subscriptions", column_name: "motivo_fin_codigo" },
       ] };
       if (text.startsWith("UPDATE public.membership_purchase_orders")) {
-        if (text.includes("estado_orden_codigo = 'pagada'")) state.orderState = "pagada";
+        if (text.includes("estado_orden_codigo = 'pagada'")) {
+          state.orderState = "pagada";
+          state.orderPaidAts.push(values[1]);
+        }
         if (text.includes("SET id_suscripcion")) state.idSubscription = values[1];
         return { rows: [{ id_order: ORDER }] };
       }
@@ -392,6 +403,7 @@ function pixelPayProcessHarness({
       if (text.startsWith("INSERT INTO public.subscription_payments")) {
         if (failSubscriptionPayment) throw new Error("forced subscription_payments failure");
         state.subscriptionPayments += 1;
+        state.subscriptionPaymentPaidAts.push(values[5]);
         return { rows: [{ id_subscription_payment: crypto.randomUUID() }] };
       }
       if (text.includes("SET estado_intent_codigo=$2::text")) {
@@ -646,6 +658,80 @@ test("aprobado con hash, monto y moneda validos activa y contabiliza una vez", a
   assert.equal(state.subscriptions, 1);
   assert.equal(state.payments, 1);
   assert.equal(state.subscriptionPayments, 1);
+});
+
+test("aprobacion directa usa el primer recibido_at durable en todas las fechas financieras", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const receivedAt = new Date(Date.now() - 5_000).toISOString().replace(/(\.\d{3})Z$/, "$1456Z");
+  const { app, state } = pixelPayProcessHarness({
+    verifiedReceiptAt: receivedAt,
+    provider: { sale: async () => ({
+      outcome: PIXELPAY_SALE_OUTCOME.APPROVED,
+      approved: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      paymentUuid: "e8888888-8888-4888-8888-888888888888",
+      transactionId: "pixelpay-temporal-evidence",
+      diagnostics: {},
+    }) },
+  });
+
+  const result = await processMembershipPixelPaySale(app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT, card: validCard, billing: validBilling,
+  });
+
+  assert.equal(result.processed, true);
+  assert.deepEqual(state.paymentPaidAts, [receivedAt]);
+  assert.deepEqual(state.orderPaidAts, [receivedAt]);
+  assert.deepEqual(state.subscriptionPaymentPaidAts, [receivedAt]);
+  assert.ok(state.verifiedEventQueries.some(sql => /SELECT to_char\(min\(pe\.recibido_at\)/i.test(sql)));
+});
+
+test("aprobacion verificada recibida despues del vencimiento queda pendiente sin segunda Sale", async (t) => {
+  t.after(() => PaymentProviderFactory.reset());
+  const receivedAfterExpiry = new Date(Date.now() + 120_000).toISOString();
+  const { app, state } = pixelPayProcessHarness({
+    verifiedReceiptAt: receivedAfterExpiry,
+    provider: { sale: async () => ({
+      outcome: PIXELPAY_SALE_OUTCOME.APPROVED,
+      approved: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      paymentUuid: "e9999999-9999-4999-8999-999999999999",
+      transactionId: "pixelpay-late-observation",
+      diagnostics: {},
+    }) },
+  });
+
+  const result = await processMembershipPixelPaySale(app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT, card: validCard, billing: validBilling,
+  });
+
+  assert.deepEqual(result, {
+    processed: false,
+    pending_confirmation: true,
+    reconciliation_required: true,
+    estado_intent_codigo: "pendiente_confirmacion",
+  });
+  assert.equal(state.verifiedEvidenceEvents, 1);
+  assert.equal(state.intentState, "pendiente_confirmacion");
+  assert.equal(state.subscriptions, 0);
+  assert.equal(state.payments, 0);
+  assert.equal(state.subscriptionPayments, 0);
+  assert.equal(state.saleCalls, 1);
+
+  await assert.rejects(processMembershipPixelPaySale(app, {
+    idPaymentIntent: INTENT, clienteId: CLIENT, card: validCard, billing: validBilling,
+  }), { code: "MEMBERSHIP_PIXELPAY_SALE_ALREADY_IN_PROGRESS" });
+  assert.equal(state.saleCalls, 1);
+});
+
+test("contrato SQL VIP no inventa paid_at y recupera el primer evento durable", () => {
+  const source = readFileSync(new URL("../src/services/membershipService.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /COALESCE\(\$6::timestamptz,\s*now\(\)\)/i);
+  assert.match(source, /ORDER BY pe\.recibido_at ASC/i);
+  assert.doesNotMatch(source, /SET estado_orden_codigo = 'pagada',[\s\S]{0,120}paid_at = now\(\)/i);
+  assert.doesNotMatch(source, /subscription_payments[\s\S]{0,400}'pagado', now\(\)/i);
 });
 
 test("monto no coincidente no activa la membresia", async (t) => {

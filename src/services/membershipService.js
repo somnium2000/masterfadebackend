@@ -83,6 +83,13 @@ function toIsoDateTime(value) {
   return parsed.toISOString();
 }
 
+function toFinancialEvidenceTimestamp(value) {
+  if (value instanceof Date) return toIsoDateTime(value);
+  const raw = safeText(value);
+  if (!raw || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)) return null;
+  return Number.isFinite(new Date(raw).getTime()) ? raw : null;
+}
+
 function resolveTimeRemainingInput(timeRemaining, finAt) {
   if (timeRemaining && typeof timeRemaining === "object") {
     return {
@@ -1712,7 +1719,7 @@ async function insertCapturedPaymentForMembershipIntent(client, intentRow) {
         $2::text,
         $3::numeric,
         $4::text,
-        COALESCE($6::timestamptz, now()),
+        $6::timestamptz,
         FALSE,
         FALSE,
         $5::uuid
@@ -1823,20 +1830,31 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
   }
   if (pixelPayEvidence) {
     const expectedAmount = toNumber(intent.monto_hnl, -1);
+    const verifiedAt = toFinancialEvidenceTimestamp(pixelPayEvidence.verifiedAt);
+    const validUntilMs = Math.min(
+      new Date(intent.intent_expires_at).getTime(),
+      new Date(intent.order_expires_at).getTime()
+    );
     if (pixelPayEvidence.approved !== true
       || pixelPayEvidence.paymentHashValid !== true
       || pixelPayEvidence.amountMatches !== true
       || toNumber(pixelPayEvidence.amount, -2) !== expectedAmount
       || safeText(pixelPayEvidence.currency).toUpperCase() !== safeText(intent.moneda_codigo).toUpperCase()
       || !safeText(pixelPayEvidence.paymentUuid)
-      || !safeText(pixelPayEvidence.transactionId)) {
+      || !safeText(pixelPayEvidence.transactionId)
+      || !verifiedAt
+      || !Number.isFinite(validUntilMs)
+      || new Date(verifiedAt).getTime() > validUntilMs) {
       throw new AppError(409, "La evidencia financiera de PixelPay no es valida", {
         code: "MEMBERSHIP_PIXELPAY_EVIDENCE_INVALID",
       });
     }
     intent.provider_payment_uuid = pixelPayEvidence.paymentUuid;
     intent.provider_transaction_id = pixelPayEvidence.transactionId;
-    intent.provider_paid_at = safeText(pixelPayEvidence.verifiedAt) || null;
+    intent.provider_paid_at = verifiedAt;
+  } else if (simulatorEvidence) {
+    // AM: Solo el simulador local autorizado crea su propio instante sintetico.
+    intent.provider_paid_at = new Date().toISOString();
   }
 
   let orderPlanSnapshot;
@@ -1878,11 +1896,11 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     `
       UPDATE public.membership_purchase_orders
       SET estado_orden_codigo = 'pagada',
-          paid_at = now(),
+          paid_at = $2::timestamptz,
           updated_at = now()
       WHERE id_order = $1::uuid
     `,
-    [intent.id_order]
+    [intent.id_order, intent.provider_paid_at]
   );
 
   await cancelActiveSubscriptionForSameBranch(client, {
@@ -1941,7 +1959,7 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
        id_suscripcion, monto_hnl, moneda_codigo, metodo, estado, paid_at,
        id_payment, registrado_por_usuario_id
      )
-     SELECT $1::uuid, $2::numeric, $3::text, 'online', 'pagado', now(), $4::uuid, $5::uuid
+     SELECT $1::uuid, $2::numeric, $3::text, 'online', 'pagado', $6::timestamptz, $4::uuid, $5::uuid
      WHERE NOT EXISTS (
        SELECT 1 FROM public.subscription_payments WHERE id_payment = $4::uuid
      )`,
@@ -1951,6 +1969,7 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
       safeText(intent.moneda_codigo) || "HNL",
       capturedPayment.id_payment,
       safeText(intent.id_usuario) || safeText(intent.created_by_usuario_id) || null,
+      intent.provider_paid_at,
     ]
   );
 
@@ -1997,7 +2016,7 @@ export async function recoverMembershipPixelPayApproval(client, {
         AND pi.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado', 'expirado')
         AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
         AND pe.firma_valida = TRUE
-      ORDER BY pe.recibido_at DESC
+      ORDER BY pe.recibido_at ASC
       LIMIT 1
       FOR UPDATE OF pi`,
     [safeIntentId]
@@ -2262,8 +2281,18 @@ async function persistVerifiedMembershipPixelPayEvidence(app, {
         intent.id_intent,
       ]
     );
+    const { rows } = await client.query(
+      `SELECT to_char(min(pe.recibido_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS verified_at
+         FROM public.payment_events pe
+        WHERE pe.id_intent = $1::uuid
+          AND pe.id_provider = $2::uuid
+          AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
+          AND pe.firma_valida = TRUE`,
+      [intent.id_intent, intent.id_provider]
+    );
     await client.query("COMMIT");
     txStarted = false;
+    return { verifiedAt: toFinancialEvidenceTimestamp(rows?.[0]?.verified_at) };
   } catch (error) {
     if (txStarted) await client.query("ROLLBACK").catch(() => {});
     throw error;
@@ -2457,13 +2486,27 @@ export async function processMembershipPixelPaySale(app, {
     observedTransactionReferenceUntrusted: saleResult.outcome === PIXELPAY_SALE_OUTCOME.UNCERTAIN ? saleResult.transactionReference : null,
   }, logger);
 
+  let durableApproval = null;
   if (saleResult.outcome === PIXELPAY_SALE_OUTCOME.APPROVED) {
-    await persistVerifiedMembershipPixelPayEvidence(app, {
+    durableApproval = await persistVerifiedMembershipPixelPayEvidence(app, {
       intent,
       saleResult,
       paymentAttemptId,
       requestId,
     });
+    const verifiedAtMs = new Date(durableApproval?.verifiedAt).getTime();
+    const validUntilMs = Math.min(
+      new Date(intent.intent_expires_at).getTime(),
+      new Date(intent.order_expires_at).getTime()
+    );
+    if (!Number.isFinite(verifiedAtMs) || !Number.isFinite(validUntilMs) || verifiedAtMs > validUntilMs) {
+      return {
+        processed: false,
+        pending_confirmation: true,
+        reconciliation_required: true,
+        estado_intent_codigo: "pendiente_confirmacion",
+      };
+    }
   }
 
   const finalClient = await app.db.connect();
@@ -2512,6 +2555,7 @@ export async function processMembershipPixelPaySale(app, {
         currency: intent.moneda_codigo,
         paymentUuid: saleResult.paymentUuid,
         transactionId: saleResult.transactionId,
+        verifiedAt: durableApproval.verifiedAt,
       },
     });
     await finalClient.query("COMMIT");
