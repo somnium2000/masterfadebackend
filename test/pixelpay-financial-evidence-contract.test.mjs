@@ -10,13 +10,17 @@ const migrationUrl = new URL(
   import.meta.url
 );
 
-test("Sale y Status persisten evidencia PixelPay antes de reconciliar", async () => {
+test("Sale persiste evidencia PixelPay canonica antes de reconciliar", async () => {
   const source = await readFile(publicPaymentsUrl, "utf8");
 
   assert.match(source, /async function persistVerifiedPixelPayEvidence/i);
   assert.match(source, /pixelpay\.sale\.approved_verified/i);
-  assert.match(source, /pixelpay\.status\.paid_verified/i);
-  assert.match(source, /SELECT[\s\S]*min\(pe\.recibido_at\)[\s\S]*payment_events/i);
+  const helperStart = source.indexOf("async function persistVerifiedPixelPayEvidence");
+  const helperEnd = source.indexOf("async function queryAndRegisterPixelPayStatus", helperStart);
+  const helper = source.slice(helperStart, helperEnd);
+  assert.match(helper, /SELECT[\s\S]*min\(pe\.recibido_at\)[\s\S]*payment_events/i);
+  assert.match(helper, /pe\.evento_tipo\s*=\s*'pixelpay\.sale\.approved_verified'/i);
+  assert.doesNotMatch(helper, /pixelpay\.status\.paid_verified/i);
   assert.match(source, /paidAt:\s*durableApproval\.verifiedAt/i);
   assert.doesNotMatch(source, /registerPaymentStatusCheck[\s\S]{0,500}paidAt:\s*new Date/i);
 });
