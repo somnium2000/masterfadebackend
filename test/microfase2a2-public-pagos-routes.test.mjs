@@ -243,6 +243,7 @@ function createPagosClient({
   const calls = [];
   const statusChecks = [];
   const payments = structuredClone(initialPayments);
+  const paymentEvents = [];
   let saleAttempts = structuredClone(initialSaleAttempts);
   let transactionSnapshot = null;
   let activeIntent = existingIntent ? { ...existingIntent } : null;
@@ -305,7 +306,7 @@ function createPagosClient({
       const text = typeof sql === "object" ? sql.text : String(sql);
       calls.push({ sql: text, params });
       if (text === "BEGIN") {
-        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, saleAttempts, groupStateCode });
+        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, paymentEvents, saleAttempts, groupStateCode });
         return { rows: [] };
       }
       if (text === "COMMIT") { transactionSnapshot = null; return { rows: [] }; }
@@ -314,6 +315,7 @@ function createPagosClient({
           activeIntent = transactionSnapshot.activeIntent;
           groupState.splice(0, groupState.length, ...transactionSnapshot.groupState);
           payments.splice(0, payments.length, ...transactionSnapshot.payments);
+          paymentEvents.splice(0, paymentEvents.length, ...transactionSnapshot.paymentEvents);
           saleAttempts = transactionSnapshot.saleAttempts;
           groupStateCode = transactionSnapshot.groupStateCode;
           transactionSnapshot = null;
@@ -611,6 +613,24 @@ function createPagosClient({
           last_verified_at: params[9],
         };
         return { rows: [{ id_status_check: "abababab-abab-4bab-8bab-abababababab" }] };
+      }
+      if (text.includes("INSERT INTO public.payment_events") && text.includes("SELECT pi.id_provider")) {
+        if (!paymentEvents.some((row) => row.provider_event_id === params[1])) {
+          paymentEvents.push({
+            id_intent: params[0],
+            provider_event_id: params[1],
+            evento_tipo: params[2],
+            payload_esencial: params[3],
+            recibido_at: new Date().toISOString(),
+          });
+        }
+        return { rows: [] };
+      }
+      if (text.includes("min(pe.recibido_at)::text AS verified_at") && text.includes("FROM public.payment_events pe")) {
+        const rows = paymentEvents
+          .filter((row) => row.id_intent === params[0])
+          .sort((a, b) => a.recibido_at.localeCompare(b.recibido_at));
+        return { rows: [{ verified_at: rows[0]?.recibido_at ?? null }] };
       }
       if (text.includes("FROM public.payments") && text.includes("estado_pago_codigo = 'capturado'")) {
         const payment = payments.find((row) => row.id_intent === params[0]);
@@ -2159,7 +2179,7 @@ function reconcileFixture(client, overrides = {}) {
   return reconcilePixelPayPaid(client, {
     idGrupoCita: GROUP_A, idIntent: INTENT_A, titularEmail: "cliente@example.com",
     paymentUuid: "PAYMENT-UUID-NEW", providerTransactionId: "TX-SANDBOX-REPEATED",
-    expectedAmount: 115, ...overrides,
+    expectedAmount: 115, paidAt: "2099-01-01T15:59:00.000Z", ...overrides,
   });
 }
 

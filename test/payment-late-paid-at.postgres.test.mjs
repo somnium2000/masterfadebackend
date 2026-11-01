@@ -13,6 +13,8 @@ import { PaymentProviderFactory } from "../src/services/payments/PaymentProvider
 const migrationUrl = new URL("../db/migrations/pixel/20261011213325_payment_late_uses_paid_at_v1.sql", import.meta.url);
 const baselineUrl = new URL("./sql/payments/qa_payment_triggers_20261011.sql", import.meta.url);
 const RUN = process.env.RUN_PAYMENT_LATE_PG_INTEGRATION === "true";
+const RUN_FINANCIAL_CONTRACT = process.env.RUN_FINANCIAL_CONTRACT_PG === "true";
+const financialContractUrl = new URL("../db/migrations/pixel/20261101025900_financial_paid_at_contract_v2.sql", import.meta.url);
 const INTENT = "9b1626eb-0c04-4ce3-ae93-5296ddcb02fe";
 const GROUP = "1cc40753-b888-4452-82b5-8e384d590fbc";
 const CITA = "05f53173-ab1a-4b35-8a70-88f2f40d22f2";
@@ -279,4 +281,52 @@ test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en clus
     });
   } catch (error) { primaryError = error; throw error; }
   finally { await cleanupPreservingError(isolated.stop, primaryError); }
+});
+
+test("PostgreSQL 17: contrato financiero exige evidencia y deshabilita pagos manuales nuevos", {
+  skip: !RUN_FINANCIAL_CONTRACT,
+}, async () => {
+  const isolated = await startIsolatedPostgres();
+  const { client } = isolated;
+  let primaryError;
+  try {
+    const historical = await readFile(new URL("../db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql", import.meta.url), "utf8");
+    await client.query(await readFile(new URL("./sql/microfase2a2/pre_2a2_schema.sql", import.meta.url), "utf8"));
+    await client.query(await readFile(new URL("./sql/payments/late_payment_support.sql", import.meta.url), "utf8"));
+    await client.query(await readFile(baselineUrl, "utf8"));
+    await client.query(functionSql(historical, "public.fn_payment_intents_capture_paid_at"));
+    await client.query(`CREATE TRIGGER tr_payment_intents_capture_paid_at BEFORE INSERT OR UPDATE OF estado_intent_codigo,paid_at
+      ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION public.fn_payment_intents_capture_paid_at()`);
+
+    await seed(client, { intentExpiry: "2099-01-01T16:00:00.000Z", holdExpiry: "2099-01-01T16:00:00.000Z",
+      holdState: "activo", intentState: "pendiente_confirmacion", citaState: "pendiente_pago" });
+    await client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'manual_pagado','legacy-manual',1,'HNL',NULL,TRUE)`, [INTENT]);
+
+    await client.query(await readFile(financialContractUrl, "utf8"));
+    assert.equal((await client.query("SELECT count(*)::int count FROM public.payments WHERE provider_tx_id='legacy-manual'")).rows[0].count, 1);
+    await client.query("DELETE FROM public.payments WHERE provider_tx_id='legacy-manual'");
+
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'manual_pagado','new-manual',1,'HNL',$2,TRUE)`, [INTENT, PAID_AT]),
+    /MF_MANUAL_PAYMENT_DISABLED/);
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','missing-evidence',1,'HNL',NULL,FALSE)`, [INTENT]),
+    /MF_PAYMENT_PAID_AT_REQUIRED/);
+
+    const payment = await client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','verified-pixelpay',1,'HNL',$2,FALSE)
+      RETURNING paid_at::text,pago_tardio`, [INTENT, PAID_AT]);
+    assert.equal(new Date(payment.rows[0].paid_at).toISOString(), new Date(PAID_AT).toISOString());
+    assert.equal(payment.rows[0].pago_tardio, false);
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    await cleanupPreservingError(isolated.stop, primaryError);
+  }
 });
