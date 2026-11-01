@@ -1,6 +1,11 @@
 CREATE ROLE anon NOLOGIN;
 CREATE ROLE authenticated NOLOGIN;
 CREATE ROLE service_role NOLOGIN;
+CREATE SCHEMA app_private;
+
+CREATE TABLE public.correos (id_correo uuid PRIMARY KEY);
+CREATE TABLE public.personas (id_persona uuid PRIMARY KEY);
+CREATE TABLE public.clientes (id_cliente uuid PRIMARY KEY);
 
 CREATE TABLE public.citas (id_cita uuid PRIMARY KEY, id_grupo_cita uuid);
 CREATE TABLE public.citas_holds (
@@ -37,6 +42,16 @@ CREATE TABLE public.subscriptions (
   id_subscription uuid PRIMARY KEY,
   motivo_fin_codigo text,
   CONSTRAINT ck_sub_motivo_fin CHECK (motivo_fin_codigo IS NULL OR motivo_fin_codigo IN ('tiempo','agotamiento','reemplazo','cancelacion'))
+);
+CREATE TABLE public.seguridad_sesiones (
+  id_sesion uuid PRIMARY KEY,
+  motivo_cierre text,
+  CONSTRAINT ck_seg_sesiones_motivo_cierre CHECK (
+    motivo_cierre IS NULL OR motivo_cierre IN (
+      'logout_usuario','logout_admin','reemplazo_sesion_cliente',
+      'sesion_expirada','riesgo_seguridad','password_reset'
+    )
+  )
 );
 CREATE TABLE public.subscription_payments (
   id_subscription_payment uuid PRIMARY KEY DEFAULT gen_random_uuid(),

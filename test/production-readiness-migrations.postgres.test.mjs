@@ -7,6 +7,14 @@ const RUN = process.env.RUN_PRODUCTION_READINESS_PG === "true";
 const financialPath = "db/migrations/pixel/20261101025900_financial_paid_at_contract_v2.sql";
 const structuralPath = "db/migrations/20261101025903_production_structural_alignment_v1.sql";
 const securityPath = "db/migrations/20261101025905_security_definer_trigger_lockdown_v1.sql";
+const structuralPaths = [
+  "db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql",
+  "db/migrations/pixel/20261016010000_pixelpay_uncertain_observed_identifiers.sql",
+  "db/migrations/pixel/20261018010000_pixelpay_observed_payment_uuid_opaque.sql",
+  "db/migrations/pixel/20261028010000_pixelpay_provider_response_code.sql",
+  "db/migrations/20261019010000_guest_registration_requests.sql",
+  structuralPath,
+];
 
 test("contratos SQL no inventan evidencia ni eliminan protecciones", async () => {
   const financial = await readFile(new URL(`../${financialPath}`, import.meta.url), "utf8");
@@ -17,6 +25,51 @@ test("contratos SQL no inventan evidencia ni eliminan protecciones", async () =>
   assert.doesNotMatch(structural, /DROP CONSTRAINT ck_payment_intents_/i);
   assert.match(structural, /eliminacion_cuenta/);
   assert.match(structural, /MF_MEMBERSHIP_IDEMPOTENCY_DUPLICATES/);
+  assert.match(structural, /ADD COLUMN idempotency_key text[\s\S]*MF_MEMBERSHIP_IDEMPOTENCY_DUPLICATES/);
+  assert.doesNotMatch(structural, /WHERE idempotency_key IS NOT NULL[\s\S]*ADD COLUMN idempotency_key/i);
+});
+
+test("PostgreSQL 17: seis migraciones estructurales reproducen Produccion y conservan finanzas", { skip: !RUN }, async (t) => {
+  const isolated = await startBookingDeadlockPostgres17();
+  const { pool } = isolated;
+  try {
+    await isolated.sqlFile("test/fixtures/production-readiness-schema.sql");
+    const protectedBefore = (await pool.query("SELECT conname, pg_get_constraintdef(oid,true) definition FROM pg_constraint WHERE conrelid='public.payment_intents'::regclass AND conname LIKE 'ck_payment_intents_%' ORDER BY conname")).rows;
+    const financialBefore = (await pool.query("SELECT p.proname, pg_get_functiondef(p.oid) definition FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('fn_trg_validar_pago_monto_tiempo','fn_payment_intents_capture_paid_at') ORDER BY p.proname")).rows;
+
+    await t.test("rollback revierte tambien la columna creada antes del preflight", async () => {
+      await pool.query("ALTER TABLE payment_intents DROP CONSTRAINT ck_payment_intents_provider_session_not_blank");
+      await assert.rejects(isolated.sqlFile(structuralPath), /psql:/);
+      assert.equal((await pool.query("SELECT to_regclass('public.membership_purchase_orders') IS NOT NULL AS table_exists")).rows[0].table_exists, true);
+      assert.equal((await pool.query("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='membership_purchase_orders' AND column_name='idempotency_key') present")).rows[0].present, false);
+      await pool.query("ALTER TABLE payment_intents ADD CONSTRAINT ck_payment_intents_provider_session_not_blank CHECK (provider_session_id IS NULL OR btrim(provider_session_id) <> '')");
+    });
+
+    for (const path of structuralPaths) await isolated.sqlFile(path);
+
+    await t.test("pixelpay_sale_attempts coincide con el contrato QA acumulado", async () => {
+      const columns = (await pool.query("SELECT column_name FROM information_schema.columns WHERE table_schema='app_private' AND table_name='pixelpay_sale_attempts' ORDER BY ordinal_position")).rows.map(r => r.column_name);
+      for (const expected of ['observed_payment_uuid_untrusted','observed_transaction_id_untrusted','observed_transaction_reference_untrusted','provider_response_code']) assert.ok(columns.includes(expected), expected);
+      const constraints = (await pool.query("SELECT conname FROM pg_constraint WHERE conrelid='app_private.pixelpay_sale_attempts'::regclass ORDER BY conname")).rows.map(r => r.conname);
+      for (const expected of ['ck_pixelpay_sale_attempts_observed_payment_uuid','ck_pixelpay_sale_attempts_provider_response_code','fk_pixelpay_sale_attempts_intent']) assert.ok(constraints.includes(expected), expected);
+      const indexes = (await pool.query("SELECT indexname FROM pg_indexes WHERE schemaname='app_private' AND tablename='pixelpay_sale_attempts'")).rows.map(r => r.indexname);
+      for (const expected of ['idx_pixelpay_sale_attempts_intent_created','idx_pixelpay_sale_attempts_unfinalized']) assert.ok(indexes.includes(expected), expected);
+    });
+
+    await t.test("membresias, guest y eliminacion de cuenta quedan alineados", async () => {
+      assert.equal((await pool.query("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='membership_purchase_orders' AND column_name='idempotency_key') present")).rows[0].present, true);
+      assert.equal((await pool.query("SELECT to_regclass('app_private.guest_registration_requests') IS NOT NULL present")).rows[0].present, true);
+      for (const table of ['subscriptions','seguridad_sesiones']) {
+        const definition = (await pool.query("SELECT pg_get_constraintdef(oid,true) definition FROM pg_constraint WHERE conrelid=$1::regclass AND conname=$2", [`public.${table}`, table === 'subscriptions' ? 'ck_sub_motivo_fin' : 'ck_seg_sesiones_motivo_cierre'])).rows[0].definition;
+        assert.match(definition, /eliminacion_cuenta/);
+      }
+    });
+
+    assert.deepEqual((await pool.query("SELECT conname, pg_get_constraintdef(oid,true) definition FROM pg_constraint WHERE conrelid='public.payment_intents'::regclass AND conname LIKE 'ck_payment_intents_%' ORDER BY conname")).rows, protectedBefore);
+    assert.deepEqual((await pool.query("SELECT p.proname, pg_get_functiondef(p.oid) definition FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('fn_trg_validar_pago_monto_tiempo','fn_payment_intents_capture_paid_at') ORDER BY p.proname")).rows, financialBefore);
+  } finally {
+    await isolated.stop();
+  }
 });
 
 test("PostgreSQL 17: migraciones fail-closed, idempotencia, ACL y paid_at", { skip: !RUN }, async (t) => {
