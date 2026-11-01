@@ -24,6 +24,13 @@ test("PostgreSQL 17: migraciones fail-closed, idempotencia, ACL y paid_at", { sk
   const { pool } = isolated;
   try {
     await isolated.sqlFile("test/fixtures/production-readiness-schema.sql");
+    const financialSql = await readFile(new URL(`../${financialPath}`, import.meta.url), "utf8");
+    await pool.query("INSERT INTO membership_purchase_orders(id_order,id_cliente,estado_orden_codigo) VALUES ('70000000-0000-4000-8000-000000000001','80000000-0000-4000-8000-000000000001','pagada')");
+    const validatorBefore = (await pool.query("SELECT pg_get_functiondef('public.fn_trg_validar_pago_monto_tiempo()'::regprocedure) definition")).rows[0].definition;
+    await assert.rejects(pool.query(financialSql), /MF_FINANCIAL_EVIDENCE_PREFLIGHT_FAILED/);
+    assert.equal((await pool.query("SELECT pg_get_functiondef('public.fn_trg_validar_pago_monto_tiempo()'::regprocedure) definition")).rows[0].definition, validatorBefore);
+    assert.equal((await pool.query("SELECT count(*)::int count FROM membership_purchase_orders WHERE estado_orden_codigo='pagada' AND paid_at IS NULL")).rows[0].count, 1);
+    await pool.query("DELETE FROM membership_purchase_orders WHERE id_order='70000000-0000-4000-8000-000000000001'");
     const protectedBefore = (await pool.query("SELECT conname FROM pg_constraint WHERE conrelid='public.payment_intents'::regclass AND conname LIKE 'ck_payment_intents_%' ORDER BY conname")).rows;
     await isolated.sqlFile(financialPath);
     await isolated.sqlFile(structuralPath);

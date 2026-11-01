@@ -24,6 +24,14 @@ BEGIN
       AND NOT t.tgisinternal AND t.tgenabled = 'O'
   ) THEN v_missing := array_append(v_missing, 'tr_payment_intents_capture_paid_at'); END IF;
 
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger t
+    WHERE t.tgrelid = 'public.payments'::regclass
+      AND t.tgname = 'tr_pay_aplicar'
+      AND t.tgfoid = to_regprocedure('public.fn_trg_aplicar_pago_a_cita()')
+      AND NOT t.tgisinternal AND t.tgenabled = 'O'
+  ) THEN v_missing := array_append(v_missing, 'tr_pay_aplicar'); END IF;
+
   IF cardinality(v_missing) > 0 THEN
     RAISE EXCEPTION 'MF_FINANCIAL_TRIGGER_PREFLIGHT_FAILED: %', array_to_string(v_missing, ',');
   END IF;
@@ -136,6 +144,6 @@ END;
 $function$;
 
 -- AM: Esta funcion usa nombres public no calificados; fijar su resolucion evita secuestro de objetos.
-ALTER FUNCTION public.fn_trg_aplicar_pago_a_intent() SET search_path = pg_catalog, public;
+ALTER FUNCTION public.fn_trg_aplicar_pago_a_cita() SET search_path = pg_catalog, public;
 
 COMMIT;

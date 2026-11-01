@@ -36,6 +36,12 @@ Required approval gate:
 
 No isolated restoration was started because Supabase's restore-to-new-project operation can create billable resources and no cost authorization was provided. Therefore promotion remains blocked.
 
+The zero-cost local logical-backup attempt also remains blocked: the official CLI has no local Supabase access token or database password, and no production credential exists in local environment files. No token was created and no remote password was reset. A logical dump cannot substitute for the managed physical-restore test.
+
+## Financial evidence trust boundary
+
+`paid_at` is an evidence-receipt timestamp, not evidence by itself. The database contract rejects missing timestamps and clock fallbacks, while the backend must establish authenticity before persisting it: PixelPay appointment recovery requires a fully verified approved Sale attempt, and membership activation requires a verified `payment_events` record. A privileged database writer could still forge both the timestamp and its supporting row; production uses the `postgres` database role for these tables, so authenticity ultimately depends on the backend verification path and credential integrity. This residual trust boundary must be accepted or replaced with a narrower writer role plus a database-enforced evidence reference before GO.
+
 ## Security disposition
 
 - Critical and corrected: direct `anon`/`authenticated` execution of two `SECURITY DEFINER` trigger functions. Their triggers remain enabled; direct client execution is revoked.

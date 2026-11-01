@@ -23,10 +23,10 @@ CREATE TABLE public.payments (
   paid_at timestamptz, pago_tardio boolean NOT NULL DEFAULT false
 );
 CREATE FUNCTION public.fn_trg_validar_pago_monto_tiempo() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
-CREATE FUNCTION public.fn_trg_aplicar_pago_a_intent() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+CREATE FUNCTION public.fn_trg_aplicar_pago_a_cita() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
 CREATE FUNCTION public.fn_payment_intents_capture_paid_at() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN RETURN NEW; END$$;
 CREATE TRIGGER tr_pay_validar BEFORE INSERT OR UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.fn_trg_validar_pago_monto_tiempo();
-CREATE TRIGGER tr_pay_aplicar AFTER INSERT OR UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.fn_trg_aplicar_pago_a_intent();
+CREATE TRIGGER tr_pay_aplicar AFTER INSERT OR UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.fn_trg_aplicar_pago_a_cita();
 CREATE TRIGGER tr_payment_intents_capture_paid_at BEFORE INSERT OR UPDATE OF estado_intent_codigo, paid_at ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION public.fn_payment_intents_capture_paid_at();
 
 CREATE TABLE public.membership_purchase_orders (
