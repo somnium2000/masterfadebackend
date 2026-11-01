@@ -65,7 +65,9 @@ test('dos reservas con mismo email no reutilizan Persona ni duplican identidad r
 test('contactos titular/acompañante se mantienen en payload canónico sin cuentas', async () => {
   const block = (order, contact) => ({ orden_integrante: order, id_persona: persona, contacto_email: contact,
     contacto_nombre: 'Guest', tipo_cliente_codigo: 'invitado', inicio_at: '2099-01-01T15:00:00Z',
-    selection: { serviceSelection: { items: [] } }, detailRows: [], id_empleado_barbero: persona });
+    selection: { serviceSelection: { items: [] } },
+    detailRows: [{ id_servicio: persona, cantidad: 1, duracion_min: 30, buffer_min: 5 }],
+    id_empleado_barbero: persona });
   const payload = buildCanonicalReservationPayload({ requestId: group, idSucursal: group, idPersonaTitular: persona,
     integrantes: [block(1, email), block(2, 'companion@example.test')] });
   assert.equal(payload.integrantes[0].contacto_email, email);
@@ -74,12 +76,18 @@ test('contactos titular/acompañante se mantienen en payload canónico sin cuent
   assert.match(citas, /contacto_email: integrante\.contacto\?\.email \|\| null/);
   let rpcCalls = 0;
   await createCanonicalReservation({ query: async (sql, params) => {
-    rpcCalls++; assert.equal(sql, 'SELECT app_private.crear_reserva_canonica_v1($1::jsonb) AS resultado');
+    rpcCalls++;
+    if (rpcCalls === 1) {
+      assert.match(sql, /pg_advisory_xact_lock/);
+      assert.ok(params[0].length > 0);
+      return { rows: [] };
+    }
+    assert.equal(sql, 'SELECT app_private.crear_reserva_canonica_v1($1::jsonb) AS resultado');
     assert.equal(params[0].integrantes[0].contacto_email, email);
     assert.equal(params[0].integrantes[1].contacto_email, 'companion@example.test');
     return { rows: [{ resultado: { id_grupo_cita: group } }] };
   } }, payload);
-  assert.equal(rpcCalls, 1);
+  assert.equal(rpcCalls, 2);
 });
 for (const name of ['sin correo en correos', 'correo histórico reasociado', 'reintento', 'conciliación interna']) {
   test(`${name}: contacto de reserva autoriza sin cambiar identidad ni importes`, async () => {

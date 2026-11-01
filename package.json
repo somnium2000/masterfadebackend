@@ -10,9 +10,8 @@
     "test": "node --test",
     "db:preflight": "node scripts/db-preflight.js",
     "load:local:1": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/load/artillery/run-local.ps1 -Stage 1",
-    "load:local:5": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/load/artillery/run-local.ps1 -Stage 5",
-    "load:local:10": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/load/artillery/run-local.ps1 -Stage 10",
     "load:local:25": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/load/artillery/run-local.ps1 -Stage 25",
+    "load:local:50": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/load/artillery/run-local.ps1 -Stage 50",
     "todopago:auth-smoke": "node scripts/todopago-auth-smoke.js"
   },
   "author": "",

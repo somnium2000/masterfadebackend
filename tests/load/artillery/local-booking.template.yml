@@ -4,43 +4,69 @@ config:
   phases:
     - duration: 1
       arrivalCount: __VUS__
-      name: "Crear __VUS__ VU concurrentes"
+      maxVusers: __VUS__
+      name: "Crear exactamente __VUS__ VU concurrentes"
   defaults:
     headers:
       accept: "application/json"
   plugins:
     expect: {}
+    metrics-by-endpoint: {}
 scenarios:
-  - name: "Hold real y actividad sostenida"
+  - name: "Recorrido público de reserva y liberación"
     beforeScenario: "assignSyntheticBooking"
     afterScenario: "recordVuserExit"
     flow:
-      - post:
-          url: "/v1/public/citas/hold"
-          headers:
-            content-type: "application/json"
-            x-idempotency-key: "{{ idempotencyKey }}"
-          json:
-            id_sucursal: "11111111-1111-4111-8111-111111111111"
-            titular:
-              nombre: "Artillery Sintetico"
-              email: "{{ email }}"
-              telefono: "99990000"
-            id_barbero: "33333333-3333-4333-8333-333333333333"
-            fecha_inicio: "{{ startAt }}"
-            selection_type: "services"
-            servicios:
-              - id_servicio: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-          expect:
-            - statusCode: 201
       - loop:
+          - function: "prepareBookingIteration"
           - get:
-              url: "/v1/health/live"
+              url: "/v1/public/catalog/servicios?id_sucursal={{ branchId }}&id_barbero={{ barberId }}"
               expect:
                 - statusCode: 200
+          - think: 0.4
           - get:
-              url: "/v1/public/citas/contexto"
+              url: "/v1/public/agenda/barberos?id_sucursal={{ branchId }}"
               expect:
                 - statusCode: 200
-          - think: 5
+          - think: 0.4
+          - get:
+              url: "/v1/public/agenda/disponibilidad?id_sucursal={{ branchId }}&selection_type=services&servicios={{ serviceId }}&fecha_desde={{ slotDate }}&fecha_hasta={{ slotDate }}&id_barbero={{ barberId }}"
+              expect:
+                - statusCode: 200
+          - think: 0.5
+          - post:
+              url: "/v1/public/citas/hold"
+              headers:
+                content-type: "application/json"
+                x-idempotency-key: "{{ idempotencyKey }}"
+              json:
+                id_sucursal: "{{ branchId }}"
+                titular:
+                  nombre: "Artillery Sintetico"
+                  email: "{{ email }}"
+                  telefono: "99990000"
+                id_barbero: "{{ barberId }}"
+                fecha_inicio: "{{ startAt }}"
+                selection_type: "services"
+                servicios:
+                  - id_servicio: "{{ serviceId }}"
+              capture:
+                - json: "$.data.id_grupo_cita"
+                  as: "groupId"
+                - json: "$.data.release_token"
+                  as: "releaseToken"
+              afterResponse: "recordHoldCreated"
+              expect:
+                - statusCode: 201
+          - think: 0.8
+          - delete:
+              url: "/v1/public/citas/hold/{{ groupId }}"
+              headers:
+                content-type: "application/json"
+              json:
+                release_token: "{{ releaseToken }}"
+              afterResponse: "recordHoldReleased"
+              expect:
+                - statusCode: 200
+          - function: "pauseBetweenIterations"
         count: __LOOPS__

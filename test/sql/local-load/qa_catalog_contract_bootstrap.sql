@@ -1,4 +1,5 @@
--- LOCAL LOAD TEST ONLY. Recovered from read-only QA catalog metadata on 2026-10-31.
+-- LOCAL LOAD TEST ONLY. Recovered from read-only QA catalog metadata and
+-- repository runtime contracts on 2026-10-31.
 -- This is deliberately separate from production migrations and contains no QA rows.
 BEGIN;
 
@@ -20,7 +21,16 @@ ALTER TABLE public.personas ADD COLUMN IF NOT EXISTS telefono_principal text,
 ALTER TABLE public.personas ALTER COLUMN id_persona SET DEFAULT gen_random_uuid();
 ALTER TABLE public.servicios_tarifas ADD COLUMN IF NOT EXISTS servicio_informativo boolean NOT NULL DEFAULT false;
 ALTER TABLE public.servicios ADD COLUMN IF NOT EXISTS activo boolean NOT NULL DEFAULT true,
-  ADD COLUMN IF NOT EXISTS deleted_at timestamptz, ADD COLUMN IF NOT EXISTS agendable boolean NOT NULL DEFAULT true;
+  ADD COLUMN IF NOT EXISTS deleted_at timestamptz, ADD COLUMN IF NOT EXISTS agendable boolean NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS descripcion text, ADD COLUMN IF NOT EXISTS grupo_catalogo text NOT NULL DEFAULT 'barberia',
+  ADD COLUMN IF NOT EXISTS visible_publico boolean NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS orden_visual integer NOT NULL DEFAULT 100;
+-- agendaService.js and the admin appointment route persist this timestamp.
+ALTER TABLE public.citas ADD COLUMN IF NOT EXISTS no_show_at timestamptz;
+CREATE TABLE IF NOT EXISTS public.payment_providers (
+  id_provider uuid PRIMARY KEY,
+  codigo text NOT NULL
+);
 ALTER TABLE public.horarios_semanales_sucursales_bloques
   ADD COLUMN IF NOT EXISTS id_bloque_horario uuid NOT NULL DEFAULT gen_random_uuid();
 CREATE UNIQUE INDEX IF NOT EXISTS uq_horarios_sucursales_bloques_id_bloque_horario
