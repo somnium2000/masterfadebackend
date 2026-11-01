@@ -114,7 +114,7 @@ BEGIN
 
   IF lower(COALESCE(v_provider_code, '')) = 'pixelpay' AND NOT v_historical_terminal THEN
     v_evidence_event_type := CASE
-      WHEN v_origin_code = 'membresia' THEN 'membership.pixelpay.approved_verified'
+      WHEN v_origin_code = 'membership' THEN 'membership.pixelpay.approved_verified'
       ELSE 'pixelpay.sale.approved_verified'
     END;
     SELECT count(*)::integer, min(pe.recibido_at)
@@ -128,7 +128,7 @@ BEGIN
       AND pe.evento_tipo = v_evidence_event_type
       AND pe.firma_valida IS TRUE
       AND pe.provider_event_id = (CASE
-        WHEN v_origin_code = 'membresia' THEN 'pixelpay_membership_' ELSE 'pixelpay_sale_' END)
+        WHEN v_origin_code = 'membership' THEN 'pixelpay_membership_' ELSE 'pixelpay_sale_' END)
         || (pe.payload_esencial->>'payment_attempt_id')
       AND (pe.payload_esencial->>'payment_uuid') = v_provider_session_id
       AND (pe.payload_esencial->>'payment_uuid') = NEW.provider_tx_id
@@ -184,7 +184,7 @@ BEGIN
        AND NEW.estado_intent_codigo IS NOT DISTINCT FROM OLD.estado_intent_codigo
        AND NEW.paid_at IS NOT DISTINCT FROM OLD.paid_at) THEN
     v_evidence_event_type := CASE
-      WHEN NEW.origen_pago_codigo = 'membresia' THEN 'membership.pixelpay.approved_verified'
+      WHEN NEW.origen_pago_codigo = 'membership' THEN 'membership.pixelpay.approved_verified'
       ELSE 'pixelpay.sale.approved_verified'
     END;
     SELECT count(*)::integer, min(pe.recibido_at)
@@ -198,7 +198,7 @@ BEGIN
       AND pe.evento_tipo = v_evidence_event_type
       AND pe.firma_valida IS TRUE
       AND pe.provider_event_id = (CASE
-        WHEN NEW.origen_pago_codigo = 'membresia' THEN 'pixelpay_membership_' ELSE 'pixelpay_sale_' END)
+        WHEN NEW.origen_pago_codigo = 'membership' THEN 'pixelpay_membership_' ELSE 'pixelpay_sale_' END)
         || (pe.payload_esencial->>'payment_attempt_id')
       AND (pe.payload_esencial->>'payment_uuid') = NEW.provider_session_id
       AND (pe.payload_esencial->>'transaction_id') = NEW.referencia_externa

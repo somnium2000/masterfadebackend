@@ -269,7 +269,7 @@ function pixelPayProcessHarness({
     verifiedEvidenceEvents: 0, verifiedReferenceWrites: 0, subscriptionInsertParams: null,
     statusClaimed: false, dynamicDurableEvidence: null, dynamicVerifiedAt: null,
     paymentProviderTxIds: [], paymentAmounts: [], paymentPaidAts: [],
-    orderPaidAts: [], subscriptionPaymentPaidAts: [], verifiedEventQueries: [],
+    orderPaidAts: [], intentPaidAts: [], subscriptionPaymentPaidAts: [], verifiedEventQueries: [],
   };
   const row = {
     ...intentRow("link_generado", owner),
@@ -385,6 +385,7 @@ function pixelPayProcessHarness({
       }
       if (text.includes("SET estado_intent_codigo = 'confirmado'")) {
         state.intentState = "confirmado";
+        state.intentPaidAts.push(values[1]);
         return { rows: [{ id_intent: INTENT }] };
       }
       if (text.startsWith("INSERT INTO public.payments")) {
@@ -683,6 +684,7 @@ test("aprobacion directa usa el primer recibido_at durable en todas las fechas f
   assert.equal(result.processed, true);
   assert.deepEqual(state.paymentPaidAts, [receivedAt]);
   assert.deepEqual(state.orderPaidAts, [receivedAt]);
+  assert.deepEqual(state.intentPaidAts, [receivedAt]);
   assert.deepEqual(state.subscriptionPaymentPaidAts, [receivedAt]);
   assert.ok(state.verifiedEventQueries.some(sql => /SELECT to_char\(min\(pe\.recibido_at\)/i.test(sql)));
 });
