@@ -42,6 +42,8 @@ The zero-cost local logical-backup attempt also remains blocked: the official CL
 
 `paid_at` is an evidence-receipt timestamp, not evidence by itself. The database contract rejects missing timestamps and clock fallbacks, while the backend must establish authenticity before persisting it: PixelPay appointment recovery requires a fully verified approved Sale attempt, and membership activation requires a verified `payment_events` record. A privileged database writer could still forge both the timestamp and its supporting row; production uses the `postgres` database role for these tables, so authenticity ultimately depends on the backend verification path and credential integrity. This residual trust boundary must be accepted or replaced with a narrower writer role plus a database-enforced evidence reference before GO.
 
+The current production catalog does not contain `app_private.pixelpay_sale_attempts`, while the prepared backend reads and writes that table in the PixelPay appointment flow. Deployment compatibility is therefore blocked until a new forward-only migration recreates and validates that contract; do not mark an old migration as applied or rewrite migration history.
+
 ## Security disposition
 
 - Critical and corrected: direct `anon`/`authenticated` execution of two `SECURITY DEFINER` trigger functions. Their triggers remain enabled; direct client execution is revoked.
