@@ -23,6 +23,20 @@ ALTER TABLE public.notificaciones_email
   ADD COLUMN cuerpo text;
 
 CREATE TABLE public.payment_providers (id_provider uuid PRIMARY KEY, codigo text NOT NULL);
+CREATE TABLE public.payment_events (
+  id_event uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  id_provider uuid NOT NULL REFERENCES public.payment_providers(id_provider),
+  provider_event_id text NOT NULL,
+  evento_tipo text NOT NULL,
+  firma_valida boolean NOT NULL DEFAULT false,
+  id_intent uuid REFERENCES public.payment_intents(id_intent),
+  id_payment uuid REFERENCES public.payments(id_payment),
+  payload_esencial jsonb NOT NULL DEFAULT '{}'::jsonb,
+  recibido_at timestamptz NOT NULL DEFAULT now(),
+  procesado_at timestamptz,
+  resultado_procesamiento text,
+  UNIQUE (id_provider, provider_event_id)
+);
 CREATE TABLE public.correos (
   id_persona uuid, direccion_correo text, es_principal boolean DEFAULT true, deleted_at timestamptz
 );
