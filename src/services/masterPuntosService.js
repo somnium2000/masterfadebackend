@@ -724,7 +724,13 @@ export async function getMasterPuntosRewardServicesConfig(app) {
   }
 }
 
-export async function updateMasterPuntosRewardServicesConfig(app, payload = {}) {
+export async function updateMasterPuntosRewardServicesConfig(app, claims, payload = {}) {
+  const roles = Array.isArray(claims?.roles) ? claims.roles : [];
+  if (!roles.includes("super_admin")) {
+    throw new AppError(403, "Solo super_admin puede actualizar la regla global", {
+      code: "MASTERPUNTOS_GLOBAL_RULE_FORBIDDEN",
+    });
+  }
   const noMembershipIds = parseUuidArray(payload?.[REWARD_CONDITION_NO_MEMBERSHIP], REWARD_CONDITION_NO_MEMBERSHIP);
   const withMembershipIds = parseUuidArray(payload?.[REWARD_CONDITION_WITH_MEMBERSHIP], REWARD_CONDITION_WITH_MEMBERSHIP);
   const client = await app.db.connect();
@@ -857,8 +863,6 @@ export async function listMasterPuntosClientes(app, claims, query = {}) {
       const idx = countParams.length;
       countWhere.push(`c.id_sucursal_origen = ${idx}::uuid`);
     }
-
-    await materializeExpiredCycles(client, null);
 
     const countQuerySql = `
       WITH rules_by_branch AS (
@@ -1087,7 +1091,6 @@ export async function getMasterPuntosClienteMovimientos(app, claims, idCliente, 
   const client = await app.db.connect();
   try {
     await ensureClientInScope(client, safeId, branchIds);
-    await materializeExpiredCycles(client, safeId);
 
     const page = Math.max(1, Number(query.page) || 1);
     const limit = Math.max(1, Math.min(100, Number(query.limit) || 50));

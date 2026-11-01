@@ -11,7 +11,15 @@ import {
 } from "../../../services/masterPuntosService.js";
 
 const ADMIN_ALLOWED_ROLES = ["admin", "super_admin"];
+const GLOBAL_REWARDS_WRITE_ROLES = ["super_admin"];
 const requestIdSchema = { type: "string" };
+const idempotencyHeadersSchema = {
+  type: "object",
+  properties: {
+    "x-idempotency-key": { type: "string", format: "uuid" },
+  },
+  additionalProperties: true,
+};
 
 const idClienteParamSchema = {
   type: "object",
@@ -109,7 +117,7 @@ export default async function adminPointsRoutes(app) {
   app.patch(
     "/regalias",
     {
-      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(GLOBAL_REWARDS_WRITE_ROLES),
       schema: {
         body: regaliasBodySchema,
         response: {
@@ -128,7 +136,7 @@ export default async function adminPointsRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const data = await updateMasterPuntosRewardServicesConfig(app, request.body || {});
+        const data = await updateMasterPuntosRewardServicesConfig(app, request.claims, request.body || {});
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo guardar la configuracion de regalias", "ADMIN_POINTS_REWARDS_SAVE_ERROR");
@@ -182,6 +190,7 @@ export default async function adminPointsRoutes(app) {
         const data = await searchActiveClientesForAdminPoints(app, {
           q: request.query?.q,
           limit: request.query?.limit,
+          claims: request.claims,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
@@ -212,7 +221,10 @@ export default async function adminPointsRoutes(app) {
     },
     async (request, reply) => {
       try {
-        const data = await getClientePointsSummary(app, request.params.id_cliente, { historyLimit: 20 });
+        const data = await getClientePointsSummary(app, request.params.id_cliente, {
+          historyLimit: 20,
+          claims: request.claims,
+        });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo obtener el resumen del cliente", "ADMIN_POINTS_SUMMARY_ERROR");
@@ -226,6 +238,7 @@ export default async function adminPointsRoutes(app) {
       preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
       schema: {
         params: idClienteParamSchema,
+        headers: idempotencyHeadersSchema,
         body: ajusteBodySchema,
         response: {
           200: {
@@ -242,6 +255,8 @@ export default async function adminPointsRoutes(app) {
       },
     },
     async (request, reply) => {
+      const idempotencyKey = request.headers?.["x-idempotency-key"];
+      reply.header("x-idempotency-key", idempotencyKey);
       try {
         const data = await addManualPointsAdjustment(app, {
           idCliente: request.params.id_cliente,
@@ -249,6 +264,8 @@ export default async function adminPointsRoutes(app) {
           puntos: request.body?.puntos,
           motivo: request.body?.motivo,
           usuarioAdmin: request.claims?.user,
+          claims: request.claims,
+          idempotencyKey,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {

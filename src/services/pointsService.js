@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { AppError } from "../utils/errors.js";
-import { assertUuid } from "./agendaService.js";
+import { assertUuid, resolveBranchIdsForClaims } from "./agendaService.js";
 
 const DEFAULT_PUNTOS_PARA_PREMIO = 10;
 const HISTORIAL_DEFAULT_LIMIT = 20;
@@ -11,6 +11,7 @@ const CLIENT_SEARCH_DEFAULT_LIMIT = 10;
 const CLIENT_SEARCH_MAX_LIMIT = 20;
 const MANUAL_ADJUST_TYPE_ADD = "ajustar";
 const MANUAL_ADJUST_TYPE_SUBTRACT = "ajuste_resta";
+const IDEMPOTENCY_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const REWARD_SERVICE_NAMES_NO_PLAN = ["corte de cabello", "corte de barba"];
 const REWARD_SERVICE_NAMES_WITH_PLAN = ["facial express"];
 const REDEEM_CONTEXT_TOKEN_PREFIX = "mf_reward_ctx_v1";
@@ -24,6 +25,77 @@ const SQL_COMPATIBLE_ERROR_CODES = new Set(["42P01", "42703", "42883"]);
 
 function normalizeText(value) {
   return String(value || "").trim();
+}
+
+function assertManualAdjustmentIdempotencyKey(value) {
+  const key = normalizeText(value).toLowerCase();
+  if (!IDEMPOTENCY_UUID_PATTERN.test(key)) {
+    throw new AppError(400, "La clave de idempotencia no es valida", {
+      code: "POINTS_ADJUSTMENT_IDEMPOTENCY_KEY_INVALID",
+    });
+  }
+  return key;
+}
+
+function buildManualAdjustmentPayloadHash({ idCliente, accion, puntos, motivo, usuarioAdmin }) {
+  return crypto.createHash("sha256").update(JSON.stringify({
+    v: 1,
+    id_cliente: idCliente,
+    accion,
+    puntos,
+    motivo,
+    usuario_admin: usuarioAdmin,
+  })).digest("hex");
+}
+
+async function claimManualAdjustmentIdempotency(client, {
+  idempotencyKey,
+  payloadHash,
+  idCliente,
+  usuarioAdmin,
+}) {
+  const inserted = await client.query(
+    `
+      INSERT INTO app_private.points_manual_adjustment_idempotency (
+        idempotency_key,
+        payload_hash,
+        id_cliente,
+        requested_by_usuario_id
+      )
+      VALUES ($1::uuid, $2::text, $3::uuid, $4::uuid)
+      ON CONFLICT (idempotency_key) DO NOTHING
+      RETURNING idempotency_key, payload_hash, response_payload
+    `,
+    [idempotencyKey, payloadHash, idCliente, usuarioAdmin]
+  );
+  if (inserted.rowCount === 1) return null;
+
+  const existing = await client.query(
+    `
+      SELECT payload_hash, response_payload
+      FROM app_private.points_manual_adjustment_idempotency
+      WHERE idempotency_key = $1::uuid
+      FOR UPDATE
+    `,
+    [idempotencyKey]
+  );
+  const row = existing.rows[0];
+  if (!row) {
+    throw new AppError(503, "No se pudo confirmar el ajuste solicitado", {
+      code: "POINTS_ADJUSTMENT_IDEMPOTENCY_UNAVAILABLE",
+    });
+  }
+  if (row.payload_hash !== payloadHash) {
+    throw new AppError(409, "La clave de idempotencia ya fue utilizada con otros datos", {
+      code: "POINTS_ADJUSTMENT_IDEMPOTENCY_CONFLICT",
+    });
+  }
+  if (!row.response_payload || typeof row.response_payload !== "object" || Array.isArray(row.response_payload)) {
+    throw new AppError(503, "No se pudo confirmar el resultado del ajuste", {
+      code: "POINTS_ADJUSTMENT_IDEMPOTENCY_UNAVAILABLE",
+    });
+  }
+  return { ...row.response_payload, idempotent_replay: true };
 }
 
 function normalizeServiceName(value) {
@@ -464,7 +536,11 @@ async function getAgregadosPuntos(client, idCliente) {
   const { rows } = await client.query(
     `
       SELECT
-        COALESCE(SUM(pt.puntos), 0)::int AS saldo_total,
+        COALESCE((
+          SELECT vpb.balance_puntos
+          FROM public.vw_points_balance vpb
+          WHERE vpb.id_cliente = $1::uuid
+        ), 0)::int AS saldo_total,
         COALESCE(SUM(CASE
           WHEN pt.puntos > 0 AND COALESCE(pt.origen_punto_codigo, 'titular') = 'titular'
             THEN pt.puntos
@@ -643,7 +719,35 @@ function assertAjusteAccion(value) {
   return action;
 }
 
-export async function searchActiveClientesForAdminPoints(app, { q, limit } = {}) {
+async function resolveAdminPointsScope(app, claims) {
+  if (!claims || typeof claims !== "object") return null;
+  const branchIds = await resolveBranchIdsForClaims(app, claims);
+  const isSuperAdmin = Array.isArray(claims?.roles) && claims.roles.includes("super_admin");
+  return { branchIds, isSuperAdmin };
+}
+
+async function assertClienteInAdminPointsScope(client, idCliente, scope) {
+  if (!scope || scope.isSuperAdmin) return;
+  const { rows } = await client.query(
+    `
+      SELECT c.id_cliente
+      FROM public.clientes c
+      WHERE c.id_cliente = $1::uuid
+        AND c.deleted_at IS NULL
+        AND COALESCE(c.estado, TRUE) IS TRUE
+        AND c.id_sucursal_origen = ANY($2::uuid[])
+      LIMIT 1
+    `,
+    [idCliente, scope.branchIds]
+  );
+  if (!rows[0]) {
+    throw new AppError(403, "El cliente no pertenece al alcance autorizado", {
+      code: "POINTS_CLIENT_BRANCH_FORBIDDEN",
+    });
+  }
+}
+
+export async function searchActiveClientesForAdminPoints(app, { q, limit, claims } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
   }
@@ -663,6 +767,7 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit } = {})
   const queryLower = query.toLowerCase();
   const containsPattern = `%${queryLower}%`;
   const startsWithPattern = `${queryLower}%`;
+  const scope = await resolveAdminPointsScope(app, claims);
 
   const { rows } = await app.db.query(
     `
@@ -693,6 +798,7 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit } = {})
         AND c.id_usuario IS NOT NULL
         AND COALESCE(u.estado, TRUE) IS TRUE
         AND COALESCE(u.estado_acceso, 'pendiente_password') NOT IN ('bloqueado', 'inactivo')
+        AND ($4::boolean IS TRUE OR c.id_sucursal_origen = ANY($3::uuid[]))
         AND (
           LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) LIKE $1::text
           OR LOWER(COALESCE(p.telefono_principal, '')) LIKE $1::text
@@ -708,9 +814,9 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit } = {})
         END,
         LOWER(TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, '')))) ASC,
         c.id_cliente ASC
-      LIMIT $3::int
+      LIMIT $5::int
     `,
-    [containsPattern, startsWithPattern, safeLimit]
+    [containsPattern, startsWithPattern, scope?.branchIds || [], scope?.isSuperAdmin ?? true, safeLimit]
   );
 
   return {
@@ -1197,15 +1303,19 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
   };
 }
 
-export async function getClientePointsSummary(app, idCliente, { historyLimit = HISTORIAL_DEFAULT_LIMIT } = {}) {
+export async function getClientePointsSummary(app, idCliente, {
+  historyLimit = HISTORIAL_DEFAULT_LIMIT,
+  claims,
+} = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
   }
 
   const safeClienteId = assertUuid(idCliente, "id_cliente");
+  const scope = await resolveAdminPointsScope(app, claims);
   const client = await app.db.connect();
   try {
-    await materializeCyclesIfAvailable(client, safeClienteId);
+    await assertClienteInAdminPointsScope(client, safeClienteId, scope);
     const cliente = await ensureClienteActivo(client, safeClienteId, { requireRegisteredUser: false });
     const agregados = await getAgregadosPuntos(client, safeClienteId);
     const puntosParaPremio = await resolvePuntosParaPremio(client, cliente.id_sucursal_origen || null);
@@ -1315,6 +1425,8 @@ export async function addManualPointsAdjustment(app, {
   puntos,
   motivo,
   usuarioAdmin,
+  claims,
+  idempotencyKey,
 } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
@@ -1325,13 +1437,33 @@ export async function addManualPointsAdjustment(app, {
   const safePuntos = assertPositiveIntegerPoints(puntos);
   const safeMotivo = assertMotivoObligatorio(motivo);
   const adminUserId = assertAdminUserId(usuarioAdmin);
+  const safeIdempotencyKey = assertManualAdjustmentIdempotencyKey(idempotencyKey);
+  const payloadHash = buildManualAdjustmentPayloadHash({
+    idCliente: safeClienteId,
+    accion: safeAccion,
+    puntos: safePuntos,
+    motivo: safeMotivo,
+    usuarioAdmin: adminUserId,
+  });
+  const scope = await resolveAdminPointsScope(app, claims);
   const dbClient = await app.db.connect();
 
   try {
     await dbClient.query("BEGIN");
     await lockClientePointsScope(dbClient, safeClienteId);
+    await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
     const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: true });
     await ensureClienteHasActiveAccessUser(dbClient, cliente.id_usuario, safeClienteId);
+    const replay = await claimManualAdjustmentIdempotency(dbClient, {
+      idempotencyKey: safeIdempotencyKey,
+      payloadHash,
+      idCliente: safeClienteId,
+      usuarioAdmin: adminUserId,
+    });
+    if (replay) {
+      await dbClient.query("COMMIT");
+      return replay;
+    }
     const adjustmentTypes = await resolveManualAdjustmentTypes(dbClient);
     await materializeCyclesIfAvailable(dbClient, safeClienteId);
 
@@ -1390,9 +1522,7 @@ export async function addManualPointsAdjustment(app, {
 
     const movimiento = insertResult.rows[0];
     const saldoActualizado = await getSaldoActual(dbClient, safeClienteId);
-    await dbClient.query("COMMIT");
-
-    return {
+    const response = {
       id_points_tx: movimiento.id_points_tx,
       id_cliente: movimiento.id_cliente,
       tipo_puntos_codigo: movimiento.tipo_puntos_codigo,
@@ -1403,7 +1533,27 @@ export async function addManualPointsAdjustment(app, {
       saldo_actual: saldoActualizado,
       saldo_siguiente: saldoSiguiente,
       created_at: movimiento.created_at ? new Date(movimiento.created_at).toISOString() : null,
+      idempotent_replay: false,
     };
+    const completed = await dbClient.query(
+      `
+        UPDATE app_private.points_manual_adjustment_idempotency
+        SET id_points_tx = $2::uuid,
+            response_payload = $3::jsonb,
+            completed_at = now()
+        WHERE idempotency_key = $1::uuid
+          AND id_points_tx IS NULL
+          AND response_payload IS NULL
+      `,
+      [safeIdempotencyKey, movimiento.id_points_tx, JSON.stringify(response)]
+    );
+    if (completed.rowCount !== 1) {
+      throw new AppError(503, "No se pudo confirmar el ajuste solicitado", {
+        code: "POINTS_ADJUSTMENT_IDEMPOTENCY_UNAVAILABLE",
+      });
+    }
+    await dbClient.query("COMMIT");
+    return response;
   } catch (error) {
     await dbClient.query("ROLLBACK").catch(() => {});
     throw error;

@@ -143,10 +143,28 @@ function normalizeCommissionRate(value) {
   return parsed;
 }
 
+function parseReportDateOnly(value, field) {
+  const dateOnly = parseDateOnly(value, field);
+  const [year, month, day] = dateOnly.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  const isValid = parsed.getUTCFullYear() === year
+    && parsed.getUTCMonth() === month - 1
+    && parsed.getUTCDate() === day;
+
+  if (!isValid) {
+    throw new AppError(400, `${field} debe ser una fecha calendario valida`, {
+      code: "REPORTES_DATE_INVALID",
+      details: { field, value: dateOnly },
+    });
+  }
+
+  return dateOnly;
+}
+
 function normalizeDateRange(query = {}) {
   const defaults = getDefaultDateRange(30);
-  const fechaDesde = parseDateOnly(query.fecha_desde || defaults.fechaDesde, "fecha_desde");
-  const fechaHasta = parseDateOnly(query.fecha_hasta || defaults.fechaHasta, "fecha_hasta");
+  const fechaDesde = parseReportDateOnly(query.fecha_desde || defaults.fechaDesde, "fecha_desde");
+  const fechaHasta = parseReportDateOnly(query.fecha_hasta || defaults.fechaHasta, "fecha_hasta");
 
   if (fechaDesde > fechaHasta) {
     throw new AppError(400, "fecha_desde no puede ser mayor que fecha_hasta", {
@@ -314,9 +332,42 @@ function appendCsvSection(lines, title, columns, rows) {
   lines.push("");
 }
 
+const SPREADSHEET_FORMULA_CHARACTERS = new Set(["=", "+", "-", "@", "\uff1d", "\uff0b", "\uff0d", "\u2212", "\uff20"]);
+const SPREADSHEET_NUMERIC_VALUE = /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?$/i;
+
+function isSpreadsheetPrefixCharacter(character) {
+  const codePoint = character.codePointAt(0);
+  return codePoint <= 0x20
+    || (codePoint >= 0x7f && codePoint <= 0x9f)
+    || [0xa0, 0x1680, 0x180e, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff].includes(codePoint)
+    || (codePoint >= 0x2000 && codePoint <= 0x200f)
+    || (codePoint >= 0x2060 && codePoint <= 0x206f);
+}
+
+function hasSpreadsheetFormulaPrefix(value) {
+  for (const character of value) {
+    if (isSpreadsheetPrefixCharacter(character)) continue;
+    return SPREADSHEET_FORMULA_CHARACTERS.has(character);
+  }
+  return false;
+}
+
+function isSpreadsheetNumericValue(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "bigint") return true;
+  if (typeof value !== "string" || /[\t\r\n]/.test(value)) return false;
+  return SPREADSHEET_NUMERIC_VALUE.test(value.trim());
+}
+
+function neutralizeSpreadsheetCell(value) {
+  if (value === null || value === undefined || isSpreadsheetNumericValue(value)) return value;
+  const normalized = String(value);
+  return hasSpreadsheetFormulaPrefix(normalized) ? `'${normalized}` : normalized;
+}
+
 function csvEscape(value) {
   if (value === null || value === undefined) return "";
-  const normalized = String(value);
+  const normalized = String(neutralizeSpreadsheetCell(value));
   if (/["\r\n,]/.test(normalized)) {
     return `"${normalized.replace(/"/g, "\"\"")}"`;
   }
@@ -329,7 +380,11 @@ function createHtmlTable(title, columns, rows) {
     ? rows
         .map(
           (row) =>
-            `<tr>${columns.map((column) => `<td>${escapeHtml(row?.[column] ?? "")}</td>`).join("")}</tr>`
+            `<tr>${columns.map((column) => {
+              const value = row?.[column] ?? "";
+              const textStyle = isSpreadsheetNumericValue(value) ? "" : ` style="mso-number-format:'\\@';"`;
+              return `<td${textStyle}>${escapeHtml(neutralizeSpreadsheetCell(value))}</td>`;
+            }).join("")}</tr>`
         )
         .join("")
     : `<tr><td colspan="${columns.length}">sin datos</td></tr>`;
@@ -757,7 +812,7 @@ async function buildReportsSnapshot(client, params) {
     client.query(
       `
         SELECT
-          EXTRACT(ISODOW FROM c.inicio_at)::int AS dia_semana_num,
+          EXTRACT(ISODOW FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int AS dia_semana_num,
           COUNT(*)::int AS total_citas,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'no_show')::int AS no_show,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'completada')::int AS completadas
@@ -768,7 +823,7 @@ async function buildReportsSnapshot(client, params) {
           AND c.id_sucursal = ANY($3::uuid[])
           AND ($4::uuid IS NULL OR c.id_sucursal = $4::uuid)
           AND ($5::uuid IS NULL OR c.id_empleado_barbero = $5::uuid)
-        GROUP BY EXTRACT(ISODOW FROM c.inicio_at)::int
+        GROUP BY EXTRACT(ISODOW FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int
         ORDER BY dia_semana_num ASC
       `,
       [fromIso, toIsoExclusive, branchIds, selectedBranchId, selectedBarberId]
@@ -776,7 +831,7 @@ async function buildReportsSnapshot(client, params) {
     client.query(
       `
         SELECT
-          EXTRACT(HOUR FROM c.inicio_at)::int AS hora,
+          EXTRACT(HOUR FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int AS hora,
           COUNT(*)::int AS total_citas,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'no_show')::int AS no_show,
           COUNT(*) FILTER (WHERE c.estado_cita_codigo = 'completada')::int AS completadas
@@ -787,7 +842,7 @@ async function buildReportsSnapshot(client, params) {
           AND c.id_sucursal = ANY($3::uuid[])
           AND ($4::uuid IS NULL OR c.id_sucursal = $4::uuid)
           AND ($5::uuid IS NULL OR c.id_empleado_barbero = $5::uuid)
-        GROUP BY EXTRACT(HOUR FROM c.inicio_at)::int
+        GROUP BY EXTRACT(HOUR FROM (c.inicio_at AT TIME ZONE 'America/Tegucigalpa'))::int
         ORDER BY total_citas DESC, hora ASC
       `,
       [fromIso, toIsoExclusive, branchIds, selectedBranchId, selectedBarberId]
