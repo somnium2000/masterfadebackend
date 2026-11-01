@@ -243,6 +243,7 @@ function createPagosClient({
   const calls = [];
   const statusChecks = [];
   const payments = structuredClone(initialPayments);
+  const paymentEvents = [];
   let saleAttempts = structuredClone(initialSaleAttempts);
   let transactionSnapshot = null;
   let activeIntent = existingIntent ? { ...existingIntent } : null;
@@ -305,7 +306,7 @@ function createPagosClient({
       const text = typeof sql === "object" ? sql.text : String(sql);
       calls.push({ sql: text, params });
       if (text === "BEGIN") {
-        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, saleAttempts, groupStateCode });
+        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, paymentEvents, saleAttempts, groupStateCode });
         return { rows: [] };
       }
       if (text === "COMMIT") { transactionSnapshot = null; return { rows: [] }; }
@@ -314,6 +315,7 @@ function createPagosClient({
           activeIntent = transactionSnapshot.activeIntent;
           groupState.splice(0, groupState.length, ...transactionSnapshot.groupState);
           payments.splice(0, payments.length, ...transactionSnapshot.payments);
+          paymentEvents.splice(0, paymentEvents.length, ...transactionSnapshot.paymentEvents);
           saleAttempts = transactionSnapshot.saleAttempts;
           groupStateCode = transactionSnapshot.groupStateCode;
           transactionSnapshot = null;
@@ -611,6 +613,24 @@ function createPagosClient({
           last_verified_at: params[9],
         };
         return { rows: [{ id_status_check: "abababab-abab-4bab-8bab-abababababab" }] };
+      }
+      if (text.includes("INSERT INTO public.payment_events") && text.includes("SELECT pi.id_provider")) {
+        if (!paymentEvents.some((row) => row.provider_event_id === params[1])) {
+          paymentEvents.push({
+            id_intent: params[0],
+            provider_event_id: params[1],
+            evento_tipo: params[2],
+            payload_esencial: params[3],
+            recibido_at: new Date().toISOString(),
+          });
+        }
+        return { rows: [] };
+      }
+      if (text.includes("min(pe.recibido_at)::text AS verified_at") && text.includes("FROM public.payment_events pe")) {
+        const rows = paymentEvents
+          .filter((row) => row.id_intent === params[0])
+          .sort((a, b) => a.recibido_at.localeCompare(b.recibido_at));
+        return { rows: [{ verified_at: rows[0]?.recibido_at ?? null }] };
       }
       if (text.includes("FROM public.payments") && text.includes("estado_pago_codigo = 'capturado'")) {
         const payment = payments.find((row) => row.id_intent === params[0]);
@@ -2159,7 +2179,7 @@ function reconcileFixture(client, overrides = {}) {
   return reconcilePixelPayPaid(client, {
     idGrupoCita: GROUP_A, idIntent: INTENT_A, titularEmail: "cliente@example.com",
     paymentUuid: "PAYMENT-UUID-NEW", providerTransactionId: "TX-SANDBOX-REPEATED",
-    expectedAmount: 115, ...overrides,
+    expectedAmount: 115, paidAt: "2099-01-01T15:59:00.000Z", ...overrides,
   });
 }
 
@@ -2937,12 +2957,59 @@ test("status rechaza payment_uuid diferente al persistido", async () => {
   await app.close();
 });
 
-test("status PAID reconcilia una sola vez y repetido no duplica payment", async () => {
+test("status PAID sin evidencia autentica completa queda bloqueado y no crea paid_verified", async () => {
+  const cases = [
+    ["sin evidencia", {}],
+    ["hash incorrecto", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-blocked", transactionId: "transaction-id-blocked", paymentHashValid: false, amountMatches: true }],
+    ["importe diferente", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-blocked", transactionId: "transaction-id-blocked", paymentHashValid: true, amountMatches: false }],
+    ["payment_uuid inconsistente", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-other", transactionId: "transaction-id-blocked", paymentHashValid: true, amountMatches: true }],
+    ["transaction_id inconsistente", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-blocked", transactionId: "transaction-id-other", paymentHashValid: true, amountMatches: true }],
+  ];
+
+  for (const [name, evidence] of cases) {
+    const provider = {
+      calls: [],
+      async queryPaymentStatus(paymentUuid, expected) {
+        this.calls.push({ paymentUuid, expected });
+        return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid, ...evidence };
+      },
+    };
+    const client = createPagosClient({
+      providerCode: "pixelpay",
+      existingIntent: {
+        id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
+        id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
+        expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+        provider_session_id: "payment-uuid-blocked", referencia_externa: "transaction-id-blocked",
+        created_by_usuario_id: USER_A,
+      },
+    });
+    const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+    const response = await app.inject({
+      method: "POST", url: "/v1/public/pagos/pixelpay/status",
+      payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+    });
+
+    assert.equal(response.statusCode, 202, `${name}: ${response.body}`);
+    assert.equal(response.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT", name);
+    assert.equal(response.json().data.booking_confirmed, false, name);
+    assert.equal(client.getPayments().length, 0, name);
+    assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion", name);
+    assert.equal(client.calls.filter((call) => call.sql.includes("pixelpay.status.paid_verified")).length, 0, name);
+    assert.equal(provider.calls[0].paymentUuid, "payment-uuid-blocked", name);
+    assert.equal(provider.calls[0].expected, undefined, `${name}: Status no recibe importe local como evidencia`);
+    await app.close();
+  }
+});
+
+test("status PAID sin Sale durable repetido queda bloqueado y no crea payment", async () => {
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus(paymentUuid) {
       this.statusCalls += 1;
-      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid };
+      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid,
+        approved: true, incomplete: false, resultPaymentUuid: paymentUuid,
+        transactionId: "transaction-id-paid-qa", paymentHashValid: true, amountMatches: true };
     },
   };
   const client = createPagosClient({
@@ -2974,16 +3041,13 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   };
 
   const first = await app.inject(request);
-  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.statusCode, 202, first.body);
   assert.equal(first.json().data.provider_status, "PAID");
-  assert.equal(first.json().data.booking_confirmed, true);
-  assert.equal(client.getPayments().length, 1);
-  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-paid-qa");
-  assert.ok(Number.isFinite(Date.parse(client.getPayments()[0].paid_at)));
-  assert.equal(client.getPayments()[0].monto_hnl, 115);
-  assert.equal(client.getPayments()[0].moneda_codigo, "HNL");
+  assert.equal(first.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT");
+  assert.equal(first.json().data.booking_confirmed, false);
+  assert.equal(client.getPayments().length, 0);
   assert.equal(client.getActiveIntent().provider_session_id, "payment-uuid-paid-qa");
-  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
   const sideEffectsAfterFirst = {
     promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,
     emails: client.calls.filter((call) => /notificaciones_email/i.test(call.sql)).length,
@@ -2991,12 +3055,12 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   };
 
   const second = await app.inject(request);
-  assert.equal(second.statusCode, 200, second.body);
-  assert.equal(second.json().data.duplicate, true);
-  assert.equal(client.getPayments().length, 1);
+  assert.equal(second.statusCode, 202, second.body);
+  assert.equal(second.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT");
+  assert.equal(client.getPayments().length, 0);
   assert.equal(provider.statusCalls, 2);
   assert.equal(client.getStatusChecks().length, 2);
-  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 0);
   assert.deepEqual({
     promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,
     emails: client.calls.filter((call) => /notificaciones_email/i.test(call.sql)).length,
@@ -3005,12 +3069,14 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   await app.close();
 });
 
-test("dos Status PAID concurrentes producen un payment y una confirmacion efectiva", async () => {
+test("dos Status PAID concurrentes sin Sale durable quedan bloqueados sin payment", async () => {
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus(paymentUuid) {
       this.statusCalls += 1;
-      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid };
+      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid,
+        approved: true, incomplete: false, resultPaymentUuid: paymentUuid,
+        transactionId: "transaction-id-concurrent-qa", paymentHashValid: true, amountMatches: true };
     },
   };
   const client = createPagosClient({
@@ -3047,13 +3113,12 @@ test("dos Status PAID concurrentes producen un payment y una confirmacion efecti
 
   const [first, second] = await Promise.all([app.inject(request), app.inject(request)]);
 
-  assert.deepEqual([first.statusCode, second.statusCode], [200, 200]);
+  assert.deepEqual([first.statusCode, second.statusCode], [202, 202]);
   assert.equal(provider.statusCalls, 2);
   assert.equal(client.getStatusChecks().length, 2);
-  assert.equal(client.getPayments().length, 1);
-  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-concurrent-qa");
-  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
-  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
   await app.close();
 });
 

@@ -13,6 +13,8 @@ import { PaymentProviderFactory } from "../src/services/payments/PaymentProvider
 const migrationUrl = new URL("../db/migrations/pixel/20261011213325_payment_late_uses_paid_at_v1.sql", import.meta.url);
 const baselineUrl = new URL("./sql/payments/qa_payment_triggers_20261011.sql", import.meta.url);
 const RUN = process.env.RUN_PAYMENT_LATE_PG_INTEGRATION === "true";
+const RUN_FINANCIAL_CONTRACT = process.env.RUN_FINANCIAL_CONTRACT_PG === "true";
+const financialContractUrl = new URL("../db/migrations/pixel/20261101025900_financial_paid_at_contract_v2.sql", import.meta.url);
 const INTENT = "9b1626eb-0c04-4ce3-ae93-5296ddcb02fe";
 const GROUP = "1cc40753-b888-4452-82b5-8e384d590fbc";
 const CITA = "05f53173-ab1a-4b35-8a70-88f2f40d22f2";
@@ -20,9 +22,14 @@ const HOLD = "1dcc3717-bec0-4b31-be58-20f0821c947a";
 const PERSON = "11111111-1111-4111-8111-111111111111";
 const BARBER = "9f7192ec-f8ee-41be-91c4-b0f4024e63a2";
 const PROVIDER = "22222222-2222-4222-8222-222222222222";
+const OTHER_PROVIDER = "33333333-3333-4333-8333-333333333333";
+const OTHER_INTENT = "44444444-4444-4444-8444-444444444444";
+const MEMBERSHIP_INTENT = "55555555-5555-4555-8555-555555555555";
+const MEMBERSHIP_ORDER = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const UUID = "S-a2f5612c-5084-4134-ad5f-feeb0ae6d8c8";
 const TX = "1f694eee-4715-45b8-a545-000000000000";
 const PAID_AT = "2026-10-11T19:43:29.880935Z";
+const FINALIZED_AT = "2026-10-11T19:43:28.123456Z";
 const EXPIRY = "2026-10-11T19:48:29.071048Z";
 const EMAIL = "qa-regression@example.invalid";
 
@@ -279,4 +286,251 @@ test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en clus
     });
   } catch (error) { primaryError = error; throw error; }
   finally { await cleanupPreservingError(isolated.stop, primaryError); }
+});
+
+test("PostgreSQL 17: contrato financiero exige evidencia y deshabilita pagos manuales nuevos", {
+  skip: !RUN_FINANCIAL_CONTRACT,
+}, async () => {
+  const isolated = await startIsolatedPostgres();
+  const { client } = isolated;
+  let primaryError;
+  try {
+    const historical = await readFile(new URL("../db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql", import.meta.url), "utf8");
+    await client.query(await readFile(new URL("./sql/microfase2a2/pre_2a2_schema.sql", import.meta.url), "utf8"));
+    await client.query(await readFile(new URL("./sql/payments/late_payment_support.sql", import.meta.url), "utf8"));
+    await client.query(await readFile(baselineUrl, "utf8"));
+    await client.query(functionSql(historical, "public.fn_payment_intents_capture_paid_at"));
+    await client.query(`CREATE TRIGGER tr_payment_intents_capture_paid_at BEFORE INSERT OR UPDATE OF estado_intent_codigo,paid_at
+      ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION public.fn_payment_intents_capture_paid_at()`);
+    await client.query(await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8"));
+
+    await seed(client, { intentExpiry: "2099-01-01T16:00:00.000Z", holdExpiry: "2099-01-01T16:00:00.000Z",
+      holdState: "activo", intentState: "pendiente_confirmacion", citaState: "pendiente_pago" });
+    await client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'manual_pagado','legacy-manual',1,'HNL',NULL,TRUE)`, [INTENT]);
+    await client.query(`INSERT INTO public.payment_intents
+      (id_intent,id_provider,id_membership_order,origen_pago_codigo,estado_intent_codigo,monto_hnl,moneda_codigo,
+       referencia_externa,provider_session_id,expires_at,paid_at)
+      SELECT ('70000000-0000-4000-8000-' || lpad(gs::text,12,'0'))::uuid,$1,gen_random_uuid(),
+        'membership','confirmado',1,'HNL','legacy-tx-' || gs,'legacy-uuid-' || gs,$2,NULL
+      FROM generate_series(1,7) gs`, [PROVIDER, EXPIRY]);
+
+    await client.query(await readFile(financialContractUrl, "utf8"));
+    assert.equal((await client.query(`SELECT count(*)::int count FROM public.payment_intents
+      WHERE origen_pago_codigo='membership' AND estado_intent_codigo='confirmado' AND paid_at IS NULL`)).rows[0].count, 7);
+    assert.equal((await client.query("SELECT count(*)::int count FROM public.payments WHERE provider_tx_id='legacy-manual'")).rows[0].count, 1);
+    await client.query("DELETE FROM public.payments WHERE provider_tx_id='legacy-manual'");
+
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'manual_pagado','new-manual',1,'HNL',$2,TRUE)`, [INTENT, PAID_AT]),
+    /MF_MANUAL_PAYMENT_DISABLED/);
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','missing-evidence',1,'HNL',NULL,FALSE)`, [INTENT]),
+    /MF_PAYMENT_PAID_AT_REQUIRED/);
+
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','arbitrary-timestamp',1,'HNL',$2,FALSE)`, [INTENT, PAID_AT]),
+    /MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED/);
+    await assert.rejects(client.query(`UPDATE public.payment_intents
+      SET paid_at=$2 WHERE id_intent=$1`, [INTENT, PAID_AT]),
+    /MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED/);
+
+    await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome,
+      sdk_response_class,upstream_http_status,uncertain,response_success,response_approved,response_incomplete,
+      transaction_result_valid,transaction_result_parsed,payment_uuid_present,transaction_id_present,payment_hash_present,
+      payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches)
+      VALUES ($1,$2,$3,'approved','SuccessResponse',200,false,true,true,false,
+        true,true,true,true,true,true,true,true,true)`, [INTENT, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", FINALIZED_AT]);
+
+    await client.query("INSERT INTO public.payment_providers(id_provider,codigo) VALUES ($1,'pixelpay-shadow')", [OTHER_PROVIDER]);
+    await client.query(`INSERT INTO public.payment_intents(id_intent,id_cita,id_hold,id_grupo_cita,id_provider,monto_hnl,
+      moneda_codigo,expires_at,estado_intent_codigo,provider_session_id,referencia_externa)
+      SELECT $1,id_cita,id_hold,id_grupo_cita,id_provider,monto_hnl,moneda_codigo,expires_at,
+        'creado',provider_session_id,referencia_externa FROM public.payment_intents WHERE id_intent=$2`, [OTHER_INTENT, INTENT]);
+
+    const eventPayload = {
+      payment_uuid: UUID, transaction_id: TX, amount: 1, currency: "HNL",
+      payment_hash_valid: true, amount_matches: true,
+      payment_attempt_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    };
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'wrong-provider','pixelpay.sale.approved_verified',TRUE,$2,$3,$4)`,
+    [OTHER_PROVIDER, eventPayload, INTENT, PAID_AT]);
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'wrong-intent','pixelpay.sale.approved_verified',TRUE,$2,$3,$4)`,
+    [PROVIDER, eventPayload, OTHER_INTENT, PAID_AT]);
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'false-evidence','pixelpay.sale.approved_verified',FALSE,$2,$3,$4)`,
+    [PROVIDER, eventPayload, INTENT, PAID_AT]);
+    await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,created_at)
+      VALUES ($1,$2,$3)`, [INTENT, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", FINALIZED_AT]);
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'pixelpay_sale_dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        'pixelpay.sale.approved_verified',TRUE,$2,$3,$4)`, [PROVIDER, {
+      payment_uuid: UUID, transaction_id: TX, currency: "HNL",
+      payment_hash_valid: true, amount_matches: true,
+      payment_attempt_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    }, INTENT, PAID_AT]);
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','invalid-events',1,'HNL',$2,FALSE)`, [INTENT, PAID_AT]),
+    /MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED/);
+
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'pixelpay_sale_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'pixelpay.sale.approved_verified',TRUE,$2,$3,$4)`, [PROVIDER, eventPayload, INTENT, PAID_AT]);
+
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado',$3,1,'HNL',$2::timestamptz + interval '1 second',FALSE)`, [INTENT, PAID_AT, UUID]),
+    /MF_PAYMENT_PAID_AT_EVIDENCE_MISMATCH/);
+
+    await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome)
+      VALUES ($1,$2,$3,'approved')`, [INTENT, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", FINALIZED_AT]);
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'pixelpay_sale_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+        'pixelpay.sale.approved_verified',TRUE,$2,$3,$4)`, [PROVIDER, {
+      ...eventPayload, payment_attempt_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    }, INTENT, PAID_AT]);
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado',$3,1,'HNL',$2,FALSE)`, [INTENT, PAID_AT, UUID]),
+    /MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED/);
+    await client.query("DELETE FROM public.payment_events WHERE provider_event_id='pixelpay_sale_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'");
+
+    const evidenceDiagnostic = await client.query(`SELECT
+      pe.id_provider=pi.id_provider provider_matches,
+      pe.provider_event_id=('pixelpay_sale_' || (pe.payload_esencial->>'payment_attempt_id')) event_id_matches,
+      (pe.payload_esencial->>'payment_uuid')=pi.provider_session_id uuid_matches,
+      (pe.payload_esencial->>'transaction_id')=pi.referencia_externa transaction_matches,
+      a.id_intent=pe.id_intent attempt_matches
+      FROM public.payment_events pe
+      JOIN public.payment_intents pi ON pi.id_intent=$1
+      JOIN app_private.pixelpay_sale_attempts a
+        ON a.payment_attempt_id::text=pe.payload_esencial->>'payment_attempt_id'
+      WHERE pe.provider_event_id LIKE 'pixelpay_sale_%'`, [INTENT]);
+    assert.ok(evidenceDiagnostic.rows.some((row) => Object.values(row).every(Boolean)),
+      JSON.stringify(evidenceDiagnostic.rows));
+    const canonicalEvidence = await client.query(`SELECT count(*)::int count,min(pe.recibido_at)::text paid_at
+      FROM public.payment_events pe
+      JOIN app_private.pixelpay_sale_attempts a ON a.id_intent=pe.id_intent
+       AND a.payment_attempt_id::text=(pe.payload_esencial->>'payment_attempt_id')
+      JOIN public.payment_intents pi ON pi.id_intent=pe.id_intent
+      WHERE pe.id_intent=$1 AND pe.id_provider=pi.id_provider
+       AND pe.evento_tipo='pixelpay.sale.approved_verified' AND pe.firma_valida IS TRUE
+       AND pe.provider_event_id='pixelpay_sale_' || (pe.payload_esencial->>'payment_attempt_id')
+       AND (pe.payload_esencial->>'payment_uuid')=pi.provider_session_id
+       AND (pe.payload_esencial->>'transaction_id')=pi.referencia_externa
+       AND CASE WHEN jsonb_typeof(pe.payload_esencial->'amount')='number'
+         THEN (pe.payload_esencial->>'amount')::numeric END=pi.monto_hnl
+       AND upper(pe.payload_esencial->>'currency')=upper(pi.moneda_codigo)
+       AND (pe.payload_esencial->>'payment_hash_valid')='true'
+       AND (pe.payload_esencial->>'amount_matches')='true'`, [INTENT]);
+    assert.equal(canonicalEvidence.rows[0].count, 1);
+    assert.equal(new Date(canonicalEvidence.rows[0].paid_at).toISOString(), new Date(PAID_AT).toISOString());
+
+    let payment;
+    try {
+      payment = await client.query(`INSERT INTO public.payments
+        (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+        VALUES ($1,'capturado',$3,1,'HNL',$2,FALSE)
+        RETURNING paid_at::text,pago_tardio`, [INTENT, PAID_AT, UUID]);
+    } catch (error) {
+      error.message += `\n${error.where || "no-context"}`;
+      throw error;
+    }
+    assert.equal(new Date(payment.rows[0].paid_at).toISOString(), new Date(PAID_AT).toISOString());
+    assert.equal(payment.rows[0].pago_tardio, false);
+    const applied = (await client.query(`SELECT i.estado_intent_codigo,i.paid_at::text,h.estado_hold_codigo,c.estado_cita_codigo
+      FROM public.payment_intents i JOIN public.citas_holds h ON h.id_hold=i.id_hold
+      JOIN public.citas c ON c.id_cita=i.id_cita WHERE i.id_intent=$1`, [INTENT])).rows[0];
+    assert.equal(applied.estado_intent_codigo, "confirmado");
+    assert.equal(new Date(applied.paid_at).toISOString(), new Date(PAID_AT).toISOString());
+    assert.equal(applied.estado_hold_codigo, "consumido");
+    assert.equal(applied.estado_cita_codigo, "confirmada");
+
+    await client.query(`CREATE TABLE public.membership_purchase_orders (
+      id_order uuid PRIMARY KEY, estado_orden_codigo text NOT NULL, paid_at timestamptz
+    );
+    CREATE TABLE public.subscriptions (
+      id_suscripcion uuid PRIMARY KEY DEFAULT gen_random_uuid(), id_intent uuid NOT NULL UNIQUE
+    );
+    CREATE TABLE public.subscription_benefits (
+      id_benefit uuid PRIMARY KEY DEFAULT gen_random_uuid(), id_suscripcion uuid NOT NULL UNIQUE
+    );`);
+    await client.query(`INSERT INTO public.membership_purchase_orders(id_order,estado_orden_codigo)
+      VALUES ($1,'pendiente_pago')`, [MEMBERSHIP_ORDER]);
+    await client.query(`INSERT INTO public.payment_intents
+      (id_intent,id_provider,id_membership_order,origen_pago_codigo,estado_intent_codigo,monto_hnl,moneda_codigo,
+       referencia_externa,provider_session_id,expires_at)
+      VALUES ($1,$2,$3,'membership','pendiente_confirmacion',1,'HNL',$4,$5,$6)`,
+    [MEMBERSHIP_INTENT, PROVIDER, MEMBERSHIP_ORDER, TX, `${UUID}-membership`, EXPIRY]);
+    await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,created_at)
+      VALUES ($1,$2,$3)`, [MEMBERSHIP_INTENT, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", FINALIZED_AT]);
+    await client.query(`INSERT INTO public.payment_events
+      (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+      VALUES ($1,'pixelpay_membership_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+       'membership.pixelpay.approved_verified',TRUE,$2,$3,$4)`, [PROVIDER, {
+      provider: "pixelpay", id_intent: MEMBERSHIP_INTENT, id_order: MEMBERSHIP_ORDER,
+      payment_uuid: `${UUID}-membership`, transaction_id: TX, amount: 1, currency: "HNL",
+      payment_hash_valid: true, amount_matches: true,
+      payment_attempt_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    }, MEMBERSHIP_INTENT, PAID_AT]);
+    const activateMembership = async () => {
+      await client.query("BEGIN");
+      try {
+        await client.query(`UPDATE public.payment_intents
+          SET estado_intent_codigo='confirmado',paid_at=$2 WHERE id_intent=$1`, [MEMBERSHIP_INTENT, PAID_AT]);
+        await client.query(`INSERT INTO public.payments
+          (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+          VALUES ($1,'capturado',$2,1,'HNL',$3,FALSE)
+          ON CONFLICT(provider_tx_id) DO UPDATE SET updated_at=now()
+          WHERE public.payments.id_intent=EXCLUDED.id_intent`,
+        [MEMBERSHIP_INTENT, `${UUID}-membership`, PAID_AT]);
+        const subscription = await client.query(`INSERT INTO public.subscriptions(id_intent) VALUES ($1)
+          ON CONFLICT(id_intent) DO UPDATE SET id_intent=EXCLUDED.id_intent RETURNING id_suscripcion`,
+        [MEMBERSHIP_INTENT]);
+        await client.query(`INSERT INTO public.subscription_benefits(id_suscripcion) VALUES ($1)
+          ON CONFLICT(id_suscripcion) DO NOTHING`, [subscription.rows[0].id_suscripcion]);
+        await client.query(`UPDATE public.membership_purchase_orders
+          SET estado_orden_codigo='pagada',paid_at=$2 WHERE id_order=$1`, [MEMBERSHIP_ORDER, PAID_AT]);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      }
+    };
+    await activateMembership();
+    await activateMembership();
+    const membershipCounts = (await client.query(`SELECT
+      (SELECT count(*)::int FROM public.payments WHERE id_intent=$1) payments,
+      (SELECT count(*)::int FROM public.subscriptions WHERE id_intent=$1) subscriptions,
+      (SELECT count(*)::int FROM public.subscription_benefits sb JOIN public.subscriptions s USING(id_suscripcion)
+        WHERE s.id_intent=$1) benefits`, [MEMBERSHIP_INTENT])).rows[0];
+    assert.deepEqual(membershipCounts, { payments: 1, subscriptions: 1, benefits: 1 });
+    const membershipTimes = (await client.query(`SELECT pi.origen_pago_codigo,pi.paid_at::text intent_paid_at,
+      p.paid_at::text payment_paid_at,mpo.paid_at::text order_paid_at
+      FROM public.payment_intents pi JOIN public.payments p USING(id_intent)
+      JOIN public.membership_purchase_orders mpo ON mpo.id_order=pi.id_membership_order
+      WHERE pi.id_intent=$1`, [MEMBERSHIP_INTENT])).rows[0];
+    assert.equal(membershipTimes.origen_pago_codigo, "membership");
+    for (const value of [membershipTimes.intent_paid_at, membershipTimes.payment_paid_at, membershipTimes.order_paid_at]) {
+      assert.equal(new Date(value).toISOString(), new Date(PAID_AT).toISOString());
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    await cleanupPreservingError(isolated.stop, primaryError);
+  }
 });
