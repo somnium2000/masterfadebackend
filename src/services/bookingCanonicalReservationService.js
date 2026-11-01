@@ -363,11 +363,49 @@ export function buildCanonicalReservationPayload({
 }
 
 export async function createCanonicalReservation(client, payload) {
+  const lockKeys = buildCanonicalReservationLockKeys(payload);
+  if (lockKeys.length > 0) {
+    await client.query(
+      `WITH ordered AS MATERIALIZED (
+         SELECT lock_key
+           FROM unnest($1::text[]) AS requested(lock_key)
+          ORDER BY lock_key
+       )
+       SELECT pg_advisory_xact_lock(hashtextextended(lock_key, 0))
+         FROM ordered`,
+      [lockKeys]
+    );
+  }
   const result = await client.query(
     "SELECT app_private.crear_reserva_canonica_v1($1::jsonb) AS resultado",
     [payload]
   );
   return result.rows?.[0]?.resultado || null;
+}
+
+export function buildCanonicalReservationLockKeys(payload = {}) {
+  const attempts = Array.isArray(payload?.assignment_attempts) ? payload.assignment_attempts : [];
+  const sources = attempts.length > 0
+    ? attempts.flatMap(attempt => Array.isArray(attempt?.integrantes) ? attempt.integrantes : [])
+    : (Array.isArray(payload?.integrantes) ? payload.integrantes : []);
+  const keys = new Set();
+  for (const integrante of sources) {
+    const barberId = String(integrante?.id_empleado_barbero || "").trim().toLowerCase();
+    const startMs = new Date(integrante?.inicio_at).getTime();
+    const details = Array.isArray(integrante?.detalles) ? integrante.detalles : [];
+    const durationMinutes = details.reduce((total, detail) => (
+      total + (Math.max(0, Number(detail?.duracion_min) || 0) * Math.max(1, Number(detail?.cantidad) || 1))
+    ), 0);
+    const bufferMinutes = details.reduce((maximum, detail) => Math.max(maximum, Math.max(0, Number(detail?.buffer_min) || 0)), 0);
+    const endMs = startMs + ((durationMinutes + bufferMinutes) * 60_000);
+    if (!UUID_PATTERN.test(barberId) || !Number.isFinite(startMs) || endMs <= startMs) continue;
+    const firstMinute = Math.floor(startMs / 60_000);
+    const lastMinute = Math.floor((endMs - 1) / 60_000);
+    for (let minute = firstMinute; minute <= lastMinute; minute += 1) {
+      keys.add(`masterfade:booking-slot:${barberId}:${minute}`);
+    }
+  }
+  return Array.from(keys).sort();
 }
 
 function extractCanonicalDetailRows(canonicalBlock = {}) {
