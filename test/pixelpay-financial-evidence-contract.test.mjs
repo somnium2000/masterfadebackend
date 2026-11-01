@@ -50,3 +50,11 @@ test("migracion exige evidencia explicita y bloquea nuevos pagos manuales", asyn
   assert.doesNotMatch(sql, /NEW\.paid_at\s*:=\s*(?:now|clock_timestamp)\(\)/i);
   assert.doesNotMatch(sql, /UPDATE\s+public\.payments[\s\S]*SET\s+paid_at/i);
 });
+
+test("migracion usa exclusivamente el origen real membership", async () => {
+  const sql = await readFile(migrationUrl, "utf8");
+
+  assert.match(sql, /origen_pago_codigo\s*=\s*'membership'/i);
+  assert.match(sql, /v_origin_code\s*=\s*'membership'/i);
+  assert.doesNotMatch(sql, /'membresia'/i);
+});

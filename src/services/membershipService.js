@@ -1937,10 +1937,11 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
     `
       UPDATE public.payment_intents
       SET estado_intent_codigo = 'confirmado',
+          paid_at = $2::timestamptz,
           updated_at = now()
       WHERE id_intent = $1::uuid
     `,
-    [intent.id_intent]
+    [intent.id_intent, intent.provider_paid_at]
   );
 
   const capturedPayment = await insertCapturedPaymentForMembershipIntent(client, intent);
