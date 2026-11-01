@@ -438,14 +438,15 @@ export async function insertPromotionUsage(db, data = {}) {
     `,
     [data.id_cita_promocion]
   );
-  const idempotencyKey = data.idempotency_key
-    || [
-      "promotion",
-      data.id_grupo_cita,
-      data.id_cita_promocion,
-      data.id_promocion_regla,
-      data.id_promocion_codigo || "sin_codigo",
-    ].join(":");
+  const requestIdempotencyKey = String(data.idempotency_key || "").trim();
+  const logicalUsageParts = [
+    data.id_grupo_cita,
+    data.id_promocion_regla,
+    data.id_promocion_codigo || "sin_codigo",
+  ];
+  const idempotencyKey = requestIdempotencyKey
+    ? [requestIdempotencyKey, "promotion-use", ...logicalUsageParts].join(":")
+    : ["promotion-use", ...logicalUsageParts].join(":");
 
   const existing = await db.query(
     `
