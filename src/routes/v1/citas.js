@@ -31,6 +31,7 @@ import {
   buildAppointmentDetailRows,
 } from "../../services/bookingReservationService.js";
 import {
+  previewGroupBonificationPromotions,
   previewPromotionsForAppointment,
   markPromotionUsagesForGroup,
   recordPromotionApplications,
@@ -450,6 +451,143 @@ function applyPlanAsPreviousDiscount(discountLines = [], discountPlan = new Map(
       base_disponible_hnl: Number(Math.max(0, Number(line.subtotal_hnl || 0) - previous).toFixed(2)),
     };
   });
+}
+
+function normalizeBookingMoney(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(2));
+}
+
+function buildExistingDiscountAllocations(detailRows = []) {
+  return (Array.isArray(detailRows) ? detailRows : [])
+    .filter((row) => Number(row?.descuento_hnl || 0) > 0 && row?.line_key)
+    .map((row) => ({
+      line_key: row.line_key,
+      source_type: "promotion",
+      source_id: "existing_booking_discount",
+      descuento_hnl: normalizeBookingMoney(row.descuento_hnl),
+    }));
+}
+
+function buildGroupPromotionContextFromIntegrantes({
+  branch,
+  clienteId = null,
+  personaId = null,
+  integrantes = [],
+  codigoPromocional = null,
+}) {
+  const first = integrantes[0] || {};
+  const startDateTime = normalizeOperationalDateTime(first.selection?.startDateTime, "fecha_inicio");
+  const discountLines = [];
+  const serviceItems = [];
+  for (const integrante of integrantes) {
+    for (const row of Array.isArray(integrante.detailRows) ? integrante.detailRows : []) {
+      const baseLine = {
+        ...row,
+        orden_integrante: integrante.orden_integrante,
+        descuento_previo_hnl: normalizeBookingMoney(row.descuento_hnl),
+        base_disponible_hnl: normalizeBookingMoney(Math.max(0, Number(row.subtotal_hnl || 0) - Number(row.descuento_hnl || 0))),
+      };
+      discountLines.push(baseLine);
+      serviceItems.push(baseLine);
+    }
+  }
+  const subtotal = normalizeBookingMoney(discountLines.reduce((sum, row) => sum + Number(row.base_disponible_hnl || 0), 0));
+  return {
+    id_sucursal: branch.id_sucursal,
+    id_empleado_barbero: first.selection?.barber?.id_empleado || null,
+    id_cliente: clienteId,
+    id_persona: personaId,
+    id_grupo_cita: null,
+    fecha_hora: startDateTime.iso_utc,
+    fecha: startDateTime.fecha_operativa,
+    fecha_operativa: startDateTime.fecha_operativa,
+    hora: startDateTime.hora_operativa,
+    subtotal_hnl: subtotal,
+    servicios: serviceItems,
+    discount_lines: discountLines,
+    paquetes: [],
+    codigo_promocional: codigoPromocional || null,
+    canal: "privado",
+    es_cliente_autenticado: true,
+    es_titular: true,
+  };
+}
+
+function filterPromotionResultByLineKeys(result = {}, lineKeys = new Set()) {
+  const applied = [];
+  for (const promotion of result.promociones_aplicadas || []) {
+    const allocations = (promotion.line_allocations || [])
+      .filter((allocation) => lineKeys.has(String(allocation?.line_key || "").trim()));
+    const discount = normalizeBookingMoney(allocations.reduce((sum, allocation) => sum + Number(allocation.descuento_hnl || 0), 0));
+    if (discount <= 0) continue;
+    applied.push({
+      ...promotion,
+      descuento_calculado_hnl: discount,
+      line_allocations: allocations,
+      targetLineKeys: allocations.map((allocation) => allocation.line_key),
+    });
+  }
+  return {
+    promociones_aplicadas: applied,
+    promociones_descartadas: [],
+  };
+}
+
+function applyGroupPromotionResultToIntegrantes(integrantes = [], groupContext = {}, groupResult = {}, {
+  bookingIsvEnabled = false,
+} = {}) {
+  if (!Array.isArray(groupResult.promociones_aplicadas) || !groupResult.promociones_aplicadas.length) return [];
+  const records = [];
+  for (const integrante of integrantes) {
+    const lineKeys = new Set((integrante.detailRows || []).map((row) => String(row?.line_key || "").trim()).filter(Boolean));
+    if (!lineKeys.size) continue;
+    const filteredResult = filterPromotionResultByLineKeys(groupResult, lineKeys);
+    if (!filteredResult.promociones_aplicadas.length) continue;
+
+    const groupAllocations = filteredResult.promociones_aplicadas.flatMap((promotion) => (
+      (promotion.line_allocations || []).map((allocation) => ({
+        line_key: allocation.line_key,
+        source_type: "promotion",
+        source_id: promotion.id_promocion_regla,
+        id_promocion: promotion.id_promocion,
+        id_promocion_regla: promotion.id_promocion_regla,
+        descuento_hnl: allocation.descuento_hnl,
+      }))
+    ));
+    const existingAllocations = buildExistingDiscountAllocations(integrante.detailRows);
+    const totalDiscount = normalizeBookingMoney([...existingAllocations, ...groupAllocations]
+      .reduce((sum, allocation) => sum + Number(allocation.descuento_hnl || 0), 0));
+    const discountPlan = buildDiscountPlan(integrante.detailRows, [...existingAllocations, ...groupAllocations]);
+    const detailRows = buildAppointmentDetailRows(integrante.selection.serviceSelection.items || [], {
+      descuentoTotalHnl: totalDiscount,
+      discountPlan,
+      ordenIntegrante: integrante.orden_integrante,
+      bookingIsvEnabled,
+    });
+    const subtotal = normalizeBookingMoney(detailRows.reduce((sum, row) => sum + Number(row.subtotal_hnl || 0), 0));
+    const total = normalizeBookingMoney(detailRows.reduce((sum, row) => sum + Number(row.total_linea_hnl || 0), 0));
+
+    integrante.detailRows = detailRows;
+    integrante.descuentoHnl = totalDiscount;
+    integrante.discountPlan = discountPlan;
+    integrante._response_totals = {
+      subtotalHnl: subtotal,
+      descuentoHnl: totalDiscount,
+      totalHnl: total,
+    };
+    integrante._group_promociones_result = filteredResult;
+    const record = {
+      order: integrante.orden_integrante,
+      context: groupContext,
+      result: filteredResult,
+      detailRows,
+    };
+    integrante._group_promociones_record = record;
+    records.push(record);
+  }
+  return records;
 }
 
 function isPointsTriggerCompileError(error) {
@@ -1496,7 +1634,9 @@ async function buildAuthenticatedCanonicalOption(dbClient, {
       es_cliente_autenticado: true,
       es_titular: isTitular,
     };
-    promocionesPreview = await previewPromotionsForAppointment(dbClient, promocionesContext);
+    promocionesPreview = await previewPromotionsForAppointment(dbClient, promocionesContext, {
+      includeGroupBonifications: false,
+    });
     if (!promocionesPreview.usedFallbackLegacy) {
       descuentoPromociones = Number(promocionesPreview.descuento_total_hnl || 0);
       totalPagar = Math.max(0, Number((totalPagar - descuentoPromociones).toFixed(2)));
@@ -2109,6 +2249,21 @@ export default async function citasRoutes(app) {
             assignment_options: integrante.id_barbero ? [] : assignmentOptions,
           });
         }
+        if (!rewardRedeemContext) {
+          const groupPromotionContext = buildGroupPromotionContextFromIntegrantes({
+            branch,
+            clienteId,
+            personaId,
+            integrantes: canonicalIntegrantes,
+            codigoPromocional: request.body?.codigo_promocional || null,
+          });
+          const groupPromotionResult = await previewGroupBonificationPromotions(dbClient, groupPromotionContext);
+          if (groupPromotionResult.promociones_aplicadas?.length) {
+            applyGroupPromotionResultToIntegrantes(canonicalIntegrantes, groupPromotionContext, groupPromotionResult, {
+              bookingIsvEnabled: app.config?.bookingIsvEnabled,
+            });
+          }
+        }
         const membershipState = await getClienteMembershipState(dbClient, clienteId);
         let membershipMessage = null;
         let membershipCoverageActive;
@@ -2162,6 +2317,9 @@ export default async function citasRoutes(app) {
               result: integrante._promociones_preview,
               detailRows: integrante.detailRows,
             });
+          }
+          if (integrante._group_promociones_record) {
+            pendingPromotionRecords.push(integrante._group_promociones_record);
           }
           if (Number(integrante.orden_integrante || 0) === 1 && rewardRedeemContext && integrante._reward_covered_hnl > 0) {
             rewardAppliedInHold = true;
@@ -2274,6 +2432,9 @@ export default async function citasRoutes(app) {
               id_grupo_cita: canonicalResult.id_grupo_cita,
               id_cita: block.id_cita,
               id_cita_integrante: block.id_cita_integrante || block.id_integrante || null,
+              id_hold: block.id_hold || null,
+              reservado_expires_at: block.expires_at || canonicalResult.expires_at || null,
+              idempotency_key: requestId,
               detailRows,
             },
             promotionRecord.result,

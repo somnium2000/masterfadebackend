@@ -55,6 +55,8 @@ const socialConfirmBodySchema = {
   type: "object",
   properties: {
     social_confirm_token: { type: "string", minLength: 16 },
+    acepta_terminos: { type: "boolean" },
+    consentimiento_marketing: { type: "boolean", default: false },
   },
   required: ["social_confirm_token"],
   additionalProperties: false,
@@ -503,41 +505,6 @@ async function insertClientWithConsents(client, params) {
   return insertLegacy.rows[0].id_cliente;
 }
 
-async function enforceExchangeClientConsents(client, authUserId) {
-  const safeAuthUserId = String(authUserId || "").trim();
-  if (!safeAuthUserId) return;
-
-  const hasConsentTimestampColumns = await hasClientsConsentTimestampColumns(client);
-  if (hasConsentTimestampColumns) {
-    await client.query(
-      `
-        UPDATE public.clientes
-        SET
-          acepta_terminos = TRUE,
-          consentimiento_marketing = TRUE,
-          acepta_terminos_at = COALESCE(acepta_terminos_at, NOW()),
-          consentimiento_marketing_at = COALESCE(consentimiento_marketing_at, NOW())
-        WHERE id_usuario = $1::uuid
-          AND deleted_at IS NULL
-      `,
-      [safeAuthUserId]
-    );
-    return;
-  }
-
-  await client.query(
-    `
-      UPDATE public.clientes
-      SET
-        acepta_terminos = TRUE,
-        consentimiento_marketing = TRUE
-      WHERE id_usuario = $1::uuid
-        AND deleted_at IS NULL
-    `,
-    [safeAuthUserId]
-  );
-}
-
 function registerResetAttempt(emailKey) {
   const now = Date.now();
   let record = resetAttemptsByEmail.get(emailKey);
@@ -950,7 +917,7 @@ async function findActiveInternalUserByConfirmedEmail(db, email) {
   return existing.rows?.[0]?.id_usuario || null;
 }
 
-async function ensureExchangeInternalUser(app, supabaseUser) {
+async function ensureExchangeInternalUser(app, supabaseUser, consent = null) {
   const authUserId = String(supabaseUser?.id || "").trim();
   if (!authUserId) {
     throw {
@@ -971,7 +938,6 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
     [authUserId]
   );
   if (existing.rowCount) {
-    await enforceExchangeClientConsents(app.db, authUserId);
     return { created: false, authUserId, email: null, fullName: null };
   }
 
@@ -985,6 +951,15 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
   }
 
   const { nombres, apellidos } = buildSocialPersonaNames(supabaseUser);
+  if (consent?.aceptaTerminos !== true) {
+    throw {
+      statusCode: 400,
+      message: "Debes aceptar terminos y condiciones para crear la cuenta.",
+      code: "AUTH_SOCIAL_CONSENT_REQUIRED",
+    };
+  }
+  const consentimientoMarketing = consent?.consentimientoMarketing === true;
+  const aceptaTerminosAt = new Date().toISOString();
   const client = await app.db.connect();
   let transactionStarted = false;
 
@@ -1045,10 +1020,10 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
       idPersona,
       authUserId,
       branchId: null,
-      consentimientoMarketing: true,
+      consentimientoMarketing,
       aceptaTerminos: true,
-      aceptaTerminosAt: new Date().toISOString(),
-      consentimientoMarketingAt: new Date().toISOString(),
+      aceptaTerminosAt,
+      consentimientoMarketingAt: consentimientoMarketing ? aceptaTerminosAt : null,
     });
 
     await client.query("COMMIT");
@@ -1087,7 +1062,6 @@ async function ensureExchangeInternalUser(app, supabaseUser) {
         );
 
         if (userNowExists.rowCount) {
-          await enforceExchangeClientConsents(app.db, authUserId);
           return { created: false, authUserId, email: null, fullName: null };
         }
       }
@@ -1532,7 +1506,10 @@ export default async function authRoutes(app) {
               "Confirmacion social resuelta contra usuario interno existente por correo verificado"
             );
           } else {
-            provision = await ensureExchangeInternalUser(app, supabaseUser);
+            provision = await ensureExchangeInternalUser(app, supabaseUser, {
+              aceptaTerminos: request.body?.acepta_terminos === true,
+              consentimientoMarketing: request.body?.consentimiento_marketing === true,
+            });
           }
         }
 

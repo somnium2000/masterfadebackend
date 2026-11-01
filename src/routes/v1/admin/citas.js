@@ -1,5 +1,6 @@
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
+import { findReservationGroupIds } from "../../../services/adminReservationLookup.js";
 import {
   ACTIVE_PAYMENT_INTENT_STATES,
   APPOINTMENT_STATE_TRANSITIONS,
@@ -408,6 +409,7 @@ async function listOperationalAppointments(client, {
   fechaHasta = null,
   limit = 100,
   sortDirection = "asc",
+  reservationGroupIds = null,
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
   const clientNameSql = contactColumnsSupport.has_contacto_nombre
@@ -425,6 +427,10 @@ async function listOperationalAppointments(client, {
     "c.deleted_at IS NULL",
     "c.id_sucursal = ANY($1::uuid[])",
   ];
+  if (reservationGroupIds) {
+    params.push(reservationGroupIds);
+    where.push(`c.id_grupo_cita = ANY($${params.length}::uuid[])`);
+  }
 
   if (barberScopeId) {
     params.push(assertUuid(barberScopeId, "id_empleado_barbero"));
@@ -1847,6 +1853,34 @@ export default async function adminCitasRoutes(app) {
         code: "ADMIN_CITAS_OPERATIVE_EVENTS_ERROR",
         requestId: request.id,
       });
+    }
+  });
+
+  app.get("/reservas/buscar", {
+    preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES),
+    schema: { querystring: { type: 'object', additionalProperties: false, required: ['codigo'], properties: {
+      codigo: { type: 'string', pattern: '^[A-Za-z0-9]{5}$' },
+      id_sucursal: { type: 'string', format: 'uuid' },
+    } } },
+  }, async (request, reply) => {
+    try {
+      let branchIds = await getScopeBranches(app, request.claims);
+      const selectedBranch = request.query.id_sucursal;
+      if (selectedBranch) {
+        if (!branchIds.includes(selectedBranch)) return sendError(reply, 403, 'Sucursal fuera de tu alcance', { code: 'ADMIN_CITAS_BRANCH_FORBIDDEN', requestId: request.id });
+        branchIds = [selectedBranch];
+      }
+      const roleScope = getRoleScope(request.claims);
+      const ids = await findReservationGroupIds(app.db, { code: request.query.codigo, branchIds, barberId: roleScope.barber_empleado_id });
+      const citas = ids.length ? await listOperationalAppointments(app.db, {
+        branchIds, barberScopeId: roleScope.barber_empleado_id, reservationGroupIds: ids, limit: 401,
+      }) : [];
+      if (citas.length > 400) return sendError(reply, 409, 'La reserva supera el límite de consulta. Contacta al administrador.', { code: 'RESERVATION_LOOKUP_TOO_MANY', requestId: request.id });
+      return sendOk(reply, { reservas: ids.map((id) => ({ id_grupo_cita: id, codigo_reserva: request.query.codigo.toUpperCase(), citas: citas.filter((cita) => cita.id_grupo_cita === id) })) });
+    } catch (error) {
+      if (error instanceof AppError) return sendError(reply, error.statusCode, error.message, { code: error.code, requestId: request.id });
+      request.log.error({ err: error }, 'Error buscando reserva');
+      return sendError(reply, 500, 'No fue posible buscar la reserva.', { code: 'RESERVATION_LOOKUP_ERROR', requestId: request.id });
     }
   });
 

@@ -16,7 +16,7 @@ import {
   createPixelPaySaleAttemptRecord,
   finalizePixelPaySaleAttemptBestEffort,
 } from "../../../services/payments/pixelPaySaleAttemptStore.js";
-import { inspectPixelPayCardExpire } from "../../../services/payments/PixelPaySdkProvider.js";
+import { inspectPixelPayCardExpire, STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT } from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
 import {
   assertPixelPayCardAllowedForEnvironment,
@@ -203,6 +203,39 @@ async function registerPaymentStatusCheck(db, {
       new Date().toISOString(),
     ]
   );
+}
+
+async function persistVerifiedPixelPayEvidence(client, {
+  idIntent,
+  providerEventId,
+  eventType,
+  payload,
+}) {
+  await client.query(
+    `INSERT INTO public.payment_events (
+       id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+     )
+     SELECT pi.id_provider, $2::text, $3::text, TRUE, $4::jsonb, pi.id_intent
+       FROM public.payment_intents pi
+      WHERE pi.id_intent = $1::uuid
+     ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+    [idIntent, providerEventId, eventType, payload]
+  );
+  const result = await client.query(
+    `SELECT min(pe.recibido_at)::text AS verified_at
+       FROM public.payment_events pe
+      WHERE pe.id_intent = $1::uuid
+        AND pe.evento_tipo = 'pixelpay.sale.approved_verified'
+        AND pe.firma_valida IS TRUE`,
+    [idIntent]
+  );
+  const verifiedAt = safeText(result.rows[0]?.verified_at);
+  if (!verifiedAt || !Number.isFinite(new Date(verifiedAt).getTime())) {
+    throw new AppError(409, "No existe evidencia financiera durable de PixelPay", {
+      code: "PIXELPAY_DURABLE_EVIDENCE_REQUIRED",
+    });
+  }
+  return { verifiedAt };
 }
 
 async function queryAndRegisterPixelPayStatus({
@@ -1690,7 +1723,17 @@ export async function reconcilePixelPayPaid(client, {
         estado_intent_codigo: intent.estado_intent_codigo };
     }
 
-    let canonicalPaidAt = safeText(paidAt) || new Date().toISOString();
+    let canonicalPaidAt = safeText(paidAt);
+    if (!canonicalPaidAt || !Number.isFinite(new Date(canonicalPaidAt).getTime())) {
+      await client.query("COMMIT");
+      return {
+        processed: false,
+        pending_confirmation: true,
+        manual_reconciliation_required: true,
+        booking_confirmed: false,
+        estado_intent_codigo: intent.estado_intent_codigo,
+      };
+    }
     try {
       assertPublicGroupPayable(groupRows);
       resolveGroupExpiresAt(groupRows);
@@ -2470,6 +2513,20 @@ export default async function publicPagosRoutes(app, options = {}) {
          WHERE id_intent = $1::uuid`,
         [idIntent, saleResult.transactionId, saleResult.paymentUuid]
       );
+      const durableApproval = await persistVerifiedPixelPayEvidence(dbClient, {
+        idIntent,
+        providerEventId: `pixelpay_sale_${claim.paymentAttemptId}`,
+        eventType: "pixelpay.sale.approved_verified",
+        payload: {
+          payment_uuid: saleResult.paymentUuid,
+          transaction_id: saleResult.transactionId,
+          amount: claim.amount,
+          currency: "HNL",
+          payment_hash_valid: saleResult.paymentHashValid === true,
+          amount_matches: saleResult.amountMatches === true,
+          payment_attempt_id: claim.paymentAttemptId,
+        },
+      });
       const reconciled = await reconcilePixelPayPaid(dbClient, {
         idGrupoCita,
         idIntent,
@@ -2477,6 +2534,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         paymentUuid: saleResult.paymentUuid,
         providerTransactionId: saleResult.transactionId,
         expectedAmount: claim.amount,
+        paidAt: durableApproval.verifiedAt,
         logger: request.log,
       });
       return sendOk(reply, reconciled);
@@ -2528,7 +2586,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       const currentTotal = calculateGroupTotalFromRows(
         await loadPublicGroup(app.db, { groupId: idGrupoCita, titularEmail, access })
       );
-      const { intent, groupRows } = await loadPublicIntentForGroup(app.db, {
+      const { intent } = await loadPublicIntentForGroup(app.db, {
         groupId: idGrupoCita,
         idIntent,
         titularEmail,
@@ -2561,33 +2619,37 @@ export default async function publicPagosRoutes(app, options = {}) {
         });
       }
       if (isPixelPayPaidStatus(status.status)) {
+        // SDK 2.5.8's hash does not authenticate the response amount or transaction IDs.
+        // Status can only trigger recovery from an independently persisted, verified Sale.
         const reconciliationClient = await app.db.connect();
         try {
-          const durableApproval = await loadDurablePixelPayApproval(reconciliationClient, { idIntent, groupRows });
-          const providerTransactionId = safeText(intent.provider_session_id)
-            && safeText(intent.referencia_externa) !== paymentUuid
-            ? safeText(intent.referencia_externa)
-            : null;
-          const reconciled = await reconcilePixelPayPaid(reconciliationClient, {
+          const recovered = await reconcilePixelPayFromDurableApproval(reconciliationClient, {
             idGrupoCita,
             idIntent,
             titularEmail,
-            paymentUuid,
-            providerTransactionId,
-            expectedAmount: currentTotal,
-            paidAt: durableApproval?.finalized_at ?? null,
-            allowExpiredRecovery: Boolean(durableApproval),
             logger: request.log,
           });
-          return sendOk(reply, {
-            id_intent: idIntent,
-            payment_uuid: paymentUuid,
-            provider_status: status.status,
-            ...reconciled,
-          }, { statusCode: reconciled.manual_reconciliation_required ? 202 : 200 });
+          if (recovered.booking_confirmed === true) {
+            return sendOk(reply, {
+              id_intent: idIntent,
+              payment_uuid: paymentUuid,
+              provider_status: status.status,
+              ...recovered,
+            });
+          }
         } finally {
           reconciliationClient.release();
         }
+        return sendOk(reply, {
+          id_intent: idIntent,
+          payment_uuid: paymentUuid,
+          provider_status: status.status,
+          code: STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
+          processed: false,
+          booking_confirmed: false,
+          pending_confirmation: true,
+          manual_reconciliation_required: true,
+        }, { statusCode: 202 });
       }
       return sendOk(reply, {
         id_intent: idIntent,

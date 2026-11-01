@@ -1326,19 +1326,20 @@ async function countInternalDependencies(client, employeeIds) {
         SELECT COUNT(*)::int AS count
         FROM public.agenda_bloqueos_empleados b
         JOIN employee_ids e ON e.id_empleado = b.id_empleado
-        WHERE COALESCE(b.deleted_at, NULL) IS NULL
+        WHERE b.rango && tstzrange(NOW(), NULL, '[)')
       ),
       agenda_blocks AS (
         SELECT COUNT(*)::int AS count
         FROM public.bloqueos_agenda b
         JOIN employee_ids e ON e.id_empleado = b.id_empleado
-        WHERE COALESCE(b.deleted_at, NULL) IS NULL
+        WHERE b.rango && tstzrange(NOW(), NULL, '[)')
       ),
       public_profiles AS (
         SELECT COUNT(*)::int AS count
         FROM public.barberos_perfiles_publicos p
         JOIN employee_ids e ON e.id_empleado = p.id_empleado
-        WHERE COALESCE(p.activo, TRUE) IS TRUE
+        WHERE p.deleted_at IS NULL
+          AND p.visible_en_landing IS TRUE
       ),
       service_rates AS (
         SELECT COUNT(*)::int AS count
@@ -1823,6 +1824,8 @@ async function reconcileAccountDeletionPoints(client, {
   usuarioId,
   referenciaPublica,
 }) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [clienteId]);
+  await client.query("SELECT public.fn_points_materialize_expired_cycles($1::uuid)", [clienteId]);
   const pointsBalanceBefore = await getCurrentPointsBalance(client, clienteId);
   let pointsForfeited = 0;
 
@@ -4110,6 +4113,12 @@ async function assertAccountDeletionAuthPreconditions(client, {
         ) AS roles_ready,
         NOT EXISTS (
           SELECT 1
+          FROM public.seguridad_sesiones ss, params p
+          WHERE ss.id_usuario = p.usuario_id
+            AND ss.estado = 'activa'
+        ) AS sessions_ready,
+        NOT EXISTS (
+          SELECT 1
           FROM public.app_protected_users apu, params p
           WHERE apu.id_usuario = p.usuario_id
             AND apu.activo IS TRUE
@@ -5079,7 +5088,7 @@ async function loadAdminRequestBase(client, requestId, { forUpdate = false } = {
           AND ru.activo IS TRUE
       ) roles ON TRUE
       LEFT JOIN LATERAL (
-        SELECT COALESCE(array_agg(DISTINCT su.nombre ORDER BY su.nombre), ARRAY[]::text[]) AS branches
+        SELECT COALESCE(array_agg(DISTINCT su.nombre_sucursal ORDER BY su.nombre_sucursal), ARRAY[]::text[]) AS branches
         FROM public.empleados ee
         LEFT JOIN public.sucursales su ON su.id_sucursal = ee.id_sucursal
         WHERE ee.id_persona = s.id_persona
@@ -5205,10 +5214,12 @@ export async function evaluateAdminInternalAccountDeletionDependencies(client, {
           SELECT abe.id_bloqueo_empleado::text AS id
           FROM public.agenda_bloqueos_empleados abe
           JOIN employee_ids e ON e.id_empleado = abe.id_empleado
+          WHERE abe.rango && tstzrange(NOW(), NULL, '[)')
           UNION
           SELECT ba.id_bloqueo::text AS id
           FROM public.bloqueos_agenda ba
           JOIN employee_ids e ON e.id_empleado = ba.id_empleado
+          WHERE ba.rango && tstzrange(NOW(), NULL, '[)')
         ) src
       ),
       public_profiles AS (
@@ -5341,7 +5352,7 @@ export async function listAdminAccountDeletionRequests(app, query = {}) {
             AND ru.activo IS TRUE
         ) roles ON TRUE
         LEFT JOIN LATERAL (
-          SELECT COALESCE(array_agg(DISTINCT su.nombre ORDER BY su.nombre), ARRAY[]::text[]) AS branches
+          SELECT COALESCE(array_agg(DISTINCT su.nombre_sucursal ORDER BY su.nombre_sucursal), ARRAY[]::text[]) AS branches
           FROM public.empleados ee
           LEFT JOIN public.sucursales su ON su.id_sucursal = ee.id_sucursal
           WHERE ee.id_persona = s.id_persona

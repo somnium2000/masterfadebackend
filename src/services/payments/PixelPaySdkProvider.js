@@ -6,6 +6,7 @@ import {
   PIXELPAY_SALE_EVENT,
   readPixelPayInputErrors,
   readPixelPayHttpMetadata,
+  safePixelPayProviderResponseCode,
 } from "./pixelPaySaleTelemetry.js";
 import {
   createPixelPaySaleSignature,
@@ -556,6 +557,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       responseApproved: normalizedResponse.data.responseApproved,
       responseIncomplete: normalizedResponse.data.responseIncomplete,
       responseCodePresent: Boolean(normalizedResponse.data.responseCode),
+      providerResponseCode: safePixelPayProviderResponseCode(normalizedResponse.data.responseCode),
       hasPaymentUuid: Boolean(paymentUuid),
       hasTransactionId: Boolean(transactionId),
       hasPaymentHash,

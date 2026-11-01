@@ -15,9 +15,10 @@ async function fixture(t, role, { missing = false, fail = false } = {}) {
     return { rowCount: 1, rows: missing ? [] : [{ id_alerta: ID, estado: 'abierta', resumen: 'SYNTHETIC', detalle: { token: 'SYNTHETIC_SECRET', safe: true } }] };
   } });
   app.decorate('requireRoles', allowed => async (request, reply) => {
-    request.claims = { roles: role ? [role] : [], user: { id_usuario: ACTOR } };
-    if (!role) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
-    if (!allowed.includes(role)) return reply.code(403).send({ error: { code: 'AUTH_FORBIDDEN' } });
+    const roles = Array.isArray(role) ? role : role ? [role] : [];
+    request.claims = { roles, user: { id_usuario: ACTOR } };
+    if (!roles.length) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
+    if (!allowed.some(item => roles.includes(item))) return reply.code(403).send({ error: { code: 'AUTH_FORBIDDEN' } });
   });
   await app.register(routes, { prefix: '/v1/admin/seguridad' }); await app.ready();
   return { app, queries, change: (estado = 'resuelta', comentario = 'Comentario sintético') => app.inject({ method: 'PATCH', url: `/v1/admin/seguridad/alertas/${ID}/estado`, payload: { estado, comentario } }) };
@@ -38,6 +39,14 @@ test('Root lista y filtra alertas con paginación sin escrituras', async t => {
 test('Root consulta detalle con tokens redactados', async t => {
   const { app } = await fixture(t, 'root'); const response = await app.inject(`/v1/admin/seguridad/alertas/${ID}`);
   assert.equal(response.statusCode, 200); assert.ok(!response.body.includes('SYNTHETIC_SECRET')); assert.equal(response.json().data.detalle.safe, true);
+});
+test('alertas multirrol requieren root aunque existan otros roles administrativos', async t => {
+  const allowed = await fixture(t, ['root', 'security_admin', 'cliente']);
+  assert.equal((await allowed.app.inject('/v1/admin/seguridad/alertas')).statusCode, 200);
+
+  const denied = await fixture(t, ['super_admin', 'security_admin', 'admin']);
+  assert.equal((await denied.app.inject('/v1/admin/seguridad/alertas')).statusCode, 403);
+  assert.equal(denied.queries.length, 0);
 });
 for (const state of ['resuelta','descartada']) test(`Root ${state} conserva comentario y auditoría sin borrar histórico`, async t => {
   const { change, queries } = await fixture(t, 'root'); const response = await change(state);
