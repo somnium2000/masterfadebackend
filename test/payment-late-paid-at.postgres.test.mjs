@@ -297,6 +297,7 @@ test("PostgreSQL 17: contrato financiero exige evidencia y deshabilita pagos man
     await client.query(functionSql(historical, "public.fn_payment_intents_capture_paid_at"));
     await client.query(`CREATE TRIGGER tr_payment_intents_capture_paid_at BEFORE INSERT OR UPDATE OF estado_intent_codigo,paid_at
       ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION public.fn_payment_intents_capture_paid_at()`);
+    await client.query(await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8"));
 
     await seed(client, { intentExpiry: "2099-01-01T16:00:00.000Z", holdExpiry: "2099-01-01T16:00:00.000Z",
       holdState: "activo", intentState: "pendiente_confirmacion", citaState: "pendiente_pago" });
@@ -317,12 +318,39 @@ test("PostgreSQL 17: contrato financiero exige evidencia y deshabilita pagos man
       VALUES ($1,'capturado','missing-evidence',1,'HNL',NULL,FALSE)`, [INTENT]),
     /MF_PAYMENT_PAID_AT_REQUIRED/);
 
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','arbitrary-timestamp',1,'HNL',$2,FALSE)`, [INTENT, PAID_AT]),
+    /MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED/);
+    await assert.rejects(client.query(`UPDATE public.payment_intents
+      SET paid_at=$2 WHERE id_intent=$1`, [INTENT, PAID_AT]),
+    /MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED/);
+
+    await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome,
+      sdk_response_class,upstream_http_status,uncertain,response_success,response_approved,response_incomplete,
+      transaction_result_valid,transaction_result_parsed,payment_uuid_present,transaction_id_present,payment_hash_present,
+      payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches)
+      VALUES ($1,gen_random_uuid(),$2,'approved','SuccessResponse',200,false,true,true,false,
+        true,true,true,true,true,true,true,true,true)`, [INTENT, PAID_AT]);
+
+    await assert.rejects(client.query(`INSERT INTO public.payments
+      (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
+      VALUES ($1,'capturado','wrong-authorized-timestamp',1,'HNL',$2::timestamptz + interval '1 second',FALSE)`, [INTENT, PAID_AT]),
+    /MF_PAYMENT_PAID_AT_EVIDENCE_MISMATCH/);
+
     const payment = await client.query(`INSERT INTO public.payments
       (id_intent,estado_pago_codigo,provider_tx_id,monto_hnl,moneda_codigo,paid_at,registrado_manualmente)
       VALUES ($1,'capturado','verified-pixelpay',1,'HNL',$2,FALSE)
       RETURNING paid_at::text,pago_tardio`, [INTENT, PAID_AT]);
     assert.equal(new Date(payment.rows[0].paid_at).toISOString(), new Date(PAID_AT).toISOString());
     assert.equal(payment.rows[0].pago_tardio, false);
+    const applied = (await client.query(`SELECT i.estado_intent_codigo,i.paid_at::text,h.estado_hold_codigo,c.estado_cita_codigo
+      FROM public.payment_intents i JOIN public.citas_holds h ON h.id_hold=i.id_hold
+      JOIN public.citas c ON c.id_cita=i.id_cita WHERE i.id_intent=$1`, [INTENT])).rows[0];
+    assert.equal(applied.estado_intent_codigo, "confirmado");
+    assert.equal(new Date(applied.paid_at).toISOString(), new Date(PAID_AT).toISOString());
+    assert.equal(applied.estado_hold_codigo, "consumido");
+    assert.equal(applied.estado_cita_codigo, "confirmada");
   } catch (error) {
     primaryError = error;
     throw error;
