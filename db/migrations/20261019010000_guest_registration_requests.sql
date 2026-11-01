@@ -1,5 +1,13 @@
 -- AM: LOCAL PROPOSAL: review and apply separately before enabling historical registration.
 BEGIN;
+DO $preflight$
+BEGIN
+  IF to_regclass('app_private.guest_registration_requests') IS NOT NULL THEN
+    RAISE EXCEPTION 'MF_GUEST_REGISTRATION_REQUESTS_ALREADY_EXISTS_REQUIRES_MANUAL_COMPARISON';
+  END IF;
+END
+$preflight$;
+
 CREATE TABLE app_private.guest_registration_requests (
   id uuid PRIMARY KEY,
   email text UNIQUE CHECK (email = lower(btrim(email))),
