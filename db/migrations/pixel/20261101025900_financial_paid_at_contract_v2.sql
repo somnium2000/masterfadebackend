@@ -11,6 +11,10 @@ BEGIN
     RAISE EXCEPTION 'MF_FINANCIAL_EVIDENCE_TABLE_REQUIRED';
   END IF;
 
+  IF to_regclass('public.payment_events') IS NULL THEN
+    RAISE EXCEPTION 'MF_FINANCIAL_PAYMENT_EVENTS_REQUIRED';
+  END IF;
+
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger t
     WHERE t.tgrelid = 'public.payments'::regclass
@@ -55,11 +59,17 @@ DECLARE
   v_historical_manual boolean := false;
   v_historical_terminal boolean := false;
   v_provider_code text;
+  v_origin_code text;
+  v_provider_session_id text;
+  v_provider_transaction_id text;
+  v_evidence_event_type text;
   v_evidence_time timestamptz;
   v_evidence_count integer := 0;
 BEGIN
-  SELECT pi.monto_hnl, pi.moneda_codigo, pi.expires_at, pi.id_hold, pp.codigo
-  INTO v_monto_intent, v_moneda_intent, v_exp_intent, v_id_hold, v_provider_code
+  SELECT pi.monto_hnl, pi.moneda_codigo, pi.expires_at, pi.id_hold, pp.codigo,
+         pi.origen_pago_codigo, pi.provider_session_id, pi.referencia_externa
+  INTO v_monto_intent, v_moneda_intent, v_exp_intent, v_id_hold, v_provider_code,
+       v_origin_code, v_provider_session_id, v_provider_transaction_id
   FROM public.payment_intents pi
   LEFT JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
   WHERE pi.id_intent = NEW.id_intent;
@@ -103,27 +113,31 @@ BEGIN
   END IF;
 
   IF lower(COALESCE(v_provider_code, '')) = 'pixelpay' AND NOT v_historical_terminal THEN
-    SELECT count(*)::integer, min(a.finalized_at)
+    v_evidence_event_type := CASE
+      WHEN v_origin_code = 'membresia' THEN 'membership.pixelpay.approved_verified'
+      ELSE 'pixelpay.sale.approved_verified'
+    END;
+    SELECT count(*)::integer, min(pe.recibido_at)
     INTO v_evidence_count, v_evidence_time
-    FROM app_private.pixelpay_sale_attempts a
-    WHERE a.id_intent = NEW.id_intent
-      AND a.outcome = 'approved'
-      AND a.sdk_response_class = 'SuccessResponse'
-      AND a.upstream_http_status = 200
-      AND a.finalized_at IS NOT NULL
-      AND a.response_success IS TRUE
-      AND a.response_approved IS TRUE
-      AND a.response_incomplete IS FALSE
-      AND a.uncertain IS FALSE
-      AND a.transaction_result_valid IS TRUE
-      AND a.transaction_result_parsed IS TRUE
-      AND a.payment_uuid_present IS TRUE
-      AND a.transaction_id_present IS TRUE
-      AND a.payment_hash_present IS TRUE
-      AND a.payment_hash_valid IS TRUE
-      AND a.transaction_amount_matches IS TRUE
-      AND a.approved_amount_matches IS TRUE
-      AND a.amount_matches IS TRUE;
+    FROM public.payment_events pe
+    JOIN app_private.pixelpay_sale_attempts a
+      ON a.id_intent = pe.id_intent
+     AND a.payment_attempt_id::text = pe.payload_esencial->>'payment_attempt_id'
+    WHERE pe.id_intent = NEW.id_intent
+      AND pe.id_provider = (SELECT pi.id_provider FROM public.payment_intents pi WHERE pi.id_intent = NEW.id_intent)
+      AND pe.evento_tipo = v_evidence_event_type
+      AND pe.firma_valida IS TRUE
+      AND pe.provider_event_id = (CASE
+        WHEN v_origin_code = 'membresia' THEN 'pixelpay_membership_' ELSE 'pixelpay_sale_' END)
+        || (pe.payload_esencial->>'payment_attempt_id')
+      AND (pe.payload_esencial->>'payment_uuid') = v_provider_session_id
+      AND (pe.payload_esencial->>'payment_uuid') = NEW.provider_tx_id
+      AND (pe.payload_esencial->>'transaction_id') = v_provider_transaction_id
+      AND CASE WHEN jsonb_typeof(pe.payload_esencial->'amount') = 'number'
+        THEN (pe.payload_esencial->>'amount')::numeric END = v_monto_intent
+      AND upper(pe.payload_esencial->>'currency') = upper(v_moneda_intent)
+      AND (pe.payload_esencial->>'payment_hash_valid') = 'true'
+      AND (pe.payload_esencial->>'amount_matches') = 'true';
     IF v_evidence_count <> 1 THEN
       RAISE EXCEPTION 'MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED';
     END IF;
@@ -156,16 +170,8 @@ DECLARE
   v_evidence_time timestamptz;
   v_evidence_count integer := 0;
   v_provider_code text;
+  v_evidence_event_type text;
 BEGIN
-  IF NEW.origen_pago_codigo <> 'cita' THEN RETURN NEW; END IF;
-
-  SELECT min(h.expires_at) INTO v_expires_at
-  FROM public.citas_holds h
-  JOIN public.citas c ON c.id_cita = h.id_cita
-  WHERE h.id_hold = NEW.id_hold
-     OR c.id_cita = NEW.id_cita
-     OR (NEW.id_grupo_cita IS NOT NULL AND c.id_grupo_cita = NEW.id_grupo_cita);
-
   SELECT pp.codigo INTO v_provider_code
   FROM public.payment_providers pp
   WHERE pp.id_provider = NEW.id_provider;
@@ -177,26 +183,44 @@ BEGIN
        AND OLD.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado')
        AND NEW.estado_intent_codigo IS NOT DISTINCT FROM OLD.estado_intent_codigo
        AND NEW.paid_at IS NOT DISTINCT FROM OLD.paid_at) THEN
-    SELECT count(*)::integer, min(a.finalized_at)
+    v_evidence_event_type := CASE
+      WHEN NEW.origen_pago_codigo = 'membresia' THEN 'membership.pixelpay.approved_verified'
+      ELSE 'pixelpay.sale.approved_verified'
+    END;
+    SELECT count(*)::integer, min(pe.recibido_at)
     INTO v_evidence_count, v_evidence_time
-    FROM app_private.pixelpay_sale_attempts a
-    WHERE a.id_intent = NEW.id_intent
-      AND a.outcome = 'approved'
-      AND a.sdk_response_class = 'SuccessResponse'
-      AND a.upstream_http_status = 200
-      AND a.finalized_at IS NOT NULL
-      AND a.response_success IS TRUE AND a.response_approved IS TRUE
-      AND a.response_incomplete IS FALSE AND a.uncertain IS FALSE
-      AND a.transaction_result_valid IS TRUE AND a.transaction_result_parsed IS TRUE
-      AND a.payment_uuid_present IS TRUE AND a.transaction_id_present IS TRUE
-      AND a.payment_hash_present IS TRUE AND a.payment_hash_valid IS TRUE
-      AND a.transaction_amount_matches IS TRUE AND a.approved_amount_matches IS TRUE
-      AND a.amount_matches IS TRUE;
+    FROM public.payment_events pe
+    JOIN app_private.pixelpay_sale_attempts a
+      ON a.id_intent = pe.id_intent
+     AND a.payment_attempt_id::text = pe.payload_esencial->>'payment_attempt_id'
+    WHERE pe.id_intent = NEW.id_intent
+      AND pe.id_provider = NEW.id_provider
+      AND pe.evento_tipo = v_evidence_event_type
+      AND pe.firma_valida IS TRUE
+      AND pe.provider_event_id = (CASE
+        WHEN NEW.origen_pago_codigo = 'membresia' THEN 'pixelpay_membership_' ELSE 'pixelpay_sale_' END)
+        || (pe.payload_esencial->>'payment_attempt_id')
+      AND (pe.payload_esencial->>'payment_uuid') = NEW.provider_session_id
+      AND (pe.payload_esencial->>'transaction_id') = NEW.referencia_externa
+      AND CASE WHEN jsonb_typeof(pe.payload_esencial->'amount') = 'number'
+        THEN (pe.payload_esencial->>'amount')::numeric END = NEW.monto_hnl
+      AND upper(pe.payload_esencial->>'currency') = upper(NEW.moneda_codigo)
+      AND (pe.payload_esencial->>'payment_hash_valid') = 'true'
+      AND (pe.payload_esencial->>'amount_matches') = 'true';
     IF v_evidence_count <> 1 THEN RAISE EXCEPTION 'MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED'; END IF;
     IF NEW.paid_at IS DISTINCT FROM v_evidence_time THEN
       RAISE EXCEPTION 'MF_PAYMENT_PAID_AT_EVIDENCE_MISMATCH';
     END IF;
   END IF;
+
+  IF NEW.origen_pago_codigo <> 'cita' THEN RETURN NEW; END IF;
+
+  SELECT min(h.expires_at) INTO v_expires_at
+  FROM public.citas_holds h
+  JOIN public.citas c ON c.id_cita = h.id_cita
+  WHERE h.id_hold = NEW.id_hold
+     OR c.id_cita = NEW.id_cita
+     OR (NEW.id_grupo_cita IS NOT NULL AND c.id_grupo_cita = NEW.id_grupo_cita);
 
   IF NEW.estado_intent_codigo = 'pendiente_confirmacion' AND NEW.paid_at IS NOT NULL THEN
     IF v_expires_at IS NULL THEN RAISE EXCEPTION 'MF_PAYMENT_HOLD_NOT_FOUND'; END IF;

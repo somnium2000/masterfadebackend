@@ -225,7 +225,7 @@ async function persistVerifiedPixelPayEvidence(client, {
     `SELECT min(pe.recibido_at)::text AS verified_at
        FROM public.payment_events pe
       WHERE pe.id_intent = $1::uuid
-        AND pe.evento_tipo IN ('pixelpay.sale.approved_verified', 'pixelpay.status.paid_verified')
+        AND pe.evento_tipo = 'pixelpay.sale.approved_verified'
         AND pe.firma_valida IS TRUE`,
     [idIntent]
   );
