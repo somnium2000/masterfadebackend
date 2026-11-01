@@ -7,6 +7,10 @@ DO $preflight$
 DECLARE
   v_missing text[] := ARRAY[]::text[];
 BEGIN
+  IF to_regclass('app_private.pixelpay_sale_attempts') IS NULL THEN
+    RAISE EXCEPTION 'MF_FINANCIAL_EVIDENCE_TABLE_REQUIRED';
+  END IF;
+
   IF NOT EXISTS (
     SELECT 1 FROM pg_trigger t
     WHERE t.tgrelid = 'public.payments'::regclass
@@ -49,10 +53,15 @@ DECLARE
   v_id_hold uuid;
   v_hold_exp timestamptz;
   v_historical_manual boolean := false;
+  v_historical_terminal boolean := false;
+  v_provider_code text;
+  v_evidence_time timestamptz;
+  v_evidence_count integer := 0;
 BEGIN
-  SELECT pi.monto_hnl, pi.moneda_codigo, pi.expires_at, pi.id_hold
-  INTO v_monto_intent, v_moneda_intent, v_exp_intent, v_id_hold
+  SELECT pi.monto_hnl, pi.moneda_codigo, pi.expires_at, pi.id_hold, pp.codigo
+  INTO v_monto_intent, v_moneda_intent, v_exp_intent, v_id_hold, v_provider_code
   FROM public.payment_intents pi
+  LEFT JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
   WHERE pi.id_intent = NEW.id_intent;
 
   IF v_monto_intent IS NULL THEN RAISE EXCEPTION 'INTENT_INEXISTENTE'; END IF;
@@ -65,6 +74,10 @@ BEGIN
 
   IF TG_OP = 'UPDATE' THEN
     v_historical_manual := (OLD.estado_pago_codigo = 'manual_pagado' OR OLD.registrado_manualmente IS TRUE)
+      AND NEW.estado_pago_codigo IS NOT DISTINCT FROM OLD.estado_pago_codigo
+      AND NEW.registrado_manualmente IS NOT DISTINCT FROM OLD.registrado_manualmente
+      AND NEW.paid_at IS NOT DISTINCT FROM OLD.paid_at;
+    v_historical_terminal := OLD.estado_pago_codigo IN ('capturado', 'conciliado', 'manual_pagado')
       AND NEW.estado_pago_codigo IS NOT DISTINCT FROM OLD.estado_pago_codigo
       AND NEW.registrado_manualmente IS NOT DISTINCT FROM OLD.registrado_manualmente
       AND NEW.paid_at IS NOT DISTINCT FROM OLD.paid_at;
@@ -89,6 +102,36 @@ BEGIN
     RAISE EXCEPTION 'MF_PAYMENT_PAID_AT_REQUIRED';
   END IF;
 
+  IF lower(COALESCE(v_provider_code, '')) = 'pixelpay' AND NOT v_historical_terminal THEN
+    SELECT count(*)::integer, min(a.finalized_at)
+    INTO v_evidence_count, v_evidence_time
+    FROM app_private.pixelpay_sale_attempts a
+    WHERE a.id_intent = NEW.id_intent
+      AND a.outcome = 'approved'
+      AND a.sdk_response_class = 'SuccessResponse'
+      AND a.upstream_http_status = 200
+      AND a.finalized_at IS NOT NULL
+      AND a.response_success IS TRUE
+      AND a.response_approved IS TRUE
+      AND a.response_incomplete IS FALSE
+      AND a.uncertain IS FALSE
+      AND a.transaction_result_valid IS TRUE
+      AND a.transaction_result_parsed IS TRUE
+      AND a.payment_uuid_present IS TRUE
+      AND a.transaction_id_present IS TRUE
+      AND a.payment_hash_present IS TRUE
+      AND a.payment_hash_valid IS TRUE
+      AND a.transaction_amount_matches IS TRUE
+      AND a.approved_amount_matches IS TRUE
+      AND a.amount_matches IS TRUE;
+    IF v_evidence_count <> 1 THEN
+      RAISE EXCEPTION 'MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED';
+    END IF;
+    IF NEW.paid_at IS DISTINCT FROM v_evidence_time THEN
+      RAISE EXCEPTION 'MF_PAYMENT_PAID_AT_EVIDENCE_MISMATCH';
+    END IF;
+  END IF;
+
   IF NEW.paid_at > v_exp_intent THEN NEW.pago_tardio := true; END IF;
   IF v_id_hold IS NOT NULL THEN
     SELECT ch.expires_at INTO v_hold_exp
@@ -110,6 +153,9 @@ AS $function$
 DECLARE
   v_expires_at timestamptz;
   v_payment_time timestamptz;
+  v_evidence_time timestamptz;
+  v_evidence_count integer := 0;
+  v_provider_code text;
 BEGIN
   IF NEW.origen_pago_codigo <> 'cita' THEN RETURN NEW; END IF;
 
@@ -119,6 +165,38 @@ BEGIN
   WHERE h.id_hold = NEW.id_hold
      OR c.id_cita = NEW.id_cita
      OR (NEW.id_grupo_cita IS NOT NULL AND c.id_grupo_cita = NEW.id_grupo_cita);
+
+  SELECT pp.codigo INTO v_provider_code
+  FROM public.payment_providers pp
+  WHERE pp.id_provider = NEW.id_provider;
+
+  IF lower(COALESCE(v_provider_code, '')) = 'pixelpay'
+     AND NEW.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado')
+     AND NEW.paid_at IS NOT NULL
+     AND NOT (TG_OP = 'UPDATE'
+       AND OLD.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado')
+       AND NEW.estado_intent_codigo IS NOT DISTINCT FROM OLD.estado_intent_codigo
+       AND NEW.paid_at IS NOT DISTINCT FROM OLD.paid_at) THEN
+    SELECT count(*)::integer, min(a.finalized_at)
+    INTO v_evidence_count, v_evidence_time
+    FROM app_private.pixelpay_sale_attempts a
+    WHERE a.id_intent = NEW.id_intent
+      AND a.outcome = 'approved'
+      AND a.sdk_response_class = 'SuccessResponse'
+      AND a.upstream_http_status = 200
+      AND a.finalized_at IS NOT NULL
+      AND a.response_success IS TRUE AND a.response_approved IS TRUE
+      AND a.response_incomplete IS FALSE AND a.uncertain IS FALSE
+      AND a.transaction_result_valid IS TRUE AND a.transaction_result_parsed IS TRUE
+      AND a.payment_uuid_present IS TRUE AND a.transaction_id_present IS TRUE
+      AND a.payment_hash_present IS TRUE AND a.payment_hash_valid IS TRUE
+      AND a.transaction_amount_matches IS TRUE AND a.approved_amount_matches IS TRUE
+      AND a.amount_matches IS TRUE;
+    IF v_evidence_count <> 1 THEN RAISE EXCEPTION 'MF_PAYMENT_DURABLE_EVIDENCE_REQUIRED'; END IF;
+    IF NEW.paid_at IS DISTINCT FROM v_evidence_time THEN
+      RAISE EXCEPTION 'MF_PAYMENT_PAID_AT_EVIDENCE_MISMATCH';
+    END IF;
+  END IF;
 
   IF NEW.estado_intent_codigo = 'pendiente_confirmacion' AND NEW.paid_at IS NOT NULL THEN
     IF v_expires_at IS NULL THEN RAISE EXCEPTION 'MF_PAYMENT_HOLD_NOT_FOUND'; END IF;
