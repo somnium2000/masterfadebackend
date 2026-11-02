@@ -747,7 +747,12 @@ async function assertClienteInAdminPointsScope(client, idCliente, scope) {
   }
 }
 
-export async function searchActiveClientesForAdminPoints(app, { q, limit, claims } = {}) {
+export async function searchActiveClientesForAdminPoints(app, {
+  q,
+  limit,
+  claims,
+  allowGlobalAssignment = false,
+} = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
   }
@@ -768,7 +773,6 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
   const containsPattern = `%${queryLower}%`;
   const startsWithPattern = `${queryLower}%`;
   const scope = await resolveAdminPointsScope(app, claims);
-
   const { rows } = await app.db.query(
     `
       SELECT
@@ -776,7 +780,8 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
         TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, ''))) AS nombre_cliente,
         COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo,
         NULLIF(p.telefono_principal, '') AS telefono,
-        c.id_usuario
+        c.id_usuario,
+        c.id_sucursal_origen
       FROM public.clientes c
       JOIN public.personas p
         ON p.id_persona = c.id_persona
@@ -816,7 +821,13 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
         c.id_cliente ASC
       LIMIT $5::int
     `,
-    [containsPattern, startsWithPattern, scope?.branchIds || [], scope?.isSuperAdmin ?? true, safeLimit]
+    [
+      containsPattern,
+      startsWithPattern,
+      scope?.branchIds || [],
+      Boolean(allowGlobalAssignment || scope?.isSuperAdmin || !scope),
+      safeLimit,
+    ]
   );
 
   return {
@@ -826,6 +837,7 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
       correo: row.correo || null,
       telefono: row.telefono || null,
       id_usuario: row.id_usuario || null,
+      id_sucursal_origen: row.id_sucursal_origen || null,
     })),
   };
 }
@@ -1306,6 +1318,7 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
 export async function getClientePointsSummary(app, idCliente, {
   historyLimit = HISTORIAL_DEFAULT_LIMIT,
   claims,
+  allowGlobalAssignment = false,
 } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
@@ -1315,7 +1328,9 @@ export async function getClientePointsSummary(app, idCliente, {
   const scope = await resolveAdminPointsScope(app, claims);
   const client = await app.db.connect();
   try {
-    await assertClienteInAdminPointsScope(client, safeClienteId, scope);
+    if (!allowGlobalAssignment) {
+      await assertClienteInAdminPointsScope(client, safeClienteId, scope);
+    }
     const cliente = await ensureClienteActivo(client, safeClienteId, { requireRegisteredUser: false });
     const agregados = await getAgregadosPuntos(client, safeClienteId);
     const puntosParaPremio = await resolvePuntosParaPremio(client, cliente.id_sucursal_origen || null);
@@ -1327,6 +1342,7 @@ export async function getClientePointsSummary(app, idCliente, {
 
     return {
       id_cliente: cliente.id_cliente,
+      id_sucursal_origen: cliente.id_sucursal_origen || null,
       nombre_cliente: `${normalizeText(cliente.nombres)} ${normalizeText(cliente.apellidos)}`.trim() || "Cliente",
       saldo_total: saldo,
       puntos_titular: Number(agregados.puntos_titular || 0),
@@ -1427,6 +1443,7 @@ export async function addManualPointsAdjustment(app, {
   usuarioAdmin,
   claims,
   idempotencyKey,
+  allowGlobalAssignment = false,
 } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
@@ -1451,7 +1468,9 @@ export async function addManualPointsAdjustment(app, {
   try {
     await dbClient.query("BEGIN");
     await lockClientePointsScope(dbClient, safeClienteId);
-    await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
+    if (safeAccion === "restar" || !allowGlobalAssignment) {
+      await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
+    }
     const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: true });
     await ensureClienteHasActiveAccessUser(dbClient, cliente.id_usuario, safeClienteId);
     const replay = await claimManualAdjustmentIdempotency(dbClient, {

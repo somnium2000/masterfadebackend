@@ -191,6 +191,7 @@ export default async function adminPointsRoutes(app) {
           q: request.query?.q,
           limit: request.query?.limit,
           claims: request.claims,
+          allowGlobalAssignment: true,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
@@ -224,6 +225,7 @@ export default async function adminPointsRoutes(app) {
         const data = await getClientePointsSummary(app, request.params.id_cliente, {
           historyLimit: 20,
           claims: request.claims,
+          allowGlobalAssignment: true,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
@@ -265,6 +267,7 @@ export default async function adminPointsRoutes(app) {
           motivo: request.body?.motivo,
           usuarioAdmin: request.claims?.user,
           claims: request.claims,
+          allowGlobalAssignment: true,
           idempotencyKey,
         });
         return sendOk(reply, data, { requestId: request.id });
