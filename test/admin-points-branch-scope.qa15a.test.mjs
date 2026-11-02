@@ -20,7 +20,7 @@ function claims(roles = ['admin'], branchIds = [BRANCH_A]) {
   return { roles, branch_ids: branchIds, user: { id_usuario: ADMIN } };
 }
 
-function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 20 } = {}) {
+function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 4 } = {}) {
   const calls = [];
   let balanceReads = 0;
   const record = (target, sql, params = []) => calls.push({
@@ -91,7 +91,7 @@ test('admin A busca y consulta cliente A', async () => {
   const search = await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims, allowGlobalAssignment: true });
   assert.deepEqual(search.clientes.map((row) => row.id_cliente), [CLIENT]);
   const summary = await getClientePointsSummary(app, CLIENT, { claims: actorClaims, allowGlobalAssignment: true });
-  assert.equal(summary.id_cliente, CLIENT); assert.equal(summary.saldo_total, 20);
+  assert.equal(summary.id_cliente, CLIENT); assert.equal(summary.saldo_total, 4);
   assert.equal(calls.some(({ sql }) => sql.includes('fn_points_materialize_expired_cycles')), false);
   assert.ok(calls.some(({ sql }) => sql.includes('FROM public.vw_points_balance')));
 });
@@ -201,7 +201,7 @@ test('ajuste autorizado conserva la transacción y el saldo', async () => {
     idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
     usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   });
-  assert.equal(result.saldo_actual, 25); assert.equal(result.saldo_siguiente, 25);
+  assert.equal(result.saldo_actual, 9); assert.equal(result.saldo_siguiente, 9);
   assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
   assert.equal(calls.filter(({ sql }) => sql === 'COMMIT').length, 1);
   const lockIndex = calls.findIndex(({ sql }) => sql.includes('pg_advisory_xact_lock'));
@@ -229,4 +229,31 @@ test('saldo insuficiente autorizado conserva rollback e integridad', async () =>
   }), { statusCode: 422, code: 'POINTS_INSUFFICIENT_BALANCE' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
   assert.equal(calls.filter(({ sql }) => sql === 'ROLLBACK').length, 1);
+});
+
+test('recompensa pendiente bloquea suma manual sin movimiento ni confirmación idempotente', async () => {
+  const { app, calls, actorClaims } = fixture({ balance: 10 });
+  await assert.rejects(addManualPointsAdjustment(app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 1, motivo: 'Ajuste bloqueado',
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+  }), { statusCode: 409, code: 'POINTS_REWARD_PENDING' });
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('UPDATE app_private.points_manual_adjustment_idempotency')), false);
+  assert.equal(calls.filter(({ sql }) => sql === 'ROLLBACK').length, 1);
+});
+
+test('suma manual no sobrepasa la meta y vuelve a permitirse debajo de ella', async () => {
+  const blocked = fixture({ balance: 9 });
+  await assert.rejects(addManualPointsAdjustment(blocked.app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 2, motivo: 'Ajuste excedente',
+    usuarioAdmin: blocked.actorClaims.user, claims: blocked.actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+  }), { statusCode: 409, code: 'POINTS_REWARD_PENDING' });
+  assert.equal(blocked.calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
+
+  const allowed = fixture({ balance: 8 });
+  const result = await addManualPointsAdjustment(allowed.app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 2, motivo: 'Ajuste permitido',
+    usuarioAdmin: allowed.actorClaims.user, claims: allowed.actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+  });
+  assert.equal(result.saldo_siguiente, 10);
 });
