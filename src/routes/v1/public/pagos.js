@@ -18,6 +18,7 @@ import {
 } from "../../../services/payments/pixelPaySaleAttemptStore.js";
 import { inspectPixelPayCardExpire, STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT } from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
+import { resolvePixelPayStatusCandidate } from "../../../services/payments/pixelPayStatusCandidate.js";
 import {
   assertPixelPayCardAllowedForEnvironment,
   assertPixelPaySandboxCardAllowed,
@@ -134,6 +135,7 @@ export function classifyPixelPayStatusResult(status) {
 
 export function classifyPixelPayStatusError(error) {
   const code = safeText(error?.code)?.toUpperCase();
+  if (code === "PIXELPAY_STATUS_PRECONDITION_FAILED") return "precondicion_fallida";
   if (code === "PIXELPAY_TIMEOUT") return "timeout";
   if (code === "PIXELPAY_NETWORK_ERROR") return "error_red";
   if (code === "PIXELPAY_RESPONSE_INVALID") return "respuesta_invalida";
@@ -2598,13 +2600,10 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
         });
       }
-      const paymentUuid = resolveStoredPixelPayUuid(intent);
-      if (!paymentUuid) {
-        throw new AppError(409, "PixelPay aun no proporciono un identificador consultable", {
-          code: "PIXELPAY_PAYMENT_UUID_MISSING",
-        });
-      }
-      assertPixelPayUuidMatches(intent, paymentUuid);
+      const statusCandidate = await resolvePixelPayStatusCandidate(app.db, intent);
+      const paymentUuid = statusCandidate.paymentUuid;
+      const usesObservedCandidate = statusCandidate.source === "observed_untrusted";
+      if (!usesObservedCandidate) assertPixelPayUuidMatches(intent, paymentUuid);
       const status = await queryAndRegisterPixelPayStatus({
         db: app.db,
         provider: PaymentProviderFactory.create(),
@@ -2619,6 +2618,17 @@ export default async function publicPagosRoutes(app, options = {}) {
         });
       }
       if (isPixelPayPaidStatus(status.status)) {
+        if (usesObservedCandidate) {
+          return sendOk(reply, {
+            id_intent: idIntent,
+            provider_status: status.status,
+            code: STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
+            processed: false,
+            booking_confirmed: false,
+            pending_confirmation: true,
+            manual_reconciliation_required: true,
+          }, { statusCode: 202 });
+        }
         // SDK 2.5.8's hash does not authenticate the response amount or transaction IDs.
         // Status can only trigger recovery from an independently persisted, verified Sale.
         const reconciliationClient = await app.db.connect();
@@ -2653,7 +2663,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       }
       return sendOk(reply, {
         id_intent: idIntent,
-        payment_uuid: paymentUuid,
+        ...(usesObservedCandidate ? {} : { payment_uuid: paymentUuid }),
         provider_status: status.status,
         estado_intent_codigo: intent.estado_intent_codigo,
       });
@@ -2661,6 +2671,12 @@ export default async function publicPagosRoutes(app, options = {}) {
       if (error instanceof AppError) {
         return sendError(reply, error.statusCode, error.message, {
           code: error.code,
+          requestId: request.id,
+        });
+      }
+      if (safeText(error?.code) === "PIXELPAY_STATUS_PRECONDITION_FAILED") {
+        return sendError(reply, 412, "PixelPay no pudo procesar la consulta de estado en este momento", {
+          code: "PIXELPAY_STATUS_PRECONDITION_FAILED",
           requestId: request.id,
         });
       }

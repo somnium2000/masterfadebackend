@@ -636,7 +636,15 @@ export class PixelPaySdkProvider extends PaymentProvider {
     let response;
     try {
       response = await transaction.getStatus(statusRequest);
-    } catch {
+    } catch (error) {
+      const metadata = readPixelPayHttpMetadata(error);
+      if (metadata.statusCode === 412 || Number(error?.statusCode) === 412) {
+        throw new PixelPaySdkError(
+          "PIXELPAY_STATUS_PRECONDITION_FAILED",
+          "PixelPay no pudo procesar la consulta de estado en este momento.",
+          { statusCode: 412 }
+        );
+      }
       throw new PixelPaySdkError(
         "PIXELPAY_NETWORK_ERROR",
         "No fue posible confirmar el estado en PixelPay.",
@@ -645,6 +653,13 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
 
     const statusCode = responseStatus(response);
+    if (statusCode === 412) {
+      throw new PixelPaySdkError(
+        "PIXELPAY_STATUS_PRECONDITION_FAILED",
+        "PixelPay no pudo procesar la consulta de estado en este momento.",
+        { statusCode: 412 }
+      );
+    }
     const transactionResult = this.readTransactionResult(response);
     const result = transactionResult.result;
     const resultPaymentUuid = text(result?.payment_uuid) || null;

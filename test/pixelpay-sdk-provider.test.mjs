@@ -1005,6 +1005,23 @@ test("SDK Status con fromResponse fallido devuelve UNKNOWN sin filtrar payload",
   assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
 });
 
+test("SDK Status HTTP 412 conserva upstream y clasifica precondicion sin reintentar", async () => {
+  const fake = makeFakeSdk({
+    statusResponse: sdkResponse(412, { success: false, data: null, valid: false }),
+  });
+
+  await assert.rejects(
+    makeProvider(fake).queryPaymentStatus(PAYMENT_UUID),
+    (error) => {
+      assert.equal(error.code, "PIXELPAY_STATUS_PRECONDITION_FAILED");
+      assert.equal(error.statusCode, 412);
+      assert.equal(error.uncertain, false);
+      return true;
+    }
+  );
+  assert.equal(fake.calls.status, 1);
+});
+
 test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", async () => {
   const fake = makeFakeSdk({
     statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
