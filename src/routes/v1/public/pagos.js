@@ -20,6 +20,10 @@ import { inspectPixelPayCardExpire, STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CO
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
 import { resolvePixelPayStatusCandidate } from "../../../services/payments/pixelPayStatusCandidate.js";
 import {
+  pixelPayStatusTransportOnRequest,
+  pixelPayStatusTransportOnResponse,
+} from "../../../services/payments/pixelPayStatusTransport.js";
+import {
   assertPixelPayCardAllowedForEnvironment,
   assertPixelPaySandboxCardAllowed,
 } from "../../../services/payments/pixelPayCardEnvironment.js";
@@ -2567,6 +2571,8 @@ export default async function publicPagosRoutes(app, options = {}) {
 
   app.post("/pixelpay/status", {
     ...routeGuard,
+    onRequest: pixelPayStatusTransportOnRequest,
+    onResponse: pixelPayStatusTransportOnResponse,
     schema: {
       body: {
         type: "object",

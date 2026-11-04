@@ -757,6 +757,16 @@ async function createPagosApp(client, {
   return app;
 }
 
+function assertStatusTransportCorrelation(logs, requestId, httpStatus) {
+  const entries = logs.map((entry) => JSON.parse(entry));
+  const received = entries.find((entry) => entry.event === "pixelpay_status_transport_received");
+  const completed = entries.find((entry) => entry.event === "pixelpay_status_transport_completed");
+  assert.equal(received?.client_request_id, requestId);
+  assert.equal(completed?.client_request_id, requestId);
+  assert.equal(completed?.http_status, httpStatus);
+  return { received, completed };
+}
+
 function createSerializedTransactionClients(baseClient) {
   let tail = Promise.resolve();
   return () => {
@@ -2875,6 +2885,8 @@ test("status carga intent PixelPay y registra una verificacion con proveedor sim
 });
 
 test("status sin payment_uuid no llama proveedor ni registra telemetria", async () => {
+  const logs = [];
+  const requestId = "10000000-0000-4000-8000-000000000409";
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus() {
@@ -2899,11 +2911,12 @@ test("status sin payment_uuid no llama proveedor ni registra telemetria", async 
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: {
       id_grupo_cita: GROUP_A,
       id_intent: INTENT_A,
@@ -2917,6 +2930,7 @@ test("status sin payment_uuid no llama proveedor ni registra telemetria", async 
   assert.equal(client.getStatusChecks().length, 0);
   assert.equal(client.getActiveIntent().verification_attempts || 0, 0);
   assert.equal(client.getPayments().length, 0);
+  assertStatusTransportCorrelation(logs, requestId, 409);
   await app.close();
 });
 
@@ -2970,6 +2984,8 @@ test("status usa el unico UUID observado uncertain del mismo intent sin promover
 });
 
 test("status bloquea UUID observados ambiguos sin consultar PixelPay", async () => {
+  const logs = [];
+  const requestId = "20000000-0000-4000-8000-000000000409";
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus() { this.statusCalls += 1; },
@@ -2996,11 +3012,12 @@ test("status bloquea UUID observados ambiguos sin consultar PixelPay", async () 
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
   });
 
@@ -3008,6 +3025,7 @@ test("status bloquea UUID observados ambiguos sin consultar PixelPay", async () 
   assert.equal(response.json().error.code, "PIXELPAY_STATUS_CANDIDATE_AMBIGUOUS");
   assert.equal(provider.statusCalls, 0);
   assert.equal(client.getStatusChecks().length, 0);
+  assertStatusTransportCorrelation(logs, requestId, 409);
   await app.close();
 });
 
@@ -3096,6 +3114,8 @@ test("status pendiente no usa UUID observado de otro intent", async () => {
 });
 
 test("status PAID con UUID observado permanece bloqueado aunque exista Sale durable", async () => {
+  const logs = [];
+  const requestId = "30000000-0000-4000-8000-000000000202";
   const observedPaymentUuid = "observed-paid-uuid-qa";
   const provider = {
     statusCalls: 0,
@@ -3149,11 +3169,12 @@ test("status PAID con UUID observado permanece bloqueado aunque exista Sale dura
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
   });
 
@@ -3165,11 +3186,13 @@ test("status PAID con UUID observado permanece bloqueado aunque exista Sale dura
   assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
   assert.equal(client.getGroupState()[0].estado_cita_codigo, "en_espera");
   assert.equal(provider.statusCalls, 1);
+  assertStatusTransportCorrelation(logs, requestId, 202);
   await app.close();
 });
 
 test("status HTTP 412 se clasifica seguro, se registra y mantiene pendiente sin reintentos", async () => {
   const logs = [];
+  const requestId = "40000000-0000-4000-8000-000000000412";
   const observedPaymentUuid = "observed-412-uuid-qa";
   const provider = {
     statusCalls: 0,
@@ -3208,11 +3231,13 @@ test("status HTTP 412 se clasifica seguro, se registra y mantiene pendiente sin 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
   });
 
   assert.equal(response.statusCode, 412, response.body);
   assert.equal(response.json().error.code, "PIXELPAY_STATUS_PRECONDITION_FAILED");
+  assertStatusTransportCorrelation(logs, requestId, 412);
   assert.deepEqual(client.getStatusChecks().map(({ result, http_status, error_code }) => ({ result, http_status, error_code })), [{
     result: "precondicion_fallida",
     http_status: 412,
@@ -3602,8 +3627,12 @@ test("status PAID sin transaction_id estable queda en conciliacion manual", asyn
 });
 
 test("status registra error tecnico sanitizado sin persistir secretos", async () => {
+  const logs = [];
+  const requestId = "50000000-0000-4000-8000-000000000502";
   const provider = {
+    statusCalls: 0,
     async queryPaymentStatus() {
+      this.statusCalls += 1;
       const error = new Error("mensaje con PAN 4111111111111111 y secreto");
       error.code = "PIXELPAY_TIMEOUT";
       error.statusCode = 504;
@@ -3626,11 +3655,12 @@ test("status registra error tecnico sanitizado sin persistir secretos", async ()
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: {
       id_grupo_cita: GROUP_A,
       id_intent: INTENT_A,
@@ -3651,6 +3681,122 @@ test("status registra error tecnico sanitizado sin persistir secretos", async ()
   );
   assert.doesNotMatch(JSON.stringify(client.getStatusChecks()), /4111111111111111|secreto/i);
   assert.equal(client.getActiveIntent().verification_attempts, 1);
+  assert.equal(provider.statusCalls, 1);
+  assertStatusTransportCorrelation(logs, requestId, 502);
+  await app.close();
+});
+
+test("Status correlaciona entrada y salida con X-Request-Id seguro", async () => {
+  const logs = [];
+  const requestId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus(paymentUuid) {
+      this.statusCalls += 1;
+      return {
+        ok: true,
+        success: true,
+        statusCode: 200,
+        status: "PENDING",
+        paymentUuid,
+        transactionId: "transaction-id-private",
+        transactionReference: "transaction-reference-private",
+        observedPaymentUuidUntrusted: "observed-payment-uuid-untrusted-private",
+      };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    ownerEmail: "privacy-status@example.com",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "payment-uuid-correlation",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: {
+      "x-request-id": requestId,
+      authorization: "Bearer auth-hash-private",
+      cookie: "mf_session=session-secret-private",
+      "x-csrf-token": "csrf-secret-private",
+      "x-card-diagnostic": "4111111111111111 cvv 999",
+    },
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "privacy-status@example.com",
+    },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.headers["x-request-id"], requestId);
+  assert.equal(provider.statusCalls, 1);
+  const entries = logs.map((entry) => JSON.parse(entry));
+  const received = entries.find((entry) => entry.event === "pixelpay_status_transport_received");
+  const completed = entries.find((entry) => entry.event === "pixelpay_status_transport_completed");
+  assert.equal(received?.client_request_id, requestId);
+  assert.equal(completed?.client_request_id, requestId);
+  assert.equal(completed?.http_status, 200);
+  assert.equal(typeof completed?.duration_ms, "number");
+  const transportLogs = JSON.stringify([received, completed]);
+  assert.doesNotMatch(
+    transportLogs,
+    /privacy-status@example\.com|payment-uuid-correlation|transaction-id-private|transaction-reference-private|observed-payment-uuid-untrusted-private|auth-hash-private|session-secret-private|csrf-secret-private|4111111111111111|999/i
+  );
+  assert.doesNotMatch(transportLogs, new RegExp(`${GROUP_A}|${INTENT_A}`, "i"));
+  await app.close();
+});
+
+test("schema invalido registra transporte completo sin invocar PixelPay ni reflejar header invalido", async () => {
+  const logs = [];
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() {
+      this.statusCalls += 1;
+      throw new Error("provider no debe ejecutarse");
+    },
+  };
+  const client = createPagosClient({ providerCode: "pixelpay" });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+  const maliciousRequestId = "invalid-request-id secret@example.com";
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": maliciousRequestId },
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "invalid-email",
+    },
+  });
+
+  assert.equal(response.statusCode, 400, response.body);
+  assert.notEqual(response.headers["x-request-id"], maliciousRequestId);
+  assert.equal(provider.statusCalls, 0);
+  const entries = logs.map((entry) => JSON.parse(entry));
+  const received = entries.find((entry) => entry.event === "pixelpay_status_transport_received");
+  const completed = entries.find((entry) => entry.event === "pixelpay_status_transport_completed");
+  assert.ok(received);
+  assert.ok(completed);
+  assert.equal(completed.http_status, 400);
+  assert.equal(received.client_request_id, received.fastify_request_id);
+  assert.equal(completed.client_request_id, received.client_request_id);
+  assert.equal(response.headers["x-request-id"], received.client_request_id);
+  assert.doesNotMatch(JSON.stringify([received, completed]), /invalid-email|secret@example\.com|invalid-request-id/i);
   await app.close();
 });
 
