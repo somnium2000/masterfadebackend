@@ -26,6 +26,22 @@ BEGIN
     'PIXELPAY_TIMEOUT', 1000, 'qa-history-request-2', v_second_checked
   );
 
+  PERFORM app_private.registrar_payment_status_check_v1(
+    v_intent, 'qa-precondition', 'manual', NULL, 'precondicion_fallida', 412::smallint,
+    'PIXELPAY_STATUS_PRECONDITION_FAILED', 25, 'qa-precondition-request', clock_timestamp()
+  );
+
+  IF NOT EXISTS (
+    SELECT 1 FROM app_private.payment_status_checks
+    WHERE id_intent = v_intent
+      AND provider_reference = 'qa-precondition'
+      AND resultado_consulta_codigo = 'precondicion_fallida'
+      AND http_status = 412
+      AND error_code = 'PIXELPAY_STATUS_PRECONDITION_FAILED'
+  ) THEN
+    RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECKS_PRECONDITION_NOT_PERSISTED';
+  END IF;
+
   SELECT count(*)::integer INTO v_count
   FROM app_private.payment_status_checks
   WHERE id_status_check IN (v_first, v_second);
@@ -49,8 +65,8 @@ BEGIN
   INTO v_after, v_second_checked
   FROM public.payment_intents
   WHERE id_intent = v_intent;
-  IF v_after <> v_before + 2 THEN
-    RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECKS_ATTEMPTS_EXPECTED_2: before %, after %', v_before, v_after;
+  IF v_after <> v_before + 3 THEN
+    RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECKS_ATTEMPTS_EXPECTED_3: before %, after %', v_before, v_after;
   END IF;
   IF v_second_checked IS NULL THEN
     RAISE EXCEPTION 'MF_PAYMENT_STATUS_CHECKS_LAST_VERIFIED_MISSING';
