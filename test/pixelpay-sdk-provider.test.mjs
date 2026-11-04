@@ -5,6 +5,7 @@ import Fastify from "fastify";
 import { PixelPayDirectProvider, PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import {
+  classifyPixelPayStatusEvidence,
   classifySdkFailureMessage,
   inspectPixelPayCardExpire,
   isPixelPayBillingAddressPlaceholder,
@@ -61,12 +62,14 @@ function makeFakeSdk({
     setupSandbox: 0,
     setupEndpoint: 0,
     setupCredentials: 0,
+    setupPlatformUser: 0,
     setupEnvironment: 0,
     setupHeaders: [],
     items: [],
     addItem: 0,
     saleRequest: null,
     statusRequest: null,
+    voidRequest: null,
     hash: [],
     validateResponse: 0,
     fromResponse: 0,
@@ -82,6 +85,7 @@ function makeFakeSdk({
     }
     setupEndpoint(value) { calls.setupEndpoint += 1; this.endpoint = value; }
     setupCredentials(key, hash) { calls.setupCredentials += 1; this.auth_key = key; this.auth_hash = hash; }
+    setupPlatformUser(hash) { calls.setupPlatformUser += 1; this.auth_user = hash; }
     setupEnvironment(value) { calls.setupEnvironment += 1; this.environment = value; }
     setupHeaders(value) { calls.setupHeaders.push(value); this.headers = value; }
   }
@@ -115,6 +119,7 @@ function makeFakeSdk({
     setBilling(value) { this.billing = value; }
   }
   class StatusTransaction {}
+  class VoidTransaction {}
   class TransactionResult {
     static validateResponse(response) {
       calls.validateResponse += 1;
@@ -141,6 +146,7 @@ function makeFakeSdk({
       if (statusError) throw statusError;
       return statusResponse;
     }
+    async doVoid(request) { calls.voidRequest = request; return { success: true, status: 200 }; }
     verifyPaymentHash(hash, orderId, secret) {
       calls.hash.push({ hash, orderId, secret });
       return hash === "valid-hash" && orderId === ORDER_ID && secret === SECRET;
@@ -151,7 +157,7 @@ function makeFakeSdk({
     calls,
     sdk: {
       Models: { Settings, Order, Item, Card, Billing },
-      Requests: { SaleTransaction, StatusTransaction },
+      Requests: { SaleTransaction, StatusTransaction, VoidTransaction },
       Services: { Transaction },
       Entities: { TransactionResult },
     },
@@ -283,12 +289,12 @@ test("SDK aprobado valido se adapta al contrato MasterFade", async () => {
   }, saleInput.billing);
   assert.equal(fake.calls.settings[0].endpoint, "https://pixelpay.dev");
   assert.equal(fake.calls.settings[0].environment, "sandbox");
-  assert.equal(fake.calls.settings[0].auth_key, "1234567890");
-  assert.equal(fake.calls.settings[0].auth_hash, "official-sandbox-auth-hash");
+  assert.equal(fake.calls.settings[0].auth_key, KEY_ID);
+  assert.equal(fake.calls.settings[0].auth_hash, AUTH_HASH);
   assert.match(fake.calls.settings[0].headers["x-client-signature"], /^[a-f0-9]{128}$/);
   assert.equal(fake.calls.setupSandbox, 1);
   assert.equal(fake.calls.setupEndpoint, 0);
-  assert.equal(fake.calls.setupCredentials, 0);
+  assert.equal(fake.calls.setupCredentials, 1);
   assert.equal(fake.calls.setupEnvironment, 0);
   assert.equal(fake.calls.setupHeaders.length, 1);
 });
@@ -323,6 +329,7 @@ test("SDK live configura endpoint, credenciales, ambiente y headers oficiales pa
 
 test("SDK bloquea credenciales faltantes y combinaciones cruzadas Sandbox/live", () => {
   const fake = makeFakeSdk();
+  assert.throws(() => makeProvider(fake, { authHash: "" }), /PIXELPAY_AUTH_HASH/);
   assert.throws(() => makeLiveProvider(fake, { authHash: "" }), /PIXELPAY_AUTH_HASH/);
   assert.throws(() => makeLiveProvider(fake, { endpoint: "https://pixelpay.dev" }), /endpoint live/i);
   assert.throws(() => makeLiveProvider(fake, { appUrl: "https://pixelpay.dev" }), /APP_URL live/i);
@@ -903,7 +910,7 @@ test("diagnostico SDK identifica campos ausentes, montos y flags de respuesta", 
   }
 });
 
-test("SDK Status valido usa data.status del envelope oficial y devuelve PAID", async () => {
+test("SDK Status valido normaliza PAID historico a COMPLETED", async () => {
   const fake = makeFakeSdk({
     statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
     transactionResult: {},
@@ -913,13 +920,58 @@ test("SDK Status valido usa data.status del envelope oficial y devuelve PAID", a
 
   assert.equal(result.ok, true);
   assert.equal(result.success, true);
-  assert.equal(result.status, "PAID");
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.terminal, true);
   assert.equal(result.paymentUuid, PAYMENT_UUID);
   assert.equal(fake.calls.status, 1);
   assert.equal(fake.calls.validateResponse, 1);
   assert.equal(fake.calls.fromResponse, 1);
   assert.equal(fake.calls.statusRequest.payment_uuid, PAYMENT_UUID);
   assert.match(fake.calls.settings[0].headers["x-client-signature"], /^[a-f0-9]{128}$/);
+});
+
+test("SDK clasifica los seis estados oficiales sin aprobar estados inciertos", async (t) => {
+  for (const scenario of [
+    ["COMPLETED", { terminal: true, approved: true, uncertain: false }],
+    ["DECLINED", { terminal: true, approved: false, rejected: true, uncertain: false }],
+    ["VOIDED", { terminal: true, approved: false, voided: true, uncertain: false }],
+    ["PENDING", { terminal: false, approved: false, uncertain: true }],
+    ["UNKNOWN", { terminal: false, approved: false, uncertain: true }],
+    ["TIMEOUT", { terminal: false, approved: false, uncertain: true }],
+  ]) {
+    await t.test(scenario[0], async () => {
+      const fake = makeFakeSdk({
+        statusResponse: sdkResponse(200, { data: { status: scenario[0] }, valid: true }),
+        transactionResult: {},
+      });
+      const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
+      const evidence = classifyPixelPayStatusEvidence(result);
+      assert.equal(result.status, scenario[0]);
+      for (const [key, value] of Object.entries(scenario[1])) assert.equal(evidence[key], value);
+      assert.equal(evidence.autoApprovalEligible, false);
+      assert.equal(classifyPixelPayStatusResult(result), "ok");
+    });
+  }
+});
+
+test("SDK prepara Void con hashes SHA512 sin ejecutar red real", async () => {
+  const fake = makeFakeSdk();
+  const provider = makeProvider(fake);
+  const authorizedEmail = "authorized@example.com";
+  await provider.voidPayment({
+    paymentUuid: PAYMENT_UUID,
+    orderId: ORDER_ID,
+    authorizedEmail,
+    reason: "QA controlled void",
+  });
+  assert.equal(fake.calls.setupPlatformUser, 1);
+  assert.equal(fake.calls.settings[0].auth_user, PixelPaySdkProvider.sha512(authorizedEmail));
+  assert.equal(fake.calls.voidRequest.payment_uuid, PAYMENT_UUID);
+  assert.equal(fake.calls.voidRequest.void_reason, "QA controlled void");
+  assert.equal(
+    fake.calls.voidRequest.void_signature,
+    PixelPaySdkProvider.sha512(`${authorizedEmail}|${ORDER_ID}|${SECRET}`)
+  );
 });
 
 test("SDK Status solo entrega evidencia financiera cuando hash e importes son validos", async () => {
@@ -932,7 +984,7 @@ test("SDK Status solo entrega evidencia financiera cuando hash e importes son va
     orderId: saleInput.orderId,
     amount: saleInput.amount,
   });
-  assert.equal(result.status, "PAID");
+  assert.equal(result.status, "COMPLETED");
   assert.equal(result.approved, true);
   assert.equal(result.paymentHashValid, true);
   assert.equal(result.amountMatches, true);
@@ -1036,7 +1088,7 @@ test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", as
   assert.equal(fake.calls.status, 0);
 
   const result = await provider.queryPaymentStatus(PAYMENT_UUID);
-  assert.equal(result.status, "PAID");
+  assert.equal(result.status, "COMPLETED");
   assert.equal(fake.calls.status, 1);
 });
 
@@ -1151,9 +1203,12 @@ test("PaymentProviderFactory conserva direct por default y permite sdk explicito
     process.env.PIXELPAY_IMPLEMENTATION = "sdk";
     delete process.env.PIXELPAY_AUTH_HASH;
     PaymentProviderFactory.reset();
+    assert.throws(() => PaymentProviderFactory.create(), /PIXELPAY_AUTH_HASH/);
+    process.env.PIXELPAY_AUTH_HASH = AUTH_HASH;
+    PaymentProviderFactory.reset();
     const sdkProvider = PaymentProviderFactory.create();
     assert.ok(sdkProvider instanceof PixelPaySdkProvider);
-    assert.equal(sdkProvider.authHash, "");
+    assert.equal(sdkProvider.authHash, AUTH_HASH);
 
     Object.assign(process.env, {
       PIXELPAY_ENV: "live",
@@ -1179,7 +1234,7 @@ test("PaymentProviderFactory conserva direct por default y permite sdk explicito
   }
 });
 
-test("configuracion QA SDK usa exclusivamente Sandbox y Direct conserva AUTH_HASH obligatorio", async () => {
+test("configuracion QA exige AUTH_HASH tanto para SDK como Direct", async () => {
   const names = [
     "NODE_ENV", "FRONTEND_URL", "JWT_SECRET", "COOKIE_SECRET", "CSRF_SECRET",
     "PAYMENT_PROVIDER", "PIXELPAY_IMPLEMENTATION", "PIXELPAY_ENV", "PIXELPAY_ENDPOINT",
@@ -1205,7 +1260,7 @@ test("configuracion QA SDK usa exclusivamente Sandbox y Direct conserva AUTH_HAS
   try {
     const sdkApp = Fastify();
     sdkApp.register(envPlugin);
-    await sdkApp.ready();
+    await assert.rejects(sdkApp.ready(), /PIXELPAY_AUTH_HASH/);
     await sdkApp.close();
 
     process.env.PIXELPAY_IMPLEMENTATION = "direct";
@@ -1251,7 +1306,7 @@ test("ENTORNO=qa conserva Sandbox aunque NODE_ENV=production sea interno del con
   const app = Fastify();
   app.register(envPlugin);
   try {
-    await app.ready();
+    await assert.rejects(app.ready(), /PIXELPAY_AUTH_HASH/);
   } finally {
     await app.close();
     for (const name of names) {

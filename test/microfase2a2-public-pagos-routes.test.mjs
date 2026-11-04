@@ -57,17 +57,18 @@ function pixelPaySalePayload() {
 for (const [name, status, expected] of [
   ["request rechazado con UNKNOWN", { ok: false, success: false, status: "UNKNOWN" }, "error_proveedor"],
   ["request rechazado sin status", { ok: false, success: false, status: "" }, "error_proveedor"],
-  ["respuesta exitosa con UNKNOWN", { ok: true, success: true, status: "UNKNOWN" }, "respuesta_invalida"],
+  ["respuesta exitosa con UNKNOWN", { ok: true, success: true, status: "UNKNOWN" }, "ok"],
   ["respuesta exitosa sin status", { ok: true, success: true, status: "" }, "respuesta_invalida"],
   ["respuesta exitosa PENDING", { ok: true, success: true, status: "PENDING" }, "ok"],
-  ["respuesta exitosa PAID", { ok: true, success: true, status: "PAID" }, "ok"],
+  ["respuesta exitosa COMPLETED", { ok: true, success: true, status: "COMPLETED" }, "ok"],
 ]) {
   test(`clasificacion status PixelPay: ${name}`, () => {
     assert.equal(classifyPixelPayStatusResult(status), expected);
   });
 }
 
-test("solo PAID exacto se clasifica como pago confirmado", () => {
+test("COMPLETED y el alias historico PAID se clasifican como pago confirmado", () => {
+  assert.equal(isPixelPayPaidStatus("COMPLETED"), true);
   assert.equal(isPixelPayPaidStatus("PAID"), true);
   assert.equal(isPixelPayPaidStatus("paid"), true);
   assert.equal(isPixelPayPaidStatus("UNPAID"), false);
@@ -2884,6 +2885,56 @@ test("status carga intent PixelPay y registra una verificacion con proveedor sim
   await app.close();
 });
 
+for (const [providerStatus, expectedIntentState, expectedPending] of [
+  ["DECLINED", "fallido", false],
+  ["VOIDED", "fallido", false],
+  ["UNKNOWN", "pendiente_confirmacion", true],
+  ["TIMEOUT", "pendiente_confirmacion", true],
+]) {
+  test(`status oficial ${providerStatus} conserva semantica financiera segura`, async () => {
+    const calls = [];
+    const provider = {
+      async queryPaymentStatus(paymentUuid, expected) {
+        calls.push({ paymentUuid, expected });
+        return {
+          ok: true,
+          success: true,
+          statusCode: 200,
+          status: providerStatus,
+          paymentUuid,
+          providerContractValid: true,
+        };
+      },
+    };
+    const client = createPagosClient({
+      providerCode: "pixelpay",
+      existingIntent: {
+        id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
+        id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
+        expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+        orden_compra: "MF-PIXELPAY-STATUS-OFFICIAL", provider_session_id: "payment-uuid-official",
+        created_by_usuario_id: USER_A,
+      },
+    });
+    const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/public/pagos/pixelpay/status",
+      payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().data.provider_status, providerStatus);
+    assert.equal(response.json().data.pending_confirmation, expectedPending);
+    assert.equal(client.getActiveIntent().estado_intent_codigo, expectedIntentState);
+    assert.equal(client.getPayments().length, 0);
+    assert.deepEqual(calls[0].expected, {
+      orderId: "MF-PIXELPAY-STATUS-OFFICIAL",
+      amount: 115,
+    });
+    await app.close();
+  });
+}
+
 test("status sin payment_uuid no llama proveedor ni registra telemetria", async () => {
   const logs = [];
   const requestId = "10000000-0000-4000-8000-000000000409";
@@ -3323,6 +3374,7 @@ test("status PAID sin evidencia autentica completa queda bloqueado y no crea pai
         id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
         id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
         expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+        orden_compra: "MF-PIXELPAY-STATUS-BLOCKED",
         provider_session_id: "payment-uuid-blocked", referencia_externa: "transaction-id-blocked",
         created_by_usuario_id: USER_A,
       },
@@ -3340,7 +3392,10 @@ test("status PAID sin evidencia autentica completa queda bloqueado y no crea pai
     assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion", name);
     assert.equal(client.calls.filter((call) => call.sql.includes("pixelpay.status.paid_verified")).length, 0, name);
     assert.equal(provider.calls[0].paymentUuid, "payment-uuid-blocked", name);
-    assert.equal(provider.calls[0].expected, undefined, `${name}: Status no recibe importe local como evidencia`);
+    assert.deepEqual(provider.calls[0].expected, {
+      orderId: "MF-PIXELPAY-STATUS-BLOCKED",
+      amount: 115,
+    }, `${name}: Status recibe orden e importe canonicos`);
     await app.close();
   }
 });

@@ -16,7 +16,11 @@ import {
   createPixelPaySaleAttemptRecord,
   finalizePixelPaySaleAttemptBestEffort,
 } from "../../../services/payments/pixelPaySaleAttemptStore.js";
-import { inspectPixelPayCardExpire, STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT } from "../../../services/payments/PixelPaySdkProvider.js";
+import {
+  classifyPixelPayStatusEvidence,
+  inspectPixelPayCardExpire,
+  STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
+} from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
 import { resolvePixelPayStatusCandidate } from "../../../services/payments/pixelPayStatusCandidate.js";
 import {
@@ -132,8 +136,12 @@ function safeTelemetryText(value, maxLength = 255) {
 
 export function classifyPixelPayStatusResult(status) {
   if (status?.ok !== true || status?.success !== true) return "error_proveedor";
-  const providerStatus = safeText(status?.status);
-  if (!providerStatus || providerStatus.toUpperCase() === "UNKNOWN") return "respuesta_invalida";
+  const providerStatus = safeText(status?.status)?.toUpperCase();
+  if (!providerStatus) return "respuesta_invalida";
+  if (!["COMPLETED", "DECLINED", "VOIDED", "PENDING", "UNKNOWN", "TIMEOUT", "PAID"].includes(providerStatus)) {
+    return "respuesta_invalida";
+  }
+  if (status?.providerContractValid === false) return "respuesta_invalida";
   return "ok";
 }
 
@@ -147,7 +155,7 @@ export function classifyPixelPayStatusError(error) {
 }
 
 export function isPixelPayPaidStatus(status) {
-  return safeText(status)?.toUpperCase() === "PAID";
+  return ["COMPLETED", "PAID"].includes(safeText(status)?.toUpperCase());
 }
 
 export function resolveStoredPixelPayUuid(intent = {}) {
@@ -249,13 +257,14 @@ async function queryAndRegisterPixelPayStatus({
   provider,
   idIntent,
   paymentUuid,
+  expected,
   origin,
   requestId,
 }) {
   const startedAt = Date.now();
   let recorded = false;
   try {
-    const status = await provider.queryPaymentStatus(paymentUuid);
+    const status = await provider.queryPaymentStatus(paymentUuid, expected);
     const result = classifyPixelPayStatusResult(status);
     await registerPaymentStatusCheck(db, {
       idIntent,
@@ -2615,6 +2624,10 @@ export default async function publicPagosRoutes(app, options = {}) {
         provider: PaymentProviderFactory.create(),
         idIntent,
         paymentUuid,
+        expected: {
+          orderId: intent.orden_compra,
+          amount: Number(intent.monto_hnl),
+        },
         origin: "manual",
         requestId: request.id,
       });
@@ -2623,6 +2636,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PIXELPAY_PAYMENT_UUID_MISMATCH",
         });
       }
+      const statusEvidence = classifyPixelPayStatusEvidence(status);
       if (isPixelPayPaidStatus(status.status)) {
         if (usesObservedCandidate) {
           return sendOk(reply, {
@@ -2667,11 +2681,29 @@ export default async function publicPagosRoutes(app, options = {}) {
           manual_reconciliation_required: true,
         }, { statusCode: 202 });
       }
+      if (statusEvidence.rejected || statusEvidence.voided) {
+        await app.db.query(
+          `UPDATE public.payment_intents
+           SET estado_intent_codigo = $2::text, updated_at = now()
+           WHERE id_intent = $1::uuid
+             AND estado_intent_codigo = 'pendiente_confirmacion'`,
+          [idIntent, "fallido"]
+        );
+        return sendOk(reply, {
+          id_intent: idIntent,
+          provider_status: statusEvidence.status,
+          estado_intent_codigo: "fallido",
+          processed: false,
+          booking_confirmed: false,
+          pending_confirmation: false,
+        });
+      }
       return sendOk(reply, {
         id_intent: idIntent,
         ...(usesObservedCandidate ? {} : { payment_uuid: paymentUuid }),
         provider_status: status.status,
-        estado_intent_codigo: intent.estado_intent_codigo,
+        estado_intent_codigo: "pendiente_confirmacion",
+        pending_confirmation: statusEvidence.uncertain,
       });
     } catch (error) {
       if (error instanceof AppError) {
