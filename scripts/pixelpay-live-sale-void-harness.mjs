@@ -18,4 +18,3 @@ export async function runPixelPayLiveSaleVoidHarness({
   });
   return { sale, voidResponse };
 }
-
