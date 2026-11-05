@@ -9,7 +9,10 @@ import {
   readPixelPayHttpMetadata,
   safePixelPayProviderResponseCode,
 } from "./pixelPaySaleTelemetry.js";
-import { buildSafePixelPayStatus412Diagnostics } from "./pixelPayStatusDiagnostics.js";
+import {
+  buildSafePixelPayStatus412Diagnostics,
+  buildSafePixelPayStatus412ExceptionDiagnostics,
+} from "./pixelPayStatusDiagnostics.js";
 import {
   createPixelPaySaleSignature,
   createPixelPayStatusSignature,
@@ -710,7 +713,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
         throw new PixelPaySdkError(
           "PIXELPAY_STATUS_PRECONDITION_FAILED",
           "PixelPay no pudo procesar la consulta de estado en este momento.",
-          { statusCode: 412 }
+          {
+            statusCode: 412,
+            providerDiagnostics: buildSafePixelPayStatus412ExceptionDiagnostics(error),
+          }
         );
       }
       throw new PixelPaySdkError(
