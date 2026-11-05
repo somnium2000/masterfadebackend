@@ -15,6 +15,10 @@ import {
 import { classifyPixelPayStatusResult } from "../src/routes/v1/public/pagos.js";
 import envPlugin from "../src/plugins/env.js";
 import { PIXELPAY_SALE_EVENT, createPixelPaySaleAttempt } from "../src/services/payments/pixelPaySaleTelemetry.js";
+import {
+  buildSafePixelPayStatus412Diagnostics,
+  sanitizePixelPayStatus412Diagnostics,
+} from "../src/services/payments/pixelPayStatusDiagnostics.js";
 
 const KEY_ID = "qa-key-not-real";
 const SECRET = "qa-secret-not-real";
@@ -1059,7 +1063,13 @@ test("SDK Status con fromResponse fallido devuelve UNKNOWN sin filtrar payload",
 
 test("SDK Status HTTP 412 conserva upstream y clasifica precondicion sin reintentar", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(412, { success: false, data: null, valid: false }),
+    statusResponse: {
+      ...sdkResponse(412, { success: false, data: { code: "SIGNATURE_MISMATCH" }, valid: false }),
+      message: "Invalid signature",
+      action: "status",
+      errors: { payment_uuid: ["valor no registrado"], secret: [SECRET] },
+      constructor: { name: "PreconditionalResponse" },
+    },
   });
 
   await assert.rejects(
@@ -1068,10 +1078,106 @@ test("SDK Status HTTP 412 conserva upstream y clasifica precondicion sin reinten
       assert.equal(error.code, "PIXELPAY_STATUS_PRECONDITION_FAILED");
       assert.equal(error.statusCode, 412);
       assert.equal(error.uncertain, false);
+      assert.deepEqual(error.providerDiagnostics, {
+        statusCode: 412,
+        responseClass: "PreconditionalResponse",
+        providerCode: "SIGNATURE_MISMATCH",
+        providerMessage: "Invalid signature",
+        providerAction: "status",
+        errorFields: ["payment_uuid"],
+        unknownErrorFieldCount: 1,
+      });
+      assert.doesNotMatch(JSON.stringify(error.providerDiagnostics), new RegExp(SECRET));
       return true;
     }
   );
   assert.equal(fake.calls.status, 1);
+});
+
+test("diagnostico Status 412 descarta mensajes, codigos y campos sensibles", () => {
+  const sensitive = `${SECRET} ${AUTH_HASH} 4111111111111111`;
+  const diagnostics = buildSafePixelPayStatus412Diagnostics({
+    status: 412,
+    message: sensitive,
+    action: `status/${sensitive}`,
+    code: sensitive,
+    data: { code: `CODE-${sensitive}`, raw: sensitive },
+    errors: {
+      payment_uuid: [PAYMENT_UUID],
+      card_number: [saleInput.card.number],
+      card_cvv: [saleInput.card.cvv],
+      authorization: [AUTH_HASH],
+    },
+    constructor: { name: "PreconditionalResponse" },
+  });
+
+  assert.deepEqual(diagnostics, {
+    statusCode: 412,
+    responseClass: "PreconditionalResponse",
+    providerCode: null,
+    providerMessage: null,
+    providerAction: null,
+    errorFields: ["payment_uuid"],
+    unknownErrorFieldCount: 3,
+  });
+  assert.doesNotMatch(JSON.stringify(diagnostics), new RegExp(SECRET));
+  assert.doesNotMatch(JSON.stringify(diagnostics), /4111111111111111|999|authorization|card_number|card_cvv/);
+});
+
+test("diagnostico Status 412 tolera respuestas incompletas o inesperadas", () => {
+  assert.deepEqual(buildSafePixelPayStatus412Diagnostics(null), {
+    statusCode: null,
+    responseClass: null,
+    providerCode: null,
+    providerMessage: null,
+    providerAction: null,
+    errorFields: [],
+    unknownErrorFieldCount: 0,
+  });
+  assert.deepEqual(buildSafePixelPayStatus412Diagnostics({
+    status: "invalid",
+    errors: new Date(),
+    constructor: { name: "UnexpectedResponse" },
+  }), {
+    statusCode: null,
+    responseClass: null,
+    providerCode: null,
+    providerMessage: null,
+    providerAction: null,
+    errorFields: [],
+    unknownErrorFieldCount: 0,
+  });
+  assert.deepEqual(sanitizePixelPayStatus412Diagnostics({
+    statusCode: 412,
+    responseClass: "PreconditionalResponse",
+    providerCode: "SAFE_CODE",
+    providerMessage: `${SECRET}\nInvalid signature`,
+    providerAction: "status",
+    errorFields: ["payment_uuid", "card_number"],
+    unknownErrorFieldCount: 99,
+  }), {
+    statusCode: 412,
+    responseClass: "PreconditionalResponse",
+    providerCode: "SAFE_CODE",
+    providerMessage: null,
+    providerAction: "status",
+    errorFields: ["payment_uuid"],
+    unknownErrorFieldCount: 0,
+  });
+  assert.deepEqual(sanitizePixelPayStatus412Diagnostics({
+    statusCode: 412,
+    providerCode: SECRET,
+    providerMessage: SECRET,
+    providerAction: SECRET,
+  }), {
+    statusCode: 412,
+    responseClass: null,
+    providerCode: null,
+    providerMessage: null,
+    providerAction: null,
+    errorFields: [],
+    unknownErrorFieldCount: 0,
+  });
 });
 
 test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", async () => {

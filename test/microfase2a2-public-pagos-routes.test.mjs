@@ -3252,6 +3252,15 @@ test("status HTTP 412 se clasifica seguro, se registra y mantiene pendiente sin 
       const error = new Error("contexto o cache desconocido");
       error.code = "PIXELPAY_STATUS_PRECONDITION_FAILED";
       error.statusCode = 412;
+      error.providerDiagnostics = {
+        statusCode: 412,
+        responseClass: "PreconditionalResponse",
+        providerCode: "SIGNATURE_MISMATCH",
+        providerMessage: "Invalid signature",
+        providerAction: "status",
+        errorFields: ["payment_uuid"],
+        unknownErrorFieldCount: 0,
+      };
       throw error;
     },
   };
@@ -3297,6 +3306,8 @@ test("status HTTP 412 se clasifica seguro, se registra y mantiene pendiente sin 
   assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
   assert.equal(client.getPayments().length, 0);
   assert.equal(provider.statusCalls, 1);
+  assert.match(logs.join(""), /SIGNATURE_MISMATCH/);
+  assert.match(logs.join(""), /Invalid signature/);
   assert.doesNotMatch(logs.join(""), new RegExp(observedPaymentUuid));
   await app.close();
 });

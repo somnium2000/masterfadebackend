@@ -27,6 +27,7 @@ import {
   pixelPayStatusTransportOnRequest,
   pixelPayStatusTransportOnResponse,
 } from "../../../services/payments/pixelPayStatusTransport.js";
+import { sanitizePixelPayStatus412Diagnostics } from "../../../services/payments/pixelPayStatusDiagnostics.js";
 import {
   assertPixelPayCardAllowedForEnvironment,
   assertPixelPaySandboxCardAllowed,
@@ -2713,6 +2714,10 @@ export default async function publicPagosRoutes(app, options = {}) {
         });
       }
       if (safeText(error?.code) === "PIXELPAY_STATUS_PRECONDITION_FAILED") {
+        request.log.warn({
+          requestId: request.id,
+          pixelPayStatusDiagnostics: sanitizePixelPayStatus412Diagnostics(error?.providerDiagnostics),
+        }, "PixelPay Status rechazo precondicion");
         return sendError(reply, 412, "PixelPay no pudo procesar la consulta de estado en este momento", {
           code: "PIXELPAY_STATUS_PRECONDITION_FAILED",
           requestId: request.id,
