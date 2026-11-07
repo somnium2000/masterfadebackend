@@ -38,10 +38,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install PostgreSQL client
+      - name: Install PostgreSQL 17 tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-17 postgresql-client-17 postgresql-contrib-17
+          POSTGRES_17_BIN=/usr/lib/postgresql/17/bin
+          if [[ ! -x "$POSTGRES_17_BIN/initdb" || ! -x "$POSTGRES_17_BIN/postgres" ]]; then
+            echo "PostgreSQL 17 binaries are required at $POSTGRES_17_BIN" >&2
+            exit 1
+          fi
+          "$POSTGRES_17_BIN/initdb" --version | grep -E '^initdb \(PostgreSQL\) 17\.'
+          "$POSTGRES_17_BIN/postgres" --version | grep -E '^postgres \(PostgreSQL\) 17\.'
+          echo "MASTERFADE_TEST_PG_BIN=$POSTGRES_17_BIN" >> "$GITHUB_ENV"
+          echo "$POSTGRES_17_BIN" >> "$GITHUB_PATH"
       - name: Install Node dependencies
         run: npm ci
       - name: Bootstrap CI roles and extensions
@@ -106,8 +115,9 @@ jobs:
         env:
           RUN_PAYMENT_LATE_PG_INTEGRATION: "true"
         run: |
-          sudo apt-get install -y postgresql postgresql-contrib
-          MASTERFADE_TEST_PG_BIN="$(find /usr/lib/postgresql -name initdb -printf '%h\n' | sort -V | tail -n 1)" node --test test/payment-late-paid-at.postgres.test.mjs
+          "$MASTERFADE_TEST_PG_BIN/initdb" --version | grep -E '^initdb \(PostgreSQL\) 17\.'
+          "$MASTERFADE_TEST_PG_BIN/postgres" --version | grep -E '^postgres \(PostgreSQL\) 17\.'
+          node --test test/payment-late-paid-at.postgres.test.mjs
       - name: Run lint
         run: npm run lint
       - name: Check whitespace
