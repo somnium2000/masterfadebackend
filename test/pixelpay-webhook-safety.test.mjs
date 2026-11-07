@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { assertPaymentWebhookContract } from "../src/routes/v1/pagos.js";
 import {
-  EXPIRABLE_PAYMENT_INTENT_STATES,
+  ACTIVE_PAYMENT_INTENT_STATES,
   expireStaleAppointmentReservations,
 } from "../src/services/agendaService.js";
 
@@ -22,7 +22,7 @@ test("habilitar el flag no omite el contrato oficial bloqueado", () => {
   );
 });
 
-test("el expirador libera la reserva sin cerrar un pago incierto", async () => {
+test("el expirador delega la proteccion a evidencia durable y conserva otros proveedores", async () => {
   const calls = [];
   const client = {
     async query(sql, params = []) {
@@ -35,7 +35,7 @@ test("el expirador libera la reserva sin cerrar un pago incierto", async () => {
 
   const intentExpiry = calls.find(({ sql }) => sql.includes("WITH target_intents AS"));
   assert.ok(intentExpiry);
-  assert.deepEqual(EXPIRABLE_PAYMENT_INTENT_STATES, ["creado", "link_generado"]);
-  assert.deepEqual(intentExpiry.params[1], ["creado", "link_generado"]);
-  assert.equal(intentExpiry.params[1].includes("pendiente_confirmacion"), false);
+  assert.deepEqual(ACTIVE_PAYMENT_INTENT_STATES, ["creado", "link_generado", "pendiente_confirmacion"]);
+  assert.deepEqual(intentExpiry.params[1], ACTIVE_PAYMENT_INTENT_STATES);
+  assert.match(intentExpiry.sql, /NOT app_private\.pixelpay_intent_has_uncertain_sale_v1\(pi\.id_intent\)/);
 });

@@ -1997,15 +1997,22 @@ export default async function publicPagosRoutes(app, options = {}) {
             buildPublicPaymentIntentPayload(existingIntent.rows[0], pricing, null)
           );
         } else {
-          await dbClient.query(
+          const expiredMismatchedIntent = await dbClient.query(
             `
-              UPDATE public.payment_intents
+              UPDATE public.payment_intents pi
               SET estado_intent_codigo = 'expirado',
                   updated_at = now()
-              WHERE id_intent = $1::uuid
+              WHERE pi.id_intent = $1::uuid
+                AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
+              RETURNING pi.id_intent
             `,
             [existingIntent.rows[0].id_intent]
           );
+          if (!expiredMismatchedIntent.rows[0]) {
+            throw new AppError(409, "El pago anterior sigue pendiente de conciliacion", {
+              code: "PUBLIC_PAGOS_RECONCILIATION_PENDING",
+            });
+          }
         }
       }
 

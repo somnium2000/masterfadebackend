@@ -44,11 +44,12 @@ export async function confirmAppointmentWithoutPayment(client, {
 
   await client.query(
     `
-      UPDATE public.payment_intents
+      UPDATE public.payment_intents pi
       SET estado_intent_codigo = 'expirado',
           updated_at = now()
-      WHERE id_cita = $1::uuid
-        AND estado_intent_codigo IN ('creado', 'link_generado', 'pendiente_confirmacion')
+      WHERE pi.id_cita = $1::uuid
+        AND pi.estado_intent_codigo IN ('creado', 'link_generado', 'pendiente_confirmacion')
+        AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
     `,
     [appointmentId]
   );

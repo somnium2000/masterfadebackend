@@ -1064,6 +1064,7 @@ async function markPendingGroupExpired(client, groupId) {
         AND c.id_cita = pi.id_cita
         AND c.deleted_at IS NULL
         AND pi.estado_intent_codigo = ANY($2::text[])
+        AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
     `,
     [groupId, ACTIVE_PAYMENT_INTENT_STATES]
   );
@@ -3217,6 +3218,7 @@ export default async function citasRoutes(app) {
               AND c.id_cita = pi.id_cita
               AND c.deleted_at IS NULL
               AND pi.estado_intent_codigo = ANY($2::text[])
+              AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
           `,
           [groupId, ACTIVE_PAYMENT_INTENT_STATES]
         );

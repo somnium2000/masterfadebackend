@@ -2166,11 +2166,12 @@ export default async function adminCitasRoutes(app) {
         );
         await dbClient.query(
           `
-            UPDATE public.payment_intents
+            UPDATE public.payment_intents pi
             SET estado_intent_codigo = 'expirado',
                 updated_at = now()
-            WHERE id_cita = $1::uuid
-              AND estado_intent_codigo = ANY($2::text[])
+            WHERE pi.id_cita = $1::uuid
+              AND pi.estado_intent_codigo = ANY($2::text[])
+              AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
           `,
           [idCita, ACTIVE_PAYMENT_INTENT_STATES]
         );
