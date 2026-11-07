@@ -7,6 +7,10 @@ CREATE ROLE service_role NOLOGIN;
 ALTER TABLE public.payments ADD COLUMN pago_tardio boolean NOT NULL DEFAULT false;
 ALTER TABLE public.payment_intents ADD COLUMN provider_session_id text;
 ALTER TABLE public.clientes ADD COLUMN id_usuario uuid;
+ALTER TABLE public.clientes
+  ADD COLUMN id_sucursal_origen uuid,
+  ADD CONSTRAINT fk_cliente_sucursal_origen
+    FOREIGN KEY (id_sucursal_origen) REFERENCES public.sucursales(id_sucursal);
 ALTER TABLE public.citas_detalles
   ADD COLUMN descuento_hnl numeric(12,2) NOT NULL DEFAULT 0,
   ADD COLUMN incluye_isv_snapshot boolean NOT NULL DEFAULT false,
