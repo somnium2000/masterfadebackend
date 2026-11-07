@@ -159,6 +159,10 @@ async function envPlugin(app) {
     bookingReleaseTokenSecret: resolveBookingReleaseTokenSecret(nodeEnv),
     paymentProvider,
     pixelPayEnv,
+    pixelPayWebhookEnabled: parseStrictBooleanEnv(process.env.PIXELPAY_WEBHOOK_ENABLED, {
+      name: "PIXELPAY_WEBHOOK_ENABLED",
+      defaultValue: false,
+    }),
     todoPago,
     trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),

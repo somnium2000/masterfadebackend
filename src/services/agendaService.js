@@ -11,6 +11,7 @@ export const OPERATIONAL_APPOINTMENT_STATES = ["en_espera", "pendiente_pago", "c
 export const BOOKING_SELECTION_TYPES = ["services", "package", "mixed"];
 export const HOLD_EXPIRABLE_APPOINTMENT_STATES = ["en_espera", "pendiente_pago"];
 export const ACTIVE_PAYMENT_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+export const EXPIRABLE_PAYMENT_INTENT_STATES = ["creado", "link_generado"];
 export const AUTO_NO_SHOW_GRACE_MINUTES = 5;
 export const APPOINTMENT_STATE_TRANSITIONS = {
   en_espera: ["confirmada", "cancelada", "expirada"],
@@ -780,7 +781,9 @@ export async function expireStaleAppointmentReservations(client, { now = new Dat
       WHERE pi.id_intent = ti.id_intent
       RETURNING pi.id_intent, ti.referencia_externa, ti.provider_code
     `,
-    [referenceNow.toISOString(), ACTIVE_PAYMENT_INTENT_STATES, expiredHoldIds, expiredCitaIds]
+    // AM: Un cobro incierto conserva su estado durable para conciliacion aunque
+    // el hold y la cita se liberen; solo intents sin Sale incierta se expiran.
+    [referenceNow.toISOString(), EXPIRABLE_PAYMENT_INTENT_STATES, expiredHoldIds, expiredCitaIds]
   );
 
   const cancelledProviderIntents = await cancelProviderIntents(expiredIntentResult.rows, logger);
