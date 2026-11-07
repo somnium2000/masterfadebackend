@@ -23,14 +23,22 @@ async function prepareSchema(client) {
       id_provider uuid PRIMARY KEY,
       codigo text NOT NULL
     );
+    CREATE TABLE public.citas_grupos (
+      id_grupo_cita uuid PRIMARY KEY,
+      id_cliente_titular uuid,
+      id_usuario_titular uuid,
+      id_persona_titular uuid,
+      estado_grupo_codigo text NOT NULL
+    );
     CREATE TABLE public.citas (
       id_cita uuid PRIMARY KEY,
-      id_grupo_cita uuid,
+      id_grupo_cita uuid REFERENCES public.citas_grupos(id_grupo_cita),
       id_empleado_barbero uuid NOT NULL,
       inicio_at timestamptz NOT NULL,
       fin_at timestamptz NOT NULL,
       estado_cita_codigo text NOT NULL,
-      deleted_at timestamptz
+      deleted_at timestamptz,
+      updated_at timestamptz NOT NULL DEFAULT now()
     );
     ALTER TABLE public.citas ADD CONSTRAINT ex_cita_barbero_activa
       EXCLUDE USING gist (
@@ -71,6 +79,18 @@ async function prepareSchema(client) {
       estado_pago_codigo text NOT NULL,
       paid_at timestamptz NOT NULL
     );
+    CREATE TABLE public.citas_promociones (
+      id_cita_promocion uuid PRIMARY KEY,
+      id_grupo_cita uuid
+    );
+    CREATE TABLE public.promociones_usos (
+      id_promocion_uso uuid PRIMARY KEY,
+      id_cita_promocion uuid,
+      estado_uso_codigo text,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE FUNCTION app_private.obtener_gracia_confirmacion_pago_min_v1()
+    RETURNS integer LANGUAGE sql STABLE AS 'SELECT 5';
   `);
   await client.query(await readFile(migrationUrl, "utf8"));
 }
@@ -85,6 +105,7 @@ async function seedReservation(client, {
   const ids = {
     provider: crypto.randomUUID(),
     group: crypto.randomUUID(),
+    client: crypto.randomUUID(),
     barber: crypto.randomUUID(),
     cita: crypto.randomUUID(),
     hold: crypto.randomUUID(),
@@ -92,6 +113,8 @@ async function seedReservation(client, {
   };
   const end = new Date(new Date(start).getTime() + 30 * 60_000).toISOString();
   await client.query("INSERT INTO payment_providers(id_provider,codigo) VALUES ($1,$2)", [ids.provider, providerCode]);
+  await client.query(`INSERT INTO citas_grupos(id_grupo_cita,id_cliente_titular,estado_grupo_codigo)
+    VALUES ($1,$2,'activo')`, [ids.group, ids.client]);
   await client.query(`INSERT INTO citas(id_cita,id_grupo_cita,id_empleado_barbero,inicio_at,fin_at,estado_cita_codigo)
     VALUES ($1,$2,$3,$4,$5,'pendiente_pago')`, [ids.cita, ids.group, ids.barber, start, end]);
   await client.query(`INSERT INTO citas_holds(id_hold,id_cita,estado_hold_codigo,expires_at)
@@ -113,6 +136,13 @@ async function seedReservation(client, {
     ]);
   }
   return { ...ids, start, end };
+}
+
+async function expireOwnerReservations(client, ids) {
+  return (await client.query(
+    "SELECT app_private.expirar_reservas_titular_v1($1,NULL,NULL,$2) result",
+    [ids.client, "2026-11-07T14:01:00.000Z"],
+  )).rows[0].result;
 }
 
 async function expireHold(client, ids) {
@@ -154,6 +184,64 @@ test("PostgreSQL 17: expiracion protege solo evidencia durable PixelPay incierta
   }
 });
 
+test("PostgreSQL 17: RPC exacto de QA libera horario sin borrar evidencia incierta", async (t) => {
+  const isolated = await startPostgres17();
+  try {
+    await prepareSchema(isolated.client);
+
+    const uncertain = await seedReservation(isolated.client, {
+      saleAttempts: [{ outcome: "uncertain", uncertain: true }],
+    });
+    const uncertainResult = await expireOwnerReservations(isolated.client, uncertain);
+    assert.deepEqual(
+      {
+        holds: uncertainResult.holds_expirados,
+        citas: uncertainResult.citas_expiradas,
+        intents: uncertainResult.intents_expirados,
+      },
+      { holds: 1, citas: 1, intents: 0 },
+    );
+    const uncertainState = (await isolated.client.query(`SELECT pi.estado_intent_codigo,
+      h.estado_hold_codigo,c.estado_cita_codigo FROM payment_intents pi
+      JOIN citas_holds h ON h.id_hold=pi.id_hold JOIN citas c ON c.id_cita=pi.id_cita
+      WHERE pi.id_intent=$1`, [uncertain.intent])).rows[0];
+    assert.deepEqual(uncertainState, {
+      estado_intent_codigo: "pendiente_confirmacion",
+      estado_hold_codigo: "expirado",
+      estado_cita_codigo: "expirada",
+    });
+
+    const replacement = crypto.randomUUID();
+    await isolated.client.query(`INSERT INTO citas
+      (id_cita,id_grupo_cita,id_empleado_barbero,inicio_at,fin_at,estado_cita_codigo)
+      VALUES ($1,$2,$3,$4,$5,'confirmada')`, [
+      replacement, uncertain.group, uncertain.barber, uncertain.start, uncertain.end,
+    ]);
+    assert.equal((await isolated.client.query("SELECT count(*)::int count FROM citas WHERE id_cita=$1", [replacement])).rows[0].count, 1);
+
+    for (const [name, options, hourOffset] of [
+      ["Mock", { providerCode: "mock" }, 1],
+      ["otro proveedor", { providerCode: "banpais" }, 2],
+      ["PixelPay definitivo", { saleAttempts: [{ outcome: "request_error_definitive", uncertain: false }] }, 3],
+    ]) {
+      await t.test(`${name} expira por el RPC`, async () => {
+        const ids = await seedReservation(isolated.client, {
+          ...options,
+          start: new Date(Date.parse(uncertain.start) + hourOffset * 3_600_000).toISOString(),
+        });
+        const result = await expireOwnerReservations(isolated.client, ids);
+        assert.equal(result.intents_expirados, 1);
+        assert.equal((await isolated.client.query(
+          "SELECT estado_intent_codigo FROM payment_intents WHERE id_intent=$1",
+          [ids.intent],
+        )).rows[0].estado_intent_codigo, "expirado");
+      });
+    }
+  } finally {
+    await isolated.stop();
+  }
+});
+
 test("PostgreSQL 17: aprobacion tardia es idempotente y no desplaza una reserva posterior", async () => {
   const isolated = await startPostgres17();
   try {
@@ -165,9 +253,12 @@ test("PostgreSQL 17: aprobacion tardia es idempotente y no desplaza una reserva 
     await isolated.client.query("UPDATE citas SET estado_cita_codigo='expirada' WHERE id_cita=$1", [ids.cita]);
 
     const laterCita = crypto.randomUUID();
+    const laterGroup = crypto.randomUUID();
+    await isolated.client.query(`INSERT INTO citas_grupos(id_grupo_cita,id_cliente_titular,estado_grupo_codigo)
+      VALUES ($1,$2,'activo')`, [laterGroup, crypto.randomUUID()]);
     await isolated.client.query(`INSERT INTO citas
       (id_cita,id_grupo_cita,id_empleado_barbero,inicio_at,fin_at,estado_cita_codigo)
-      VALUES ($1,$2,$3,$4,$5,'confirmada')`, [laterCita, crypto.randomUUID(), ids.barber, ids.start, ids.end]);
+      VALUES ($1,$2,$3,$4,$5,'confirmada')`, [laterCita, laterGroup, ids.barber, ids.start, ids.end]);
 
     await isolated.client.query("BEGIN");
     try {
