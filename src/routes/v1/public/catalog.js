@@ -199,10 +199,7 @@ const PUBLIC_SERVICES_SQL = `
       )
       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
-      AND (
-        st.precio_hnl > 0
-        OR (st.precio_hnl = 0 AND COALESCE(st.servicio_informativo, FALSE) IS TRUE)
-      )
+      AND st.precio_hnl >= 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -260,7 +257,7 @@ const PUBLIC_SERVICES_SQL = `
     AND COALESCE(ss.duracion_min, s.duracion_min) > 0
     AND (
       ss.precio_hnl > 0
-      OR (ss.precio_hnl = 0 AND ss.servicio_informativo IS TRUE)
+      OR (ss.precio_hnl = 0 AND (ss.servicio_informativo IS TRUE OR s.agendable IS FALSE))
     )
   ORDER BY s.orden_visual ASC, s.nombre_servicio ASC
 `;
@@ -400,10 +397,7 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
       )
       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
-      AND (
-        st.precio_hnl > 0
-        OR (st.precio_hnl = 0 AND COALESCE(st.servicio_informativo, FALSE) IS TRUE)
-      )
+      AND st.precio_hnl >= 0
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -456,7 +450,7 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
     AND COALESCE(ss.duracion_min, s.duracion_min) > 0
     AND (
       ss.precio_hnl > 0
-      OR (ss.precio_hnl = 0 AND ss.servicio_informativo IS TRUE)
+      OR (ss.precio_hnl = 0 AND (ss.servicio_informativo IS TRUE OR s.agendable IS FALSE))
     )
     AND (
       LOWER(s.nombre_servicio) LIKE $3::text
@@ -826,7 +820,7 @@ function getPromotionVigenciaStatus(promotion, nowParts = getBusinessNowParts())
 
 function mapServiceRow(row) {
   const grupoCatalogo = String(row.grupo_catalogo || "barberia").trim().toLowerCase() === "otros" ? "otros" : "barberia";
-  const servicioInformativo = Boolean(row.servicio_informativo ?? false);
+  const servicioInformativo = Boolean(row.servicio_informativo ?? false) || row.agendable === false;
   const activo = Boolean(row.activo ?? true);
   const agendable = activo && Boolean(row.agendable ?? (grupoCatalogo === "barberia")) && !servicioInformativo;
 

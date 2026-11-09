@@ -27,10 +27,10 @@ function service(overrides = {}) {
 }
 
 function publishedByServiceQuery(sql, row) {
-  const supportsInformativeZero = /st\.precio_hnl = 0[\s\S]*st\.servicio_informativo/.test(sql)
+  const supportsInformativeZero = /st\.precio_hnl >= 0/.test(sql)
     && /ss\.precio_hnl = 0[\s\S]*ss\.servicio_informativo/.test(sql);
   const validPrice = row.precio_hnl > 0
-    || (supportsInformativeZero && row.precio_hnl === 0 && row.servicio_informativo === true);
+    || (supportsInformativeZero && row.precio_hnl === 0 && (row.servicio_informativo === true || row.agendable === false));
   return row.activo && row.visible_publico && row.tarifa_activa && row.tarifa_vigente
     && row.sucursal_habilitada && validPrice;
 }
@@ -65,11 +65,13 @@ for (const endpoint of [
       service({ id_servicio: "21111111-1111-4111-8111-111111111111", servicio_informativo: true }),
       service({ id_servicio: "31111111-1111-4111-8111-111111111111", precio_hnl: 0, servicio_informativo: true }),
       service({ id_servicio: "41111111-1111-4111-8111-111111111111", precio_hnl: 0 }),
+      service({ id_servicio: "51111111-1111-4111-8111-111111111111", precio_hnl: 0, agendable: false }),
     ];
     const { app, calls } = await buildApp(t, rows);
     const response = await app.inject(endpoint);
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(response.json().data.servicios.map((row) => row.id_servicio), rows.slice(0, 3).map((row) => row.id_servicio));
+    assert.deepEqual(response.json().data.servicios.map((row) => row.id_servicio), [...rows.slice(0, 3), rows[4]].map((row) => row.id_servicio));
+    assert.equal(response.json().data.servicios.at(-1).servicio_informativo, true);
     const sql = calls.find((call) => call.includes("JOIN service_scope"));
     for (const clause of ["st.activo IS TRUE", "su.estado IS TRUE", "s.activo IS TRUE", "s.visible_publico IS TRUE"]) {
       assert.ok(sql.includes(clause), `Conserva control: ${clause}`);
