@@ -87,6 +87,30 @@ test("PostgreSQL 17: account deletion schema preserves internal history and guar
     `);
     assert.equal(grants.rows[0].count, 0);
 
+    const redacted = await client.query(`
+      SELECT app_private.fn_redact_account_pii_jsonb_v1(
+        '{"nombre":"Ana","email":"ana@example.test","nested":{"token":"secret","estado":"activo"},"items":[{"telefono":"9999","codigo":"ok"}]}'::jsonb
+      ) AS value
+    `);
+    assert.deepEqual(redacted.rows[0].value, {
+      nombre: "Cliente eliminado",
+      email: null,
+      nested: { token: null, estado: "activo" },
+      items: [{ telefono: null, codigo: "ok" }]
+    });
+    assert.equal((await client.query("SELECT app_private.fn_redact_account_pii_jsonb_v1(NULL::jsonb) AS value")).rows[0].value, null);
+    const redactorAcl = await client.query(`
+      SELECT p.proacl::text AS acl, p.provolatile, p.proisstrict, p.prosecdef
+      FROM pg_proc p
+      WHERE p.oid='app_private.fn_redact_account_pii_jsonb_v1(jsonb)'::regprocedure
+    `);
+    assert.deepEqual(redactorAcl.rows[0], {
+      acl: "{postgres=X/postgres}",
+      provolatile: "i",
+      proisstrict: true,
+      prosecdef: false
+    });
+
     const person = "11111111-1111-4111-8111-111111111111";
     const clientId = "22222222-2222-4222-8222-222222222222";
     await client.query("INSERT INTO public.personas(id_persona) VALUES ($1)", [person]);
