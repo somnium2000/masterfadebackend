@@ -69,9 +69,35 @@ test('la consulta es agregada, parametrizada y de solo lectura', async (t) => {
   assert.match(sql, /COUNT\(s\.id_suscripcion\)/);
   assert.match(sql, /COUNT\(DISTINCT pt\.id_points_tx\)/);
   assert.match(sql, /tipo_puntos_codigo = 'canjear'/);
+  assert.match(sql, /WITH RECURSIVE range_config/);
+  assert.match(sql, /LEAST\(b\.bucket \+ rc\.step, rc\.local_to\)/);
+  assert.match(sql, /COALESCE\(\(SELECT SUM\(ep\.monto_hnl\)/);
   assert.doesNotMatch(sql, /subscription_payments|citas_detalles|total_pagar_hnl/);
   assert.doesNotMatch(sql, /\b(?:INSERT|UPDATE|DELETE|ALTER|DROP)\b/i);
   assert.deepEqual(calls[0].params[0], ['capturado', 'conciliado', 'manual_pagado']);
+});
+
+test('conserva buckets sin actividad y totales de series verificables', async (t) => {
+  const { app } = await fixture(t, 'super_admin', {
+    ingresos_citas_hnl_periodo: '5.00',
+    planes_activados: '1',
+    masterpuntos_canjeados: '2',
+    ingresos_serie: [
+      { periodo: '2026-11-01T00:00:00', ingresos_hnl: '2.00' },
+      { periodo: '2026-11-02T00:00:00', ingresos_hnl: '0.00' },
+      { periodo: '2026-11-03T00:00:00', ingresos_hnl: '3.00' },
+    ],
+    actividad_serie: [
+      { periodo: '2026-11-01T00:00:00', planes_activados: '0', masterpuntos_canjeados: '1' },
+      { periodo: '2026-11-02T00:00:00', planes_activados: '0', masterpuntos_canjeados: '0' },
+      { periodo: '2026-11-03T00:00:00', planes_activados: '1', masterpuntos_canjeados: '1' },
+    ],
+  });
+  const body = (await app.inject('/v1/admin/super-dashboard/summary?fecha_desde=2026-11-01&fecha_hasta=2026-11-03')).json().data;
+  assert.equal(body.ingresos_serie.reduce((sum, item) => sum + item.ingresos_hnl, 0), body.ingresos_citas_hnl_periodo);
+  assert.equal(body.actividad_serie.reduce((sum, item) => sum + item.planes_activados, 0), body.planes_activados);
+  assert.equal(body.actividad_serie.reduce((sum, item) => sum + item.masterpuntos_canjeados, 0), body.masterpuntos_canjeados);
+  assert.equal(body.ingresos_serie[1].ingresos_hnl, 0);
 });
 
 test('agrupa hoy por hora y rangos extensos de forma acotada', async (t) => {

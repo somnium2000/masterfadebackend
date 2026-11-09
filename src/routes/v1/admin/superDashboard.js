@@ -48,7 +48,28 @@ function resolveGrouping(fechaDesde, fechaHasta) {
 }
 
 const SUMMARY_SQL = `
-  WITH eligible_payments AS (
+  WITH RECURSIVE range_config AS (
+    SELECT
+      $2::timestamptz AT TIME ZONE '${TIMEZONE}' AS local_from,
+      $3::timestamptz AT TIME ZONE '${TIMEZONE}' AS local_to,
+      CASE $4::text
+        WHEN 'hour' THEN INTERVAL '1 hour'
+        WHEN 'day' THEN INTERVAL '1 day'
+        WHEN 'week' THEN INTERVAL '7 days'
+        WHEN 'month' THEN INTERVAL '1 month'
+        ELSE INTERVAL '1 year'
+      END AS step
+  ),
+  buckets AS (
+    SELECT rc.local_from AS bucket
+    FROM range_config rc
+    UNION ALL
+    SELECT b.bucket + rc.step
+    FROM buckets b
+    CROSS JOIN range_config rc
+    WHERE b.bucket + rc.step < rc.local_to
+  ),
+  eligible_payments AS (
     SELECT DISTINCT p.id_payment, p.monto_hnl, p.paid_at
     FROM public.payments p
     JOIN public.payment_intents pi ON pi.id_intent = p.id_intent
@@ -57,32 +78,24 @@ const SUMMARY_SQL = `
       AND p.paid_at IS NOT NULL
       AND c.deleted_at IS NULL
   ),
-  income_by_bucket AS (
+  continuous_series AS (
     SELECT
-      date_trunc($4::text, ep.paid_at AT TIME ZONE '${TIMEZONE}') AS bucket,
-      COALESCE(SUM(ep.monto_hnl), 0)::numeric AS total_hnl
-    FROM eligible_payments ep
-    WHERE ep.paid_at >= $2::timestamptz
-      AND ep.paid_at < $3::timestamptz
-    GROUP BY 1
-  ),
-  activity_rows AS (
-    SELECT date_trunc($4::text, s.inicio_at AT TIME ZONE '${TIMEZONE}') AS bucket,
-           1::bigint AS planes, 0::bigint AS canjes
-    FROM public.subscriptions s
-    WHERE s.inicio_at >= $2::timestamptz AND s.inicio_at < $3::timestamptz
-    UNION ALL
-    SELECT date_trunc($4::text, pt.created_at AT TIME ZONE '${TIMEZONE}') AS bucket,
-           0::bigint AS planes, 1::bigint AS canjes
-    FROM public.points_transactions pt
-    WHERE pt.tipo_puntos_codigo = 'canjear'
-      AND pt.created_at >= $2::timestamptz AND pt.created_at < $3::timestamptz
-  ),
-  activity_by_bucket AS (
-    SELECT bucket, SUM(planes)::bigint AS planes_activados,
-           SUM(canjes)::bigint AS masterpuntos_canjeados
-    FROM activity_rows
-    GROUP BY bucket
+      b.bucket,
+      COALESCE((SELECT SUM(ep.monto_hnl)
+        FROM eligible_payments ep
+        WHERE ep.paid_at AT TIME ZONE '${TIMEZONE}' >= b.bucket
+          AND ep.paid_at AT TIME ZONE '${TIMEZONE}' < LEAST(b.bucket + rc.step, rc.local_to)), 0)::numeric AS ingresos_hnl,
+      (SELECT COUNT(s.id_suscripcion)
+        FROM public.subscriptions s
+        WHERE s.inicio_at AT TIME ZONE '${TIMEZONE}' >= b.bucket
+          AND s.inicio_at AT TIME ZONE '${TIMEZONE}' < LEAST(b.bucket + rc.step, rc.local_to))::bigint AS planes_activados,
+      (SELECT COUNT(DISTINCT pt.id_points_tx)
+        FROM public.points_transactions pt
+        WHERE pt.tipo_puntos_codigo = 'canjear'
+          AND pt.created_at AT TIME ZONE '${TIMEZONE}' >= b.bucket
+          AND pt.created_at AT TIME ZONE '${TIMEZONE}' < LEAST(b.bucket + rc.step, rc.local_to))::bigint AS masterpuntos_canjeados
+    FROM buckets b
+    CROSS JOIN range_config rc
   )
   SELECT
     (SELECT COUNT(c.id_cita)::bigint FROM public.citas c WHERE c.deleted_at IS NULL) AS total_citas,
@@ -99,14 +112,14 @@ const SUMMARY_SQL = `
         AND pt.created_at >= $2::timestamptz
         AND pt.created_at < $3::timestamptz) AS masterpuntos_canjeados,
     COALESCE((SELECT json_agg(json_build_object(
-      'periodo', to_char(ib.bucket, 'YYYY-MM-DD"T"HH24:MI:SS'),
-      'ingresos_hnl', ib.total_hnl
-    ) ORDER BY ib.bucket) FROM income_by_bucket ib), '[]'::json) AS ingresos_serie,
+      'periodo', to_char(cs.bucket, 'YYYY-MM-DD"T"HH24:MI:SS'),
+      'ingresos_hnl', cs.ingresos_hnl
+    ) ORDER BY cs.bucket) FROM continuous_series cs), '[]'::json) AS ingresos_serie,
     COALESCE((SELECT json_agg(json_build_object(
-      'periodo', to_char(ab.bucket, 'YYYY-MM-DD"T"HH24:MI:SS'),
-      'planes_activados', ab.planes_activados,
-      'masterpuntos_canjeados', ab.masterpuntos_canjeados
-    ) ORDER BY ab.bucket) FROM activity_by_bucket ab), '[]'::json) AS actividad_serie`;
+      'periodo', to_char(cs.bucket, 'YYYY-MM-DD"T"HH24:MI:SS'),
+      'planes_activados', cs.planes_activados,
+      'masterpuntos_canjeados', cs.masterpuntos_canjeados
+    ) ORDER BY cs.bucket) FROM continuous_series cs), '[]'::json) AS actividad_serie`;
 
 export default async function superDashboardRoutes(app) {
   app.get("/summary", { preHandler: app.requireRoles(["super_admin"]) }, async (request, reply) => {
