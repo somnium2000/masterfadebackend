@@ -4,6 +4,7 @@ import Fastify from "fastify";
 import routes from "../src/routes/v1/public/catalog.js";
 
 const BRANCH = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const OTHER_BRANCH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 function service(overrides = {}) {
   return {
@@ -19,6 +20,7 @@ function service(overrides = {}) {
     servicio_informativo: false,
     orden_visual: 10,
     precio_hnl: 250,
+    id_sucursal: BRANCH,
     tarifa_activa: true,
     tarifa_vigente: true,
     sucursal_habilitada: true,
@@ -27,7 +29,7 @@ function service(overrides = {}) {
 }
 
 function publishedByServiceQuery(sql, row) {
-  const supportsInformativeZero = /st\.precio_hnl >= 0/.test(sql)
+  const supportsInformativeZero = /JOIN public\.servicios tariff_service[\s\S]*tariff_service\.id_servicio = st\.id_servicio/.test(sql)
     && /ss\.precio_hnl = 0[\s\S]*ss\.servicio_informativo/.test(sql);
   const validPrice = row.precio_hnl > 0
     || (supportsInformativeZero && row.precio_hnl === 0 && (row.servicio_informativo === true || row.agendable === false));
@@ -39,11 +41,17 @@ async function buildApp(t, rows) {
   const calls = [];
   const app = Fastify();
   app.decorate("db", {
-    query: async (sql) => {
+    query: async (sql, params = []) => {
       const text = String(sql);
       calls.push(text);
       if (text.includes("FROM public.servicios s") && text.includes("JOIN service_scope")) {
-        const published = rows.filter((row) => publishedByServiceQuery(text, row));
+        const branchId = params[0] ?? null;
+        const candidates = rows.filter((row) => (!branchId || row.id_sucursal === branchId) && publishedByServiceQuery(text, row));
+        const selected = new Map();
+        for (const row of candidates.sort((left, right) => left.precio_hnl - right.precio_hnl || left.id_sucursal.localeCompare(right.id_sucursal))) {
+          if (!selected.has(row.id_servicio)) selected.set(row.id_servicio, row);
+        }
+        const published = [...selected.values()];
         return { rows: published, rowCount: published.length };
       }
       return { rows: [], rowCount: 0 };
@@ -70,12 +78,15 @@ for (const endpoint of [
     const { app, calls } = await buildApp(t, rows);
     const response = await app.inject(endpoint);
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(response.json().data.servicios.map((row) => row.id_servicio), [...rows.slice(0, 3), rows[4]].map((row) => row.id_servicio));
-    assert.equal(response.json().data.servicios.at(-1).servicio_informativo, true);
+    const published = response.json().data.servicios;
+    assert.deepEqual(published.map((row) => row.id_servicio).sort(), [...rows.slice(0, 3), rows[4]].map((row) => row.id_servicio).sort());
+    assert.equal(published.find((row) => row.id_servicio === rows[4].id_servicio).servicio_informativo, true);
     const sql = calls.find((call) => call.includes("JOIN service_scope"));
     for (const clause of ["st.activo IS TRUE", "su.estado IS TRUE", "s.activo IS TRUE", "s.visible_publico IS TRUE"]) {
       assert.ok(sql.includes(clause), `Conserva control: ${clause}`);
     }
+    assert.match(sql, /JOIN public\.servicios tariff_service\s+ON tariff_service\.id_servicio = st\.id_servicio/);
+    assert.match(sql, /st\.precio_hnl > 0[\s\S]*st\.precio_hnl = 0[\s\S]*st\.servicio_informativo[\s\S]*tariff_service\.agendable IS FALSE/);
   });
 
   for (const [name, override] of [
@@ -90,6 +101,37 @@ for (const endpoint of [
       assert.deepEqual(response.json().data.servicios, []);
     });
   }
+}
+
+for (const endpoint of [
+  "/v1/public/catalog/servicios",
+  "/v1/public/catalog/busqueda?q=servicio",
+]) {
+  test(`${endpoint}: tarifa agendable cero no desplaza oferta positiva de otra sucursal`, async (t) => {
+    const serviceId = "61111111-1111-4111-8111-111111111111";
+    const rows = [
+      service({ id_servicio: serviceId, id_sucursal: BRANCH, precio_hnl: 0 }),
+      service({ id_servicio: serviceId, id_sucursal: OTHER_BRANCH, precio_hnl: 275 }),
+    ];
+    const { app } = await buildApp(t, rows);
+    const response = await app.inject(endpoint);
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().data.servicios.length, 1);
+    assert.equal(response.json().data.servicios[0].precio_hnl, 275);
+  });
+
+  test(`${endpoint}: filtro de sucursal no toma la tarifa válida de otra sucursal`, async (t) => {
+    const serviceId = "71111111-1111-4111-8111-111111111111";
+    const rows = [
+      service({ id_servicio: serviceId, id_sucursal: BRANCH, precio_hnl: 0 }),
+      service({ id_servicio: serviceId, id_sucursal: OTHER_BRANCH, precio_hnl: 290 }),
+    ];
+    const { app } = await buildApp(t, rows);
+    const separator = endpoint.includes("?") ? "&" : "?";
+    const response = await app.inject(`${endpoint}${separator}id_sucursal=${BRANCH}`);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().data.servicios, []);
+  });
 }
 
 test("agendamiento conserva la exclusión explícita de tarifas informativas", async () => {

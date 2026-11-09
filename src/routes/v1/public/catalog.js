@@ -189,6 +189,8 @@ const PUBLIC_SERVICES_SQL = `
         ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
       ) AS rn
     FROM public.servicios_tarifas st
+    JOIN public.servicios tariff_service
+      ON tariff_service.id_servicio = st.id_servicio
     JOIN public.sucursales su
       ON su.id_sucursal = st.id_sucursal
     WHERE st.deleted_at IS NULL
@@ -199,7 +201,11 @@ const PUBLIC_SERVICES_SQL = `
       )
       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
-      AND st.precio_hnl >= 0
+      AND (
+        st.precio_hnl > 0
+        OR (st.precio_hnl = 0 AND COALESCE(st.servicio_informativo, FALSE) IS TRUE)
+        OR (st.precio_hnl = 0 AND tariff_service.agendable IS FALSE)
+      )
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -387,6 +393,8 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
         ORDER BY st.vigente_desde DESC, st.updated_at DESC, st.id_tarifa DESC
       ) AS rn
     FROM public.servicios_tarifas st
+    JOIN public.servicios tariff_service
+      ON tariff_service.id_servicio = st.id_servicio
     JOIN public.sucursales su
       ON su.id_sucursal = st.id_sucursal
     WHERE st.deleted_at IS NULL
@@ -397,7 +405,11 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
       )
       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
-      AND st.precio_hnl >= 0
+      AND (
+        st.precio_hnl > 0
+        OR (st.precio_hnl = 0 AND COALESCE(st.servicio_informativo, FALSE) IS TRUE)
+        OR (st.precio_hnl = 0 AND tariff_service.agendable IS FALSE)
+      )
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
