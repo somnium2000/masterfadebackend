@@ -13,6 +13,7 @@ import reportesRoutes from "./reportes.js";
 import seguridadRoutes from "./seguridad.js";
 import storageRoutes from "./storage.js";
 import sucursalesRoutes from "./sucursales.js";
+import superDashboardRoutes from "./superDashboard.js";
 
 export default async function adminRoutes(app) {
   await app.register(personasRoutes, { prefix: "/personas" });
@@ -30,4 +31,5 @@ export default async function adminRoutes(app) {
   await app.register(seguridadRoutes, { prefix: "/seguridad" });
   await app.register(configuracionRoutes, { prefix: "/configuracion" });
   await app.register(storageRoutes, { prefix: "/storage" });
+  await app.register(superDashboardRoutes, { prefix: "/super-dashboard" });
 }

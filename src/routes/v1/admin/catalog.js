@@ -71,7 +71,7 @@ const serviceBodySchema = {
           activo: { type: "boolean" },
           servicio_informativo: { type: "boolean" },
         },
-        required: ["id_sucursal", "precio_hnl", "duracion_min"],
+        required: ["id_sucursal", "duracion_min"],
         additionalProperties: false,
       },
     },
@@ -1488,7 +1488,9 @@ function normalizeServiceBranchTariffs(body = {}) {
     seen.add(branchId);
 
     const activo = normalizeBoolean(item?.activo, true);
-    const precioHnl = Number(item?.precio_hnl);
+    const servicioInformativo = normalizeBoolean(item?.servicio_informativo, false);
+    const precioVacio = item?.precio_hnl === undefined || item?.precio_hnl === null || item?.precio_hnl === "";
+    const precioHnl = precioVacio && servicioInformativo ? 0 : Number(item?.precio_hnl);
     const duracionMin = Number(item?.duracion_min);
     const bufferMin = item?.buffer_min === undefined || item?.buffer_min === null
       ? LEGACY_SERVICE_BUFFER_FALLBACK
@@ -1512,7 +1514,7 @@ function normalizeServiceBranchTariffs(body = {}) {
       duracion_min: Math.max(1, Math.floor(duracionMin || 1)),
       buffer_min: Math.max(0, Math.floor(bufferMin || 0)),
       activo,
-      servicio_informativo: normalizeBoolean(item?.servicio_informativo, false),
+      servicio_informativo: servicioInformativo,
     };
   });
 }
@@ -2326,10 +2328,14 @@ async function upsertCurrentBaseServiceTariff(client, idServicio, idSucursal, pa
     });
   }
   const nextActivo = payload.activo === undefined ? normalizeBoolean(currentTariff?.activo, true) : Boolean(payload.activo);
+  const servicioInformativo =
+    payload.servicio_informativo === undefined
+      ? normalizeBoolean(currentTariff?.servicio_informativo, false)
+      : Boolean(payload.servicio_informativo);
   const precioHnl =
     payload.precio_hnl === undefined
       ? currentTariff?.precio_hnl == null
-        ? null
+        ? servicioInformativo ? 0 : null
         : Number(currentTariff.precio_hnl)
       : Number(payload.precio_hnl);
   const duracionMin =
@@ -2344,11 +2350,6 @@ async function upsertCurrentBaseServiceTariff(client, idServicio, idSucursal, pa
         ? LEGACY_SERVICE_BUFFER_FALLBACK
         : Number(currentTariff.buffer_min)
       : Number(payload.buffer_min);
-  const servicioInformativo =
-    payload.servicio_informativo === undefined
-      ? normalizeBoolean(currentTariff?.servicio_informativo, false)
-      : Boolean(payload.servicio_informativo);
-
   if (nextActivo && (!Number.isFinite(precioHnl) || precioHnl < 0)) {
     throw new AppError(400, "El precio de la tarifa debe ser mayor o igual a 0", {
       code: "CATALOG_SERVICE_TARIFF_PRICE_INVALID",
@@ -3173,7 +3174,7 @@ export default async function adminCatalogRoutes(app) {
             activo: { type: "boolean" },
             servicio_informativo: { type: "boolean" },
           },
-          required: ["id_sucursal", "precio_hnl", "duracion_min"],
+          required: ["id_sucursal", "duracion_min"],
           additionalProperties: false,
         },
         response: {

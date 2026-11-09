@@ -9,6 +9,7 @@ import authPlugin from '../src/plugins/auth.js';
 import security from '../src/plugins/security.js';
 import { globalErrorHandler } from '../src/utils/errors.js';
 import { acquirePasswordOperationLock, generateRecoveryActionLink } from '../src/services/authRecovery.js';
+import { readFile } from 'node:fs/promises';
 
 process.env.FRONTEND_URL='http://127.0.0.1:5189';
 process.env.SUPABASE_URL='http://127.0.0.1:9';
@@ -26,7 +27,7 @@ async function fixture(t,options={}){
   const q=sql.replace(/\s+/g,' ').trim();calls.push({q,params});
   if(q.startsWith('SELECT pg_advisory_')||q==='BEGIN'||q==='ROLLBACK')return {rows:[{}],rowCount:1};
   if(q.startsWith('UPDATE public.seguridad_sesiones')&&q.includes("motivo_cierre = 'password_reset'")){
-   actions.push('revoke');if(options.dbFail)throw Error('SQL private diagnostic');assert.equal(params[0],USER);revoked=true;return {rows:[{id_sesion:SID}],rowCount:1};
+   actions.push('revoke');if(options.dbFail)throw Error('SQL private diagnostic');assert.equal(params[0],USER);revoked=!options.zeroSessions;return options.zeroSessions?{rows:[],rowCount:0}:{rows:[{id_sesion:SID}],rowCount:1};
   }
   if(q.includes('token_jti_hash = $3'))return {rows:[{estado:revoked?'revocada':'activa',ultimo_uso_at:new Date(),expira_at:new Date(Date.now()+3600000),revocada_at:revoked?new Date():null}]};
   if(q.includes('WITH base_user'))return {rows:[{id_usuario:USER,roles:['cliente'],branch_ids:[]}]};
@@ -109,14 +110,30 @@ test('dos confirmaciones concurrentes consumen el OTP una sola vez',async t=>{
  const f=await fixture(t);const replies=await Promise.all([f.reset(),f.reset()]);assert.deepEqual(replies.map(r=>r.statusCode).sort(),[200,401]);assert.equal(f.state().updates,1);
 });
 for(const option of ['dbFail','updateFail','updateTimeout','signOutFail'])test('fallo parcial seguro '+option,async t=>{
- const f=await fixture(t,{[option]:true});const r=await f.reset();assert.equal(r.statusCode,503,r.body);assert.doesNotMatch(r.body,/SQL|diagnostic|timeout|synthetic/);
+ const f=await fixture(t,{[option]:true});const r=await f.reset();assert.equal(r.statusCode,option==='signOutFail'?200:503,r.body);assert.doesNotMatch(r.body,/SQL|diagnostic|timeout|synthetic/);
  if(option==='dbFail'){assert.equal(f.state().updates,0);assert.equal(f.state().password,'BeforeOnly9!');}
  else{assert.equal(f.state().revoked,true);assert.equal((await f.app.inject({url:'/probe',headers:{cookie:'mf_session='+syntheticSession()}})).statusCode,401);}
+ if(option==='signOutFail'){assert.equal(r.json().data.password_updated,true);assert.equal(r.json().data.session_revocation_confirmed,false);assert.equal(f.state().password,body.contrasena);}
 });
 test('cookie de otra identidad no autoriza ni cambia su contraseña',async t=>{
  const f=await fixture(t);const other=jwt.sign({sub:OTHER,sid:SID,jti:JTI,token_type:'app'},process.env.JWT_SECRET,{issuer:'masterfade-api',audience:'masterfade-app',expiresIn:'1h'});
  const r=await f.app.inject({method:'POST',url:'/v1/auth/reset-password',headers:{cookie:'mf_session='+other},payload:body});
- assert.equal(r.statusCode,409);assert.equal(f.state().updates,0);assert.equal(f.state().revoked,false);
+ assert.equal(r.statusCode,409);assert.equal(r.json().error.code,'AUTH_RECOVERY_ACTIVE_SESSION');assert.equal(f.state().updates,0);assert.equal(f.state().revoked,false);assert.equal(f.state().verifies,0);assert.equal(f.state().consumed,false);
+});
+test('cero sesiones internas no impide configurar la contraseña',async t=>{
+ const f=await fixture(t,{zeroSessions:true});const r=await f.reset();assert.equal(r.statusCode,200,r.body);assert.equal(f.state().password,body.contrasena);assert.equal(f.state().updates,1);assert.equal(f.state().revoked,false);
+});
+test('la contraseña nueva permite iniciar sesión después del reset',async t=>{
+ const f=await fixture(t);assert.equal((await f.reset()).statusCode,200);
+ const login=await f.app.inject({method:'POST',url:'/v1/auth/login',payload:{identifier:'qa02i@example.test',contrasena:body.contrasena}});
+ assert.equal(login.statusCode,200,login.body);
+});
+test('contrato SQL preparado admite password_reset sin retirar motivos existentes',async()=>{
+ const migrations=new URL('../db/migrations/',import.meta.url);const entries=await import('node:fs/promises').then(fs=>fs.readdir(migrations));
+ const name=entries.find(entry=>entry.endsWith('_auth_password_reset_session_reason_v1.sql'));assert.ok(name,'Falta migración del motivo password_reset');
+ const sql=await readFile(new URL(name,migrations),'utf8');
+ for(const reason of ['logout_usuario','logout_admin','reemplazo_sesion_cliente','sesion_expirada','riesgo_seguridad','eliminacion_cuenta','password_reset'])assert.match(sql,new RegExp(`'${reason}'`));
+ assert.match(sql,/VALIDATE CONSTRAINT ck_seg_sesiones_motivo_cierre/i);
 });
 test('login con contraseña anterior queda fuera del intervalo de reset',async t=>{
  let reached,release;const entered=new Promise(r=>reached=r),wait=new Promise(r=>release=r);

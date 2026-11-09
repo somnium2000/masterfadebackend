@@ -716,9 +716,10 @@ export async function expireStaleAppointmentReservations(client, { now = new Dat
 
   const expiredHolds = expiredHoldsResult.rows;
   const expiredHoldIds = expiredHolds.map((row) => row.id_hold);
-  const expiredCitaIds = Array.from(new Set(expiredHolds.map((row) => row.id_cita)));
+  const expiredCitaIds = Array.from(new Set(expiredHolds.map((row) => row.id_cita).filter(Boolean)));
 
   let citasExpiradas = 0;
+  let promotionUsagesCanceled = 0;
   if (expiredCitaIds.length) {
     const citaResult = await client.query(
       `
@@ -731,6 +732,28 @@ export async function expireStaleAppointmentReservations(client, { now = new Dat
       [expiredCitaIds, HOLD_EXPIRABLE_APPOINTMENT_STATES]
     );
     citasExpiradas = Number(citaResult.rowCount || 0);
+
+    const promotionUsageResult = await client.query(
+      `
+        UPDATE public.promociones_usos pu
+        SET estado_uso_codigo = 'cancelado',
+            liberado_at = COALESCE(liberado_at, now()),
+            updated_at = now()
+        WHERE pu.estado_uso_codigo = 'reservado'
+          AND (
+            pu.id_hold = ANY($2::uuid[])
+            OR pu.id_cita = ANY($1::uuid[])
+            OR EXISTS (
+              SELECT 1
+              FROM public.citas c
+              WHERE c.id_cita = ANY($1::uuid[])
+                AND c.id_grupo_cita = pu.id_grupo_cita
+            )
+          )
+      `,
+      [expiredCitaIds, expiredHoldIds]
+    );
+    promotionUsagesCanceled = Number(promotionUsageResult.rowCount || 0);
   }
 
   const expiredIntentResult = await client.query(
@@ -744,6 +767,7 @@ export async function expireStaleAppointmentReservations(client, { now = new Dat
         JOIN public.payment_providers pp
           ON pp.id_provider = pi.id_provider
         WHERE pi.estado_intent_codigo = ANY($2::text[])
+          AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
           AND (
             pi.expires_at <= $1::timestamptz
             OR (cardinality($3::uuid[]) > 0 AND pi.id_hold = ANY($3::uuid[]))
@@ -757,6 +781,8 @@ export async function expireStaleAppointmentReservations(client, { now = new Dat
       WHERE pi.id_intent = ti.id_intent
       RETURNING pi.id_intent, ti.referencia_externa, ti.provider_code
     `,
+    // AM: Solo la evidencia privada de Sale incierta PixelPay sobrevive a la
+    // liberacion del horario; otros pendientes conservan su expiracion normal.
     [referenceNow.toISOString(), ACTIVE_PAYMENT_INTENT_STATES, expiredHoldIds, expiredCitaIds]
   );
 
@@ -780,6 +806,7 @@ export async function expireStaleAppointmentReservations(client, { now = new Dat
     expired_holds: expiredHolds.length,
     expired_citas: citasExpiradas,
     expired_intents: expiredIntentResult.rowCount || 0,
+    promotion_usages_canceled: promotionUsagesCanceled,
     canceled_provider_intents: cancelledProviderIntents,
     auto_no_show: Number(autoNoShowResult.rowCount || 0),
   };

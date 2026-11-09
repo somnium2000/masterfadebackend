@@ -78,6 +78,7 @@ const COMMUNICATION_SUBJECT_MAX_LENGTH = 180;
 const COMMUNICATION_CONTENT_TEXT_MAX_LENGTH = 20000;
 const COMMUNICATION_OBSERVATIONS_MAX_LENGTH = 2000;
 const COMMUNICATION_SEND_STATUS_PENDING = "pendiente";
+const COMMUNICATION_SEND_STATUS_SENDING = "enviando";
 const COMMUNICATION_SEND_STATUS_SENT = "enviado";
 const COMMUNICATION_SEND_STATUS_FAILED = "fallido";
 const COMMUNICATION_FALLBACK_SEND_DELAY_MINUTES = 1440;
@@ -1473,6 +1474,22 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
       totalOmitidos += 1;
       continue;
     }
+    const claimedResult = await client.query(
+      `
+        UPDATE public.comunicaciones_envios
+        SET
+          estado_envio = $4::text,
+          intentos = COALESCE(intentos, 0) + 1,
+          updated_at = NOW()
+        WHERE id_envio = $1::uuid
+          AND id_campania = $2::uuid
+          AND estado_envio = $3::text
+        RETURNING id_envio
+      `,
+      [row.id_envio, campaign.id_campania, sourceStatus, COMMUNICATION_SEND_STATUS_SENDING]
+    );
+    if (!claimedResult.rows?.[0]) continue;
+
     totalIntentados += 1;
     const emailPayload = buildCommunicationCampaignEmailPayload(campaign, row.nombre_cliente);
     let mailResult;
@@ -1489,8 +1506,7 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
     }
 
     if (mailResult?.sent) {
-      totalExitosos += 1;
-      await client.query(
+      const sentResult = await client.query(
         `
           UPDATE public.comunicaciones_envios
           SET
@@ -1498,27 +1514,40 @@ async function processCampaignShipmentsDelivery(client, mailer, campaign, source
             enviado_at = NOW(),
             ultimo_error = NULL,
             provider_message_id = $3::text,
-            intentos = COALESCE(intentos, 0) + 1,
             updated_at = NOW()
           WHERE id_envio = $1::uuid
+            AND estado_envio = $4::text
+          RETURNING id_envio
         `,
-        [row.id_envio, COMMUNICATION_SEND_STATUS_SENT, mailResult?.provider_message_id ?? null]
+        [row.id_envio, COMMUNICATION_SEND_STATUS_SENT, mailResult?.provider_message_id ?? null, COMMUNICATION_SEND_STATUS_SENDING]
       );
+      if (!sentResult.rows?.[0]) {
+        throw new AppError(409, "No se pudo confirmar de forma durable el resultado del envio", {
+          code: "CONFIG_COMM_CAMPAIGN_SEND_RESULT_UNCERTAIN",
+        });
+      }
+      totalExitosos += 1;
     } else {
-      totalFallidos += 1;
       options.log?.warn?.({ code: COMMUNICATION_SEND_ERROR_CODE, campaignId: campaign.id_campania, shipmentId: row.id_envio }, "Fallo de entrega de comunicación");
-      await client.query(
+      const failedResult = await client.query(
         `
           UPDATE public.comunicaciones_envios
           SET
             estado_envio = $2::text,
             ultimo_error = $3::text,
-            intentos = COALESCE(intentos, 0) + 1,
             updated_at = NOW()
           WHERE id_envio = $1::uuid
+            AND estado_envio = $4::text
+          RETURNING id_envio
         `,
-        [row.id_envio, COMMUNICATION_SEND_STATUS_FAILED, COMMUNICATION_SEND_ERROR_CODE]
+        [row.id_envio, COMMUNICATION_SEND_STATUS_FAILED, COMMUNICATION_SEND_ERROR_CODE, COMMUNICATION_SEND_STATUS_SENDING]
       );
+      if (!failedResult.rows?.[0]) {
+        throw new AppError(409, "No se pudo confirmar de forma durable el fallo del envio", {
+          code: "CONFIG_COMM_CAMPAIGN_SEND_RESULT_UNCERTAIN",
+        });
+      }
+      totalFallidos += 1;
     }
   }
 
@@ -1530,13 +1559,13 @@ async function refreshCommunicationCampaignMetrics(client, campaignId, actorUser
     `
       SELECT
         COUNT(*)::int AS total_destinatarios,
-        COUNT(*) FILTER (WHERE estado_envio = $2::text)::int AS total_pendientes,
+        COUNT(*) FILTER (WHERE estado_envio IN ($2::text, $5::text))::int AS total_pendientes,
         COUNT(*) FILTER (WHERE estado_envio = $3::text)::int AS total_enviados,
         COUNT(*) FILTER (WHERE estado_envio = $4::text)::int AS total_fallidos
       FROM public.comunicaciones_envios
       WHERE id_campania = $1::uuid
     `,
-    [campaignId, COMMUNICATION_SEND_STATUS_PENDING, COMMUNICATION_SEND_STATUS_SENT, COMMUNICATION_SEND_STATUS_FAILED]
+    [campaignId, COMMUNICATION_SEND_STATUS_PENDING, COMMUNICATION_SEND_STATUS_SENT, COMMUNICATION_SEND_STATUS_FAILED, COMMUNICATION_SEND_STATUS_SENDING]
   );
   const counters = countersResult.rows?.[0] || {};
 
@@ -3181,7 +3210,7 @@ export default async function adminConfiguracionRoutes(app) {
           `,
           [
             campaign.id_campania,
-            scheduledAt,
+            effectiveSendAt,
             recipientsToSchedule.length,
             totalExcluidosConAjustes,
             JSON.stringify(exclusionsSnapshot),
@@ -3529,13 +3558,13 @@ export default async function adminConfiguracionRoutes(app) {
           `
             SELECT
               COUNT(*)::int AS total_destinatarios,
-              COUNT(*) FILTER (WHERE estado_envio = $2::text)::int AS total_pendientes,
+              COUNT(*) FILTER (WHERE estado_envio IN ($2::text, $5::text))::int AS total_pendientes,
               COUNT(*) FILTER (WHERE estado_envio = $3::text)::int AS total_enviados,
               COUNT(*) FILTER (WHERE estado_envio = $4::text)::int AS total_fallidos
             FROM public.comunicaciones_envios
             WHERE id_campania = $1::uuid
           `,
-          [campaignId, COMMUNICATION_SEND_STATUS_PENDING, COMMUNICATION_SEND_STATUS_SENT, COMMUNICATION_SEND_STATUS_FAILED]
+          [campaignId, COMMUNICATION_SEND_STATUS_PENDING, COMMUNICATION_SEND_STATUS_SENT, COMMUNICATION_SEND_STATUS_FAILED, COMMUNICATION_SEND_STATUS_SENDING]
         );
         const counters = countersResult.rows?.[0] || {};
         const totalPendientes = Number(counters.total_pendientes || 0);

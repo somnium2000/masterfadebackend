@@ -20,7 +20,7 @@ function claims(roles = ['admin'], branchIds = [BRANCH_A]) {
   return { roles, branch_ids: branchIds, user: { id_usuario: ADMIN } };
 }
 
-function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 20 } = {}) {
+function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 4 } = {}) {
   const calls = [];
   let balanceReads = 0;
   const record = (target, sql, params = []) => calls.push({
@@ -73,10 +73,10 @@ function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 20
         const text = String(sql); record('db', text, params);
         if (text.includes('FROM public.sucursales')) return { rows: branchRows() };
         if (text.includes('FROM public.clientes c')) {
-          assert.ok(text.indexOf('id_sucursal_origen = ANY') < text.lastIndexOf('LIMIT'), 'el alcance debe aplicarse antes del límite final');
-          return { rows: canReachClient(params[2] || [], params[3]) ? [{
-            id_cliente: CLIENT, nombre_cliente: 'Cliente Sintético', correo: null, telefono: null, id_usuario: USER,
-          }] : [] };
+          return { rows: [{
+            id_cliente: CLIENT, nombre_cliente: 'Cliente Sintético', correo: null, telefono: null,
+            id_usuario: USER, id_sucursal_origen: clientBranch,
+          }] };
         }
         throw new Error(`SQL_DB_NO_SIMULADO: ${text}`);
       },
@@ -88,25 +88,27 @@ function fixture({ actorClaims = claims(), clientBranch = BRANCH_A, balance = 20
 
 test('admin A busca y consulta cliente A', async () => {
   const { app, calls, actorClaims } = fixture();
-  const search = await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims });
+  const search = await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims, allowGlobalAssignment: true });
   assert.deepEqual(search.clientes.map((row) => row.id_cliente), [CLIENT]);
-  const summary = await getClientePointsSummary(app, CLIENT, { claims: actorClaims });
-  assert.equal(summary.id_cliente, CLIENT); assert.equal(summary.saldo_total, 20);
+  const summary = await getClientePointsSummary(app, CLIENT, { claims: actorClaims, allowGlobalAssignment: true });
+  assert.equal(summary.id_cliente, CLIENT); assert.equal(summary.saldo_total, 4);
   assert.equal(calls.some(({ sql }) => sql.includes('fn_points_materialize_expired_cycles')), false);
   assert.ok(calls.some(({ sql }) => sql.includes('FROM public.vw_points_balance')));
 });
 
-test('admin A no obtiene ni materializa cliente B', async () => {
+test('admin A busca y consulta globalmente cliente B sin materializar movimientos', async () => {
   const { app, calls, actorClaims } = fixture({ clientBranch: BRANCH_B });
-  assert.deepEqual(await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims }), { clientes: [] });
-  await assert.rejects(getClientePointsSummary(app, CLIENT, { claims: actorClaims }), {
-    statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN',
-  });
+  const search = await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims, allowGlobalAssignment: true });
+  assert.equal(search.clientes[0].id_cliente, CLIENT);
+  assert.equal(search.clientes[0].id_sucursal_origen, BRANCH_B);
+  const summary = await getClientePointsSummary(app, CLIENT, { claims: actorClaims, allowGlobalAssignment: true });
+  assert.equal(summary.id_cliente, CLIENT);
+  assert.equal(summary.id_sucursal_origen, BRANCH_B);
   assert.equal(calls.some(({ sql }) => sql.includes('fn_points_materialize_expired_cycles')), false);
-  assert.equal(calls.some(({ sql }) => sql.includes('FROM public.points_transactions')), false);
+  assert.ok(calls.some(({ sql }) => sql.includes('FROM public.vw_points_balance')));
 });
 
-test('Fastify inject rechaza cliente B sin exponer identidad, saldo ni movimientos', async (t) => {
+test('Fastify inject permite buscar, resumir y sumar globalmente, pero rechaza restar fuera de alcance', async (t) => {
   const scoped = fixture({ clientBranch: BRANCH_B });
   const app = Fastify({ logger: false });
   app.decorate('db', scoped.app.db);
@@ -116,38 +118,46 @@ test('Fastify inject rechaza cliente B sin exponer identidad, saldo ni movimient
 
   const search = await app.inject('/puntos/clientes/buscar?q=Cliente');
   const summary = await app.inject(`/puntos/clientes/${CLIENT}/resumen`);
-  const adjustment = await app.inject({
+  const addition = await app.inject({
     method: 'POST', url: `/puntos/clientes/${CLIENT}/ajuste`,
     headers: { 'x-idempotency-key': IDEMPOTENCY_KEY },
     payload: { accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético' },
   });
+  const subtraction = await app.inject({
+    method: 'POST', url: `/puntos/clientes/${CLIENT}/ajuste`,
+    headers: { 'x-idempotency-key': '77777777-7777-4777-8777-777777777777' },
+    payload: { accion: 'restar', puntos: 5, motivo: 'Ajuste sintético' },
+  });
 
-  assert.equal(search.statusCode, 200); assert.deepEqual(search.json().data.clientes, []);
-  for (const response of [summary, adjustment]) {
-    assert.equal(response.statusCode, 403);
-    assert.equal(response.json().error.code, 'POINTS_CLIENT_BRANCH_FORBIDDEN');
-    assert.doesNotMatch(response.body, /Cliente B|cliente-b|saldo|movimiento/i);
-  }
-  assert.equal(scoped.calls.some(({ sql }) => /INSERT INTO|UPDATE public\./.test(sql)), false);
+  assert.equal(search.statusCode, 200); assert.equal(search.json().data.clientes[0].id_cliente, CLIENT);
+  assert.equal(summary.statusCode, 200); assert.equal(summary.json().data.id_cliente, CLIENT);
+  assert.equal(addition.statusCode, 200); assert.equal(addition.json().data.id_cliente, CLIENT);
+  assert.equal(subtraction.statusCode, 403);
+  assert.equal(subtraction.json().error.code, 'POINTS_CLIENT_BRANCH_FORBIDDEN');
+  assert.equal(scoped.calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
 });
 
 test('admin con múltiples sucursales puede consultar cliente B', async () => {
   const actorClaims = claims(['admin'], [BRANCH_A, BRANCH_B]);
   const { app } = fixture({ actorClaims, clientBranch: BRANCH_B });
-  assert.equal((await getClientePointsSummary(app, CLIENT, { claims: actorClaims })).id_cliente, CLIENT);
+  assert.equal((await getClientePointsSummary(app, CLIENT, { claims: actorClaims, allowGlobalAssignment: true })).id_cliente, CLIENT);
 });
 
-test('cliente sin sucursal no es accesible para admin', async () => {
+test('cliente elegible sin sucursal es visible y admite suma, pero no resta para admin', async () => {
   const { app, calls, actorClaims } = fixture({ clientBranch: null });
-  assert.deepEqual(await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims }), { clientes: [] });
-  await assert.rejects(getClientePointsSummary(app, CLIENT, { claims: actorClaims }), {
-    statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN',
+  const search = await searchActiveClientesForAdminPoints(app, { q: 'Cliente', claims: actorClaims, allowGlobalAssignment: true });
+  assert.equal(search.clientes[0].id_cliente, CLIENT); assert.equal(search.clientes[0].id_sucursal_origen, null);
+  assert.equal((await getClientePointsSummary(app, CLIENT, { claims: actorClaims, allowGlobalAssignment: true })).id_sucursal_origen, null);
+  await addManualPointsAdjustment(app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY, allowGlobalAssignment: true,
   });
   await assert.rejects(addManualPointsAdjustment(app, {
-    idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
-    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+    idCliente: CLIENT, accion: 'restar', puntos: 5, motivo: 'Ajuste sintético',
+    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    idempotencyKey: '77777777-7777-4777-8777-777777777777',
   }), { statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN' });
-  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
+  assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
 });
 
 test('super_admin conserva búsqueda y resumen globales', async () => {
@@ -174,10 +184,10 @@ test('resumen del flujo cliente sin claims administrativos conserva comportamien
   assert.equal(calls.some(({ target, sql }) => target === 'db' && sql.includes('FROM public.sucursales')), false);
 });
 
-test('ajuste fuera de alcance revierte sin insertar ni modificar puntos', async () => {
+test('resta fuera de alcance revierte sin insertar ni modificar puntos', async () => {
   const { app, calls, actorClaims } = fixture({ clientBranch: BRANCH_B });
   await assert.rejects(addManualPointsAdjustment(app, {
-    idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
+    idCliente: CLIENT, accion: 'restar', puntos: 5, motivo: 'Ajuste sintético',
     usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   }), { statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN' });
   assert.equal(calls.some(({ sql }) => /INSERT INTO|UPDATE public\./.test(sql)), false);
@@ -191,13 +201,24 @@ test('ajuste autorizado conserva la transacción y el saldo', async () => {
     idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
     usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   });
-  assert.equal(result.saldo_actual, 25); assert.equal(result.saldo_siguiente, 25);
+  assert.equal(result.saldo_actual, 9); assert.equal(result.saldo_siguiente, 9);
   assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
   assert.equal(calls.filter(({ sql }) => sql === 'COMMIT').length, 1);
   const lockIndex = calls.findIndex(({ sql }) => sql.includes('pg_advisory_xact_lock'));
+  const insertIndex = calls.findIndex(({ sql }) => sql.includes('INSERT INTO public.points_transactions'));
+  assert.ok(lockIndex < insertIndex);
+});
+
+test('resta autorizada de admin conserva validación por sucursal antes de insertar', async () => {
+  const { app, calls, actorClaims } = fixture({ balance: 20 });
+  await addManualPointsAdjustment(app, {
+    idCliente: CLIENT, accion: 'restar', puntos: 5, motivo: 'Ajuste sintético',
+    usuarioAdmin: actorClaims.user, claims: actorClaims,
+    idempotencyKey: '77777777-7777-4777-8777-777777777777',
+  });
   const scopeIndex = calls.findIndex(({ sql }) => sql.startsWith('SELECT c.id_cliente'));
   const insertIndex = calls.findIndex(({ sql }) => sql.includes('INSERT INTO public.points_transactions'));
-  assert.ok(lockIndex < scopeIndex && scopeIndex < insertIndex);
+  assert.ok(scopeIndex >= 0 && scopeIndex < insertIndex);
 });
 
 test('saldo insuficiente autorizado conserva rollback e integridad', async () => {
@@ -208,4 +229,31 @@ test('saldo insuficiente autorizado conserva rollback e integridad', async () =>
   }), { statusCode: 422, code: 'POINTS_INSUFFICIENT_BALANCE' });
   assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
   assert.equal(calls.filter(({ sql }) => sql === 'ROLLBACK').length, 1);
+});
+
+test('recompensa pendiente bloquea suma manual sin movimiento ni confirmación idempotente', async () => {
+  const { app, calls, actorClaims } = fixture({ balance: 10 });
+  await assert.rejects(addManualPointsAdjustment(app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 1, motivo: 'Ajuste bloqueado',
+    usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+  }), { statusCode: 409, code: 'POINTS_REWARD_PENDING' });
+  assert.equal(calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
+  assert.equal(calls.some(({ sql }) => sql.includes('UPDATE app_private.points_manual_adjustment_idempotency')), false);
+  assert.equal(calls.filter(({ sql }) => sql === 'ROLLBACK').length, 1);
+});
+
+test('suma manual no sobrepasa la meta y vuelve a permitirse debajo de ella', async () => {
+  const blocked = fixture({ balance: 9 });
+  await assert.rejects(addManualPointsAdjustment(blocked.app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 2, motivo: 'Ajuste excedente',
+    usuarioAdmin: blocked.actorClaims.user, claims: blocked.actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+  }), { statusCode: 409, code: 'POINTS_REWARD_PENDING' });
+  assert.equal(blocked.calls.some(({ sql }) => sql.includes('INSERT INTO public.points_transactions')), false);
+
+  const allowed = fixture({ balance: 8 });
+  const result = await addManualPointsAdjustment(allowed.app, {
+    idCliente: CLIENT, accion: 'sumar', puntos: 2, motivo: 'Ajuste permitido',
+    usuarioAdmin: allowed.actorClaims.user, claims: allowed.actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
+  });
+  assert.equal(result.saldo_siguiente, 10);
 });

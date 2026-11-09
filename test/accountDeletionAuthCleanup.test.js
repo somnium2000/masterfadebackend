@@ -47,6 +47,7 @@ function preconditions(overrides = {}) {
     storage_ready: true,
     memberships_ready: true,
     points_ready: true,
+    sessions_ready: true,
     ...overrides,
   };
 }
@@ -341,6 +342,21 @@ test("activo Storage fallido rechaza", async () => {
 test("membresia activa rechaza", async () => {
   const client = createClient({ preconditionRow: preconditions({ memberships_ready: false }) });
   await assert.rejects(cleanup(client), { code: "CLIENT_ACCOUNT_DELETION_AUTH_PRECONDITION_FAILED" });
+});
+
+test("sesion activa rechaza sin eliminar Auth y conserva estado recuperable", async () => {
+  const request = requestRow();
+  const client = createClient({ request, preconditionRow: preconditions({ sessions_ready: false }) });
+  const supabase = makeSupabase();
+
+  await assert.rejects(cleanup(client, makeApp(client, supabase)), {
+    code: "CLIENT_ACCOUNT_DELETION_AUTH_PRECONDITION_FAILED",
+  });
+
+  assert.equal(authCalls(supabase, "deleteUser").length, 0);
+  assert.equal(request.estado_codigo, "auth_pendiente");
+  assert.doesNotMatch(allSql(client), /estado_codigo = 'completada'/);
+  assert.match(allSql(client), /NOT EXISTS\s*\(\s*SELECT 1\s*FROM public\.seguridad_sesiones ss[\s\S]*ss\.estado = 'activa'[\s\S]*\) AS sessions_ready/);
 });
 
 test("identidad Auth existente se elimina con false", async () => {

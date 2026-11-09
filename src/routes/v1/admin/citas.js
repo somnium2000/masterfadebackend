@@ -1,5 +1,6 @@
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
+import { findReservationGroupIds } from "../../../services/adminReservationLookup.js";
 import {
   ACTIVE_PAYMENT_INTENT_STATES,
   APPOINTMENT_STATE_TRANSITIONS,
@@ -261,7 +262,8 @@ async function getScopeBranches(app, claims) {
 function getRoleScope(claims) {
   const roles = Array.isArray(claims?.roles) ? claims.roles : [];
   const elevated = roles.includes("admin") || roles.includes("super_admin");
-  const isBarberOnly = !elevated && roles.includes("barbero");
+  const hasBarberRole = roles.includes("barbero");
+  const isBarberOnly = !elevated && hasBarberRole;
   const empleadoId = claims?.empleado_id ?? null;
 
   if (isBarberOnly && !empleadoId) {
@@ -273,6 +275,7 @@ function getRoleScope(claims) {
   return {
     elevated,
     barber_empleado_id: isBarberOnly ? empleadoId : null,
+    preferences_barber_empleado_id: hasBarberRole && empleadoId ? empleadoId : null,
     actor_usuario_id: claims?.user?.id_usuario ?? null,
   };
 }
@@ -308,7 +311,17 @@ function parseStatusFilter(rawValue, fallbackStates = []) {
   return Array.from(new Set(raw.split(",").map((item) => String(item || "").trim()).filter(Boolean)));
 }
 
-function mapOperationalAppointment(row) {
+function normalizeOperationalCutPreferences(value, historicalValue = null) {
+  const candidates = [value, historicalValue];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const normalized = candidate.trim();
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function mapOperationalAppointment(row, { preferencesBarberId = null } = {}) {
   const serviceDetails = Array.isArray(row.servicios_detalle)
     ? row.servicios_detalle.map((item) => ({
         id_servicio: item?.id_servicio ?? null,
@@ -327,6 +340,11 @@ function mapOperationalAppointment(row) {
     nombre_barbero: row.nombre_barbero ?? "Sin nombre",
     id_persona_cliente: row.id_persona_cliente,
     id_cliente: row.id_cliente ?? null,
+    preferencias_corte: preferencesBarberId
+      && row.id_cliente
+      && row.id_empleado_barbero === preferencesBarberId
+      ? normalizeOperationalCutPreferences(row.preferencias_corte, row.preferencias_corte_historicas)
+      : null,
     nombre_cliente: row.nombre_cliente ?? "Sin nombre",
     telefono_cliente: row.telefono_cliente ?? null,
     correo_cliente: row.correo_cliente ?? null,
@@ -400,6 +418,7 @@ async function getAppointmentContactColumnsSupport(client) {
 async function listOperationalAppointments(client, {
   branchIds,
   barberScopeId = null,
+  preferencesBarberId = null,
   idEmpleadoBarbero = null,
   idSucursal = null,
   states = [],
@@ -408,6 +427,7 @@ async function listOperationalAppointments(client, {
   fechaHasta = null,
   limit = 100,
   sortDirection = "asc",
+  reservationGroupIds = null,
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
   const clientNameSql = contactColumnsSupport.has_contacto_nombre
@@ -425,6 +445,10 @@ async function listOperationalAppointments(client, {
     "c.deleted_at IS NULL",
     "c.id_sucursal = ANY($1::uuid[])",
   ];
+  if (reservationGroupIds) {
+    params.push(reservationGroupIds);
+    where.push(`c.id_grupo_cita = ANY($${params.length}::uuid[])`);
+  }
 
   if (barberScopeId) {
     params.push(assertUuid(barberScopeId, "id_empleado_barbero"));
@@ -481,6 +505,41 @@ async function listOperationalAppointments(client, {
     `);
   }
 
+  const safePreferencesBarberId = preferencesBarberId
+    ? assertUuid(preferencesBarberId, "empleado_id")
+    : null;
+  let preferencesSelect = "NULL::text AS preferencias_corte, NULL::text AS preferencias_corte_historicas";
+  let preferencesJoin = "";
+  if (safePreferencesBarberId) {
+    params.push(safePreferencesBarberId);
+    const preferencesIdx = params.length;
+    preferencesSelect = `
+      CASE
+        WHEN c.id_empleado_barbero = $${preferencesIdx}::uuid
+          AND c.id_cliente IS NOT NULL
+          AND cli.id_cliente IS NOT NULL
+        THEN CASE
+          WHEN jsonb_typeof(cli.preferencias) = 'string' THEN NULLIF(BTRIM(cli.preferencias #>> '{}'), '')
+          ELSE NULL
+        END
+        ELSE NULL
+      END AS preferencias_corte,
+      CASE
+        WHEN c.id_empleado_barbero = $${preferencesIdx}::uuid
+          AND c.id_cliente IS NOT NULL
+          AND cli.id_cliente IS NOT NULL
+        THEN NULLIF(BTRIM(pc.observaciones), '')
+        ELSE NULL
+      END AS preferencias_corte_historicas
+    `;
+    preferencesJoin = `
+      LEFT JOIN public.clientes cli
+        ON cli.id_cliente = c.id_cliente
+       AND cli.id_persona = c.id_persona_cliente
+       AND cli.deleted_at IS NULL
+    `;
+  }
+
   params.push(limit);
   const limitIdx = params.length;
 
@@ -511,6 +570,7 @@ async function listOperationalAppointments(client, {
         c.moneda_codigo,
         c.asignada_automaticamente,
         c.notas,
+        ${preferencesSelect},
         ${clientPhoneSql} AS telefono_cliente,
         ${clientEmailSql} AS correo_cliente,
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Sin nombre') AS nombre_barbero,
@@ -533,6 +593,7 @@ async function listOperationalAppointments(client, {
         ON pb.id_persona = eb.id_persona
       JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
+      ${preferencesJoin}
       LEFT JOIN LATERAL (
         SELECT c2.direccion_correo::text AS email
         FROM public.correos c2
@@ -593,7 +654,7 @@ async function listOperationalAppointments(client, {
     params
   );
 
-  return rows.map(mapOperationalAppointment);
+  return rows.map((row) => mapOperationalAppointment(row, { preferencesBarberId: safePreferencesBarberId }));
 }
 
 async function getScopedAppointment(client, { idCita, branchIds, barberScopeId = null, forUpdate = false }) {
@@ -1850,6 +1911,34 @@ export default async function adminCitasRoutes(app) {
     }
   });
 
+  app.get("/reservas/buscar", {
+    preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES),
+    schema: { querystring: { type: 'object', additionalProperties: false, required: ['codigo'], properties: {
+      codigo: { type: 'string', pattern: '^[A-Za-z0-9]{5}$' },
+      id_sucursal: { type: 'string', format: 'uuid' },
+    } } },
+  }, async (request, reply) => {
+    try {
+      let branchIds = await getScopeBranches(app, request.claims);
+      const selectedBranch = request.query.id_sucursal;
+      if (selectedBranch) {
+        if (!branchIds.includes(selectedBranch)) return sendError(reply, 403, 'Sucursal fuera de tu alcance', { code: 'ADMIN_CITAS_BRANCH_FORBIDDEN', requestId: request.id });
+        branchIds = [selectedBranch];
+      }
+      const roleScope = getRoleScope(request.claims);
+      const ids = await findReservationGroupIds(app.db, { code: request.query.codigo, branchIds, barberId: roleScope.barber_empleado_id });
+      const citas = ids.length ? await listOperationalAppointments(app.db, {
+        branchIds, barberScopeId: roleScope.barber_empleado_id, reservationGroupIds: ids, limit: 401,
+      }) : [];
+      if (citas.length > 400) return sendError(reply, 409, 'La reserva supera el límite de consulta. Contacta al administrador.', { code: 'RESERVATION_LOOKUP_TOO_MANY', requestId: request.id });
+      return sendOk(reply, { reservas: ids.map((id) => ({ id_grupo_cita: id, codigo_reserva: request.query.codigo.toUpperCase(), citas: citas.filter((cita) => cita.id_grupo_cita === id) })) });
+    } catch (error) {
+      if (error instanceof AppError) return sendError(reply, error.statusCode, error.message, { code: error.code, requestId: request.id });
+      request.log.error({ err: error }, 'Error buscando reserva');
+      return sendError(reply, 500, 'No fue posible buscar la reserva.', { code: 'RESERVATION_LOOKUP_ERROR', requestId: request.id });
+    }
+  });
+
   app.get("/operativas", { preHandler: app.requireRoles(OPERATIONAL_ALLOWED_ROLES) }, async (request, reply) => {
     try {
       await expireStaleAppointmentReservations(app.db, { logger: request.log });
@@ -1860,6 +1949,7 @@ export default async function adminCitasRoutes(app) {
       const citas = await listOperationalAppointments(app.db, {
         branchIds,
         barberScopeId: roleScope.barber_empleado_id,
+        preferencesBarberId: roleScope.preferences_barber_empleado_id,
         idSucursal: request.query?.id_sucursal ?? null,
         idEmpleadoBarbero: request.query?.id_empleado_barbero ?? null,
         states,
@@ -2076,11 +2166,12 @@ export default async function adminCitasRoutes(app) {
         );
         await dbClient.query(
           `
-            UPDATE public.payment_intents
+            UPDATE public.payment_intents pi
             SET estado_intent_codigo = 'expirado',
                 updated_at = now()
-            WHERE id_cita = $1::uuid
-              AND estado_intent_codigo = ANY($2::text[])
+            WHERE pi.id_cita = $1::uuid
+              AND pi.estado_intent_codigo = ANY($2::text[])
+              AND NOT app_private.pixelpay_intent_has_uncertain_sale_v1(pi.id_intent)
           `,
           [idCita, ACTIVE_PAYMENT_INTENT_STATES]
         );

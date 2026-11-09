@@ -114,10 +114,9 @@ function buildProfileCompletion(profile) {
   const required = [
     "telefono_principal",
     "fecha_nacimiento",
-    "genero_codigo",
-    "direccion_texto",
+    "preferencias_corte",
   ];
-  const recommended = ["preferencias_corte"];
+  const recommended = [];
 
   const missingFields = required.filter((field) => !resolveFieldPresence(profile?.[field]));
   const missingRecommended = recommended.filter((field) => !resolveFieldPresence(profile?.[field]));

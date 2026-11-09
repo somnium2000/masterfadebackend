@@ -88,7 +88,7 @@ export default async function adminPointsRoutes(app) {
   app.get(
     "/regalias",
     {
-      preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
+      preHandler: app.requireRoles(GLOBAL_REWARDS_WRITE_ROLES),
       schema: {
         response: {
           200: {
@@ -168,8 +168,9 @@ export default async function adminPointsRoutes(app) {
                         correo: { type: ["string", "null"] },
                         telefono: { type: ["string", "null"] },
                         id_usuario: { type: ["string", "null"], format: "uuid" },
+                        id_sucursal_origen: { type: ["string", "null"], format: "uuid" },
                       },
-                      required: ["id_cliente", "nombre_cliente", "correo", "telefono", "id_usuario"],
+                      required: ["id_cliente", "nombre_cliente", "correo", "telefono", "id_usuario", "id_sucursal_origen"],
                       additionalProperties: false,
                     },
                   },
@@ -191,6 +192,7 @@ export default async function adminPointsRoutes(app) {
           q: request.query?.q,
           limit: request.query?.limit,
           claims: request.claims,
+          allowGlobalAssignment: true,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
@@ -224,6 +226,7 @@ export default async function adminPointsRoutes(app) {
         const data = await getClientePointsSummary(app, request.params.id_cliente, {
           historyLimit: 20,
           claims: request.claims,
+          allowGlobalAssignment: true,
         });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
@@ -265,6 +268,7 @@ export default async function adminPointsRoutes(app) {
           motivo: request.body?.motivo,
           usuarioAdmin: request.claims?.user,
           claims: request.claims,
+          allowGlobalAssignment: true,
           idempotencyKey,
         });
         return sendOk(reply, data, { requestId: request.id });

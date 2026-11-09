@@ -37,6 +37,7 @@ function isUnsafeMethod(method) {
 
 function isCsrfExemptPath(pathname) {
   const path = String(pathname || "");
+  if (path === "/v1/public" || path.startsWith("/v1/public/")) return true;
   return CSRF_EXEMPT_PATHS.some((allowed) => path === allowed || path.endsWith(allowed));
 }
 
@@ -98,7 +99,8 @@ async function securityPlugin(app) {
     max: Number(process.env.RATE_LIMIT_MAX || 200),
     timeWindow: process.env.RATE_LIMIT_WINDOW || "1 minute",
     keyGenerator: (request) => `${request.ip}:${request.routerPath || request.url}`,
-    errorResponseBuilder: (request) => ({
+    errorResponseBuilder: (request, context) => ({
+      statusCode: context.statusCode,
       ok: false,
       error: {
         code: "RATE_LIMIT_EXCEEDED",

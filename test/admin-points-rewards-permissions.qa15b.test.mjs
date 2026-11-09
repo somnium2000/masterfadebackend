@@ -63,13 +63,13 @@ async function setup(t, roles) {
   return app;
 }
 
-test("admin consulta regalías pero no puede actualizarlas", async (t) => {
+test("admin no puede consultar ni actualizar regalías", async (t) => {
   const app = await setup(t, ["admin"]);
   const read = await app.inject({ method: "GET", url: "/v1/admin/puntos/regalias" });
   const write = await app.inject({ method: "PATCH", url: "/v1/admin/puntos/regalias", payload });
-  assert.equal(read.statusCode, 200);
+  assert.equal(read.statusCode, 403);
   assert.equal(write.statusCode, 403);
-  assert.deepEqual(calls.map(({ name }) => name), ["get"]);
+  assert.deepEqual(calls, []);
 });
 
 for (const [label, roles] of [
@@ -77,11 +77,14 @@ for (const [label, roles] of [
   ["super_admin multirrol", ["admin", "super_admin"]],
 ]) test(`${label} puede actualizar regalías y transmite claims`, async (t) => {
   const app = await setup(t, roles);
+  const read = await app.inject({ method: "GET", url: "/v1/admin/puntos/regalias" });
   const response = await app.inject({ method: "PATCH", url: "/v1/admin/puntos/regalias", payload });
+  assert.equal(read.statusCode, 200);
   assert.equal(response.statusCode, 200);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args[1].roles, roles);
-  assert.deepEqual(calls[0].args[2], payload);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].name, "get");
+  assert.deepEqual(calls[1].args[1].roles, roles);
+  assert.deepEqual(calls[1].args[2], payload);
 });
 
 for (const [label, roles] of [

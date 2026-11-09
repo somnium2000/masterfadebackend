@@ -21,9 +21,10 @@ async function fixture(t, role, { sid = CURRENT, fail = false } = {}) {
   const app = Fastify(); t.after(() => app.close());
   app.decorate('db', { query, connect: async () => ({ query, release() {} }) });
   app.decorate('requireRoles', allowed => async (request, reply) => {
-    request.claims = { roles: role ? [role] : [], user: { id_usuario: ACTOR } }; request.user = { sid };
-    if (!role) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
-    if (!allowed.includes(role)) return reply.code(403).send({ error: { code: 'AUTH_FORBIDDEN' } });
+    const roles = Array.isArray(role) ? role : role ? [role] : [];
+    request.claims = { roles, user: { id_usuario: ACTOR } }; request.user = { sid };
+    if (!roles.length) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
+    if (!allowed.some(item => roles.includes(item))) return reply.code(403).send({ error: { code: 'AUTH_FORBIDDEN' } });
   });
   await app.register(routes, { prefix: '/v1/admin/seguridad' }); await app.ready(); return { app, queries };
 }
@@ -65,6 +66,14 @@ test('sin sesión actual no realiza revocación masiva', async t => {
   const { app, queries } = await fixture(t, 'root', { sid: null });
   assert.equal((await app.inject({ method: 'POST', url: '/v1/admin/seguridad/sesiones/revocar-todas' })).statusCode, 400);
   assert.equal(queries.length, 0);
+});
+test('multirrol autoriza por security_admin sin escalar combinaciones no permitidas', async t => {
+  const allowed = await fixture(t, ['cliente', 'security_admin']);
+  assert.equal((await allowed.app.inject({ method: 'POST', url: `/v1/admin/seguridad/sesiones/${TARGET}/revocar` })).statusCode, 200);
+
+  const denied = await fixture(t, ['cliente', 'admin']);
+  assert.equal((await denied.app.inject({ method: 'POST', url: `/v1/admin/seguridad/sesiones/${TARGET}/revocar` })).statusCode, 403);
+  assert.equal(denied.queries.length, 0);
 });
 test('error masivo hace rollback y no expone mensaje SQL', async t => {
   const { app, queries } = await fixture(t, 'root', { fail: true });

@@ -15,7 +15,7 @@ const KEY = '66666666-6666-4666-8666-666666666666';
 const actorClaims = { roles: ['admin'], branch_ids: [BRANCH], user: { id_usuario: ADMIN } };
 
 function fixture() {
-  const idempotency = new Map(); const movements = []; const calls = []; let balance = 20;
+  const idempotency = new Map(); const movements = []; const calls = []; let balance = 4;
   const client = {
     async query(sql, params = []) {
       const text = String(sql).replace(/\s+/g, ' ').trim(); calls.push({ text, params });
@@ -25,6 +25,7 @@ function fixture() {
       if (text.includes('FROM public.usuarios u')) return { rows: [{ id_usuario: USER }] };
       if (text.includes('FROM public.tipos_puntos')) return { rows: [{ tipo_puntos_codigo: 'ajustar', signo: 1 }, { tipo_puntos_codigo: 'ajuste_resta', signo: -1 }] };
       if (text.includes('fn_points_materialize_expired_cycles')) return { rows: [] };
+      if (text.includes('fn_points_get_effective_rule')) return { rows: [{ puntos_para_premio: 10 }] };
       if (text.includes('SELECT COALESCE(SUM(pt.puntos), 0)::int AS saldo_total')) return { rows: [{ saldo_total: balance }] };
       if (text.includes('INSERT INTO app_private.points_manual_adjustment_idempotency')) {
         if (idempotency.has(params[0])) return { rows: [], rowCount: 0 };

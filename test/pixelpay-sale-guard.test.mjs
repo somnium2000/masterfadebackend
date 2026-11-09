@@ -43,6 +43,10 @@ test("live acepta tarjetas reales y bloquea las tarjetas oficiales de Sandbox", 
     (error) => error.code === "PIXELPAY_TEST_CARD_FORBIDDEN_IN_LIVE"
   );
   assert.throws(
+    () => assertPixelPayCardAllowedForEnvironment("5555555555554444", "live"),
+    (error) => error.code === "PIXELPAY_TEST_CARD_FORBIDDEN_IN_LIVE"
+  );
+  assert.throws(
     () => assertPixelPayCardAllowedForEnvironment("4000000000000002", "sandbox"),
     (error) => error.code === "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED"
   );
