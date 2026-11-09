@@ -70,6 +70,9 @@ test('la consulta es agregada, parametrizada y de solo lectura', async (t) => {
   assert.match(sql, /COUNT\(DISTINCT pt\.id_points_tx\)/);
   assert.match(sql, /tipo_puntos_codigo = 'canjear'/);
   assert.match(sql, /WITH RECURSIVE range_config/);
+  assert.match(sql, /WHEN 'month' THEN date_trunc\('month', \$2::timestamptz/);
+  assert.match(sql, /WHEN 'year' THEN date_trunc\('year', \$2::timestamptz/);
+  assert.match(sql, /GREATEST\(b\.bucket, rc\.local_from\)/);
   assert.match(sql, /LEAST\(b\.bucket \+ rc\.step, rc\.local_to\)/);
   assert.match(sql, /COALESCE\(\(SELECT SUM\(ep\.monto_hnl\)/);
   assert.doesNotMatch(sql, /subscription_payments|citas_detalles|total_pagar_hnl/);
@@ -106,4 +109,12 @@ test('agrupa hoy por hora y rangos extensos de forma acotada', async (t) => {
   await app.inject('/v1/admin/super-dashboard/summary?fecha_desde=2026-01-01&fecha_hasta=2026-11-08');
   assert.equal(calls[0].params[3], 'hour');
   assert.equal(calls[1].params[3], 'month');
+});
+
+test('períodos parciales de mes y año conservan límites reales', async (t) => {
+  const { app, calls } = await fixture(t);
+  await app.inject('/v1/admin/super-dashboard/summary?fecha_desde=2026-01-15&fecha_hasta=2026-06-20');
+  await app.inject('/v1/admin/super-dashboard/summary?fecha_desde=2024-03-15&fecha_hasta=2026-05-20');
+  assert.deepEqual(calls[0].params.slice(1), ['2026-01-15T06:00:00.000Z', '2026-06-21T06:00:00.000Z', 'month']);
+  assert.deepEqual(calls[1].params.slice(1), ['2024-03-15T06:00:00.000Z', '2026-05-21T06:00:00.000Z', 'year']);
 });

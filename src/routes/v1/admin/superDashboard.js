@@ -53,6 +53,11 @@ const SUMMARY_SQL = `
       $2::timestamptz AT TIME ZONE '${TIMEZONE}' AS local_from,
       $3::timestamptz AT TIME ZONE '${TIMEZONE}' AS local_to,
       CASE $4::text
+        WHEN 'month' THEN date_trunc('month', $2::timestamptz AT TIME ZONE '${TIMEZONE}')
+        WHEN 'year' THEN date_trunc('year', $2::timestamptz AT TIME ZONE '${TIMEZONE}')
+        ELSE $2::timestamptz AT TIME ZONE '${TIMEZONE}'
+      END AS bucket_from,
+      CASE $4::text
         WHEN 'hour' THEN INTERVAL '1 hour'
         WHEN 'day' THEN INTERVAL '1 day'
         WHEN 'week' THEN INTERVAL '7 days'
@@ -61,7 +66,7 @@ const SUMMARY_SQL = `
       END AS step
   ),
   buckets AS (
-    SELECT rc.local_from AS bucket
+    SELECT rc.bucket_from AS bucket
     FROM range_config rc
     UNION ALL
     SELECT b.bucket + rc.step
@@ -83,16 +88,16 @@ const SUMMARY_SQL = `
       b.bucket,
       COALESCE((SELECT SUM(ep.monto_hnl)
         FROM eligible_payments ep
-        WHERE ep.paid_at AT TIME ZONE '${TIMEZONE}' >= b.bucket
+        WHERE ep.paid_at AT TIME ZONE '${TIMEZONE}' >= GREATEST(b.bucket, rc.local_from)
           AND ep.paid_at AT TIME ZONE '${TIMEZONE}' < LEAST(b.bucket + rc.step, rc.local_to)), 0)::numeric AS ingresos_hnl,
       (SELECT COUNT(s.id_suscripcion)
         FROM public.subscriptions s
-        WHERE s.inicio_at AT TIME ZONE '${TIMEZONE}' >= b.bucket
+        WHERE s.inicio_at AT TIME ZONE '${TIMEZONE}' >= GREATEST(b.bucket, rc.local_from)
           AND s.inicio_at AT TIME ZONE '${TIMEZONE}' < LEAST(b.bucket + rc.step, rc.local_to))::bigint AS planes_activados,
       (SELECT COUNT(DISTINCT pt.id_points_tx)
         FROM public.points_transactions pt
         WHERE pt.tipo_puntos_codigo = 'canjear'
-          AND pt.created_at AT TIME ZONE '${TIMEZONE}' >= b.bucket
+          AND pt.created_at AT TIME ZONE '${TIMEZONE}' >= GREATEST(b.bucket, rc.local_from)
           AND pt.created_at AT TIME ZONE '${TIMEZONE}' < LEAST(b.bucket + rc.step, rc.local_to))::bigint AS masterpuntos_canjeados
     FROM buckets b
     CROSS JOIN range_config rc
