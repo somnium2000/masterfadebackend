@@ -57,17 +57,18 @@ function pixelPaySalePayload() {
 for (const [name, status, expected] of [
   ["request rechazado con UNKNOWN", { ok: false, success: false, status: "UNKNOWN" }, "error_proveedor"],
   ["request rechazado sin status", { ok: false, success: false, status: "" }, "error_proveedor"],
-  ["respuesta exitosa con UNKNOWN", { ok: true, success: true, status: "UNKNOWN" }, "respuesta_invalida"],
+  ["respuesta exitosa con UNKNOWN", { ok: true, success: true, status: "UNKNOWN" }, "ok"],
   ["respuesta exitosa sin status", { ok: true, success: true, status: "" }, "respuesta_invalida"],
   ["respuesta exitosa PENDING", { ok: true, success: true, status: "PENDING" }, "ok"],
-  ["respuesta exitosa PAID", { ok: true, success: true, status: "PAID" }, "ok"],
+  ["respuesta exitosa COMPLETED", { ok: true, success: true, status: "COMPLETED" }, "ok"],
 ]) {
   test(`clasificacion status PixelPay: ${name}`, () => {
     assert.equal(classifyPixelPayStatusResult(status), expected);
   });
 }
 
-test("solo PAID exacto se clasifica como pago confirmado", () => {
+test("COMPLETED y el alias historico PAID se clasifican como pago confirmado", () => {
+  assert.equal(isPixelPayPaidStatus("COMPLETED"), true);
   assert.equal(isPixelPayPaidStatus("PAID"), true);
   assert.equal(isPixelPayPaidStatus("paid"), true);
   assert.equal(isPixelPayPaidStatus("UNPAID"), false);
@@ -243,6 +244,7 @@ function createPagosClient({
   const calls = [];
   const statusChecks = [];
   const payments = structuredClone(initialPayments);
+  const paymentEvents = [];
   let saleAttempts = structuredClone(initialSaleAttempts);
   let transactionSnapshot = null;
   let activeIntent = existingIntent ? { ...existingIntent } : null;
@@ -305,7 +307,7 @@ function createPagosClient({
       const text = typeof sql === "object" ? sql.text : String(sql);
       calls.push({ sql: text, params });
       if (text === "BEGIN") {
-        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, saleAttempts, groupStateCode });
+        transactionSnapshot = structuredClone({ activeIntent, groupState, payments, paymentEvents, saleAttempts, groupStateCode });
         return { rows: [] };
       }
       if (text === "COMMIT") { transactionSnapshot = null; return { rows: [] }; }
@@ -314,6 +316,7 @@ function createPagosClient({
           activeIntent = transactionSnapshot.activeIntent;
           groupState.splice(0, groupState.length, ...transactionSnapshot.groupState);
           payments.splice(0, payments.length, ...transactionSnapshot.payments);
+          paymentEvents.splice(0, paymentEvents.length, ...transactionSnapshot.paymentEvents);
           saleAttempts = transactionSnapshot.saleAttempts;
           groupStateCode = transactionSnapshot.groupStateCode;
           transactionSnapshot = null;
@@ -346,6 +349,18 @@ function createPagosClient({
           final_parameters: structuredClone(params),
         });
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
+      }
+      if (text.includes("FROM app_private.pixelpay_sale_attempts")
+        && text.includes("observed_payment_uuid_untrusted")) {
+        return {
+          rows: [...new Set(saleAttempts
+            .filter((entry) => entry.id_intent === params[0]
+              && entry.outcome === "uncertain"
+              && entry.finalized_at
+              && entry.observed_payment_uuid_untrusted)
+            .map((entry) => entry.observed_payment_uuid_untrusted))]
+            .map((observedPaymentUuid) => ({ observed_payment_uuid_untrusted: observedPaymentUuid })),
+        };
       }
       if (text.includes("AS finalized_at FROM app_private.pixelpay_sale_attempts")) {
         const flags = ["response_success", "response_approved", "transaction_result_valid", "transaction_result_parsed",
@@ -612,6 +627,24 @@ function createPagosClient({
         };
         return { rows: [{ id_status_check: "abababab-abab-4bab-8bab-abababababab" }] };
       }
+      if (text.includes("INSERT INTO public.payment_events") && text.includes("SELECT pi.id_provider")) {
+        if (!paymentEvents.some((row) => row.provider_event_id === params[1])) {
+          paymentEvents.push({
+            id_intent: params[0],
+            provider_event_id: params[1],
+            evento_tipo: params[2],
+            payload_esencial: params[3],
+            recibido_at: new Date().toISOString(),
+          });
+        }
+        return { rows: [] };
+      }
+      if (text.includes("min(pe.recibido_at)::text AS verified_at") && text.includes("FROM public.payment_events pe")) {
+        const rows = paymentEvents
+          .filter((row) => row.id_intent === params[0])
+          .sort((a, b) => a.recibido_at.localeCompare(b.recibido_at));
+        return { rows: [{ verified_at: rows[0]?.recibido_at ?? null }] };
+      }
       if (text.includes("FROM public.payments") && text.includes("estado_pago_codigo = 'capturado'")) {
         const payment = payments.find((row) => row.id_intent === params[0]);
         if (text.includes("EXISTS")) {
@@ -723,6 +756,16 @@ async function createPagosApp(client, {
     authenticated,
   });
   return app;
+}
+
+function assertStatusTransportCorrelation(logs, requestId, httpStatus) {
+  const entries = logs.map((entry) => JSON.parse(entry));
+  const received = entries.find((entry) => entry.event === "pixelpay_status_transport_received");
+  const completed = entries.find((entry) => entry.event === "pixelpay_status_transport_completed");
+  assert.equal(received?.client_request_id, requestId);
+  assert.equal(completed?.client_request_id, requestId);
+  assert.equal(completed?.http_status, httpStatus);
+  return { received, completed };
 }
 
 function createSerializedTransactionClients(baseClient) {
@@ -2159,7 +2202,7 @@ function reconcileFixture(client, overrides = {}) {
   return reconcilePixelPayPaid(client, {
     idGrupoCita: GROUP_A, idIntent: INTENT_A, titularEmail: "cliente@example.com",
     paymentUuid: "PAYMENT-UUID-NEW", providerTransactionId: "TX-SANDBOX-REPEATED",
-    expectedAmount: 115, ...overrides,
+    expectedAmount: 115, paidAt: "2099-01-01T15:59:00.000Z", ...overrides,
   });
 }
 
@@ -2838,10 +2881,63 @@ test("status carga intent PixelPay y registra una verificacion con proveedor sim
   assert.equal(client.getStatusChecks()[0].provider_status, "pending");
   assert.equal(client.getStatusChecks()[0].http_status, 200);
   assert.ok(!client.calls.some((call) => call.sql.includes("SET last_verified_at = now()")));
+  assert.equal(client.calls.some((call) => call.sql.includes("observed_payment_uuid_untrusted")), false);
   await app.close();
 });
 
+for (const [providerStatus, expectedIntentState, expectedPending] of [
+  ["DECLINED", "fallido", false],
+  ["VOIDED", "fallido", false],
+  ["UNKNOWN", "pendiente_confirmacion", true],
+  ["TIMEOUT", "pendiente_confirmacion", true],
+]) {
+  test(`status oficial ${providerStatus} conserva semantica financiera segura`, async () => {
+    const calls = [];
+    const provider = {
+      async queryPaymentStatus(paymentUuid, expected) {
+        calls.push({ paymentUuid, expected });
+        return {
+          ok: true,
+          success: true,
+          statusCode: 200,
+          status: providerStatus,
+          paymentUuid,
+          providerContractValid: true,
+        };
+      },
+    };
+    const client = createPagosClient({
+      providerCode: "pixelpay",
+      existingIntent: {
+        id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
+        id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
+        expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+        orden_compra: "MF-PIXELPAY-STATUS-OFFICIAL", provider_session_id: "payment-uuid-official",
+        created_by_usuario_id: USER_A,
+      },
+    });
+    const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/public/pagos/pixelpay/status",
+      payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().data.provider_status, providerStatus);
+    assert.equal(response.json().data.pending_confirmation, expectedPending);
+    assert.equal(client.getActiveIntent().estado_intent_codigo, expectedIntentState);
+    assert.equal(client.getPayments().length, 0);
+    assert.deepEqual(calls[0].expected, {
+      orderId: "MF-PIXELPAY-STATUS-OFFICIAL",
+      amount: 115,
+    });
+    await app.close();
+  });
+}
+
 test("status sin payment_uuid no llama proveedor ni registra telemetria", async () => {
+  const logs = [];
+  const requestId = "10000000-0000-4000-8000-000000000409";
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus() {
@@ -2866,11 +2962,12 @@ test("status sin payment_uuid no llama proveedor ni registra telemetria", async 
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: {
       id_grupo_cita: GROUP_A,
       id_intent: INTENT_A,
@@ -2884,6 +2981,334 @@ test("status sin payment_uuid no llama proveedor ni registra telemetria", async 
   assert.equal(client.getStatusChecks().length, 0);
   assert.equal(client.getActiveIntent().verification_attempts || 0, 0);
   assert.equal(client.getPayments().length, 0);
+  assertStatusTransportCorrelation(logs, requestId, 409);
+  await app.close();
+});
+
+test("status usa el unico UUID observado uncertain del mismo intent sin promoverlo", async () => {
+  const observedPaymentUuid = "observed-payment-uuid-qa";
+  const provider = {
+    statusCalls: [],
+    async queryPaymentStatus(paymentUuid) {
+      this.statusCalls.push(paymentUuid);
+      return { ok: true, success: true, statusCode: 200, status: "PENDING", paymentUuid };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialSaleAttempts: [{
+      id_intent: INTENT_A,
+      outcome: "uncertain",
+      finalized_at: "2026-11-03T12:00:00.000Z",
+      observed_payment_uuid_untrusted: observedPaymentUuid,
+    }],
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: null,
+      referencia_externa: null,
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(provider.statusCalls, [observedPaymentUuid]);
+  assert.equal(client.getActiveIntent().provider_session_id, null);
+  assert.equal(client.getActiveIntent().referencia_externa, null);
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(JSON.stringify(response.json()).includes(observedPaymentUuid), false);
+  await app.close();
+});
+
+test("status bloquea UUID observados ambiguos sin consultar PixelPay", async () => {
+  const logs = [];
+  const requestId = "20000000-0000-4000-8000-000000000409";
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() { this.statusCalls += 1; },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialSaleAttempts: ["observed-a", "observed-b", "observed-a"].map((uuid) => ({
+      id_intent: INTENT_A,
+      outcome: "uncertain",
+      finalized_at: "2026-11-03T12:00:00.000Z",
+      observed_payment_uuid_untrusted: uuid,
+    })),
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: null,
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json().error.code, "PIXELPAY_STATUS_CANDIDATE_AMBIGUOUS");
+  assert.equal(provider.statusCalls, 0);
+  assert.equal(client.getStatusChecks().length, 0);
+  assertStatusTransportCorrelation(logs, requestId, 409);
+  await app.close();
+});
+
+test("status no usa UUID observado fuera de pendiente_confirmacion", async () => {
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() { this.statusCalls += 1; },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialSaleAttempts: [{
+      id_intent: INTENT_A,
+      outcome: "uncertain",
+      finalized_at: "2026-11-03T12:00:00.000Z",
+      observed_payment_uuid_untrusted: "other-intent-observed-uuid",
+    }],
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "creado",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: null,
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json().error.code, "PIXELPAY_PAYMENT_UUID_MISSING");
+  assert.equal(provider.statusCalls, 0);
+  assert.equal(client.calls.some((call) => call.sql.includes("observed_payment_uuid_untrusted")), false);
+  await app.close();
+});
+
+test("status pendiente no usa UUID observado de otro intent", async () => {
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() { this.statusCalls += 1; },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialSaleAttempts: [{
+      id_intent: "aaaaaaaa-9999-4999-8999-999999999999",
+      outcome: "uncertain",
+      finalized_at: "2026-11-03T12:00:00.000Z",
+      observed_payment_uuid_untrusted: "other-intent-observed-uuid",
+    }],
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: null,
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json().error.code, "PIXELPAY_PAYMENT_UUID_MISSING");
+  assert.equal(provider.statusCalls, 0);
+  assert.equal(client.getStatusChecks().length, 0);
+  await app.close();
+});
+
+test("status PAID con UUID observado permanece bloqueado aunque exista Sale durable", async () => {
+  const logs = [];
+  const requestId = "30000000-0000-4000-8000-000000000202";
+  const observedPaymentUuid = "observed-paid-uuid-qa";
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus(paymentUuid) {
+      this.statusCalls += 1;
+      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialSaleAttempts: [
+      {
+        id_intent: INTENT_A,
+        outcome: "uncertain",
+        finalized_at: "2026-11-03T12:00:00.000Z",
+        observed_payment_uuid_untrusted: observedPaymentUuid,
+      },
+      {
+        id_intent: INTENT_A,
+        outcome: "approved",
+        sdk_response_class: "SuccessResponse",
+        upstream_http_status: 200,
+        finalized_at: "2026-11-03T11:59:00.000Z",
+        response_success: true,
+        response_approved: true,
+        response_incomplete: false,
+        transaction_result_valid: true,
+        transaction_result_parsed: true,
+        payment_uuid_present: true,
+        transaction_id_present: true,
+        payment_hash_present: true,
+        payment_hash_valid: true,
+        transaction_amount_matches: true,
+        approved_amount_matches: true,
+        amount_matches: true,
+        uncertain: false,
+      },
+    ],
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: null,
+      referencia_externa: null,
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+
+  assert.equal(response.statusCode, 202, response.body);
+  assert.equal(response.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT");
+  assert.equal(response.json().data.booking_confirmed, false);
+  assert.equal(JSON.stringify(response.json()).includes(observedPaymentUuid), false);
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "en_espera");
+  assert.equal(provider.statusCalls, 1);
+  assertStatusTransportCorrelation(logs, requestId, 202);
+  await app.close();
+});
+
+test("status HTTP 412 se clasifica seguro, se registra y mantiene pendiente sin reintentos", async () => {
+  const logs = [];
+  const requestId = "40000000-0000-4000-8000-000000000412";
+  const observedPaymentUuid = "observed-412-uuid-qa";
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() {
+      this.statusCalls += 1;
+      const error = new Error("contexto o cache desconocido");
+      error.code = "PIXELPAY_STATUS_PRECONDITION_FAILED";
+      error.statusCode = 412;
+      error.providerDiagnostics = {
+        statusCode: 412,
+        responseClass: "PreconditionalResponse",
+        providerCode: "SIGNATURE_MISMATCH",
+        providerMessageCode: "INVALID_SIGNATURE",
+        providerAction: "status",
+        errorFields: ["payment_uuid"],
+        unknownErrorFieldCount: 0,
+      };
+      throw error;
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    initialSaleAttempts: [{
+      id_intent: INTENT_A,
+      outcome: "uncertain",
+      finalized_at: "2026-11-03T12:00:00.000Z",
+      observed_payment_uuid_untrusted: observedPaymentUuid,
+    }],
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: null,
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
+    payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+  });
+
+  assert.equal(response.statusCode, 412, response.body);
+  assert.equal(response.json().error.code, "PIXELPAY_STATUS_PRECONDITION_FAILED");
+  assertStatusTransportCorrelation(logs, requestId, 412);
+  assert.deepEqual(client.getStatusChecks().map(({ result, http_status, error_code }) => ({ result, http_status, error_code })), [{
+    result: "precondicion_fallida",
+    http_status: 412,
+    error_code: "PIXELPAY_STATUS_PRECONDITION_FAILED",
+  }]);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(provider.statusCalls, 1);
+  assert.match(logs.join(""), /SIGNATURE_MISMATCH/);
+  assert.match(logs.join(""), /INVALID_SIGNATURE/);
+  assert.doesNotMatch(logs.join(""), new RegExp(observedPaymentUuid));
   await app.close();
 });
 
@@ -2937,12 +3362,63 @@ test("status rechaza payment_uuid diferente al persistido", async () => {
   await app.close();
 });
 
-test("status PAID reconcilia una sola vez y repetido no duplica payment", async () => {
+test("status PAID sin evidencia autentica completa queda bloqueado y no crea paid_verified", async () => {
+  const cases = [
+    ["sin evidencia", {}],
+    ["hash incorrecto", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-blocked", transactionId: "transaction-id-blocked", paymentHashValid: false, amountMatches: true }],
+    ["importe diferente", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-blocked", transactionId: "transaction-id-blocked", paymentHashValid: true, amountMatches: false }],
+    ["payment_uuid inconsistente", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-other", transactionId: "transaction-id-blocked", paymentHashValid: true, amountMatches: true }],
+    ["transaction_id inconsistente", { approved: true, incomplete: false, resultPaymentUuid: "payment-uuid-blocked", transactionId: "transaction-id-other", paymentHashValid: true, amountMatches: true }],
+  ];
+
+  for (const [name, evidence] of cases) {
+    const provider = {
+      calls: [],
+      async queryPaymentStatus(paymentUuid, expected) {
+        this.calls.push({ paymentUuid, expected });
+        return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid, ...evidence };
+      },
+    };
+    const client = createPagosClient({
+      providerCode: "pixelpay",
+      existingIntent: {
+        id_intent: INTENT_A, id_provider: PROVIDER_A, id_cita: CITA_A, id_hold: HOLD_A,
+        id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
+        expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
+        orden_compra: "MF-PIXELPAY-STATUS-BLOCKED",
+        provider_session_id: "payment-uuid-blocked", referencia_externa: "transaction-id-blocked",
+        created_by_usuario_id: USER_A,
+      },
+    });
+    const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+    const response = await app.inject({
+      method: "POST", url: "/v1/public/pagos/pixelpay/status",
+      payload: { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: "cliente@example.com" },
+    });
+
+    assert.equal(response.statusCode, 202, `${name}: ${response.body}`);
+    assert.equal(response.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT", name);
+    assert.equal(response.json().data.booking_confirmed, false, name);
+    assert.equal(client.getPayments().length, 0, name);
+    assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion", name);
+    assert.equal(client.calls.filter((call) => call.sql.includes("pixelpay.status.paid_verified")).length, 0, name);
+    assert.equal(provider.calls[0].paymentUuid, "payment-uuid-blocked", name);
+    assert.deepEqual(provider.calls[0].expected, {
+      orderId: "MF-PIXELPAY-STATUS-BLOCKED",
+      amount: 115,
+    }, `${name}: Status recibe orden e importe canonicos`);
+    await app.close();
+  }
+});
+
+test("status PAID sin Sale durable repetido queda bloqueado y no crea payment", async () => {
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus(paymentUuid) {
       this.statusCalls += 1;
-      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid };
+      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid,
+        approved: true, incomplete: false, resultPaymentUuid: paymentUuid,
+        transactionId: "transaction-id-paid-qa", paymentHashValid: true, amountMatches: true };
     },
   };
   const client = createPagosClient({
@@ -2974,16 +3450,13 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   };
 
   const first = await app.inject(request);
-  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.statusCode, 202, first.body);
   assert.equal(first.json().data.provider_status, "PAID");
-  assert.equal(first.json().data.booking_confirmed, true);
-  assert.equal(client.getPayments().length, 1);
-  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-paid-qa");
-  assert.ok(Number.isFinite(Date.parse(client.getPayments()[0].paid_at)));
-  assert.equal(client.getPayments()[0].monto_hnl, 115);
-  assert.equal(client.getPayments()[0].moneda_codigo, "HNL");
+  assert.equal(first.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT");
+  assert.equal(first.json().data.booking_confirmed, false);
+  assert.equal(client.getPayments().length, 0);
   assert.equal(client.getActiveIntent().provider_session_id, "payment-uuid-paid-qa");
-  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
   const sideEffectsAfterFirst = {
     promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,
     emails: client.calls.filter((call) => /notificaciones_email/i.test(call.sql)).length,
@@ -2991,12 +3464,12 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   };
 
   const second = await app.inject(request);
-  assert.equal(second.statusCode, 200, second.body);
-  assert.equal(second.json().data.duplicate, true);
-  assert.equal(client.getPayments().length, 1);
+  assert.equal(second.statusCode, 202, second.body);
+  assert.equal(second.json().data.code, "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT");
+  assert.equal(client.getPayments().length, 0);
   assert.equal(provider.statusCalls, 2);
   assert.equal(client.getStatusChecks().length, 2);
-  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 0);
   assert.deepEqual({
     promotions: client.calls.filter((call) => /promociones_usos|citas_promociones/i.test(call.sql)).length,
     emails: client.calls.filter((call) => /notificaciones_email/i.test(call.sql)).length,
@@ -3005,12 +3478,14 @@ test("status PAID reconcilia una sola vez y repetido no duplica payment", async 
   await app.close();
 });
 
-test("dos Status PAID concurrentes producen un payment y una confirmacion efectiva", async () => {
+test("dos Status PAID concurrentes sin Sale durable quedan bloqueados sin payment", async () => {
   const provider = {
     statusCalls: 0,
     async queryPaymentStatus(paymentUuid) {
       this.statusCalls += 1;
-      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid };
+      return { ok: true, success: true, statusCode: 200, status: "PAID", paymentUuid,
+        approved: true, incomplete: false, resultPaymentUuid: paymentUuid,
+        transactionId: "transaction-id-concurrent-qa", paymentHashValid: true, amountMatches: true };
     },
   };
   const client = createPagosClient({
@@ -3047,13 +3522,12 @@ test("dos Status PAID concurrentes producen un payment y una confirmacion efecti
 
   const [first, second] = await Promise.all([app.inject(request), app.inject(request)]);
 
-  assert.deepEqual([first.statusCode, second.statusCode], [200, 200]);
+  assert.deepEqual([first.statusCode, second.statusCode], [202, 202]);
   assert.equal(provider.statusCalls, 2);
   assert.equal(client.getStatusChecks().length, 2);
-  assert.equal(client.getPayments().length, 1);
-  assert.equal(client.getPayments()[0].provider_tx_id, "payment-uuid-concurrent-qa");
-  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
-  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
   await app.close();
 });
 
@@ -3219,8 +3693,12 @@ test("status PAID sin transaction_id estable queda en conciliacion manual", asyn
 });
 
 test("status registra error tecnico sanitizado sin persistir secretos", async () => {
+  const logs = [];
+  const requestId = "50000000-0000-4000-8000-000000000502";
   const provider = {
+    statusCalls: 0,
     async queryPaymentStatus() {
+      this.statusCalls += 1;
       const error = new Error("mensaje con PAN 4111111111111111 y secreto");
       error.code = "PIXELPAY_TIMEOUT";
       error.statusCode = 504;
@@ -3243,11 +3721,12 @@ test("status registra error tecnico sanitizado sin persistir secretos", async ()
       created_by_usuario_id: USER_A,
     },
   });
-  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": requestId },
     payload: {
       id_grupo_cita: GROUP_A,
       id_intent: INTENT_A,
@@ -3268,6 +3747,122 @@ test("status registra error tecnico sanitizado sin persistir secretos", async ()
   );
   assert.doesNotMatch(JSON.stringify(client.getStatusChecks()), /4111111111111111|secreto/i);
   assert.equal(client.getActiveIntent().verification_attempts, 1);
+  assert.equal(provider.statusCalls, 1);
+  assertStatusTransportCorrelation(logs, requestId, 502);
+  await app.close();
+});
+
+test("Status correlaciona entrada y salida con X-Request-Id seguro", async () => {
+  const logs = [];
+  const requestId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus(paymentUuid) {
+      this.statusCalls += 1;
+      return {
+        ok: true,
+        success: true,
+        statusCode: 200,
+        status: "PENDING",
+        paymentUuid,
+        transactionId: "transaction-id-private",
+        transactionReference: "transaction-reference-private",
+        observedPaymentUuidUntrusted: "observed-payment-uuid-untrusted-private",
+      };
+    },
+  };
+  const client = createPagosClient({
+    providerCode: "pixelpay",
+    ownerEmail: "privacy-status@example.com",
+    existingIntent: {
+      id_intent: INTENT_A,
+      id_provider: PROVIDER_A,
+      id_cita: CITA_A,
+      id_hold: HOLD_A,
+      id_grupo_cita: GROUP_A,
+      estado_intent_codigo: "pendiente_confirmacion",
+      expires_at: "2099-01-01T16:00:00.000Z",
+      monto_hnl: "115.00",
+      moneda_codigo: "HNL",
+      provider_session_id: "payment-uuid-correlation",
+      created_by_usuario_id: USER_A,
+    },
+  });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: {
+      "x-request-id": requestId,
+      authorization: "Bearer auth-hash-private",
+      cookie: "mf_session=session-secret-private",
+      "x-csrf-token": "csrf-secret-private",
+      "x-card-diagnostic": "4111111111111111 cvv 999",
+    },
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "privacy-status@example.com",
+    },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.headers["x-request-id"], requestId);
+  assert.equal(provider.statusCalls, 1);
+  const entries = logs.map((entry) => JSON.parse(entry));
+  const received = entries.find((entry) => entry.event === "pixelpay_status_transport_received");
+  const completed = entries.find((entry) => entry.event === "pixelpay_status_transport_completed");
+  assert.equal(received?.client_request_id, requestId);
+  assert.equal(completed?.client_request_id, requestId);
+  assert.equal(completed?.http_status, 200);
+  assert.equal(typeof completed?.duration_ms, "number");
+  const transportLogs = JSON.stringify([received, completed]);
+  assert.doesNotMatch(
+    transportLogs,
+    /privacy-status@example\.com|payment-uuid-correlation|transaction-id-private|transaction-reference-private|observed-payment-uuid-untrusted-private|auth-hash-private|session-secret-private|csrf-secret-private|4111111111111111|999/i
+  );
+  assert.doesNotMatch(transportLogs, new RegExp(`${GROUP_A}|${INTENT_A}`, "i"));
+  await app.close();
+});
+
+test("schema invalido registra transporte completo sin invocar PixelPay ni reflejar header invalido", async () => {
+  const logs = [];
+  const provider = {
+    statusCalls: 0,
+    async queryPaymentStatus() {
+      this.statusCalls += 1;
+      throw new Error("provider no debe ejecutarse");
+    },
+  };
+  const client = createPagosClient({ providerCode: "pixelpay" });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, logs });
+  const maliciousRequestId = "invalid-request-id secret@example.com";
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/pixelpay/status",
+    headers: { "x-request-id": maliciousRequestId },
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: INTENT_A,
+      titular_email: "invalid-email",
+    },
+  });
+
+  assert.equal(response.statusCode, 400, response.body);
+  assert.notEqual(response.headers["x-request-id"], maliciousRequestId);
+  assert.equal(provider.statusCalls, 0);
+  const entries = logs.map((entry) => JSON.parse(entry));
+  const received = entries.find((entry) => entry.event === "pixelpay_status_transport_received");
+  const completed = entries.find((entry) => entry.event === "pixelpay_status_transport_completed");
+  assert.ok(received);
+  assert.ok(completed);
+  assert.equal(completed.http_status, 400);
+  assert.equal(received.client_request_id, received.fastify_request_id);
+  assert.equal(completed.client_request_id, received.client_request_id);
+  assert.equal(response.headers["x-request-id"], received.client_request_id);
+  assert.doesNotMatch(JSON.stringify([received, completed]), /invalid-email|secret@example\.com|invalid-request-id/i);
   await app.close();
 });
 

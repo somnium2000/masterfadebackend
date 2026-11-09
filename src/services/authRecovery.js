@@ -118,6 +118,10 @@ export async function acquirePasswordOperationLock(app, email) {
 export async function resetPasswordWithRecovery(app, body, currentUserId = null) {
   const url = process.env.SUPABASE_URL?.trim(), key = process.env.SUPABASE_ANON_KEY?.trim();
   if (!url || !key || !app.supabaseAdmin || !app.db) throw new AppError(503, 'No se pudo validar el enlace.', { code: 'AUTH_RESET_UNAVAILABLE' });
+  // AM: una sesion administrada debe cerrarse antes de consumir la prueba de recovery.
+  // El token_hash no permite conocer el titular sin verificarlo, por lo que se bloquea
+  // cualquier sesion previa y el enlace permanece utilizable tras cerrar sesion.
+  if (currentUserId) throw new AppError(409, 'Cierra la sesión actual y vuelve a abrir este enlace.', { code: 'AUTH_RECOVERY_ACTIVE_SESSION' });
   // Never install the recovery session into a shared anon/admin client.
   const recovery = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false } });
   let lock, verified = false, completed = false;
@@ -128,7 +132,6 @@ export async function resetPasswordWithRecovery(app, body, currentUserId = null)
     }
     verified = true;
     const userId = data.user.id;
-    if (currentUserId && currentUserId !== userId) throw new AppError(409, 'Cierra la sesión actual antes de utilizar este enlace.', { code: 'AUTH_RECOVERY_IDENTITY_MISMATCH' });
     lock = await acquirePasswordOperationLock(app, data.user.email);
     const internal = await lock.client.query('SELECT id_usuario FROM public.usuarios WHERE id_usuario=$1::uuid AND deleted_at IS NULL', [userId]);
     if (internal.rows.length !== 1) throw new AppError(401, 'No se pudo validar el enlace.', { code: 'AUTH_RECOVERY_LINK_INVALID' });
@@ -139,9 +142,8 @@ export async function resetPasswordWithRecovery(app, body, currentUserId = null)
     const updated = await app.supabaseAdmin.auth.admin.updateUserById(userId, { password: body.contrasena });
     if (updated.error || updated.data?.user?.id !== userId) throw new AppError(503, 'No se pudo completar el cambio. Solicita un enlace nuevo.', { code: 'AUTH_RESET_UNCONFIRMED' });
     const signedOut = await recovery.auth.signOut({ scope: 'global' });
-    if (signedOut.error) throw new AppError(503, 'No se pudo confirmar el cierre de sesiones. Solicita un enlace nuevo.', { code: 'AUTH_RESET_UNCONFIRMED' });
     completed = true;
-    return { password_updated: true, login_required: true };
+    return { password_updated: true, login_required: true, session_revocation_confirmed: !signedOut.error };
   } finally {
     if (verified && !completed) await recovery.auth.signOut({ scope: 'local' }).catch(() => {});
     await lock?.release();

@@ -15,7 +15,7 @@ const read = (name, result) => async (...args) => {
 const forbiddenWrite = () => { throw new Error('WRITE_SERVICE_MUST_NOT_RUN'); };
 const pointsServices = {
   addManualPointsAdjustment: forbiddenWrite,
-  searchActiveClientesForAdminPoints: read('search', { clientes: [{ id_cliente: A, nombre_cliente: 'Sintético A', correo: null, telefono: null, id_usuario: null }] }),
+  searchActiveClientesForAdminPoints: read('search', { clientes: [{ id_cliente: A, nombre_cliente: 'Sintético A', correo: null, telefono: null, id_usuario: null, id_sucursal_origen: A }] }),
   getClientePointsSummary: read('summary', (_app, id) => ({ id_cliente: id, saldo_total: id === A ? 7 : 2, puntos_titular: 5, puntos_integrante: 2, puntos_para_premio: 10, progreso_actual: 7, historial: [] })),
 };
 const masterServices = {
@@ -49,7 +49,6 @@ async function setup(t, roles) {
   calls = []; fail = false;
   const app = Fastify({ logger: false });
   app.decorate('requireRoles', (allowed) => async (request, reply) => {
-    assert.deepEqual(allowed, ['admin', 'super_admin']);
     if (!roles) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
     if (!roles.some((role) => allowed.includes(role))) return reply.code(403).send({ error: { code: 'AUTH_FORBIDDEN' } });
     request.claims = { roles, user: { id_usuario: B }, branch_ids: [A] };
@@ -62,7 +61,8 @@ async function setup(t, roles) {
 for (const roles of [['admin'], ['super_admin'], ['admin', 'super_admin'], ['barbero'], ['cliente'], ['security_auditor'], null]) {
   for (const endpoint of endpoints) test(`${roles?.join('+') || 'anónimo'} GET ${endpoint}`, async (t) => {
     const app = await setup(t, roles);
-    const allowed = roles?.some((role) => ['admin', 'super_admin'].includes(role));
+    const allowedRoles = endpoint === '/puntos/regalias' ? ['super_admin'] : ['admin', 'super_admin'];
+    const allowed = roles?.some((role) => allowedRoles.includes(role));
     const response = await app.inject({ method: 'GET', url: endpoint });
     assert.equal(response.statusCode, allowed ? 200 : roles ? 403 : 401);
     assert.equal(calls.length, allowed ? 1 : 0);
@@ -70,7 +70,7 @@ for (const roles of [['admin'], ['super_admin'], ['admin', 'super_admin'], ['bar
   });
 }
 for (const endpoint of endpoints) test(`error seguro en GET ${endpoint}`, async (t) => {
-  const app = await setup(t, ['admin']); fail = true;
+  const app = await setup(t, endpoint === '/puntos/regalias' ? ['super_admin'] : ['admin']); fail = true;
   const response = await app.inject({ method: 'GET', url: endpoint });
   assert.equal(response.statusCode, 500); assert.doesNotMatch(response.body, /SQL|INTERNAL|SECRET/);
 });

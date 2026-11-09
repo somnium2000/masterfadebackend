@@ -1,4 +1,5 @@
 import PixelPaySdk from "@pixelpay/sdk-core";
+import { createHash } from "node:crypto";
 import { PaymentProvider } from "./PaymentProvider.js";
 import {
   createPixelPaySaleAttempt,
@@ -6,7 +7,12 @@ import {
   PIXELPAY_SALE_EVENT,
   readPixelPayInputErrors,
   readPixelPayHttpMetadata,
+  safePixelPayProviderResponseCode,
 } from "./pixelPaySaleTelemetry.js";
+import {
+  buildSafePixelPayStatus412Diagnostics,
+  buildSafePixelPayStatus412ExceptionDiagnostics,
+} from "./pixelPayStatusDiagnostics.js";
 import {
   createPixelPaySaleSignature,
   createPixelPayStatusSignature,
@@ -28,6 +34,9 @@ const PIXELPAY_BILLING_ADDRESS_PLACEHOLDERS = new Set([
 ]);
 const PIXELPAY_SANDBOX_URL = "https://pixelpay.dev";
 const PIXELPAY_ENVIRONMENTS = new Set(["sandbox", "live"]);
+const PIXELPAY_STATUS_VALUES = new Set([
+  "COMPLETED", "DECLINED", "VOIDED", "PENDING", "UNKNOWN", "TIMEOUT",
+]);
 
 const SDK_FAILURE_MESSAGE_CODES = new Map([
   ["Could not obtain necessary credentials for transaction.", "SDK_PUBLIC_KEY_UNAVAILABLE"],
@@ -42,6 +51,32 @@ const SDK_FAILURE_MESSAGE_CODES = new Map([
 
 export const STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT =
   "STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT";
+
+export function classifyPixelPayStatusEvidence(status = {}) {
+  const normalizedStatus = text(status.status).toUpperCase();
+  const paymentUuidMatches = Boolean(status.paymentUuid)
+    && (!status.resultPaymentUuid || status.resultPaymentUuid === status.paymentUuid);
+  const officialStatus = PIXELPAY_STATUS_VALUES.has(normalizedStatus);
+  const responseAuthenticated = status.providerContractValid === true;
+  const financialEvidenceComplete = responseAuthenticated
+    && paymentUuidMatches
+    && status.paymentHashValid === true
+    && status.amountMatches === true;
+  return {
+    status: normalizedStatus,
+    officialStatus,
+    terminal: ["COMPLETED", "DECLINED", "VOIDED"].includes(normalizedStatus),
+    approved: normalizedStatus === "COMPLETED",
+    rejected: normalizedStatus === "DECLINED",
+    voided: normalizedStatus === "VOIDED",
+    uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(normalizedStatus),
+    responseAuthenticated,
+    paymentUuidMatches,
+    financialEvidenceComplete,
+    // AM: getStatus no habilita confirmacion hasta validar su evidencia real en PR08.
+    autoApprovalEligible: false,
+  };
+}
 
 function text(value) {
   return String(value ?? "").trim();
@@ -96,6 +131,7 @@ export function validatePixelPaySdkConfig({ endpoint, env, keyId, secretKey, aut
   }
   if (!normalizedKeyId) throw new Error("Configuracion PixelPay SDK incompleta: PIXELPAY_KEY_ID.");
   if (!normalizedSecretKey) throw new Error("Configuracion PixelPay SDK incompleta: PIXELPAY_SECRET_KEY.");
+  if (!normalizedAuthHash) throw new Error("Configuracion PixelPay SDK incompleta: PIXELPAY_AUTH_HASH.");
 
   if (normalizedEnv === "sandbox") {
     if (normalizedEndpoint !== PIXELPAY_SANDBOX_URL) {
@@ -110,9 +146,6 @@ export function validatePixelPaySdkConfig({ endpoint, env, keyId, secretKey, aut
     }
     if (normalizedAppUrl === PIXELPAY_SANDBOX_URL) {
       throw new Error("PIXELPAY_APP_URL live no puede usar la URL Sandbox.");
-    }
-    if (!normalizedAuthHash) {
-      throw new Error("Configuracion PixelPay SDK live incompleta: PIXELPAY_AUTH_HASH.");
     }
   }
 
@@ -226,6 +259,7 @@ function assertSdkShape(sdk) {
     sdk?.Models?.Billing,
     sdk?.Requests?.SaleTransaction,
     sdk?.Requests?.StatusTransaction,
+    sdk?.Requests?.VoidTransaction,
     sdk?.Services?.Transaction,
     sdk?.Entities?.TransactionResult,
   ];
@@ -240,6 +274,7 @@ function assertSdkShape(sdk) {
     typeof settingsPrototype?.setupSandbox !== "function"
     || typeof settingsPrototype?.setupEndpoint !== "function"
     || typeof settingsPrototype?.setupCredentials !== "function"
+    || typeof settingsPrototype?.setupPlatformUser !== "function"
     || typeof settingsPrototype?.setupEnvironment !== "function"
     || typeof settingsPrototype?.setupHeaders !== "function"
   ) {
@@ -263,6 +298,7 @@ export class PixelPaySdkError extends Error {
     cardExpireFormatValid = null,
     cardExpireFuture = null,
     billingAddressLength = null,
+    providerDiagnostics = null,
   } = {}) {
     super(message);
     this.name = "PixelPaySdkError";
@@ -287,6 +323,7 @@ export class PixelPaySdkError extends Error {
     this.billingAddressLength = Number.isSafeInteger(billingAddressLength) && billingAddressLength >= 0
       ? billingAddressLength
       : null;
+    this.providerDiagnostics = providerDiagnostics;
   }
 }
 
@@ -324,6 +361,9 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const settings = new this.sdk.Models.Settings();
     if (this.env === "sandbox") {
       settings.setupSandbox();
+      // AM: setupSandbox fija el ambiente pero sus credenciales genericas deben
+      // sobrescribirse con las credenciales autenticadas del comercio.
+      settings.setupCredentials(this.keyId, this.authHash);
     } else {
       settings.setupEndpoint(this.endpoint);
       settings.setupCredentials(this.keyId, this.authHash);
@@ -331,6 +371,38 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
     settings.setupHeaders({ "x-client-signature": signature });
     return new this.sdk.Services.Transaction(settings);
+  }
+
+  static sha512(value) {
+    return createHash("sha512").update(text(value), "utf8").digest("hex");
+  }
+
+  async voidPayment({ paymentUuid, orderId, authorizedEmail, reason = "VOID" } = {}) {
+    const normalizedPaymentUuid = text(paymentUuid);
+    const normalizedOrderId = text(orderId);
+    const normalizedEmail = text(authorizedEmail).toLowerCase();
+    if (!normalizedPaymentUuid || !normalizedOrderId || !normalizedEmail) {
+      throw new PixelPaySdkError(
+        "PIXELPAY_VOID_INPUT_INVALID",
+        "La anulacion PixelPay requiere payment_uuid, order_id y usuario autorizado."
+      );
+    }
+    const settings = new this.sdk.Models.Settings();
+    if (this.env === "sandbox") settings.setupSandbox();
+    else {
+      settings.setupEndpoint(this.endpoint);
+      settings.setupEnvironment("live");
+    }
+    settings.setupCredentials(this.keyId, this.authHash);
+    settings.setupPlatformUser(PixelPaySdkProvider.sha512(normalizedEmail));
+    const transaction = new this.sdk.Services.Transaction(settings);
+    const request = new this.sdk.Requests.VoidTransaction();
+    request.payment_uuid = normalizedPaymentUuid;
+    request.void_reason = text(reason) || "VOID";
+    request.void_signature = PixelPaySdkProvider.sha512(
+      `${normalizedEmail}|${normalizedOrderId}|${this.secretKey}`
+    );
+    return transaction.doVoid(request);
   }
 
   buildSaleRequest({ orderId, currency, amount, items, customer, billing, card } = {}, referenceDate = this.now()) {
@@ -556,6 +628,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       responseApproved: normalizedResponse.data.responseApproved,
       responseIncomplete: normalizedResponse.data.responseIncomplete,
       responseCodePresent: Boolean(normalizedResponse.data.responseCode),
+      providerResponseCode: safePixelPayProviderResponseCode(normalizedResponse.data.responseCode),
       hasPaymentUuid: Boolean(paymentUuid),
       hasTransactionId: Boolean(transactionId),
       hasPaymentHash,
@@ -634,7 +707,18 @@ export class PixelPaySdkProvider extends PaymentProvider {
     let response;
     try {
       response = await transaction.getStatus(statusRequest);
-    } catch {
+    } catch (error) {
+      const metadata = readPixelPayHttpMetadata(error);
+      if (metadata.statusCode === 412 || Number(error?.statusCode) === 412) {
+        throw new PixelPaySdkError(
+          "PIXELPAY_STATUS_PRECONDITION_FAILED",
+          "PixelPay no pudo procesar la consulta de estado en este momento.",
+          {
+            statusCode: 412,
+            providerDiagnostics: buildSafePixelPayStatus412ExceptionDiagnostics(error),
+          }
+        );
+      }
       throw new PixelPaySdkError(
         "PIXELPAY_NETWORK_ERROR",
         "No fue posible confirmar el estado en PixelPay.",
@@ -643,6 +727,16 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
 
     const statusCode = responseStatus(response);
+    if (statusCode === 412) {
+      throw new PixelPaySdkError(
+        "PIXELPAY_STATUS_PRECONDITION_FAILED",
+        "PixelPay no pudo procesar la consulta de estado en este momento.",
+        {
+          statusCode: 412,
+          providerDiagnostics: buildSafePixelPayStatus412Diagnostics(response),
+        }
+      );
+    }
     const transactionResult = this.readTransactionResult(response);
     const result = transactionResult.result;
     const resultPaymentUuid = text(result?.payment_uuid) || null;
@@ -669,22 +763,35 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const amountMatches = transactionAmountMatches && approvedAmountMatches;
     // AM: sdk-core@2.5.8 no declara `status` en TransactionResult; el contrato
     // oficial de Status lo entrega en el envelope como `data.status`.
+    const rawStatus = text(response?.data?.status).toUpperCase();
+    const normalizedStatus = rawStatus === "PAID" ? "COMPLETED" : rawStatus;
+    const providerContractValid = transactionResult.valid === true
+      && transactionResult.parsed === true
+      && PIXELPAY_STATUS_VALUES.has(normalizedStatus);
     const payload = normalizePixelPayStatusResponse({
       success: responseSuccess(response),
-      data: transactionResult.valid && transactionResult.dataPresent && transactionResult.parsed
-        ? { status: response?.data?.status }
+      data: providerContractValid
+        ? { status: normalizedStatus }
         : {},
     });
+    const status = providerContractValid ? normalizedStatus : "UNKNOWN";
     return {
       ok: statusCode != null && statusCode >= 200 && statusCode < 300,
       statusCode,
       success: payload.success,
       paymentUuid: normalizedUuid,
-      status: payload.data.status,
-      approved: result?.response_approved === true && result?.response_incomplete !== true,
+      status,
+      terminal: ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
+      uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
+      approved: status === "COMPLETED"
+        && result?.response_approved === true
+        && result?.response_incomplete !== true,
+      rejected: status === "DECLINED",
+      voided: status === "VOIDED",
       incomplete: result?.response_incomplete === true,
       definitiveRejected: transactionResult.valid === true
         && transactionResult.parsed === true
+        && status === "DECLINED"
         && result?.response_approved === false
         && result?.response_incomplete === false
         && resultPaymentUuid === normalizedUuid,
@@ -692,6 +799,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       resultPaymentUuid,
       paymentHashValid,
       amountMatches,
+      providerContractValid,
       response: payload,
     };
   }

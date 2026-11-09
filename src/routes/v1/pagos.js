@@ -169,6 +169,19 @@ function validateWebhookFreshness(request) {
   }
 }
 
+export function assertPaymentWebhookContract(app, providerCode) {
+  if (providerCode !== "pixelpay") return;
+  if (app.config?.pixelPayWebhookEnabled !== true) {
+    throw new AppError(503, "Webhook PixelPay no habilitado", {
+      code: "PIXELPAY_WEBHOOK_DISABLED",
+    });
+  }
+  // AM: El proveedor aun no publica un contrato verificable de autenticidad.
+  throw new AppError(503, "Contrato de webhook PixelPay pendiente", {
+    code: "PIXELPAY_WEBHOOK_PROVIDER_CONTRACT_BLOCKED",
+  });
+}
+
 async function loadOwnedAppointment(client, { citaId, clienteId, personaId }) {
   const { rows } = await client.query(
     `
@@ -541,17 +554,19 @@ export default async function pagosRoutes(app) {
           401: errorResponseSchema,
           404: errorResponseSchema,
           409: errorResponseSchema,
+          503: errorResponseSchema,
           500: errorResponseSchema,
         },
       },
     },
     async (request, reply) => {
-      const dbClient = await app.db.connect();
+      let dbClient = null;
 
       try {
-        validateWebhookFreshness(request);
-
         const providerCode = String(request.params?.proveedor || "").trim().toLowerCase();
+        assertPaymentWebhookContract(app, providerCode);
+        validateWebhookFreshness(request);
+        dbClient = await app.db.connect();
         const body = request.body && typeof request.body === "object" ? request.body : {};
         const providerIntentId = safeText(body.provider_intent_id ?? body.providerIntentId ?? body.referencia_externa);
         const intentIdempotencyKey = safeText(body.idempotency_key ?? body.idempotencyKey);
@@ -833,15 +848,17 @@ export default async function pagosRoutes(app) {
           extension_pending: false,
         });
       } catch (error) {
-        try {
-          await dbClient.query("ROLLBACK");
-        } catch {
-          // no-op
+        if (dbClient) {
+          try {
+            await dbClient.query("ROLLBACK");
+          } catch {
+            // no-op
+          }
         }
 
         return sendHandled(reply, request, error, "No se pudo procesar el webhook de pago", "PAGOS_WEBHOOK_ERROR");
       } finally {
-        dbClient.release();
+        dbClient?.release();
       }
     }
   );

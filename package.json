@@ -24,10 +24,10 @@
     "@pixelpay/sdk-core": "2.5.8",
     "@supabase/supabase-js": "^2.97.0",
     "dotenv": "^16.6.1",
-    "fastify": "^5.8.5",
+    "fastify": "^5.12.5",
     "fastify-plugin": "^5.1.0",
     "jsonwebtoken": "^9.0.3",
-    "nodemailer": "^8.0.5",
+    "nodemailer": "^10.4.0",
     "pg": "^8.16.3"
   },
   "devDependencies": {

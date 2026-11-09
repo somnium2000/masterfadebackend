@@ -58,3 +58,25 @@ test('rango invertido rechazado antes de SQL', async (t) => {
   assert.equal(response.json().error.code, 'REPORTES_DATE_RANGE_INVALID');
   assert.equal(queries.length, 0); assert.equal(released(), 1);
 });
+
+for (const invalidDate of ['2026-02-30', '2026-99-99', '2026-04-31', '2026-00-01', '2026-02-29']) {
+  test(`fecha calendario invalida ${invalidDate} se rechaza antes de SQL`, async (t) => {
+    const { app, queries, released } = await setup(t);
+    const response = await app.inject(`/reportes/dashboard?fecha_desde=${invalidDate}&fecha_hasta=${invalidDate}`);
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'REPORTES_DATE_INVALID');
+    assert.equal(queries.length, 0);
+    assert.equal(released(), 1);
+  });
+}
+
+for (const validDate of ['2024-02-29', '2026-10-29']) {
+  test(`fecha calendario valida ${validDate} conserva el flujo`, async (t) => {
+    const { app, queries, released } = await setup(t);
+    const response = await app.inject(`/reportes/dashboard?fecha_desde=${validDate}&fecha_hasta=${validDate}`);
+    assert.equal(response.statusCode, 200);
+    assert.ok(queries.length > 0);
+    assert.equal(response.json().data.filtros_aplicados.fecha_desde, validDate);
+    assert.equal(released(), 1);
+  });
+}

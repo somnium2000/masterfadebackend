@@ -12,8 +12,8 @@ const CLIENT_SEARCH_MAX_LIMIT = 20;
 const MANUAL_ADJUST_TYPE_ADD = "ajustar";
 const MANUAL_ADJUST_TYPE_SUBTRACT = "ajuste_resta";
 const IDEMPOTENCY_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const REWARD_SERVICE_NAMES_NO_PLAN = ["corte de cabello", "corte de barba"];
-const REWARD_SERVICE_NAMES_WITH_PLAN = ["facial express"];
+const REWARD_CONDITION_NO_MEMBERSHIP = "sin_membresia";
+const REWARD_CONDITION_WITH_MEMBERSHIP = "con_membresia";
 const REDEEM_CONTEXT_TOKEN_PREFIX = "mf_reward_ctx_v1";
 const REDEEM_CONTEXT_TOKEN_VERSION = 1;
 const REDEEM_CONTEXT_TTL_SECONDS = Math.max(
@@ -96,14 +96,6 @@ async function claimManualAdjustmentIdempotency(client, {
     });
   }
   return { ...row.response_payload, idempotent_replay: true };
-}
-
-function normalizeServiceName(value) {
-  return normalizeText(value)
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .toLowerCase();
 }
 
 function encodeBase64Url(value) {
@@ -293,7 +285,7 @@ export async function grantCompanionPointsForConfirmedGroup(client, { idGrupoCit
   const safeGroupId = assertUuid(idGrupoCita, "id_grupo_cita");
   const titularResult = await client.query(
     `
-      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario
+      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario, c.id_sucursal_origen
       FROM public.citas_grupos cg
       JOIN public.clientes c
         ON c.id_cliente = cg.id_cliente_titular
@@ -304,6 +296,10 @@ export async function grantCompanionPointsForConfirmedGroup(client, { idGrupoCit
   );
   const titular = titularResult.rows[0] || null;
   if (!titular?.id_cliente) return 0;
+
+  await lockClientePointsScope(client, titular.id_cliente);
+  await materializeCyclesIfAvailable(client, titular.id_cliente);
+  const puntosParaPremio = Math.max(1, await resolvePuntosParaPremio(client, titular.id_sucursal_origen || null));
 
   const companionsResult = await client.query(
     `
@@ -320,6 +316,7 @@ export async function grantCompanionPointsForConfirmedGroup(client, { idGrupoCit
 
   let granted = 0;
   for (const companion of companionsResult.rows || []) {
+    if (await getSaldoActual(client, titular.id_cliente) >= puntosParaPremio) break;
     let cycleId = null;
     try {
       const cycleResult = await client.query(
@@ -371,7 +368,7 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
   const safeGroupId = assertUuid(idGrupoCita, "id_grupo_cita");
   const titularResult = await client.query(
     `
-      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario
+      SELECT cg.id_cliente_titular AS id_cliente, c.id_usuario, c.id_sucursal_origen
       FROM public.citas_grupos cg
       JOIN public.clientes c
         ON c.id_cliente = cg.id_cliente_titular
@@ -382,6 +379,10 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
   );
   const titular = titularResult.rows[0] || null;
   if (!titular?.id_cliente) return { titular: 0, acompanantes: 0 };
+
+  await lockClientePointsScope(client, titular.id_cliente);
+  await materializeCyclesIfAvailable(client, titular.id_cliente);
+  const puntosParaPremio = Math.max(1, await resolvePuntosParaPremio(client, titular.id_sucursal_origen || null));
 
   const citasResult = await client.query(
     `
@@ -404,6 +405,7 @@ export async function grantEngagementPointsForConfirmedGroup(client, { idGrupoCi
   let grantedTitular = 0;
   let grantedCompanions = 0;
   for (const cita of citasResult.rows || []) {
+    if (await getSaldoActual(client, titular.id_cliente) >= puntosParaPremio) break;
     const isTitular = Number(cita.orden_integrante || 1) <= 1;
     if (isTitular && cita.es_canje_recompensa === true) continue;
 
@@ -508,6 +510,18 @@ async function resolvePuntosParaPremio(client, idSucursal) {
   return Number(rows[0]?.puntos_para_premio || DEFAULT_PUNTOS_PARA_PREMIO);
 }
 
+async function resolveEffectivePointsRule(client, idSucursal) {
+  const { rows } = await client.query(
+    `
+      SELECT r.id_rule, r.puntos_para_premio
+      FROM public.fn_points_get_effective_rule($1::uuid) r
+      LIMIT 1
+    `,
+    [idSucursal || null]
+  );
+  return rows[0] || null;
+}
+
 async function listMovimientosCompactos(client, idCliente, { limit = HISTORIAL_DEFAULT_LIMIT } = {}) {
   const safeLimit = resolveHistoryLimit(limit);
   const { rows } = await client.query(
@@ -600,68 +614,75 @@ async function hasActivePlan(client, idCliente) {
   return Boolean(rows[0]?.has_active_plan);
 }
 
+async function listConfiguredRewardServices(client, {
+  idSucursalRegla,
+  hasPlanActivo,
+} = {}) {
+  const rule = await resolveEffectivePointsRule(client, idSucursalRegla || null);
+  if (!rule?.id_rule) return [];
+  const condition = hasPlanActivo ? REWARD_CONDITION_WITH_MEMBERSHIP : REWARD_CONDITION_NO_MEMBERSHIP;
+  const { rows } = await client.query(
+    `
+      SELECT
+        prs.id_servicio,
+        s.nombre_servicio,
+        prs.orden_visual,
+        COALESCE(
+          array_agg(DISTINCT su.id_sucursal ORDER BY su.id_sucursal)
+            FILTER (WHERE su.id_sucursal IS NOT NULL AND st.id_tarifa IS NOT NULL),
+          ARRAY[]::uuid[]
+        ) AS sucursales_disponibles
+      FROM public.points_rule_services prs
+      JOIN public.servicios s
+        ON s.id_servicio = prs.id_servicio
+       AND s.deleted_at IS NULL
+       AND s.activo IS TRUE
+       AND s.visible_publico IS TRUE
+       AND s.agendable IS TRUE
+      LEFT JOIN public.sucursales su
+        ON su.deleted_at IS NULL
+       AND su.estado IS TRUE
+      LEFT JOIN public.servicios_tarifas st
+        ON st.id_servicio = s.id_servicio
+       AND st.deleted_at IS NULL
+       AND st.activo IS TRUE
+       AND (st.id_sucursal = su.id_sucursal OR st.id_sucursal IS NULL)
+       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
+       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
+      WHERE prs.id_rule = $1::uuid
+        AND prs.cliente_condicion_codigo = $2::text
+        AND prs.habilitado IS TRUE
+        AND prs.visible_cliente IS TRUE
+      GROUP BY prs.id_servicio, s.nombre_servicio, prs.orden_visual
+      HAVING COUNT(st.id_tarifa) > 0
+      ORDER BY prs.orden_visual ASC NULLS LAST, s.nombre_servicio ASC, prs.id_servicio ASC
+    `,
+    [rule.id_rule, condition]
+  );
+  return rows.map((row) => ({
+    id_servicio: row.id_servicio,
+    nombre_servicio: row.nombre_servicio,
+    sucursales_disponibles: Array.isArray(row.sucursales_disponibles)
+      ? row.sucursales_disponibles.map((id) => String(id))
+      : [],
+  }));
+}
+
 async function resolveServicioCanjeValido(client, {
   idServicioCanje,
   idSucursal,
   hasPlanActivo,
+  idSucursalRegla,
 }) {
-  const allowedNames = hasPlanActivo
-    ? REWARD_SERVICE_NAMES_WITH_PLAN
-    : REWARD_SERVICE_NAMES_NO_PLAN;
-  const normalizedAllowed = new Set(allowedNames.map((entry) => normalizeServiceName(entry)));
-
-  const { rows } = await client.query(
-    `
-      SELECT
-        s.id_servicio,
-        s.nombre_servicio
-      FROM public.servicios s
-      WHERE s.id_servicio = $1::uuid
-        AND s.deleted_at IS NULL
-        AND s.activo IS TRUE
-      LIMIT 1
-    `,
-    [idServicioCanje]
-  );
-
-  const service = rows[0] ?? null;
+  const configured = await listConfiguredRewardServices(client, { idSucursalRegla, hasPlanActivo });
+  const service = configured.find((entry) => String(entry.id_servicio) === String(idServicioCanje)) || null;
   if (!service) {
-    throw new AppError(404, "Servicio no encontrado o inactivo", {
-      code: "POINTS_REDEEM_SERVICE_NOT_FOUND",
+    throw new AppError(409, "El servicio no esta habilitado para este tipo de cliente", {
+      code: "POINTS_REDEEM_SERVICE_FORBIDDEN",
       details: { id_servicio: idServicioCanje },
     });
   }
-
-  const normalizedName = normalizeServiceName(service.nombre_servicio);
-  if (!normalizedAllowed.has(normalizedName)) {
-    throw new AppError(409, "El servicio no esta permitido para este tipo de cliente", {
-      code: "POINTS_REDEEM_SERVICE_FORBIDDEN",
-      details: {
-        id_servicio: idServicioCanje,
-        servicio_nombre: service.nombre_servicio,
-        permitidos: allowedNames,
-        requiere_plan_activo: hasPlanActivo,
-      },
-    });
-  }
-
-  const tariffResult = await client.query(
-    `
-      SELECT st.id_tarifa
-      FROM public.servicios_tarifas st
-      WHERE st.id_servicio = $1::uuid
-        AND st.id_sucursal = $2::uuid
-        AND st.deleted_at IS NULL
-        AND st.activo IS TRUE
-        AND st.vigente_desde <= CURRENT_DATE
-        AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= CURRENT_DATE)
-      ORDER BY st.updated_at DESC, st.id_tarifa DESC
-      LIMIT 1
-    `,
-    [idServicioCanje, idSucursal]
-  );
-
-  if (!tariffResult.rows[0]) {
+  if (!service.sucursales_disponibles.includes(String(idSucursal))) {
     throw new AppError(409, "El servicio no esta disponible para canje en la sucursal indicada", {
       code: "POINTS_REDEEM_SERVICE_BRANCH_UNAVAILABLE",
       details: { id_servicio: idServicioCanje, id_sucursal: idSucursal },
@@ -671,7 +692,6 @@ async function resolveServicioCanjeValido(client, {
   return {
     id_servicio: service.id_servicio,
     nombre_servicio: service.nombre_servicio,
-    permitidos: allowedNames,
   };
 }
 
@@ -747,7 +767,12 @@ async function assertClienteInAdminPointsScope(client, idCliente, scope) {
   }
 }
 
-export async function searchActiveClientesForAdminPoints(app, { q, limit, claims } = {}) {
+export async function searchActiveClientesForAdminPoints(app, {
+  q,
+  limit,
+  claims,
+  allowGlobalAssignment = false,
+} = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
   }
@@ -768,7 +793,6 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
   const containsPattern = `%${queryLower}%`;
   const startsWithPattern = `${queryLower}%`;
   const scope = await resolveAdminPointsScope(app, claims);
-
   const { rows } = await app.db.query(
     `
       SELECT
@@ -776,7 +800,8 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
         TRIM(CONCAT(COALESCE(p.nombres, ''), ' ', COALESCE(p.apellidos, ''))) AS nombre_cliente,
         COALESCE(NULLIF(cp.email, ''), NULLIF(au.email::text, '')) AS correo,
         NULLIF(p.telefono_principal, '') AS telefono,
-        c.id_usuario
+        c.id_usuario,
+        c.id_sucursal_origen
       FROM public.clientes c
       JOIN public.personas p
         ON p.id_persona = c.id_persona
@@ -816,7 +841,13 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
         c.id_cliente ASC
       LIMIT $5::int
     `,
-    [containsPattern, startsWithPattern, scope?.branchIds || [], scope?.isSuperAdmin ?? true, safeLimit]
+    [
+      containsPattern,
+      startsWithPattern,
+      scope?.branchIds || [],
+      Boolean(allowGlobalAssignment || scope?.isSuperAdmin || !scope),
+      safeLimit,
+    ]
   );
 
   return {
@@ -826,6 +857,7 @@ export async function searchActiveClientesForAdminPoints(app, { q, limit, claims
       correo: row.correo || null,
       telefono: row.telefono || null,
       id_usuario: row.id_usuario || null,
+      id_sucursal_origen: row.id_sucursal_origen || null,
     })),
   };
 }
@@ -960,6 +992,7 @@ export async function resolveRedeemContextForHold(dbClient, {
     idServicioCanje: parsedContext.id_servicio_canje,
     idSucursal: safeSucursalId,
     hasPlanActivo: planActivo,
+    idSucursalRegla: cliente.id_sucursal_origen || safeSucursalId,
   });
 
   return {
@@ -1126,6 +1159,7 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
       idServicioCanje: serviceHintId,
       idSucursal,
       hasPlanActivo: planActivo,
+      idSucursalRegla: cliente.id_sucursal_origen || idSucursal,
     });
     selectedService = {
       id_servicio: validated.id_servicio,
@@ -1140,6 +1174,7 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
           idServicioCanje: detail.id_servicio,
           idSucursal,
           hasPlanActivo: planActivo,
+          idSucursalRegla: cliente.id_sucursal_origen || idSucursal,
         });
         candidates.push({
           id_servicio: validated.id_servicio,
@@ -1306,6 +1341,8 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
 export async function getClientePointsSummary(app, idCliente, {
   historyLimit = HISTORIAL_DEFAULT_LIMIT,
   claims,
+  allowGlobalAssignment = false,
+  includeRedeemableServices = false,
 } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
@@ -1315,18 +1352,30 @@ export async function getClientePointsSummary(app, idCliente, {
   const scope = await resolveAdminPointsScope(app, claims);
   const client = await app.db.connect();
   try {
-    await assertClienteInAdminPointsScope(client, safeClienteId, scope);
+    if (!allowGlobalAssignment) {
+      await assertClienteInAdminPointsScope(client, safeClienteId, scope);
+    }
     const cliente = await ensureClienteActivo(client, safeClienteId, { requireRegisteredUser: false });
     const agregados = await getAgregadosPuntos(client, safeClienteId);
     const puntosParaPremio = await resolvePuntosParaPremio(client, cliente.id_sucursal_origen || null);
     const safeRequired = Math.max(1, Number(puntosParaPremio || DEFAULT_PUNTOS_PARA_PREMIO));
     const saldo = Number(agregados.saldo_total || 0);
     const recompensasDisponibles = Math.floor(Math.max(0, saldo) / safeRequired);
-    const progresoActual = ((saldo % safeRequired) + safeRequired) % safeRequired;
+    const progresoActual = saldo >= safeRequired
+      ? safeRequired
+      : ((saldo % safeRequired) + safeRequired) % safeRequired;
     const historial = await listMovimientosCompactos(client, safeClienteId, { limit: historyLimit });
+    const planActivo = includeRedeemableServices ? await hasActivePlan(client, safeClienteId) : false;
+    const serviciosRedimibles = includeRedeemableServices
+      ? await listConfiguredRewardServices(client, {
+          idSucursalRegla: cliente.id_sucursal_origen || null,
+          hasPlanActivo: planActivo,
+        })
+      : undefined;
 
     return {
       id_cliente: cliente.id_cliente,
+      id_sucursal_origen: cliente.id_sucursal_origen || null,
       nombre_cliente: `${normalizeText(cliente.nombres)} ${normalizeText(cliente.apellidos)}`.trim() || "Cliente",
       saldo_total: saldo,
       puntos_titular: Number(agregados.puntos_titular || 0),
@@ -1335,6 +1384,10 @@ export async function getClientePointsSummary(app, idCliente, {
       recompensas_disponibles: recompensasDisponibles,
       progreso_actual: progresoActual,
       puede_canjear: saldo >= safeRequired,
+      ...(includeRedeemableServices ? {
+        estado_plan: planActivo ? "activa" : "sin_membresia",
+        servicios_redimibles: serviciosRedimibles,
+      } : {}),
       historial,
     };
   } finally {
@@ -1354,7 +1407,9 @@ export async function resolveRewardRedeemGateForCliente(dbClient, {
   const safeRequired = Math.max(1, Number(puntosParaPremio || DEFAULT_PUNTOS_PARA_PREMIO));
   const saldo = Number(agregados.saldo_total || 0);
   const recompensasDisponibles = Math.floor(Math.max(0, saldo) / safeRequired);
-  const progresoActual = ((saldo % safeRequired) + safeRequired) % safeRequired;
+  const progresoActual = saldo >= safeRequired
+    ? safeRequired
+    : ((saldo % safeRequired) + safeRequired) % safeRequired;
   return {
     saldo_total: saldo,
     recompensas_disponibles: recompensasDisponibles,
@@ -1395,6 +1450,7 @@ export async function prepareRewardRedeemContextForHold(dbClient, {
     idServicioCanje: safeServicioId,
     idSucursal: safeSucursalId,
     hasPlanActivo: planActivo,
+    idSucursalRegla: cliente.id_sucursal_origen || safeSucursalId,
   });
   const nowSeconds = Math.floor(Date.now() / 1000);
   const expiresAt = nowSeconds + REDEEM_CONTEXT_TTL_SECONDS;
@@ -1427,6 +1483,7 @@ export async function addManualPointsAdjustment(app, {
   usuarioAdmin,
   claims,
   idempotencyKey,
+  allowGlobalAssignment = false,
 } = {}) {
   if (!app?.db) {
     throw new AppError(500, "Base de datos no configurada", { code: "DB_NOT_CONFIGURED" });
@@ -1451,7 +1508,9 @@ export async function addManualPointsAdjustment(app, {
   try {
     await dbClient.query("BEGIN");
     await lockClientePointsScope(dbClient, safeClienteId);
-    await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
+    if (safeAccion === "restar" || !allowGlobalAssignment) {
+      await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
+    }
     const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: true });
     await ensureClienteHasActiveAccessUser(dbClient, cliente.id_usuario, safeClienteId);
     const replay = await claimManualAdjustmentIdempotency(dbClient, {
@@ -1468,6 +1527,7 @@ export async function addManualPointsAdjustment(app, {
     await materializeCyclesIfAvailable(dbClient, safeClienteId);
 
     const saldoActual = await getSaldoActual(dbClient, safeClienteId);
+    const puntosParaPremio = Math.max(1, await resolvePuntosParaPremio(dbClient, cliente.id_sucursal_origen || null));
     if (safeAccion === "restar" && saldoActual < safePuntos) {
       throw new AppError(422, "No hay puntos suficientes para restar", {
         code: "POINTS_INSUFFICIENT_BALANCE",
@@ -1479,6 +1539,16 @@ export async function addManualPointsAdjustment(app, {
     }
     const signedPoints = safeAccion === "restar" ? -safePuntos : safePuntos;
     const saldoSiguiente = saldoActual + signedPoints;
+    if (safeAccion === "sumar" && (saldoActual >= puntosParaPremio || saldoSiguiente > puntosParaPremio)) {
+      throw new AppError(409, "El cliente debe canjear su recompensa antes de acumular mas puntos", {
+        code: "POINTS_REWARD_PENDING",
+        details: {
+          saldo_actual: saldoActual,
+          saldo_siguiente: saldoSiguiente,
+          puntos_para_premio: puntosParaPremio,
+        },
+      });
+    }
     const tipoPuntosCodigo = safeAccion === "restar" ? adjustmentTypes.restar : adjustmentTypes.sumar;
 
     const insertResult = await dbClient.query(
@@ -1603,6 +1673,7 @@ export async function redeemReward(app, {
       idServicioCanje: safeServicioId,
       idSucursal: safeSucursalId,
       hasPlanActivo: planActivo,
+      idSucursalRegla: cliente.id_sucursal_origen || safeSucursalId,
     });
 
     const nowSeconds = Math.floor(Date.now() / 1000);

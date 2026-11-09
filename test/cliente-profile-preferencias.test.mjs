@@ -155,7 +155,7 @@ test("telefono valido con preferencias vacias persiste JSON vacio no nulo", asyn
   assert.deepEqual(clientesUpdates(client)[0].params, [CLIENTE_ID, JSON.stringify("")]);
 });
 
-test("perfil completo admite preferencias vacias", async () => {
+test("guardar sin preferencias sigue permitido y conserva el perfil incompleto", async () => {
   const { response, client } = await patchProfile({
     telefono_principal: "+504 9999-0001",
     fecha_nacimiento: "1992-06-15",
@@ -167,6 +167,10 @@ test("perfil completo admite preferencias vacias", async () => {
   assert.equal(response.statusCode, 200);
   assert.equal(client.state.preferencias_corte, "");
   assert.equal(response.json().data.cliente.preferencias_corte, null);
+  assert.equal(response.json().data.profile_completion.is_complete, false);
+  assert.equal(response.json().data.profile_completion.completion_percent, 67);
+  assert.deepEqual(response.json().data.profile_completion.missing_fields, ["preferencias_corte"]);
+  assert.deepEqual(response.json().data.profile_completion.recommended_fields, []);
 });
 
 test("preferencias no vacias conservan el texto", async () => {
@@ -175,6 +179,30 @@ test("preferencias no vacias conservan el texto", async () => {
   assert.equal(response.statusCode, 200);
   assert.equal(client.state.preferencias_corte, "degradado bajo");
   assert.equal(response.json().data.cliente.preferencias_corte, "degradado bajo");
+  assert.equal(response.json().data.profile_completion.is_complete, true);
+  assert.equal(response.json().data.profile_completion.completion_percent, 100);
+});
+
+test("genero y direccion vacios no reducen un perfil completo", async () => {
+  const client = createDbClient({
+    profile: createProfile({ genero_codigo: null, genero_descripcion: null, direccion_texto: null }),
+  });
+  const { response } = await patchProfile({ telefono_principal: "+504 9999-0004" }, { client });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().data.profile_completion.is_complete, true);
+  assert.equal(response.json().data.profile_completion.completion_percent, 100);
+  assert.deepEqual(response.json().data.profile_completion.missing_fields, []);
+});
+
+test("preferencias con solo espacios no cuentan como completadas", async () => {
+  const { response } = await patchProfile({ preferencias_corte: "   " });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().data.cliente.preferencias_corte, null);
+  assert.equal(response.json().data.profile_completion.is_complete, false);
+  assert.equal(response.json().data.profile_completion.completion_percent, 67);
+  assert.deepEqual(response.json().data.profile_completion.missing_fields, ["preferencias_corte"]);
 });
 
 test("null borra explicitamente preferencias existentes", async () => {

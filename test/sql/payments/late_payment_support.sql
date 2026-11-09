@@ -7,6 +7,10 @@ CREATE ROLE service_role NOLOGIN;
 ALTER TABLE public.payments ADD COLUMN pago_tardio boolean NOT NULL DEFAULT false;
 ALTER TABLE public.payment_intents ADD COLUMN provider_session_id text;
 ALTER TABLE public.clientes ADD COLUMN id_usuario uuid;
+ALTER TABLE public.clientes
+  ADD COLUMN id_sucursal_origen uuid,
+  ADD CONSTRAINT fk_cliente_sucursal_origen
+    FOREIGN KEY (id_sucursal_origen) REFERENCES public.sucursales(id_sucursal);
 ALTER TABLE public.citas_detalles
   ADD COLUMN descuento_hnl numeric(12,2) NOT NULL DEFAULT 0,
   ADD COLUMN incluye_isv_snapshot boolean NOT NULL DEFAULT false,
@@ -23,6 +27,20 @@ ALTER TABLE public.notificaciones_email
   ADD COLUMN cuerpo text;
 
 CREATE TABLE public.payment_providers (id_provider uuid PRIMARY KEY, codigo text NOT NULL);
+CREATE TABLE public.payment_events (
+  id_event uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  id_provider uuid NOT NULL REFERENCES public.payment_providers(id_provider),
+  provider_event_id text NOT NULL,
+  evento_tipo text NOT NULL,
+  firma_valida boolean NOT NULL DEFAULT false,
+  id_intent uuid REFERENCES public.payment_intents(id_intent),
+  id_payment uuid REFERENCES public.payments(id_payment),
+  payload_esencial jsonb NOT NULL DEFAULT '{}'::jsonb,
+  recibido_at timestamptz NOT NULL DEFAULT now(),
+  procesado_at timestamptz,
+  resultado_procesamiento text,
+  UNIQUE (id_provider, provider_event_id)
+);
 CREATE TABLE public.correos (
   id_persona uuid, direccion_correo text, es_principal boolean DEFAULT true, deleted_at timestamptz
 );

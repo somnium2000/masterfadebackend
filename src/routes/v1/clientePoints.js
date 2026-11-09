@@ -71,7 +71,10 @@ export default async function clientePointsRoutes(app) {
     async (request, reply) => {
       try {
         const { clienteId } = ensureClienteContext(request);
-        const data = await getClientePointsSummary(app, clienteId, { historyLimit: 20 });
+        const data = await getClientePointsSummary(app, clienteId, {
+          historyLimit: 20,
+          includeRedeemableServices: true,
+        });
         return sendOk(reply, data, { requestId: request.id });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo cargar el resumen de puntos", "CLIENT_POINTS_SUMMARY_ERROR");

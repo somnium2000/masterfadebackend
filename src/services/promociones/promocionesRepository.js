@@ -40,13 +40,15 @@ export async function getCandidatePromotionRules(db, context = {}) {
         pra.modo_aplicacion_codigo,
         pra.min_subtotal_hnl,
         pra.max_descuento_hnl,
+        COALESCE(pra.cantidad_requerida, p.cantidad_requerida) AS cantidad_requerida,
+        COALESCE(pra.cantidad_bonificada, p.cantidad_bonificada) AS cantidad_bonificada,
+        pra.bonificacion_modo_codigo,
+        pra.scope_evaluacion_codigo,
         pra.activo AS regla_activa,
         p.id_promocion,
         p.titulo AS nombre_promocion_snapshot,
         p.estado AS estado_promocion,
         p.mecanica,
-        p.cantidad_requerida,
-        p.cantidad_bonificada,
         ps.id_promocion_sucursal,
         ps.id_sucursal,
         ps.visible_publico,
@@ -201,7 +203,7 @@ export async function getPromotionCompatibility(db, ruleIds = []) {
 export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
   if (!Array.isArray(ruleIds) || !ruleIds.length) return { byRule: new Map(), byRuleClient: new Map(), byRulePeriod: new Map() };
 
-  const dateRef = String(context.fecha_operativa || context.fecha || "").slice(0, 10) || new Date().toISOString().slice(0, 10);
+  const dateRef = toIsoDate(context.fecha_operativa || context.fecha) || toIsoDate(new Date());
   const idCliente = context.id_cliente ? String(context.id_cliente).trim() : null;
   const idPersona = context.id_persona ? String(context.id_persona).trim() : null;
   const idPromocionSucursal = context.id_promocion_sucursal ? String(context.id_promocion_sucursal).trim() : null;
@@ -232,7 +234,10 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
   const byRulePeriod = new Map();
 
   const computeWeekKey = (dateIso) => {
-    const date = new Date(`${dateIso}T00:00:00Z`);
+    const normalized = toIsoDate(dateIso);
+    if (!normalized) return null;
+    const date = new Date(`${normalized}T00:00:00Z`);
+    if (Number.isNaN(date.getTime())) return null;
     const day = (date.getUTCDay() + 6) % 7;
     date.setUTCDate(date.getUTCDate() - day);
     return date.toISOString().slice(0, 10);
@@ -253,13 +258,13 @@ export async function getPromotionUsageStats(db, context = {}, ruleIds = []) {
       byRuleClient.set(key, (byRuleClient.get(key) || 0) + 1);
     }
 
-    const dateOp = String(row.fecha_operativa || "").slice(0, 10);
-    const monthKey = dateOp.slice(0, 7);
+    const dateOp = toIsoDate(row.fecha_operativa);
+    const monthKey = dateOp ? dateOp.slice(0, 7) : null;
     const weekKey = computeWeekKey(dateOp);
     const suffixes = [`total`];
-    if (dateOp === dateRef) suffixes.push(`dia:${dateRef}`);
-    if (monthKey === dateRef.slice(0, 7)) suffixes.push(`mes:${monthKey}`);
-    if (weekKey === computeWeekKey(dateRef)) suffixes.push(`semana:${weekKey}`);
+    if (dateOp && dateOp === dateRef) suffixes.push(`dia:${dateRef}`);
+    if (monthKey && monthKey === dateRef.slice(0, 7)) suffixes.push(`mes:${monthKey}`);
+    if (weekKey && weekKey === computeWeekKey(dateRef)) suffixes.push(`semana:${weekKey}`);
 
     for (const suffix of suffixes) {
       const baseKey = `${ruleId}:${suffix}`;
@@ -311,6 +316,19 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
     params
   );
   if (existing.rows[0]?.id_cita_promocion) {
+    await db.query(
+      `
+        UPDATE public.citas_promociones
+        SET id_hold = COALESCE(id_hold, $2::uuid),
+            calculado_en_codigo = COALESCE(calculado_en_codigo, $3::text)
+        WHERE id_cita_promocion = $1::uuid
+      `,
+      [
+        existing.rows[0].id_cita_promocion,
+        data.id_hold || null,
+        data.calculado_en_codigo || null,
+      ]
+    );
     return existing.rows[0].id_cita_promocion;
   }
 
@@ -337,7 +355,9 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
         prioridad_aplicacion,
         es_acumulable,
         estado_aplicacion_codigo,
-        motivo_no_aplicada
+        motivo_no_aplicada,
+        id_hold,
+        calculado_en_codigo
       )
       VALUES (
         $1::uuid,
@@ -360,7 +380,9 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
         $18::int,
         $19::boolean,
         $20::text,
-        $21::text
+        $21::text,
+        $22::uuid,
+        $23::text
       )
       RETURNING id_cita_promocion
     `,
@@ -386,6 +408,8 @@ export async function insertAppointmentPromotionApplication(db, data = {}) {
       Boolean(data.es_acumulable),
       data.estado_aplicacion_codigo || "no_aplicada",
       data.motivo_no_aplicada || null,
+      data.id_hold || null,
+      data.calculado_en_codigo || null,
     ]
   );
   return result.rows[0]?.id_cita_promocion || null;
@@ -414,6 +438,16 @@ export async function insertPromotionUsage(db, data = {}) {
     `,
     [data.id_cita_promocion]
   );
+  const requestIdempotencyKey = String(data.idempotency_key || "").trim();
+  const logicalUsageParts = [
+    data.id_grupo_cita,
+    data.id_promocion_regla,
+    data.id_promocion_codigo || "sin_codigo",
+  ];
+  const idempotencyKey = requestIdempotencyKey
+    ? [requestIdempotencyKey, "promotion-use", ...logicalUsageParts].join(":")
+    : ["promotion-use", ...logicalUsageParts].join(":");
+
   const existing = await db.query(
     `
       SELECT id_promocion_uso
@@ -433,6 +467,22 @@ export async function insertPromotionUsage(db, data = {}) {
     ]
   );
   if (existing.rows[0]?.id_promocion_uso) {
+    await db.query(
+      `
+        UPDATE public.promociones_usos
+        SET id_hold = COALESCE(id_hold, $2::uuid),
+            reservado_expires_at = COALESCE(reservado_expires_at, $3::timestamptz),
+            idempotency_key = COALESCE(idempotency_key, $4::text),
+            updated_at = now()
+        WHERE id_promocion_uso = $1::uuid
+      `,
+      [
+        existing.rows[0].id_promocion_uso,
+        data.id_hold || null,
+        data.reservado_expires_at || null,
+        idempotencyKey,
+      ]
+    );
     return existing.rows[0].id_promocion_uso;
   }
 
@@ -450,7 +500,11 @@ export async function insertPromotionUsage(db, data = {}) {
         id_empleado_barbero,
         fecha_operativa,
         estado_uso_codigo,
-        usado_at
+        usado_at,
+        id_hold,
+        reservado_expires_at,
+        liberado_at,
+        idempotency_key
       )
       VALUES (
         $1::uuid,
@@ -464,7 +518,11 @@ export async function insertPromotionUsage(db, data = {}) {
         $9::uuid,
         $10::date,
         $11::text,
-        NOW()
+        NOW(),
+        $12::uuid,
+        $13::timestamptz,
+        $14::timestamptz,
+        $15::text
       )
       RETURNING id_promocion_uso
     `,
@@ -480,6 +538,10 @@ export async function insertPromotionUsage(db, data = {}) {
       data.id_empleado_barbero || null,
       String(data.fecha_operativa || new Date().toISOString().slice(0, 10)).slice(0, 10),
       data.estado_uso_codigo || "consumido",
+      data.id_hold || null,
+      data.reservado_expires_at || null,
+      data.liberado_at || null,
+      idempotencyKey,
     ]
   );
   return result.rows[0]?.id_promocion_uso || null;
