@@ -199,7 +199,10 @@ const PUBLIC_SERVICES_SQL = `
       )
       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
-      AND st.precio_hnl > 0
+      AND (
+        st.precio_hnl > 0
+        OR (st.precio_hnl = 0 AND COALESCE(st.servicio_informativo, FALSE) IS TRUE)
+      )
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -255,7 +258,10 @@ const PUBLIC_SERVICES_SQL = `
     AND s.activo IS TRUE
     AND s.visible_publico IS TRUE
     AND COALESCE(ss.duracion_min, s.duracion_min) > 0
-    AND ss.precio_hnl > 0
+    AND (
+      ss.precio_hnl > 0
+      OR (ss.precio_hnl = 0 AND ss.servicio_informativo IS TRUE)
+    )
   ORDER BY s.orden_visual ASC, s.nombre_servicio ASC
 `;
 
@@ -394,7 +400,10 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
       )
       AND st.vigente_desde <= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date
       AND (st.vigente_hasta IS NULL OR st.vigente_hasta >= (NOW() AT TIME ZONE 'America/Tegucigalpa')::date)
-      AND st.precio_hnl > 0
+      AND (
+        st.precio_hnl > 0
+        OR (st.precio_hnl = 0 AND COALESCE(st.servicio_informativo, FALSE) IS TRUE)
+      )
       AND su.deleted_at IS NULL
       AND su.estado IS TRUE
       AND ($1::uuid IS NULL OR st.id_sucursal = $1::uuid)
@@ -445,7 +454,10 @@ const PUBLIC_SERVICES_SEARCH_SQL = `
     AND s.activo IS TRUE
     AND s.visible_publico IS TRUE
     AND COALESCE(ss.duracion_min, s.duracion_min) > 0
-    AND ss.precio_hnl > 0
+    AND (
+      ss.precio_hnl > 0
+      OR (ss.precio_hnl = 0 AND ss.servicio_informativo IS TRUE)
+    )
     AND (
       LOWER(s.nombre_servicio) LIKE $3::text
       OR LOWER(COALESCE(s.descripcion, '')) LIKE $3::text
