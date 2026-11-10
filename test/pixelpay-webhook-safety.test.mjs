@@ -4,6 +4,7 @@ import Fastify from "fastify";
 
 import {
   assertPaymentWebhookContract,
+  buildPixelPayCallbackRejectionTelemetry,
   default as pagosRoutes,
   processPixelPayOrderCallback,
 } from "../src/routes/v1/pagos.js";
@@ -311,6 +312,33 @@ test("callback real rechaza orden, UUID, monto, moneda y transaccion inconsisten
     assert.equal(result.processed, false);
     assert.equal(fixture.event.result, "status_incierto_pendiente");
   });
+});
+
+test("telemetria de rechazo contiene solo codigo y comparaciones booleanas", async () => {
+  const fixture = callbackFixture();
+  let rejection;
+  try {
+    await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: { ...validCallback, uuid: "P-OTHER" },
+      requestId: "req-safe-telemetry",
+    });
+  } catch (error) {
+    rejection = buildPixelPayCallbackRejectionTelemetry(error);
+  }
+  assert.deepEqual(rejection, {
+    code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+    order_unique: true,
+    payment_uuid_matches: false,
+    amount_matches: true,
+    currency_matches: true,
+  });
+  const serialized = JSON.stringify(rejection);
+  assert.equal(serialized.includes("P-OTHER"), false);
+  assert.equal(serialized.includes("valid-hash"), false);
+  assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payment_events/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments/i.test(text)), false);
 });
 
 test("callback ya verificado responde idempotente sin repetir Status", async () => {

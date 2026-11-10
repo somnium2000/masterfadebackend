@@ -8,6 +8,12 @@ import { buildPixelPayCallbackProbeTelemetry } from "../../services/payments/pix
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const PIXELPAY_CALLBACK_MISMATCH_CODES = new Set([
+  "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+  "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
+  "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
+  "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS",
+]);
 
 const requestIdSchema = { type: "string" };
 
@@ -65,6 +71,26 @@ function ensureClientContext(request) {
 function safeText(value) {
   const raw = String(value ?? "").trim();
   return raw.length ? raw : null;
+}
+
+export function buildPixelPayCallbackRejectionTelemetry(error) {
+  const code = safeText(error?.code)?.toUpperCase();
+  if (!PIXELPAY_CALLBACK_MISMATCH_CODES.has(code)) return null;
+  const comparisons = error?.safeCallbackComparisons || {};
+  const safeBoolean = value => typeof value === "boolean" ? value : null;
+  return {
+    code,
+    order_unique: safeBoolean(comparisons.orderUnique),
+    payment_uuid_matches: safeBoolean(comparisons.paymentUuidMatches),
+    amount_matches: safeBoolean(comparisons.amountMatches),
+    currency_matches: safeBoolean(comparisons.currencyMatches),
+  };
+}
+
+function callbackMismatchError(statusCode, message, code, comparisons) {
+  const error = new AppError(statusCode, message, { code });
+  error.safeCallbackComparisons = comparisons;
+  return error;
 }
 
 function buildCallbackUrl(citaId) {
@@ -290,28 +316,50 @@ export async function processPixelPayOrderCallback({
       [orderId]
     );
     if (lookup.rows.length !== 1) {
-      throw new AppError(lookup.rows.length ? 409 : 404, "Orden PixelPay no identificada de forma unica", {
-        code: lookup.rows.length
-          ? "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS"
-          : "PIXELPAY_CALLBACK_ORDER_NOT_FOUND",
+      const ambiguous = lookup.rows.length > 1;
+      if (ambiguous) {
+        throw callbackMismatchError(
+          409,
+          "Orden PixelPay no identificada de forma unica",
+          "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS",
+          { orderUnique: false }
+        );
+      }
+      throw new AppError(404, "Orden PixelPay no identificada de forma unica", {
+        code: "PIXELPAY_CALLBACK_ORDER_NOT_FOUND",
       });
     }
     intent = lookup.rows[0];
     const storedPaymentUuid = safeText(intent.provider_session_id);
-    if (storedPaymentUuid && storedPaymentUuid !== paymentUuid) {
-      throw new AppError(409, "El UUID PixelPay no coincide con la orden", {
-        code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
-      });
+    const comparisons = {
+      orderUnique: true,
+      paymentUuidMatches: !storedPaymentUuid || storedPaymentUuid === paymentUuid,
+      amountMatches: Number(intent.monto_hnl).toFixed(2) === callbackAmount.toFixed(2),
+      currencyMatches: safeText(intent.moneda_codigo).toUpperCase() === callbackCurrency,
+    };
+    if (!comparisons.paymentUuidMatches) {
+      throw callbackMismatchError(
+        409,
+        "El UUID PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+        comparisons
+      );
     }
-    if (Number(intent.monto_hnl).toFixed(2) !== callbackAmount.toFixed(2)) {
-      throw new AppError(409, "El monto PixelPay no coincide con la orden", {
-        code: "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
-      });
+    if (!comparisons.amountMatches) {
+      throw callbackMismatchError(
+        409,
+        "El monto PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
+        comparisons
+      );
     }
-    if (safeText(intent.moneda_codigo).toUpperCase() !== callbackCurrency) {
-      throw new AppError(409, "La moneda PixelPay no coincide con la orden", {
-        code: "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
-      });
+    if (!comparisons.currencyMatches) {
+      throw callbackMismatchError(
+        409,
+        "La moneda PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
+        comparisons
+      );
     }
     const inserted = await client.query(
       `INSERT INTO public.payment_events (
@@ -1178,6 +1226,14 @@ export default async function pagosRoutes(app) {
           } catch {
             // no-op
           }
+        }
+
+        const rejectionTelemetry = buildPixelPayCallbackRejectionTelemetry(error);
+        if (rejectionTelemetry) {
+          request.log.warn(
+            { pixelPayCallbackRejection: rejectionTelemetry },
+            "PixelPay order_callback rejected by financial comparison"
+          );
         }
 
         return sendHandled(reply, request, error, "No se pudo procesar el webhook de pago", "PAGOS_WEBHOOK_ERROR");
