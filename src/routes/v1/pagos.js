@@ -178,14 +178,16 @@ export function assertPaymentWebhookContract(app, providerCode) {
   }
   // `x-client-signature` autentica solicitudes salientes y `payment_hash`
   // autentica una respuesta de pago. Ninguno demuestra que un POST entrante
-  // provenga de PixelPay. El callback remoto publicado pertenece a Hosted
-  // Payment; no existe un contrato oficial equivalente para SDK doSale.
+  // provenga de PixelPay. El SDK declara `order_callback`, pero el contrato
+  // publicado de body/reintentos pertenece a Hosted Payment y no documenta
+  // que sea reutilizable para SDK doSale.
   // Este bloqueo debe ocurrir antes de validar el body o abrir PostgreSQL.
-  throw new AppError(503, "Callback remoto PixelPay no compatible con SDK doSale", {
+  throw new AppError(503, "Contrato de autenticidad del callback PixelPay incompleto", {
     code: "PIXELPAY_WEBHOOK_PROVIDER_CONTRACT_BLOCKED",
     details: {
       integration: "sdk_do_sale",
-      hostedCallbackApplicable: false,
+      sdkRemoteCallbackDeclared: true,
+      hostedCallbackContractApplicable: false,
       remoteCallbackAuthenticated: false,
     },
   });

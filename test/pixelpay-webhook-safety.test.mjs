@@ -20,7 +20,8 @@ test("habilitar el flag no omite el contrato oficial bloqueado", () => {
     (error) => error?.statusCode === 503
       && error?.code === "PIXELPAY_WEBHOOK_PROVIDER_CONTRACT_BLOCKED"
       && error?.details?.integration === "sdk_do_sale"
-      && error?.details?.hostedCallbackApplicable === false
+      && error?.details?.sdkRemoteCallbackDeclared === true
+      && error?.details?.hostedCallbackContractApplicable === false
       && error?.details?.remoteCallbackAuthenticated === false
   );
 });
