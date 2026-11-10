@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import Fastify from "fastify";
+import fp from "fastify-plugin";
+import gate from "../src/plugins/adminDataEntry.js";
 
 import clientePointsRoutes from "../src/routes/v1/clientePoints.js";
 import {
@@ -88,6 +90,8 @@ test("resumen administrativo no expone ni consulta servicios de recompensa", asy
 test("GET cliente puntos resumen entrega opciones configuradas sin escrituras", async (t) => {
   const fixture = summaryFixture();
   const app = Fastify({ logger: false });
+  await app.register(fp(async a => { a.decorate('config', { adminDataEntryMode: true, paymentProvider: 'disabled' }); }, { name: 'env-plugin' }));
+  await app.register(gate);
   app.decorate("db", fixture.app.db);
   app.decorate("requireRoles", () => async (request) => {
     request.claims = { roles: ["cliente"], cliente_id: CLIENT, user: { id_usuario: USER } };

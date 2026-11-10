@@ -2,10 +2,34 @@ import fp from "fastify-plugin";
 import { sendError } from "../utils/errors.js";
 import { getAssetById } from "../services/storage/storageAssetsRepo.js";
 import { getStorageScope } from "../services/storage/storageScopes.js";
-import { verifySupabaseAccessToken } from "../services/supabaseSessionGuard.js";
 
 // AM: Exact existing route templates; new/alternative endpoints stay closed by default.
 export const ADMIN_DATA_ENTRY_ROUTES = Object.freeze([
+  "POST /v1/auth/register",
+  "POST /v1/auth/register/confirm",
+  "POST /v1/auth/register/resend",
+  "POST /v1/auth/social/confirm",
+  "GET /v1/cliente/me",
+  "PATCH /v1/cliente/me",
+  "GET /v1/cliente/planes/estado",
+  "POST /v1/cliente/planes/cancelar",
+  "PATCH /v1/cliente/planes/:id_suscripcion/cancelar",
+  "GET /v1/cliente/puntos/resumen",
+  "GET /v1/citas",
+  "GET /v1/citas/pendiente",
+  "GET /v1/citas/:id",
+  "POST /v1/citas/pendiente/:id_grupo_cita/descartar",
+  "POST /v1/cliente/me/profile-image/prepare",
+  "POST /v1/cliente/me/profile-image/read-url",
+  "DELETE /v1/cliente/me/profile-image",
+  "GET /v1/cliente/me/account-deletion/preview",
+  "POST /v1/cliente/me/account-deletion/requests",
+  "POST /v1/cliente/me/account-deletion/requests/:requestId/confirm",
+  "GET /v1/account-deletion/me/preview",
+  "GET /v1/account-deletion/me/requests/current",
+  "POST /v1/account-deletion/me/requests",
+  "POST /v1/account-deletion/me/requests/:requestId/cancel",
+  "POST /v1/public/account-deletion/requests/:reference/execute",
   "GET /v1/admin/personas",
   "GET /v1/admin/personas/catalogos",
   "GET /v1/admin/personas/roles",
@@ -140,17 +164,10 @@ export default fp(async function adminDataEntryPlugin(app) {
   // AM: Append after existing route auth/role guards, never replace authorization.
   app.addHook('onRoute', options => {
     const route = normalize(options.url);
-    if (!route.endsWith('/uploads/prepare') && !route.endsWith('/assets/:id/read-url') && route !== '/v1/auth/exchange') return;
+    if (!route.endsWith('/uploads/prepare') && !route.endsWith('/assets/:id/read-url')) return;
     const previous = options.preHandler ? [].concat(options.preHandler) : [];
     options.preHandler = [...previous, async (request, reply) => {
-      if (route === '/v1/auth/exchange') {
-        try {
-          const token = String(request.body?.supabase_token ?? request.body?.access_token ?? request.body?.token ?? '').trim();
-          const { user } = await verifySupabaseAccessToken(app, token);
-          const result = await app.db.query('SELECT 1 FROM public.usuarios WHERE id_usuario=$1::uuid AND deleted_at IS NULL', [user.id]);
-          if (result.rows.length !== 1) return restricted(reply);
-        } catch { return restricted(reply); }
-      } else if (route.endsWith('/uploads/prepare')) {
+      if (route.endsWith('/uploads/prepare')) {
         if (!photographScopes.has(request.body?.scope_key) || photographScopes.get(request.body.scope_key) !== request.body?.entity_type) return restricted(reply);
       } else {
         try {

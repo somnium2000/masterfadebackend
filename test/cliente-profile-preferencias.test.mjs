@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
+import fp from "fastify-plugin";
+import gate from "../src/plugins/adminDataEntry.js";
 
 import clienteRoutes from "../src/routes/v1/cliente.js";
+import citasRoutes from "../src/routes/v1/citas.js";
 import { sendError } from "../src/utils/errors.js";
 
 const CLIENTE_ID = "11111111-1111-4111-8111-111111111111";
@@ -36,7 +39,7 @@ function createProfile(overrides = {}) {
   };
 }
 
-function createDbClient({ profile = createProfile(), failOnClientesUpdate = null } = {}) {
+function createDbClient({ profile = createProfile(), failOnClientesUpdate = null, images = false, appointments = false, foreignMembership = false } = {}) {
   const calls = [];
   const state = { ...profile };
   let transactionSnapshot = null;
@@ -48,6 +51,19 @@ function createDbClient({ profile = createProfile(), failOnClientesUpdate = null
     async query(sql, params = []) {
       const text = String(sql).trim();
       calls.push({ sql: text, params });
+      if (foreignMembership && text.includes('FROM public.subscriptions s') && text.includes('WHERE s.id_suscripcion = $1::uuid')) return {rows:[{id_suscripcion:params[0],id_cliente:PERSONA_ID,estado_suscripcion_codigo:'activa'}]};
+      if (appointments && text.includes('FROM public.citas c') && text.includes('c.id_cliente = $1::uuid OR c.id_persona_cliente = $2::uuid')) {
+        assert.deepEqual(params.slice(0,2),[state.id_cliente,state.id_persona]);
+        return {rows:params.length>2 && params[2]!==state.id_cliente ? [] : [{id_cita:state.id_cliente,id_sucursal:PERSONA_ID,id_empleado_barbero:PERSONA_ID,estado_cita_codigo:'completada',inicio_at:'2026-01-01T10:00:00Z',fin_at:'2026-01-01T11:00:00Z'}]};
+      }
+      if (images && text.includes('INSERT INTO public.storage_assets')) return { rows: [{ id_asset: PERSONA_ID }] };
+      if (images && text.includes('FROM public.storage_assets')) return { rows: [{ id_asset: params[0], scope_key: 'private_client_profile', visibility: 'private', entity_type: 'cliente', entity_id: params[0] === PERSONA_ID ? CLIENTE_ID : PERSONA_ID, owner_cliente_id: params[0] === PERSONA_ID ? CLIENTE_ID : PERSONA_ID, bucket_name: 'imagenes_privadas', object_path: 'synthetic/profile.png' }] };
+      if (images && text.includes('UPDATE public.storage_assets')) return { rows: [{ id_asset: PERSONA_ID, status: 'eliminado' }] };
+      if (images && text.includes('UPDATE public.personas') && text.includes('foto_perfil_asset_id = NULL')) {
+        assert.equal(params[0], state.id_persona);
+        state.foto_perfil_asset_id = null; state.foto_perfil_path = null; return { rows: [], rowCount: 1 };
+      }
+      if (images && text.includes('FROM public.clientes') && !text.includes('JOIN public.personas')) return { rows: [{ id_cliente: CLIENTE_ID, id_usuario: profile.id_usuario, id_persona: PERSONA_ID }] };
 
       if (text === "BEGIN") {
         transactionSnapshot = { ...state };
@@ -65,6 +81,7 @@ function createDbClient({ profile = createProfile(), failOnClientesUpdate = null
       if (text.includes("FROM information_schema.columns")) {
         return {
           rows: [
+            {table_name:'personas',column_name:'foto_perfil_asset_id'}, {table_name:'personas',column_name:'foto_perfil_path'},
             { table_name: "clientes", column_name: "preferencias", data_type: "jsonb", udt_name: "jsonb" },
             { table_name: "clientes", column_name: "updated_at", data_type: "timestamp", udt_name: "timestamp" },
             { table_name: "personas", column_name: "updated_at", data_type: "timestamp", udt_name: "timestamp" },
@@ -79,6 +96,7 @@ function createDbClient({ profile = createProfile(), failOnClientesUpdate = null
           : { rows: [] };
       }
       if (text.includes("FROM public.clientes c") && text.includes("JOIN public.personas p")) {
+        assert.equal(params[0], state.id_cliente);
         return { rows: [{ ...state }] };
       }
       if (text.includes("FROM public.vw_points_balance")) {
@@ -108,8 +126,10 @@ function createDbClient({ profile = createProfile(), failOnClientesUpdate = null
   };
 }
 
-async function createApp({ client = createDbClient(), authorized = true } = {}) {
+async function createApp({ client = createDbClient(), authorized = true, clientId = CLIENTE_ID } = {}) {
   const app = Fastify({ logger: false });
+  await app.register(fp(async a => { a.decorate("config", { adminDataEntryMode: true, paymentProvider: "disabled" }); }, { name: "env-plugin" }));
+  await app.register(gate);
   app.decorate("requireRoles", () => async (request, reply) => {
     if (!authorized) {
       return sendError(reply, 403, "No tienes permisos para realizar esta accion", {
@@ -117,10 +137,12 @@ async function createApp({ client = createDbClient(), authorized = true } = {}) 
         requestId: request.id,
       });
     }
-    request.claims = { cliente_id: CLIENTE_ID };
+    request.claims = { cliente_id: clientId, roles: ['cliente'], user: { id_usuario: '33333333-3333-4333-8333-333333333333', id_persona: client.state.id_persona } };
   });
-  app.decorate("db", { async connect() { return client; } });
+  app.decorate("db", { query: client.query.bind(client), async connect() { return client; } });
+  app.decorate('supabaseAdmin', { storage: { from: () => ({ createSignedUploadUrl: async () => ({data:{token:'synthetic-upload'}}), createSignedUrl: async () => ({data:{signedUrl:'https://synthetic.invalid/photo'}}), remove: async () => ({error:null}) }) } });
   await app.register(clienteRoutes, { prefix: "/v1/cliente" });
+  await app.register(citasRoutes, { prefix: "/v1/citas" });
   return app;
 }
 
@@ -261,6 +283,69 @@ test("error durante la escritura ejecuta rollback y no filtra detalles SQL", asy
   assert.ok(client.calls.some((call) => call.sql === "ROLLBACK"));
   assert.equal(client.state.telefono_principal, "+504 8888-8888");
   assert.equal(client.state.preferencias_corte, "clasico");
+});
+
+test('fotografia propia prepara, lee y elimina; fotografia ajena es rechazada', async t => {
+  const client = createDbClient({ images: true, profile: createProfile({ foto_perfil_asset_id: PERSONA_ID, foto_perfil_path: 'synthetic/profile.png' }) });
+  const app = await createApp({client}); t.after(() => app.close());
+  let response = await app.inject({method:'POST',url:'/v1/cliente/me/profile-image/prepare',payload:{file_name:'photo.png',content_type:'image/png',size_bytes:128}});
+  assert.equal(response.statusCode,201,response.body);
+  response = await app.inject({method:'POST',url:'/v1/cliente/me/profile-image/read-url',payload:{asset_id:PERSONA_ID}});
+  assert.equal(response.statusCode,200,response.body);
+  const before = client.calls.filter(x=>x.sql.startsWith('UPDATE')).length;
+  response = await app.inject({method:'POST',url:'/v1/cliente/me/profile-image/read-url',payload:{asset_id:'44444444-4444-4444-8444-444444444444'}});
+  assert.equal(response.statusCode,403,response.body);
+  assert.equal(client.calls.filter(x=>x.sql.startsWith('UPDATE')).length,before);
+  response = await app.inject({method:'DELETE',url:'/v1/cliente/me/profile-image'});
+  assert.equal(response.statusCode,200,response.body);
+  assert.equal(client.state.foto_perfil_asset_id,null);
+});
+
+test('dashboard consulta perfil, historial, pendientes y membresias sin activar compras', async t => {
+  const client = createDbClient(); const app = await createApp({client}); t.after(()=>app.close());
+  for (const url of ['/v1/cliente/me','/v1/citas','/v1/citas/pendiente','/v1/cliente/planes/estado']) {
+    const response=await app.inject({url}); assert.equal(response.statusCode,200,url+': '+response.body);
+  }
+  const detail=await app.inject({url:'/v1/citas/44444444-4444-4444-8444-444444444444'});
+  assert.equal(detail.statusCode,404,detail.body);
+  const scoped=client.calls.filter(x=>x.sql.includes('c.id_cliente = $1::uuid OR c.id_persona_cliente = $2::uuid'));
+  assert.ok(scoped.length>=2);
+  for(const call of scoped) assert.deepEqual(call.params.slice(0,2),[CLIENTE_ID,PERSONA_ID]);
+  const cancelled=await app.inject({method:'POST',url:'/v1/cliente/planes/cancelar',payload:{}});
+  assert.equal(cancelled.statusCode,200,cancelled.body);
+  assert.equal(cancelled.json().data.cancelacion.cancelled,false);
+});
+
+test('dos identidades conservan perfil y rechazan identidad o foto ajena en escrituras', async t => {
+  const other='44444444-4444-4444-8444-444444444444';
+  for(const id of [CLIENTE_ID,other]) {
+    const client=createDbClient({images:true,profile:createProfile({id_cliente:id})});
+    const app=await createApp({client,clientId:id}); t.after(()=>app.close());
+    const own=await app.inject({url:'/v1/cliente/me'}); assert.equal(own.statusCode,200,own.body);
+    const patch=await app.inject({method:'PATCH',url:'/v1/cliente/me',payload:{id_cliente:id===other?CLIENTE_ID:other,telefono_principal:'99999999'}});
+    assert.equal(patch.statusCode,200,patch.body);
+    assert.equal(patch.json().data.cliente.id_cliente,id);
+    const before=client.calls.filter(x=>x.sql.startsWith('UPDATE')).length;
+    const remove=await app.inject({method:'DELETE',url:'/v1/cliente/me/profile-image',payload:{asset_id:other}});
+    // DELETE only operates on the authenticated profile, never on an asset supplied by the caller.
+    assert.equal(remove.statusCode,200,remove.body);
+    assert.equal(remove.json().data.removed,false);
+    assert.equal(client.calls.filter(x=>x.sql.startsWith('UPDATE')).length,before);
+  }
+});
+
+test('dos clientes solo consultan citas propias; no cancelan membresia ajena',async t=>{
+  const other='44444444-4444-4444-8444-444444444444';
+  for(const id of [CLIENTE_ID,other]) {
+    const client=createDbClient({appointments:true,foreignMembership:true,profile:createProfile({id_cliente:id})});
+    const app=await createApp({client,clientId:id});t.after(()=>app.close());
+    let response=await app.inject({url:'/v1/citas'});assert.equal(response.statusCode,200,response.body);
+    assert.deepEqual(response.json().data.citas.map(x=>x.id_cita),[id]);
+    response=await app.inject({url:'/v1/citas/'+id});assert.equal(response.statusCode,200,response.body);
+    response=await app.inject({url:'/v1/citas/'+(id===other?CLIENTE_ID:other)});assert.equal(response.statusCode,404,response.body);
+    response=await app.inject({method:'PATCH',url:'/v1/cliente/planes/'+other+'/cancelar',payload:{}});assert.equal(response.statusCode,403,response.body);
+    assert.equal(client.calls.filter(x=>/^\s*(UPDATE|INSERT|DELETE)\b/.test(x.sql)).length,0);
+  }
 });
 
 test("perfil existente sin cambios de preferencias conserva respuesta compatible", async () => {
