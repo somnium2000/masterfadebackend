@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import Fastify from 'fastify';
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 import routes from '../src/routes/v1/admin/seguridad.js';
 const ACTOR = '11111111-1111-4111-8111-111111111111';
 const TARGET = '21111111-1111-4111-8111-111111111111';
@@ -19,7 +19,7 @@ async function fixture(t, role, options = {}) {
     if (options.fail && /UPDATE public.usuarios/.test(sql)) throw new Error('INTERNAL_SYNTHETIC');
     return { rows: [], rowCount: 1 };
   };
-  const app = Fastify(); t.after(() => app.close());
+  const app = await adminModeApp(); t.after(() => app.close());
   app.decorate('db', { query, connect: async () => ({ query, release() {} }) });
   app.decorate('requireRoles', allowed => async (request, reply) => {
     request.claims = { roles: role ? [role] : [], user: { id_usuario: ACTOR } };

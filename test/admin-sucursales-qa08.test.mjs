@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import Fastify from 'fastify';
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 import routes from '../src/routes/v1/admin/sucursales.js';
 
 const ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -39,7 +39,7 @@ async function fixture(t, { initial = true, concurrent, dependencies = 0, missin
     if (text.includes('FROM public.empresas')) return { rows: missingCompany ? [] : [{}], rowCount: missingCompany ? 0 : 1 };
     return { rows: missing ? [] : [row()], rowCount: missing ? 0 : 1 };
   } };
-  const app = Fastify({ logger: false });
+  const app = await adminModeApp();
   app.decorate('db', { query: client.query.bind(client), connect: async () => client });
   app.decorate('requireRoles', allowed => async (request, reply) => {
     request.claims = { roles };
@@ -100,7 +100,7 @@ test('error SQL durante transición explícita hace rollback', async t => {
 test('nombres equivalentes concurrentes se serializan por empresa', async t => {
   const inserted = [];
   let tail = Promise.resolve();
-  const app = Fastify({ logger: false });
+  const app = await adminModeApp();
   app.decorate('requireRoles', () => async () => {});
   app.decorate('db', { async connect() {
     let unlock;
@@ -134,7 +134,7 @@ test('activación e inactivación concurrentes esperan el bloqueo y releen estad
   const unlocked = new Promise(resolve => { unlock = resolve; });
   const events = [];
   let clients = 0;
-  const app = Fastify({ logger: false });
+  const app = await adminModeApp();
   app.decorate('requireRoles', () => async () => {});
   app.decorate('db', { async connect() {
     const number = ++clients;

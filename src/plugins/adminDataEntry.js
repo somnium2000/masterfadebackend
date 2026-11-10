@@ -5,6 +5,23 @@ import { getStorageScope } from "../services/storage/storageScopes.js";
 
 // AM: Exact existing route templates; new/alternative endpoints stay closed by default.
 export const ADMIN_DATA_ENTRY_ROUTES = Object.freeze([
+  "GET /v1/admin/account-deletion/requests",
+  "GET /v1/admin/account-deletion/requests/:requestId",
+  "POST /v1/admin/account-deletion/requests/:requestId/approve",
+  "POST /v1/admin/account-deletion/requests/:requestId/reject",
+  "POST /v1/admin/account-deletion/requests/:requestId/retry",
+  "POST /v1/admin/sucursales",
+  "PATCH /v1/admin/sucursales/:id",
+  "PATCH /v1/admin/sucursales/:id/activar",
+  "PATCH /v1/admin/sucursales/:id/inactivar",
+  "DELETE /v1/admin/sucursales/:id",
+  "POST /v1/admin/configuracion/promociones",
+  "PATCH /v1/admin/configuracion/promociones/:id",
+  "PATCH /v1/barbero/perfil",
+  "DELETE /v1/admin/storage/assets/:id",
+  "POST /v1/admin/seguridad/sesiones/revocar-todas",
+  "PATCH /v1/admin/personas/usuarios/:id_usuario/estado-acceso",
+  "PATCH /v1/admin/personas/usuarios/:id_usuario/inactivar",
   "POST /v1/auth/register",
   "POST /v1/auth/register/confirm",
   "POST /v1/auth/register/resend",
@@ -143,7 +160,7 @@ const administrativeOperationPrefixes = Object.freeze([
   "/v1/admin/membresias",
 ]);
 // AM: Only photographs of approved modules; existing scope/identity/branch checks still run.
-const photographScopes = new Map([['public_barber_profile', 'barbero'], ['private_client_profile', 'cliente'], ['public_service_image', 'servicio']]);
+const photographScopes = new Map([['public_barber_profile', 'barbero'], ['private_client_profile', 'cliente'], ['public_service_image', 'servicio'], ['public_promotion_main', 'promocion'], ['public_promotion_mobile', 'promocion']]);
 const normalize = path => String(path || '').replace(/\/$/, '');
 const restricted = reply => sendError(reply, 403, 'Esta operación no está disponible durante la carga administrativa.', { code: 'ADMIN_DATA_ENTRY_RESTRICTED' });
 
@@ -164,7 +181,7 @@ export default fp(async function adminDataEntryPlugin(app) {
   // AM: Append after existing route auth/role guards, never replace authorization.
   app.addHook('onRoute', options => {
     const route = normalize(options.url);
-    if (!route.endsWith('/uploads/prepare') && !route.endsWith('/assets/:id/read-url')) return;
+    if (!route.endsWith('/uploads/prepare') && !route.endsWith('/assets/:id/read-url') && route !== '/v1/admin/storage/assets/:id') return;
     const previous = options.preHandler ? [].concat(options.preHandler) : [];
     options.preHandler = [...previous, async (request, reply) => {
       if (route.endsWith('/uploads/prepare')) {

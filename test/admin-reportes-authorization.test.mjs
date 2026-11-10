@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import Fastify from "fastify";
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 
 import adminReportesRoutes from "../src/routes/v1/admin/reportes.js";
 
@@ -14,7 +14,7 @@ const ENDPOINTS = [
 async function buildApp(roles = null) {
   let databaseAccesses = 0;
   let databaseConnections = 0;
-  const app = Fastify({ logger: false });
+  const app = await adminModeApp();
   const rejectDatabaseAccess = async () => {
     databaseAccesses += 1;
     throw new Error("REPORTES_TEST_DB_REACHED");

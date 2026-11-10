@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import Fastify from "fastify";
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 import routes from "../src/routes/v1/admin/configuracion.js";
 // AM: El escritor concurrente tambien ejecuta el helper productivo.
 import { markAssetStatus } from "../src/services/storage/storageAssetsRepo.js";
@@ -150,7 +150,7 @@ async function buildApp({ roles = ["admin"], branches = [A], assignments = branc
     }
     throw new Error("Unexpected mock query");
   };
-  const app = Fastify({ logger: false });
+  const app = await adminModeApp();
   app.decorate("requireRoles", (allowed) => async (request, reply) => {
     if (!roles) return reply.code(401).send({ ok: false, error: { code: "AUTH_REQUIRED", message: "Unauthorized" } });
     if (!roles.some((role) => allowed.includes(role))) return reply.code(403).send({ ok: false, error: { code: "AUTH_FORBIDDEN", message: "Forbidden" } });

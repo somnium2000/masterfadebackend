@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { readFileSync } from 'node:fs';
-import Fastify from 'fastify';
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 
 // Solo servicios ficticios: nunca se importan cálculos, materializaciones ni escrituras.
 const A = '11111111-1111-4111-8111-111111111111';
@@ -44,10 +44,10 @@ async function loadRoutes(path) {
 }
 const points = await loadRoutes('../src/routes/v1/admin/puntos.js');
 const master = await loadRoutes('../src/routes/v1/admin/masterpuntos.js');
-const endpoints = ['/puntos/regalias', '/puntos/clientes/buscar?q=Sintetico&limit=2', `/puntos/clientes/${A}/resumen`, '/master/contexto', '/master/clientes?page=1&limit=2', `/master/clientes/${A}/movimientos?page=1&limit=2`];
+const endpoints = ['/v1/admin/puntos/regalias', '/v1/admin/puntos/clientes/buscar?q=Sintetico&limit=2', `/v1/admin/puntos/clientes/${A}/resumen`, '/v1/admin/masterpuntos/contexto', '/v1/admin/masterpuntos/clientes?page=1&limit=2', `/v1/admin/masterpuntos/clientes/${A}/movimientos?page=1&limit=2`];
 async function setup(t, roles) {
   calls = []; fail = false;
-  const app = Fastify({ logger: false });
+  const app = await adminModeApp();
   app.decorate('requireRoles', (allowed) => async (request, reply) => {
     if (!roles) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
     if (!roles.some((role) => allowed.includes(role))) return reply.code(403).send({ error: { code: 'AUTH_FORBIDDEN' } });
@@ -55,29 +55,29 @@ async function setup(t, roles) {
   });
   const noDatabase = () => { throw new Error('DATABASE_MUST_NOT_RUN'); };
   app.decorate('db', { query: noDatabase, connect: noDatabase });
-  await app.register(points, { prefix: '/puntos' }); await app.register(master, { prefix: '/master' });
+  await app.register(points, { prefix: '/v1/admin/puntos' }); await app.register(master, { prefix: '/v1/admin/masterpuntos' });
   t.after(() => app.close()); return app;
 }
 for (const roles of [['admin'], ['super_admin'], ['admin', 'super_admin'], ['barbero'], ['cliente'], ['security_auditor'], null]) {
   for (const endpoint of endpoints) test(`${roles?.join('+') || 'anónimo'} GET ${endpoint}`, async (t) => {
     const app = await setup(t, roles);
-    const allowedRoles = endpoint === '/puntos/regalias' ? ['super_admin'] : ['admin', 'super_admin'];
+    const allowedRoles = endpoint === '/v1/admin/puntos/regalias' ? ['super_admin'] : ['admin', 'super_admin'];
     const allowed = roles?.some((role) => allowedRoles.includes(role));
     const response = await app.inject({ method: 'GET', url: endpoint });
     assert.equal(response.statusCode, allowed ? 200 : roles ? 403 : 401);
     assert.equal(calls.length, allowed ? 1 : 0);
-    if (allowed && endpoint.startsWith('/master/')) assert.deepEqual(calls[0].args[1].branch_ids, [A]);
+    if (allowed && endpoint.startsWith('/v1/admin/masterpuntos/')) assert.deepEqual(calls[0].args[1].branch_ids, [A]);
   });
 }
 for (const endpoint of endpoints) test(`error seguro en GET ${endpoint}`, async (t) => {
-  const app = await setup(t, endpoint === '/puntos/regalias' ? ['super_admin'] : ['admin']); fail = true;
+  const app = await setup(t, endpoint === '/v1/admin/puntos/regalias' ? ['super_admin'] : ['admin']); fail = true;
   const response = await app.inject({ method: 'GET', url: endpoint });
   assert.equal(response.statusCode, 500); assert.doesNotMatch(response.body, /SQL|INTERNAL|SECRET/);
 });
 test('resúmenes conservan exclusivamente el identificador solicitado y valores del servicio', async (t) => {
   const app = await setup(t, ['admin']);
   for (const [id, balance] of [[A, 7], [B, 2]]) {
-    const response = await app.inject({ method: 'GET', url: `/puntos/clientes/${id}/resumen` });
+    const response = await app.inject({ method: 'GET', url: `/v1/admin/puntos/clientes/${id}/resumen` });
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().data.id_cliente, id); assert.equal(response.json().data.saldo_total, balance);
     assert.equal(calls.at(-1).args[1], id);
@@ -85,7 +85,7 @@ test('resúmenes conservan exclusivamente el identificador solicitado y valores 
 });
 test('identificador inválido rechazado antes de servicios de consulta', async (t) => {
   const app = await setup(t, ['admin']);
-  for (const endpoint of ['/puntos/clientes/invalid/resumen', '/master/clientes/invalid/movimientos']) {
+  for (const endpoint of ['/v1/admin/puntos/clientes/invalid/resumen', '/v1/admin/masterpuntos/clientes/invalid/movimientos']) {
     const response = await app.inject({ method: 'GET', url: endpoint }); assert.equal(response.statusCode, 400);
   }
   assert.equal(calls.length, 0);
@@ -96,11 +96,11 @@ test('rutas de búsqueda, resumen y ajuste pasan claims completos al servicio', 
   pointsServices.addManualPointsAdjustment = read('adjustment', { id_points_tx: A, id_cliente: A, saldo_actual: 5 });
   t.after(() => { pointsServices.addManualPointsAdjustment = originalAdjustment; });
   const app = await setup(t, ['admin']);
-  await app.inject('/puntos/clientes/buscar?q=Sintetico');
-  await app.inject(`/puntos/clientes/${A}/resumen`);
+  await app.inject('/v1/admin/puntos/clientes/buscar?q=Sintetico');
+  await app.inject(`/v1/admin/puntos/clientes/${A}/resumen`);
   const adjustment = await app.inject({
     method: 'POST',
-    url: `/puntos/clientes/${A}/ajuste`,
+    url: `/v1/admin/puntos/clientes/${A}/ajuste`,
     headers: { 'x-idempotency-key': '99999999-9999-4999-8999-999999999999' },
     payload: { accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético' },
   });
@@ -115,7 +115,7 @@ for (const role of ['cliente', 'barbero']) test(`${role} no puede invocar ajuste
   const app = await setup(t, [role]);
   const response = await app.inject({
     method: 'POST',
-    url: `/puntos/clientes/${A}/ajuste`,
+    url: `/v1/admin/puntos/clientes/${A}/ajuste`,
     headers: { 'x-idempotency-key': '99999999-9999-4999-8999-999999999999' },
     payload: { accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético' },
   });

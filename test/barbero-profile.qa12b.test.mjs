@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import Fastify from 'fastify';
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 import routes from '../src/routes/v1/barbero.js';
 const USER = '11111111-1111-4111-8111-111111111111';
 const PERSON = '21111111-1111-4111-8111-111111111111';
@@ -18,7 +18,7 @@ async function fixture(t, role, { missing = false, fail = false } = {}) {
     if (sql.includes('UPDATE public.personas')) { assert.equal(params[0], PERSON); assert.doesNotMatch(sql, /salario|id_sucursal|roles/); }
     return { rows: [], rowCount: 1 };
   };
-  const app = Fastify(); t.after(() => app.close()); app.decorate('db', { query, connect: async () => ({ query, release() {} }) });
+  const app = await adminModeApp(); t.after(() => app.close()); app.decorate('db', { query, connect: async () => ({ query, release() {} }) });
   app.decorate('requireRoles', allowed => async (request, reply) => {
     request.claims = { roles: role ? [role] : [], user: { id_usuario: USER } };
     if (!role) return reply.code(401).send({ error: { code: 'AUTH_REQUIRED' } });
