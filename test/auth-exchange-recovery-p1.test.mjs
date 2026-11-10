@@ -6,7 +6,7 @@ import { fixture, body, USER } from './auth-recovery-qa02i.test.mjs';
 
 // AM: Proveedor estricto y persistencia exclusivamente en memoria; sin conexiones.
 async function setup(t, options = {}) {
-  const f = await fixture(t, options);
+  const f = await fixture(t, { ...options, adminMode: Boolean(options.newSocial || options.newProvision) });
   const providerSecret = randomBytes(40).toString('hex');
   const authSessions = new Map(), appSessions = new Map(), calls = [];
   const other = randomUUID(), oldSid = randomUUID();

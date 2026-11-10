@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, randomBytes } from 'node:crypto';
 import Fastify from 'fastify';
+import fp from 'fastify-plugin';
+import adminDataEntry from '../src/plugins/adminDataEntry.js';
 import cookie from '@fastify/cookie';
 import jwt from 'jsonwebtoken';
 import authRoutes from '../src/routes/v1/auth.js';
@@ -45,7 +47,9 @@ async function fixture(t,options={}){
   return query(q,p);
  },release(){unlock?.();}};};
  const app=Fastify({logger:false});app.setErrorHandler(globalErrorHandler);
- app.decorate('db',{query,connect});app.decorate('config',{corsOrigins:[process.env.FRONTEND_URL],cookieSecret:randomBytes(32).toString('hex')});
+ app.decorate('db',{query,connect});app.decorate('config',{adminDataEntryMode:Boolean(options.adminMode),paymentProvider:'disabled',corsOrigins:[process.env.FRONTEND_URL],cookieSecret:randomBytes(32).toString('hex')});
+ await app.register(fp(async()=>{}, {name:'env-plugin'}));
+ await app.register(adminDataEntry);
  app.decorate('supabaseAdmin',{auth:{admin:{
   generateLink:async input=>{generated=input;return options.missing?{error:{code:'user_not_found'}}:{data:{properties:{hashed_token:HASH,action_link:'https://synthetic.invalid/auth/v1/verify?type=recovery&token='+HASH}}};},
   updateUserById:async(id,attrs)=>{actions.push('update');assert.equal(id,USER);updates++;if(options.beforeUpdate)await options.beforeUpdate();if(options.updateFail)return {error:{status:503}};password=attrs.password;if(options.updateTimeout)throw Error('ambiguous provider timeout');return {data:{user:{id:USER}}};},
