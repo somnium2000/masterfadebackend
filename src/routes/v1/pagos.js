@@ -205,9 +205,9 @@ export function assertPaymentWebhookContract(app, providerCode) {
   }
 }
 
-function pixelPayCallbackEventId({ orderId, transactionId, paymentHash }) {
+function pixelPayCallbackEventId({ orderId, idIntent }) {
   const digest = crypto.createHash("sha256")
-    .update([orderId, transactionId, paymentHash].join("|"), "utf8")
+    .update([orderId, idIntent].join("|"), "utf8")
     .digest("hex");
   return `pixelpay_order_callback_${digest}`;
 }
@@ -294,7 +294,7 @@ export async function processPixelPayOrderCallback({
     });
   }
 
-  const providerEventId = pixelPayCallbackEventId({ orderId, transactionId, paymentHash });
+  let providerEventId;
   const client = await db.connect();
   let intent;
   let duplicate;
@@ -331,6 +331,9 @@ export async function processPixelPayOrderCallback({
       });
     }
     intent = lookup.rows[0];
+    // One notification slot per financial intent/order, including pending Sale recovery.
+    // Callback identifiers and the order hash cannot create additional event identities.
+    providerEventId = pixelPayCallbackEventId({ orderId, idIntent: intent.id_intent });
     const trustedPaymentUuid = safeText(intent.provider_session_id);
     const trustedTransactionId = safeText(intent.referencia_externa);
     const comparisons = {
@@ -377,11 +380,6 @@ export async function processPixelPayOrderCallback({
       )
       : { rows: [] };
     const hasVerifiedSaleCorrelation = saleEvidence.rows.length === 1;
-    if (hasVerifiedSaleCorrelation && trustedTransactionId !== transactionId) {
-      throw new AppError(409, "La transaccion PixelPay no coincide con la Sale verificada", {
-        code: "PIXELPAY_CALLBACK_TRANSACTION_ID_MISMATCH",
-      });
-    }
     const inserted = await client.query(
       `INSERT INTO public.payment_events (
          id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent,
@@ -396,8 +394,12 @@ export async function processPixelPayOrderCallback({
         {
           order_id: orderId,
           callback_uuid: paymentUuid,
+          callback_transaction_id: transactionId,
           payment_uuid: trustedPaymentUuid,
-          transaction_id: transactionId,
+          transaction_id: trustedTransactionId,
+          callback_uuid_matches: paymentUuid === trustedPaymentUuid,
+          callback_transaction_id_matches: transactionId === trustedTransactionId,
+          order_hash_valid: true,
           amount: callbackAmount,
           currency: callbackCurrency,
           provider_status: callbackStatus,
@@ -475,8 +477,7 @@ export async function processPixelPayOrderCallback({
       amount: Number(intent.monto_hnl),
     });
     const uuidMatches = safeText(status?.resultPaymentUuid) === trustedPaymentUuid;
-    const transactionMatches = safeText(status?.transactionId) === trustedTransactionId
-      && transactionId === trustedTransactionId;
+    const transactionMatches = safeText(status?.transactionId) === trustedTransactionId;
     const currencyMatches = safeText(intent.moneda_codigo)?.toUpperCase() === "HNL";
     const statusOrderMatches = !safeText(status?.resultOrderId)
       || safeText(status.resultOrderId) === orderId;
