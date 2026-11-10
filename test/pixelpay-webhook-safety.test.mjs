@@ -124,10 +124,44 @@ function callbackFixture({
 }
 
 const validCallback = {
-  order_id: "ORDER-1",
-  payment_uuid: "P-1",
+  order: "ORDER-1",
+  uuid: "P-1",
   payment_hash: "valid-hash",
+  transaction_id: "TX-1",
+  amount: 100,
+  currency: "HNL",
+  status: "COMPLETED",
+  transaction_type: "SALE",
+  transaction_redeemed_points: 0,
+  transaction_approved_amount: 100,
+  transaction_amount: 100,
+  transaction_auth: "[SANITIZED]",
+  transaction_terminal: "[SANITIZED]",
+  transaction_merchant: "[SANITIZED]",
+  response_cvn: "[SANITIZED]",
+  response_avs: "[SANITIZED]",
+  response_cavv: "[SANITIZED]",
+  transaction_reference: "[SANITIZED]",
+  transaction_time: "[SANITIZED]",
+  transaction_date: "[SANITIZED]",
+  response_approved: true,
+  response_incomplete: false,
+  response_code: "00",
+  response_time: "[SANITIZED]",
+  response_reason: "approved",
+  installment_type: null,
+  installment_months: null,
+  payment_uuid: "P-1",
+  response_message: "[SANITIZED]",
+  response_status: "[SANITIZED]",
+  customer_name: "[REDACTED]",
+  customer_email: "[REDACTED]",
+  billing_address: "[REDACTED]",
+  card_type: "[SANITIZED]",
+  card_last_four: "[REDACTED]",
 };
+
+assert.equal(Object.keys(validCallback).length, 35);
 
 test("callback valido verifica Status pero conserva pendiente", async () => {
   const fixture = callbackFixture();
@@ -166,6 +200,68 @@ test("callback falsificado se rechaza antes de abrir PostgreSQL", async () => {
     (error) => error?.statusCode === 401 && error?.code === "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID"
   );
   assert.equal(connects, 0);
+});
+
+test("callback real rechaza orden, UUID, monto, moneda y transaccion inconsistentes", async (t) => {
+  await t.test("orden incorrecta", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, order: "ORDER-OTHER" },
+        requestId: "req-order-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID"
+    );
+  });
+  await t.test("UUID incorrecto", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, uuid: "P-OTHER", payment_uuid: "P-OTHER" },
+        requestId: "req-uuid-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH"
+    );
+  });
+  await t.test("monto incorrecto", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, amount: 99 },
+        requestId: "req-callback-amount-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_AMOUNT_MISMATCH"
+    );
+  });
+  await t.test("moneda incorrecta", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, currency: "USD" },
+        requestId: "req-callback-currency-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_CURRENCY_MISMATCH"
+    );
+  });
+  await t.test("transaction ID distinto de Status queda incierto", async () => {
+    const fixture = callbackFixture();
+    const result = await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: { ...validCallback, transaction_id: "TX-OTHER" },
+      requestId: "req-transaction-mismatch",
+    });
+    assert.equal(result.processed, false);
+    assert.equal(fixture.event.result, "status_incierto_pendiente");
+  });
 });
 
 test("callback ya verificado responde idempotente sin repetir Status", async () => {
@@ -285,21 +381,18 @@ test("callbacks concurrentes reclaman una sola consulta Status", async () => {
   assert.equal(statusCalls, 1);
 });
 
-test("moneda interna distinta de HNL nunca produce confirmacion financiera", async () => {
+test("moneda del callback distinta de la orden se rechaza antes de Status", async () => {
   const fixture = callbackFixture({ intentOverrides: { moneda_codigo: "USD" } });
-  const result = await processPixelPayOrderCallback({
-    db: fixture.db,
-    provider: fixture.provider,
-    body: validCallback,
-    requestId: "req-currency",
-  });
-  assert.equal(result.processed, false);
-  assert.equal(fixture.event.result, "status_incierto_pendiente");
-  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
-  assert.equal(
-    fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.status_verified")),
-    false
+  await assert.rejects(
+    processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: validCallback,
+      requestId: "req-currency",
+    }),
+    (error) => error?.code === "PIXELPAY_CALLBACK_CURRENCY_MISMATCH"
   );
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
 });
 
 test("Status 412 y monto incorrecto permanecen pendientes", async (t) => {
@@ -346,16 +439,30 @@ test("callback tardio conserva intent expirado sin promoverlo", async () => {
   assert.equal(fixture.queries.some(({ text }) => /UPDATE public\.payment_intents/i.test(text)), false);
 });
 
-test("callback exige nombres canonicos SDK y no campos Hosted", async () => {
+test("callback de intent confirmado no duplica pago ni modifica paid_at", async () => {
+  const fixture = callbackFixture({ intentOverrides: { estado_intent_codigo: "confirmado" } });
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-confirmed",
+  });
+  assert.equal(result.processed, false);
+  assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /UPDATE public\.payment_intents/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /paid_at/i.test(text)), false);
+});
+
+test("callback acepta nombres reales order/uuid y rechaza alias contradictorios", async () => {
   const fixture = callbackFixture();
   await assert.rejects(
     processPixelPayOrderCallback({
       db: fixture.db,
       provider: fixture.provider,
-      body: { order: "ORDER-1", uuid: "P-1", payment_hash: "valid-hash" },
-      requestId: "req-hosted-shape",
+      body: { ...validCallback, order_id: "ORDER-OTHER" },
+      requestId: "req-conflicting-alias",
     }),
-    (error) => error?.code === "PIXELPAY_CALLBACK_REQUIRED_FIELDS_MISSING"
+    (error) => error?.code === "PIXELPAY_CALLBACK_IDENTIFIER_CONFLICT"
   );
   assert.equal(fixture.queries.length, 0);
 });

@@ -237,10 +237,26 @@ export async function processPixelPayOrderCallback({
   requestId,
   retryCooldownSeconds = 90,
 }) {
-  const orderId = safeText(body?.order_id);
-  const paymentUuid = safeText(body?.payment_uuid);
+  const callbackOrder = safeText(body?.order);
+  const legacyOrder = safeText(body?.order_id);
+  const callbackUuid = safeText(body?.uuid);
+  const legacyPaymentUuid = safeText(body?.payment_uuid);
+  if ((callbackOrder && legacyOrder && callbackOrder !== legacyOrder)
+    || (callbackUuid && legacyPaymentUuid && callbackUuid !== legacyPaymentUuid)) {
+    throw new AppError(400, "Callback PixelPay contiene identificadores contradictorios", {
+      code: "PIXELPAY_CALLBACK_IDENTIFIER_CONFLICT",
+    });
+  }
+  const orderId = callbackOrder || legacyOrder;
+  const paymentUuid = callbackUuid || legacyPaymentUuid;
   const paymentHash = safeText(body?.payment_hash);
-  if (!orderId || !paymentUuid || !paymentHash) {
+  const transactionId = safeText(body?.transaction_id);
+  const callbackAmount = Number(body?.amount);
+  const callbackCurrency = safeText(body?.currency).toUpperCase();
+  const callbackStatus = safeText(body?.status).toUpperCase();
+  if (!orderId || !paymentUuid || !paymentHash || !transactionId
+    || !Number.isFinite(callbackAmount) || callbackAmount <= 0
+    || !callbackCurrency || !callbackStatus) {
     throw new AppError(400, "Callback PixelPay incompleto", {
       code: "PIXELPAY_CALLBACK_REQUIRED_FIELDS_MISSING",
     });
@@ -287,6 +303,16 @@ export async function processPixelPayOrderCallback({
         code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
       });
     }
+    if (Number(intent.monto_hnl).toFixed(2) !== callbackAmount.toFixed(2)) {
+      throw new AppError(409, "El monto PixelPay no coincide con la orden", {
+        code: "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
+      });
+    }
+    if (safeText(intent.moneda_codigo).toUpperCase() !== callbackCurrency) {
+      throw new AppError(409, "La moneda PixelPay no coincide con la orden", {
+        code: "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
+      });
+    }
     const inserted = await client.query(
       `INSERT INTO public.payment_events (
          id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
@@ -296,7 +322,14 @@ export async function processPixelPayOrderCallback({
       [
         intent.id_provider,
         providerEventId,
-        { order_id: orderId, payment_uuid: paymentUuid },
+        {
+          order_id: orderId,
+          payment_uuid: paymentUuid,
+          transaction_id: transactionId,
+          amount: callbackAmount,
+          currency: callbackCurrency,
+          provider_status: callbackStatus,
+        },
         intent.id_intent,
       ]
     );
@@ -355,7 +388,10 @@ export async function processPixelPayOrderCallback({
       amount: Number(intent.monto_hnl),
     });
     const uuidMatches = safeText(status?.resultPaymentUuid) === paymentUuid;
+    const transactionMatches = safeText(status?.transactionId) === transactionId;
     const currencyMatches = safeText(intent.moneda_codigo)?.toUpperCase() === "HNL";
+    const callbackStatusMatches = ["COMPLETED", "PAID", "APPROVED", "SUCCESS"]
+      .includes(callbackStatus);
     const financiallyVerified = status?.ok === true
       && status?.success === true
       && status?.providerContractValid === true
@@ -365,7 +401,9 @@ export async function processPixelPayOrderCallback({
       && status?.approved === true
       && status?.incomplete !== true
       && Boolean(safeText(status?.transactionId))
+      && transactionMatches
       && currencyMatches
+      && callbackStatusMatches
       && uuidMatches;
     await recordCallbackStatusCheck(db, {
       idIntent: intent.id_intent,
