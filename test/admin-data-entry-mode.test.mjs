@@ -15,6 +15,7 @@ import points from '../src/routes/v1/clientePoints.js';
 import publicCitas from '../src/routes/v1/public/citas.js';
 import publicPayments from '../src/routes/v1/public/pagos.js';
 import payments from '../src/routes/v1/pagos.js';
+import adminStorage from '../src/routes/v1/admin/storage.js';
 import { globalErrorHandler } from '../src/utils/errors.js';
 
 const ID='11111111-1111-4111-8111-111111111111';
@@ -138,6 +139,26 @@ for(const scope of ['public_promotion_main','public_branding','public_gallery_it
 test('approved photograph preserves auth and permits its business handler',async t=>{
  const {app,state}=await fixture(t);app.post('/v1/admin/storage/uploads/prepare',{preHandler:app.requireRoles(['super_admin'])},async()=>{state.business++;return {ok:true};});
  const r=await app.inject({method:'POST',url:'/v1/admin/storage/uploads/prepare',payload:{scope_key:'public_barber_profile',entity_type:'barbero'}});assert.equal(r.statusCode,200);assert.equal(state.business,1);assert.equal(state.auth,1);
+});
+for(const scope of ['public_promotion_main','public_promotion_mobile'])test('promotion image scope reaches real storage controller '+scope,async t=>{
+ const {app}=await fixture(t);let calls=0;
+ const original=app.db.query;app.db.query=async(sql,params)=>{
+  if(sql.includes('INSERT INTO public.storage_assets'))return {rows:[{id_asset:ID}]};
+  return original(sql,params);
+ };
+ app.decorate('supabaseAdmin',{storage:{from:()=>({getPublicUrl:()=>({data:{publicUrl:'https://synthetic.invalid/photo'}}),createSignedUploadUrl:async()=>{calls++;return {data:{token:'synthetic'}};}})}});
+ await app.register(adminStorage,{prefix:'/v1/admin/storage'});
+ const r=await app.inject({method:'POST',url:'/v1/admin/storage/uploads/prepare',payload:{scope_key:scope,entity_type:'promocion',id_sucursal:ID,file_name:'photo.webp',content_type:'image/webp',size_bytes:128}});
+ assert.equal(r.statusCode,201,r.body);assert.equal(calls,1);
+});
+test('promotion image read and delete retain real storage checks',async t=>{
+ const asset={id_asset:ID,scope_key:'public_promotion_main',entity_type:'promocion',bucket_name:'imagenes_publicas',visibility:'public',public_url:'https://synthetic.invalid/photo',object_path:'synthetic/photo',id_sucursal:ID};
+ const {app}=await fixture(t,{asset});let removed=0;
+ app.db.query=async sql=>sql.includes('SELECT 1')?{rows:[],rowCount:0}:{rows:[asset],rowCount:1};
+ app.decorate('supabaseAdmin',{storage:{from:()=>({remove:async()=>{removed++;return {error:null};}})}});
+ await app.register(adminStorage,{prefix:'/v1/admin/storage'});
+ const read=await app.inject({method:'POST',url:'/v1/admin/storage/assets/'+ID+'/read-url',payload:{}});assert.equal(read.statusCode,200,read.body);
+ const deleted=await app.inject({method:'DELETE',url:'/v1/admin/storage/assets/'+ID});assert.equal(deleted.statusCode,200,deleted.body);assert.equal(removed,1);
 });
 for(const change of [{scope_key:'public_promotion_main'},{bucket_name:'wrong'},{entity_type:'promocion'},{deleted_at:'2026-01-01'}])test('read-url rejects inconsistent/out-of-scope metadata '+JSON.stringify(change),async t=>{
  const asset={id_asset:ID,scope_key:'public_barber_profile',entity_type:'barbero',bucket_name:'imagenes_publicas',visibility:'public',...change};const {app,state}=await fixture(t,{asset});app.post('/v1/admin/storage/assets/:id/read-url',{preHandler:app.requireRoles(['super_admin'])},async()=>{state.business++;return {ok:true};});const r=await app.inject({method:'POST',url:'/v1/admin/storage/assets/'+ID+'/read-url',payload:{}});assert.equal(r.statusCode,403);assert.equal(state.business,0);
