@@ -14,7 +14,7 @@ function probeEnv(overrides = {}) {
     PIXELPAY_PROBE_CARD_EXPIRE_MONTH: "12",
     PIXELPAY_PROBE_CARD_EXPIRE_YEAR: "28",
     PIXELPAY_PROBE_DRY_RUN: "true",
-    PIXELPAY_PROBE_ORDER_CALLBACK_URL: "https://qa-api.masterfadeapp.com/v1/pagos/webhook/pixelpay",
+    PIXELPAY_PROBE_ORDER_CALLBACK_URL: "https://api-qa.masterfadeapp.com/v1/pagos/webhook/pixelpay",
     PIXELPAY_PROBE_EXECUTE: "I_UNDERSTAND_SINGLE_SANDBOX_SALE",
     ...overrides,
   };
@@ -178,7 +178,7 @@ test("probe dry-run construye y enlaza todos los modelos sin Transaction ni red"
 test("probe exige callback QA HTTPS sin query y no ejecuta Sale con autorizacion ausente", async () => {
   const fake = fakeProbeSdk();
   const invalid = await runPixelPaySandboxSaleProbe({
-    env: probeEnv({ PIXELPAY_PROBE_ORDER_CALLBACK_URL: "https://qa-api.masterfadeapp.com/v1/pagos/webhook/pixelpay?secret=no" }),
+    env: probeEnv({ PIXELPAY_PROBE_ORDER_CALLBACK_URL: "https://api-qa.masterfadeapp.com/v1/pagos/webhook/pixelpay?secret=no" }),
     sdk: fake.sdk,
     write: () => {},
   });
@@ -193,6 +193,24 @@ test("probe exige callback QA HTTPS sin query y no ejecuta Sale con autorizacion
   assert.equal(unauthorized.exitCode, 2);
   assert.equal(unauthorized.saleCount, 0);
   assert.equal(fake.calls.sale, 0);
+});
+
+test("probe rechaza produccion y cualquier host distinto de API QA", async () => {
+  for (const callbackUrl of [
+    "https://api.masterfadeapp.com/v1/pagos/webhook/pixelpay",
+    "https://qa-api.masterfadeapp.com/v1/pagos/webhook/pixelpay",
+    "https://api-qa.masterfadeapp.com:444/v1/pagos/webhook/pixelpay",
+  ]) {
+    const fake = fakeProbeSdk();
+    const result = await runPixelPaySandboxSaleProbe({
+      env: probeEnv({ PIXELPAY_PROBE_ORDER_CALLBACK_URL: callbackUrl }),
+      sdk: fake.sdk,
+      write: () => {},
+    });
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.saleCount, 0);
+    assert.equal(fake.calls.sale, 0);
+  }
 });
 
 test("DRY_RUN_OK no se emite cuando falla la construccion de modelos", async () => {

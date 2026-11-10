@@ -37,6 +37,7 @@ function money(value) {
 }
 
 function resolveProbeCallbackUrl(rawValue) {
+  const expectedHost = "api-qa.masterfadeapp.com";
   let parsed;
   try {
     parsed = new URL(text(rawValue));
@@ -44,6 +45,8 @@ function resolveProbeCallbackUrl(rawValue) {
     throw new TypeError("INVALID_QA_ORDER_CALLBACK_URL");
   }
   if (parsed.protocol !== "https:"
+    || parsed.hostname !== expectedHost
+    || parsed.port
     || parsed.username
     || parsed.password
     || parsed.search
