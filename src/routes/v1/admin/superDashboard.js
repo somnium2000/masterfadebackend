@@ -3,6 +3,7 @@ import { sendOk } from "../../../utils/response.js";
 
 const TIMEZONE = "America/Tegucigalpa";
 const SUCCESS_PAYMENT_STATES = ["capturado", "conciliado", "manual_pagado"];
+const DASHBOARD_APPOINTMENT_STATES = ["confirmada", "en_salon", "en_atencion", "completada"];
 
 function dateOnlyInHonduras(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
@@ -103,7 +104,8 @@ const SUMMARY_SQL = `
     CROSS JOIN range_config rc
   )
   SELECT
-    (SELECT COUNT(c.id_cita)::bigint FROM public.citas c WHERE c.deleted_at IS NULL) AS total_citas,
+    (SELECT COUNT(c.id_cita)::bigint FROM public.citas c WHERE c.deleted_at IS NULL
+      AND c.estado_cita_codigo = ANY($5::text[])) AS total_citas,
     (SELECT COALESCE(SUM(ep.monto_hnl), 0)::numeric FROM eligible_payments ep) AS ingresos_citas_hnl_total,
     (SELECT COALESCE(SUM(ep.monto_hnl), 0)::numeric FROM eligible_payments ep
       WHERE ep.paid_at >= $2::timestamptz AND ep.paid_at < $3::timestamptz) AS ingresos_citas_hnl_periodo,
@@ -141,6 +143,7 @@ export default async function superDashboardRoutes(app) {
         hondurasDayStartUtc(fechaDesde),
         hondurasDayStartUtc(addDay(fechaHasta)),
         resolveGrouping(fechaDesde, fechaHasta),
+        DASHBOARD_APPOINTMENT_STATES,
       ];
       const { rows } = await app.db.query(SUMMARY_SQL, values);
       const row = rows[0] || {};
