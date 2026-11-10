@@ -23,6 +23,36 @@ async function fixture(t,{enabled=true,role='super_admin',asset=null,identityExi
  t.after(()=>app.close());return {app,state};
 }
 const blocked=[['POST','/v1/public/citas'],['POST','/v1/public/citas/hold'],['POST','/v1/citas/hold'],['POST','/v1/cliente/planes/orden'],['POST','/v1/cliente/planes/pago-intent'],['POST','/v1/cliente/planes/simulator/event'],['POST','/v1/pagos'],['POST','/v1/pagos/reservas'],['POST','/v1/public/pagos/webhook/pixelpay'],['POST','/v1/pagos/webhook/banpais'],['POST','/v1/account-deletion'],['POST','/v1/admin/account-deletion'],['POST','/v1/public/account-deletion'],['POST','/v1/auth/register'],['POST','/v1/auth/register/confirm'],['POST','/v1/auth/register/resend'],['POST','/v1/auth/social/confirm'],['PATCH','/v1/barbero/perfil'],['PATCH','/v1/admin/sucursales/'+ID+'/inactivar'],['DELETE','/v1/admin/personas/usuarios/'+ID+'/permanente'],['POST','/v1/admin/configuracion/promociones'],['POST','/v1/admin/configuracion/comunicacion/campanias/'+ID+'/enviar'],['POST','/v1/admin/seguridad/sesiones/revocar-todas'],['POST','/v1/admin/masterpuntos/legacy-migracion'],['POST','/v1/new-business-route']];
+const publicCatalogReads=[
+ ['GET','/v1/public/catalog/sucursales'],
+ ['GET','/v1/public/catalog/servicios'],
+ ['GET','/v1/public/catalog/paquetes'],
+ ['GET','/v1/public/catalog/promociones'],
+ ['GET','/v1/public/catalog/busqueda'],
+ ['GET','/v1/public/agenda/barberos'],
+ ['GET','/v1/public/catalog/planes'],
+];
+test('approved public catalog reads bypass only the administrative-mode guard',async t=>{
+ const {app,state}=await fixture(t);
+ for(const [method,url]of publicCatalogReads)app.route({method,url,handler:async()=>{state.business++;return {ok:true};}});
+ for(const [method,url]of publicCatalogReads){const r=await app.inject({method,url});assert.equal(r.statusCode,200,r.body);}
+ assert.equal(state.business,publicCatalogReads.length);
+});
+test('public catalog GET allowlist does not grant write methods or path variants',async t=>{
+ const {app,state}=await fixture(t);
+ for(const method of ['POST','PATCH','PUT','DELETE'])app.route({method,url:'/v1/public/catalog/servicios',handler:async()=>{state.business++;return {ok:true};}});
+ app.get('/v1/public/catalog/servicios/extra',async()=>{state.business++;return {ok:true};});
+ for(const method of ['POST','PATCH','PUT','DELETE']){const r=await app.inject({method,url:'/v1/public/catalog/servicios',payload:{}});assert.equal(r.statusCode,403,r.body);assert.equal(r.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');}
+ const suffix=await app.inject({url:'/v1/public/catalog/servicios/extra'});assert.equal(suffix.statusCode,403,suffix.body);assert.equal(suffix.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');
+ assert.equal(state.business,0);
+});
+test('booking availability and commercial public operations remain blocked',async t=>{
+ const {app,state}=await fixture(t);
+ const restricted=[['GET','/v1/public/agenda/disponibilidad'],['GET','/v1/public/agenda/horarios'],['POST','/v1/public/citas'],['POST','/v1/public/pagos/webhook/pixelpay']];
+ for(const [method,url]of restricted)app.route({method,url,handler:async()=>{state.business++;return {ok:true};}});
+ for(const [method,url]of restricted){const r=await app.inject({method,url,payload:method==='GET'?undefined:{}});assert.equal(r.statusCode,403,r.body);assert.equal(r.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');}
+ assert.equal(state.business,0);
+});
 // AM: Block registered business routes before even their auth hook, including privileged callers.
 for(const role of ['super_admin','admin','root','cliente'])test('deny-by-default overrides role '+role,async t=>{
  const {app,state}=await fixture(t,{role});
