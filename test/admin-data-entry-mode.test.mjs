@@ -13,6 +13,8 @@ import cliente from '../src/routes/v1/cliente.js';
 import citas from '../src/routes/v1/citas.js';
 import points from '../src/routes/v1/clientePoints.js';
 import publicCitas from '../src/routes/v1/public/citas.js';
+import publicPayments from '../src/routes/v1/public/pagos.js';
+import payments from '../src/routes/v1/pagos.js';
 import { globalErrorHandler } from '../src/utils/errors.js';
 
 const ID='11111111-1111-4111-8111-111111111111';
@@ -26,7 +28,12 @@ async function fixture(t,{enabled=true,role='super_admin',asset=null,identityExi
  await app.register(gate);await app.register(cors,{origin:'https://masterfadeapp.com'});
  t.after(()=>app.close());return {app,state};
 }
-const blocked = [["POST","/v1/public/citas"],["POST","/v1/public/citas/hold"],["POST","/v1/citas"],["POST","/v1/citas/hold"],["POST","/v1/citas/hold/11111111-1111-4111-8111-111111111111/confirmar"],["POST","/v1/citas/pendiente/11111111-1111-4111-8111-111111111111/retomar"],["POST","/v1/cliente/puntos/canjear"],["POST","/v1/cliente/planes/adquirir"],["POST","/v1/cliente/planes/orden"],["POST","/v1/cliente/planes/pago-intent"],["POST","/v1/cliente/planes/confirmar-pago"],["POST","/v1/cliente/planes/pago-intent/11111111-1111-4111-8111-111111111111/estado"],["POST","/v1/cliente/planes/simulator/event"],["POST","/v1/pagos"],["POST","/v1/pagos/reservas"],["POST","/v1/auth/not-approved"]];
+const commercialRoutes = [["POST","/v1/public/citas/hold","/v1/public/citas/hold"],["POST","/v1/citas","/v1/citas"],["POST","/v1/citas/hold","/v1/citas/hold"],["POST","/v1/citas/hold/:id_grupo_cita/confirmar","/v1/citas/hold/11111111-1111-4111-8111-111111111111/confirmar"],["POST","/v1/citas/pendiente/:id_grupo_cita/retomar","/v1/citas/pendiente/11111111-1111-4111-8111-111111111111/retomar"],["POST","/v1/cliente/puntos/canjear","/v1/cliente/puntos/canjear"],["POST","/v1/cliente/planes/adquirir","/v1/cliente/planes/adquirir"],["POST","/v1/cliente/planes/orden","/v1/cliente/planes/orden"],["POST","/v1/cliente/planes/pago-intent","/v1/cliente/planes/pago-intent"],["POST","/v1/cliente/planes/confirmar-pago","/v1/cliente/planes/confirmar-pago"],["POST","/v1/cliente/planes/pago-intent/:id_payment_intent/estado","/v1/cliente/planes/pago-intent/11111111-1111-4111-8111-111111111111/estado"],["POST","/v1/cliente/planes/simulator/event","/v1/cliente/planes/simulator/event"]];
+for(const prefix of ['/v1/public/pagos','/v1/pagos/reservas']) {
+ for(const suffix of ['/crear-intent','/pixelpay/sale','/pixelpay/status','/estado','/mock-completar','/simulator/event']) commercialRoutes.push(['POST',prefix+suffix,prefix+suffix]);
+}
+commercialRoutes.push(['POST','/v1/pagos/crear-intent','/v1/pagos/crear-intent']);
+const blocked = commercialRoutes.map(([method, , url]) => [method, url]);
 const publicCatalogReads=[
  ['GET','/v1/public/catalog/sucursales'],
  ['GET','/v1/public/catalog/servicios'],
@@ -42,16 +49,16 @@ test('real commercial controllers reject every registered blocked operation befo
  await app.register(citas,{prefix:'/v1/citas'});
  await app.register(points,{prefix:'/v1/cliente/puntos'});
  await app.register(publicCitas,{prefix:'/v1/public/citas'});
+ await app.register(publicPayments,{prefix:'/v1/public/pagos'});
+ await app.register(publicPayments,{prefix:'/v1/pagos/reservas',authenticated:true});
+ await app.register(payments,{prefix:'/v1/pagos'});
  await app.ready();
- let tested=0;
- for(const [method,url]of blocked){
-  if(!app.hasRoute({method,url}) && !url.includes(ID))continue;
-  tested++;
+ for(const [method,template,url]of commercialRoutes){
+  assert.ok(app.hasRoute({method,url:template}), method+' '+template+' must be registered');
   const response=await app.inject({method,url,payload:{id_servicio:ID,id_sucursal:ID,usar_puntos:true}});
   assert.equal(response.statusCode,403,response.body);
   assert.equal(response.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');
  }
- assert.ok(tested>=10,`registered operations tested: ${tested}`);
  assert.equal(state.auth,0);assert.equal(state.queries,0);assert.equal(state.business,0);
 });
 test('approved public catalog reads bypass only the administrative-mode guard',async t=>{

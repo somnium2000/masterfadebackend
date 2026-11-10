@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import Fastify from "fastify";
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 
 import publicAccountDeletionRoutes from "../src/routes/v1/public/accountDeletion.js";
 import publicRoutes from "../src/routes/v1/public/index.js";
@@ -288,7 +288,7 @@ test("loader rechaza solicitud inexistente y token incorrecto de forma indisting
 });
 
 test("referencia invalida y body extra quedan cubiertos por schema de ruta", async () => {
-  const app = Fastify();
+  const app = await adminModeApp();
   await app.register(publicAccountDeletionRoutes, { prefix: "/v1/public/account-deletion" });
   const response = await app.inject({
     method: "POST",
@@ -510,7 +510,7 @@ test("3D.2 conserva hash al completar", async () => {
 });
 
 test("confirmacion autenticada con app.inject devuelve token", async () => {
-  const app = Fastify();
+  const app = await adminModeApp();
   const client = createRequestClient({
     activeRow: requestRow({ estado_codigo: "pendiente_confirmacion" }),
     updateRow: requestRow({ estado_codigo: "evaluada", execution_token_expires_at: "2026-07-11T12:10:00.000Z" }),
@@ -538,9 +538,33 @@ test("confirmacion autenticada con app.inject devuelve token", async () => {
   await app.close();
 });
 
+test('preview y solicitud propia conservan controladores con guard activo', async t => {
+  const app=await adminModeApp(); t.after(()=>app.close());
+  const client=createRequestClient();
+  app.decorate('requireRoles',()=>async request=>{request.claims={cliente_id:CLIENTE_ID,user:{id_persona:PERSONA_ID,id_usuario:USUARIO_ID}};});
+  app.decorate('db',{connect:async()=>({...client,release(){}})});
+  await app.register(clienteRoutes,{prefix:'/v1/cliente'});
+  const preview=await app.inject({url:'/v1/cliente/me/account-deletion/preview'});
+  assert.equal(preview.statusCode,200,preview.body);
+  const request=await app.inject({method:'POST',url:'/v1/cliente/me/account-deletion/requests',payload:{idempotency_key:'account-delete:test-key-001'}});
+  assert.equal(request.statusCode,200,request.body);
+});
+
+for(const foreign of [false,true]) test('confirmacion rechaza '+(foreign?'solicitud ajena':'reautenticacion incorrecta')+' sin mutaciones', async t=>{
+  const app=await adminModeApp();t.after(()=>app.close());let connections=0;const calls=[];
+  app.decorate('requireRoles',()=>async request=>{request.claims={cliente_id:CLIENTE_ID,user:{id_persona:PERSONA_ID,id_usuario:USUARIO_ID}};});
+  app.decorate('supabaseAdmin',{auth:{getUser:async()=>({data:{user:{id:foreign?USUARIO_ID:CLIENTE_ID}},error:null})}});
+  app.decorate('db',{connect:async()=>{connections++;return {release(){},query:async(sql,params)=>{calls.push({sql,params});return {rows:[]};}};}});
+  await app.register(clienteRoutes,{prefix:'/v1/cliente'});
+  const response=await app.inject({method:'POST',url:`/v1/cliente/me/account-deletion/requests/${REQUEST_ID}/confirm`,payload:{reauth_token:makeJwt(),confirmacion_texto:'ELIMINAR MI CUENTA',acepta_perder_masterpuntos:true,acepta_cancelar_membresia:true,acepta_historial_anonimizado:true,acepta_irreversibilidad:true}});
+  assert.equal(response.statusCode,foreign?404:403,response.body);
+  assert.equal(calls.filter(x=>/^\s*(UPDATE|INSERT|DELETE)\b/.test(x.sql)).length,0);
+  if(!foreign)assert.equal(connections,0);
+});
+
 test("ejecucion publica con token valido y replay completado responde correctamente", async () => {
   const token = generateAccountDeletionExecutionToken();
-  const app = Fastify();
+  const app = await adminModeApp();
   app.decorate("db", { async connect() { return createExecutionClient({ states: ["completada"], token }); } });
   await app.register(publicAccountDeletionRoutes, { prefix: "/v1/public/account-deletion" });
   const response = await app.inject({
@@ -555,7 +579,7 @@ test("ejecucion publica con token valido y replay completado responde correctame
 });
 
 test("ejecucion publica sin token responde 400", async () => {
-  const app = Fastify();
+  const app = await adminModeApp();
   await app.register(publicAccountDeletionRoutes, { prefix: "/v1/public/account-deletion" });
   const response = await app.inject({
     method: "POST",
@@ -568,7 +592,7 @@ test("ejecucion publica sin token responde 400", async () => {
 
 test("token incorrecto responde 401", async () => {
   const token = generateAccountDeletionExecutionToken();
-  const app = Fastify();
+  const app = await adminModeApp();
   app.decorate("db", { async connect() { return createExecutionClient({ states: ["evaluada"], token }); } });
   await app.register(publicAccountDeletionRoutes, { prefix: "/v1/public/account-deletion" });
   const response = await app.inject({

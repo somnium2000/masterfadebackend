@@ -6,7 +6,7 @@ import { fixture, body, USER } from './auth-recovery-qa02i.test.mjs';
 
 // AM: Proveedor estricto y persistencia exclusivamente en memoria; sin conexiones.
 async function setup(t, options = {}) {
-  const f = await fixture(t, { ...options, adminMode: Boolean(options.newSocial || options.newProvision) });
+  const f = await fixture(t, { ...options, adminMode: true });
   const providerSecret = randomBytes(40).toString('hex');
   const authSessions = new Map(), appSessions = new Map(), calls = [];
   const other = randomUUID(), oldSid = randomUUID();
@@ -139,7 +139,7 @@ function cookie(response) {
   const values = response.headers['set-cookie'];
   return (Array.isArray(values) ? values : [values || '']).find(v => v.startsWith('mf_session='))?.split(';')[0];
 }
-const probe = (f, value) => f.app.inject({ url: '/probe', headers: { cookie: value } });
+const probe = (f, value) => f.app.inject({ url: '/v1/health', headers: { cookie: value } });
 function rejected(response, f, before = 0) {
   assert.ok([401, 403, 503].includes(response.statusCode), response.body);
   assert.equal(cookie(response), undefined); assert.equal(f.stats().inserts, before);

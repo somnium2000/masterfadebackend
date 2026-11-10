@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import Fastify from 'fastify';
+import { adminModeApp } from './helpers/adminModeApp.mjs';
 import cookie from '@fastify/cookie';
 import jwt from 'jsonwebtoken';
 import authRoutes from '../src/routes/v1/auth.js';
@@ -48,25 +48,25 @@ async function setup(t, options = {}) {
     if (sql.includes('token_jti_hash = $3')) return { rows: state === 'inexistente' ? [] : [{ estado: state, ultimo_uso_at: new Date(options.idle ? 0 : Date.now()), expira_at: new Date(state === 'expirada' ? 0 : Date.now() + 3600000), revocada_at: state === 'revocada' ? new Date() : null }] };
     return { rows: [], rowCount: 0 };
   };
-  const app = Fastify(); app.decorate('db', { query, connect: async () => ({ query, release() {} }) });
+  const app = await adminModeApp(); app.decorate('db', { query, connect: async () => ({ query, release() {} }) });
   app.decorate('supabase', { auth: { signInWithPassword: async () => { providerCalls++; return options.invalidPassword ? { error: { status: 401 } } : { data: { user: { id: USER } } }; } } });
   const syntheticUser = { id: USER, email: 'synthetic@example.test', email_confirmed_at: new Date().toISOString() };
   app.decorate('supabaseAdmin', { auth: { getUser: async () => ({ data: { user: syntheticUser } }), admin: { getUserById: async () => ({ data: { user: syntheticUser } }) } } });
-  await app.register(cookie); await app.register(authPlugin); await app.register(authRoutes, { prefix: '/auth' });
-  app.get('/guard', { preHandler: app.requireRoles(['cliente']) }, async () => ({ ok: true }));
+  await app.register(cookie); await app.register(authPlugin); await app.register(authRoutes, { prefix: '/v1/auth' });
+  app.get('/v1/health', { preHandler: app.requireRoles(['cliente']) }, async () => ({ ok: true }));
   await app.ready(); t.after(() => app.close());
   return { app, queries, stats: () => ({ state, sessions, providerCalls, resets }) };
 }
 
 for (const options of [{ lockError: true }, { protectionError: true }]) test(`login fail-closed ${JSON.stringify(options)}`, async t => {
   const f = await setup(t, options);
-  const r = await f.app.inject({ method: 'POST', url: '/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
+  const r = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
   assert.equal(r.statusCode, 503); assert.equal(r.json().error.code, 'AUTH_LOCK_CHECK_UNAVAILABLE');
   assert.equal(r.headers['set-cookie'], undefined); assert.equal(f.stats().sessions, 0); assert.equal(f.stats().resets, 0);
   assert.ok(!r.body.includes('synthetic private'));
 });
 test('bloqueo real conserva 429 y no se elimina antes de validarlo', async t => {
-  const f = await setup(t, { locked: true }); const r = await f.app.inject({ method: 'POST', url: '/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
+  const f = await setup(t, { locked: true }); const r = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
   assert.equal(r.statusCode, 429); assert.equal(r.json().error.code, 'AUTH_USER_TEMPORARILY_LOCKED'); assert.equal(f.stats().sessions, 0); assert.equal(f.stats().resets, 0);
 });
 test('bypass protegido solo después de verificación positiva', async t => {
@@ -78,40 +78,40 @@ test('identidad inválida no consulta el bloqueo', async () => {
   assert.equal(result.ok, false); assert.equal(calls, 0);
 });
 test('login válido conserva sesión y cookies', async t => {
-  const f = await setup(t); const r = await f.app.inject({ method: 'POST', url: '/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
+  const f = await setup(t); const r = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
   assert.equal(r.statusCode, 200); assert.equal(f.stats().sessions, 1); assert.ok(r.headers['set-cookie']);
 });
 test('credenciales incorrectas mantienen rechazo', async t => {
-  const f = await setup(t, { invalidPassword: true }); const r = await f.app.inject({ method: 'POST', url: '/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
+  const f = await setup(t, { invalidPassword: true }); const r = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
   assert.equal(r.statusCode, 401); assert.equal(f.stats().sessions, 0);
 });
 test('rate limiting impide contactar al proveedor', async t => {
-  const f = await setup(t, { rateLimited: true }); const r = await f.app.inject({ method: 'POST', url: '/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
+  const f = await setup(t, { rateLimited: true }); const r = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { identifier: 'synthetic@example.test', contrasena: 'synthetic' } });
   assert.equal(r.statusCode, 429); assert.equal(f.stats().providerCalls, 0);
 });
 for (const state of ['activa', 'cerrada', 'revocada', 'expirada', 'inexistente']) test(`logout idempotente: ${state}`, async t => {
   const f = await setup(t, { state }); const headers = { cookie: `mf_session=${token()}` };
-  for (let i = 0; i < 2; i++) { const r = await f.app.inject({ method: 'POST', url: '/auth/logout', headers }); assert.equal(r.statusCode, 200); assert.equal(r.json().data.logged_out, true); }
-  assert.equal((await f.app.inject({ url: '/guard', headers })).statusCode, 401);
+  for (let i = 0; i < 2; i++) { const r = await f.app.inject({ method: 'POST', url: '/v1/auth/logout', headers }); assert.equal(r.statusCode, 200); assert.equal(r.json().data.logged_out, true); }
+  assert.equal((await f.app.inject({ url: '/v1/health', headers })).statusCode, 401);
 });
 for (const options of [{ closeError: true }, { noUpdate: true }]) test(`no confirma cierre sin revocación: ${JSON.stringify(options)}`, async t => {
   const f = await setup(t, options); const headers = { cookie: `mf_session=${token()}` };
-  const r = await f.app.inject({ method: 'POST', url: '/auth/logout', headers });
+  const r = await f.app.inject({ method: 'POST', url: '/v1/auth/logout', headers });
   assert.equal(r.statusCode, 503); assert.equal(r.json().error.code, 'AUTH_LOGOUT_UNCONFIRMED'); assert.equal(r.headers['set-cookie'], undefined);
-  assert.equal((await f.app.inject({ url: '/guard', headers })).statusCode, 200);
+  assert.equal((await f.app.inject({ url: '/v1/health', headers })).statusCode, 200);
 });
 test('sin token o token inválido no existe una sesión utilizable que revocar', async t => {
   const f = await setup(t);
-  for (const value of ['', 'invalid']) { const r = await f.app.inject({ method: 'POST', url: '/auth/logout', headers: { cookie: `mf_session=${value}` } }); assert.equal(r.statusCode, 200); }
+  for (const value of ['', 'invalid']) { const r = await f.app.inject({ method: 'POST', url: '/v1/auth/logout', headers: { cookie: `mf_session=${value}` } }); assert.equal(r.statusCode, 200); }
 });
 test('logout concurrente cierra una vez y ambos resultados son seguros', async t => {
   const f = await setup(t); const headers = { cookie: `mf_session=${token()}` };
-  const results = await Promise.all([1, 2].map(() => f.app.inject({ method: 'POST', url: '/auth/logout', headers })));
+  const results = await Promise.all([1, 2].map(() => f.app.inject({ method: 'POST', url: '/v1/auth/logout', headers })));
   assert.ok(results.every(r => r.statusCode === 200)); assert.equal(f.stats().state, 'cerrada');
-  assert.equal((await f.app.inject({ url: '/guard', headers })).statusCode, 401);
+  assert.equal((await f.app.inject({ url: '/v1/health', headers })).statusCode, 401);
 });
 test('inactividad sigue rechazando la sesión', async t => {
-  const f = await setup(t, { idle: true }); const r = await f.app.inject({ url: '/guard', headers: { cookie: `mf_session=${token()}` } });
+  const f = await setup(t, { idle: true }); const r = await f.app.inject({ url: '/v1/health', headers: { cookie: `mf_session=${token()}` } });
   assert.equal(r.statusCode, 401); assert.equal(r.json().error.code, 'AUTH_SESSION_IDLE_EXPIRED');
 });
 test('fallo SQL en comprobación posterior tampoco confirma cierre', async () => {
@@ -121,7 +121,7 @@ test('fallo SQL en comprobación posterior tampoco confirma cierre', async () =>
 for (const endpoint of ['exchange', 'social/confirm']) test(`${endpoint} no elude el fallo del bloqueo temporal`, async t => {
   const f = await setup(t, { lockError: true });
   const payload = endpoint === 'exchange' ? { supabase_token: jwt.sign({ sub: USER, session_id: SID }, process.env.JWT_SECRET, { expiresIn: '1h' }) } : { social_confirm_token: jwt.sign({ sub: USER, email: 'synthetic@example.test', token_type: 'social_confirm', session_id: SID }, process.env.JWT_SECRET, { issuer: 'masterfade-api', audience: 'masterfade-app', expiresIn: '1h' }) };
-  const r = await f.app.inject({ method: 'POST', url: '/auth/' + endpoint, payload });
+  const r = await f.app.inject({ method: 'POST', url: '/v1/auth/' + endpoint, payload });
   assert.equal(r.statusCode, 503, r.body); assert.equal(r.json().error.code, 'AUTH_LOCK_CHECK_UNAVAILABLE');
   assert.equal(f.stats().sessions, 0); assert.equal(r.headers['set-cookie'], undefined);
 });

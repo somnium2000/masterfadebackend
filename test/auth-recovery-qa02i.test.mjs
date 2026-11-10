@@ -69,7 +69,8 @@ async function fixture(t,options={}){
  };
  if(options.security)await app.register(security);else await app.register(cookie);
  await app.register(authPlugin);await app.register(authRoutes,{prefix:'/v1/auth'});
- app.get('/probe',{preHandler:app.authenticate},async()=>({ok:true}));await app.ready();
+ app.get('/probe',{preHandler:app.authenticate},async()=>({ok:true}));
+ app.get('/v1/health',{preHandler:app.authenticate},async()=>({ok:true}));await app.ready();
  t.after(async()=>{await app.close();globalThis.fetch=prior;});
  return {app,calls,actions,providerCalls,get generated(){return generated;},state:()=>({password,revoked,updates,delivered,verifies,consumed}),reset:p=>app.inject({method:'POST',url:'/v1/auth/reset-password',payload:p||body})};
 }
