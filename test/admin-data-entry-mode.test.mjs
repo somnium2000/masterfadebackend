@@ -9,20 +9,24 @@ import personas from '../src/routes/v1/admin/personas.js';
 import catalog from '../src/routes/v1/admin/catalog.js';
 import plans from '../src/routes/v1/admin/plans.js';
 import cortesias from '../src/routes/v1/admin/cortesias.js';
+import cliente from '../src/routes/v1/cliente.js';
+import citas from '../src/routes/v1/citas.js';
+import points from '../src/routes/v1/clientePoints.js';
+import publicCitas from '../src/routes/v1/public/citas.js';
 import { globalErrorHandler } from '../src/utils/errors.js';
 
 const ID='11111111-1111-4111-8111-111111111111';
 async function fixture(t,{enabled=true,role='super_admin',asset=null,identityExists=false}={}){
  const app=Fastify();const state={business:0,auth:0,queries:0};
  app.setErrorHandler(globalErrorHandler);
- await app.register(fp(async a=>{a.decorate('config',{adminDataEntryMode:enabled});},{name:'env-plugin'}));
+ await app.register(fp(async a=>{a.decorate('config',{adminDataEntryMode:enabled,paymentProvider:'disabled'});},{name:'env-plugin'}));
  app.decorate('db',{async query(sql){state.queries++;if(sql.includes('FROM public.usuarios'))return {rows:identityExists?[{exists:1}]:[]};return {rows:asset?[asset]:[],rowCount:asset?1:0};}});
  app.db.connect=async()=>({query:app.db.query.bind(app.db),release(){}});
  app.decorate('requireRoles',roles=>async(req,reply)=>{state.auth++;req.claims={user:{id_usuario:ID},roles:[role],branch_ids:[]};if(!roles.includes(role))return reply.code(403).send({code:'ROLE_FORBIDDEN'});});
  await app.register(gate);await app.register(cors,{origin:'https://masterfadeapp.com'});
  t.after(()=>app.close());return {app,state};
 }
-const blocked=[['POST','/v1/public/citas'],['POST','/v1/public/citas/hold'],['POST','/v1/citas/hold'],['POST','/v1/cliente/planes/orden'],['POST','/v1/cliente/planes/pago-intent'],['POST','/v1/cliente/planes/simulator/event'],['POST','/v1/pagos'],['POST','/v1/pagos/reservas'],['POST','/v1/public/pagos/webhook/pixelpay'],['POST','/v1/pagos/webhook/banpais'],['POST','/v1/account-deletion'],['POST','/v1/admin/account-deletion'],['POST','/v1/public/account-deletion'],['POST','/v1/auth/register'],['POST','/v1/auth/register/confirm'],['POST','/v1/auth/register/resend'],['POST','/v1/auth/social/confirm'],['PATCH','/v1/barbero/perfil'],['PATCH','/v1/admin/sucursales/'+ID+'/inactivar'],['DELETE','/v1/admin/personas/usuarios/'+ID+'/permanente'],['POST','/v1/admin/configuracion/promociones'],['POST','/v1/admin/configuracion/comunicacion/campanias/'+ID+'/enviar'],['POST','/v1/admin/seguridad/sesiones/revocar-todas'],['POST','/v1/admin/masterpuntos/legacy-migracion'],['POST','/v1/new-business-route']];
+const blocked = [["POST","/v1/public/citas"],["POST","/v1/public/citas/hold"],["POST","/v1/citas"],["POST","/v1/citas/hold"],["POST","/v1/citas/hold/11111111-1111-4111-8111-111111111111/confirmar"],["POST","/v1/citas/pendiente/11111111-1111-4111-8111-111111111111/retomar"],["POST","/v1/cliente/puntos/canjear"],["POST","/v1/cliente/planes/adquirir"],["POST","/v1/cliente/planes/orden"],["POST","/v1/cliente/planes/pago-intent"],["POST","/v1/cliente/planes/confirmar-pago"],["POST","/v1/cliente/planes/pago-intent/11111111-1111-4111-8111-111111111111/estado"],["POST","/v1/cliente/planes/simulator/event"],["POST","/v1/pagos"],["POST","/v1/pagos/reservas"],["POST","/v1/auth/not-approved"]];
 const publicCatalogReads=[
  ['GET','/v1/public/catalog/sucursales'],
  ['GET','/v1/public/catalog/servicios'],
@@ -32,6 +36,24 @@ const publicCatalogReads=[
  ['GET','/v1/public/agenda/barberos'],
  ['GET','/v1/public/catalog/planes'],
 ];
+test('real commercial controllers reject every registered blocked operation before auth or database effects',async t=>{
+ const {app,state}=await fixture(t,{role:'cliente'});
+ await app.register(cliente,{prefix:'/v1/cliente'});
+ await app.register(citas,{prefix:'/v1/citas'});
+ await app.register(points,{prefix:'/v1/cliente/puntos'});
+ await app.register(publicCitas,{prefix:'/v1/public/citas'});
+ await app.ready();
+ let tested=0;
+ for(const [method,url]of blocked){
+  if(!app.hasRoute({method,url}) && !url.includes(ID))continue;
+  tested++;
+  const response=await app.inject({method,url,payload:{id_servicio:ID,id_sucursal:ID,usar_puntos:true}});
+  assert.equal(response.statusCode,403,response.body);
+  assert.equal(response.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');
+ }
+ assert.ok(tested>=10,`registered operations tested: ${tested}`);
+ assert.equal(state.auth,0);assert.equal(state.queries,0);assert.equal(state.business,0);
+});
 test('approved public catalog reads bypass only the administrative-mode guard',async t=>{
  const {app,state}=await fixture(t);
  for(const [method,url]of publicCatalogReads)app.route({method,url,handler:async()=>{state.business++;return {ok:true};}});
@@ -57,7 +79,7 @@ test('booking availability and commercial public operations remain blocked',asyn
 for(const role of ['super_admin','admin','root','cliente'])test('deny-by-default overrides role '+role,async t=>{
  const {app,state}=await fixture(t,{role});
  for(const [method,url]of blocked)app.route({method,url,preHandler:async()=>{state.auth++;},handler:async()=>{state.business++;return {ok:true};}});
- for(const [method,url]of blocked.filter(([method,url])=>!ADMIN_DATA_ENTRY_ROUTES.includes(method+' '+url))){const r=await app.inject({method,url,payload:{}});assert.equal(r.statusCode,403,r.body);assert.equal(r.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');}
+ for(const [method,url]of blocked){const r=await app.inject({method,url,payload:{}});assert.equal(r.statusCode,403,r.body);assert.equal(r.json().error.code,'ADMIN_DATA_ENTRY_RESTRICTED');}
  assert.equal(state.business,0);assert.equal(state.auth,0);assert.equal(state.queries,0);
 });
 test('unmatched paths, alternative methods and encoded suffix cannot open an endpoint',async t=>{

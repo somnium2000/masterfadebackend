@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
+import fp from "fastify-plugin";
+import gate from "../src/plugins/adminDataEntry.js";
 
 import clienteRoutes from "../src/routes/v1/cliente.js";
 import { sendError } from "../src/utils/errors.js";
@@ -110,6 +112,8 @@ function createDbClient({ profile = createProfile(), failOnClientesUpdate = null
 
 async function createApp({ client = createDbClient(), authorized = true } = {}) {
   const app = Fastify({ logger: false });
+  await app.register(fp(async a => { a.decorate("config", { adminDataEntryMode: true, paymentProvider: "disabled" }); }, { name: "env-plugin" }));
+  await app.register(gate);
   app.decorate("requireRoles", () => async (request, reply) => {
     if (!authorized) {
       return sendError(reply, 403, "No tienes permisos para realizar esta accion", {
