@@ -87,6 +87,26 @@ function parseCorsOrigins(rawValue, fallback = "http://localhost:5173") {
     .filter(Boolean);
 }
 
+export function resolvePixelPayOrderCallbackUrl(rawValue, enabled = false) {
+  if (enabled !== true) return null;
+  const value = String(rawValue || "").trim();
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("PIXELPAY_ORDER_CALLBACK_URL debe ser una URL HTTPS valida.");
+  }
+  if (parsed.protocol !== "https:"
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || parsed.pathname.replace(/\/+$/, "") !== "/v1/pagos/webhook/pixelpay") {
+    throw new Error("PIXELPAY_ORDER_CALLBACK_URL debe apuntar por HTTPS a /v1/pagos/webhook/pixelpay.");
+  }
+  return parsed.toString();
+}
+
 async function envPlugin(app) {
   dotenv.config();
 
@@ -153,6 +173,10 @@ async function envPlugin(app) {
   }
   
   const isProdOrStaging = nodeEnv === "production" || nodeEnv === "staging";
+  const pixelPayWebhookEnabled = parseStrictBooleanEnv(process.env.PIXELPAY_WEBHOOK_ENABLED, {
+    name: "PIXELPAY_WEBHOOK_ENABLED",
+    defaultValue: false,
+  });
 
   const config = {
     nodeEnv,
@@ -165,10 +189,11 @@ async function envPlugin(app) {
     bookingReleaseTokenSecret: resolveBookingReleaseTokenSecret(nodeEnv),
     paymentProvider,
     pixelPayEnv,
-    pixelPayWebhookEnabled: parseStrictBooleanEnv(process.env.PIXELPAY_WEBHOOK_ENABLED, {
-      name: "PIXELPAY_WEBHOOK_ENABLED",
-      defaultValue: false,
-    }),
+    pixelPayWebhookEnabled,
+    pixelPayOrderCallbackUrl: resolvePixelPayOrderCallbackUrl(
+      process.env.PIXELPAY_ORDER_CALLBACK_URL,
+      pixelPayWebhookEnabled
+    ),
     todoPago,
     trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),

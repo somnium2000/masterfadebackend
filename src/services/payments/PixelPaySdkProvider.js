@@ -405,7 +405,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     return transaction.doVoid(request);
   }
 
-  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card } = {}, referenceDate = this.now()) {
+  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card, callbackUrl } = {}, referenceDate = this.now()) {
     const normalizedExpire = normalizeCardExpire(card?.expire, referenceDate);
     const normalizedBillingAddress = text(billing?.address);
     if (isPixelPayBillingAddressPlaceholder(normalizedBillingAddress)) {
@@ -431,6 +431,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
     order.currency = text(currency).toUpperCase();
     order.customer_name = text(customer?.name);
     order.customer_email = text(customer?.email);
+    const normalizedCallbackUrl = text(callbackUrl);
+    if (normalizedCallbackUrl) {
+      order.callback_url = normalizedCallbackUrl;
+    }
 
     for (const source of items) {
       const code = text(source?.code);
@@ -476,6 +480,22 @@ export class PixelPaySdkProvider extends PaymentProvider {
     saleRequest.setCard(paymentCard);
     saleRequest.setBilling(paymentBilling);
     return saleRequest;
+  }
+
+  verifyPaymentHash(paymentHash, orderId) {
+    const normalizedHash = text(paymentHash);
+    const normalizedOrderId = text(orderId);
+    if (!normalizedHash || !normalizedOrderId) return false;
+    try {
+      const transaction = this.createTransaction();
+      return transaction.verifyPaymentHash(
+        normalizedHash,
+        normalizedOrderId,
+        this.secretKey
+      ) === true;
+    } catch {
+      return false;
+    }
   }
 
   readTransactionResult(response) {

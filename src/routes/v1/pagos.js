@@ -176,21 +176,200 @@ export function assertPaymentWebhookContract(app, providerCode) {
       code: "PIXELPAY_WEBHOOK_DISABLED",
     });
   }
-  // `x-client-signature` autentica solicitudes salientes y `payment_hash`
-  // autentica una respuesta de pago. Ninguno demuestra que un POST entrante
-  // provenga de PixelPay. El SDK declara `order_callback`, pero el contrato
-  // publicado de body/reintentos pertenece a Hosted Payment y no documenta
-  // que sea reutilizable para SDK doSale.
-  // Este bloqueo debe ocurrir antes de validar el body o abrir PostgreSQL.
-  throw new AppError(503, "Contrato de autenticidad del callback PixelPay incompleto", {
-    code: "PIXELPAY_WEBHOOK_PROVIDER_CONTRACT_BLOCKED",
-    details: {
-      integration: "sdk_do_sale",
-      sdkRemoteCallbackDeclared: true,
-      hostedCallbackContractApplicable: false,
-      remoteCallbackAuthenticated: false,
-    },
-  });
+}
+
+function pixelPayCallbackEventId({ orderId, paymentUuid, paymentHash }) {
+  const digest = crypto.createHash("sha256")
+    .update([orderId, paymentUuid, paymentHash].join("|"), "utf8")
+    .digest("hex");
+  return `pixelpay_order_callback_${digest}`;
+}
+
+function classifyCallbackStatusError(error) {
+  const code = safeText(error?.code)?.toUpperCase();
+  if (code === "PIXELPAY_STATUS_PRECONDITION_FAILED") return "precondicion_fallida";
+  if (code === "PIXELPAY_NETWORK_ERROR") return "error_red";
+  if (code === "PIXELPAY_RESPONSE_INVALID") return "respuesta_invalida";
+  return "error_proveedor";
+}
+
+async function recordCallbackStatusCheck(db, {
+  idIntent,
+  paymentUuid,
+  providerStatus = null,
+  result,
+  statusCode = null,
+  errorCode = null,
+  durationMs,
+  requestId,
+}) {
+  await db.query(
+    `SELECT app_private.registrar_payment_status_check_v1(
+       $1::uuid, $2::text, 'automatico', $3::text, $4::text,
+       $5::smallint, $6::text, $7::integer, $8::text, $9::timestamptz
+     ) AS id_status_check`,
+    [
+      idIntent,
+      paymentUuid,
+      safeText(providerStatus)?.slice(0, 120) || null,
+      result,
+      Number.isInteger(statusCode) ? statusCode : null,
+      safeText(errorCode)?.slice(0, 120) || null,
+      Math.min(Math.max(0, Math.trunc(durationMs || 0)), 2147483647),
+      safeText(requestId),
+      new Date().toISOString(),
+    ]
+  );
+}
+
+export async function processPixelPayOrderCallback({ db, provider, body, requestId }) {
+  const orderId = safeText(body?.order_id);
+  const paymentUuid = safeText(body?.payment_uuid);
+  const paymentHash = safeText(body?.payment_hash);
+  if (!orderId || !paymentUuid || !paymentHash) {
+    throw new AppError(400, "Callback PixelPay incompleto", {
+      code: "PIXELPAY_CALLBACK_REQUIRED_FIELDS_MISSING",
+    });
+  }
+  if (typeof provider?.verifyPaymentHash !== "function"
+    || provider.verifyPaymentHash(paymentHash, orderId) !== true) {
+    throw new AppError(401, "Hash de pago PixelPay invalido", {
+      code: "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID",
+    });
+  }
+
+  const providerEventId = pixelPayCallbackEventId({ orderId, paymentUuid, paymentHash });
+  const client = await db.connect();
+  let intent;
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
+      `pixelpay-order-callback:${orderId}`,
+    ]);
+    const lookup = await client.query(
+      `SELECT pi.id_intent, pi.id_provider, pi.orden_compra, pi.provider_session_id,
+              pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
+         FROM public.payment_intents pi
+         JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
+        WHERE pp.codigo = 'pixelpay'
+          AND pi.orden_compra = $1::text
+        ORDER BY pi.created_at DESC
+        LIMIT 2
+        FOR UPDATE OF pi`,
+      [orderId]
+    );
+    if (lookup.rows.length !== 1) {
+      throw new AppError(lookup.rows.length ? 409 : 404, "Orden PixelPay no identificada de forma unica", {
+        code: lookup.rows.length
+          ? "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS"
+          : "PIXELPAY_CALLBACK_ORDER_NOT_FOUND",
+      });
+    }
+    intent = lookup.rows[0];
+    const storedPaymentUuid = safeText(intent.provider_session_id);
+    if (storedPaymentUuid && storedPaymentUuid !== paymentUuid) {
+      throw new AppError(409, "El UUID PixelPay no coincide con la orden", {
+        code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+      });
+    }
+    const inserted = await client.query(
+      `INSERT INTO public.payment_events (
+         id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+       ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.received', TRUE, $3::jsonb, $4::uuid)
+       ON CONFLICT (id_provider, provider_event_id) DO NOTHING
+       RETURNING id_event`,
+      [
+        intent.id_provider,
+        providerEventId,
+        { order_id: orderId, payment_uuid: paymentUuid },
+        intent.id_intent,
+      ]
+    );
+    await client.query("COMMIT");
+    if (!inserted.rows[0]) {
+      return {
+        provider: "pixelpay",
+        provider_event_id: providerEventId,
+        status: "pending",
+        processed: false,
+        duplicate: true,
+        extension_pending: true,
+      };
+    }
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  const startedAt = Date.now();
+  let status;
+  try {
+    status = await provider.queryPaymentStatus(paymentUuid, {
+      orderId,
+      amount: Number(intent.monto_hnl),
+    });
+    const uuidMatches = safeText(status?.resultPaymentUuid) === paymentUuid;
+    const verified = status?.ok === true
+      && status?.success === true
+      && status?.providerContractValid === true
+      && status?.paymentHashValid === true
+      && status?.amountMatches === true
+      && uuidMatches;
+    await recordCallbackStatusCheck(db, {
+      idIntent: intent.id_intent,
+      paymentUuid,
+      providerStatus: status?.status,
+      result: verified ? "ok" : "respuesta_invalida",
+      statusCode: status?.statusCode,
+      durationMs: Date.now() - startedAt,
+      requestId,
+    });
+    await db.query(
+      `UPDATE public.payment_events
+          SET procesado_at = now(),
+              resultado_procesamiento = $3::text
+        WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
+      [
+        intent.id_provider,
+        providerEventId,
+        verified ? "status_verificado_pendiente_conciliacion" : "status_incierto_pendiente",
+      ]
+    );
+    return {
+      provider: "pixelpay",
+      provider_event_id: providerEventId,
+      status: safeText(status?.status)?.toLowerCase() || "pending",
+      processed: false,
+      duplicate: false,
+      extension_pending: true,
+    };
+  } catch (error) {
+    await recordCallbackStatusCheck(db, {
+      idIntent: intent.id_intent,
+      paymentUuid,
+      result: classifyCallbackStatusError(error),
+      statusCode: error?.statusCode,
+      errorCode: error?.code,
+      durationMs: Date.now() - startedAt,
+      requestId,
+    });
+    await db.query(
+      `UPDATE public.payment_events
+          SET procesado_at = now(), resultado_procesamiento = 'status_incierto_pendiente'
+        WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
+      [intent.id_provider, providerEventId]
+    );
+    return {
+      provider: "pixelpay",
+      provider_event_id: providerEventId,
+      status: "pending",
+      processed: false,
+      duplicate: false,
+      extension_pending: true,
+    };
+  }
 }
 
 async function loadOwnedAppointment(client, { citaId, clienteId, personaId }) {
@@ -576,6 +755,15 @@ export default async function pagosRoutes(app) {
       try {
         const providerCode = String(request.params?.proveedor || "").trim().toLowerCase();
         assertPaymentWebhookContract(app, providerCode);
+        if (providerCode === "pixelpay") {
+          const result = await processPixelPayOrderCallback({
+            db: app.db,
+            provider: PaymentProviderFactory.create(),
+            body: request.body,
+            requestId: request.id,
+          });
+          return sendOk(reply, result);
+        }
         validateWebhookFreshness(request);
         dbClient = await app.db.connect();
         const body = request.body && typeof request.body === "object" ? request.body : {};
