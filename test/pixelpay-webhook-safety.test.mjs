@@ -42,8 +42,15 @@ test("callback URL solo se materializa con flag y endpoint HTTPS exacto", () => 
   );
 });
 
-function callbackFixture({ duplicate = false, status = {}, statusError = null, intentOverrides = {} } = {}) {
+function callbackFixture({
+  duplicate = false,
+  eventResult = null,
+  status = {},
+  statusError = null,
+  intentOverrides = {},
+} = {}) {
   const queries = [];
+  const event = { exists: duplicate, result: eventResult, claimedAt: null };
   const intent = {
     id_intent: "11111111-1111-4111-8111-111111111111",
     id_provider: "22222222-2222-4222-8222-222222222222",
@@ -60,7 +67,25 @@ function callbackFixture({ duplicate = false, status = {}, statusError = null, i
       queries.push({ text, params });
       if (text.includes("FROM public.payment_intents pi")) return { rows: [intent] };
       if (text.includes("INSERT INTO public.payment_events")) {
-        return { rows: duplicate ? [] : [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+        if (event.exists) return { rows: [] };
+        event.exists = true;
+        return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+      }
+      if (text.includes("status_consulta_en_curso")) {
+        const retryable = event.result == null || [
+          "status_consulta_en_curso",
+          "status_412_pendiente",
+          "status_error_red_pendiente",
+          "status_incierto_pendiente",
+        ].includes(event.result);
+        const cooldownMs = Number(params[2] || 0) * 1000;
+        if (!retryable
+          || (event.claimedAt != null && (Date.now() - event.claimedAt) < cooldownMs)) {
+          return { rows: [] };
+        }
+        event.result = "status_consulta_en_curso";
+        event.claimedAt = Date.now();
+        return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
       }
       return { rows: [] };
     },
@@ -68,7 +93,12 @@ function callbackFixture({ duplicate = false, status = {}, statusError = null, i
   };
   const db = {
     async connect() { return client; },
-    async query(sql, params = []) { queries.push({ text: String(sql), params }); return { rows: [] }; },
+    async query(sql, params = []) {
+      const text = String(sql);
+      queries.push({ text, params });
+      if (text.includes("UPDATE public.payment_events") && params[2]) event.result = params[2];
+      return { rows: [] };
+    },
   };
   const provider = {
     verifyPaymentHash(hash, orderId) { return hash === "valid-hash" && orderId === "ORDER-1"; },
@@ -83,11 +113,14 @@ function callbackFixture({ duplicate = false, status = {}, statusError = null, i
         resultPaymentUuid: "P-1",
         status: "COMPLETED",
         statusCode: 200,
+        approved: true,
+        incomplete: false,
+        transactionId: "TX-1",
         ...status,
       };
     },
   };
-  return { db, provider, queries };
+  return { db, provider, queries, event };
 }
 
 const validCallback = {
@@ -109,6 +142,14 @@ test("callback valido verifica Status pero conserva pendiente", async () => {
   assert.equal(result.extension_pending, true);
   assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
   assert.equal(fixture.queries.some(({ text }) => text.includes("confirmar_reserva_pagada")), false);
+  assert.equal(
+    fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.received")),
+    true
+  );
+  assert.equal(
+    fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.status_verified")),
+    true
+  );
 });
 
 test("callback falsificado se rechaza antes de abrir PostgreSQL", async () => {
@@ -127,8 +168,11 @@ test("callback falsificado se rechaza antes de abrir PostgreSQL", async () => {
   assert.equal(connects, 0);
 });
 
-test("callback duplicado responde idempotente sin repetir Status", async () => {
-  const fixture = callbackFixture({ duplicate: true });
+test("callback ya verificado responde idempotente sin repetir Status", async () => {
+  const fixture = callbackFixture({
+    duplicate: true,
+    eventResult: "status_verificado_pendiente_conciliacion",
+  });
   let statusCalls = 0;
   fixture.provider.queryPaymentStatus = async () => { statusCalls += 1; throw new Error("no debe consultar"); };
   const result = await processPixelPayOrderCallback({
@@ -139,6 +183,123 @@ test("callback duplicado responde idempotente sin repetir Status", async () => {
   });
   assert.equal(result.duplicate, true);
   assert.equal(statusCalls, 0);
+});
+
+test("duplicado pendiente recupera despues de Status 412", async () => {
+  const fixture = callbackFixture({
+    statusError: Object.assign(new Error("precondition"), {
+      code: "PIXELPAY_STATUS_PRECONDITION_FAILED",
+      statusCode: 412,
+    }),
+  });
+  let statusCalls = 0;
+  const originalStatus = fixture.provider.queryPaymentStatus;
+  fixture.provider.queryPaymentStatus = async (...args) => {
+    statusCalls += 1;
+    return originalStatus(...args);
+  };
+  const first = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-412-first",
+  });
+  assert.equal(first.status, "pending");
+  assert.equal(fixture.event.result, "status_412_pendiente");
+
+  fixture.provider.queryPaymentStatus = async () => {
+    statusCalls += 1;
+    return {
+      ok: true,
+      success: true,
+      providerContractValid: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      resultPaymentUuid: "P-1",
+      status: "COMPLETED",
+      statusCode: 200,
+      approved: true,
+      incomplete: false,
+      transactionId: "TX-1",
+    };
+  };
+  const recovered = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-412-retry",
+    retryCooldownSeconds: 0,
+  });
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.duplicate, true);
+  assert.equal(recovered.processed, false);
+  assert.equal(fixture.event.result, "status_verificado_pendiente_conciliacion");
+  assert.equal(statusCalls, 2);
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
+});
+
+test("callbacks concurrentes reclaman una sola consulta Status", async () => {
+  const fixture = callbackFixture();
+  let statusCalls = 0;
+  let releaseStatus;
+  let statusStarted;
+  const started = new Promise((resolve) => { statusStarted = resolve; });
+  const release = new Promise((resolve) => { releaseStatus = resolve; });
+  fixture.provider.queryPaymentStatus = async () => {
+    statusCalls += 1;
+    statusStarted();
+    await release;
+    return {
+      ok: true,
+      success: true,
+      providerContractValid: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      resultPaymentUuid: "P-1",
+      status: "COMPLETED",
+      statusCode: 200,
+      approved: true,
+      incomplete: false,
+      transactionId: "TX-1",
+    };
+  };
+
+  const firstPromise = processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-concurrent-1",
+  });
+  await started;
+  const second = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-concurrent-2",
+  });
+  assert.equal(second.duplicate, true);
+  assert.equal(second.processed, false);
+  assert.equal(statusCalls, 1);
+  releaseStatus();
+  await firstPromise;
+  assert.equal(statusCalls, 1);
+});
+
+test("moneda interna distinta de HNL nunca produce confirmacion financiera", async () => {
+  const fixture = callbackFixture({ intentOverrides: { moneda_codigo: "USD" } });
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-currency",
+  });
+  assert.equal(result.processed, false);
+  assert.equal(fixture.event.result, "status_incierto_pendiente");
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
+  assert.equal(
+    fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.status_verified")),
+    false
+  );
 });
 
 test("Status 412 y monto incorrecto permanecen pendientes", async (t) => {

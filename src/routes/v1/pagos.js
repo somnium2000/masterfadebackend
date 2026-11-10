@@ -185,6 +185,13 @@ function pixelPayCallbackEventId({ orderId, paymentUuid, paymentHash }) {
   return `pixelpay_order_callback_${digest}`;
 }
 
+function pixelPayCallbackStatusEventId({ providerEventId, transactionId }) {
+  const digest = crypto.createHash("sha256")
+    .update([providerEventId, transactionId].join("|"), "utf8")
+    .digest("hex");
+  return `pixelpay_callback_status_${digest}`;
+}
+
 function classifyCallbackStatusError(error) {
   const code = safeText(error?.code)?.toUpperCase();
   if (code === "PIXELPAY_STATUS_PRECONDITION_FAILED") return "precondicion_fallida";
@@ -222,7 +229,13 @@ async function recordCallbackStatusCheck(db, {
   );
 }
 
-export async function processPixelPayOrderCallback({ db, provider, body, requestId }) {
+export async function processPixelPayOrderCallback({
+  db,
+  provider,
+  body,
+  requestId,
+  retryCooldownSeconds = 90,
+}) {
   const orderId = safeText(body?.order_id);
   const paymentUuid = safeText(body?.payment_uuid);
   const paymentHash = safeText(body?.payment_hash);
@@ -241,6 +254,7 @@ export async function processPixelPayOrderCallback({ db, provider, body, request
   const providerEventId = pixelPayCallbackEventId({ orderId, paymentUuid, paymentHash });
   const client = await db.connect();
   let intent;
+  let duplicate;
   try {
     await client.query("BEGIN");
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
@@ -285,14 +299,43 @@ export async function processPixelPayOrderCallback({ db, provider, body, request
         intent.id_intent,
       ]
     );
+    duplicate = !inserted.rows[0];
+    const claimed = await client.query(
+      `UPDATE public.payment_events
+          SET procesado_at = now(),
+              resultado_procesamiento = 'status_consulta_en_curso'
+        WHERE id_provider = $1::uuid
+          AND provider_event_id = $2::text
+          AND (
+            resultado_procesamiento IS NULL
+            OR (
+              resultado_procesamiento IN (
+                'status_consulta_en_curso',
+                'status_412_pendiente',
+                'status_error_red_pendiente',
+                'status_incierto_pendiente'
+              )
+              AND (
+                procesado_at IS NULL
+                OR procesado_at <= now() - make_interval(secs => $3::integer)
+              )
+            )
+          )
+       RETURNING id_event`,
+      [
+        intent.id_provider,
+        providerEventId,
+        Math.min(Math.max(0, Math.trunc(retryCooldownSeconds || 0)), 300),
+      ]
+    );
     await client.query("COMMIT");
-    if (!inserted.rows[0]) {
+    if (!claimed.rows[0]) {
       return {
         provider: "pixelpay",
         provider_event_id: providerEventId,
         status: "pending",
         processed: false,
-        duplicate: true,
+        duplicate,
         extension_pending: true,
       };
     }
@@ -311,21 +354,51 @@ export async function processPixelPayOrderCallback({ db, provider, body, request
       amount: Number(intent.monto_hnl),
     });
     const uuidMatches = safeText(status?.resultPaymentUuid) === paymentUuid;
-    const verified = status?.ok === true
+    const currencyMatches = safeText(intent.moneda_codigo)?.toUpperCase() === "HNL";
+    const financiallyVerified = status?.ok === true
       && status?.success === true
       && status?.providerContractValid === true
       && status?.paymentHashValid === true
       && status?.amountMatches === true
+      && ["COMPLETED", "PAID"].includes(safeText(status?.status)?.toUpperCase())
+      && status?.approved === true
+      && status?.incomplete !== true
+      && Boolean(safeText(status?.transactionId))
+      && currencyMatches
       && uuidMatches;
     await recordCallbackStatusCheck(db, {
       idIntent: intent.id_intent,
       paymentUuid,
       providerStatus: status?.status,
-      result: verified ? "ok" : "respuesta_invalida",
+      result: financiallyVerified ? "ok" : "respuesta_invalida",
       statusCode: status?.statusCode,
       durationMs: Date.now() - startedAt,
       requestId,
     });
+    if (financiallyVerified) {
+      await db.query(
+        `INSERT INTO public.payment_events (
+           id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+         ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.status_verified', TRUE, $3::jsonb, $4::uuid)
+         ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+        [
+          intent.id_provider,
+          pixelPayCallbackStatusEventId({
+            providerEventId,
+            transactionId: status.transactionId,
+          }),
+          {
+            order_id: orderId,
+            payment_uuid: paymentUuid,
+            transaction_id: status.transactionId,
+            amount: Number(intent.monto_hnl),
+            currency: safeText(intent.moneda_codigo)?.toUpperCase(),
+            provider_status: safeText(status.status)?.toUpperCase(),
+          },
+          intent.id_intent,
+        ]
+      );
+    }
     await db.query(
       `UPDATE public.payment_events
           SET procesado_at = now(),
@@ -334,7 +407,9 @@ export async function processPixelPayOrderCallback({ db, provider, body, request
       [
         intent.id_provider,
         providerEventId,
-        verified ? "status_verificado_pendiente_conciliacion" : "status_incierto_pendiente",
+        financiallyVerified
+          ? "status_verificado_pendiente_conciliacion"
+          : "status_incierto_pendiente",
       ]
     );
     return {
@@ -342,10 +417,15 @@ export async function processPixelPayOrderCallback({ db, provider, body, request
       provider_event_id: providerEventId,
       status: safeText(status?.status)?.toLowerCase() || "pending",
       processed: false,
-      duplicate: false,
+      duplicate,
       extension_pending: true,
     };
   } catch (error) {
+    const callbackResult = safeText(error?.code)?.toUpperCase() === "PIXELPAY_STATUS_PRECONDITION_FAILED"
+      ? "status_412_pendiente"
+      : safeText(error?.code)?.toUpperCase() === "PIXELPAY_NETWORK_ERROR"
+        ? "status_error_red_pendiente"
+        : "status_incierto_pendiente";
     await recordCallbackStatusCheck(db, {
       idIntent: intent.id_intent,
       paymentUuid,
@@ -357,16 +437,16 @@ export async function processPixelPayOrderCallback({ db, provider, body, request
     });
     await db.query(
       `UPDATE public.payment_events
-          SET procesado_at = now(), resultado_procesamiento = 'status_incierto_pendiente'
+          SET procesado_at = now(), resultado_procesamiento = $3::text
         WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
-      [intent.id_provider, providerEventId]
+      [intent.id_provider, providerEventId, callbackResult]
     );
     return {
       provider: "pixelpay",
       provider_event_id: providerEventId,
       status: "pending",
       processed: false,
-      duplicate: false,
+      duplicate,
       extension_pending: true,
     };
   }
