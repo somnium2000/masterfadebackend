@@ -241,6 +241,44 @@ test("callback real con order/uuid verifica Status pero conserva pendiente", asy
   );
 });
 
+test("diagnostico Status muestra solo booleanos y mantiene pendiente evidencia incompleta", async () => {
+  for (const failed of ["paymentHashValid", "amountMatches", "approved", "providerContractValid"]) {
+    const fixture = callbackFixture({ status: { [failed]: false } });
+    const logs = [];
+    await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: validCallback,
+      logger: { info(value) { logs.push(value); } },
+    });
+    const conditions = logs[0].pixelPayCallbackStatusValidation;
+    assert.equal(Object.values(conditions).every(value => typeof value === "boolean"), true);
+    assert.equal(conditions.financiallyVerified, false);
+    assert.deepEqual(Object.keys(conditions).sort(), [
+      "ok", "success", "providerContractValid", "paymentHashValid", "amountMatches",
+      "approved", "incomplete", "uuidMatches", "transactionMatches", "currencyMatches",
+      "statusOrderMatches", "statusCurrencyMatches", "callbackStatusMatches", "financiallyVerified",
+    ].sort());
+    assert.equal(fixture.event.result, "status_incierto_pendiente");
+    assert.equal(fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.status_verified")), false);
+    assert.doesNotMatch(JSON.stringify(logs), /P-1|TX-1|ORDER-1|valid-hash/);
+  }
+});
+
+test("Status verificado no emite diagnostico ni consulta adicional", async () => {
+  const fixture = callbackFixture();
+  let logs = 0;
+  let calls = 0;
+  const originalStatus = fixture.provider.queryPaymentStatus;
+  fixture.provider.queryPaymentStatus = async (...args) => { calls += 1; return originalStatus(...args); };
+  await processPixelPayOrderCallback({
+    db: fixture.db, provider: fixture.provider, body: validCallback,
+    logger: { info() { logs += 1; } },
+  });
+  assert.equal(logs, 0);
+  assert.equal(calls, 1);
+});
+
 test("callback falsificado se rechaza antes de abrir PostgreSQL", async () => {
   let connects = 0;
   const fixture = callbackFixture();

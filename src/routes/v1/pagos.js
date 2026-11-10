@@ -262,6 +262,7 @@ export async function processPixelPayOrderCallback({
   body,
   requestId,
   retryCooldownSeconds = 90,
+  logger = null,
 }) {
   const callbackOrder = safeText(body?.order);
   const legacyOrder = safeText(body?.order_id);
@@ -485,21 +486,42 @@ export async function processPixelPayOrderCallback({
       || safeText(status.resultCurrency)?.toUpperCase() === callbackCurrency;
     const callbackStatusMatches = ["COMPLETED", "PAID", "APPROVED", "SUCCESS"]
       .includes(callbackStatus);
-    const financiallyVerified = status?.ok === true
-      && status?.success === true
-      && status?.providerContractValid === true
-      && status?.paymentHashValid === true
-      && status?.amountMatches === true
-      && ["COMPLETED", "PAID"].includes(safeText(status?.status)?.toUpperCase())
-      && status?.approved === true
-      && status?.incomplete !== true
-      && Boolean(safeText(status?.transactionId))
-      && transactionMatches
-      && currencyMatches
-      && statusOrderMatches
-      && statusCurrencyMatches
-      && callbackStatusMatches
-      && uuidMatches;
+    const financialConditions = {
+      http_ok: status?.ok === true,
+      response_success: status?.success === true,
+      provider_contract_valid: status?.providerContractValid === true,
+      payment_hash_valid: status?.paymentHashValid === true,
+      amount_matches: status?.amountMatches === true,
+      status_approved: ["COMPLETED", "PAID"].includes(safeText(status?.status)?.toUpperCase()),
+      approved: status?.approved === true,
+      not_incomplete: status?.incomplete !== true,
+      transaction_id_present: Boolean(safeText(status?.transactionId)),
+      transaction_id_matches: transactionMatches,
+      intent_currency_valid: currencyMatches,
+      order_matches_or_absent: statusOrderMatches,
+      currency_matches_or_absent: statusCurrencyMatches,
+      callback_status_accepted: callbackStatusMatches,
+      payment_uuid_matches: uuidMatches,
+    };
+    const financiallyVerified = Object.values(financialConditions).every(value => value === true);
+    if (!financiallyVerified) logger?.info?.({
+      pixelPayCallbackStatusValidation: {
+        ok: status?.ok === true,
+        success: status?.success === true,
+        providerContractValid: status?.providerContractValid === true,
+        paymentHashValid: status?.paymentHashValid === true,
+        amountMatches: status?.amountMatches === true,
+        approved: status?.approved === true,
+        incomplete: status?.incomplete === true,
+        uuidMatches,
+        transactionMatches,
+        currencyMatches,
+        statusOrderMatches,
+        statusCurrencyMatches,
+        callbackStatusMatches,
+        financiallyVerified,
+      },
+    }, "PixelPay callback Status financial conditions");
     await recordCallbackStatusCheck(db, {
       idIntent: intent.id_intent,
       paymentUuid: trustedPaymentUuid,
@@ -981,6 +1003,7 @@ export default async function pagosRoutes(app) {
             provider: PaymentProviderFactory.create(),
             body: request.body,
             requestId: request.id,
+            logger: request.log,
           });
           return sendOk(reply, result);
         }
