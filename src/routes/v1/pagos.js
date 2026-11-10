@@ -263,6 +263,7 @@ export async function processPixelPayOrderCallback({
   requestId,
   retryCooldownSeconds = 90,
   logger = null,
+  statusShapeProbeEnabled = false,
 }) {
   const callbackOrder = safeText(body?.order);
   const legacyOrder = safeText(body?.order_id);
@@ -476,6 +477,10 @@ export async function processPixelPayOrderCallback({
     status = await provider.queryPaymentStatus(trustedPaymentUuid, {
       orderId,
       amount: Number(intent.monto_hnl),
+    }, {
+      enabled: statusShapeProbeEnabled === true,
+      requestId,
+      logger,
     });
     const uuidMatches = safeText(status?.resultPaymentUuid) === trustedPaymentUuid;
     const transactionMatches = safeText(status?.transactionId) === trustedTransactionId;
@@ -1004,6 +1009,7 @@ export default async function pagosRoutes(app) {
             body: request.body,
             requestId: request.id,
             logger: request.log,
+            statusShapeProbeEnabled: app.config?.pixelPayStatusShapeProbeEnabled === true,
           });
           return sendOk(reply, result);
         }

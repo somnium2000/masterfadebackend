@@ -1,4 +1,5 @@
 import PixelPaySdk from "@pixelpay/sdk-core";
+import { capturePixelPayStatusShape, emitPixelPayStatusShape } from "./pixelPayStatusShapeProbe.js";
 import { createHash } from "node:crypto";
 import { PaymentProvider } from "./PaymentProvider.js";
 import {
@@ -706,7 +707,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     };
   }
 
-  async queryPaymentStatus(paymentUuid, expected = {}) {
+  async queryPaymentStatus(paymentUuid, expected = {}, shapeProbe = {}) {
     const normalizedUuid = text(paymentUuid);
     if (!normalizedUuid) {
       throw new PixelPaySdkError(
@@ -757,8 +758,11 @@ export class PixelPaySdkProvider extends PaymentProvider {
         }
       );
     }
+    const beforeShape = capturePixelPayStatusShape(this, shapeProbe, response?.data);
     const transactionResult = this.readTransactionResult(response);
     const result = transactionResult.result;
+    emitPixelPayStatusShape(shapeProbe, beforeShape,
+      beforeShape ? capturePixelPayStatusShape(this, shapeProbe, result) : null);
     const resultPaymentUuid = text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
     const resultOrderId = text(result?.order_id) || text(response?.data?.order_id) || null;

@@ -716,6 +716,53 @@ test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", as
   assert.equal(response.json().data.extension_pending, true);
 });
 
+test("callback forwards only server shape config, requestId and logger", async t => {
+  const previousProvider = process.env.PAYMENT_PROVIDER;
+  const previousAdmin = process.env.ADMIN_DATA_ENTRY_MODE;
+  process.env.PAYMENT_PROVIDER = "pixelpay";
+  process.env.ADMIN_DATA_ENTRY_MODE = "false";
+  t.after(() => {
+    PaymentProviderFactory.reset();
+    if (previousProvider === undefined) delete process.env.PAYMENT_PROVIDER; else process.env.PAYMENT_PROVIDER = previousProvider;
+    if (previousAdmin === undefined) delete process.env.ADMIN_DATA_ENTRY_MODE; else process.env.ADMIN_DATA_ENTRY_MODE = previousAdmin;
+  });
+  const results = [];
+  for (const configured of [true, false, undefined]) {
+    const fixture = callbackFixture();
+    let calls = 0;
+    let options;
+    let serverLogger;
+    const original = fixture.provider.queryPaymentStatus;
+    fixture.provider.queryPaymentStatus = async (uuid, expected, probe) => {
+      calls += 1; options = probe;
+      assert.equal(uuid, "P-1");
+      return original(uuid, expected);
+    };
+    PaymentProviderFactory._instance = fixture.provider;
+    const app = Fastify({ genReqId: () => "req-server-synthetic" });
+    app.decorate("config", { pixelPayWebhookEnabled: true,
+      ...(configured === undefined ? {} : { pixelPayStatusShapeProbeEnabled: configured }) });
+    app.decorate("db", fixture.db);
+    app.decorate("requireRoles", () => async () => {});
+    app.addHook("onRequest", async request => { serverLogger = request.log; });
+    await app.register(pagosRoutes, { prefix: "/v1/pagos" });
+    try {
+      const response = await app.inject({ method: "POST",
+        url: "/v1/pagos/webhook/pixelpay?pixelPayStatusShapeProbeEnabled=true",
+        headers: { "x-status-shape-probe-enabled": "true" },
+        payload: { ...validCallback, enabled: true, statusShapeProbeEnabled: true } });
+      assert.equal(response.statusCode, 200);
+      assert.equal(options.enabled, configured === true);
+      assert.equal(options.requestId, "req-server-synthetic");
+      assert.equal(options.logger, serverLogger);
+      assert.equal(calls, 1);
+      results.push(response.json().data);
+    } finally { await app.close(); }
+  }
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(results[1], results[2]);
+});
+
 test("el expirador delega la proteccion a evidencia durable y conserva otros proveedores", async () => {
   const calls = [];
   const client = {

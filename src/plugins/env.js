@@ -1,6 +1,19 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
 import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
+
+export function resolvePixelPayStatusShapeProbeEnabled(env) {
+  const enabled = parseStrictBooleanEnv(env.PIXELPAY_STATUS_SHAPE_PROBE_ENABLED, {
+    name: "PIXELPAY_STATUS_SHAPE_PROBE_ENABLED", defaultValue: false,
+  });
+  if (enabled && (env.ENTORNO !== "qa"
+    || !["development", "test"].includes(env.NODE_ENV)
+    || env.PIXELPAY_ENV !== "sandbox"
+    || env.PIXELPAY_ENDPOINT !== "https://pixelpay.dev")) {
+    throw new Error("PIXELPAY_STATUS_SHAPE_PROBE_ENABLED requiere QA, NODE_ENV development/test y Sandbox autorizado.");
+  }
+  return enabled;
+}
 import { resolveTodoPagoConfig } from "../services/payments/todopago/todoPagoConfig.js";
 import { validatePixelPaySdkConfig } from "../services/payments/PixelPaySdkProvider.js";
 
@@ -181,6 +194,7 @@ async function envPlugin(app) {
     process.env.PIXELPAY_CALLBACK_PROBE_ENABLED,
     { name: "PIXELPAY_CALLBACK_PROBE_ENABLED", defaultValue: false }
   );
+  const pixelPayStatusShapeProbeEnabled = resolvePixelPayStatusShapeProbeEnabled(process.env);
   if (pixelPayCallbackProbeEnabled
     && (isProdOrStaging || pixelPayEnv !== "sandbox" || !pixelPayWebhookEnabled)) {
     throw new Error(
@@ -201,6 +215,7 @@ async function envPlugin(app) {
     pixelPayEnv,
     pixelPayWebhookEnabled,
     pixelPayCallbackProbeEnabled,
+    pixelPayStatusShapeProbeEnabled,
     pixelPayOrderCallbackUrl: resolvePixelPayOrderCallbackUrl(
       process.env.PIXELPAY_ORDER_CALLBACK_URL,
       pixelPayWebhookEnabled
