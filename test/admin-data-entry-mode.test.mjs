@@ -22,7 +22,7 @@ async function fixture(t,{enabled=true,role='super_admin',asset=null,identityExi
  await app.register(gate);await app.register(cors,{origin:'https://masterfadeapp.com'});
  t.after(()=>app.close());return {app,state};
 }
-const blocked=[['POST','/v1/public/citas'],['POST','/v1/pagos'],['POST','/v1/pagos/reservas'],['POST','/v1/public/pagos/webhook/pixelpay'],['POST','/v1/pagos/webhook/banpais'],['POST','/v1/admin/membresias'],['POST','/v1/account-deletion'],['POST','/v1/admin/account-deletion'],['POST','/v1/public/account-deletion'],['POST','/v1/auth/register'],['POST','/v1/auth/register/confirm'],['POST','/v1/auth/register/resend'],['POST','/v1/auth/social/confirm'],['PATCH','/v1/barbero/perfil'],['PATCH','/v1/admin/sucursales/'+ID+'/inactivar'],['DELETE','/v1/admin/personas/usuarios/'+ID+'/permanente'],['POST','/v1/admin/configuracion/promociones'],['POST','/v1/new-business-route']];
+const blocked=[['POST','/v1/public/citas'],['POST','/v1/public/citas/hold'],['POST','/v1/citas/hold'],['POST','/v1/cliente/planes/orden'],['POST','/v1/cliente/planes/pago-intent'],['POST','/v1/cliente/planes/simulator/event'],['POST','/v1/pagos'],['POST','/v1/pagos/reservas'],['POST','/v1/public/pagos/webhook/pixelpay'],['POST','/v1/pagos/webhook/banpais'],['POST','/v1/account-deletion'],['POST','/v1/admin/account-deletion'],['POST','/v1/public/account-deletion'],['POST','/v1/auth/register'],['POST','/v1/auth/register/confirm'],['POST','/v1/auth/register/resend'],['POST','/v1/auth/social/confirm'],['PATCH','/v1/barbero/perfil'],['PATCH','/v1/admin/sucursales/'+ID+'/inactivar'],['DELETE','/v1/admin/personas/usuarios/'+ID+'/permanente'],['POST','/v1/admin/configuracion/promociones'],['POST','/v1/new-business-route']];
 // AM: Block registered business routes before even their auth hook, including privileged callers.
 for(const role of ['super_admin','admin','root','cliente'])test('deny-by-default overrides role '+role,async t=>{
  const {app,state}=await fixture(t,{role});
@@ -47,6 +47,14 @@ for(const [plugin,prefix,paths]of [[personas,'/v1/admin/personas',['/clientes','
 });
 test('original role restrictions are not granted by the allowlist',async t=>{
  const {app}=await fixture(t,{role:'cliente'});await app.register(personas,{prefix:'/v1/admin/personas'});const r=await app.inject({url:'/v1/admin/personas/clientes'});assert.equal(r.statusCode,403);assert.equal(r.json().code,'ROLE_FORBIDDEN');
+});
+for(const prefix of ['/v1/admin/citas','/v1/admin/membresias'])test('administrative operation remains available '+prefix,async t=>{
+ const {app,state}=await fixture(t);app.post(prefix+'/probe',{preHandler:app.requireRoles(['super_admin','admin'])},async()=>{state.business++;return {ok:true};});
+ const r=await app.inject({method:'POST',url:prefix+'/probe',payload:{}});assert.equal(r.statusCode,200,r.body);assert.equal(state.auth,1);assert.equal(state.business,1);
+});
+for(const prefix of ['/v1/admin/citas','/v1/admin/membresias'])test('administrative operation keeps role protection '+prefix,async t=>{
+ const {app,state}=await fixture(t,{role:'cliente'});app.post(prefix+'/probe',{preHandler:app.requireRoles(['super_admin','admin'])},async()=>{state.business++;return {ok:true};});
+ const r=await app.inject({method:'POST',url:prefix+'/probe',payload:{}});assert.equal(r.statusCode,403,r.body);assert.equal(r.json().code,'ROLE_FORBIDDEN');assert.equal(state.auth,1);assert.equal(state.business,0);
 });
 for(const scope of ['public_promotion_main','public_branding','public_gallery_item','arbitrary'])test('unapproved Storage scope cannot reach business '+scope,async t=>{
  const {app,state}=await fixture(t);app.post('/v1/admin/storage/uploads/prepare',{preHandler:app.requireRoles(['super_admin'])},async()=>{state.business++;return {ok:true};});
