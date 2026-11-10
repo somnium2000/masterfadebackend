@@ -761,6 +761,11 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const result = transactionResult.result;
     const resultPaymentUuid = text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
+    const resultOrderId = text(result?.order_id) || text(response?.data?.order_id) || null;
+    const resultCurrency = text(result?.transaction_currency)
+      || text(response?.data?.transaction_currency)
+      || text(response?.data?.order_currency)
+      || null;
     const expectedOrderId = text(expected?.orderId);
     const expectedAmount = expected?.amount;
     const hasPaymentHash = Boolean(text(result?.payment_hash));
@@ -817,6 +822,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
         && resultPaymentUuid === normalizedUuid,
       transactionId,
       resultPaymentUuid,
+      resultOrderId,
+      resultCurrency,
       paymentHashValid,
       amountMatches,
       providerContractValid,

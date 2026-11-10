@@ -205,9 +205,9 @@ export function assertPaymentWebhookContract(app, providerCode) {
   }
 }
 
-function pixelPayCallbackEventId({ orderId, paymentUuid, paymentHash }) {
+function pixelPayCallbackEventId({ orderId, transactionId, paymentHash }) {
   const digest = crypto.createHash("sha256")
-    .update([orderId, paymentUuid, paymentHash].join("|"), "utf8")
+    .update([orderId, transactionId, paymentHash].join("|"), "utf8")
     .digest("hex");
   return `pixelpay_order_callback_${digest}`;
 }
@@ -294,7 +294,7 @@ export async function processPixelPayOrderCallback({
     });
   }
 
-  const providerEventId = pixelPayCallbackEventId({ orderId, paymentUuid, paymentHash });
+  const providerEventId = pixelPayCallbackEventId({ orderId, transactionId, paymentHash });
   const client = await db.connect();
   let intent;
   let duplicate;
@@ -305,6 +305,7 @@ export async function processPixelPayOrderCallback({
     ]);
     const lookup = await client.query(
       `SELECT pi.id_intent, pi.id_provider, pi.orden_compra, pi.provider_session_id,
+              pi.referencia_externa,
               pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
          FROM public.payment_intents pi
          JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
@@ -330,21 +331,14 @@ export async function processPixelPayOrderCallback({
       });
     }
     intent = lookup.rows[0];
-    const storedPaymentUuid = safeText(intent.provider_session_id);
+    const trustedPaymentUuid = safeText(intent.provider_session_id);
+    const trustedTransactionId = safeText(intent.referencia_externa);
     const comparisons = {
       orderUnique: true,
-      paymentUuidMatches: !storedPaymentUuid || storedPaymentUuid === paymentUuid,
+      paymentUuidMatches: !trustedPaymentUuid || trustedPaymentUuid === paymentUuid,
       amountMatches: Number(intent.monto_hnl).toFixed(2) === callbackAmount.toFixed(2),
       currencyMatches: safeText(intent.moneda_codigo).toUpperCase() === callbackCurrency,
     };
-    if (!comparisons.paymentUuidMatches) {
-      throw callbackMismatchError(
-        409,
-        "El UUID PixelPay no coincide con la orden",
-        "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
-        comparisons
-      );
-    }
     if (!comparisons.amountMatches) {
       throw callbackMismatchError(
         409,
@@ -361,10 +355,39 @@ export async function processPixelPayOrderCallback({
         comparisons
       );
     }
+    const saleEvidence = trustedPaymentUuid && trustedTransactionId
+      ? await client.query(
+        `SELECT 1 AS verified
+           FROM public.payment_events pe
+          WHERE pe.id_intent = $1::uuid
+            AND pe.evento_tipo = 'pixelpay.sale.approved_verified'
+            AND pe.firma_valida IS TRUE
+            AND pe.payload_esencial->>'payment_uuid' = $2::text
+            AND pe.payload_esencial->>'transaction_id' = $3::text
+            AND pe.payload_esencial->>'currency' = $4::text
+            AND (pe.payload_esencial->>'amount')::numeric = $5::numeric
+          LIMIT 1`,
+        [
+          intent.id_intent,
+          trustedPaymentUuid,
+          trustedTransactionId,
+          callbackCurrency,
+          callbackAmount,
+        ]
+      )
+      : { rows: [] };
+    const hasVerifiedSaleCorrelation = saleEvidence.rows.length === 1;
+    if (hasVerifiedSaleCorrelation && trustedTransactionId !== transactionId) {
+      throw new AppError(409, "La transaccion PixelPay no coincide con la Sale verificada", {
+        code: "PIXELPAY_CALLBACK_TRANSACTION_ID_MISMATCH",
+      });
+    }
     const inserted = await client.query(
       `INSERT INTO public.payment_events (
-         id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
-       ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.received', TRUE, $3::jsonb, $4::uuid)
+         id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent,
+         resultado_procesamiento
+       ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.received', FALSE,
+                 $3::jsonb, $4::uuid, $5::text)
        ON CONFLICT (id_provider, provider_event_id) DO NOTHING
        RETURNING id_event`,
       [
@@ -372,16 +395,29 @@ export async function processPixelPayOrderCallback({
         providerEventId,
         {
           order_id: orderId,
-          payment_uuid: paymentUuid,
+          callback_uuid: paymentUuid,
+          payment_uuid: trustedPaymentUuid,
           transaction_id: transactionId,
           amount: callbackAmount,
           currency: callbackCurrency,
           provider_status: callbackStatus,
         },
         intent.id_intent,
+        hasVerifiedSaleCorrelation ? null : "sale_evidence_missing_pending",
       ]
     );
     duplicate = !inserted.rows[0];
+    if (!hasVerifiedSaleCorrelation) {
+      await client.query("COMMIT");
+      return {
+        provider: "pixelpay",
+        provider_event_id: providerEventId,
+        status: "pending",
+        processed: false,
+        duplicate,
+        extension_pending: true,
+      };
+    }
     const claimed = await client.query(
       `UPDATE public.payment_events
           SET procesado_at = now(),
@@ -395,7 +431,8 @@ export async function processPixelPayOrderCallback({
                 'status_consulta_en_curso',
                 'status_412_pendiente',
                 'status_error_red_pendiente',
-                'status_incierto_pendiente'
+                'status_incierto_pendiente',
+                'sale_evidence_missing_pending'
               )
               AND (
                 procesado_at IS NULL
@@ -429,15 +466,22 @@ export async function processPixelPayOrderCallback({
   }
 
   const startedAt = Date.now();
+  const trustedPaymentUuid = safeText(intent.provider_session_id);
+  const trustedTransactionId = safeText(intent.referencia_externa);
   let status;
   try {
-    status = await provider.queryPaymentStatus(paymentUuid, {
+    status = await provider.queryPaymentStatus(trustedPaymentUuid, {
       orderId,
       amount: Number(intent.monto_hnl),
     });
-    const uuidMatches = safeText(status?.resultPaymentUuid) === paymentUuid;
-    const transactionMatches = safeText(status?.transactionId) === transactionId;
+    const uuidMatches = safeText(status?.resultPaymentUuid) === trustedPaymentUuid;
+    const transactionMatches = safeText(status?.transactionId) === trustedTransactionId
+      && transactionId === trustedTransactionId;
     const currencyMatches = safeText(intent.moneda_codigo)?.toUpperCase() === "HNL";
+    const statusOrderMatches = !safeText(status?.resultOrderId)
+      || safeText(status.resultOrderId) === orderId;
+    const statusCurrencyMatches = !safeText(status?.resultCurrency)
+      || safeText(status.resultCurrency)?.toUpperCase() === callbackCurrency;
     const callbackStatusMatches = ["COMPLETED", "PAID", "APPROVED", "SUCCESS"]
       .includes(callbackStatus);
     const financiallyVerified = status?.ok === true
@@ -451,11 +495,13 @@ export async function processPixelPayOrderCallback({
       && Boolean(safeText(status?.transactionId))
       && transactionMatches
       && currencyMatches
+      && statusOrderMatches
+      && statusCurrencyMatches
       && callbackStatusMatches
       && uuidMatches;
     await recordCallbackStatusCheck(db, {
       idIntent: intent.id_intent,
-      paymentUuid,
+      paymentUuid: trustedPaymentUuid,
       providerStatus: status?.status,
       result: financiallyVerified ? "ok" : "respuesta_invalida",
       statusCode: status?.statusCode,
@@ -476,7 +522,7 @@ export async function processPixelPayOrderCallback({
           }),
           {
             order_id: orderId,
-            payment_uuid: paymentUuid,
+            payment_uuid: trustedPaymentUuid,
             transaction_id: status.transactionId,
             amount: Number(intent.monto_hnl),
             currency: safeText(intent.moneda_codigo)?.toUpperCase(),
@@ -515,7 +561,7 @@ export async function processPixelPayOrderCallback({
         : "status_incierto_pendiente";
     await recordCallbackStatusCheck(db, {
       idIntent: intent.id_intent,
-      paymentUuid,
+      paymentUuid: trustedPaymentUuid,
       result: classifyCallbackStatusError(error),
       statusCode: error?.statusCode,
       errorCode: error?.code,
