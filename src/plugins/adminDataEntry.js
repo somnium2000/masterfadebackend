@@ -76,6 +76,10 @@ export const ADMIN_DATA_ENTRY_ROUTES = Object.freeze([
   "POST /v1/admin/storage/assets/:id/read-url",
 ]);
 const allowed = new Set(ADMIN_DATA_ENTRY_ROUTES);
+const administrativeOperationPrefixes = Object.freeze([
+  "/v1/admin/citas",
+  "/v1/admin/membresias",
+]);
 // AM: Only photographs of approved modules; existing scope/identity/branch checks still run.
 const photographScopes = new Map([['public_barber_profile', 'barbero'], ['private_client_profile', 'cliente'], ['public_service_image', 'servicio']]);
 const normalize = path => String(path || '').replace(/\/$/, '');
@@ -89,7 +93,11 @@ export default fp(async function adminDataEntryPlugin(app) {
     if (request.method === 'OPTIONS' && route === '*') return;
     if (request.headers['x-http-method-override'] || request.headers['x-method-override']) return restricted(reply);
     const method = request.method === 'HEAD' ? 'GET' : request.method;
-    if (!allowed.has(method + ' ' + normalize(route))) return restricted(reply);
+    const normalizedRoute = normalize(route);
+    const isAdministrativeOperation = administrativeOperationPrefixes.some(prefix => (
+      normalizedRoute === prefix || normalizedRoute.startsWith(prefix + '/')
+    ));
+    if (!allowed.has(method + ' ' + normalizedRoute) && !isAdministrativeOperation) return restricted(reply);
   });
   // AM: Append after existing route auth/role guards, never replace authorization.
   app.addHook('onRoute', options => {
