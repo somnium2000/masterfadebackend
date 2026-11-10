@@ -124,46 +124,95 @@ function callbackFixture({
 }
 
 const validCallback = {
-  order: "ORDER-1",
-  uuid: "P-1",
-  payment_hash: "valid-hash",
-  transaction_id: "TX-1",
   amount: 100,
-  currency: "HNL",
-  status: "COMPLETED",
-  transaction_type: "SALE",
-  transaction_redeemed_points: 0,
-  transaction_approved_amount: 100,
-  transaction_amount: 100,
-  transaction_auth: "[SANITIZED]",
-  transaction_terminal: "[SANITIZED]",
-  transaction_merchant: "[SANITIZED]",
-  response_cvn: "[SANITIZED]",
-  response_avs: "[SANITIZED]",
-  response_cavv: "[SANITIZED]",
-  transaction_reference: "[SANITIZED]",
-  transaction_time: "[SANITIZED]",
-  transaction_date: "[SANITIZED]",
-  response_approved: true,
-  response_incomplete: false,
-  response_code: "00",
-  response_time: "[SANITIZED]",
-  response_reason: "approved",
-  installment_type: null,
-  installment_months: null,
-  payment_uuid: "P-1",
-  response_message: "[SANITIZED]",
-  response_status: "[SANITIZED]",
-  customer_name: "[REDACTED]",
-  customer_email: "[REDACTED]",
+  attach_url: null,
   billing_address: "[REDACTED]",
+  billing_city: "[REDACTED]",
+  billing_country: "HN",
+  billing_state: "[REDACTED]",
+  billing_zip: "[REDACTED]",
+  card_account: "[REDACTED]",
+  card_brand: "[SANITIZED]",
   card_type: "[SANITIZED]",
-  card_last_four: "[REDACTED]",
+  category: "[SANITIZED]",
+  client_device: "[SANITIZED]",
+  client_ip: "[REDACTED]",
+  company_key: "[REDACTED]",
+  company_name: "[REDACTED]",
+  company_slug: "[REDACTED]",
+  created_at: "2026-11-10T00:00:00.000Z",
+  currency: "HNL",
+  customer_email: "[REDACTED]",
+  customer_name: "[REDACTED]",
+  customer_phone: "[REDACTED]",
+  description: "[SANITIZED]",
+  extra: [],
+  is_overdue: false,
+  items: [],
+  note: "[SANITIZED]",
+  order: "ORDER-1",
+  paid_at: "2026-11-10T00:00:00.000Z",
+  payment_hash: "valid-hash",
+  payment_url: "[REDACTED]",
+  ref: "[SANITIZED]",
+  status: "COMPLETED",
+  tax_amount: 0,
+  transaction_id: "TX-1",
+  uuid: "P-1",
 };
 
-assert.equal(Object.keys(validCallback).length, 35);
+const observedCallbackShape = {
+  amount: "number",
+  attach_url: "null",
+  billing_address: "string",
+  billing_city: "string",
+  billing_country: "string",
+  billing_state: "string",
+  billing_zip: "string",
+  card_account: "string",
+  card_brand: "string",
+  card_type: "string",
+  category: "string",
+  client_device: "string",
+  client_ip: "string",
+  company_key: "string",
+  company_name: "string",
+  company_slug: "string",
+  created_at: "string",
+  currency: "string",
+  customer_email: "string",
+  customer_name: "string",
+  customer_phone: "string",
+  description: "string",
+  extra: "array",
+  is_overdue: "boolean",
+  items: "array",
+  note: "string",
+  order: "string",
+  paid_at: "string",
+  payment_hash: "string",
+  payment_url: "string",
+  ref: "string",
+  status: "string",
+  tax_amount: "number",
+  transaction_id: "string",
+  uuid: "string",
+};
 
-test("callback valido verifica Status pero conserva pendiente", async () => {
+function payloadShape(payload) {
+  return Object.fromEntries(Object.entries(payload).map(([key, value]) => [
+    key,
+    value === null ? "null" : Array.isArray(value) ? "array" : typeof value,
+  ]));
+}
+
+test("fixture reproduce exactamente los 35 nombres y tipos observados", () => {
+  assert.deepEqual(payloadShape(validCallback), observedCallbackShape);
+  assert.equal(Object.hasOwn(validCallback, "order_id"), false);
+  assert.equal(Object.hasOwn(validCallback, "payment_uuid"), false);
+});
+
+test("callback real con order/uuid verifica Status pero conserva pendiente", async () => {
   const fixture = callbackFixture();
   const result = await processPixelPayOrderCallback({
     db: fixture.db,
@@ -221,7 +270,7 @@ test("callback real rechaza orden, UUID, monto, moneda y transaccion inconsisten
       processPixelPayOrderCallback({
         db: fixture.db,
         provider: fixture.provider,
-        body: { ...validCallback, uuid: "P-OTHER", payment_uuid: "P-OTHER" },
+        body: { ...validCallback, uuid: "P-OTHER" },
         requestId: "req-uuid-mismatch",
       }),
       (error) => error?.code === "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH"
@@ -453,7 +502,24 @@ test("callback de intent confirmado no duplica pago ni modifica paid_at", async 
   assert.equal(fixture.queries.some(({ text }) => /paid_at/i.test(text)), false);
 });
 
-test("callback acepta nombres reales order/uuid y rechaza alias contradictorios", async () => {
+test("callback conserva compatibilidad independiente con aliases anteriores", async () => {
+  const fixture = callbackFixture();
+  const { order, uuid, ...callbackWithoutRealIdentifiers } = validCallback;
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: {
+      ...callbackWithoutRealIdentifiers,
+      order_id: order,
+      payment_uuid: uuid,
+    },
+    requestId: "req-legacy-aliases",
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.processed, false);
+});
+
+test("callback rechaza aliases contradictorios antes de PostgreSQL", async () => {
   const fixture = callbackFixture();
   await assert.rejects(
     processPixelPayOrderCallback({
