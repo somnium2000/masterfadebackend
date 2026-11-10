@@ -4,6 +4,7 @@ import { sendOk } from "../../utils/response.js";
 import { assertUuid, expireStaleAppointmentReservations } from "../../services/agendaService.js";
 import { PaymentProviderFactory } from "../../services/payments/PaymentProviderFactory.js";
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
+import { buildPixelPayCallbackProbeTelemetry } from "../../services/payments/pixelPayCallbackProbeTelemetry.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
@@ -836,6 +837,12 @@ export default async function pagosRoutes(app) {
         const providerCode = String(request.params?.proveedor || "").trim().toLowerCase();
         assertPaymentWebhookContract(app, providerCode);
         if (providerCode === "pixelpay") {
+          if (app.config?.pixelPayCallbackProbeEnabled === true) {
+            request.log.info(
+              { pixelPayCallbackProbe: buildPixelPayCallbackProbeTelemetry(request) },
+              "PixelPay order_callback QA probe received"
+            );
+          }
           const result = await processPixelPayOrderCallback({
             db: app.db,
             provider: PaymentProviderFactory.create(),

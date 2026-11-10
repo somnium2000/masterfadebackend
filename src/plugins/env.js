@@ -177,6 +177,16 @@ async function envPlugin(app) {
     name: "PIXELPAY_WEBHOOK_ENABLED",
     defaultValue: false,
   });
+  const pixelPayCallbackProbeEnabled = parseStrictBooleanEnv(
+    process.env.PIXELPAY_CALLBACK_PROBE_ENABLED,
+    { name: "PIXELPAY_CALLBACK_PROBE_ENABLED", defaultValue: false }
+  );
+  if (pixelPayCallbackProbeEnabled
+    && (isProdOrStaging || pixelPayEnv !== "sandbox" || !pixelPayWebhookEnabled)) {
+    throw new Error(
+      "PIXELPAY_CALLBACK_PROBE_ENABLED solo se permite en Sandbox no productivo con webhook habilitado."
+    );
+  }
 
   const config = {
     nodeEnv,
@@ -190,6 +200,7 @@ async function envPlugin(app) {
     paymentProvider,
     pixelPayEnv,
     pixelPayWebhookEnabled,
+    pixelPayCallbackProbeEnabled,
     pixelPayOrderCallbackUrl: resolvePixelPayOrderCallbackUrl(
       process.env.PIXELPAY_ORDER_CALLBACK_URL,
       pixelPayWebhookEnabled

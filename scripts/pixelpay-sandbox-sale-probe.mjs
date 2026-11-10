@@ -36,6 +36,24 @@ function money(value) {
   return Number.isFinite(amount) ? amount.toFixed(2) : "";
 }
 
+function resolveProbeCallbackUrl(rawValue) {
+  let parsed;
+  try {
+    parsed = new URL(text(rawValue));
+  } catch {
+    throw new TypeError("INVALID_QA_ORDER_CALLBACK_URL");
+  }
+  if (parsed.protocol !== "https:"
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || parsed.pathname.replace(/\/+$/, "") !== "/v1/pagos/webhook/pixelpay") {
+    throw new TypeError("INVALID_QA_ORDER_CALLBACK_URL");
+  }
+  return parsed.toString();
+}
+
 function responseStatus(response) {
   const raw = typeof response?.getStatus === "function"
     ? response.getStatus()
@@ -64,6 +82,7 @@ function writeSafeEvent(write, event, context, details = {}) {
     orderId: context.orderId,
     amount: context.amount,
     currency: context.currency,
+    callbackConfigured: context.callbackConfigured === true,
   };
   if (event === "AFTER_SALE") {
     Object.assign(payload, {
@@ -102,6 +121,7 @@ function buildModels(sdk, env, context) {
   order.amount = context.amount;
   order.customer_name = "PIXELPAY SANDBOX PROBE";
   order.customer_email = "pixelpay-probe@masterfade.invalid";
+  order.callback_url = context.callbackUrl;
 
   const card = new sdk.Models.Card();
   card.number = assertPixelPaySandboxCardAllowed(env.PIXELPAY_PROBE_CARD_NUMBER);
@@ -121,6 +141,9 @@ function buildModels(sdk, env, context) {
   sale.setOrder(order);
   sale.setCard(card);
   sale.setBilling(billing);
+  if (sale.order_callback !== context.callbackUrl) {
+    throw new TypeError("ORDER_CALLBACK_MAPPING_FAILED");
+  }
   const models = { settings, order, card, billing, sale };
   const expectedTypes = [
     ["Settings", settings, sdk.Models.Settings],
@@ -149,6 +172,7 @@ export async function runPixelPaySandboxSaleProbe({
     orderId: `MF-QA-PROBE-${Date.now()}-${randomUUID().slice(0, 8)}`,
     amount: 1,
     currency: "HNL",
+    callbackConfigured: false,
   };
   writeSafeEvent(write, "PROBE_START", context);
 
@@ -160,12 +184,26 @@ export async function runPixelPaySandboxSaleProbe({
     writeSafeEvent(write, "SALE_ERROR", context, { outcome: "ERROR", errorName: "ENDPOINT_NOT_SANDBOX" });
     return { exitCode: 2, saleCount: 0, outcome: "ERROR", context };
   }
+  try {
+    context.callbackUrl = resolveProbeCallbackUrl(env.PIXELPAY_PROBE_ORDER_CALLBACK_URL);
+    context.callbackConfigured = true;
+  } catch (error) {
+    writeSafeEvent(write, "SALE_ERROR", context, { outcome: "ERROR", errorName: error?.message });
+    return { exitCode: 2, saleCount: 0, outcome: "ERROR", context };
+  }
   let saleCount = 0;
   try {
     const models = buildModels(sdk, env, context);
     if (text(env.PIXELPAY_PROBE_DRY_RUN).toLowerCase() === "true") {
       writeSafeEvent(write, "DRY_RUN_OK", context, { outcome: "DRY_RUN" });
       return { exitCode: 0, saleCount: 0, outcome: "DRY_RUN", context };
+    }
+    if (text(env.PIXELPAY_PROBE_EXECUTE) !== "I_UNDERSTAND_SINGLE_SANDBOX_SALE") {
+      writeSafeEvent(write, "SALE_ERROR", context, {
+        outcome: "ERROR",
+        errorName: "EXPLICIT_SINGLE_SALE_AUTHORIZATION_REQUIRED",
+      });
+      return { exitCode: 2, saleCount: 0, outcome: "ERROR", context };
     }
     const signature = createPixelPaySaleSignature({
       secretKey: env.PIXELPAY_SECRET_KEY,
