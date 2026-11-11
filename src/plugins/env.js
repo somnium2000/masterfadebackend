@@ -1,6 +1,19 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
 import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
+
+export function resolvePixelPayStatusShapeProbeEnabled(env) {
+  const enabled = parseStrictBooleanEnv(env.PIXELPAY_STATUS_SHAPE_PROBE_ENABLED, {
+    name: "PIXELPAY_STATUS_SHAPE_PROBE_ENABLED", defaultValue: false,
+  });
+  if (enabled && (env.ENTORNO !== "qa"
+    || !["development", "test"].includes(env.NODE_ENV)
+    || env.PIXELPAY_ENV !== "sandbox"
+    || env.PIXELPAY_ENDPOINT !== "https://pixelpay.dev")) {
+    throw new Error("PIXELPAY_STATUS_SHAPE_PROBE_ENABLED requiere QA, NODE_ENV development/test y Sandbox autorizado.");
+  }
+  return enabled;
+}
 import { resolveTodoPagoConfig } from "../services/payments/todopago/todoPagoConfig.js";
 import { validatePixelPaySdkConfig } from "../services/payments/PixelPaySdkProvider.js";
 
@@ -87,6 +100,26 @@ function parseCorsOrigins(rawValue, fallback = "http://localhost:5173") {
     .filter(Boolean);
 }
 
+export function resolvePixelPayOrderCallbackUrl(rawValue, enabled = false) {
+  if (enabled !== true) return null;
+  const value = String(rawValue || "").trim();
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("PIXELPAY_ORDER_CALLBACK_URL debe ser una URL HTTPS valida.");
+  }
+  if (parsed.protocol !== "https:"
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || parsed.pathname.replace(/\/+$/, "") !== "/v1/pagos/webhook/pixelpay") {
+    throw new Error("PIXELPAY_ORDER_CALLBACK_URL debe apuntar por HTTPS a /v1/pagos/webhook/pixelpay.");
+  }
+  return parsed.toString();
+}
+
 async function envPlugin(app) {
   dotenv.config();
 
@@ -153,6 +186,21 @@ async function envPlugin(app) {
   }
   
   const isProdOrStaging = nodeEnv === "production" || nodeEnv === "staging";
+  const pixelPayWebhookEnabled = parseStrictBooleanEnv(process.env.PIXELPAY_WEBHOOK_ENABLED, {
+    name: "PIXELPAY_WEBHOOK_ENABLED",
+    defaultValue: false,
+  });
+  const pixelPayCallbackProbeEnabled = parseStrictBooleanEnv(
+    process.env.PIXELPAY_CALLBACK_PROBE_ENABLED,
+    { name: "PIXELPAY_CALLBACK_PROBE_ENABLED", defaultValue: false }
+  );
+  const pixelPayStatusShapeProbeEnabled = resolvePixelPayStatusShapeProbeEnabled(process.env);
+  if (pixelPayCallbackProbeEnabled
+    && (isProdOrStaging || pixelPayEnv !== "sandbox" || !pixelPayWebhookEnabled)) {
+    throw new Error(
+      "PIXELPAY_CALLBACK_PROBE_ENABLED solo se permite en Sandbox no productivo con webhook habilitado."
+    );
+  }
 
   const config = {
     nodeEnv,
@@ -165,10 +213,13 @@ async function envPlugin(app) {
     bookingReleaseTokenSecret: resolveBookingReleaseTokenSecret(nodeEnv),
     paymentProvider,
     pixelPayEnv,
-    pixelPayWebhookEnabled: parseStrictBooleanEnv(process.env.PIXELPAY_WEBHOOK_ENABLED, {
-      name: "PIXELPAY_WEBHOOK_ENABLED",
-      defaultValue: false,
-    }),
+    pixelPayWebhookEnabled,
+    pixelPayCallbackProbeEnabled,
+    pixelPayStatusShapeProbeEnabled,
+    pixelPayOrderCallbackUrl: resolvePixelPayOrderCallbackUrl(
+      process.env.PIXELPAY_ORDER_CALLBACK_URL,
+      pixelPayWebhookEnabled
+    ),
     todoPago,
     trustProxy: parseBoolean(process.env.TRUST_PROXY, isProdOrStaging),
     cookieSecure: parseBoolean(process.env.AUTH_COOKIE_SECURE, isProdOrStaging),

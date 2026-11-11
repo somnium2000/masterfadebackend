@@ -1,11 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import Fastify from "fastify";
 
-import { assertPaymentWebhookContract } from "../src/routes/v1/pagos.js";
+import {
+  assertPaymentWebhookContract,
+  buildPixelPayCallbackRejectionTelemetry,
+  default as pagosRoutes,
+  processPixelPayOrderCallback,
+} from "../src/routes/v1/pagos.js";
 import {
   ACTIVE_PAYMENT_INTENT_STATES,
   expireStaleAppointmentReservations,
 } from "../src/services/agendaService.js";
+import { resolvePixelPayOrderCallbackUrl } from "../src/plugins/env.js";
+import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 
 test("PixelPay webhook permanece deshabilitado por defecto", () => {
   assert.throws(
@@ -14,12 +22,745 @@ test("PixelPay webhook permanece deshabilitado por defecto", () => {
   );
 });
 
-test("habilitar el flag no omite el contrato oficial bloqueado", () => {
-  assert.throws(
-    () => assertPaymentWebhookContract({ config: { pixelPayWebhookEnabled: true } }, "pixelpay"),
-    (error) => error?.statusCode === 503
-      && error?.code === "PIXELPAY_WEBHOOK_PROVIDER_CONTRACT_BLOCKED"
+test("habilitar el flag permite evaluar el contrato SDK order_callback", () => {
+  assert.doesNotThrow(
+    () => assertPaymentWebhookContract({ config: { pixelPayWebhookEnabled: true } }, "pixelpay")
   );
+});
+
+test("callback URL solo se materializa con flag y endpoint HTTPS exacto", () => {
+  assert.equal(resolvePixelPayOrderCallbackUrl("", false), null);
+  assert.equal(
+    resolvePixelPayOrderCallbackUrl(
+      "https://api.example.test/v1/pagos/webhook/pixelpay",
+      true
+    ),
+    "https://api.example.test/v1/pagos/webhook/pixelpay"
+  );
+  assert.throws(
+    () => resolvePixelPayOrderCallbackUrl("http://api.example.test/v1/pagos/webhook/pixelpay", true),
+    /HTTPS/
+  );
+});
+
+function callbackFixture({
+  duplicate = false,
+  eventResult = null,
+  status = {},
+  statusError = null,
+  intentOverrides = {},
+  saleEvidence = true,
+} = {}) {
+  const queries = [];
+  const event = { exists: duplicate, result: eventResult, claimedAt: null };
+  const intent = {
+    id_intent: "11111111-1111-4111-8111-111111111111",
+    id_provider: "22222222-2222-4222-8222-222222222222",
+    orden_compra: "ORDER-1",
+    provider_session_id: "P-1",
+    referencia_externa: "TX-1",
+    monto_hnl: "100.00",
+    moneda_codigo: "HNL",
+    estado_intent_codigo: "pendiente_confirmacion",
+    ...intentOverrides,
+  };
+  const client = {
+    async query(sql, params = []) {
+      const text = String(sql);
+      queries.push({ text, params });
+      if (text.includes("FROM public.payment_intents pi")) return { rows: [intent] };
+      if (text.includes("pixelpay.sale.approved_verified")) {
+        return { rows: saleEvidence ? [{ verified: 1 }] : [] };
+      }
+      if (text.includes("INSERT INTO public.payment_events")) {
+        if (event.exists) return { rows: [] };
+        event.exists = true;
+        return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+      }
+      if (text.includes("status_consulta_en_curso")) {
+        const retryable = event.result == null || [
+          "status_consulta_en_curso",
+          "status_412_pendiente",
+          "status_error_red_pendiente",
+          "status_incierto_pendiente",
+        ].includes(event.result);
+        const cooldownMs = Number(params[2] || 0) * 1000;
+        if (!retryable
+          || (event.claimedAt != null && (Date.now() - event.claimedAt) < cooldownMs)) {
+          return { rows: [] };
+        }
+        event.result = "status_consulta_en_curso";
+        event.claimedAt = Date.now();
+        return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const db = {
+    async connect() { return client; },
+    async query(sql, params = []) {
+      const text = String(sql);
+      queries.push({ text, params });
+      if (text.includes("UPDATE public.payment_events") && params[2]) event.result = params[2];
+      return { rows: [] };
+    },
+  };
+  const provider = {
+    verifyPaymentHash(hash, orderId) { return hash === "valid-hash" && orderId === "ORDER-1"; },
+    async queryPaymentStatus() {
+      if (statusError) throw statusError;
+      return {
+        ok: true,
+        success: true,
+        providerContractValid: true,
+        paymentHashValid: true,
+        amountMatches: true,
+        resultPaymentUuid: "P-1",
+        status: "COMPLETED",
+        statusCode: 200,
+        approved: true,
+        incomplete: false,
+        transactionId: "TX-1",
+        ...status,
+      };
+    },
+  };
+  return { db, provider, queries, event };
+}
+
+const validCallback = {
+  amount: 100,
+  attach_url: null,
+  billing_address: "[REDACTED]",
+  billing_city: "[REDACTED]",
+  billing_country: "HN",
+  billing_state: "[REDACTED]",
+  billing_zip: "[REDACTED]",
+  card_account: "[REDACTED]",
+  card_brand: "[SANITIZED]",
+  card_type: "[SANITIZED]",
+  category: "[SANITIZED]",
+  client_device: "[SANITIZED]",
+  client_ip: "[REDACTED]",
+  company_key: "[REDACTED]",
+  company_name: "[REDACTED]",
+  company_slug: "[REDACTED]",
+  created_at: "2026-11-10T00:00:00.000Z",
+  currency: "HNL",
+  customer_email: "[REDACTED]",
+  customer_name: "[REDACTED]",
+  customer_phone: "[REDACTED]",
+  description: "[SANITIZED]",
+  extra: [],
+  is_overdue: false,
+  items: [],
+  note: "[SANITIZED]",
+  order: "ORDER-1",
+  paid_at: "2026-11-10T00:00:00.000Z",
+  payment_hash: "valid-hash",
+  payment_url: "[REDACTED]",
+  ref: "[SANITIZED]",
+  status: "COMPLETED",
+  tax_amount: 0,
+  transaction_id: "TX-1",
+  uuid: "P-1",
+};
+
+const observedCallbackShape = {
+  amount: "number",
+  attach_url: "null",
+  billing_address: "string",
+  billing_city: "string",
+  billing_country: "string",
+  billing_state: "string",
+  billing_zip: "string",
+  card_account: "string",
+  card_brand: "string",
+  card_type: "string",
+  category: "string",
+  client_device: "string",
+  client_ip: "string",
+  company_key: "string",
+  company_name: "string",
+  company_slug: "string",
+  created_at: "string",
+  currency: "string",
+  customer_email: "string",
+  customer_name: "string",
+  customer_phone: "string",
+  description: "string",
+  extra: "array",
+  is_overdue: "boolean",
+  items: "array",
+  note: "string",
+  order: "string",
+  paid_at: "string",
+  payment_hash: "string",
+  payment_url: "string",
+  ref: "string",
+  status: "string",
+  tax_amount: "number",
+  transaction_id: "string",
+  uuid: "string",
+};
+
+function payloadShape(payload) {
+  return Object.fromEntries(Object.entries(payload).map(([key, value]) => [
+    key,
+    value === null ? "null" : Array.isArray(value) ? "array" : typeof value,
+  ]));
+}
+
+test("fixture reproduce exactamente los 35 nombres y tipos observados", () => {
+  assert.deepEqual(payloadShape(validCallback), observedCallbackShape);
+  assert.equal(Object.hasOwn(validCallback, "order_id"), false);
+  assert.equal(Object.hasOwn(validCallback, "payment_uuid"), false);
+});
+
+test("callback real con order/uuid verifica Status pero conserva pendiente", async () => {
+  const fixture = callbackFixture();
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-valid",
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.processed, false);
+  assert.equal(result.extension_pending, true);
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
+  assert.equal(fixture.queries.some(({ text }) => text.includes("confirmar_reserva_pagada")), false);
+  assert.equal(
+    fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.received")),
+    true
+  );
+  assert.equal(
+    fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.status_verified")),
+    true
+  );
+});
+
+test("diagnostico Status muestra solo booleanos y mantiene pendiente evidencia incompleta", async () => {
+  for (const failed of ["paymentHashValid", "amountMatches", "approved", "providerContractValid"]) {
+    const fixture = callbackFixture({ status: { [failed]: false } });
+    const logs = [];
+    await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: validCallback,
+      logger: { info(value) { logs.push(value); } },
+    });
+    const conditions = logs[0].pixelPayCallbackStatusValidation;
+    assert.equal(Object.values(conditions).every(value => typeof value === "boolean"), true);
+    assert.equal(conditions.financiallyVerified, false);
+    assert.deepEqual(Object.keys(conditions).sort(), [
+      "ok", "success", "providerContractValid", "paymentHashValid", "amountMatches",
+      "approved", "incomplete", "uuidMatches", "transactionMatches", "currencyMatches",
+      "statusOrderMatches", "statusCurrencyMatches", "callbackStatusMatches", "financiallyVerified",
+    ].sort());
+    assert.equal(fixture.event.result, "status_incierto_pendiente");
+    assert.equal(fixture.queries.some(({ text }) => text.includes("pixelpay.order_callback.status_verified")), false);
+    assert.doesNotMatch(JSON.stringify(logs), /P-1|TX-1|ORDER-1|valid-hash/);
+  }
+});
+
+test("Status verificado no emite diagnostico ni consulta adicional", async () => {
+  const fixture = callbackFixture();
+  let logs = 0;
+  let calls = 0;
+  const originalStatus = fixture.provider.queryPaymentStatus;
+  fixture.provider.queryPaymentStatus = async (...args) => { calls += 1; return originalStatus(...args); };
+  await processPixelPayOrderCallback({
+    db: fixture.db, provider: fixture.provider, body: validCallback,
+    logger: { info() { logs += 1; } },
+  });
+  assert.equal(logs, 0);
+  assert.equal(calls, 1);
+});
+
+test("callback falsificado se rechaza antes de abrir PostgreSQL", async () => {
+  let connects = 0;
+  const fixture = callbackFixture();
+  fixture.db.connect = async () => { connects += 1; throw new Error("no debe conectar"); };
+  await assert.rejects(
+    processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: { ...validCallback, payment_hash: "forged" },
+      requestId: "req-forged",
+    }),
+    (error) => error?.statusCode === 401 && error?.code === "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID"
+  );
+  assert.equal(connects, 0);
+});
+
+test("callback real correlaciona UUID auxiliar y rechaza inconsistencias financieras", async (t) => {
+  await t.test("orden incorrecta", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, order: "ORDER-OTHER" },
+        requestId: "req-order-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID"
+    );
+  });
+  await t.test("UUID auxiliar diferente usa el UUID financiero verificado de Sale", async () => {
+    const fixture = callbackFixture();
+    let queriedUuid = null;
+    const originalStatus = fixture.provider.queryPaymentStatus;
+    fixture.provider.queryPaymentStatus = async (paymentUuid, expected) => {
+      queriedUuid = paymentUuid;
+      return originalStatus(paymentUuid, expected);
+    };
+    const result = await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: { ...validCallback, uuid: "CALLBACK-AUXILIARY" },
+      requestId: "req-uuid-auxiliary",
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(queriedUuid, "P-1");
+    assert.equal(
+      fixture.queries.some(({ text }) => /pixelpay\.order_callback\.received', FALSE/i.test(text)),
+      true
+    );
+  });
+  await t.test("monto incorrecto", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, amount: 99 },
+        requestId: "req-callback-amount-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_AMOUNT_MISMATCH"
+    );
+  });
+  await t.test("moneda incorrecta", async () => {
+    const fixture = callbackFixture();
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, currency: "USD" },
+        requestId: "req-callback-currency-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_CURRENCY_MISMATCH"
+    );
+  });
+  await t.test("transaction ID auxiliar distinto usa identidad financiera de Sale", async () => {
+    const fixture = callbackFixture();
+    let queriedUuid;
+    const originalStatus = fixture.provider.queryPaymentStatus;
+    fixture.provider.queryPaymentStatus = async (uuid, expected) => {
+      queriedUuid = uuid;
+      return originalStatus(uuid, expected);
+    };
+    const result = await processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, uuid: "CALLBACK-AUX", transaction_id: "TX-OTHER" },
+        requestId: "req-transaction-mismatch",
+      });
+    assert.equal(queriedUuid, "P-1");
+    assert.equal(result.status, "completed");
+    assert.equal(fixture.event.result, "status_verificado_pendiente_conciliacion");
+    const received = fixture.queries.find(({ text }) => text.includes("pixelpay.order_callback.received"));
+    assert.equal(received.params[2].transaction_id, "TX-1");
+    assert.equal(received.params[2].callback_transaction_id_matches, false);
+    assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments|UPDATE public\.payment_intents|confirmar_reserva_pagada/i.test(text)), false);
+  });
+  await t.test("Status con transaccion distinta conserva el evento pendiente", async () => {
+    const fixture = callbackFixture({ status: { transactionId: "TX-STATUS-OTHER" } });
+    const result = await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: { ...validCallback, uuid: "CALLBACK-AUXILIARY" },
+      requestId: "req-status-transaction-mismatch",
+    });
+    assert.equal(result.processed, false);
+    assert.equal(fixture.event.result, "status_incierto_pendiente");
+  });
+  await t.test("Status con orden o moneda contradictoria conserva pendiente", async () => {
+    for (const status of [{ resultOrderId: "ORDER-OTHER" }, { resultCurrency: "USD" }]) {
+      const fixture = callbackFixture({ status });
+      const result = await processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, uuid: "CALLBACK-AUXILIARY" },
+        requestId: "req-status-contract-mismatch",
+      });
+      assert.equal(result.processed, false);
+      assert.equal(fixture.event.result, "status_incierto_pendiente");
+    }
+  });
+});
+
+test("telemetria de rechazo contiene solo codigo y comparaciones booleanas", () => {
+  const fixture = callbackFixture();
+  const rejection = buildPixelPayCallbackRejectionTelemetry(Object.assign(new Error("mismatch"), {
+    code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+    safeCallbackComparisons: {
+      orderUnique: true,
+      paymentUuidMatches: false,
+      amountMatches: true,
+      currencyMatches: true,
+    },
+  }));
+  assert.deepEqual(rejection, {
+    code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+    order_unique: true,
+    payment_uuid_matches: false,
+    amount_matches: true,
+    currency_matches: true,
+  });
+  const serialized = JSON.stringify(rejection);
+  assert.equal(serialized.includes("P-OTHER"), false);
+  assert.equal(serialized.includes("valid-hash"), false);
+  assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payment_events/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments/i.test(text)), false);
+});
+
+test("Sale incierta sin UUID financiero conserva callback pendiente sin Status", async () => {
+  const fixture = callbackFixture({
+    saleEvidence: false,
+    intentOverrides: { provider_session_id: null, referencia_externa: null },
+  });
+  let statusCalls = 0;
+  fixture.provider.queryPaymentStatus = async () => { statusCalls += 1; };
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: { ...validCallback, uuid: "CALLBACK-UNTRUSTED" },
+    requestId: "req-uncertain-sale",
+  });
+  assert.equal(result.status, "pending");
+  assert.equal(statusCalls, 0);
+  assert.equal(
+    fixture.queries.some(({ params }) => params.includes("sale_evidence_missing_pending")),
+    true
+  );
+});
+
+test("callback ya verificado responde idempotente sin repetir Status", async () => {
+  const fixture = callbackFixture({
+    duplicate: true,
+    eventResult: "status_verificado_pendiente_conciliacion",
+  });
+  let statusCalls = 0;
+  fixture.provider.queryPaymentStatus = async () => { statusCalls += 1; throw new Error("no debe consultar"); };
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-duplicate",
+  });
+  assert.equal(result.duplicate, true);
+  assert.equal(statusCalls, 0);
+});
+
+test("identificadores auxiliares distintos deduplican por identidad financiera", async () => {
+  const fixture = callbackFixture();
+  const first = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: { ...validCallback, uuid: "CALLBACK-AUX-1" },
+    requestId: "req-aux-1",
+  });
+  const second = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: { ...validCallback, uuid: "CALLBACK-AUX-2", transaction_id: "TX-AUX-2" },
+    requestId: "req-aux-2",
+  });
+  assert.equal(first.provider_event_id, second.provider_event_id);
+  assert.equal(second.duplicate, true);
+});
+
+test("duplicado pendiente recupera despues de Status 412", async () => {
+  const fixture = callbackFixture({
+    statusError: Object.assign(new Error("precondition"), {
+      code: "PIXELPAY_STATUS_PRECONDITION_FAILED",
+      statusCode: 412,
+    }),
+  });
+  let statusCalls = 0;
+  const originalStatus = fixture.provider.queryPaymentStatus;
+  fixture.provider.queryPaymentStatus = async (...args) => {
+    statusCalls += 1;
+    return originalStatus(...args);
+  };
+  const first = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-412-first",
+  });
+  assert.equal(first.status, "pending");
+  assert.equal(fixture.event.result, "status_412_pendiente");
+
+  fixture.provider.queryPaymentStatus = async () => {
+    statusCalls += 1;
+    return {
+      ok: true,
+      success: true,
+      providerContractValid: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      resultPaymentUuid: "P-1",
+      status: "COMPLETED",
+      statusCode: 200,
+      approved: true,
+      incomplete: false,
+      transactionId: "TX-1",
+    };
+  };
+  const recovered = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-412-retry",
+    retryCooldownSeconds: 0,
+  });
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.duplicate, true);
+  assert.equal(recovered.processed, false);
+  assert.equal(fixture.event.result, "status_verificado_pendiente_conciliacion");
+  assert.equal(statusCalls, 2);
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
+});
+
+test("callbacks concurrentes reclaman una sola consulta Status", async () => {
+  const fixture = callbackFixture();
+  let statusCalls = 0;
+  let releaseStatus;
+  let statusStarted;
+  const started = new Promise((resolve) => { statusStarted = resolve; });
+  const release = new Promise((resolve) => { releaseStatus = resolve; });
+  fixture.provider.queryPaymentStatus = async () => {
+    statusCalls += 1;
+    statusStarted();
+    await release;
+    return {
+      ok: true,
+      success: true,
+      providerContractValid: true,
+      paymentHashValid: true,
+      amountMatches: true,
+      resultPaymentUuid: "P-1",
+      status: "COMPLETED",
+      statusCode: 200,
+      approved: true,
+      incomplete: false,
+      transactionId: "TX-1",
+    };
+  };
+
+  const firstPromise = processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-concurrent-1",
+  });
+  await started;
+  const second = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-concurrent-2",
+  });
+  assert.equal(second.duplicate, true);
+  assert.equal(second.processed, false);
+  assert.equal(statusCalls, 1);
+  releaseStatus();
+  await firstPromise;
+  assert.equal(statusCalls, 1);
+});
+
+test("moneda del callback distinta de la orden se rechaza antes de Status", async () => {
+  const fixture = callbackFixture({ intentOverrides: { moneda_codigo: "USD" } });
+  await assert.rejects(
+    processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: validCallback,
+      requestId: "req-currency",
+    }),
+    (error) => error?.code === "PIXELPAY_CALLBACK_CURRENCY_MISMATCH"
+  );
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
+});
+
+test("Status 412 y monto incorrecto permanecen pendientes", async (t) => {
+  await t.test("Status 412", async () => {
+    const fixture = callbackFixture({
+      statusError: Object.assign(new Error("precondition"), {
+        code: "PIXELPAY_STATUS_PRECONDITION_FAILED",
+        statusCode: 412,
+      }),
+    });
+    const result = await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: validCallback,
+      requestId: "req-412",
+    });
+    assert.equal(result.status, "pending");
+    assert.equal(result.processed, false);
+    assert.equal(fixture.queries.some(({ params }) => params?.includes("precondicion_fallida")), true);
+  });
+  await t.test("monto incorrecto", async () => {
+    const fixture = callbackFixture({ status: { amountMatches: false } });
+    const result = await processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: validCallback,
+      requestId: "req-amount",
+    });
+    assert.equal(result.processed, false);
+    assert.equal(fixture.queries.some(({ params }) => params?.includes("respuesta_invalida")), true);
+  });
+});
+
+test("callback tardio conserva intent expirado sin promoverlo", async () => {
+  const fixture = callbackFixture({ intentOverrides: { estado_intent_codigo: "expirado" } });
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-late",
+  });
+  assert.equal(result.processed, false);
+  assert.equal(result.extension_pending, true);
+  assert.equal(fixture.queries.some(({ text }) => /UPDATE public\.payment_intents/i.test(text)), false);
+});
+
+test("callback de intent confirmado no duplica pago ni modifica paid_at", async () => {
+  const fixture = callbackFixture({ intentOverrides: { estado_intent_codigo: "confirmado" } });
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-confirmed",
+  });
+  assert.equal(result.processed, false);
+  assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /UPDATE public\.payment_intents/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /paid_at/i.test(text)), false);
+});
+
+test("callback conserva compatibilidad independiente con aliases anteriores", async () => {
+  const fixture = callbackFixture();
+  const { order, uuid, ...callbackWithoutRealIdentifiers } = validCallback;
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: {
+      ...callbackWithoutRealIdentifiers,
+      order_id: order,
+      payment_uuid: uuid,
+    },
+    requestId: "req-legacy-aliases",
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.processed, false);
+});
+
+test("callback rechaza aliases contradictorios antes de PostgreSQL", async () => {
+  const fixture = callbackFixture();
+  await assert.rejects(
+    processPixelPayOrderCallback({
+      db: fixture.db,
+      provider: fixture.provider,
+      body: { ...validCallback, order_id: "ORDER-OTHER" },
+      requestId: "req-conflicting-alias",
+    }),
+    (error) => error?.code === "PIXELPAY_CALLBACK_IDENTIFIER_CONFLICT"
+  );
+  assert.equal(fixture.queries.length, 0);
+});
+
+test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", async (t) => {
+  const previousProvider = process.env.PAYMENT_PROVIDER;
+  const previousAdminMode = process.env.ADMIN_DATA_ENTRY_MODE;
+  const fixture = callbackFixture();
+  process.env.PAYMENT_PROVIDER = "pixelpay";
+  process.env.ADMIN_DATA_ENTRY_MODE = "false";
+  PaymentProviderFactory._instance = fixture.provider;
+  const app = Fastify();
+  app.decorate("config", { pixelPayWebhookEnabled: true });
+  app.decorate("db", fixture.db);
+  app.decorate("requireRoles", () => async () => {});
+  await app.register(pagosRoutes, { prefix: "/v1/pagos" });
+  t.after(async () => {
+    await app.close();
+    PaymentProviderFactory.reset();
+    if (previousProvider === undefined) delete process.env.PAYMENT_PROVIDER;
+    else process.env.PAYMENT_PROVIDER = previousProvider;
+    if (previousAdminMode === undefined) delete process.env.ADMIN_DATA_ENTRY_MODE;
+    else process.env.ADMIN_DATA_ENTRY_MODE = previousAdminMode;
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/pagos/webhook/pixelpay",
+    payload: validCallback,
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().data.processed, false);
+  assert.equal(response.json().data.extension_pending, true);
+});
+
+test("callback forwards only server shape config, requestId and logger", async t => {
+  const previousProvider = process.env.PAYMENT_PROVIDER;
+  const previousAdmin = process.env.ADMIN_DATA_ENTRY_MODE;
+  process.env.PAYMENT_PROVIDER = "pixelpay";
+  process.env.ADMIN_DATA_ENTRY_MODE = "false";
+  t.after(() => {
+    PaymentProviderFactory.reset();
+    if (previousProvider === undefined) delete process.env.PAYMENT_PROVIDER; else process.env.PAYMENT_PROVIDER = previousProvider;
+    if (previousAdmin === undefined) delete process.env.ADMIN_DATA_ENTRY_MODE; else process.env.ADMIN_DATA_ENTRY_MODE = previousAdmin;
+  });
+  const results = [];
+  for (const configured of [true, false, undefined]) {
+    const fixture = callbackFixture();
+    let calls = 0;
+    let options;
+    let serverLogger;
+    const original = fixture.provider.queryPaymentStatus;
+    fixture.provider.queryPaymentStatus = async (uuid, expected, probe) => {
+      calls += 1; options = probe;
+      assert.equal(uuid, "P-1");
+      return original(uuid, expected);
+    };
+    PaymentProviderFactory._instance = fixture.provider;
+    const app = Fastify({ genReqId: () => "req-server-synthetic" });
+    app.decorate("config", { pixelPayWebhookEnabled: true,
+      ...(configured === undefined ? {} : { pixelPayStatusShapeProbeEnabled: configured }) });
+    app.decorate("db", fixture.db);
+    app.decorate("requireRoles", () => async () => {});
+    app.addHook("onRequest", async request => { serverLogger = request.log; });
+    await app.register(pagosRoutes, { prefix: "/v1/pagos" });
+    try {
+      const response = await app.inject({ method: "POST",
+        url: "/v1/pagos/webhook/pixelpay?pixelPayStatusShapeProbeEnabled=true",
+        headers: { "x-status-shape-probe-enabled": "true" },
+        payload: { ...validCallback, enabled: true, statusShapeProbeEnabled: true } });
+      assert.equal(response.statusCode, 200);
+      assert.equal(options.enabled, configured === true);
+      assert.equal(options.requestId, "req-server-synthetic");
+      assert.equal(options.logger, serverLogger);
+      assert.equal(calls, 1);
+      results.push(response.json().data);
+    } finally { await app.close(); }
+  }
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(results[1], results[2]);
 });
 
 test("el expirador delega la proteccion a evidencia durable y conserva otros proveedores", async () => {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import Fastify from "fastify";
 import { PixelPayDirectProvider, PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
@@ -1548,7 +1549,8 @@ test("SDK oficial carga en ESM y construye sus modelos sin ejecutar red", () => 
     authHash: AUTH_HASH,
     appUrl: "https://pixelpay.dev",
   });
-  const request = provider.buildSaleRequest(saleInput);
+  const callbackUrl = "https://api.example.test/v1/pagos/webhook/pixelpay";
+  const request = provider.buildSaleRequest({ ...saleInput, callbackUrl });
   assert.equal(request.constructor.name, "SaleTransaction");
   assert.equal(request.order_id, ORDER_ID);
   assert.equal(request.order_currency, "HNL");
@@ -1556,6 +1558,30 @@ test("SDK oficial carga en ESM y construye sus modelos sin ejecutar red", () => 
   assert.equal(request.card_expire, "2807");
   assert.equal(request.billing_country, "HN");
   assert.equal(request.billing_state, "HN-CR");
+  assert.equal(request.order_callback, callbackUrl);
   assert.equal(typeof provider.sdk.Entities.TransactionResult.validateResponse, "function");
   assert.equal(typeof provider.sdk.Entities.TransactionResult.fromResponse, "function");
+});
+
+test("SDK 2.5.8 transforma Order.callback_url en SaleTransaction.order_callback", () => {
+  const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
+  const callbackUrl = "https://api.example.test/v1/pagos/webhook/pixelpay";
+  const request = makeProvider(fake).buildSaleRequest({ ...saleInput, callbackUrl });
+  assert.equal(request.order.callback_url, callbackUrl);
+});
+
+test("SDK 2.5.8 verifica payment_hash del callback con orden, key y secret", () => {
+  const provider = new PixelPaySdkProvider({
+    endpoint: "https://pixelpay.dev",
+    env: "sandbox",
+    keyId: KEY_ID,
+    secretKey: SECRET,
+    authHash: AUTH_HASH,
+    appUrl: "https://pixelpay.dev",
+  });
+  const paymentHash = createHash("md5")
+    .update(`${ORDER_ID}|${KEY_ID}|${SECRET}`, "utf8")
+    .digest("hex");
+  assert.equal(provider.verifyPaymentHash(paymentHash, ORDER_ID), true);
+  assert.equal(provider.verifyPaymentHash(paymentHash, "OTHER-ORDER"), false);
 });
