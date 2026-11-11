@@ -2428,6 +2428,7 @@ export default async function publicPagosRoutes(app, options = {}) {
             expire: request.body.card_expire,
             cvv: request.body.card_cvv,
           },
+          callbackUrl: app.config?.pixelPayOrderCallbackUrl || null,
         }, {
           requestId: request.id,
           idIntent,

@@ -53,7 +53,10 @@ test("PostgreSQL 17 aislado acepta solo response_code financiero seguro", { skip
   await pool.query("CREATE TABLE app_private.pixelpay_sale_attempts (id_sale_attempt uuid PRIMARY KEY DEFAULT gen_random_uuid())");
   const migration = await readFile(new URL("../db/migrations/pixel/20261028010000_pixelpay_provider_response_code.sql", import.meta.url), "utf8");
   await pool.query(migration);
-  await pool.query(migration);
+  await assert.rejects(
+    pool.query(migration),
+    (error) => error.code === "42701",
+  );
 
   for (const code of [null, "00", "05", "N7", "X-1", "A_B.C:D"]) {
     await pool.query("INSERT INTO app_private.pixelpay_sale_attempts(provider_response_code) VALUES ($1)", [code]);

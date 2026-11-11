@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import env from "./plugins/env.js";
+import adminDataEntry from "./plugins/adminDataEntry.js";
 import logger from "./plugins/logger.js";
 import security from "./plugins/security.js";
 import db from "./plugins/db.js";
@@ -22,11 +23,13 @@ export async function buildApp() {
   app.setErrorHandler(globalErrorHandler);
 
   await app.register(env);
+  await app.register(adminDataEntry);
   await app.register(logger);
   await app.register(security);
   await app.register(db);
   await app.register(mailer);
-  await app.register(membershipAlerts);
+  // AM: Administrative startup must not launch membership business jobs.
+  if (!app.config.adminDataEntryMode) await app.register(membershipAlerts);
   await app.register(auth);
   await app.register(securityRealtime);
   await app.register(agendaRealtime);
