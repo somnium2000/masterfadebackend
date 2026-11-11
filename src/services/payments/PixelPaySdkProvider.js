@@ -1,4 +1,5 @@
 import PixelPaySdk from "@pixelpay/sdk-core";
+import { capturePixelPayStatusShape, emitPixelPayStatusShape } from "./pixelPayStatusShapeProbe.js";
 import { createHash } from "node:crypto";
 import { PaymentProvider } from "./PaymentProvider.js";
 import {
@@ -405,7 +406,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     return transaction.doVoid(request);
   }
 
-  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card } = {}, referenceDate = this.now()) {
+  buildSaleRequest({ orderId, currency, amount, items, customer, billing, card, callbackUrl } = {}, referenceDate = this.now()) {
     const normalizedExpire = normalizeCardExpire(card?.expire, referenceDate);
     const normalizedBillingAddress = text(billing?.address);
     if (isPixelPayBillingAddressPlaceholder(normalizedBillingAddress)) {
@@ -431,6 +432,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
     order.currency = text(currency).toUpperCase();
     order.customer_name = text(customer?.name);
     order.customer_email = text(customer?.email);
+    const normalizedCallbackUrl = text(callbackUrl);
+    if (normalizedCallbackUrl) {
+      order.callback_url = normalizedCallbackUrl;
+    }
 
     for (const source of items) {
       const code = text(source?.code);
@@ -476,6 +481,22 @@ export class PixelPaySdkProvider extends PaymentProvider {
     saleRequest.setCard(paymentCard);
     saleRequest.setBilling(paymentBilling);
     return saleRequest;
+  }
+
+  verifyPaymentHash(paymentHash, orderId) {
+    const normalizedHash = text(paymentHash);
+    const normalizedOrderId = text(orderId);
+    if (!normalizedHash || !normalizedOrderId) return false;
+    try {
+      const transaction = this.createTransaction();
+      return transaction.verifyPaymentHash(
+        normalizedHash,
+        normalizedOrderId,
+        this.secretKey
+      ) === true;
+    } catch {
+      return false;
+    }
   }
 
   readTransactionResult(response) {
@@ -686,7 +707,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     };
   }
 
-  async queryPaymentStatus(paymentUuid, expected = {}) {
+  async queryPaymentStatus(paymentUuid, expected = {}, shapeProbe = {}) {
     const normalizedUuid = text(paymentUuid);
     if (!normalizedUuid) {
       throw new PixelPaySdkError(
@@ -737,10 +758,18 @@ export class PixelPaySdkProvider extends PaymentProvider {
         }
       );
     }
+    const beforeShape = capturePixelPayStatusShape(this, shapeProbe, response?.data);
     const transactionResult = this.readTransactionResult(response);
     const result = transactionResult.result;
+    emitPixelPayStatusShape(shapeProbe, beforeShape,
+      beforeShape ? capturePixelPayStatusShape(this, shapeProbe, result) : null);
     const resultPaymentUuid = text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
+    const resultOrderId = text(result?.order_id) || text(response?.data?.order_id) || null;
+    const resultCurrency = text(result?.transaction_currency)
+      || text(response?.data?.transaction_currency)
+      || text(response?.data?.order_currency)
+      || null;
     const expectedOrderId = text(expected?.orderId);
     const expectedAmount = expected?.amount;
     const hasPaymentHash = Boolean(text(result?.payment_hash));
@@ -797,6 +826,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
         && resultPaymentUuid === normalizedUuid,
       transactionId,
       resultPaymentUuid,
+      resultOrderId,
+      resultCurrency,
       paymentHashValid,
       amountMatches,
       providerContractValid,
