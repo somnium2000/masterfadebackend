@@ -3,8 +3,16 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '120s';
 
+DO $preflight$
+BEGIN
+  IF to_regclass('app_private.pixelpay_sale_attempts') IS NOT NULL THEN
+    RAISE EXCEPTION 'MF_PIXELPAY_SALE_ATTEMPTS_ALREADY_EXISTS_REQUIRES_MANUAL_COMPARISON';
+  END IF;
+END
+$preflight$;
+
 -- AM: Una fila privada por intento; el claim y el registro inicial comparten COMMIT.
-CREATE TABLE IF NOT EXISTS app_private.pixelpay_sale_attempts (
+CREATE TABLE app_private.pixelpay_sale_attempts (
   id_sale_attempt uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   id_intent uuid NOT NULL,
   payment_attempt_id uuid NOT NULL UNIQUE,
@@ -82,10 +90,10 @@ CREATE TABLE IF NOT EXISTS app_private.pixelpay_sale_attempts (
       AND left(cf_ray, 16) ~* '[a-f]'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_pixelpay_sale_attempts_intent_created
+CREATE INDEX idx_pixelpay_sale_attempts_intent_created
   ON app_private.pixelpay_sale_attempts (id_intent, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_pixelpay_sale_attempts_unfinalized
+CREATE INDEX idx_pixelpay_sale_attempts_unfinalized
   ON app_private.pixelpay_sale_attempts (created_at)
   WHERE finalized_at IS NULL;
 

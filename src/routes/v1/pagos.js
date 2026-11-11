@@ -4,9 +4,16 @@ import { sendOk } from "../../utils/response.js";
 import { assertUuid, expireStaleAppointmentReservations } from "../../services/agendaService.js";
 import { PaymentProviderFactory } from "../../services/payments/PaymentProviderFactory.js";
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
+import { buildPixelPayCallbackProbeTelemetry } from "../../services/payments/pixelPayCallbackProbeTelemetry.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
+const PIXELPAY_CALLBACK_MISMATCH_CODES = new Set([
+  "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+  "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
+  "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
+  "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS",
+]);
 
 const requestIdSchema = { type: "string" };
 
@@ -64,6 +71,26 @@ function ensureClientContext(request) {
 function safeText(value) {
   const raw = String(value ?? "").trim();
   return raw.length ? raw : null;
+}
+
+export function buildPixelPayCallbackRejectionTelemetry(error) {
+  const code = safeText(error?.code)?.toUpperCase();
+  if (!PIXELPAY_CALLBACK_MISMATCH_CODES.has(code)) return null;
+  const comparisons = error?.safeCallbackComparisons || {};
+  const safeBoolean = value => typeof value === "boolean" ? value : null;
+  return {
+    code,
+    order_unique: safeBoolean(comparisons.orderUnique),
+    payment_uuid_matches: safeBoolean(comparisons.paymentUuidMatches),
+    amount_matches: safeBoolean(comparisons.amountMatches),
+    currency_matches: safeBoolean(comparisons.currencyMatches),
+  };
+}
+
+function callbackMismatchError(statusCode, message, code, comparisons) {
+  const error = new AppError(statusCode, message, { code });
+  error.safeCallbackComparisons = comparisons;
+  return error;
 }
 
 function buildCallbackUrl(citaId) {
@@ -176,10 +203,414 @@ export function assertPaymentWebhookContract(app, providerCode) {
       code: "PIXELPAY_WEBHOOK_DISABLED",
     });
   }
-  // AM: El proveedor aun no publica un contrato verificable de autenticidad.
-  throw new AppError(503, "Contrato de webhook PixelPay pendiente", {
-    code: "PIXELPAY_WEBHOOK_PROVIDER_CONTRACT_BLOCKED",
-  });
+}
+
+function pixelPayCallbackEventId({ orderId, idIntent }) {
+  const digest = crypto.createHash("sha256")
+    .update([orderId, idIntent].join("|"), "utf8")
+    .digest("hex");
+  return `pixelpay_order_callback_${digest}`;
+}
+
+function pixelPayCallbackStatusEventId({ providerEventId, transactionId }) {
+  const digest = crypto.createHash("sha256")
+    .update([providerEventId, transactionId].join("|"), "utf8")
+    .digest("hex");
+  return `pixelpay_callback_status_${digest}`;
+}
+
+function classifyCallbackStatusError(error) {
+  const code = safeText(error?.code)?.toUpperCase();
+  if (code === "PIXELPAY_STATUS_PRECONDITION_FAILED") return "precondicion_fallida";
+  if (code === "PIXELPAY_NETWORK_ERROR") return "error_red";
+  if (code === "PIXELPAY_RESPONSE_INVALID") return "respuesta_invalida";
+  return "error_proveedor";
+}
+
+async function recordCallbackStatusCheck(db, {
+  idIntent,
+  paymentUuid,
+  providerStatus = null,
+  result,
+  statusCode = null,
+  errorCode = null,
+  durationMs,
+  requestId,
+}) {
+  await db.query(
+    `SELECT app_private.registrar_payment_status_check_v1(
+       $1::uuid, $2::text, 'automatico', $3::text, $4::text,
+       $5::smallint, $6::text, $7::integer, $8::text, $9::timestamptz
+     ) AS id_status_check`,
+    [
+      idIntent,
+      paymentUuid,
+      safeText(providerStatus)?.slice(0, 120) || null,
+      result,
+      Number.isInteger(statusCode) ? statusCode : null,
+      safeText(errorCode)?.slice(0, 120) || null,
+      Math.min(Math.max(0, Math.trunc(durationMs || 0)), 2147483647),
+      safeText(requestId),
+      new Date().toISOString(),
+    ]
+  );
+}
+
+export async function processPixelPayOrderCallback({
+  db,
+  provider,
+  body,
+  requestId,
+  retryCooldownSeconds = 90,
+  logger = null,
+  statusShapeProbeEnabled = false,
+}) {
+  const callbackOrder = safeText(body?.order);
+  const legacyOrder = safeText(body?.order_id);
+  const callbackUuid = safeText(body?.uuid);
+  const legacyPaymentUuid = safeText(body?.payment_uuid);
+  if ((callbackOrder && legacyOrder && callbackOrder !== legacyOrder)
+    || (callbackUuid && legacyPaymentUuid && callbackUuid !== legacyPaymentUuid)) {
+    throw new AppError(400, "Callback PixelPay contiene identificadores contradictorios", {
+      code: "PIXELPAY_CALLBACK_IDENTIFIER_CONFLICT",
+    });
+  }
+  const orderId = callbackOrder || legacyOrder;
+  const paymentUuid = callbackUuid || legacyPaymentUuid;
+  const paymentHash = safeText(body?.payment_hash);
+  const transactionId = safeText(body?.transaction_id);
+  const callbackAmount = Number(body?.amount);
+  const callbackCurrency = safeText(body?.currency).toUpperCase();
+  const callbackStatus = safeText(body?.status).toUpperCase();
+  if (!orderId || !paymentUuid || !paymentHash || !transactionId
+    || !Number.isFinite(callbackAmount) || callbackAmount <= 0
+    || !callbackCurrency || !callbackStatus) {
+    throw new AppError(400, "Callback PixelPay incompleto", {
+      code: "PIXELPAY_CALLBACK_REQUIRED_FIELDS_MISSING",
+    });
+  }
+  if (typeof provider?.verifyPaymentHash !== "function"
+    || provider.verifyPaymentHash(paymentHash, orderId) !== true) {
+    throw new AppError(401, "Hash de pago PixelPay invalido", {
+      code: "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID",
+    });
+  }
+
+  let providerEventId;
+  const client = await db.connect();
+  let intent;
+  let duplicate;
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
+      `pixelpay-order-callback:${orderId}`,
+    ]);
+    const lookup = await client.query(
+      `SELECT pi.id_intent, pi.id_provider, pi.orden_compra, pi.provider_session_id,
+              pi.referencia_externa,
+              pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
+         FROM public.payment_intents pi
+         JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
+        WHERE pp.codigo = 'pixelpay'
+          AND pi.orden_compra = $1::text
+        ORDER BY pi.created_at DESC
+        LIMIT 2
+        FOR UPDATE OF pi`,
+      [orderId]
+    );
+    if (lookup.rows.length !== 1) {
+      const ambiguous = lookup.rows.length > 1;
+      if (ambiguous) {
+        throw callbackMismatchError(
+          409,
+          "Orden PixelPay no identificada de forma unica",
+          "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS",
+          { orderUnique: false }
+        );
+      }
+      throw new AppError(404, "Orden PixelPay no identificada de forma unica", {
+        code: "PIXELPAY_CALLBACK_ORDER_NOT_FOUND",
+      });
+    }
+    intent = lookup.rows[0];
+    // One notification slot per financial intent/order, including pending Sale recovery.
+    // Callback identifiers and the order hash cannot create additional event identities.
+    providerEventId = pixelPayCallbackEventId({ orderId, idIntent: intent.id_intent });
+    const trustedPaymentUuid = safeText(intent.provider_session_id);
+    const trustedTransactionId = safeText(intent.referencia_externa);
+    const comparisons = {
+      orderUnique: true,
+      paymentUuidMatches: !trustedPaymentUuid || trustedPaymentUuid === paymentUuid,
+      amountMatches: Number(intent.monto_hnl).toFixed(2) === callbackAmount.toFixed(2),
+      currencyMatches: safeText(intent.moneda_codigo).toUpperCase() === callbackCurrency,
+    };
+    if (!comparisons.amountMatches) {
+      throw callbackMismatchError(
+        409,
+        "El monto PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
+        comparisons
+      );
+    }
+    if (!comparisons.currencyMatches) {
+      throw callbackMismatchError(
+        409,
+        "La moneda PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
+        comparisons
+      );
+    }
+    const saleEvidence = trustedPaymentUuid && trustedTransactionId
+      ? await client.query(
+        `SELECT 1 AS verified
+           FROM public.payment_events pe
+          WHERE pe.id_intent = $1::uuid
+            AND pe.evento_tipo = 'pixelpay.sale.approved_verified'
+            AND pe.firma_valida IS TRUE
+            AND pe.payload_esencial->>'payment_uuid' = $2::text
+            AND pe.payload_esencial->>'transaction_id' = $3::text
+            AND pe.payload_esencial->>'currency' = $4::text
+            AND (pe.payload_esencial->>'amount')::numeric = $5::numeric
+          LIMIT 1`,
+        [
+          intent.id_intent,
+          trustedPaymentUuid,
+          trustedTransactionId,
+          callbackCurrency,
+          callbackAmount,
+        ]
+      )
+      : { rows: [] };
+    const hasVerifiedSaleCorrelation = saleEvidence.rows.length === 1;
+    const inserted = await client.query(
+      `INSERT INTO public.payment_events (
+         id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent,
+         resultado_procesamiento
+       ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.received', FALSE,
+                 $3::jsonb, $4::uuid, $5::text)
+       ON CONFLICT (id_provider, provider_event_id) DO NOTHING
+       RETURNING id_event`,
+      [
+        intent.id_provider,
+        providerEventId,
+        {
+          order_id: orderId,
+          callback_uuid: paymentUuid,
+          callback_transaction_id: transactionId,
+          payment_uuid: trustedPaymentUuid,
+          transaction_id: trustedTransactionId,
+          callback_uuid_matches: paymentUuid === trustedPaymentUuid,
+          callback_transaction_id_matches: transactionId === trustedTransactionId,
+          order_hash_valid: true,
+          amount: callbackAmount,
+          currency: callbackCurrency,
+          provider_status: callbackStatus,
+        },
+        intent.id_intent,
+        hasVerifiedSaleCorrelation ? null : "sale_evidence_missing_pending",
+      ]
+    );
+    duplicate = !inserted.rows[0];
+    if (!hasVerifiedSaleCorrelation) {
+      await client.query("COMMIT");
+      return {
+        provider: "pixelpay",
+        provider_event_id: providerEventId,
+        status: "pending",
+        processed: false,
+        duplicate,
+        extension_pending: true,
+      };
+    }
+    const claimed = await client.query(
+      `UPDATE public.payment_events
+          SET procesado_at = now(),
+              resultado_procesamiento = 'status_consulta_en_curso'
+        WHERE id_provider = $1::uuid
+          AND provider_event_id = $2::text
+          AND (
+            resultado_procesamiento IS NULL
+            OR (
+              resultado_procesamiento IN (
+                'status_consulta_en_curso',
+                'status_412_pendiente',
+                'status_error_red_pendiente',
+                'status_incierto_pendiente',
+                'sale_evidence_missing_pending'
+              )
+              AND (
+                procesado_at IS NULL
+                OR procesado_at <= now() - make_interval(secs => $3::integer)
+              )
+            )
+          )
+       RETURNING id_event`,
+      [
+        intent.id_provider,
+        providerEventId,
+        Math.min(Math.max(0, Math.trunc(retryCooldownSeconds || 0)), 300),
+      ]
+    );
+    await client.query("COMMIT");
+    if (!claimed.rows[0]) {
+      return {
+        provider: "pixelpay",
+        provider_event_id: providerEventId,
+        status: "pending",
+        processed: false,
+        duplicate,
+        extension_pending: true,
+      };
+    }
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  const startedAt = Date.now();
+  const trustedPaymentUuid = safeText(intent.provider_session_id);
+  const trustedTransactionId = safeText(intent.referencia_externa);
+  let status;
+  try {
+    status = await provider.queryPaymentStatus(trustedPaymentUuid, {
+      orderId,
+      amount: Number(intent.monto_hnl),
+    }, {
+      enabled: statusShapeProbeEnabled === true,
+      requestId,
+      logger,
+    });
+    const uuidMatches = safeText(status?.resultPaymentUuid) === trustedPaymentUuid;
+    const transactionMatches = safeText(status?.transactionId) === trustedTransactionId;
+    const currencyMatches = safeText(intent.moneda_codigo)?.toUpperCase() === "HNL";
+    const statusOrderMatches = !safeText(status?.resultOrderId)
+      || safeText(status.resultOrderId) === orderId;
+    const statusCurrencyMatches = !safeText(status?.resultCurrency)
+      || safeText(status.resultCurrency)?.toUpperCase() === callbackCurrency;
+    const callbackStatusMatches = ["COMPLETED", "PAID", "APPROVED", "SUCCESS"]
+      .includes(callbackStatus);
+    const financialConditions = {
+      http_ok: status?.ok === true,
+      response_success: status?.success === true,
+      provider_contract_valid: status?.providerContractValid === true,
+      payment_hash_valid: status?.paymentHashValid === true,
+      amount_matches: status?.amountMatches === true,
+      status_approved: ["COMPLETED", "PAID"].includes(safeText(status?.status)?.toUpperCase()),
+      approved: status?.approved === true,
+      not_incomplete: status?.incomplete !== true,
+      transaction_id_present: Boolean(safeText(status?.transactionId)),
+      transaction_id_matches: transactionMatches,
+      intent_currency_valid: currencyMatches,
+      order_matches_or_absent: statusOrderMatches,
+      currency_matches_or_absent: statusCurrencyMatches,
+      callback_status_accepted: callbackStatusMatches,
+      payment_uuid_matches: uuidMatches,
+    };
+    const financiallyVerified = Object.values(financialConditions).every(value => value === true);
+    if (!financiallyVerified) logger?.info?.({
+      pixelPayCallbackStatusValidation: {
+        ok: status?.ok === true,
+        success: status?.success === true,
+        providerContractValid: status?.providerContractValid === true,
+        paymentHashValid: status?.paymentHashValid === true,
+        amountMatches: status?.amountMatches === true,
+        approved: status?.approved === true,
+        incomplete: status?.incomplete === true,
+        uuidMatches,
+        transactionMatches,
+        currencyMatches,
+        statusOrderMatches,
+        statusCurrencyMatches,
+        callbackStatusMatches,
+        financiallyVerified,
+      },
+    }, "PixelPay callback Status financial conditions");
+    await recordCallbackStatusCheck(db, {
+      idIntent: intent.id_intent,
+      paymentUuid: trustedPaymentUuid,
+      providerStatus: status?.status,
+      result: financiallyVerified ? "ok" : "respuesta_invalida",
+      statusCode: status?.statusCode,
+      durationMs: Date.now() - startedAt,
+      requestId,
+    });
+    if (financiallyVerified) {
+      await db.query(
+        `INSERT INTO public.payment_events (
+           id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+         ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.status_verified', TRUE, $3::jsonb, $4::uuid)
+         ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
+        [
+          intent.id_provider,
+          pixelPayCallbackStatusEventId({
+            providerEventId,
+            transactionId: status.transactionId,
+          }),
+          {
+            order_id: orderId,
+            payment_uuid: trustedPaymentUuid,
+            transaction_id: status.transactionId,
+            amount: Number(intent.monto_hnl),
+            currency: safeText(intent.moneda_codigo)?.toUpperCase(),
+            provider_status: safeText(status.status)?.toUpperCase(),
+          },
+          intent.id_intent,
+        ]
+      );
+    }
+    await db.query(
+      `UPDATE public.payment_events
+          SET procesado_at = now(),
+              resultado_procesamiento = $3::text
+        WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
+      [
+        intent.id_provider,
+        providerEventId,
+        financiallyVerified
+          ? "status_verificado_pendiente_conciliacion"
+          : "status_incierto_pendiente",
+      ]
+    );
+    return {
+      provider: "pixelpay",
+      provider_event_id: providerEventId,
+      status: safeText(status?.status)?.toLowerCase() || "pending",
+      processed: false,
+      duplicate,
+      extension_pending: true,
+    };
+  } catch (error) {
+    const callbackResult = safeText(error?.code)?.toUpperCase() === "PIXELPAY_STATUS_PRECONDITION_FAILED"
+      ? "status_412_pendiente"
+      : safeText(error?.code)?.toUpperCase() === "PIXELPAY_NETWORK_ERROR"
+        ? "status_error_red_pendiente"
+        : "status_incierto_pendiente";
+    await recordCallbackStatusCheck(db, {
+      idIntent: intent.id_intent,
+      paymentUuid: trustedPaymentUuid,
+      result: classifyCallbackStatusError(error),
+      statusCode: error?.statusCode,
+      errorCode: error?.code,
+      durationMs: Date.now() - startedAt,
+      requestId,
+    });
+    await db.query(
+      `UPDATE public.payment_events
+          SET procesado_at = now(), resultado_procesamiento = $3::text
+        WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
+      [intent.id_provider, providerEventId, callbackResult]
+    );
+    return {
+      provider: "pixelpay",
+      provider_event_id: providerEventId,
+      status: "pending",
+      processed: false,
+      duplicate,
+      extension_pending: true,
+    };
+  }
 }
 
 async function loadOwnedAppointment(client, { citaId, clienteId, personaId }) {
@@ -565,6 +996,23 @@ export default async function pagosRoutes(app) {
       try {
         const providerCode = String(request.params?.proveedor || "").trim().toLowerCase();
         assertPaymentWebhookContract(app, providerCode);
+        if (providerCode === "pixelpay") {
+          if (app.config?.pixelPayCallbackProbeEnabled === true) {
+            request.log.info(
+              { pixelPayCallbackProbe: buildPixelPayCallbackProbeTelemetry(request) },
+              "PixelPay order_callback QA probe received"
+            );
+          }
+          const result = await processPixelPayOrderCallback({
+            db: app.db,
+            provider: PaymentProviderFactory.create(),
+            body: request.body,
+            requestId: request.id,
+            logger: request.log,
+            statusShapeProbeEnabled: app.config?.pixelPayStatusShapeProbeEnabled === true,
+          });
+          return sendOk(reply, result);
+        }
         validateWebhookFreshness(request);
         dbClient = await app.db.connect();
         const body = request.body && typeof request.body === "object" ? request.body : {};
@@ -854,6 +1302,14 @@ export default async function pagosRoutes(app) {
           } catch {
             // no-op
           }
+        }
+
+        const rejectionTelemetry = buildPixelPayCallbackRejectionTelemetry(error);
+        if (rejectionTelemetry) {
+          request.log.warn(
+            { pixelPayCallbackRejection: rejectionTelemetry },
+            "PixelPay order_callback rejected by financial comparison"
+          );
         }
 
         return sendHandled(reply, request, error, "No se pudo procesar el webhook de pago", "PAGOS_WEBHOOK_ERROR");

@@ -343,7 +343,9 @@ test("migration privada define contrato, checks y allowlists identicas a JavaScr
   const sql = (await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
   const evidenceSql = await readFile(new URL("../db/migrations/pixel/20261016010000_pixelpay_uncertain_observed_identifiers.sql", import.meta.url), "utf8");
   const responseCodeSql = await readFile(new URL("../db/migrations/pixel/20261028010000_pixelpay_provider_response_code.sql", import.meta.url), "utf8");
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS app_private\.pixelpay_sale_attempts/);
+  assert.match(sql, /DO \$preflight\$[\s\S]*to_regclass\('app_private\.pixelpay_sale_attempts'\) IS NOT NULL[\s\S]*RAISE EXCEPTION 'MF_PIXELPAY_SALE_ATTEMPTS_ALREADY_EXISTS_REQUIRES_MANUAL_COMPARISON'[\s\S]*\$preflight\$;/);
+  assert.match(sql, /CREATE TABLE app_private\.pixelpay_sale_attempts/);
+  assert.doesNotMatch(sql, /CREATE TABLE IF NOT EXISTS app_private\.pixelpay_sale_attempts/);
   assert.match(sql, /payment_attempt_id uuid NOT NULL UNIQUE/);
   assert.match(sql, /REFERENCES public\.payment_intents\(id_intent\)\s+ON UPDATE CASCADE ON DELETE RESTRICT/);
   assert.match(sql, /upstream_http_status BETWEEN 100 AND 599/);
@@ -373,7 +375,8 @@ test("migration privada define contrato, checks y allowlists identicas a JavaScr
   assert.match(evidenceSql, /no demuestra aprobacion ni identidad financiera confiable/);
   assert.match(evidenceSql, /REVOKE ALL ON TABLE app_private\.pixelpay_sale_attempts FROM PUBLIC, anon, authenticated, service_role/);
   assert.doesNotMatch(evidenceSql, /\bGRANT\b|SECURITY DEFINER|provider_session_id|referencia_externa/);
-  assert.match(responseCodeSql, /ADD COLUMN IF NOT EXISTS provider_response_code varchar\(16\)/);
+  assert.match(responseCodeSql, /ADD COLUMN provider_response_code varchar\(16\)/);
+  assert.doesNotMatch(responseCodeSql, /ADD COLUMN IF NOT EXISTS provider_response_code/);
   assert.match(responseCodeSql, /provider_response_code ~ '\^\[A-Z0-9\]\[A-Z0-9\._:-\]\{0,15\}\$'/);
   assert.match(responseCodeSql, /provider_response_code !~ '\^\[0-9\]\{13,19\}\$'/);
   assert.match(responseCodeSql, /REVOKE ALL ON TABLE app_private\.pixelpay_sale_attempts FROM PUBLIC, anon, authenticated, service_role/);

@@ -14,6 +14,8 @@ function probeEnv(overrides = {}) {
     PIXELPAY_PROBE_CARD_EXPIRE_MONTH: "12",
     PIXELPAY_PROBE_CARD_EXPIRE_YEAR: "28",
     PIXELPAY_PROBE_DRY_RUN: "true",
+    PIXELPAY_PROBE_ORDER_CALLBACK_URL: "https://api-qa.masterfadeapp.com/v1/pagos/webhook/pixelpay",
+    PIXELPAY_PROBE_EXECUTE: "I_UNDERSTAND_SINGLE_SANDBOX_SALE",
     ...overrides,
   };
 }
@@ -73,7 +75,11 @@ function fakeProbeSdk({
   class Billing { constructor() { calls.billing += 1; } }
   class SaleTransaction {
     constructor() { calls.saleTransaction += 1; }
-    setOrder(value) { calls.setOrder += 1; this.order = value; }
+    setOrder(value) {
+      calls.setOrder += 1;
+      this.order = value;
+      this.order_callback = value.callback_url;
+    }
     setCard(value) { calls.setCard += 1; this.card = value; }
     setBilling(value) { calls.setBilling += 1; this.billing = value; }
   }
@@ -162,9 +168,48 @@ test("probe dry-run construye y enlaza todos los modelos sin Transaction ni red"
     assert.equal(fake.calls.transaction, 0);
     assert.equal(fake.calls.sale, 0);
     assert.equal(fetchCalls, 0);
+    assert.equal(result.context.callbackConfigured, true);
     assert.deepEqual(output.lines.map((entry) => entry.event), ["PROBE_START", "DRY_RUN_OK"]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("probe exige callback QA HTTPS sin query y no ejecuta Sale con autorizacion ausente", async () => {
+  const fake = fakeProbeSdk();
+  const invalid = await runPixelPaySandboxSaleProbe({
+    env: probeEnv({ PIXELPAY_PROBE_ORDER_CALLBACK_URL: "https://api-qa.masterfadeapp.com/v1/pagos/webhook/pixelpay?secret=no" }),
+    sdk: fake.sdk,
+    write: () => {},
+  });
+  assert.equal(invalid.exitCode, 2);
+  assert.equal(invalid.saleCount, 0);
+
+  const unauthorized = await runPixelPaySandboxSaleProbe({
+    env: probeEnv({ PIXELPAY_PROBE_DRY_RUN: "false", PIXELPAY_PROBE_EXECUTE: "" }),
+    sdk: fake.sdk,
+    write: () => {},
+  });
+  assert.equal(unauthorized.exitCode, 2);
+  assert.equal(unauthorized.saleCount, 0);
+  assert.equal(fake.calls.sale, 0);
+});
+
+test("probe rechaza produccion y cualquier host distinto de API QA", async () => {
+  for (const callbackUrl of [
+    "https://api.masterfadeapp.com/v1/pagos/webhook/pixelpay",
+    "https://qa-api.masterfadeapp.com/v1/pagos/webhook/pixelpay",
+    "https://api-qa.masterfadeapp.com:444/v1/pagos/webhook/pixelpay",
+  ]) {
+    const fake = fakeProbeSdk();
+    const result = await runPixelPaySandboxSaleProbe({
+      env: probeEnv({ PIXELPAY_PROBE_ORDER_CALLBACK_URL: callbackUrl }),
+      sdk: fake.sdk,
+      write: () => {},
+    });
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.saleCount, 0);
+    assert.equal(fake.calls.sale, 0);
   }
 });
 
@@ -233,7 +278,7 @@ test("AFTER_SALE usa response.status y conserva telemetria estrictamente permiti
   assert.equal(result.outcome, "APPROVED");
   assert.equal(afterSale.statusCode, 201);
   assert.deepEqual(Object.keys(afterSale).sort(), [
-    "amount", "approvedAmountMatches", "currency", "event", "orderId", "outcome",
+    "amount", "approvedAmountMatches", "callbackConfigured", "currency", "event", "orderId", "outcome",
     "paymentHashPresent", "paymentHashValid", "paymentUuidPresent", "probeId",
     "responseApproved", "responseClass", "responseIncomplete", "statusCode", "success",
     "timestamp", "transactionAmountMatches", "transactionIdPresent",

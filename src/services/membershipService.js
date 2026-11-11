@@ -2385,12 +2385,15 @@ export async function processMembershipPixelPaySale(app, {
       cardExpireFuture: expiry.future,
       billingAddressLength: normalizeText(billing?.address).length,
     });
+    const membershipOrderReference = `VIP-${intent.id_order}`;
     const updated = await claimClient.query(
       `UPDATE public.payment_intents
-          SET estado_intent_codigo = 'pendiente_confirmacion', updated_at = now()
+          SET estado_intent_codigo = 'pendiente_confirmacion',
+              orden_compra = $2::text,
+              updated_at = now()
         WHERE id_intent = $1::uuid AND estado_intent_codigo = 'link_generado'
         RETURNING id_intent`,
-      [safeIntentId]
+      [safeIntentId, membershipOrderReference]
     );
     if (!updated.rows[0]) throw new AppError(409, "Ya existe un cobro en curso para este intent", {
       code: "MEMBERSHIP_PIXELPAY_SALE_ALREADY_IN_PROGRESS",
@@ -2417,6 +2420,7 @@ export async function processMembershipPixelPaySale(app, {
       customer: { name: safeText(clienteSnapshot?.nombre_completo) || "Cliente", email: safeText(clienteSnapshot?.email) },
       card,
       billing,
+      callbackUrl: app.config?.pixelPayOrderCallbackUrl || null,
     }, { requestId, idIntent: safeIntentId, paymentAttemptId, logger });
   } catch (providerError) {
     const diagnostic = buildSafeProviderErrorDiagnostic(providerError, requestId);
