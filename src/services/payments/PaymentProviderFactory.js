@@ -1,4 +1,5 @@
 import { AppError } from "../../utils/errors.js";
+import { resolveQaPaymentSimulationConfig } from "../../config/qaPaymentSimulation.js";
 import { MockPaymentProvider } from "./MockPaymentProvider.js";
 import { TodoPagoPreprodSimulatedProvider } from "./TodoPagoPreprodSimulatedProvider.js";
 import { PixelPayDirectProvider } from "./PixelPayDirectProvider.js";
@@ -49,6 +50,7 @@ export class PaymentProviderFactory {
 
             case "todopago":
                 if (todoPagoMode === "preprod_simulated") {
+                    resolveQaPaymentSimulationConfig(process.env);
                     PaymentProviderFactory._instance = new TodoPagoPreprodSimulatedProvider();
                     break;
                 }

@@ -729,6 +729,7 @@ async function createPagosApp(client, {
   authenticated = false,
   claims = null,
   privatePilot = null,
+  config = {},
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -741,7 +742,15 @@ async function createPagosApp(client, {
         }
       : false,
   });
-  app.decorate("config", { paymentProvider: providerCode, pixelPayEnv: "sandbox" });
+  app.decorate("config", {
+    paymentProvider: providerCode,
+    pixelPayEnv: "sandbox",
+    todoPago: providerCode === "todopago"
+      ? { mode: "preprod_simulated", simulatedEnabled: true }
+      : null,
+    qaPaymentSimulation: { enabled: providerCode === "todopago" },
+    ...config,
+  });
   if (!privatePilot) app.decorate("requireRoles", () => async (request) => {
     request.claims = claims;
   });
@@ -1307,6 +1316,78 @@ test("preprod_simulated conserva redirect y payment_url", async () => {
   assert.equal(response.json().data.launch.type, "redirect");
   assert.equal(response.json().data.launch.method, "GET");
   assert.equal(response.json().data.payment_url, response.json().data.launch.action);
+  await app.close();
+});
+
+test("TodoPago simulado aprueba, confirma y no duplica el pago", async () => {
+  const client = createPagosClient({ providerCode: "todopago" });
+  const app = await createPagosApp(client, {
+    providerCode: "todopago",
+    providerAdapter: new TodoPagoPreprodSimulatedProvider(),
+  });
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+  const payload = {
+    id_grupo_cita: GROUP_A,
+    id_intent: created.json().data.id_intent,
+    titular_email: "cliente@example.com",
+    monto_prueba_hnl: 1,
+  };
+  const approved = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/simulator/event",
+    payload,
+  });
+  const duplicate = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/simulator/event",
+    payload,
+  });
+
+  assert.equal(approved.statusCode, 200, approved.body);
+  assert.equal(approved.json().data.normalized_status, "PAID");
+  assert.equal(approved.json().data.booking_confirmed, true);
+  assert.equal(duplicate.statusCode, 200, duplicate.body);
+  assert.equal(duplicate.json().data.duplicate, true);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  await app.close();
+});
+
+test("TodoPago simulado rechaza sin crear pago ni confirmar la cita", async () => {
+  const client = createPagosClient({ providerCode: "todopago" });
+  const app = await createPagosApp(client, {
+    providerCode: "todopago",
+    providerAdapter: new TodoPagoPreprodSimulatedProvider(),
+  });
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+  const rejected = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/simulator/event",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: created.json().data.id_intent,
+      titular_email: "cliente@example.com",
+      monto_prueba_hnl: 1.05,
+    },
+  });
+
+  assert.equal(rejected.statusCode, 200, rejected.body);
+  assert.equal(rejected.json().data.normalized_status, "FAILED");
+  assert.equal(rejected.json().data.booking_confirmed, false);
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "fallido");
+  assert.notEqual(client.getGroupState()[0].estado_cita_codigo, "confirmada");
   await app.close();
 });
 
