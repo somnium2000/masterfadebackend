@@ -58,6 +58,10 @@ import {
 } from "../../services/booking/bookingHoldOrchestrationService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
+const CLIENT_APPOINTMENT_SECTIONS = {
+  proximas: ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"],
+  historial: ["completada", "cancelada", "cancelada_por_cliente", "expirada", "no_show", "anulada"],
+};
 const requestIdSchema = { type: "string" };
 const HONDURAS_TIME_ZONE = "America/Tegucigalpa";
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -245,7 +249,7 @@ function toIsoOrNull(value) {
   return parsed.toISOString();
 }
 
-async function listAppointmentRows(client, { clienteId, personaId, citaId = null, estado = null, fechaDesde = null, fechaHasta = null }) {
+async function listAppointmentRows(client, { clienteId, personaId, citaId = null, estado = null, fechaDesde = null, fechaHasta = null, apartado = null, page = 1 }) {
   const params = [clienteId, personaId];
   const conditions = [
     "c.deleted_at IS NULL",
@@ -269,8 +273,7 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
     conditions.push(`c.inicio_at < (($${params.length}::date + 1)::timestamp AT TIME ZONE 'America/Tegucigalpa')`);
   }
 
-  const { rows } = await client.query(
-    `
+  const sql = `
       SELECT
         c.id_cita,
         c.id_sucursal,
@@ -340,10 +343,34 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
       ) mem ON TRUE
       WHERE ${conditions.join(" AND ")}
       ORDER BY c.inicio_at DESC, c.id_cita DESC
-    `,
-    params
-  );
-
+    `;
+  if (apartado) {
+    // AM: Conteos y página comparten snapshot SQL y el mismo aislamiento del listado tradicional.
+    params.push(CLIENT_APPOINTMENT_SECTIONS.proximas, CLIENT_APPOINTMENT_SECTIONS.historial,
+      CLIENT_APPOINTMENT_SECTIONS[apartado], page);
+    const [active, history, selected, requested] = [params.length - 3, params.length - 2, params.length - 1, params.length];
+    const { rows } = await client.query(`WITH eligible AS (${sql}), counts AS (
+      SELECT (COUNT(*) FILTER (WHERE estado_cita_codigo = ANY($${active}::text[])))::int AS proximas,
+        (COUNT(*) FILTER (WHERE estado_cita_codigo = ANY($${history}::text[])))::int AS historial,
+        (COUNT(*) FILTER (WHERE estado_cita_codigo = ANY($${selected}::text[])))::int AS total,
+        (COUNT(*) FILTER (WHERE estado_cita_codigo = 'pendiente_pago'))::int AS pendientes_pago
+      FROM eligible
+    ), metadata AS (
+      SELECT *, GREATEST(1, (total + 4) / 5) AS total_pages,
+        LEAST($${requested}::int, GREATEST(1, (total + 4) / 5)) AS page FROM counts
+    )
+    SELECT metadata.*, COALESCE((SELECT jsonb_agg(p ORDER BY p.inicio_at DESC, p.id_cita DESC)
+      FROM (SELECT * FROM eligible WHERE estado_cita_codigo = ANY($${selected}::text[])
+        ORDER BY inicio_at DESC, id_cita DESC LIMIT 5 OFFSET (metadata.page - 1) * 5) p), '[]'::jsonb) AS citas
+    FROM metadata`, params);
+    const result = rows[0];
+    return { citas: result.citas.map(mapAppointmentRow),
+      totals: { proximas: result.proximas, historial: result.historial,
+        total: result.proximas + result.historial, pendientes_pago: result.pendientes_pago },
+      pagination: { apartado, page: result.page, limit: 5, total: result.total,
+        total_pages: result.total_pages, has_next: result.page < result.total_pages, has_prev: result.page > 1 } };
+  }
+  const { rows } = await client.query(sql, params);
   return rows;
 }
 
@@ -3248,6 +3275,9 @@ export default async function citasRoutes(app) {
         querystring: {
           type: "object",
           properties: {
+            apartado: { type: "string", enum: ["proximas", "historial"] },
+            page: { type: "integer", minimum: 1, maximum: 100000000 },
+            limit: { type: "integer", enum: [5] },
             estado: { type: "string" },
             fecha_desde: { type: "string", format: "date" },
             fecha_hasta: { type: "string", format: "date" },
@@ -3263,6 +3293,15 @@ export default async function citasRoutes(app) {
                 type: "object",
                 properties: {
                   citas: { type: "array", items: citaResumenSchema },
+                  totals: { type: "object", properties: {
+                    proximas: { type: "integer" }, historial: { type: "integer" },
+                    total: { type: "integer" }, pendientes_pago: { type: "integer" },
+                  }, additionalProperties: false },
+                  pagination: { type: "object", properties: {
+                    apartado: { type: "string" }, page: { type: "integer" }, limit: { type: "integer" },
+                    total: { type: "integer" }, total_pages: { type: "integer" },
+                    has_next: { type: "boolean" }, has_prev: { type: "boolean" },
+                  }, additionalProperties: false },
                 },
                 required: ["citas"],
                 additionalProperties: false,
@@ -3283,9 +3322,17 @@ export default async function citasRoutes(app) {
     async (request, reply) => {
       try {
         const context = ensureClientContext(request);
+        const apartado = request.query?.apartado ?? null;
+        if (!apartado && (request.query?.page !== undefined || request.query?.limit !== undefined)) {
+          throw new AppError(400, "Selecciona el apartado que deseas consultar", { code: "CITAS_SECTION_REQUIRED" });
+        }
         const estado = request.query?.estado ? String(request.query.estado).trim() : null;
         const fechaDesde = request.query?.fecha_desde ? parseDateOnly(request.query.fecha_desde, "fecha_desde") : null;
         const fechaHasta = request.query?.fecha_hasta ? parseDateOnly(request.query.fecha_hasta, "fecha_hasta") : null;
+
+        if (apartado && fechaDesde && fechaHasta && fechaDesde > fechaHasta) {
+          throw new AppError(400, "El rango de fechas no es válido", { code: "CITAS_DATE_RANGE_INVALID" });
+        }
 
         if (estado && !OCCUPIED_APPOINTMENT_STATES.concat(["expirada", "cancelada", "completada", "no_show"]).includes(estado)) {
           throw new AppError(400, "estado no es valido", {
@@ -3299,9 +3346,11 @@ export default async function citasRoutes(app) {
           estado,
           fechaDesde,
           fechaHasta,
+          apartado,
+          page: request.query?.page ?? 1,
         });
 
-        return sendOk(reply, {
+        return sendOk(reply, apartado ? rows : {
           citas: rows.map(mapAppointmentRow),
         });
       } catch (error) {
