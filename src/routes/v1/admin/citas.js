@@ -666,9 +666,9 @@ async function listOperationalAppointments(client, {
       WITH filtered_appointments AS (${sql})
       SELECT (SELECT COUNT(*)::int FROM filtered_appointments) AS total,
         COALESCE((
-          SELECT jsonb_agg(p ORDER BY p.inicio_at DESC, p.id_cita DESC)
+          SELECT jsonb_agg(p ORDER BY p.inicio_at ${normalizedSortDirection}, p.id_cita ${normalizedSortDirection})
           FROM (SELECT * FROM filtered_appointments
-                ORDER BY inicio_at DESC, id_cita DESC
+                ORDER BY inicio_at ${normalizedSortDirection}, id_cita ${normalizedSortDirection}
                 LIMIT $${limitIdx}::int OFFSET $${params.length}::bigint) p
         ), '[]'::jsonb) AS citas
     `, params);
@@ -1972,7 +1972,11 @@ export default async function adminCitasRoutes(app) {
       const roleScope = getRoleScope(request.claims);
       const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
       const states = parseStatusFilter(request.query?.estado, OPERATIONAL_APPOINTMENT_STATES);
-      const citas = await listOperationalAppointments(app.db, {
+      const page = request.query?.page === undefined ? null : Number(request.query.page);
+      if (page !== null && (!Number.isSafeInteger(page) || page < 1 || page > 100000000)) {
+        throw new AppError(400, "Página inválida", { code: "ADMIN_CITAS_INVALID_PAGE" });
+      }
+      const result = await listOperationalAppointments(app.db, {
         branchIds,
         barberScopeId: roleScope.barber_empleado_id,
         preferencesBarberId: roleScope.preferences_barber_empleado_id,
@@ -1983,10 +1987,12 @@ export default async function adminCitasRoutes(app) {
         fechaDesde,
         fechaHasta,
         limit: parseLimit(request.query?.limit, 120, 400),
+        page,
         dateOffset: request.query?.zona_horaria === "America/Tegucigalpa" ? "-06:00" : "",
       });
       return sendOk(reply, {
-        citas,
+        citas: page === null ? result : result.citas,
+        ...(page === null ? {} : { pagination: result.pagination }),
         filtros: {
           id_sucursal: request.query?.id_sucursal ?? null,
           id_empleado_barbero: request.query?.id_empleado_barbero ?? null,

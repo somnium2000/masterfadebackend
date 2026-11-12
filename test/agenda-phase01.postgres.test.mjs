@@ -118,4 +118,36 @@ test('historial real: SQL PostgreSQL, páginas estables, filtros y día Honduras
     }
     assert.ok([...seen[0]].every(id=>!seen[1].has(id)));
   }
+  await t.test('operativas: rango futuro completo, paginación ascendente y aislamiento',async()=>{
+    await pg.exec('DELETE FROM citas');
+    await pg.query(`INSERT INTO citas(id_cita,id_sucursal,id_empleado_barbero,id_persona_cliente,inicio_at,estado_cita_codigo,alias_integrante)
+      SELECT ('44444444-4444-4444-8444-' || lpad(i::text,12,'0'))::uuid,$1,$2,
+        CASE WHEN i=2 THEN NULL ELSE $3::uuid END,
+        '2026-11-15T06:00:00Z'::timestamptz + (i-1)*interval '1 minute','confirmada',
+        CASE WHEN i=2 THEN 'Invitado sin cuenta' ELSE 'Titular '||i END
+      FROM generate_series(1,405) i`,[BRANCH,BARBER,PERSON]);
+    const range='fecha_desde=2026-11-15&fecha_hasta=2026-11-15&zona_horaria=America%2FTegucigalpa';
+    for(const zone of ['UTC','Asia/Tokyo','America/Los_Angeles']){
+      await pg.exec("SET TIME ZONE '"+zone+"'");
+      const rows=[];
+      for(const page of [1,2]){
+        const data=await get('operativas?'+range+'&page='+page+'&limit=400');
+        assert.equal(data.pagination.total,405);assert.equal(data.pagination.total_pages,2);
+        assert.equal(data.pagination.has_next,page===1);assert.equal(data.citas.length,page===1?400:5);
+        rows.push(...data.citas);
+      }
+      assert.equal(new Set(rows.map(r=>r.id_cita)).size,405);
+      assert.deepEqual(rows.map(r=>Number(r.id_cita.slice(-12))),Array.from({length:405},(_,i)=>i+1));
+      assert.equal(rows[1].nombre_cliente,'Invitado sin cuenta');
+      assert.equal((await get('operativas?'+range+'&page=3&limit=400')).citas.length,0);
+      const legacy=await get('operativas?'+range);assert.equal(legacy.pagination,undefined);assert.equal(legacy.citas.length,120);
+      assert.equal((await get('operativas?'+range+'&id_empleado_barbero='+secondBarber+'&page=1')).pagination.total,0);
+      assert.equal((await get('operativas?fecha_desde=2026-11-14&fecha_hasta=2026-11-14&page=1&zona_horaria=America%2FTegucigalpa')).pagination.total,0);
+      const history=await get('historial?'+range+'&page=1&limit=9');assert.equal(Number(history.citas[0].id_cita.slice(-12)),405);
+    }
+    for(const page of ['0','-1','1.5','invalid'])assert.equal((await app.inject({url:'/v1/admin/citas/operativas?page='+page})).statusCode,400);
+    assert.equal((await app.inject({url:'/v1/admin/citas/operativas?fecha_desde=2026-11-16&fecha_hasta=2026-11-15&page=1'})).statusCode,400);
+    assert.equal((await app.inject({url:'/v1/admin/citas/operativas?'+range+'&page=1',headers:{'x-fixture-role':'cliente'}})).statusCode,403);
+    assert.equal((await app.inject({url:'/v1/admin/citas/operativas?'+range+'&page=1&id_sucursal=99999999-9999-4999-8999-999999999999'})).statusCode,403);
+  });
 });
