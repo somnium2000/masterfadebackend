@@ -3148,6 +3148,64 @@ async function listActiveSubscriptionRowsByCliente(client, clienteId, { limit = 
   }
 }
 
+// AM: Lectura paginada independiente: no recorta los consumos usados para remanentes.
+export async function listClienteMembershipConsumptions(client, clienteId, { page = 1, idSuscripcion = null } = {}) {
+  const limit = 5;
+  const requestedPage = Math.max(1, Math.min(1000000, Math.trunc(Number(page) || 1)));
+  const empty = { consumos: [], pagination: { page: 1, limit, total: 0, total_pages: 1 } };
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasSubscriptions || !capabilities.hasSubscriptionConsumptions) return empty;
+  if (idSuscripcion) {
+    const owned = await client.query('SELECT id_suscripcion FROM public.subscriptions WHERE id_suscripcion=$1::uuid AND id_cliente=$2::uuid', [idSuscripcion, clienteId]);
+    if (!owned.rows.length) throw new AppError(404, "No se encontró la suscripción", { code: "CLIENTE_SUBSCRIPTION_NOT_FOUND" });
+  }
+  const active = await listActiveSubscriptionRowsByCliente(client, clienteId, { limit: 20 });
+  const activeIds = active.map(row => row.id_suscripcion);
+  const subscriptionIds = idSuscripcion ? [idSuscripcion] : (activeIds.length ? activeIds : null);
+  const activeScope = idSuscripcion ? activeIds.includes(idSuscripcion) : activeIds.length > 0;
+  const branchSql = capabilities.hasSubsSucursalContratada ? 'COALESCE(c.id_sucursal, sub.id_sucursal_contratada)' : 'c.id_sucursal';
+  const validity = [
+    capabilities.hasSubcInvalidado ? 'COALESCE(sc.invalidado,FALSE) IS FALSE' : 'TRUE',
+    capabilities.hasSubcSourceKind ? "sc.source_kind = 'appointment_completed'" : 'TRUE',
+    activeScope ? "(c.id_cita IS NULL OR c.estado_cita_codigo NOT IN ('expirada','cancelada'))" : 'TRUE',
+  ].join(' AND ');
+  const { rows } = await client.query(`
+    WITH filtered AS MATERIALIZED (
+      SELECT sc.id_consumo, sc.id_suscripcion, sc.id_cita, sc.orden_integrante,
+        sc.item_tipo, sc.item_codigo, sc.item_nombre, sc.id_servicio, sc.cantidad,
+        sc.coverage_status, sc.total_hnl, sc.created_at, c.estado_cita_codigo,
+        ${capabilities.hasSubcUsuarioEjecutor ? "sc.id_usuario_ejecutor, NULLIF(TRIM(CONCAT(pu.nombres,' ',pu.apellidos)),'') AS nombre_usuario_ejecutor" : 'NULL::uuid AS id_usuario_ejecutor, NULL::text AS nombre_usuario_ejecutor'},
+        ${capabilities.hasSubcIdCortesia ? 'sc.id_cortesia' : 'NULL::uuid AS id_cortesia'},
+        ${capabilities.hasSubcSourceKind ? 'sc.source_kind' : 'NULL::text AS source_kind'},
+        ${capabilities.hasSubcInvalidado ? 'sc.invalidado' : 'FALSE AS invalidado'},
+        ${capabilities.hasSubcInvalidadoMotivo ? 'sc.invalidado_motivo' : 'NULL::text AS invalidado_motivo'},
+        ${branchSql} AS id_sucursal, suc.nombre_sucursal,
+        ${capabilities.hasMembershipPlans ? 'mp.nombre_plan' : 'NULL::text AS nombre_plan'}
+      FROM public.subscription_consumptions sc
+      JOIN public.subscriptions sub ON sub.id_suscripcion=sc.id_suscripcion AND sub.id_cliente=$1::uuid
+      LEFT JOIN public.citas c ON c.id_cita=sc.id_cita
+      LEFT JOIN public.sucursales suc ON suc.id_sucursal=${branchSql}
+      ${capabilities.hasSubcUsuarioEjecutor ? 'LEFT JOIN public.usuarios ue ON ue.id_usuario=sc.id_usuario_ejecutor LEFT JOIN public.personas pu ON pu.id_persona=ue.id_persona' : ''}
+      ${capabilities.hasMembershipPlans ? 'LEFT JOIN public.membership_plans mp ON mp.id_plan=sub.id_plan' : ''}
+      WHERE ${activeScope ? 'TRUE' : 'sc.id_cliente=$1::uuid'} AND ($2::uuid[] IS NULL OR sc.id_suscripcion=ANY($2::uuid[])) AND ${validity}
+    ), totals AS (SELECT count(*)::int AS total FROM filtered), paging AS (
+      SELECT total, GREATEST(1,ceil(total::numeric/$4)::int) AS total_pages,
+        LEAST($3::int,GREATEST(1,ceil(total::numeric/$4)::int)) AS page FROM totals
+    )
+    SELECT paging.*, COALESCE((SELECT jsonb_agg(to_jsonb(entry) ORDER BY entry.created_at DESC, entry.id_consumo DESC)
+      FROM (SELECT * FROM filtered ORDER BY created_at DESC,id_consumo DESC LIMIT $4 OFFSET (paging.page-1)*$4) entry),'[]'::jsonb) AS consumos
+    FROM paging
+  `, [clienteId, subscriptionIds, requestedPage, limit]);
+  const result = rows[0];
+  return {
+    consumos: mapConsumptionHistory(result.consumos).map((entry, index) => ({ ...entry,
+      id_suscripcion: result.consumos[index].id_suscripcion,
+      nombre_plan: result.consumos[index].nombre_plan,
+    })),
+    pagination: { page: result.page, limit, total: result.total, total_pages: result.total_pages },
+  };
+}
+
 export async function getClienteMembershipState(client, clienteId) {
   // AM: Estado resiliente; nunca debe depender de columnas/tablas opcionales para responder.
   const hasSubscriptions = (await getAnySubscriptionCount(client, clienteId)) > 0;
