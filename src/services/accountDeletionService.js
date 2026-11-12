@@ -1068,28 +1068,8 @@ export async function confirmClientAccountDeletionRequest(client, {
     });
   }
 
-  if (existing.estado_codigo === "evaluada" && existing.reautenticado_at) {
-    const executionToken = issueAccountDeletionExecutionToken();
-    const updated = await updateAccountDeletionRequestAfterConfirmation(client, {
-      requestId,
-      estadoCodigo: "evaluada",
-      reautenticadoAt: authenticatedAt,
-      bloqueosDetectados: [],
-      resumenImpacto: normalizeJsonObject(existing.resumen_impacto, {}),
-      traceRequestId,
-      executionTokenHash: executionToken.tokenHash,
-    });
-
-    return {
-      request: serializeRequestRow(updated),
-      ready_for_processing: true,
-      idempotent_replay: true,
-      execution: buildExecutionTokenResponse(updated, executionToken.token),
-      preview: null,
-    };
-  }
-
-  if (!REQUEST_CONFIRMABLE_STATES.includes(existing.estado_codigo)) {
+  const idempotentReplay = existing.estado_codigo === "evaluada" && Boolean(existing.reautenticado_at);
+  if (!idempotentReplay && !REQUEST_CONFIRMABLE_STATES.includes(existing.estado_codigo)) {
     throw new AppError(409, "La solicitud no se encuentra en un estado válido para confirmación.", {
       code: "CLIENT_ACCOUNT_DELETION_REQUEST_STATE_INVALID",
       details: mapActiveRequestDetails(existing),
@@ -1119,7 +1099,7 @@ export async function confirmClientAccountDeletionRequest(client, {
   return {
     request: serializeRequestRow(updated, { preview }),
     ready_for_processing: !shouldBlock,
-    idempotent_replay: false,
+    idempotent_replay: idempotentReplay,
     ...(executionToken ? { execution: buildExecutionTokenResponse(updated, executionToken.token) } : {}),
     preview,
   };
@@ -2138,8 +2118,13 @@ export async function runClientAccountDeletionInternal(app, {
 } = {}) {
   const client = await app.db.connect();
   let transactionStarted = false;
+  let sessionLockHeld = false;
+  let discardConnection;
 
   try {
+    // AM: Esperar antes de BEGIN evita un snapshot SERIALIZABLE anterior al dueño previo del lock.
+    await acquireAccountDeletionSessionLock(client, usuarioId);
+    sessionLockHeld = true;
     await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
     transactionStarted = true;
     await acquireAccountDeletionUserLock(client, usuarioId);
@@ -2166,7 +2151,14 @@ export async function runClientAccountDeletionInternal(app, {
     }
     throw mapSerializationConflict(error);
   } finally {
-    client.release();
+    if (sessionLockHeld) {
+      try {
+        await releaseAccountDeletionSessionLock(client, usuarioId);
+      } catch (error) {
+        discardConnection = error;
+      }
+    }
+    client.release(discardConnection);
   }
 }
 

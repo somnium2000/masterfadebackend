@@ -1033,7 +1033,7 @@ async function propagateOperationalDelay(client, {
         AND c.inicio_at > $4::timestamptz
         AND (c.inicio_at AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date = ($4::timestamptz AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date
       ORDER BY c.inicio_at ASC, c.id_cita ASC
-      FOR UPDATE
+      FOR UPDATE OF c
     `,
     [
       citaCausante.id_empleado_barbero,
