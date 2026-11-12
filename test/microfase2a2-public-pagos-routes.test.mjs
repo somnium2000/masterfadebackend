@@ -18,6 +18,7 @@ import { TodoPagoPreprodSimulatedProvider } from "../src/services/payments/TodoP
 import { PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS } from "../src/services/payments/pixelPaySaleAttemptStore.js";
 import { createHangingPgPool } from "./helpers/hangingPgPool.mjs";
 import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
+import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 
 const GROUP_A = "11111111-2222-4333-8444-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
@@ -727,6 +728,7 @@ async function createPagosApp(client, {
   connectFactory = null,
   authenticated = false,
   claims = null,
+  privatePilot = null,
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -740,7 +742,7 @@ async function createPagosApp(client, {
       : false,
   });
   app.decorate("config", { paymentProvider: providerCode, pixelPayEnv: "sandbox" });
-  app.decorate("requireRoles", () => async (request) => {
+  if (!privatePilot) app.decorate("requireRoles", () => async (request) => {
     request.claims = claims;
   });
   app.decorate("db", {
@@ -751,12 +753,36 @@ async function createPagosApp(client, {
       return client.query(sql, params);
     },
   });
+  if (privatePilot) app.pilotRequest = await installPrivatePilot(app, privatePilot.t, { userId: USER_A, clientId: CLIENT_A });
   await app.register(publicPagosRoutes, {
     prefix: authenticated ? "/v1/pagos/reservas" : "/v1/public/pagos",
     authenticated,
   });
   return app;
 }
+
+test("private pilot: crear intent y Sale verificada confirman la reserva una sola vez", async t => {
+  const provider = { saleCalls: 0, async sale() { this.saleCalls++; return {
+    outcome: "approved", paymentUuid: "P-PRIVATE-PILOT", transactionId: "TX-PRIVATE-PILOT",
+    paymentHashValid: true, amountMatches: true,
+  }; } };
+  const client = createPagosClient({ providerCode: "pixelpay" });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, privatePilot: { t } });
+  t.after(() => app.close());
+  const created = await app.inject({ ...app.pilotRequest, method: "POST", url: "/v1/public/pagos/crear-intent", payload: publicIntentPayload() });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(provider.saleCalls, 0);
+  const payload = { ...pixelPaySalePayload(), id_intent: created.json().data.id_intent };
+  const paid = await app.inject({ ...app.pilotRequest, method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload });
+  assert.equal(paid.statusCode, 200, paid.body);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  assert.equal(client.getGroupState()[0].estado_hold_codigo, "consumido");
+  await app.inject({ ...app.pilotRequest, method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload });
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(client.getPayments().length, 1);
+});
 
 function assertStatusTransportCorrelation(logs, requestId, httpStatus) {
   const entries = logs.map((entry) => JSON.parse(entry));

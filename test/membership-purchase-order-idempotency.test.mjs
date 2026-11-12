@@ -3,6 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import Fastify from "fastify";
 import clienteRoutes from "../src/routes/v1/cliente.js";
+import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 
 const CLIENT = "41111111-1111-4111-8111-111111111111";
 const OTHER = "42222222-2222-4222-8222-222222222222";
@@ -126,18 +127,33 @@ function store({ hasKeyColumn = true, hasIndex = true, concurrent = false, failF
   return data;
 }
 
-async function appFor(t, data) {
+async function appFor(t, data, privatePilot = false) {
   const app = Fastify();
   app.decorate("db", { connect: data.connect });
-  app.decorate("requireRoles", () => async (request) => {
+  if (!privatePilot) app.decorate("requireRoles", () => async (request) => {
     // AM: Header exclusivo del doble para simular claims autenticados de dos clientes.
     request.claims = { roles: ["cliente"], cliente_id: request.headers["x-test-client"] || CLIENT, user: { id_usuario: USER } };
   });
+  if (privatePilot) {
+    app.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false });
+    app.pilotRequest = await installPrivatePilot(app, t, { userId: USER, clientId: CLIENT });
+  }
   await app.register(clienteRoutes, { prefix: "/v1/cliente" });
   await app.ready();
   t.after(() => app.close());
   return app;
 }
+
+test("private pilot: orden VIP HTTP conserva snapshots y clave idempotente del propietario", async t => {
+  const data = store();
+  const app = await appFor(t, data, true);
+  const request = { ...app.pilotRequest, method: "POST", url: "/v1/cliente/planes/orden", payload: { id_plan_sucursal: OFFER, idempotency_key: KEY } };
+  const first = success(await app.inject(request));
+  const second = success(await app.inject(request));
+  assert.deepEqual(first, second);
+  assert.equal(data.orders.length, 1);
+  assert.equal(data.orders[0].id_cliente, CLIENT);
+});
 const requestOrder = (app, { key = KEY, offer = OFFER, cliente = CLIENT, payload = {} } = {}) => app.inject({
   method: "POST", url: "/v1/cliente/planes/orden", headers: { "x-test-client": cliente },
   payload: { id_plan_sucursal: offer, ...(key === undefined ? {} : { idempotency_key: key }), ...payload },

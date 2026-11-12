@@ -15,6 +15,7 @@ import {
 } from "../src/services/membershipService.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
+import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 
 const CLIENT = "41111111-1111-4111-8111-111111111111";
 const OTHER_CLIENT = "42222222-2222-4222-8222-222222222222";
@@ -464,7 +465,7 @@ test("membresia live rechaza tarjetas oficiales Sandbox antes de abrir una trans
 async function buildPixelPayRouteApp(t, harnessOptions) {
   const harness = pixelPayProcessHarness(harnessOptions);
   const server = Fastify();
-  server.decorate("requireRoles", () => async (request) => {
+  if (!harnessOptions.privatePilot) server.decorate("requireRoles", () => async (request) => {
     request.claims = { roles: ["cliente"], cliente_id: CLIENT, user: { id_usuario: USER } };
   });
   server.decorate("db", harness.app.db);
@@ -474,6 +475,7 @@ async function buildPixelPayRouteApp(t, harnessOptions) {
     pixelPayEnv: "sandbox",
     todoPago: { mode: "disabled", simulatedEnabled: false },
   });
+  if (harnessOptions.privatePilot) server.pilotRequest = await installPrivatePilot(server, t, { userId: USER, clientId: CLIENT });
   await server.register(clienteRoutes, { prefix: "/v1/cliente" });
   await server.ready();
   t.after(async () => {
@@ -482,6 +484,57 @@ async function buildPixelPayRouteApp(t, harnessOptions) {
   });
   return { server, state: harness.state };
 }
+
+test("private pilot: HTTP Sale VIP activa y contabiliza sin duplicar pago ni suscripcion", async t => {
+  const { server, state } = await buildPixelPayRouteApp(t, { privatePilot: true, provider: { sale: async () => ({
+    outcome: PIXELPAY_SALE_OUTCOME.APPROVED, approved: true, paymentHashValid: true,
+    amountMatches: true, paymentUuid: "P-PRIVATE-VIP", transactionId: "TX-PRIVATE-VIP", diagnostics: {},
+  }) } });
+  const request = { ...server.pilotRequest, method: "POST", url: "/v1/cliente/planes/confirmar-pago",
+    payload: { id_payment_intent: INTENT, card: validCard, billing: validBilling } };
+  const first = await server.inject(request);
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(state.intentState, "confirmado");
+  assert.equal(state.orderState, "pagada");
+  const second = await server.inject(request);
+  assert.equal(second.statusCode, 200, second.body);
+  assert.equal(state.saleCalls, 1);
+  assert.equal(state.payments, 1);
+  assert.equal(state.subscriptions, 1);
+  assert.equal(state.subscriptionPayments, 1);
+});
+
+test("private pilot: HTTP crea el intent VIP desde la orden sin iniciar Sale", async t => {
+  const previousProvider = process.env.PAYMENT_PROVIDER;
+  process.env.PAYMENT_PROVIDER = "pixelpay";
+  t.after(() => { if (previousProvider === undefined) delete process.env.PAYMENT_PROVIDER; else process.env.PAYMENT_PROVIDER = previousProvider; });
+  let persisted = null, inserts = 0;
+  const row = intentRow("link_generado");
+  const client = { release() {}, async query(sql, values = []) {
+    const text = String(sql).replace(/\s+/g, " ").trim();
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(text)) return { rows: [] };
+    if (text.includes("FROM public.membership_purchase_orders mpo")) return { rows: [{ ...row, moneda_codigo: "HNL", expires_at: new Date(Date.now() + 600000).toISOString() }] };
+    if (text.includes("FROM public.payment_providers")) return { rows: [{ id_provider: row.id_provider, codigo: "pixelpay", activo: true }] };
+    if (text.includes("FROM public.payment_intents") && text.includes("idempotency_key")) return { rows: persisted ? [persisted] : [] };
+    if (text.startsWith("INSERT INTO public.payment_intents")) {
+      inserts++; persisted = { id_intent: INTENT, id_membership_order: values[1], origen_pago_codigo: "membership", monto_hnl: values[2], moneda_codigo: values[3], estado_intent_codigo: "link_generado" };
+      return { rows: [persisted] };
+    }
+    throw Error(`Unexpected synthetic query: ${text.slice(0, 100)}`);
+  } };
+  const server = Fastify();
+  server.decorate("db", { connect: async () => client });
+  server.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false });
+  const account = await installPrivatePilot(server, t, { userId: USER, clientId: CLIENT });
+  await server.register(clienteRoutes, { prefix: "/v1/cliente" });
+  t.after(() => server.close());
+  for (let i = 0; i < 2; i++) {
+    const response = await server.inject({ ...account, method: "POST", url: "/v1/cliente/planes/pago-intent", payload: { id_order: ORDER } });
+    assert.equal(response.statusCode, 201, response.body);
+    assert.equal(response.json().data.id_payment_intent, INTENT);
+  }
+  assert.equal(inserts, 1);
+});
 
 test("HTTP confirmar-pago conserva card y billing hasta el servicio y responde 200 sin PAN/CVV", async (t) => {
   let receivedTransaction;

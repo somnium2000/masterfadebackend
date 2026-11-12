@@ -90,6 +90,7 @@ export const ADMIN_DATA_ENTRY_ROUTES = Object.freeze([
   "GET /v1/health/ready",
   "GET /v1/auth/login",
   "GET /v1/auth/me",
+  "GET /v1/commerce/eligibility",
   "GET /v1/auth/csrf",
   "GET /v1/admin/sucursales",
   "GET /v1/admin/sucursales/empresas",
@@ -125,6 +126,9 @@ export default fp(async function adminDataEntryPlugin(app) {
     if (request.headers['x-http-method-override'] || request.headers['x-method-override']) return restricted(reply);
     const method = request.method === 'HEAD' ? 'GET' : request.method;
     const normalizedRoute = normalize(route);
+    // AM: Existing callbacks retain their own financial verification even during pilot rollback.
+    if (method === 'POST' && normalizedRoute === '/v1/pagos/webhook/:proveedor'
+      && String(request.params?.proveedor || '').toLowerCase() === 'pixelpay') return;
     const isAdministrativeOperation = administrativeOperationPrefixes.some(prefix => (
       normalizedRoute === prefix || normalizedRoute.startsWith(prefix + '/')
     ));
