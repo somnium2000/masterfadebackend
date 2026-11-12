@@ -17,6 +17,7 @@ import pagos from "../src/routes/v1/pagos.js";
 import adminCitas from "../src/routes/v1/admin/citas.js";
 import adminMembresias from "../src/routes/v1/admin/membresias.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
+import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 
 const USER = crypto.randomUUID(), OTHER = crypto.randomUUID();
 const SECRET = crypto.randomBytes(40).toString("hex");
@@ -40,7 +41,7 @@ async function fixture(t, options = {}) {
   app.decorate("db", { query: async (sql, params) => {
     if (sql.includes("FROM public.seguridad_sesiones")) return { rows: options.revoked ? [] : [{ estado: "activa", ultimo_uso_at: new Date(), expira_at: new Date(Date.now() + 60000) }] };
     if (sql.includes("UPDATE public.seguridad_sesiones")) return { rows: [] };
-    if (sql.includes("WITH base_user")) return { rows: [{ id_usuario: params[0], roles: ["super_admin", "cliente"] }] };
+    if (sql.includes("WITH base_user")) return { rows: [{ id_usuario: params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
     state.unexpectedSql++; throw Error("Unexpected business SQL");
   }, connect: async () => { state.unexpectedSql++; throw Error("Business connection prohibited"); } });
   await app.register(fp(async a => a.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false, ...options.config }), { name: "env-plugin" }));
@@ -106,6 +107,48 @@ test("explicit proxy: rightmost hop wins; forwarded chains and untrusted peers c
     const r = await f.app.inject({ method: "POST", url: "/v1/citas/probe", remoteAddress: peer, headers: { ...f.headers(), "x-forwarded-for": forwarded } });
     assert.equal(r.statusCode, expected, r.body);
   }
+});
+
+test("eligibility is false for guests, other accounts and owners without a valid client identity", async t => {
+  for (const scenario of ["guest", "other-user", "missing-client", "invalid-client", "admin-only"]) {
+    await t.test(scenario, async sub => {
+      const f = await fixture(sub, scenario === "missing-client" ? { clientId: null }
+        : scenario === "invalid-client" ? { clientId: "unverified" }
+        : scenario === "admin-only" ? { roles: ["super_admin"] } : {});
+      const response = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: IP,
+        headers: scenario === "guest" ? {} : f.headers(scenario === "other-user" ? OTHER : USER) });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.deepEqual(response.json().data, { booking: false, vipPurchase: false });
+      assert.match(response.headers["cache-control"], /no-store/);
+      const denial = await f.app.inject({ method: "POST", url: "/v1/public/pagos/crear-intent", remoteAddress: IP,
+        headers: scenario === "guest" ? {} : f.headers(scenario === "other-user" ? OTHER : USER), payload: {} });
+      assert.ok([401, 403].includes(denial.statusCode), denial.body);
+      assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+    });
+  }
+});
+
+test("proxy eligibility probe never creates business data and ignores spoofed external addresses", async t => {
+  let providerCalls = 0;
+  const originalCreate = PaymentProviderFactory.create;
+  PaymentProviderFactory.create = () => { providerCalls++; throw new Error("Provider prohibited during eligibility probe"); };
+  t.after(() => { PaymentProviderFactory.create = originalCreate; });
+  const f = await fixture(t, { env: { PRIVATE_COMMERCE_PROXY_IPS: "10.0.0.2" } });
+  for (const [peer, forwarded, owner, expected] of [
+    ["10.0.0.2", IP, true, true], ["10.0.0.2", IP, false, false],
+    ["198.51.100.2", IP, true, false], ["10.0.0.3", IP, true, false],
+    ["10.0.0.2", `${IP}, 198.51.100.2`, true, false],
+  ]) {
+    const response = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: peer,
+      headers: { ...f.headers(owner ? USER : OTHER), "x-forwarded-for": forwarded, "x-real-ip": IP, forwarded: `for=${IP}` } });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json().data, { booking: expected, vipPurchase: expected });
+  }
+  const guest = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: "10.0.0.2", headers: { "x-forwarded-for": IP } });
+  assert.equal(guest.statusCode, 200, guest.body);
+  assert.deepEqual(guest.json().data, { booking: false, vipPurchase: false });
+  assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+  assert.equal(providerCalls, 0);
 });
 
 test("presale and callbacks remain independent of owner IP/session and pilot switch", async t => {

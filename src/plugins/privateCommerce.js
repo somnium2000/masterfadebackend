@@ -68,10 +68,14 @@ export default fp(async function privateCommerce(app) {
   async function eligible(request, reply) {
     if (!config.enabled || app.config.adminDataEntryMode || app.config.paymentProvider !== "pixelpay"
       || !privateCommerceIpAllowed(request, config)) return false;
+    if (!request.cookies?.mf_session) return false;
     await verify(request, reply);
     if (reply.sent) return false;
     return config.userIds.includes(String(request.auth?.sub || "").toLowerCase())
-      && request.claims?.user?.id_usuario === request.auth?.sub;
+      && request.claims?.user?.id_usuario === request.auth?.sub
+      // AM: Eligibility promises both client flows; the server must resolve an active client and role.
+      && UUID.test(String(request.claims?.cliente_id || ""))
+      && request.claims?.roles?.includes("cliente") === true;
   }
   app.addHook("onRequest", async (request, reply) => {
     if (!isPrivateCommerceRoute(request.method, request.routeOptions.url)) return;
