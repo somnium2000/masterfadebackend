@@ -5,6 +5,7 @@ import logger from "./plugins/logger.js";
 import security from "./plugins/security.js";
 import db from "./plugins/db.js";
 import auth from "./plugins/auth.js";
+import privateCommerce from "./plugins/privateCommerce.js";
 import mailer from "./plugins/mailer.js";
 import membershipAlerts from "./plugins/membershipAlerts.js";
 import securityRealtime from "./plugins/securityRealtime.js";
@@ -31,6 +32,7 @@ export async function buildApp() {
   // AM: Administrative startup must not launch membership business jobs.
   if (!app.config.adminDataEntryMode) await app.register(membershipAlerts);
   await app.register(auth);
+  await app.register(privateCommerce);
   await app.register(securityRealtime);
   await app.register(agendaRealtime);
   await app.register(routes);

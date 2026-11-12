@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fp from "fastify-plugin";
+import privateCommerce from "../src/plugins/privateCommerce.js";
 import Fastify from "fastify";
 
 import {
@@ -693,9 +695,11 @@ test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", as
   process.env.ADMIN_DATA_ENTRY_MODE = "false";
   PaymentProviderFactory._instance = fixture.provider;
   const app = Fastify();
-  app.decorate("config", { pixelPayWebhookEnabled: true });
+  app.decorate("config", { pixelPayWebhookEnabled: true, privateCommercePilot: { enabled: false } });
   app.decorate("db", fixture.db);
   app.decorate("requireRoles", () => async () => {});
+  await app.register(fp(async () => {}, { name: "env-plugin" }));
+  await app.register(privateCommerce);
   await app.register(pagosRoutes, { prefix: "/v1/pagos" });
   t.after(async () => {
     await app.close();
@@ -709,11 +713,15 @@ test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", as
   const response = await app.inject({
     method: "POST",
     url: "/v1/pagos/webhook/pixelpay",
+    remoteAddress: "198.51.100.2",
     payload: validCallback,
   });
   assert.equal(response.statusCode, 200, response.body);
   assert.equal(response.json().data.processed, false);
   assert.equal(response.json().data.extension_pending, true);
+  const duplicate = await app.inject({ method: "POST", url: "/v1/pagos/webhook/pixelpay", remoteAddress: "198.51.100.3", payload: validCallback });
+  assert.equal(duplicate.statusCode, 200, duplicate.body);
+  assert.equal(duplicate.json().data.duplicate, true);
 });
 
 test("callback forwards only server shape config, requestId and logger", async t => {
