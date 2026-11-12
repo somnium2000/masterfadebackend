@@ -48,7 +48,7 @@ test('historial real: SQL PostgreSQL, páginas estables, filtros y día Honduras
   app.decorate('requireRoles',allowed=>async request=>{
     const role=request.headers['x-fixture-role']||'admin';
     if(!allowed.includes(role)) {const e=new Error('Forbidden');e.statusCode=403;throw e;}
-    request.claims={roles:[role],branch_ids:[BRANCH],empleado_id:BARBER};
+    request.claims={roles:[role],branch_ids:[BRANCH],empleado_id:request.headers['x-fixture-barber'] || BARBER};
   });
   await app.register(routes,{prefix:'/v1/admin/citas'});
   const get=async path=>{const r=await app.inject({url:'/v1/admin/citas/'+path});assert.equal(r.statusCode,200,r.body+' '+queryError);return r.json().data;};
@@ -76,5 +76,46 @@ test('historial real: SQL PostgreSQL, páginas estables, filtros y día Honduras
     const day=await get('operativas?fecha_desde=2026-11-12&fecha_hasta=2026-11-12&zona_horaria=America%2FTegucigalpa');
     assert.deepEqual(day.citas.map(c=>c.id_cita.slice(-1)),['1','2']);
     assert.equal((await get('historial?limit=9')).citas.length,4);
+  }
+  await pg.exec("DELETE FROM citas; ALTER TABLE personas ADD COLUMN observaciones text; CREATE TABLE clientes(id_cliente uuid,id_persona uuid,deleted_at timestamptz,preferencias jsonb)");
+  const secondBarber='88888888-8888-4888-8888-888888888888';
+  await pg.query('INSERT INTO empleados VALUES ($1,$2)',[secondBarber,PERSON]);
+  const today=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Tegucigalpa',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+  const midnight=new Date(today+'T00:00:00-06:00').getTime();
+  let serial=100;
+  for(const barber of [BARBER,secondBarber]){
+    for(const offset of [-1,0,1])for(const state of ['confirmada','en_salon','en_atencion','completada']){
+      await pg.query("INSERT INTO citas(id_cita,id_sucursal,id_empleado_barbero,id_persona_cliente,inicio_at,estado_cita_codigo) VALUES ($1,$2,$3,$4,$5,$6)",
+        ['44444444-4444-4444-8444-'+String(serial++).padStart(12,'0'),BRANCH,barber,PERSON,new Date(midnight+offset*86400000+36000000).toISOString(),state]);
+    }
+    for(const time of [new Date(midnight+86400000-1).toISOString(),new Date(midnight+86400000).toISOString()]){
+      await pg.query("INSERT INTO citas(id_cita,id_sucursal,id_empleado_barbero,id_persona_cliente,inicio_at,estado_cita_codigo) VALUES ($1,$2,$3,$4,$5,'completada')",
+        ['44444444-4444-4444-8444-'+String(serial++).padStart(12,'0'),BRANCH,barber,PERSON,time]);
+    }
+  }
+  for(const zone of ['UTC','Asia/Tokyo','America/Los_Angeles']){
+    await pg.exec("SET TIME ZONE '"+zone+"'");
+    const seen=[];
+    for(const barber of [BARBER,secondBarber]){
+      const headers={'x-fixture-role':'barbero','x-fixture-barber':barber};
+      const other=barber===BARBER?secondBarber:BARBER;
+      for(const path of ['operativas','operativas/completadas-hoy']){
+        assert.equal((await app.inject({url:'/v1/admin/citas/'+path+'?id_empleado_barbero='+other,headers})).statusCode,403);
+        assert.equal((await app.inject({url:'/v1/admin/citas/'+path+'?id_sucursal=99999999-9999-4999-8999-999999999999',headers})).statusCode,403);
+      }
+      const active=await app.inject({url:'/v1/admin/citas/operativas?fecha_desde='+today+'&fecha_hasta='+today+'&zona_horaria=America%2FTegucigalpa',headers});
+      const done=await app.inject({url:'/v1/admin/citas/operativas/completadas-hoy',headers});
+      assert.equal(active.statusCode,200,active.body+' '+queryError);assert.equal(done.statusCode,200,done.body+' '+queryError);
+      const remaining=active.json().data.citas,completed=done.json().data.citas;
+      assert.equal(remaining.length,3);assert.equal(completed.length,2);
+      const rows=[...remaining,...completed];
+      assert.equal(new Set(rows.map(row=>row.id_cita)).size,5);
+      for(const row of rows){
+        assert.equal(row.id_empleado_barbero,barber);
+        assert.ok(new Date(row.inicio_at).getTime()>=midnight && new Date(row.inicio_at).getTime()<midnight+86400000);
+      }
+      seen.push(new Set(rows.map(row=>row.id_cita)));
+    }
+    assert.ok([...seen[0]].every(id=>!seen[1].has(id)));
   }
 });

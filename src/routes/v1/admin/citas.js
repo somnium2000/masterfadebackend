@@ -2021,6 +2021,7 @@ export default async function adminCitasRoutes(app) {
         fechaHasta: operationalDate,
         limit: parseLimit(request.query?.limit, 200, 300),
         sortDirection: "desc",
+        dateOffset: "-06:00",
       });
 
       return sendOk(reply, {
