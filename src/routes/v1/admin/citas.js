@@ -428,6 +428,8 @@ async function listOperationalAppointments(client, {
   limit = 100,
   sortDirection = "asc",
   reservationGroupIds = null,
+  page = null,
+  dateOffset = "",
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
   const clientNameSql = contactColumnsSupport.has_contacto_nombre
@@ -483,13 +485,18 @@ async function listOperationalAppointments(client, {
   }
 
   if (fechaDesde) {
-    params.push(`${fechaDesde}T00:00:00`);
+    params.push(`${fechaDesde}T00:00:00${dateOffset}`);
     where.push(`c.inicio_at >= $${params.length}::timestamptz`);
   }
 
   if (fechaHasta) {
-    params.push(`${fechaHasta}T23:59:59.999`);
-    where.push(`c.inicio_at <= $${params.length}::timestamptz`);
+    if (dateOffset) {
+      params.push(`${fechaHasta}T00:00:00${dateOffset}`);
+      where.push(`c.inicio_at < ($${params.length}::timestamptz + interval '24 hours')`);
+    } else {
+      params.push(`${fechaHasta}T23:59:59.999`);
+      where.push(`c.inicio_at <= $${params.length}::timestamptz`);
+    }
   }
 
   if (q) {
@@ -544,8 +551,7 @@ async function listOperationalAppointments(client, {
   const limitIdx = params.length;
 
   const normalizedSortDirection = String(sortDirection || "asc").toLowerCase() === "desc" ? "DESC" : "ASC";
-  const { rows } = await client.query(
-    `
+  const sql = `
       SELECT
         c.id_cita,
         c.id_grupo_cita,
@@ -649,10 +655,27 @@ async function listOperationalAppointments(client, {
       ) delay_reag ON TRUE
       WHERE ${where.join(" AND ")}
       ORDER BY c.inicio_at ${normalizedSortDirection}, c.id_cita ${normalizedSortDirection}
-      LIMIT $${limitIdx}::int
-    `,
-    params
-  );
+    `;
+  if (page !== null) {
+    params.push((page - 1) * limit);
+    const result = await client.query(`
+      WITH filtered_appointments AS (${sql})
+      SELECT (SELECT COUNT(*)::int FROM filtered_appointments) AS total,
+        COALESCE((
+          SELECT jsonb_agg(p ORDER BY p.inicio_at DESC, p.id_cita DESC)
+          FROM (SELECT * FROM filtered_appointments
+                ORDER BY inicio_at DESC, id_cita DESC
+                LIMIT $${limitIdx}::int OFFSET $${params.length}::bigint) p
+        ), '[]'::jsonb) AS citas
+    `, params);
+    const total = Number(result.rows[0]?.total || 0);
+    return {
+      citas: (result.rows[0]?.citas || []).map(row => mapOperationalAppointment(row, { preferencesBarberId: safePreferencesBarberId })),
+      pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)),
+        has_next: page * limit < total, has_prev: page > 1 },
+    };
+  }
+  const { rows } = await client.query(sql + ` LIMIT $${limitIdx}::int`, params);
 
   return rows.map((row) => mapOperationalAppointment(row, { preferencesBarberId: safePreferencesBarberId }));
 }
@@ -1957,6 +1980,7 @@ export default async function adminCitasRoutes(app) {
         fechaDesde,
         fechaHasta,
         limit: parseLimit(request.query?.limit, 120, 400),
+        dateOffset: request.query?.zona_horaria === "America/Tegucigalpa" ? "-06:00" : "",
       });
       return sendOk(reply, {
         citas,
@@ -2029,7 +2053,13 @@ export default async function adminCitasRoutes(app) {
       const roleScope = getRoleScope(request.claims);
       const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
       const states = parseStatusFilter(request.query?.estado, []);
-      const citas = await listOperationalAppointments(app.db, {
+      const page = Number(request.query?.page ?? 1);
+      if (!Number.isSafeInteger(page) || page < 1 || page > 100000000) {
+        throw new AppError(400, "Página inválida", { code: "ADMIN_CITAS_INVALID_PAGE" });
+      }
+      const limit = parseLimit(request.query?.limit, 200, 500);
+      if (limit < 1) throw new AppError(400, "Límite inválido", { code: "ADMIN_CITAS_LIMIT_INVALID" });
+      const { citas, pagination } = await listOperationalAppointments(app.db, {
         branchIds,
         barberScopeId: roleScope.barber_empleado_id,
         idSucursal: request.query?.id_sucursal ?? null,
@@ -2038,8 +2068,10 @@ export default async function adminCitasRoutes(app) {
         q: cleanText(request.query?.q),
         fechaDesde,
         fechaHasta,
-        limit: parseLimit(request.query?.limit, 200, 500),
+        limit,
         sortDirection: "desc",
+        page,
+        dateOffset: request.query?.zona_horaria === "America/Tegucigalpa" ? "-06:00" : "",
       });
       return sendOk(reply, {
         citas,
@@ -2052,6 +2084,7 @@ export default async function adminCitasRoutes(app) {
           q: cleanText(request.query?.q),
         },
         estados_historicos_sugeridos: HISTORICAL_DEFAULT_STATES,
+        pagination,
       });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar el historial de citas", "ADMIN_CITAS_HISTORY_LIST_ERROR");
