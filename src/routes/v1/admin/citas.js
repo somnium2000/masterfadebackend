@@ -415,6 +415,12 @@ async function getAppointmentContactColumnsSupport(client) {
   return appointmentContactColumnsSupportCache;
 }
 
+// AM: El invitado puede no tener persona; priorizar el contacto y conservar el alias como respaldo.
+function buildOperationalClientNameSql(support) {
+  return `COALESCE(${support.has_contacto_nombre ? "NULLIF(BTRIM(c.contacto_nombre), '')," : ''}
+    NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), NULLIF(BTRIM(c.alias_integrante), ''), 'Sin nombre')`;
+}
+
 async function listOperationalAppointments(client, {
   branchIds,
   barberScopeId = null,
@@ -432,9 +438,7 @@ async function listOperationalAppointments(client, {
   dateOffset = "",
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
-  const clientNameSql = contactColumnsSupport.has_contacto_nombre
-    ? "COALESCE(NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
-    : "COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
+  const clientNameSql = buildOperationalClientNameSql(contactColumnsSupport);
   const clientPhoneSql = contactColumnsSupport.has_contacto_telefono
     ? "COALESCE(c.contacto_telefono, pc.telefono_principal)"
     : "pc.telefono_principal";
@@ -597,7 +601,7 @@ async function listOperationalAppointments(client, {
         ON eb.id_empleado = c.id_empleado_barbero
       JOIN public.personas pb
         ON pb.id_persona = eb.id_persona
-      JOIN public.personas pc
+      LEFT JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
       ${preferencesJoin}
       LEFT JOIN LATERAL (
@@ -695,9 +699,7 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
   }
 
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
-  const clientNameSql = contactColumnsSupport.has_contacto_nombre
-    ? "COALESCE(NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
-    : "COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
+  const clientNameSql = buildOperationalClientNameSql(contactColumnsSupport);
 
   const { rows } = await client.query(
     `
@@ -736,10 +738,10 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
         ON eb.id_empleado = c.id_empleado_barbero
       JOIN public.personas pb
         ON pb.id_persona = eb.id_persona
-      JOIN public.personas pc
+      LEFT JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
       WHERE ${where.join(" AND ")}
-      ${forUpdate ? "FOR UPDATE" : ""}
+      ${forUpdate ? "FOR UPDATE OF c" : ""}
       LIMIT 1
     `,
     params
@@ -995,6 +997,7 @@ async function propagateOperationalDelay(client, {
     };
   }
 
+  const clientNameSql = buildOperationalClientNameSql(await getAppointmentContactColumnsSupport(client));
   const affectedResult = await client.query(
     `
       SELECT
@@ -1005,14 +1008,14 @@ async function propagateOperationalDelay(client, {
         c.fin_at,
         c.duracion_total_min,
         c.buffer_total_min,
-        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Cliente') AS nombre_cliente,
+        ${clientNameSql} AS nombre_cliente,
         COALESCE(c.contacto_email, cp.email) AS correo_cliente,
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Barbero') AS nombre_barbero,
         s.nombre_sucursal
       FROM public.citas c
       JOIN public.sucursales s
         ON s.id_sucursal = c.id_sucursal
-      JOIN public.personas pc
+      LEFT JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
       JOIN public.empleados eb
         ON eb.id_empleado = c.id_empleado_barbero

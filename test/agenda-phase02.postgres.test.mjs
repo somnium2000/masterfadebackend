@@ -56,7 +56,7 @@ test('FASE-02: PostgreSQL aislado, transiciones y bloqueo Cliente', {skip:!BIN},
   pool=new pg.Pool({host:'127.0.0.1',port,user:'postgres',database:'postgres',max:4});
   await pool.query(fixtureSchema);
   await pool.query(`
-    ALTER TABLE citas ADD COLUMN llegada_real_at timestamptz, ADD COLUMN no_show_at timestamptz, ADD COLUMN updated_at timestamptz, ADD COLUMN contacto_email text, ADD COLUMN id_cita_integrante uuid;
+    ALTER TABLE citas ADD COLUMN llegada_real_at timestamptz, ADD COLUMN no_show_at timestamptz, ADD COLUMN updated_at timestamptz, ADD COLUMN contacto_email text, ADD COLUMN contacto_nombre text, ADD COLUMN id_cita_integrante uuid;
     ALTER TABLE empleados ADD COLUMN estado boolean, ADD COLUMN deleted_at timestamptz;
     ALTER TABLE citas_reagendaciones ADD COLUMN id_sucursal uuid, ADD COLUMN id_empleado_barbero_anterior uuid, ADD COLUMN id_empleado_barbero_nuevo uuid,
       ADD COLUMN inicio_at_anterior timestamptz, ADD COLUMN fin_at_anterior timestamptz, ADD COLUMN inicio_at_nuevo timestamptz, ADD COLUMN fin_at_nuevo timestamptz,
@@ -71,7 +71,8 @@ test('FASE-02: PostgreSQL aislado, transiciones y bloqueo Cliente', {skip:!BIN},
   const db={query(sql,params){
     if(sql.includes('WITH base_user'))return Promise.resolve({rows:profiles.has(params[0])?[profiles.get(params[0])]:[]});
     if(sql.includes('token_jti_hash = $3'))return Promise.resolve({rows:[{estado:'activa',ultimo_uso_at:new Date(),expira_at:new Date(Date.now()+3600000),revocada_at:null}]});
-    return pool.query(sql,params);
+    if(sql.includes('UPDATE public.citas_holds')||sql.includes('WITH target_intents')||sql.includes('no_show_at = COALESCE'))return Promise.resolve({rows:[],rowCount:0});
+    return pool.query(sql,params).catch(error=>{queryError=error;throw error;});
   },async connect(){
     return {async query(sql,params){
       // AM: No se ejecuta mantenimiento financiero ni caducidad ajena al caso; el flujo y sus transacciones usan SQL real.
@@ -263,4 +264,54 @@ test('FASE-02: PostgreSQL aislado, transiciones y bloqueo Cliente', {skip:!BIN},
       assert.equal(result.value.processed,false);assert.equal(result.value.request_state,'bloqueada');
     }finally{await holder.query('ROLLBACK');holder.release();}
   });
+  await t.test('invitados sin persona: listado, Buscar reserva, nombres y aislamiento',async subtest=>{
+    subtest.mock.timers.enable({apis:['Date'],now:new Date('2030-06-15T16:10:00Z')});
+    await pool.query('DELETE FROM citas; ALTER TABLE clientes ADD COLUMN preferencias jsonb; ALTER TABLE personas ADD COLUMN observaciones text');
+    const secondBarber=randomUUID(),secondBranch=randomUUID(),group=randomUUID();
+    await pool.query("INSERT INTO empleados(id_empleado,id_persona,estado) VALUES($1,$2,true)",[secondBarber,PERSON]);
+    await pool.query("INSERT INTO sucursales VALUES($1,'Otra',NULL,true)",[secondBranch]);
+    const holder=await insert('confirmada','2030-06-15T14:00:00Z'),guest=await insert('confirmada','2030-06-15T15:00:00Z'),other=await insert('confirmada','2030-06-15T16:00:00Z');
+    await pool.query("UPDATE citas SET id_grupo_cita=$1 WHERE id_cita=ANY($2::uuid[])",[group,[holder,guest,other]]);
+    await pool.query("UPDATE citas SET id_cliente=$1,contacto_nombre='Contacto titular',alias_integrante='Titular' WHERE id_cita=$2",[CLIENT,holder]);
+    await pool.query("UPDATE citas SET id_persona_cliente=NULL,contacto_nombre='Invitado de contacto',alias_integrante='Alias invitado' WHERE id_cita=$1",[guest]);
+    await pool.query("UPDATE citas SET id_persona_cliente=NULL,contacto_nombre='   ',alias_integrante='Segundo invitado',id_empleado_barbero=$1 WHERE id_cita=$2",[secondBarber,other]);
+    const outside=await insert('confirmada','2030-06-15T17:00:00Z');await pool.query('UPDATE citas SET id_sucursal=$1 WHERE id_cita=$2',[secondBranch,outside]);
+    const yesterday=await insert('confirmada','2030-06-15T05:59:59.999Z'),last=await insert('confirmada','2030-06-16T05:59:59.999Z'),tomorrow=await insert('confirmada','2030-06-16T06:00:00Z');
+    const read=async(path,role='admin',barber=BARBER)=>{
+      const id=randomUUID();profiles.set(id,{id_usuario:id,roles:[role],branch_ids:[BRANCH],empleado_id:barber});
+      const token=jwt.sign({sub:id,sid:randomUUID(),jti:randomUUID(),token_type:'app'},process.env.JWT_SECRET,{issuer:'masterfade-api',audience:'masterfade-app',expiresIn:'1h'});
+      return app.inject({url:'/v1/admin/citas'+path,headers:{cookie:'mf_session='+token}});
+    };
+    const list=role=>read('/operativas?fecha_desde=2030-06-15&fecha_hasta=2030-06-15&zona_horaria=America%2FTegucigalpa&id_sucursal='+BRANCH,role);
+    for(const role of ['admin','super_admin']){
+      const response=await list(role);assert.equal(response.statusCode,200,response.body+' '+queryError?.message);
+      const rows=response.json().data.citas;assert.deepEqual(rows.filter(r=>r.id_grupo_cita===group).map(r=>r.id_cita),[holder,guest,other]);assert.equal(new Set(rows.map(r=>r.id_cita)).size,rows.length);assert.ok(rows.some(r=>r.id_cita===last));assert.ok(!rows.some(r=>r.id_cita===yesterday||r.id_cita===tomorrow));
+      assert.equal(rows.find(r=>r.id_cita===holder).nombre_cliente,'Contacto titular');assert.equal(rows.find(r=>r.id_cita===guest).nombre_cliente,'Invitado de contacto');assert.equal(rows.find(r=>r.id_cita===other).nombre_cliente,'Segundo invitado');
+    }
+    const barberRows=(await list('barbero')).json().data.citas;assert.deepEqual(barberRows.filter(r=>r.id_grupo_cita===group).map(r=>r.id_cita),[holder,guest]);
+    const secondRead=await read('/operativas?id_sucursal='+BRANCH,'barbero',secondBarber);assert.deepEqual(secondRead.json().data.citas.map(r=>r.id_cita),[other]);
+    const foreign=await read('/operativas?id_sucursal='+secondBranch,'barbero');assert.equal(foreign.statusCode,403,foreign.body);
+    let hash=0;for(const char of group.toUpperCase())hash=((hash<<5)-hash+char.charCodeAt(0))|0;const code=Math.abs(hash).toString(36).toUpperCase().padStart(5,'0').slice(-5);
+    const lookup=await read('/reservas/buscar?codigo='+code+'&id_sucursal='+BRANCH);assert.equal(lookup.statusCode,200,lookup.body);assert.equal(lookup.json().data.reservas[0].citas.length,3);
+    const monthBefore=await insert('confirmada','2030-06-01T05:59:59.999Z'),monthFirst=await insert('confirmada','2030-06-01T06:00:00Z'),monthLast=await insert('confirmada','2030-07-01T05:59:59.999Z'),monthNext=await insert('confirmada','2030-07-01T06:00:00Z');
+    const month=await read('/operativas?fecha_desde=2030-06-01&fecha_hasta=2030-06-30&zona_horaria=America%2FTegucigalpa&id_sucursal='+BRANCH,'barbero');assert.equal(month.statusCode,200,month.body);const monthIds=month.json().data.citas.map(r=>r.id_cita);assert.ok(monthIds.includes(monthFirst));assert.ok(monthIds.includes(monthLast));assert.ok(!monthIds.includes(monthBefore));assert.ok(!monthIds.includes(monthNext));
+    const denied=await action(guest,'registrar-llegada',{'x-fixture-role':'barbero','x-fixture-barber':secondBarber});assert.equal(denied.statusCode,404,denied.body);
+    for(const [op,next]of [['registrar-llegada','en_salon'],['iniciar-atencion','en_atencion'],['finalizar-atencion','completada']]){
+      const response=await action(guest,op,{'x-fixture-role':op==='registrar-llegada'?'admin':'barbero'});assert.equal(response.statusCode,200,response.body+' '+queryError?.message);assert.equal((await state(guest)).estado_cita_codigo,next);
+    }
+    await pool.query("UPDATE citas SET contacto_nombre=' ',alias_integrante='Alias titular' WHERE id_cita=$1",[holder]);
+    assert.equal((await list('admin')).json().data.citas.find(r=>r.id_cita===holder).nombre_cliente,'Cliente Fixture');
+  });
+  await t.test('invitado en propagación: bloqueo seguro, rollback y jornada HN exclusiva',async subtest=>{
+    subtest.mock.timers.enable({apis:['Date'],now:new Date('2030-06-15T18:00:00Z')});
+    await pool.query('DELETE FROM citas; DELETE FROM citas_reagendaciones');
+    const lead=await insert('en_salon','2030-06-15T17:45:00Z'),guest=await insert('confirmada','2030-06-15T18:30:00Z'),late=await insert('confirmada','2030-06-16T05:59:59.999Z'),tomorrow=await insert('confirmada','2030-06-16T06:00:00Z');
+    await pool.query("UPDATE citas SET id_persona_cliente=NULL,contacto_nombre='Invitado retrasado' WHERE id_cita=ANY($1::uuid[])",[[guest,late,tomorrow]]);
+    const snapshot=await state(guest);await pool.query('ALTER TABLE citas_reagendaciones ADD CONSTRAINT fixture_guest_failure CHECK(false)');
+    const failure=await action(lead,'iniciar-atencion');assert.equal(failure.statusCode,500);assert.equal(queryError.code,'23514');assert.equal((await state(guest)).inicio_at.getTime(),snapshot.inicio_at.getTime());assert.equal((await state(lead)).estado_cita_codigo,'en_salon');
+    await pool.query('ALTER TABLE citas_reagendaciones DROP CONSTRAINT fixture_guest_failure');const response=await action(lead,'iniciar-atencion');assert.equal(response.statusCode,200,response.body+' '+queryError?.message);
+    assert.equal((await state(guest)).inicio_at.getTime(),snapshot.inicio_at.getTime()+15*60000);assert.equal((await state(late)).inicio_at.toISOString(),'2030-06-16T06:14:59.999Z');assert.equal((await state(tomorrow)).inicio_at.toISOString(),'2030-06-16T06:00:00.000Z');
+    assert.equal(Number((await pool.query('SELECT count(*) n FROM citas_reagendaciones')).rows[0].n),2);
+  });
+
 });
