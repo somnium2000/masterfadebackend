@@ -54,20 +54,20 @@ test('Citas Cliente: SQL PostgreSQL aislado y autenticación real', { skip: !pro
     await pg.query(`INSERT INTO citas(id_cita,id_sucursal,id_empleado_barbero,id_cliente,id_persona_cliente,estado_cita_codigo,inicio_at,fin_at,deleted_at)
       VALUES($1,$2,$3,$4,$5,$6,$7,$7::timestamptz+interval '30 minutes',$8)`,[id,branch,barber,client,persona,state,date,deleted]);return id;
   };
-  await t.test('0,1,5,6,10,41,56 por apartado, empates estables y contrato tradicional',async()=>{
-    for(const count of [0,1,5,6,10,41,56]){
+  await t.test('0,1,4,5,6,8,9,10,41,56 por apartado, empates estables y contrato tradicional',async()=>{
+    for(const count of [0,1,4,5,6,8,9,10,41,56]){
       await pg.exec('TRUNCATE citas,subscription_consumptions');const expected={proximas:[],historial:[]};
       for(let i=1;i<=count;i++){
         expected.proximas.push(await insert(i,active[(i-1)%5]));
         expected.historial.push(await insert(i+100,history[(i-1)%6]));
       }
       for(const apartado of ['proximas','historial']){
-        const ids=[];for(let page=1;page<=Math.max(1,Math.ceil(count/5));page++){
-          const data=await read(`?apartado=${apartado}&page=${page}&limit=5`);
+        const ids=[];for(let page=1;page<=Math.max(1,Math.ceil(count/4));page++){
+          const data=await read(`?apartado=${apartado}&page=${page}&limit=4`);
           assert.deepEqual(data.totals,{proximas:count,historial:count,total:count*2,pendientes_pago:Math.floor((count+3)/5)});
-          assert.equal(data.pagination.page,page);assert.equal(data.pagination.total,count);assert.equal(data.pagination.limit,5);
-          assert.equal(data.pagination.total_pages,Math.max(1,Math.ceil(count/5)));assert.equal(data.pagination.has_prev,page>1);assert.equal(data.pagination.has_next,page<Math.ceil(count/5));
-          assert.ok(data.citas.length<=5);ids.push(...data.citas.map(c=>c.id_cita));
+          assert.equal(data.pagination.page,page);assert.equal(data.pagination.total,count);assert.equal(data.pagination.limit,4);
+          assert.equal(data.pagination.total_pages,Math.max(1,Math.ceil(count/4)));assert.equal(data.pagination.has_prev,page>1);assert.equal(data.pagination.has_next,page<Math.ceil(count/4));
+          assert.ok(data.citas.length<=4);ids.push(...data.citas.map(c=>c.id_cita));
         }
         assert.deepEqual(ids,[...expected[apartado]].reverse());assert.equal(new Set(ids).size,count);
       }
@@ -81,7 +81,7 @@ test('Citas Cliente: SQL PostgreSQL aislado y autenticación real', { skip: !pro
     await insert(502,'confirmada',{client:null});await insert(503,'confirmada',{persona:null});await insert(504,'confirmada',{deleted:'2026-01-01'});
     await pg.exec("INSERT INTO subscription_consumptions SELECT id_cita FROM citas WHERE id_cita::text LIKE '%000000000500'; INSERT INTO subscription_consumptions SELECT id_cita FROM subscription_consumptions LIMIT 1;");
     const first=await read('?apartado=proximas');assert.ok(first.citas[0].inicio_at.startsWith('2040'));assert.equal(first.totals.proximas,59);
-    const last=await read('?apartado=proximas&page=999');assert.equal(last.pagination.page,12);assert.equal(last.citas.length,4);
+    const last=await read('?apartado=proximas&page=999');assert.equal(last.pagination.page,15);assert.equal(last.citas.length,3);
     const theirs=await call('?apartado=proximas',foreign);assert.equal(theirs.json().data.totals.total,1);
     assert.equal((await read('?apartado=proximas&id_cliente='+other+'&id_persona_cliente='+otherPerson)).totals.proximas,59);
     assert.equal((await call('/'+first.citas[0].id_cita,foreign)).statusCode,404);
@@ -91,7 +91,7 @@ test('Citas Cliente: SQL PostgreSQL aislado y autenticación real', { skip: !pro
     assert.equal(writes,0);
   });
   await t.test('parámetros inválidos, token inválido, perfil y rol requerido',async()=>{
-    for(const query of ['?apartado=otra','?page=1','?limit=5','?apartado=proximas&page=0','?apartado=historial&page=-1','?apartado=proximas&page=1.2','?apartado=proximas&page=abc','?apartado=proximas&limit=6','?apartado=proximas&limit=0'])assert.equal((await call(query)).statusCode,400,query);
+    for(const query of ['?apartado=otra','?page=1','?limit=5','?apartado=proximas&page=0','?apartado=historial&page=-1','?apartado=proximas&page=1.2','?apartado=proximas&page=abc','?apartado=proximas&limit=5','?apartado=proximas&limit=6','?apartado=proximas&limit=0'])assert.equal((await call(query)).statusCode,400,query);
     for(const query of ['?apartado=historial&page=100000001','?apartado=proximas&fecha_desde=2026-11-16&fecha_hasta=2026-11-15','?apartado=proximas&fecha_desde=2026-13-01'])assert.equal((await call(query)).statusCode,400,query);
     assert.equal((await call('?apartado=proximas','invalid')).statusCode,401);
     assert.equal((await app.inject({url:'/v1/citas?apartado=proximas'})).statusCode,401);
@@ -102,7 +102,7 @@ test('Citas Cliente: SQL PostgreSQL aislado y autenticación real', { skip: !pro
     await pg.exec('TRUNCATE citas,citas_holds,payment_intents,subscription_consumptions');
     const all=[...active,...history],ids=[];for(let i=0;i<all.length;i++)ids.push(await insert(i+1,all[i]));
     const prox=await read('?apartado=proximas'),past=await read('?apartado=historial');
-    assert.deepEqual(new Set(prox.citas.map(c=>c.estado_cita_codigo)),new Set(active));
+    assert.deepEqual(new Set([...prox.citas,...(await read('?apartado=proximas&page=2')).citas].map(c=>c.estado_cita_codigo)),new Set(active));
     const rest=await read('?apartado=historial&page=2');assert.deepEqual(new Set([...past.citas,...rest.citas].map(c=>c.estado_cita_codigo)),new Set(history));
     assert.equal(prox.totals.total,11);assert.equal(prox.totals.pendientes_pago,1);
     const group=randomUUID(),pendingId=ids[1];await pg.query('UPDATE citas SET id_grupo_cita=$1,orden_integrante=1 WHERE id_cita=$2',[group,pendingId]);
@@ -110,8 +110,8 @@ test('Citas Cliente: SQL PostgreSQL aislado y autenticación real', { skip: !pro
     await pg.query("INSERT INTO payment_intents(id_intent,id_cita,estado_intent_codigo,expires_at,monto_hnl,moneda_codigo) VALUES($1,$2,'creado','2099-01-01',100,'HNL')",[randomUUID(),pendingId]);
     const pending=await call('/pendiente');assert.equal(pending.statusCode,200,pending.body+' '+sqlError?.message);assert.equal(pending.json().data.pendiente.id_grupo_cita,group);assert.equal(pending.json().data.pendiente.vigente,true);
     assert.equal((await call('/pendiente',foreign)).json().data.pendiente,null);
-    await pg.query('DELETE FROM citas WHERE id_cita=$1',[ids[10]]);
-    const shrunk=await read('?apartado=historial&page=2');assert.equal(shrunk.pagination.page,1);assert.equal(shrunk.citas.length,5);
+    await pg.query('DELETE FROM citas WHERE id_cita=ANY($1::uuid[])',[[ids[9],ids[10]]]);
+    const shrunk=await read('?apartado=historial&page=2');assert.equal(shrunk.pagination.page,1);assert.equal(shrunk.citas.length,4);
     const before=await pg.query('SELECT id_cita,estado_cita_codigo FROM citas ORDER BY id_cita');
     for(let i=0;i<3;i++)await read('?apartado=proximas&page=1');
     assert.deepEqual((await pg.query('SELECT id_cita,estado_cita_codigo FROM citas ORDER BY id_cita')).rows,before.rows);assert.equal(writes,0);

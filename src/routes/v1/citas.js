@@ -58,6 +58,7 @@ import {
 } from "../../services/booking/bookingHoldOrchestrationService.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente"];
+const CLIENT_APPOINTMENT_PAGE_SIZE = 4;
 const CLIENT_APPOINTMENT_SECTIONS = {
   proximas: ["en_espera", "pendiente_pago", "confirmada", "en_salon", "en_atencion"],
   historial: ["completada", "cancelada", "cancelada_por_cliente", "expirada", "no_show", "anulada"],
@@ -356,18 +357,18 @@ async function listAppointmentRows(client, { clienteId, personaId, citaId = null
         (COUNT(*) FILTER (WHERE estado_cita_codigo = 'pendiente_pago'))::int AS pendientes_pago
       FROM eligible
     ), metadata AS (
-      SELECT *, GREATEST(1, (total + 4) / 5) AS total_pages,
-        LEAST($${requested}::int, GREATEST(1, (total + 4) / 5)) AS page FROM counts
+      SELECT *, GREATEST(1, (total + ${CLIENT_APPOINTMENT_PAGE_SIZE - 1}) / ${CLIENT_APPOINTMENT_PAGE_SIZE}) AS total_pages,
+        LEAST($${requested}::int, GREATEST(1, (total + ${CLIENT_APPOINTMENT_PAGE_SIZE - 1}) / ${CLIENT_APPOINTMENT_PAGE_SIZE})) AS page FROM counts
     )
     SELECT metadata.*, COALESCE((SELECT jsonb_agg(p ORDER BY p.inicio_at DESC, p.id_cita DESC)
       FROM (SELECT * FROM eligible WHERE estado_cita_codigo = ANY($${selected}::text[])
-        ORDER BY inicio_at DESC, id_cita DESC LIMIT 5 OFFSET (metadata.page - 1) * 5) p), '[]'::jsonb) AS citas
+        ORDER BY inicio_at DESC, id_cita DESC LIMIT ${CLIENT_APPOINTMENT_PAGE_SIZE} OFFSET (metadata.page - 1) * ${CLIENT_APPOINTMENT_PAGE_SIZE}) p), '[]'::jsonb) AS citas
     FROM metadata`, params);
     const result = rows[0];
     return { citas: result.citas.map(mapAppointmentRow),
       totals: { proximas: result.proximas, historial: result.historial,
         total: result.proximas + result.historial, pendientes_pago: result.pendientes_pago },
-      pagination: { apartado, page: result.page, limit: 5, total: result.total,
+      pagination: { apartado, page: result.page, limit: CLIENT_APPOINTMENT_PAGE_SIZE, total: result.total,
         total_pages: result.total_pages, has_next: result.page < result.total_pages, has_prev: result.page > 1 } };
   }
   const { rows } = await client.query(sql, params);
@@ -3277,7 +3278,7 @@ export default async function citasRoutes(app) {
           properties: {
             apartado: { type: "string", enum: ["proximas", "historial"] },
             page: { type: "integer", minimum: 1, maximum: 100000000 },
-            limit: { type: "integer", enum: [5] },
+            limit: { type: "integer", enum: [CLIENT_APPOINTMENT_PAGE_SIZE] },
             estado: { type: "string" },
             fecha_desde: { type: "string", format: "date" },
             fecha_hasta: { type: "string", format: "date" },
