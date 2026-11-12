@@ -17,6 +17,18 @@ const MAINTENANCE_ROUTES = new Set([
   "POST /v1/admin/citas/dias-inhabilitados", "DELETE /v1/admin/citas/dias-inhabilitados",
   "DELETE /v1/admin/citas/dias-inhabilitados/:id", "PATCH /v1/admin/citas/parametros",
 ]);
+const QA_PAYMENT_SIMULATION_ROUTES = new Set([
+  "POST /v1/public/citas/validar-contactos",
+  "POST /v1/public/citas/validar-titular",
+  "POST /v1/public/citas/hold",
+  "POST /v1/citas/hold",
+  "POST /v1/public/pagos/crear-intent",
+  "POST /v1/public/pagos/estado",
+  "POST /v1/public/pagos/simulator/event",
+  "POST /v1/pagos/reservas/crear-intent",
+  "POST /v1/pagos/reservas/estado",
+  "POST /v1/pagos/reservas/simulator/event",
+]);
 const normalizeIp = value => {
   const text = String(value || "").trim();
   const ip = text.startsWith("::ffff:") ? text.slice(7) : text;
@@ -54,6 +66,11 @@ export function isPrivateCommerceRoute(method, route) {
   return false;
 }
 
+export function isQaPaymentSimulationRoute(method, route) {
+  const path = String(route || "").replace(/\/$/, "");
+  return QA_PAYMENT_SIMULATION_ROUTES.has(`${method} ${path}`);
+}
+
 export function privateCommerceIpAllowed(request, config) {
   const peer = normalizeIp(request.raw.socket.remoteAddress);
   if (!config.proxies.length) return config.ips.includes(peer);
@@ -64,6 +81,7 @@ export function privateCommerceIpAllowed(request, config) {
 
 export default fp(async function privateCommerce(app) {
   const config = app.config.privateCommercePilot || resolvePrivateCommerceConfig(process.env);
+  const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const verify = app.requireRoles([]);
   async function eligible(request, reply) {
     if (!config.enabled || app.config.adminDataEntryMode || app.config.paymentProvider !== "pixelpay"
@@ -79,6 +97,8 @@ export default fp(async function privateCommerce(app) {
   }
   app.addHook("onRequest", async (request, reply) => {
     if (!isPrivateCommerceRoute(request.method, request.routeOptions.url)) return;
+    if (qaPaymentSimulationEnabled
+      && isQaPaymentSimulationRoute(request.method, request.routeOptions.url)) return;
     if (await eligible(request, reply)) {
       // AM: Public booking now uses a session too; keep it protected against cross-site mutations.
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)
@@ -91,6 +111,9 @@ export default fp(async function privateCommerce(app) {
   });
   app.get("/v1/commerce/eligibility", async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
+    if (qaPaymentSimulationEnabled) {
+      return { ok: true, data: { booking: true, vipPurchase: false } };
+    }
     const allowed = await eligible(request, reply);
     if (reply.sent) return;
     return { ok: true, data: { booking: allowed, vipPurchase: allowed } };

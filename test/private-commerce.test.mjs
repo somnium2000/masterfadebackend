@@ -163,6 +163,56 @@ test("presale and callbacks remain independent of owner IP/session and pilot swi
   assert.equal(f.state.unexpectedSql, 0);
 });
 
+test("QA simulation opens only booking and TodoPago simulator routes", async t => {
+  const app = Fastify();
+  app.decorate("config", {
+    paymentProvider: "todopago",
+    adminDataEntryMode: false,
+    privateCommercePilot: { enabled: false, userIds: [], ips: [], proxies: [] },
+    qaPaymentSimulation: { enabled: true },
+  });
+  app.decorate("requireRoles", () => async () => {});
+  await app.register(fp(async () => {}, { name: "env-plugin" }));
+  await app.register(gate);
+  t.after(() => app.close());
+
+  const allowed = [
+    "/v1/public/citas/validar-contactos",
+    "/v1/public/citas/validar-titular",
+    "/v1/public/citas/hold",
+    "/v1/citas/hold",
+    "/v1/public/pagos/crear-intent",
+    "/v1/public/pagos/estado",
+    "/v1/public/pagos/simulator/event",
+    "/v1/pagos/reservas/crear-intent",
+    "/v1/pagos/reservas/estado",
+    "/v1/pagos/reservas/simulator/event",
+  ];
+  const denied = [
+    "/v1/public/pagos/mock-completar",
+    "/v1/public/pagos/pixelpay/sale",
+    "/v1/cliente/planes/orden",
+    "/v1/admin/citas/hold",
+  ];
+  for (const url of [...allowed, ...denied]) {
+    app.post(url, async () => ({ reached: true }));
+  }
+
+  for (const url of allowed) {
+    const response = await app.inject({ method: "POST", url, payload: {} });
+    assert.equal(response.statusCode, 200, `${url}: ${response.body}`);
+    assert.equal(response.json().reached, true);
+  }
+  for (const url of denied) {
+    const response = await app.inject({ method: "POST", url, payload: {} });
+    assert.equal(response.statusCode, 403, `${url}: ${response.body}`);
+    assert.equal(response.json().error.code, "PRIVATE_COMMERCE_RESTRICTED");
+  }
+
+  const eligibility = await app.inject({ url: "/v1/commerce/eligibility" });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false });
+});
+
 test("callback reaches its own financial guard even in administrative mode", async t => {
   const f = await fixture(t, { env: { PRIVATE_COMMERCE_PILOT_ENABLED: "false" }, config: { adminDataEntryMode: true } });
   const callback = await f.app.inject({ method: "POST", url: "/v1/pagos/webhook/pixelpay", remoteAddress: "198.51.100.2", payload: {} });
