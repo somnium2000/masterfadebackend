@@ -296,6 +296,10 @@ export function extractPixelPayStatusContract(response, expected = {}, sdkEnvelo
       ? rawResponseCode
       : null;
     const expectedTransactionId = strictStatusText(expected?.transactionId);
+    const expectedPaymentUuid = strictStatusText(expected?.paymentUuid);
+    const paymentUuidMatches = Boolean(financial)
+      && (!Object.hasOwn(financial, "payment_uuid")
+        || (typeof financial.payment_uuid === "string" && financial.payment_uuid === expectedPaymentUuid));
     const expectedAmount = strictStatusAmount(expected?.amount);
     const transactionAmountMatches = transactionAmount !== null
       && expectedAmount !== null
@@ -312,6 +316,9 @@ export function extractPixelPayStatusContract(response, expected = {}, sdkEnvelo
     const approvedCode = responseCode === "00";
     const approvalSignalsAgree = responseApproved.valid
       && responseApproved.value === approvedCode;
+    // AM: Si Status incluye la senal de interrupcion, solo false es coherente con una respuesta completa.
+    const incompleteSignalValid = Boolean(financial)
+      && (!Object.hasOwn(financial, "response_incomplete") || financial.response_incomplete === false);
     const statusSignalsAgree = normalizedStatus === "COMPLETED"
       ? responseApproved.value === true && approvedCode
       : responseApproved.value === false && !approvedCode;
@@ -331,6 +338,8 @@ export function extractPixelPayStatusContract(response, expected = {}, sdkEnvelo
       && Boolean(responseCode)
       && amountMatches
       && transactionIdMatches
+      && paymentUuidMatches
+      && incompleteSignalValid
       && approvalSignalsAgree
       && statusSignalsAgree;
 
@@ -875,7 +884,9 @@ export class PixelPaySdkProvider extends PaymentProvider {
     } catch {
       sdkEnvelopeValid = false;
     }
-    const contract = extractPixelPayStatusContract(response, expected, sdkEnvelopeValid);
+    const contract = extractPixelPayStatusContract(response, {
+      ...expected, paymentUuid: normalizedUuid,
+    }, sdkEnvelopeValid);
     emitPixelPayStatusShape(
       shapeProbe,
       beforeShape,

@@ -1028,6 +1028,79 @@ test("SDK Status verifica el contrato anidado pero no fabrica payment_hash ni ap
   assert.equal(fake.calls.fromResponse, 0);
 });
 
+test("SDK 2.5.8 Status valida response_incomplete presente sin exigir un campo no confirmado", async (t) => {
+  for (const [name, extra, valid] of [
+    ["ausente", {}, true],
+    ["boolean false", { response_incomplete: false }, true],
+    ["boolean true", { response_incomplete: true }, false],
+    ["string false", { response_incomplete: "false" }, false],
+    ["numero cero", { response_incomplete: 0 }, false],
+    ["null", { response_incomplete: null }, false],
+    ["undefined explicito", { response_incomplete: undefined }, false],
+  ]) {
+    await t.test(name, async () => {
+      const provider = new PixelPaySdkProvider({ endpoint: "https://pixelpay.dev", env: "sandbox",
+        keyId: KEY_ID, secretKey: SECRET, authHash: AUTH_HASH, appUrl: "https://pixelpay.dev" });
+      const response = new provider.sdk.Responses.SuccessResponse();
+      response.setStatus(200);
+      response.success = true;
+      response.data = statusData("paid", extra);
+      provider.createTransaction = () => ({
+        async getStatus(request) {
+          assert.equal(request.payment_uuid, PAYMENT_UUID);
+          return response;
+        },
+      });
+      const result = await provider.queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
+      assert.equal(result.providerContractValid, valid);
+      assert.equal(result.providerApproved, valid);
+      assert.equal(result.status, valid ? "COMPLETED" : "UNKNOWN");
+      assert.equal(result.incomplete, !valid);
+      assert.equal(result.approved, false);
+      assert.equal(result.paymentHashValid, false);
+      assert.equal(result.paymentHashEvidenceAvailable, false);
+      assert.equal(result.definitiveRejected, false);
+    });
+  }
+});
+
+test("SDK 2.5.8 Status valida payment_uuid si aparece sin fabricar evidencia", async (t) => {
+  for (const [name, extra, valid] of [
+    ["ausente", {}, true],
+    ["UUID consultado", { payment_uuid: PAYMENT_UUID }, true],
+    ["UUID contradictorio", { payment_uuid: "other-payment" }, false],
+    ["objeto", { payment_uuid: {} }, false],
+    ["numero", { payment_uuid: 123 }, false],
+    ["null", { payment_uuid: null }, false],
+  ]) {
+    await t.test(name, async () => {
+      const provider = new PixelPaySdkProvider({ endpoint: "https://pixelpay.dev", env: "sandbox",
+        keyId: KEY_ID, secretKey: SECRET, authHash: AUTH_HASH, appUrl: "https://pixelpay.dev" });
+      const response = new provider.sdk.Responses.SuccessResponse();
+      response.setStatus(200);
+      response.success = true;
+      response.data = statusData("paid", extra);
+      provider.createTransaction = () => ({
+        async getStatus(request) {
+          assert.equal(request.payment_uuid, PAYMENT_UUID);
+          return response;
+        },
+      });
+      const result = await provider.queryPaymentStatus(PAYMENT_UUID,
+        { ...STATUS_EXPECTED, paymentUuid: "caller-cannot-replace-queried-UUID" });
+      assert.equal(result.providerContractValid, valid);
+      assert.equal(result.providerApproved, valid);
+      assert.equal(result.status, valid ? "COMPLETED" : "UNKNOWN");
+      assert.equal(result.incomplete, !valid);
+      assert.equal(result.paymentUuid, PAYMENT_UUID);
+      assert.equal(result.resultPaymentUuid, null);
+      assert.equal(result.approved, false);
+      assert.equal(result.paymentHashValid, false);
+      assert.equal(result.paymentHashEvidenceAvailable, false);
+    });
+  }
+});
+
 test("SDK Status rechaza campos faltantes, tipos invalidos, contradicciones y diferencias financieras", async (t) => {
   const withoutField = (field) => {
     const data = statusData("paid");

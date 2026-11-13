@@ -1849,6 +1849,16 @@ export async function confirmMembershipPaymentAndActivateSubscription(client, {
         code: "MEMBERSHIP_PIXELPAY_EVIDENCE_INVALID",
       });
     }
+    // AM: Revalidar el instante exacto bajo locks; Date no conserva los microsegundos de la orden.
+    const validity = await client.query(`SELECT
+      ($2::timestamptz <= pi.expires_at AND $2::timestamptz <= mpo.expires_at) AS evidence_within_validity
+      FROM public.payment_intents pi JOIN public.membership_purchase_orders mpo ON mpo.id_order = pi.id_membership_order
+      WHERE pi.id_intent = $1::uuid`, [safeIntentId, verifiedAt]);
+    if (validity.rows?.[0]?.evidence_within_validity !== true) {
+      throw new AppError(409, "La evidencia financiera de PixelPay no es valida", {
+        code: "MEMBERSHIP_PIXELPAY_EVIDENCE_INVALID",
+      });
+    }
     intent.provider_payment_uuid = pixelPayEvidence.paymentUuid;
     intent.provider_transaction_id = pixelPayEvidence.transactionId;
     intent.provider_paid_at = verifiedAt;
@@ -1998,27 +2008,45 @@ export async function recoverMembershipPixelPayApproval(client, {
   if (identityLock.rows?.[0]?.deletion_identity_lock !== true) throw new AppError(409,
     "La cuenta no esta disponible. El pago conserva su evidencia para conciliacion.", { code: "MEMBERSHIP_PAYMENT_ACCOUNT_UNAVAILABLE" });
   const { rows } = await client.query(
-    `SELECT pi.id_intent, pi.id_provider, pi.id_membership_order, pi.estado_intent_codigo,
+    `WITH valid_membership_events AS (
+       SELECT pe.*
+       FROM public.payment_events pe
+       JOIN app_private.pixelpay_sale_attempts a ON a.id_intent = pe.id_intent
+         AND a.payment_attempt_id::text = pe.payload_esencial->>'payment_attempt_id'
+       JOIN public.payment_intents expected ON expected.id_intent = pe.id_intent
+         AND expected.id_provider = pe.id_provider
+       WHERE pe.id_intent = $1::uuid AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
+         AND pe.firma_valida IS TRUE
+         AND pe.provider_event_id = 'pixelpay_membership_' || (pe.payload_esencial->>'payment_attempt_id')
+         AND pe.payload_esencial->>'payment_uuid' = expected.provider_session_id
+         AND pe.payload_esencial->>'transaction_id' = expected.referencia_externa
+         AND CASE WHEN jsonb_typeof(pe.payload_esencial->'amount') = 'number'
+           THEN (pe.payload_esencial->>'amount')::numeric END = expected.monto_hnl
+         AND upper(pe.payload_esencial->>'currency') = upper(expected.moneda_codigo)
+         AND pe.payload_esencial->>'payment_hash_valid' = 'true'
+         AND pe.payload_esencial->>'amount_matches' = 'true'
+     )
+     SELECT pi.id_intent, pi.id_provider, pi.id_membership_order, pi.estado_intent_codigo,
             pi.monto_hnl, pi.moneda_codigo, pi.expires_at AS intent_expires_at,
             mpo.id_cliente, mpo.expires_at AS order_expires_at,
             mpo.estado_orden_codigo, mpo.id_suscripcion,
             pp.codigo AS provider_code,
             pe.payload_esencial,
+            (pe.recibido_at <= pi.expires_at AND pe.recibido_at <= mpo.expires_at) AS within_validity,
             to_char(pe.recibido_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS verified_at
        FROM public.payment_intents pi
        JOIN public.membership_purchase_orders mpo
          ON mpo.id_order = pi.id_membership_order
        JOIN public.payment_providers pp
          ON pp.id_provider = pi.id_provider
-       JOIN public.payment_events pe
+       JOIN valid_membership_events pe
          ON pe.id_intent = pi.id_intent
         AND pe.id_provider = pi.id_provider
       WHERE pi.id_intent = $1::uuid
         AND pi.estado_intent_codigo IN ('pendiente_confirmacion', 'confirmado', 'expirado')
+        AND (SELECT count(*) FROM valid_membership_events) = 1
         AND pe.evento_tipo = 'membership.pixelpay.approved_verified'
         AND pe.firma_valida = TRUE
-      ORDER BY pe.recibido_at ASC
-      LIMIT 1
       FOR UPDATE OF pi`,
     [safeIntentId]
   );
@@ -2055,7 +2083,8 @@ export async function recoverMembershipPixelPayApproval(client, {
   const expiries = [durable.intent_expires_at, durable.order_expires_at]
     .map((value) => new Date(value).getTime())
     .filter(Number.isFinite);
-  if (!Number.isFinite(verifiedAtMs) || expiries.length !== 2 || verifiedAtMs > Math.min(...expiries)) {
+  // AM: PostgreSQL compara los vencimientos sin truncar los microsegundos del evento.
+  if (!Number.isFinite(verifiedAtMs) || expiries.length !== 2 || durable.within_validity !== true) {
     throw new AppError(409, "La aprobación durable no fue verificada dentro de la vigencia", {
       code: "MEMBERSHIP_PIXELPAY_RECOVERY_VERIFIED_AFTER_EXPIRY",
     });

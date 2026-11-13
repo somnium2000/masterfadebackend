@@ -361,6 +361,43 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       assert.equal((await recover()).booking_confirmed, true);
       await assertConfirmedOnce();
     });
+    await t.test("dos recuperaciones realmente concurrentes esperan el mismo lock y capturan una sola vez", async () => {
+      await reset();
+      const options = { host: "127.0.0.1", port: client.connectionParameters.port,
+        user: "postgres", password: "", database: "postgres", ssl: false, query_timeout: 10000 };
+      const peers = [new pg.Client(options), new pg.Client(options)];
+      let outcomes;
+      let pending;
+      let lockHeld = false;
+      try {
+        await Promise.all(peers.map((peer) => peer.connect()));
+        const pids = await Promise.all(peers.map(async (peer) => (await peer.query("SELECT pg_backend_pid() pid")).rows[0].pid));
+        await client.query("BEGIN");
+        lockHeld = true;
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))", [`pixelpay-sale:${INTENT}`]);
+        pending = Promise.allSettled(peers.map((peer) => recover(peer)));
+        const deadline = Date.now() + 5000;
+        let waiting = 0;
+        do {
+          waiting = (await client.query(`SELECT count(*)::int count FROM pg_locks
+            WHERE locktype='advisory' AND NOT granted AND pid=ANY($1::int[])`, [pids])).rows[0].count;
+          if (waiting < 2) await new Promise((resolve) => setTimeout(resolve, 20));
+        } while (waiting < 2 && Date.now() < deadline);
+        // AM: Probar solapamiento real, no solo invocar promesas que podrian serializarse.
+        assert.equal(waiting, 2);
+        await client.query("COMMIT");
+        lockHeld = false;
+        outcomes = await pending;
+      } finally {
+        if (lockHeld) await client.query("ROLLBACK");
+        if (pending) await pending;
+        await Promise.all(peers.map((peer) => peer.end()));
+      }
+      assert.deepEqual(outcomes.map((outcome) => outcome.status), ["fulfilled", "fulfilled"]);
+      assert.equal(outcomes.filter((outcome) => outcome.value.duplicate === true).length, 1);
+      assert.ok(outcomes.every((outcome) => outcome.value.booking_confirmed === true));
+      await assertConfirmedOnce();
+    });
     await t.test("segunda ruta valida paidAt contra evento, no finalized_at", async () => {
       await reset();
       await client.query("UPDATE public.citas_grupos SET estado_grupo_codigo='activo'");
