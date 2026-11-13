@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fp from "fastify-plugin";
 import privateCommerce from "../src/plugins/privateCommerce.js";
 import Fastify from "fastify";
+import fastifyRawBody from "fastify-raw-body";
 
 import {
   assertPaymentWebhookContract,
@@ -16,6 +17,7 @@ import {
 } from "../src/services/agendaService.js";
 import { resolvePixelPayOrderCallbackUrl } from "../src/plugins/env.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
+import { createPixelPayWebhookSignature } from "../src/services/payments/pixelPayWebhookSignature.js";
 
 test("PixelPay webhook permanece deshabilitado por defecto", () => {
   assert.throws(
@@ -116,12 +118,15 @@ function callbackFixture({
         ok: true,
         success: true,
         providerContractValid: true,
-        paymentHashValid: true,
         amountMatches: true,
-        resultPaymentUuid: "P-1",
+        paymentUuid: "P-1",
         status: "COMPLETED",
         statusCode: 200,
-        approved: true,
+        approved: false,
+        providerApproved: true,
+        responseApproved: true,
+        responseCode: "00",
+        transactionAuthPresent: true,
         incomplete: false,
         transactionId: "TX-1",
         ...status,
@@ -244,7 +249,9 @@ test("callback real con order/uuid verifica Status pero conserva pendiente", asy
 });
 
 test("diagnostico Status muestra solo booleanos y mantiene pendiente evidencia incompleta", async () => {
-  for (const failed of ["paymentHashValid", "amountMatches", "approved", "providerContractValid"]) {
+  for (const failed of [
+    "amountMatches", "providerApproved", "responseApproved", "transactionAuthPresent", "providerContractValid",
+  ]) {
     const fixture = callbackFixture({ status: { [failed]: false } });
     const logs = [];
     await processPixelPayOrderCallback({
@@ -257,8 +264,9 @@ test("diagnostico Status muestra solo booleanos y mantiene pendiente evidencia i
     assert.equal(Object.values(conditions).every(value => typeof value === "boolean"), true);
     assert.equal(conditions.financiallyVerified, false);
     assert.deepEqual(Object.keys(conditions).sort(), [
-      "ok", "success", "providerContractValid", "paymentHashValid", "amountMatches",
-      "approved", "incomplete", "uuidMatches", "transactionMatches", "currencyMatches",
+      "ok", "success", "providerContractValid", "durableSaleVerified", "amountMatches",
+      "providerApprovalSignalsValid", "responseApproved", "responseCodeApproved",
+      "transactionAuthPresent", "incomplete", "uuidMatches", "transactionMatches", "currencyMatches",
       "statusOrderMatches", "statusCurrencyMatches", "callbackStatusMatches", "financiallyVerified",
     ].sort());
     assert.equal(fixture.event.result, "status_incierto_pendiente");
@@ -297,7 +305,7 @@ test("callback falsificado se rechaza antes de abrir PostgreSQL", async () => {
   assert.equal(connects, 0);
 });
 
-test("callback real correlaciona UUID auxiliar y rechaza inconsistencias financieras", async (t) => {
+test("callback real exige identidades de Sale y rechaza inconsistencias financieras", async (t) => {
   await t.test("orden incorrecta", async () => {
     const fixture = callbackFixture();
     await assert.rejects(
@@ -310,26 +318,20 @@ test("callback real correlaciona UUID auxiliar y rechaza inconsistencias financi
       (error) => error?.code === "PIXELPAY_CALLBACK_PAYMENT_HASH_INVALID"
     );
   });
-  await t.test("UUID auxiliar diferente usa el UUID financiero verificado de Sale", async () => {
+  await t.test("UUID distinto al Sale verificado se rechaza antes de Status", async () => {
     const fixture = callbackFixture();
-    let queriedUuid = null;
-    const originalStatus = fixture.provider.queryPaymentStatus;
-    fixture.provider.queryPaymentStatus = async (paymentUuid, expected) => {
-      queriedUuid = paymentUuid;
-      return originalStatus(paymentUuid, expected);
-    };
-    const result = await processPixelPayOrderCallback({
-      db: fixture.db,
-      provider: fixture.provider,
-      body: { ...validCallback, uuid: "CALLBACK-AUXILIARY" },
-      requestId: "req-uuid-auxiliary",
-    });
-    assert.equal(result.status, "completed");
-    assert.equal(queriedUuid, "P-1");
-    assert.equal(
-      fixture.queries.some(({ text }) => /pixelpay\.order_callback\.received', FALSE/i.test(text)),
-      true
+    let statusCalls = 0;
+    fixture.provider.queryPaymentStatus = async () => { statusCalls += 1; };
+    await assert.rejects(
+      processPixelPayOrderCallback({
+        db: fixture.db,
+        provider: fixture.provider,
+        body: { ...validCallback, uuid: "CALLBACK-OTHER" },
+        requestId: "req-uuid-mismatch",
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH"
     );
+    assert.equal(statusCalls, 0);
   });
   await t.test("monto incorrecto", async () => {
     const fixture = callbackFixture();
@@ -355,34 +357,27 @@ test("callback real correlaciona UUID auxiliar y rechaza inconsistencias financi
       (error) => error?.code === "PIXELPAY_CALLBACK_CURRENCY_MISMATCH"
     );
   });
-  await t.test("transaction ID auxiliar distinto usa identidad financiera de Sale", async () => {
+  await t.test("transaction ID distinto al Sale verificado se rechaza antes de Status", async () => {
     const fixture = callbackFixture();
-    let queriedUuid;
-    const originalStatus = fixture.provider.queryPaymentStatus;
-    fixture.provider.queryPaymentStatus = async (uuid, expected) => {
-      queriedUuid = uuid;
-      return originalStatus(uuid, expected);
-    };
-    const result = await processPixelPayOrderCallback({
+    let statusCalls = 0;
+    fixture.provider.queryPaymentStatus = async () => { statusCalls += 1; };
+    await assert.rejects(
+      processPixelPayOrderCallback({
         db: fixture.db,
         provider: fixture.provider,
-        body: { ...validCallback, uuid: "CALLBACK-AUX", transaction_id: "TX-OTHER" },
+        body: { ...validCallback, transaction_id: "TX-OTHER" },
         requestId: "req-transaction-mismatch",
-      });
-    assert.equal(queriedUuid, "P-1");
-    assert.equal(result.status, "completed");
-    assert.equal(fixture.event.result, "status_verificado_pendiente_conciliacion");
-    const received = fixture.queries.find(({ text }) => text.includes("pixelpay.order_callback.received"));
-    assert.equal(received.params[2].transaction_id, "TX-1");
-    assert.equal(received.params[2].callback_transaction_id_matches, false);
-    assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments|UPDATE public\.payment_intents|confirmar_reserva_pagada/i.test(text)), false);
+      }),
+      (error) => error?.code === "PIXELPAY_CALLBACK_TRANSACTION_ID_MISMATCH"
+    );
+    assert.equal(statusCalls, 0);
   });
   await t.test("Status con transaccion distinta conserva el evento pendiente", async () => {
     const fixture = callbackFixture({ status: { transactionId: "TX-STATUS-OTHER" } });
     const result = await processPixelPayOrderCallback({
       db: fixture.db,
       provider: fixture.provider,
-      body: { ...validCallback, uuid: "CALLBACK-AUXILIARY" },
+      body: validCallback,
       requestId: "req-status-transaction-mismatch",
     });
     assert.equal(result.processed, false);
@@ -394,7 +389,7 @@ test("callback real correlaciona UUID auxiliar y rechaza inconsistencias financi
       const result = await processPixelPayOrderCallback({
         db: fixture.db,
         provider: fixture.provider,
-        body: { ...validCallback, uuid: "CALLBACK-AUXILIARY" },
+        body: validCallback,
         requestId: "req-status-contract-mismatch",
       });
       assert.equal(result.processed, false);
@@ -410,6 +405,7 @@ test("telemetria de rechazo contiene solo codigo y comparaciones booleanas", () 
     safeCallbackComparisons: {
       orderUnique: true,
       paymentUuidMatches: false,
+      transactionIdMatches: true,
       amountMatches: true,
       currencyMatches: true,
     },
@@ -418,6 +414,7 @@ test("telemetria de rechazo contiene solo codigo y comparaciones booleanas", () 
     code: "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
     order_unique: true,
     payment_uuid_matches: false,
+    transaction_id_matches: true,
     amount_matches: true,
     currency_matches: true,
   });
@@ -466,19 +463,19 @@ test("callback ya verificado responde idempotente sin repetir Status", async () 
   assert.equal(statusCalls, 0);
 });
 
-test("identificadores auxiliares distintos deduplican por identidad financiera", async () => {
+test("reenvios con el mismo UUID deduplican por identidad PixelPay", async () => {
   const fixture = callbackFixture();
   const first = await processPixelPayOrderCallback({
     db: fixture.db,
     provider: fixture.provider,
-    body: { ...validCallback, uuid: "CALLBACK-AUX-1" },
-    requestId: "req-aux-1",
+    body: validCallback,
+    requestId: "req-replay-1",
   });
   const second = await processPixelPayOrderCallback({
     db: fixture.db,
     provider: fixture.provider,
-    body: { ...validCallback, uuid: "CALLBACK-AUX-2", transaction_id: "TX-AUX-2" },
-    requestId: "req-aux-2",
+    body: validCallback,
+    requestId: "req-replay-2",
   });
   assert.equal(first.provider_event_id, second.provider_event_id);
   assert.equal(second.duplicate, true);
@@ -512,12 +509,15 @@ test("duplicado pendiente recupera despues de Status 412", async () => {
       ok: true,
       success: true,
       providerContractValid: true,
-      paymentHashValid: true,
       amountMatches: true,
-      resultPaymentUuid: "P-1",
+      paymentUuid: "P-1",
       status: "COMPLETED",
       statusCode: 200,
-      approved: true,
+      approved: false,
+      providerApproved: true,
+      responseApproved: true,
+      responseCode: "00",
+      transactionAuthPresent: true,
       incomplete: false,
       transactionId: "TX-1",
     };
@@ -552,12 +552,15 @@ test("callbacks concurrentes reclaman una sola consulta Status", async () => {
       ok: true,
       success: true,
       providerContractValid: true,
-      paymentHashValid: true,
       amountMatches: true,
-      resultPaymentUuid: "P-1",
+      paymentUuid: "P-1",
       status: "COMPLETED",
       statusCode: 200,
-      approved: true,
+      approved: false,
+      providerApproved: true,
+      responseApproved: true,
+      responseCode: "00",
+      transactionAuthPresent: true,
       incomplete: false,
       transactionId: "TX-1",
     };
@@ -687,12 +690,15 @@ test("callback rechaza aliases contradictorios antes de PostgreSQL", async () =>
   assert.equal(fixture.queries.length, 0);
 });
 
-test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", async (t) => {
+test("receptor SDK observa firma valida y responde HTTP 200 sin activar rechazo", async (t) => {
   const previousProvider = process.env.PAYMENT_PROVIDER;
   const previousAdminMode = process.env.ADMIN_DATA_ENTRY_MODE;
+  const previousSecret = process.env.PIXELPAY_SECRET_KEY;
+  const webhookSecret = "synthetic-webhook-secret-not-real";
   const fixture = callbackFixture();
   process.env.PAYMENT_PROVIDER = "pixelpay";
   process.env.ADMIN_DATA_ENTRY_MODE = "false";
+  process.env.PIXELPAY_SECRET_KEY = webhookSecret;
   PaymentProviderFactory._instance = fixture.provider;
   const app = Fastify();
   app.decorate("config", { pixelPayWebhookEnabled: true, privateCommercePilot: { enabled: false } });
@@ -700,6 +706,12 @@ test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", as
   app.decorate("requireRoles", () => async () => {});
   await app.register(fp(async () => {}, { name: "env-plugin" }));
   await app.register(privateCommerce);
+  await app.register(fastifyRawBody, {
+    field: "rawBody",
+    global: false,
+    encoding: "utf8",
+    runFirst: true,
+  });
   await app.register(pagosRoutes, { prefix: "/v1/pagos" });
   t.after(async () => {
     await app.close();
@@ -708,20 +720,51 @@ test("receptor SDK responde HTTP 200 a callback aceptado sin headers Hosted", as
     else process.env.PAYMENT_PROVIDER = previousProvider;
     if (previousAdminMode === undefined) delete process.env.ADMIN_DATA_ENTRY_MODE;
     else process.env.ADMIN_DATA_ENTRY_MODE = previousAdminMode;
+    if (previousSecret === undefined) delete process.env.PIXELPAY_SECRET_KEY;
+    else process.env.PIXELPAY_SECRET_KEY = previousSecret;
   });
 
+  const rawBody = JSON.stringify(validCallback);
+  const signature = createPixelPayWebhookSignature(rawBody, webhookSecret);
   const response = await app.inject({
     method: "POST",
     url: "/v1/pagos/webhook/pixelpay",
     remoteAddress: "198.51.100.2",
-    payload: validCallback,
+    headers: { "content-type": "application/json", "x-client-signature": signature },
+    payload: rawBody,
   });
   assert.equal(response.statusCode, 200, response.body);
   assert.equal(response.json().data.processed, false);
   assert.equal(response.json().data.extension_pending, true);
-  const duplicate = await app.inject({ method: "POST", url: "/v1/pagos/webhook/pixelpay", remoteAddress: "198.51.100.3", payload: validCallback });
+  const received = fixture.queries.find(({ text }) => text.includes("pixelpay.order_callback.received"));
+  assert.equal(received.params[2].callback_signature_present, true);
+  assert.equal(received.params[2].callback_signature_valid, true);
+  assert.equal(received.params[2].callback_signature_enforced, false);
+  assert.doesNotMatch(JSON.stringify(received.params[2]), new RegExp(signature, "i"));
+  const duplicate = await app.inject({
+    method: "POST",
+    url: "/v1/pagos/webhook/pixelpay",
+    remoteAddress: "198.51.100.3",
+    headers: { "content-type": "application/json", "x-client-signature": signature },
+    payload: rawBody,
+  });
   assert.equal(duplicate.statusCode, 200, duplicate.body);
   assert.equal(duplicate.json().data.duplicate, true);
+  assert.equal(duplicate.json().data.provider_event_id, response.json().data.provider_event_id);
+  for (const headers of [
+    { "content-type": "application/json" },
+    { "content-type": "application/json", "x-signature": "0".repeat(128) },
+  ]) {
+    const observationalReplay = await app.inject({
+      method: "POST",
+      url: "/v1/pagos/webhook/pixelpay",
+      remoteAddress: "198.51.100.4",
+      headers,
+      payload: rawBody,
+    });
+    assert.equal(observationalReplay.statusCode, 200, observationalReplay.body);
+    assert.equal(observationalReplay.json().data.duplicate, true);
+  }
 });
 
 test("callback forwards only server shape config, requestId and logger", async t => {

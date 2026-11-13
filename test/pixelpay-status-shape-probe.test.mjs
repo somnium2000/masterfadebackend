@@ -6,13 +6,15 @@ import { resolvePixelPayStatusShapeProbeEnabled } from "../src/plugins/env.js";
 import { PixelPaySdkProvider } from "../src/services/payments/PixelPaySdkProvider.js";
 
 // SYNTHETIC transport fixtures. These are not captured PixelPay responses.
-const synthetic = {
+const syntheticFinancial = {
   payment_uuid: "SYNTHETIC-UUID", transaction_id: "SYNTHETIC-TX",
   payment_hash: createHash("md5").update("SYNTHETIC-ORDER|qa-key-not-real|qa-secret-not-real").digest("hex"), transaction_amount: 1,
-  transaction_approved_amount: 1, response_approved: true,
+  transaction_approved_amount: 1, transaction_auth: "123456", response_approved: "1",
+  response_code: "00",
   response_incomplete: false, status: "COMPLETED", order_id: "SYNTHETIC-ORDER",
   transaction_currency: "HNL", order_currency: "HNL",
 };
+const synthetic = { status: "paid", last_response: { data: syntheticFinancial } };
 
 async function run(data, { enabled = true, loggerFails = false } = {}) {
   const provider = new PixelPaySdkProvider({
@@ -37,7 +39,7 @@ async function run(data, { enabled = true, loggerFails = false } = {}) {
   const read = provider.readTransactionResult.bind(provider);
   provider.readTransactionResult = value => { parses += 1; return read(value); };
   const result = await provider.queryPaymentStatus("SYNTHETIC-UUID", {
-    orderId: "SYNTHETIC-ORDER", amount: 1,
+    orderId: "SYNTHETIC-ORDER", amount: 1, transactionId: "SYNTHETIC-TX",
   }, {
     enabled, requestId: "req-synthetic",
     logger: { info(value) { if (loggerFails) throw new Error("logger failed"); logs.push(value); } },
@@ -54,48 +56,56 @@ test("SYNTHETIC real SDK shape probe: safety, parser, guards and equivalence", a
   });
   process.env.ENTORNO = "qa";
   process.env.NODE_ENV = "test";
-  const cases = [synthetic, {}, Object.fromEntries(Object.keys(synthetic).map(k => [k, null])), {
-    ...synthetic, payment_uuid: [], transaction_id: {}, payment_hash: 42,
-    transaction_amount: "1", response_approved: "true", response_incomplete: false,
-  }, { status: "COMPLETED", nested: { ...synthetic } }, { payment_uuid: undefined }];
+  const cases = [synthetic, {}, { status: null, last_response: null }, {
+    status: "paid",
+    last_response: { data: {
+      ...syntheticFinancial, payment_uuid: [], transaction_id: {}, payment_hash: 42,
+      transaction_amount: "1", response_approved: "true", response_incomplete: false,
+    } },
+  }, { status: "COMPLETED", last_response: { data: { ...syntheticFinancial } } },
+  { status: "paid", last_response: { data: { ...syntheticFinancial, payment_uuid: undefined } } }];
   for (const data of cases) {
     const off = await run(data, { enabled: false });
     const on = await run(data);
     const brokenLogger = await run(data, { loggerFails: true });
     assert.deepEqual(on.result, off.result);
     if (data === synthetic) {
-      assert.equal(on.result.paymentHashValid, true);
+      assert.equal(on.result.paymentHashValid, false);
       assert.equal(on.result.amountMatches, true);
-      assert.equal(on.result.approved, true);
-      assert.equal(on.result.resultPaymentUuid, synthetic.payment_uuid);
-      assert.equal(on.result.transactionId, synthetic.transaction_id);
-      assert.equal(JSON.stringify(on.logs).includes(synthetic.payment_hash), false);
+      assert.equal(on.result.providerApproved, true);
+      assert.equal(on.result.approved, false);
+      assert.equal(on.result.resultPaymentUuid, null);
+      assert.equal(on.result.transactionId, syntheticFinancial.transaction_id);
+      assert.equal(JSON.stringify(on.logs).includes(syntheticFinancial.payment_hash), false);
     }
     assert.deepEqual(brokenLogger.result, off.result);
     assert.equal(on.calls, 1);
     assert.equal(off.calls, 1);
-    assert.equal(on.parses, 1);
-    assert.equal(off.parses, 1);
+    assert.equal(on.parses, 0);
+    assert.equal(off.parses, 0);
     assert.equal(off.logs.length, 0);
     assert.equal(on.logs.length, 1);
     const shape = on.logs[0].pixelPayStatusShapeProbe;
-    assert.deepEqual(shape.response_data.response_incomplete,
-      Object.hasOwn(data, "response_incomplete") ? {
-        present: true, type: data.response_incomplete === null ? "null" : "boolean",
+    assert.deepEqual(shape.response_data.last_response,
+      Object.hasOwn(data, "last_response") ? {
+        present: true, type: data.last_response === null ? "null" : "object",
       } : { present: false, type: "missing" });
-    assert.deepEqual(shape.transaction_result.status, { present: false, type: "missing" });
-    assert.equal(Object.keys(shape.response_data).length, 11);
+    assert.equal(Object.keys(shape.response_data).length, 14);
+    assert.equal(Object.keys(shape.last_response_data).length, 14);
     assert.doesNotMatch(JSON.stringify(on.logs), /SYNTHETIC-UUID|SYNTHETIC-TX|SYNTHETIC-HASH|qa-secret|nested|HNL/);
   }
   const absent = (await run({})).logs[0].pixelPayStatusShapeProbe;
   assert.deepEqual(absent.response_data.payment_uuid, { present: false, type: "missing" });
-  assert.deepEqual(absent.transaction_result.payment_uuid, { present: true, type: "missing" });
+  assert.deepEqual(absent.last_response_data.payment_uuid, { present: false, type: "missing" });
   for (const [value, type] of [[null, "null"], [false, "boolean"], ["secret-fictitious", "string"],
     [12, "number"], [{ child: "secret-fictitious" }, "object"], [["secret-fictitious"], "array"],
     [undefined, "missing"]]) {
-    const diagnostic = (await run({ payment_uuid: value })).logs[0].pixelPayStatusShapeProbe;
-    assert.deepEqual(diagnostic.response_data.payment_uuid, { present: true, type });
-    assert.deepEqual(diagnostic.transaction_result.payment_uuid, { present: true, type });
+    const diagnostic = (await run({
+      status: "paid",
+      last_response: { data: { ...syntheticFinancial, payment_uuid: value } },
+    })).logs[0].pixelPayStatusShapeProbe;
+    assert.deepEqual(diagnostic.response_data.payment_uuid, { present: false, type: "missing" });
+    assert.deepEqual(diagnostic.last_response_data.payment_uuid, { present: true, type });
     assert.doesNotMatch(JSON.stringify(diagnostic), /secret-fictitious|child/);
   }
   const parserFailure = new Proxy({ status: "COMPLETED" }, { ownKeys() { throw new Error("parser failure"); } });

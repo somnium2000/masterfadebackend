@@ -2939,6 +2939,7 @@ for (const [providerStatus, expectedIntentState, expectedPending] of [
         id_grupo_cita: GROUP_A, estado_intent_codigo: "pendiente_confirmacion",
         expires_at: "2099-01-01T16:00:00.000Z", monto_hnl: "115.00", moneda_codigo: "HNL",
         orden_compra: "MF-PIXELPAY-STATUS-OFFICIAL", provider_session_id: "payment-uuid-official",
+        referencia_externa: "transaction-id-official",
         created_by_usuario_id: USER_A,
       },
     });
@@ -2956,6 +2957,7 @@ for (const [providerStatus, expectedIntentState, expectedPending] of [
     assert.deepEqual(calls[0].expected, {
       orderId: "MF-PIXELPAY-STATUS-OFFICIAL",
       amount: 115,
+      transactionId: "transaction-id-official",
     });
     await app.close();
   });
@@ -3432,7 +3434,8 @@ test("status PAID sin evidencia autentica completa queda bloqueado y no crea pai
     assert.deepEqual(provider.calls[0].expected, {
       orderId: "MF-PIXELPAY-STATUS-BLOCKED",
       amount: 115,
-    }, `${name}: Status recibe orden e importe canonicos`);
+      transactionId: "transaction-id-blocked",
+    }, `${name}: Status recibe identidad e importe canonicos`);
     await app.close();
   }
 });

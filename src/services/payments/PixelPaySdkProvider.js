@@ -67,7 +67,8 @@ export function classifyPixelPayStatusEvidence(status = {}) {
     status: normalizedStatus,
     officialStatus,
     terminal: ["COMPLETED", "DECLINED", "VOIDED"].includes(normalizedStatus),
-    approved: normalizedStatus === "COMPLETED",
+    approved: false,
+    providerApproved: normalizedStatus === "COMPLETED" && status.providerApproved === true,
     rejected: normalizedStatus === "DECLINED",
     voided: normalizedStatus === "VOIDED",
     uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(normalizedStatus),
@@ -240,6 +241,115 @@ function responseStatus(response) {
 
 function responseSuccess(response) {
   return typeof response?.success === "boolean" ? response.success : null;
+}
+
+function strictStatusText(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized : null;
+}
+
+function strictStatusAmount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+function strictResponseApproved(value) {
+  if (value === true || value === "1") return { valid: true, value: true };
+  if (value === false || value === "0") return { valid: true, value: false };
+  return { valid: false, value: null };
+}
+
+function emptyPixelPayStatusContract() {
+  return {
+    normalizedStatus: "UNKNOWN",
+    transactionId: null,
+    transactionAuthPresent: false,
+    responseApproved: null,
+    responseCode: null,
+    transactionAmountMatches: false,
+    approvedAmountMatches: false,
+    amountMatches: false,
+    transactionIdMatches: false,
+    providerContractValid: false,
+    providerApproved: false,
+  };
+}
+
+export function extractPixelPayStatusContract(response, expected = {}, sdkEnvelopeValid = false) {
+  try {
+    const envelope = objectOrNull(response?.data);
+    const lastResponse = objectOrNull(envelope?.last_response);
+    const financial = objectOrNull(lastResponse?.data);
+    const rawStatus = strictStatusText(envelope?.status)?.toUpperCase() || "";
+    const normalizedStatus = rawStatus === "PAID" ? "COMPLETED" : rawStatus;
+    const statusCode = responseStatus(response);
+    const transactionId = strictStatusText(financial?.transaction_id);
+    const transactionAuth = strictStatusText(financial?.transaction_auth);
+    const transactionAmount = strictStatusAmount(financial?.transaction_amount);
+    const approvedAmount = strictStatusAmount(financial?.transaction_approved_amount);
+    const responseApproved = strictResponseApproved(financial?.response_approved);
+    const rawResponseCode = strictStatusText(financial?.response_code);
+    const responseCode = rawResponseCode
+      && safePixelPayProviderResponseCode(rawResponseCode) === rawResponseCode
+      ? rawResponseCode
+      : null;
+    const expectedTransactionId = strictStatusText(expected?.transactionId);
+    const expectedAmount = strictStatusAmount(expected?.amount);
+    const transactionAmountMatches = transactionAmount !== null
+      && expectedAmount !== null
+      && money(transactionAmount) === money(expectedAmount);
+    const approvedAmountMatches = approvedAmount !== null
+      && expectedAmount !== null
+      && money(approvedAmount) === money(expectedAmount);
+    const amountMatches = transactionAmountMatches
+      && approvedAmountMatches
+      && money(transactionAmount) === money(approvedAmount);
+    const transactionIdMatches = Boolean(transactionId)
+      && Boolean(expectedTransactionId)
+      && transactionId === expectedTransactionId;
+    const approvedCode = responseCode === "00";
+    const approvalSignalsAgree = responseApproved.valid
+      && responseApproved.value === approvedCode;
+    const statusSignalsAgree = normalizedStatus === "COMPLETED"
+      ? responseApproved.value === true && approvedCode
+      : responseApproved.value === false && !approvedCode;
+    const providerContractValid = sdkEnvelopeValid === true
+      && statusCode != null
+      && statusCode >= 200
+      && statusCode < 300
+      && responseSuccess(response) === true
+      && PIXELPAY_STATUS_VALUES.has(normalizedStatus)
+      && Boolean(lastResponse)
+      && Boolean(financial)
+      && Boolean(transactionId)
+      && Boolean(transactionAuth)
+      && transactionAmount !== null
+      && approvedAmount !== null
+      && responseApproved.valid
+      && Boolean(responseCode)
+      && amountMatches
+      && transactionIdMatches
+      && approvalSignalsAgree
+      && statusSignalsAgree;
+
+    return {
+      normalizedStatus: providerContractValid ? normalizedStatus : "UNKNOWN",
+      transactionId,
+      transactionAuthPresent: Boolean(transactionAuth),
+      responseApproved: responseApproved.value,
+      responseCode,
+      transactionAmountMatches,
+      approvedAmountMatches,
+      amountMatches,
+      transactionIdMatches,
+      providerContractValid,
+      providerApproved: providerContractValid && normalizedStatus === "COMPLETED",
+    };
+  } catch {
+    return emptyPixelPayStatusContract();
+  }
 }
 
 export function classifySdkFailureMessage(response) {
@@ -759,44 +869,22 @@ export class PixelPaySdkProvider extends PaymentProvider {
       );
     }
     const beforeShape = capturePixelPayStatusShape(this, shapeProbe, response?.data);
-    const transactionResult = this.readTransactionResult(response);
-    const result = transactionResult.result;
-    emitPixelPayStatusShape(shapeProbe, beforeShape,
-      beforeShape ? capturePixelPayStatusShape(this, shapeProbe, result) : null);
-    const resultPaymentUuid = text(result?.payment_uuid) || null;
-    const transactionId = text(result?.transaction_id) || null;
-    const resultOrderId = text(result?.order_id) || text(response?.data?.order_id) || null;
-    const resultCurrency = text(result?.transaction_currency)
-      || text(response?.data?.transaction_currency)
-      || text(response?.data?.order_currency)
-      || null;
-    const expectedOrderId = text(expected?.orderId);
-    const expectedAmount = expected?.amount;
-    const hasPaymentHash = Boolean(text(result?.payment_hash));
-    let paymentHashValid = false;
-    if (hasPaymentHash && expectedOrderId) {
-      try {
-        paymentHashValid = transaction.verifyPaymentHash(
-          result.payment_hash,
-          expectedOrderId,
-          this.secretKey
-        ) === true;
-      } catch {
-        paymentHashValid = false;
-      }
+    let sdkEnvelopeValid;
+    try {
+      sdkEnvelopeValid = this.sdk.Entities.TransactionResult.validateResponse(response) === true;
+    } catch {
+      sdkEnvelopeValid = false;
     }
-    const transactionAmountMatches = valuePresent(result?.transaction_amount)
-      && money(result.transaction_amount) === money(expectedAmount);
-    const approvedAmountMatches = valuePresent(result?.transaction_approved_amount)
-      && money(result.transaction_approved_amount) === money(expectedAmount);
-    const amountMatches = transactionAmountMatches && approvedAmountMatches;
-    // AM: sdk-core@2.5.8 no declara `status` en TransactionResult; el contrato
-    // oficial de Status lo entrega en el envelope como `data.status`.
-    const rawStatus = text(response?.data?.status).toUpperCase();
-    const normalizedStatus = rawStatus === "PAID" ? "COMPLETED" : rawStatus;
-    const providerContractValid = transactionResult.valid === true
-      && transactionResult.parsed === true
-      && PIXELPAY_STATUS_VALUES.has(normalizedStatus);
+    const contract = extractPixelPayStatusContract(response, expected, sdkEnvelopeValid);
+    emitPixelPayStatusShape(
+      shapeProbe,
+      beforeShape,
+      beforeShape
+        ? capturePixelPayStatusShape(this, shapeProbe, response?.data?.last_response?.data)
+        : null
+    );
+    const providerContractValid = contract.providerContractValid;
+    const normalizedStatus = contract.normalizedStatus;
     const payload = normalizePixelPayStatusResponse({
       success: responseSuccess(response),
       data: providerContractValid
@@ -812,24 +900,25 @@ export class PixelPaySdkProvider extends PaymentProvider {
       status,
       terminal: ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
       uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
-      approved: status === "COMPLETED"
-        && result?.response_approved === true
-        && result?.response_incomplete !== true,
+      approved: false,
+      providerApproved: contract.providerApproved,
       rejected: status === "DECLINED",
       voided: status === "VOIDED",
-      incomplete: result?.response_incomplete === true,
-      definitiveRejected: transactionResult.valid === true
-        && transactionResult.parsed === true
-        && status === "DECLINED"
-        && result?.response_approved === false
-        && result?.response_incomplete === false
-        && resultPaymentUuid === normalizedUuid,
-      transactionId,
-      resultPaymentUuid,
-      resultOrderId,
-      resultCurrency,
-      paymentHashValid,
-      amountMatches,
+      incomplete: providerContractValid !== true,
+      definitiveRejected: providerContractValid === true && status === "DECLINED",
+      transactionId: contract.transactionId,
+      resultPaymentUuid: null,
+      resultOrderId: null,
+      resultCurrency: null,
+      paymentHashValid: false,
+      paymentHashEvidenceAvailable: false,
+      transactionAuthPresent: contract.transactionAuthPresent,
+      responseApproved: contract.responseApproved,
+      responseCode: contract.responseCode,
+      transactionIdMatches: contract.transactionIdMatches,
+      transactionAmountMatches: contract.transactionAmountMatches,
+      approvedAmountMatches: contract.approvedAmountMatches,
+      amountMatches: contract.amountMatches,
       providerContractValid,
       response: payload,
     };

@@ -5,11 +5,13 @@ import { assertUuid, expireStaleAppointmentReservations } from "../../services/a
 import { PaymentProviderFactory } from "../../services/payments/PaymentProviderFactory.js";
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
 import { buildPixelPayCallbackProbeTelemetry } from "../../services/payments/pixelPayCallbackProbeTelemetry.js";
+import { inspectPixelPayWebhookSignature } from "../../services/payments/pixelPayWebhookSignature.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
 const PIXELPAY_CALLBACK_MISMATCH_CODES = new Set([
   "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+  "PIXELPAY_CALLBACK_TRANSACTION_ID_MISMATCH",
   "PIXELPAY_CALLBACK_AMOUNT_MISMATCH",
   "PIXELPAY_CALLBACK_CURRENCY_MISMATCH",
   "PIXELPAY_CALLBACK_ORDER_AMBIGUOUS",
@@ -82,6 +84,7 @@ export function buildPixelPayCallbackRejectionTelemetry(error) {
     code,
     order_unique: safeBoolean(comparisons.orderUnique),
     payment_uuid_matches: safeBoolean(comparisons.paymentUuidMatches),
+    transaction_id_matches: safeBoolean(comparisons.transactionIdMatches),
     amount_matches: safeBoolean(comparisons.amountMatches),
     currency_matches: safeBoolean(comparisons.currencyMatches),
   };
@@ -205,9 +208,9 @@ export function assertPaymentWebhookContract(app, providerCode) {
   }
 }
 
-function pixelPayCallbackEventId({ orderId, idIntent }) {
+function pixelPayCallbackEventId(paymentUuid) {
   const digest = crypto.createHash("sha256")
-    .update([orderId, idIntent].join("|"), "utf8")
+    .update(paymentUuid, "utf8")
     .digest("hex");
   return `pixelpay_order_callback_${digest}`;
 }
@@ -264,6 +267,7 @@ export async function processPixelPayOrderCallback({
   retryCooldownSeconds = 90,
   logger = null,
   statusShapeProbeEnabled = false,
+  signatureVerification = null,
 }) {
   const callbackOrder = safeText(body?.order);
   const legacyOrder = safeText(body?.order_id);
@@ -297,6 +301,7 @@ export async function processPixelPayOrderCallback({
   }
 
   let providerEventId;
+  let hasVerifiedSaleCorrelation;
   const client = await db.connect();
   let intent;
   let duplicate;
@@ -333,17 +338,34 @@ export async function processPixelPayOrderCallback({
       });
     }
     intent = lookup.rows[0];
-    // One notification slot per financial intent/order, including pending Sale recovery.
-    // Callback identifiers and the order hash cannot create additional event identities.
-    providerEventId = pixelPayCallbackEventId({ orderId, idIntent: intent.id_intent });
     const trustedPaymentUuid = safeText(intent.provider_session_id);
     const trustedTransactionId = safeText(intent.referencia_externa);
+    // AM: PixelPay define uuid como identidad idempotente; si Sale ya lo fijo,
+    // el callback debe coincidir antes de registrar el evento.
+    providerEventId = pixelPayCallbackEventId(trustedPaymentUuid || paymentUuid);
     const comparisons = {
       orderUnique: true,
       paymentUuidMatches: !trustedPaymentUuid || trustedPaymentUuid === paymentUuid,
+      transactionIdMatches: !trustedTransactionId || trustedTransactionId === transactionId,
       amountMatches: Number(intent.monto_hnl).toFixed(2) === callbackAmount.toFixed(2),
       currencyMatches: safeText(intent.moneda_codigo).toUpperCase() === callbackCurrency,
     };
+    if (!comparisons.paymentUuidMatches) {
+      throw callbackMismatchError(
+        409,
+        "El UUID PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_PAYMENT_UUID_MISMATCH",
+        comparisons
+      );
+    }
+    if (!comparisons.transactionIdMatches) {
+      throw callbackMismatchError(
+        409,
+        "La transaccion PixelPay no coincide con la orden",
+        "PIXELPAY_CALLBACK_TRANSACTION_ID_MISMATCH",
+        comparisons
+      );
+    }
     if (!comparisons.amountMatches) {
       throw callbackMismatchError(
         409,
@@ -381,7 +403,7 @@ export async function processPixelPayOrderCallback({
         ]
       )
       : { rows: [] };
-    const hasVerifiedSaleCorrelation = saleEvidence.rows.length === 1;
+    hasVerifiedSaleCorrelation = saleEvidence.rows.length === 1;
     const inserted = await client.query(
       `INSERT INTO public.payment_events (
          id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent,
@@ -402,6 +424,10 @@ export async function processPixelPayOrderCallback({
           callback_uuid_matches: paymentUuid === trustedPaymentUuid,
           callback_transaction_id_matches: transactionId === trustedTransactionId,
           order_hash_valid: true,
+          callback_signature_present: signatureVerification?.present === true,
+          callback_signature_valid: signatureVerification?.valid === true,
+          callback_signature_ambiguous: signatureVerification?.ambiguous === true,
+          callback_signature_enforced: false,
           amount: callbackAmount,
           currency: callbackCurrency,
           provider_status: callbackStatus,
@@ -477,12 +503,13 @@ export async function processPixelPayOrderCallback({
     status = await provider.queryPaymentStatus(trustedPaymentUuid, {
       orderId,
       amount: Number(intent.monto_hnl),
+      transactionId: trustedTransactionId,
     }, {
       enabled: statusShapeProbeEnabled === true,
       requestId,
       logger,
     });
-    const uuidMatches = safeText(status?.resultPaymentUuid) === trustedPaymentUuid;
+    const uuidMatches = safeText(status?.paymentUuid) === trustedPaymentUuid;
     const transactionMatches = safeText(status?.transactionId) === trustedTransactionId;
     const currencyMatches = safeText(intent.moneda_codigo)?.toUpperCase() === "HNL";
     const statusOrderMatches = !safeText(status?.resultOrderId)
@@ -495,10 +522,13 @@ export async function processPixelPayOrderCallback({
       http_ok: status?.ok === true,
       response_success: status?.success === true,
       provider_contract_valid: status?.providerContractValid === true,
-      payment_hash_valid: status?.paymentHashValid === true,
+      durable_sale_verified: hasVerifiedSaleCorrelation,
       amount_matches: status?.amountMatches === true,
       status_approved: ["COMPLETED", "PAID"].includes(safeText(status?.status)?.toUpperCase()),
-      approved: status?.approved === true,
+      provider_approval_signals_valid: status?.providerApproved === true,
+      response_approved: status?.responseApproved === true,
+      response_code_approved: status?.responseCode === "00",
+      transaction_auth_present: status?.transactionAuthPresent === true,
       not_incomplete: status?.incomplete !== true,
       transaction_id_present: Boolean(safeText(status?.transactionId)),
       transaction_id_matches: transactionMatches,
@@ -514,9 +544,12 @@ export async function processPixelPayOrderCallback({
         ok: status?.ok === true,
         success: status?.success === true,
         providerContractValid: status?.providerContractValid === true,
-        paymentHashValid: status?.paymentHashValid === true,
+        durableSaleVerified: hasVerifiedSaleCorrelation,
         amountMatches: status?.amountMatches === true,
-        approved: status?.approved === true,
+        providerApprovalSignalsValid: status?.providerApproved === true,
+        responseApproved: status?.responseApproved === true,
+        responseCodeApproved: status?.responseCode === "00",
+        transactionAuthPresent: status?.transactionAuthPresent === true,
         incomplete: status?.incomplete === true,
         uuidMatches,
         transactionMatches,
@@ -997,6 +1030,15 @@ export default async function pagosRoutes(app) {
         const providerCode = String(request.params?.proveedor || "").trim().toLowerCase();
         assertPaymentWebhookContract(app, providerCode);
         if (providerCode === "pixelpay") {
+          const signatureVerification = inspectPixelPayWebhookSignature({
+            headers: request.headers,
+            rawHeaders: request.raw?.rawHeaders,
+            rawBody: request.rawBody,
+            secretKey: process.env.PIXELPAY_SECRET_KEY,
+          });
+          request.log.info({
+            pixelPayWebhookSignature: signatureVerification,
+          }, "PixelPay callback signature observed without enforcement");
           if (app.config?.pixelPayCallbackProbeEnabled === true) {
             request.log.info(
               { pixelPayCallbackProbe: buildPixelPayCallbackProbeTelemetry(request) },
@@ -1010,6 +1052,7 @@ export default async function pagosRoutes(app) {
             requestId: request.id,
             logger: request.log,
             statusShapeProbeEnabled: app.config?.pixelPayStatusShapeProbeEnabled === true,
+            signatureVerification,
           });
           return sendOk(reply, result);
         }

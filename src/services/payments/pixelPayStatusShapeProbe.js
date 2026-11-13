@@ -1,7 +1,8 @@
 const FIELDS = Object.freeze([
   "payment_uuid", "transaction_id", "payment_hash", "transaction_amount",
-  "transaction_approved_amount", "response_approved", "response_incomplete",
-  "status", "order_id", "transaction_currency", "order_currency",
+  "transaction_approved_amount", "transaction_auth", "response_approved",
+  "response_incomplete", "response_code", "status", "last_response", "order_id",
+  "transaction_currency", "order_currency",
 ]);
 
 // Own undefined properties count as present, with type 'missing'. This preserves
@@ -37,7 +38,7 @@ export function emitPixelPayStatusShape(options, before, after) {
     options?.logger?.info?.({
       request_id: typeof requestId === "string" && /^req-[A-Za-z0-9-]{1,64}$/.test(requestId)
         ? requestId : null,
-      pixelPayStatusShapeProbe: { response_data: before, transaction_result: after },
+      pixelPayStatusShapeProbe: { response_data: before, last_response_data: after },
     }, "PixelPay Status fixed field shapes (no values)");
   } catch {
     // Diagnostics must never affect payment interpretation or error handling.

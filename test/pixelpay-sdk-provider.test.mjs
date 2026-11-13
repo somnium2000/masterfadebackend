@@ -52,6 +52,30 @@ function approvedData(overrides = {}) {
   };
 }
 
+function statusData(status = "paid", overrides = {}) {
+  const approved = ["paid", "completed"].includes(String(status).toLowerCase());
+  return {
+    status,
+    last_response: {
+      data: {
+        transaction_id: "transaction-sdk-qa",
+        transaction_amount: 1,
+        transaction_approved_amount: 1,
+        transaction_auth: approved ? "123456" : "000000",
+        response_approved: approved ? "1" : "0",
+        response_code: approved ? "00" : "05",
+        ...overrides,
+      },
+    },
+  };
+}
+
+const STATUS_EXPECTED = {
+  orderId: ORDER_ID,
+  amount: 1,
+  transactionId: "transaction-sdk-qa",
+};
+
 function makeFakeSdk({
   saleResponse,
   statusResponse,
@@ -309,13 +333,13 @@ test("SDK live configura endpoint, credenciales, ambiente y headers oficiales pa
   const resultData = approvedData();
   const fake = makeFakeSdk({
     saleResponse: sdkResponse(200, { data: resultData }),
-    statusResponse: sdkResponse(200, { data: { status: "paid", ...resultData } }),
+    statusResponse: sdkResponse(200, { data: statusData("paid") }),
     transactionResult: resultData,
   });
   const provider = makeLiveProvider(fake);
 
   await provider.sale(saleInput);
-  await provider.queryPaymentStatus(PAYMENT_UUID, { orderId: ORDER_ID, amount: 1 });
+  await provider.queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
 
   assert.equal(fake.calls.sale, 1);
   assert.equal(fake.calls.status, 1);
@@ -918,27 +942,28 @@ test("diagnostico SDK identifica campos ausentes, montos y flags de respuesta", 
 
 test("SDK Status valido normaliza PAID historico a COMPLETED", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
-    transactionResult: {},
+    statusResponse: sdkResponse(200, { data: statusData("paid"), valid: true }),
   });
   const provider = makeProvider(fake);
-  const result = await provider.queryPaymentStatus(PAYMENT_UUID);
+  const result = await provider.queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
 
   assert.equal(result.ok, true);
   assert.equal(result.success, true);
   assert.equal(result.status, "COMPLETED");
   assert.equal(result.terminal, true);
+  assert.equal(result.providerApproved, true);
+  assert.equal(result.approved, false);
   assert.equal(result.paymentUuid, PAYMENT_UUID);
   assert.equal(fake.calls.status, 1);
   assert.equal(fake.calls.validateResponse, 1);
-  assert.equal(fake.calls.fromResponse, 1);
+  assert.equal(fake.calls.fromResponse, 0);
   assert.equal(fake.calls.statusRequest.payment_uuid, PAYMENT_UUID);
   assert.match(fake.calls.settings[0].headers["x-client-signature"], /^[a-f0-9]{128}$/);
 });
 
 test("SDK clasifica los seis estados oficiales sin aprobar estados inciertos", async (t) => {
   for (const scenario of [
-    ["COMPLETED", { terminal: true, approved: true, uncertain: false }],
+    ["COMPLETED", { terminal: true, approved: false, providerApproved: true, uncertain: false }],
     ["DECLINED", { terminal: true, approved: false, rejected: true, uncertain: false }],
     ["VOIDED", { terminal: true, approved: false, voided: true, uncertain: false }],
     ["PENDING", { terminal: false, approved: false, uncertain: true }],
@@ -947,10 +972,9 @@ test("SDK clasifica los seis estados oficiales sin aprobar estados inciertos", a
   ]) {
     await t.test(scenario[0], async () => {
       const fake = makeFakeSdk({
-        statusResponse: sdkResponse(200, { data: { status: scenario[0] }, valid: true }),
-        transactionResult: {},
+        statusResponse: sdkResponse(200, { data: statusData(scenario[0]), valid: true }),
       });
-      const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
+      const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
       const evidence = classifyPixelPayStatusEvidence(result);
       assert.equal(result.status, scenario[0]);
       for (const [key, value] of Object.entries(scenario[1])) assert.equal(evidence[key], value);
@@ -980,34 +1004,82 @@ test("SDK prepara Void con hashes SHA512 sin ejecutar red real", async () => {
   );
 });
 
-test("SDK Status solo entrega evidencia financiera cuando hash e importes son validos", async () => {
-  const resultData = approvedData();
+test("SDK Status verifica el contrato anidado pero no fabrica payment_hash ni aprobacion final", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { data: { status: "paid", ...resultData }, valid: true }),
-    transactionResult: resultData,
+    statusResponse: sdkResponse(200, {
+      data: statusData("paid", { payment_hash: "valid-hash", payment_uuid: PAYMENT_UUID }),
+      valid: true,
+    }),
   });
-  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, {
-    orderId: saleInput.orderId,
-    amount: saleInput.amount,
-  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
   assert.equal(result.status, "COMPLETED");
-  assert.equal(result.approved, true);
-  assert.equal(result.paymentHashValid, true);
+  assert.equal(result.providerApproved, true);
+  assert.equal(result.approved, false);
+  assert.equal(result.paymentHashValid, false);
+  assert.equal(result.paymentHashEvidenceAvailable, false);
   assert.equal(result.amountMatches, true);
-  assert.equal(result.resultPaymentUuid, PAYMENT_UUID);
+  assert.equal(result.transactionIdMatches, true);
+  assert.equal(result.transactionAuthPresent, true);
+  assert.equal(result.responseApproved, true);
+  assert.equal(result.responseCode, "00");
+  assert.equal(result.resultPaymentUuid, null);
   assert.ok(result.transactionId);
+  assert.equal(fake.calls.hash.length, 0);
+  assert.equal(fake.calls.fromResponse, 0);
 });
 
-test("SDK Status solo marca rechazo definitivo desde TransactionResult valido y no incompleto", async () => {
-  const resultData = approvedData({ response_approved: false, response_incomplete: false });
+test("SDK Status rechaza campos faltantes, tipos invalidos, contradicciones y diferencias financieras", async (t) => {
+  const withoutField = (field) => {
+    const data = statusData("paid");
+    delete data.last_response.data[field];
+    return data;
+  };
+  const withField = (field, value) => statusData("paid", { [field]: value });
+  const cases = [
+    ["status ausente", { last_response: statusData("paid").last_response }],
+    ["status con tipo invalido", { ...statusData("paid"), status: 1 }],
+    ["last_response ausente", { status: "paid" }],
+    ["last_response.data ausente", { status: "paid", last_response: {} }],
+    ["transaction_id ausente", withoutField("transaction_id")],
+    ["transaction_amount ausente", withoutField("transaction_amount")],
+    ["transaction_approved_amount ausente", withoutField("transaction_approved_amount")],
+    ["transaction_auth ausente", withoutField("transaction_auth")],
+    ["response_approved ausente", withoutField("response_approved")],
+    ["response_code ausente", withoutField("response_code")],
+    ["transaction_id objeto", withField("transaction_id", {})],
+    ["transaction_amount string", withField("transaction_amount", "1.00")],
+    ["transaction_approved_amount string", withField("transaction_approved_amount", "1.00")],
+    ["transaction_auth numero", withField("transaction_auth", 123456)],
+    ["response_approved numero", withField("response_approved", 1)],
+    ["response_code numero", withField("response_code", 0)],
+    ["paid contradice response_approved", withField("response_approved", "0")],
+    ["paid contradice response_code", withField("response_code", "05")],
+    ["transaction_id distinto", withField("transaction_id", "transaction-other")],
+    ["transaction_amount distinto", withField("transaction_amount", 2)],
+    ["transaction_approved_amount distinto", withField("transaction_approved_amount", 2)],
+    ["estructura financiera plana", { status: "paid", ...approvedData() }],
+  ];
+
+  for (const [name, data] of cases) {
+    await t.test(name, async () => {
+      const fake = makeFakeSdk({ statusResponse: sdkResponse(200, { data, valid: true }) });
+      const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
+      assert.equal(result.providerContractValid, false);
+      assert.equal(result.status, "UNKNOWN");
+      assert.equal(result.providerApproved, false);
+      assert.equal(result.approved, false);
+      assert.equal(result.paymentHashValid, false);
+      assert.equal(result.definitiveRejected, false);
+      assert.equal(fake.calls.fromResponse, 0);
+    });
+  }
+});
+
+test("SDK Status solo marca rechazo definitivo desde contrato anidado coherente", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { data: { status: "declined", ...resultData }, valid: true }),
-    transactionResult: resultData,
+    statusResponse: sdkResponse(200, { data: statusData("declined"), valid: true }),
   });
-  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, {
-    orderId: saleInput.orderId,
-    amount: saleInput.amount,
-  });
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
   assert.equal(result.status, "DECLINED");
   assert.equal(result.approved, false);
   assert.equal(result.definitiveRejected, true);
@@ -1015,7 +1087,7 @@ test("SDK Status solo marca rechazo definitivo desde TransactionResult valido y 
 
 test("SDK Status con validateResponse=false devuelve UNKNOWN", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { success: true, data: {}, valid: false }),
+    statusResponse: sdkResponse(200, { success: true, data: statusData("paid"), valid: false }),
   });
   const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
 
@@ -1030,7 +1102,7 @@ test("SDK Status con validateResponse=false devuelve UNKNOWN", async () => {
 
 test("SDK Status HTTP 200 invalido conserva ok pero nunca confia en success ni payload crudo", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { success: true, data: { status: "paid" }, valid: false }),
+    statusResponse: sdkResponse(200, { success: true, data: statusData("paid"), valid: false }),
   });
   const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
 
@@ -1043,21 +1115,27 @@ test("SDK Status HTTP 200 invalido conserva ok pero nunca confia en success ni p
   assert.equal(fake.calls.fromResponse, 0);
 });
 
-test("SDK Status con fromResponse fallido devuelve UNKNOWN sin filtrar payload", async () => {
+test("SDK Status no usa TransactionResult.fromResponse ni filtra payload anidado", async () => {
   const sensitive = [saleInput.card.number.replace(/\D+/g, ""), saleInput.card.cvv, SECRET, AUTH_HASH].join(" ");
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { success: true, data: { status: "paid", raw: sensitive }, valid: true }),
+    statusResponse: sdkResponse(200, {
+      success: true,
+      data: { ...statusData("paid"), raw: sensitive },
+      valid: true,
+    }),
     transactionResultError: new Error(sensitive),
   });
-  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID);
+  const result = await makeProvider(fake).queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
   const serialized = JSON.stringify(result);
 
   assert.equal(result.ok, true);
-  assert.equal(result.status, "UNKNOWN");
-  assert.equal(classifyPixelPayStatusResult(result), "respuesta_invalida");
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.providerApproved, true);
+  assert.equal(result.approved, false);
+  assert.equal(classifyPixelPayStatusResult(result), "ok");
   assert.equal(fake.calls.status, 1);
   assert.equal(fake.calls.validateResponse, 1);
-  assert.equal(fake.calls.fromResponse, 1);
+  assert.equal(fake.calls.fromResponse, 0);
   assert.doesNotMatch(serialized, new RegExp(saleInput.card.number.replace(/\D+/g, "")));
   assert.doesNotMatch(serialized, new RegExp(SECRET));
   assert.doesNotMatch(serialized, new RegExp(AUTH_HASH));
@@ -1236,8 +1314,7 @@ test("SDK Status 412 lanzado extrae solo envelope Axios sanitizado", async () =>
 
 test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", async () => {
   const fake = makeFakeSdk({
-    statusResponse: sdkResponse(200, { data: { status: "paid" }, valid: true }),
-    transactionResult: {},
+    statusResponse: sdkResponse(200, { data: statusData("paid"), valid: true }),
   });
   const provider = makeProvider(fake);
 
@@ -1247,7 +1324,7 @@ test("SDK Status exige payment_uuid y nunca invoca getStatus mas de una vez", as
   );
   assert.equal(fake.calls.status, 0);
 
-  const result = await provider.queryPaymentStatus(PAYMENT_UUID);
+  const result = await provider.queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
   assert.equal(result.status, "COMPLETED");
   assert.equal(fake.calls.status, 1);
 });
@@ -1561,6 +1638,36 @@ test("SDK oficial carga en ESM y construye sus modelos sin ejecutar red", () => 
   assert.equal(request.order_callback, callbackUrl);
   assert.equal(typeof provider.sdk.Entities.TransactionResult.validateResponse, "function");
   assert.equal(typeof provider.sdk.Entities.TransactionResult.fromResponse, "function");
+});
+
+test("SDK 2.5.8 conserva el envelope Status y el extractor lee last_response.data", async () => {
+  const provider = new PixelPaySdkProvider({
+    endpoint: "https://pixelpay.dev",
+    env: "sandbox",
+    keyId: KEY_ID,
+    secretKey: SECRET,
+    authHash: AUTH_HASH,
+    appUrl: "https://pixelpay.dev",
+  });
+  const response = new provider.sdk.Responses.SuccessResponse();
+  response.setStatus(200);
+  response.success = true;
+  response.data = statusData("paid");
+  provider.createTransaction = () => ({
+    async getStatus(request) {
+      assert.equal(request.payment_uuid, PAYMENT_UUID);
+      return response;
+    },
+  });
+
+  const result = await provider.queryPaymentStatus(PAYMENT_UUID, STATUS_EXPECTED);
+
+  assert.equal(provider.sdk.Entities.TransactionResult.validateResponse(response), true);
+  assert.equal(result.providerContractValid, true);
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.providerApproved, true);
+  assert.equal(result.approved, false);
+  assert.equal(result.transactionId, STATUS_EXPECTED.transactionId);
 });
 
 test("SDK 2.5.8 transforma Order.callback_url en SaleTransaction.order_callback", () => {

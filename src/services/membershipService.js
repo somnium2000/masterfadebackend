@@ -2169,7 +2169,11 @@ export async function reconcileMembershipPixelPayStatus(app, {
   try {
     providerStatus = await PaymentProviderFactory.create().queryPaymentStatus(
       intent.provider_session_id,
-      { orderId: `VIP-${intent.id_order}`, amount: toNumber(intent.monto_hnl, -1) }
+      {
+        orderId: `VIP-${intent.id_order}`,
+        amount: toNumber(intent.monto_hnl, -1),
+        transactionId: intent.referencia_externa,
+      }
     );
   } catch {
     return { normalized_status: "PENDIENTE", estado_intent_codigo: intent.estado_intent_codigo, provider_uncertain: true };
