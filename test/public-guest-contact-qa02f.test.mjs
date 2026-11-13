@@ -136,3 +136,34 @@ test('Fastify real: arranque con mocks, no enumera cuentas y conserva duplicados
     payload: { contactos: [{ email }, { email }] } });
   assert.equal(duplicate.statusCode, 409); assert.equal(duplicate.json().error.code, 'PUBLIC_CITAS_CONTACT_DUPLICATE_CONFLICT');
 });
+
+// AM: Contrato publico uniforme: nunca revela si el correo pertenece a una cuenta existente.
+test('ACOMPANANTES-01: aviso para correos de acompanantes sin consultar identidades', async t => {
+  const app = Fastify({ logger: false }); let queries = 0;
+  app.decorate('db', { query: async () => { queries++; throw new Error('No debe consultar identidades'); } });
+  await app.register(publicCitasRoutes, { prefix: '/v1/public/citas' });
+  await app.ready(); t.after(() => app.close());
+  let expected;
+  for (const count of [1, 2, 3, 4]) for (const kind of ['nuevo', 'cliente', 'admin']) {
+    const contactos = Array.from({ length: count }, (_, i) => ({ blockIndex: i + 1, rol_integrante_codigo: 'acompanante', email: `${kind}${i}@example.test` }));
+    const response = await app.inject({ method: 'POST', url: '/v1/public/citas/validar-contactos', payload: { contactos } });
+    assert.equal(response.statusCode, 200); assert.equal(response.json().valido, true);
+    const warnings = response.json().warnings; expected ??= warnings;
+    assert.deepEqual(warnings, expected); assert.equal(warnings[0].code, 'COMPANION_POINTS_POLICY');
+    assert.doesNotMatch(JSON.stringify(warnings), /@|id_cliente|existe|registrado/);
+  }
+  assert.equal(queries, 0);
+});
+
+test('ACOMPANANTES-01: auditoria del bloqueo comercial de canje con 1-4 acompanantes', () => {
+  const source = readFileSync(new URL('../src/routes/v1/citas.js', import.meta.url), 'utf8');
+  const exclusive = vm.runInNewContext('(' + extract(source, 'function assertRewardRedeemExclusiveHold(', 'function buildUniqueServiceIds(') + ')', {
+    AppError: ErrorDouble, safeText: value => String(value || '').trim(),
+  });
+  for (const count of [1, 2, 3, 4]) {
+    const integrantes = Array.from({ length: count + 1 }, () => ({ selection_type: 'services' }));
+    assert.doesNotThrow(() => exclusive({ integrantes, rewardRedeemContext: null }));
+    assert.throws(() => exclusive({ integrantes, rewardRedeemContext: {} }), error => error.code === 'POINTS_REDEEM_COMPANIONS_NOT_ALLOWED' && error.statusCode === 409);
+  }
+  assert.match(source, /code: ['"]REWARD_REDEEM_REQUIRED['"]/);
+});

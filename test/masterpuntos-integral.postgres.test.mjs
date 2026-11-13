@@ -15,6 +15,7 @@ import auth from '../src/plugins/auth.js';
 import privateCommerce from '../src/plugins/privateCommerce.js';
 import operationalRoutes from '../src/routes/v1/admin/citas.js';
 import clientePointsRoutes from '../src/routes/v1/clientePoints.js';
+import publicCitasRoutes from '../src/routes/v1/public/citas.js';
 import {
   addManualPointsAdjustment, applyRewardRedeemForConfirmedGroup, getClientePointsSummary, redeemReward,
   resolveRedeemContextForHold, resolveRewardRedeemGateForCliente,
@@ -123,6 +124,14 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
     assert.equal(await balance(owner.id), -10);
     await pool.query('DELETE FROM points_transactions WHERE id_cliente=$1', [owner.id]);
     await pool.query('DELETE FROM points_cycles WHERE id_cliente=$1', [owner.id]);
+  });
+  await t.test('ACOMPANANTES-01: preflight exige metadatos autoritativos de grupo', async () => {
+    const guard = migrationSql.slice(migrationSql.indexOf('DO $preflight$'), migrationSql.indexOf('$preflight$;') + '$preflight$;'.length);
+    await assert.rejects(tx(async client => {
+      await client.query('ALTER TABLE citas_grupos RENAME COLUMN origen_codigo TO origen_ausente_fixture');
+      await client.query(guard);
+    }), /MASTERPUNTOS_PREFLIGHT_GROUP_METADATA_REQUIRED/);
+    assert.ok((await pool.query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='citas_grupos' AND column_name='origen_codigo'")).rowCount);
   });
   await t.test('PREFLIGHT-02: historia cerrada anterior al ciclo, sin cambios de datos', async suite => {
     const readOnlySql = await readFile(new URL('../db/manual/masterpuntos_integral_preflight.sql', import.meta.url), 'utf8');
@@ -317,13 +326,83 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
       assert.equal(cycle.annual, true); assert.equal(cycle.recent, true);
     }
   });
-  await t.test('titular, dos acompañantes registrados e invitado: identidad propia, nunca titular sustituto', async () => {
+  await t.test('grupo publico: titular, registrados e invitado conservan su atribucion anterior', async () => {
     const owners = await Promise.all([createClient(), createClient(true), createClient()]), group = randomUUID();
     await pool.query('INSERT INTO citas_grupos VALUES($1,$2)', [group, owners[0].id]);
     const ids = await Promise.all([...owners, null].map((owner, i) => insert(owner, { group, order: i + 1 })));
     await Promise.all(ids.map(complete));
     for (const owner of owners) assert.equal(await balance(owner.id), 1);
     assert.equal((await pool.query('SELECT count(*)::int n FROM points_transactions WHERE id_cita=ANY($1::uuid[])', [ids])).rows[0].n, 3);
+  });
+  await t.test('ACOMPANANTES-01: todos los puntos de grupos autenticados pertenecen al titular', async suite => {
+    const identities = async ids => (await pool.query(`SELECT id_cita,id_cliente,id_persona_cliente,id_grupo_cita,
+      orden_integrante,id_empleado_barbero,id_sucursal,contacto_nombre,contacto_email,inicio_at,fin_at
+      FROM citas WHERE id_cita=ANY($1::uuid[]) ORDER BY id_cita`, [ids])).rows;
+    const authGroup = async owner => {
+      const group = randomUUID();
+      await pool.query("INSERT INTO citas_grupos(id_grupo_cita,id_cliente_titular,origen_codigo) VALUES($1,$2,'cliente_autenticado')", [group, owner?.id || null]);
+      return group;
+    };
+    for (const member of [false, true]) for (const count of [1, 2, 3, 4]) for (const kind of ['registrados', 'invitados', 'mixtos']) {
+      await suite.test(`${count} acompanantes ${kind}, membresia titular=${member}: +${count + 1} solo al titular`, async () => {
+        const owner = await createClient(member), group = await authGroup(owner), companions = [], ids = [await insert(owner, { group })];
+        for (let i = 0; i < count; i++) {
+          const registered = kind === 'registrados' || (kind === 'mixtos' && i % 2 === 0);
+          const companion = registered ? await createClient(!member) : null;
+          companions.push(companion); ids.push(await insert(companion, { group, order: i + 2, amount: i % 2 ? 300 : 0 }));
+        }
+        const before = await identities(ids);
+        assert.equal(await balance(owner.id), 0);
+        await Promise.all(ids.map(complete)); await Promise.all([...ids, ...ids].map(complete));
+        assert.equal(await balance(owner.id), count + 1);
+        for (const companion of companions.filter(Boolean)) {
+          assert.equal(await balance(companion.id), 0);
+          assert.equal((await pool.query('SELECT count(*)::int n FROM points_cycles WHERE id_cliente=$1', [companion.id])).rows[0].n, 0);
+        }
+        assert.deepEqual(await identities(ids), before);
+        const points = (await pool.query('SELECT id_cliente,id_cita,puntos,origen_punto_codigo,id_cycle FROM points_transactions WHERE id_cita=ANY($1::uuid[])', [ids])).rows;
+        assert.equal(points.length, ids.length); assert.equal(new Set(points.map(row => row.id_cycle)).size, 1);
+        for (const row of points) { assert.equal(row.id_cliente, owner.id); assert.equal(row.puntos, 1); }
+        assert.equal(points.filter(row => row.origen_punto_codigo === 'integrante').length, count);
+        assert.equal((await pool.query("SELECT vence_at=primer_acumulado_at+interval '12 months' anual FROM points_cycles WHERE id_cliente=$1", [owner.id])).rows[0].anual, true);
+      });
+    }
+    await suite.test('guardia rechaza atribuir a un acompanante o tercero; permite solo al titular del grupo', async () => {
+      const owner = await createClient(), companion = await createClient(), third = await createClient(), group = await authGroup(owner);
+      const id = await insert(companion, { group, order: 2 }); await complete(id);
+      for (const target of [companion.id, third.id]) {
+        const changed = await pool.query("UPDATE points_transactions SET id_cliente=$1,tipo_puntos_codigo='acumular' WHERE id_cita=$2 RETURNING *", [target, id]);
+        assert.equal(changed.rowCount, 0);
+      }
+      const same = await pool.query("UPDATE points_transactions SET id_cliente=$1,tipo_puntos_codigo='acumular',puntos=9 WHERE id_cita=$2 RETURNING *", [owner.id, id]);
+      assert.equal(same.rowCount, 1); assert.equal(same.rows[0].puntos, 1);
+      assert.equal(await balance(owner.id), 1); assert.equal(await balance(companion.id), 0); assert.equal(await balance(third.id), 0);
+    });
+    await suite.test('cancelaciones, inasistencias, pendientes y canje del titular conservan exclusiones', async () => {
+      const owner = await createClient(true), companion = await createClient(), group = await authGroup(owner);
+      const reward = await insert(owner, { group, reward: true }); await complete(reward);
+      for (const state of ['confirmada','cancelada','cancelada_por_cliente','no_show','expirada','anulada','en_espera','pendiente_pago']) await insert(companion, { group, order: 2, state });
+      assert.equal(await balance(owner.id), 0); assert.equal(await balance(companion.id), 0);
+      const guest = await insert(null, { group, order: 3 }); await complete(guest);
+      assert.equal(await balance(owner.id), 1);
+    });
+    await suite.test('grupo autenticado sin titular valido nunca usa al acompanante como reemplazo', async () => {
+      const companion = await createClient(), group = await authGroup(null);
+      await complete(await insert(companion, { group, order: 2 }));
+      assert.equal(await balance(companion.id), 0);
+      assert.equal((await pool.query('SELECT count(*)::int n FROM points_transactions WHERE id_cliente=$1', [companion.id])).rows[0].n, 0);
+    });
+    await suite.test('no se transfieren ni duplican puntos historicos al aplicar o repetir la migracion', async () => {
+      const owner = await createClient(), companion = await createClient(), group = randomUUID();
+      await pool.query("INSERT INTO citas_grupos(id_grupo_cita,id_cliente_titular,origen_codigo) VALUES($1,$2,'publico')", [group, owner.id]);
+      const id = await insert(companion, { group, order: 2 }); await complete(id);
+      const before = (await pool.query('SELECT to_jsonb(pt) data FROM points_transactions pt WHERE id_cita=$1', [id])).rows;
+      // AM: El cambio de origen sintetico simula un registro historico previo a esta politica, no una migracion de datos.
+      await pool.query("UPDATE citas_grupos SET origen_codigo='cliente_autenticado' WHERE id_grupo_cita=$1", [group]);
+      await pool.query(migrationSql); await complete(id);
+      assert.deepEqual((await pool.query('SELECT to_jsonb(pt) data FROM points_transactions pt WHERE id_cita=$1', [id])).rows, before);
+      assert.equal(await balance(owner.id), 0); assert.equal(await balance(companion.id), 1);
+    });
   });
   await t.test('confirmadas, canceladas, vencidas, no_show, soft-delete y titular de recompensa no acreditan', async () => {
     const owner = await createClient();
@@ -473,12 +552,40 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
     const user = owner.user; profiles.set(user, { id_usuario: user, roles, cliente_id: owner.id, id_persona: owner.person, branch_ids: [scope], empleado_id: barber });
     return jwt.sign({ sub: user, sid: randomUUID(), jti: randomUUID(), token_type: 'app' }, process.env.JWT_SECRET, { issuer: 'masterfade-api', audience: 'masterfade-app', expiresIn: '1h' });
   };
-  app = Fastify(); app.decorate('db', db); app.decorate('config', { adminDataEntryMode: false, paymentProvider: 'disabled', privateCommercePilot: { enabled: false, userIds: [], ips: [], proxies: [] } });
+  app = Fastify(); app.decorate('db', db); app.decorate('config', { adminDataEntryMode: false, paymentProvider: 'disabled', qaPaymentSimulation: { enabled: true }, privateCommercePilot: { enabled: false, userIds: [], ips: [], proxies: [] } });
   await app.register(fp(async () => {}, { name: 'env-plugin' }));
   await app.register(cookie); await app.register(auth); await app.register(privateCommerce);
   await app.register(operationalRoutes, { prefix: '/v1/admin/citas' });
   await app.register(clientePointsRoutes, { prefix: '/v1/cliente/puntos' });
+  await app.register(publicCitasRoutes, { prefix: '/v1/public/citas' });
   await app.ready();
+  await t.test('ACOMPANANTES-01: correos registrados y nuevos, 1-4 contactos, aviso uniforme sin enumeracion', async () => {
+    const companion = await createClient(), registered = 'registered@example.test';
+    await pool.query('INSERT INTO correos VALUES(gen_random_uuid(),$1,$2,NULL,true,true)', [companion.person, registered]);
+    const snapshot = async () => (await pool.query('SELECT row_to_json(c) datos FROM correos c ORDER BY id_correo')).rows;
+    const before = await snapshot();
+    let expected;
+    for (const count of [1, 2, 3, 4]) for (const email of [registered, 'new@example.test']) {
+      const contactos = Array.from({ length: count }, (_, i) => ({ blockIndex: i + 1, rol_integrante_codigo: 'acompanante',
+        email: i === 0 ? email : `guest${i}@example.test`, nombre: `Invitado ${i}` }));
+      const response = await app.inject({ method: 'POST', url: '/v1/public/citas/validar-contactos', payload: { contactos } });
+      assert.equal(response.statusCode, 200, response.body);
+      const data = response.json(); assert.equal(data.valido, true);
+      assert.equal(data.warnings.length, 1); assert.equal(data.warnings[0].code, 'COMPANION_POINTS_POLICY');
+      expected ??= data.warnings; assert.deepEqual(data.warnings, expected);
+      assert.doesNotMatch(JSON.stringify(data.warnings), /@|id_cliente|registrado|existe/);
+    }
+    const invalid = await app.inject({ method: 'POST', url: '/v1/public/citas/validar-contactos', payload: { contactos: [{ blockIndex: 1, email: 'bad-email' }] } });
+    assert.equal(invalid.statusCode, 400);
+    for (const field of ['email', 'telefono', 'dni']) {
+      const value = { email: registered, telefono: '99999999', dni: '0801199000001' }[field];
+      const duplicate = await app.inject({ method: 'POST', url: '/v1/public/citas/validar-contactos',
+        payload: { contactos: [{ blockIndex: 1, [field]: value }, { blockIndex: 2, [field]: field === 'email' ? value.toUpperCase() : value }] } });
+      assert.equal(duplicate.statusCode, 409, duplicate.body);
+      assert.equal(duplicate.json().error.code, 'PUBLIC_CITAS_CONTACT_DUPLICATE_CONFLICT');
+    }
+    assert.deepEqual(await snapshot(), before); assert.equal(await balance(companion.id), 0);
+  });
   await t.test('Finalizar atención y PATCH estado Completada acreditan a través de los controladores reales', async () => {
     for (const member of [false, true]) for (const patch of [false, true]) {
       const owner = await createClient(member), id = await insert(owner, { state: 'en_atencion' });
@@ -489,6 +596,22 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
       assert.equal(await balance(owner.id), 1);
       const replay = await app.inject({ method: 'POST', url: `/v1/admin/citas/${id}/finalizar-atencion`, headers: { cookie: `mf_session=${token}` }, payload: {} });
       assert.equal(replay.statusCode, 409); assert.equal(await balance(owner.id), 1);
+    }
+  });
+  await t.test('ACOMPANANTES-01: finalizar y cambio administrativo acreditan invitados y registrados al titular', async () => {
+    for (const patch of [false, true]) for (const member of [false, true]) {
+      const owner = await createClient(member), companion = await createClient(!member), group = randomUUID();
+      await pool.query("INSERT INTO citas_grupos(id_grupo_cita,id_cliente_titular,origen_codigo) VALUES($1,$2,'cliente_autenticado')", [group, owner.id]);
+      const token = access(await createClient(), ['super_admin']);
+      for (const [index, person] of [companion, null].entries()) {
+        const id = await insert(person, { group, order: index + 2, state: 'en_atencion' });
+        const response = await app.inject({ method: patch ? 'PATCH' : 'POST', url: `/v1/admin/citas/${id}/${patch ? 'estado' : 'finalizar-atencion'}`,
+          headers: { cookie: `mf_session=${token}` }, payload: patch ? { estado_cita_codigo: 'completada' } : {} });
+        assert.equal(response.statusCode, 200, response.body + ' ' + errors.at(-1)?.message);
+        const replay = await app.inject({ method: 'POST', url: `/v1/admin/citas/${id}/finalizar-atencion`, headers: { cookie: `mf_session=${token}` }, payload: {} });
+        assert.equal(replay.statusCode, 409);
+      }
+      assert.equal(await balance(owner.id), 2); assert.equal(await balance(companion.id), 0);
     }
   });
   await t.test('Cliente solo consulta sus puntos; rol/sucursal invalidos no completan ni acreditan', async () => {

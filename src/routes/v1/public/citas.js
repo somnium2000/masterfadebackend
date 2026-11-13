@@ -1318,7 +1318,10 @@ export default async function publicCitasRoutes(app) {
         return reply.code(200).send({
           ok: true,
           valido: true,
-          warnings: [],
+          // AM: Aviso uniforme, sin lookup ni indicador de existencia de cuentas por correo.
+          warnings: contactos.some(contacto => contacto.rol_integrante_codigo === "acompanante" && contacto.email)
+            ? [{ code: "COMPANION_POINTS_POLICY", message: "Si reservas desde tu cuenta, los MasterPuntos de las citas completadas que califican en el grupo se acreditan solo al titular, aunque un acompa\u00f1ante tenga cuenta propia." }]
+            : [],
           errors: [],
           requestId: request.id,
         });

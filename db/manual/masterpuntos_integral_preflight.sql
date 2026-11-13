@@ -27,7 +27,9 @@ FROM public.points_transactions pt JOIN public.citas c ON c.id_cita=pt.id_cita
 WHERE pt.tipo_puntos_codigo='acumular' AND c.estado_cita_codigo<>'completada';
 SELECT count(*) AS movimientos_con_identidad_distinta
 FROM public.points_transactions pt JOIN public.citas c ON c.id_cita=pt.id_cita
-WHERE pt.tipo_puntos_codigo='acumular' AND pt.id_cliente IS DISTINCT FROM c.id_cliente;
+LEFT JOIN public.citas_grupos cg ON cg.id_grupo_cita=c.id_grupo_cita
+WHERE pt.tipo_puntos_codigo='acumular' AND pt.id_cliente IS DISTINCT FROM
+  CASE WHEN cg.origen_codigo='cliente_autenticado' THEN cg.id_cliente_titular ELSE c.id_cliente END;
 -- AM: BEGIN HISTORICAL_DEBITS_PROOF
 WITH affected_clients AS (
   SELECT DISTINCT pc.id_cliente

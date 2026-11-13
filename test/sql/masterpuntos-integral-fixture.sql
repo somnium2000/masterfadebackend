@@ -27,7 +27,7 @@ ALTER TABLE servicios ADD PRIMARY KEY(id_servicio), ADD COLUMN deleted_at timest
 ALTER TABLE sucursales ADD PRIMARY KEY(id_sucursal);
 ALTER TABLE citas_detalles ADD COLUMN subtotal_hnl numeric DEFAULT 0;
 CREATE TABLE clientes(id_cliente uuid PRIMARY KEY,id_usuario uuid,id_persona uuid,id_sucursal_origen uuid,estado boolean DEFAULT true,deleted_at timestamptz);
-CREATE TABLE citas_grupos(id_grupo_cita uuid PRIMARY KEY,id_cliente_titular uuid);
+CREATE TABLE citas_grupos(id_grupo_cita uuid PRIMARY KEY,id_cliente_titular uuid,origen_codigo text NOT NULL DEFAULT 'publico');
 CREATE TABLE estados_cita(estado_cita_codigo text);
 INSERT INTO estados_cita VALUES('completada');
 CREATE TABLE tipos_puntos(tipo_puntos_codigo text PRIMARY KEY,signo int);

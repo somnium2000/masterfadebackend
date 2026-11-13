@@ -8,6 +8,11 @@ LOCK TABLE public.points_transactions, public.points_cycles, public.tipos_puntos
 
 DO $preflight$
 BEGIN
+  IF (SELECT count(*) FROM pg_attribute
+      WHERE attrelid = to_regclass('public.citas_grupos') AND NOT attisdropped
+        AND attname IN ('id_grupo_cita', 'id_cliente_titular', 'origen_codigo')) <> 3 THEN
+    RAISE EXCEPTION 'MASTERPUNTOS_PREFLIGHT_GROUP_METADATA_REQUIRED';
+  END IF;
   IF to_regprocedure('public.fn_points_get_or_create_active_cycle(uuid,timestamptz)') IS NULL
      OR to_regprocedure('public.fn_points_get_or_create_active_cycle(uuid,integer,timestamptz)') IS NULL
      OR to_regprocedure('public.fn_points_materialize_expired_cycles(uuid)') IS NULL
@@ -177,13 +182,20 @@ $function$;
 
 CREATE OR REPLACE FUNCTION public.fn_points_tx_guard_acumular_final() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, public AS $function$
-DECLARE v_cita public.citas%ROWTYPE;
+DECLARE v_cita public.citas%ROWTYPE; v_beneficiario uuid;
 BEGIN
   IF NEW.tipo_puntos_codigo <> 'acumular' OR NEW.id_cita IS NULL THEN RETURN NEW; END IF;
   SELECT c.* INTO v_cita FROM public.citas c
   WHERE c.id_cita = NEW.id_cita AND c.deleted_at IS NULL;
-  IF NOT FOUND OR v_cita.estado_cita_codigo <> 'completada'
-     OR v_cita.id_cliente IS NULL OR v_cita.id_cliente IS DISTINCT FROM NEW.id_cliente
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  v_beneficiario := v_cita.id_cliente;
+  IF v_cita.id_grupo_cita IS NOT NULL THEN
+    SELECT CASE WHEN cg.origen_codigo = 'cliente_autenticado' THEN cg.id_cliente_titular ELSE v_cita.id_cliente END
+    INTO v_beneficiario FROM public.citas_grupos cg WHERE cg.id_grupo_cita = v_cita.id_grupo_cita;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+  END IF;
+  IF v_cita.estado_cita_codigo <> 'completada'
+     OR v_beneficiario IS NULL OR v_beneficiario IS DISTINCT FROM NEW.id_cliente
      OR (COALESCE(v_cita.es_canje_recompensa, false) AND COALESCE(v_cita.orden_integrante, 1) <= 1) THEN
     RETURN NULL;
   END IF;
@@ -195,25 +207,33 @@ $function$;
 
 CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_por_cita() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, public AS $function$
-DECLARE v_cycle record; v_usuario uuid; v_origen text;
+DECLARE v_cycle record; v_usuario uuid; v_origen text; v_beneficiario uuid;
 BEGIN
-  IF NEW.estado_cita_codigo <> 'completada' OR NEW.id_cliente IS NULL OR NEW.deleted_at IS NOT NULL THEN RETURN NEW; END IF;
+  IF NEW.estado_cita_codigo <> 'completada' OR NEW.deleted_at IS NOT NULL THEN RETURN NEW; END IF;
   IF TG_OP = 'UPDATE' THEN
     IF OLD.estado_cita_codigo IS NOT DISTINCT FROM NEW.estado_cita_codigo THEN RETURN NEW; END IF;
   END IF;
+  -- AM: El grupo autenticado define al beneficiario; nunca se altera la identidad de la cita.
+  v_beneficiario := NEW.id_cliente;
+  IF NEW.id_grupo_cita IS NOT NULL THEN
+    SELECT CASE WHEN cg.origen_codigo = 'cliente_autenticado' THEN cg.id_cliente_titular ELSE NEW.id_cliente END
+    INTO v_beneficiario FROM public.citas_grupos cg WHERE cg.id_grupo_cita = NEW.id_grupo_cita;
+    IF NOT FOUND THEN RETURN NEW; END IF;
+  END IF;
+  IF v_beneficiario IS NULL THEN RETURN NEW; END IF;
   v_origen := CASE WHEN COALESCE(NEW.orden_integrante, 1) > 1 THEN 'integrante' ELSE 'titular' END;
   IF COALESCE(NEW.es_canje_recompensa, false) AND v_origen = 'titular' THEN RETURN NEW; END IF;
   SELECT c.id_usuario INTO v_usuario FROM public.clientes c
-  WHERE c.id_cliente = NEW.id_cliente AND c.deleted_at IS NULL;
+  WHERE c.id_cliente = v_beneficiario AND c.deleted_at IS NULL;
   IF NOT FOUND THEN RETURN NEW; END IF;
-  PERFORM pg_advisory_xact_lock(hashtext(NEW.id_cliente::text));
+  PERFORM pg_advisory_xact_lock(hashtext(v_beneficiario::text));
   IF EXISTS (SELECT 1 FROM public.points_transactions pt WHERE pt.id_cita = NEW.id_cita AND pt.tipo_puntos_codigo = 'acumular') THEN RETURN NEW; END IF;
-  SELECT * INTO v_cycle FROM public.fn_points_get_or_create_active_cycle(NEW.id_cliente, 12, now());
+  SELECT * INTO v_cycle FROM public.fn_points_get_or_create_active_cycle(v_beneficiario, 12, now());
   INSERT INTO public.points_transactions (
     id_cliente, id_cita, id_cycle, id_sucursal_origen, tipo_puntos_codigo,
     origen_punto_codigo, puntos, vence_at, motivo, creado_por_usuario_id, created_at, updated_at
   ) VALUES (
-    NEW.id_cliente, NEW.id_cita, v_cycle.id_cycle, NEW.id_sucursal, 'acumular',
+    v_beneficiario, NEW.id_cita, v_cycle.id_cycle, NEW.id_sucursal, 'acumular',
     v_origen, 1, v_cycle.vence_at,
     CASE WHEN v_origen = 'integrante' THEN 'Punto por acompañante en visita completada' ELSE 'Punto por visita completada del titular' END,
     COALESCE(NEW.creada_por_usuario_id, v_usuario), now(), now()
