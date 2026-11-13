@@ -2636,6 +2636,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         expected: {
           orderId: intent.orden_compra,
           amount: Number(intent.monto_hnl),
+          transactionId: intent.referencia_externa,
         },
         origin: "manual",
         requestId: request.id,
