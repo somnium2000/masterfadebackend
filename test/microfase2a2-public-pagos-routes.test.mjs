@@ -297,6 +297,9 @@ function createPagosClient({
     getPayments() {
       return structuredClone(payments);
     },
+    getPaymentEvents() {
+      return structuredClone(paymentEvents);
+    },
     getSaleAttempts() {
       return structuredClone(saleAttempts);
     },
@@ -627,6 +630,20 @@ function createPagosClient({
           last_verified_at: params[9],
         };
         return { rows: [{ id_status_check: "abababab-abab-4bab-8bab-abababababab" }] };
+      }
+      if (text.includes("INSERT INTO public.payment_events")
+        && text.includes("VALUES ($1::uuid, $2::text, $3::text, TRUE, $4::jsonb, $5::uuid)")) {
+        if (!paymentEvents.some((row) => row.provider_event_id === params[1])) {
+          paymentEvents.push({
+            id_intent: params[4],
+            id_provider: params[0],
+            provider_event_id: params[1],
+            evento_tipo: params[2],
+            payload_esencial: structuredClone(params[3]),
+            recibido_at: new Date().toISOString(),
+          });
+        }
+        return { rows: [] };
       }
       if (text.includes("INSERT INTO public.payment_events") && text.includes("SELECT pi.id_provider")) {
         if (!paymentEvents.some((row) => row.provider_event_id === params[1])) {
@@ -1354,8 +1371,15 @@ test("TodoPago simulado aprueba, confirma y no duplica el pago", async () => {
   assert.equal(duplicate.statusCode, 200, duplicate.body);
   assert.equal(duplicate.json().data.duplicate, true);
   assert.equal(client.getPayments().length, 1);
+  assert.equal(Number(client.getPayments()[0].monto_hnl), 115);
+  assert.equal(client.getPaymentEvents().length, 1);
+  assert.equal(client.getPaymentEvents()[0].evento_tipo, "payment.simulated.result");
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.normalized_status, "PAID");
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.monto_resuelto_hnl, 1);
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.monto_intent_hnl, 115);
   assert.equal(client.getActiveIntent().estado_intent_codigo, "confirmado");
   assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  assert.equal(client.getGroupState()[0].estado_hold_codigo, "consumido");
   await app.close();
 });
 
@@ -1386,8 +1410,50 @@ test("TodoPago simulado rechaza sin crear pago ni confirmar la cita", async () =
   assert.equal(rejected.json().data.normalized_status, "FAILED");
   assert.equal(rejected.json().data.booking_confirmed, false);
   assert.equal(client.getPayments().length, 0);
+  assert.equal(client.getPaymentEvents().length, 1);
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.normalized_status, "FAILED");
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.monto_resuelto_hnl, 1.05);
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.monto_intent_hnl, 115);
   assert.equal(client.getActiveIntent().estado_intent_codigo, "fallido");
   assert.notEqual(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  await app.close();
+});
+
+test("TodoPago simulado conserva timeout pendiente sin pago ni confirmacion", async () => {
+  const client = createPagosClient({ providerCode: "todopago" });
+  const app = await createPagosApp(client, {
+    providerCode: "todopago",
+    providerAdapter: new TodoPagoPreprodSimulatedProvider(),
+  });
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/crear-intent",
+    payload: publicIntentPayload(),
+  });
+  const timedOut = await app.inject({
+    method: "POST",
+    url: "/v1/public/pagos/simulator/event",
+    payload: {
+      id_grupo_cita: GROUP_A,
+      id_intent: created.json().data.id_intent,
+      titular_email: "cliente@example.com",
+      monto_prueba_hnl: 1.57,
+    },
+  });
+
+  assert.equal(timedOut.statusCode, 200, timedOut.body);
+  assert.equal(timedOut.json().data.normalized_status, "PENDING");
+  assert.equal(timedOut.json().data.response_code, "TO");
+  assert.equal(timedOut.json().data.booking_confirmed, false);
+  assert.equal(client.getPayments().length, 0);
+  assert.equal(client.getPaymentEvents().length, 1);
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.normalized_status, "PENDING");
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.monto_resuelto_hnl, 1.57);
+  assert.equal(client.getPaymentEvents()[0].payload_esencial.monto_intent_hnl, 115);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, "pendiente_confirmacion");
+  assert.notEqual(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  assert.notEqual(client.getGroupState()[0].estado_hold_codigo, "consumido");
   await app.close();
 });
 
