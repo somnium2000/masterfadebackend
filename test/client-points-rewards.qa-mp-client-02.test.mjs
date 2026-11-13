@@ -6,7 +6,6 @@ import clientePointsRoutes from "../src/routes/v1/clientePoints.js";
 import {
   applyRewardRedeemForConfirmedGroup,
   getClientePointsSummary,
-  grantEngagementPointsForConfirmedGroup,
   redeemReward,
 } from "../src/services/pointsService.js";
 
@@ -19,7 +18,6 @@ const SERVICE_NO_PLAN = "66666666-6666-4666-8666-666666666666";
 const SERVICE_PLAN = "77777777-7777-4777-8777-777777777777";
 const GROUP = "88888888-8888-4888-8888-888888888888";
 const CITA_A = "99999999-9999-4999-8999-999999999999";
-const CITA_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CYCLE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 function summaryFixture({ balance = 10, activePlan = false } = {}) {
@@ -128,47 +126,6 @@ test("servicio no configurado se rechaza por API sin descontar puntos", async ()
   assert.equal(fixture.calls.some(({ text }) => text.includes("INSERT INTO public.points_transactions")), false);
 });
 
-function accrualFixture(initialBalance) {
-  let balance = initialBalance;
-  const inserts = [];
-  const client = {
-    async query(sql, params = []) {
-      const text = String(sql).replace(/\s+/g, " ").trim();
-      if (text.includes("FROM public.citas_grupos cg")) return { rows: [{ id_cliente: CLIENT, id_usuario: USER, id_sucursal_origen: BRANCH_A }] };
-      if (text.includes("pg_advisory_xact_lock") || text.includes("fn_points_materialize_expired_cycles")) return { rows: [] };
-      if (text.includes("COALESCE(r.puntos_para_premio")) return { rows: [{ puntos_para_premio: 10 }] };
-      if (text.includes("FROM public.citas") && text.includes("orden_integrante")) return { rows: [
-        { id_cita: CITA_A, id_sucursal: BRANCH_A, inicio_at: "2026-11-02T12:00:00Z", orden_integrante: 1, es_canje_recompensa: false },
-        { id_cita: CITA_B, id_sucursal: BRANCH_A, inicio_at: "2026-11-02T12:30:00Z", orden_integrante: 2, es_canje_recompensa: false },
-      ] };
-      if (text.includes("SELECT COALESCE(SUM(pt.puntos), 0)::int AS saldo_total")) return { rows: [{ saldo_total: balance }] };
-      if (text.includes("fn_points_get_or_create_active_cycle")) return { rows: [{ id_cycle: CYCLE }] };
-      if (text.includes("INSERT INTO public.points_transactions")) {
-        balance += 1; inserts.push(params[1]);
-        return { rows: [{ id_points_tx: params[1] }], rowCount: 1 };
-      }
-      throw new Error(`SQL_NO_SIMULADO: ${text}`);
-    },
-  };
-  return { client, inserts, balance: () => balance };
-}
-
-test("acumulacion automatica alcanza la meta pero no la supera con titular y acompanante", async () => {
-  const fixture = accrualFixture(9);
-  const result = await grantEngagementPointsForConfirmedGroup(fixture.client, { idGrupoCita: GROUP });
-  assert.deepEqual(result, { titular: 1, acompanantes: 0 });
-  assert.equal(fixture.balance(), 10);
-  assert.deepEqual(fixture.inserts, [CITA_A]);
-});
-
-test("recompensa pendiente historica bloquea toda acumulacion automatica", async () => {
-  const fixture = accrualFixture(12);
-  const result = await grantEngagementPointsForConfirmedGroup(fixture.client, { idGrupoCita: GROUP });
-  assert.deepEqual(result, { titular: 0, acompanantes: 0 });
-  assert.equal(fixture.balance(), 12);
-  assert.deepEqual(fixture.inserts, []);
-});
-
 test("confirmar canje descuenta una sola vez y libera acumulacion bajo la meta", async () => {
   let balance = 10;
   let redeemed = null;
@@ -207,7 +164,4 @@ test("confirmar canje descuenta una sola vez y libera acumulacion bajo la meta",
   assert.equal(replay.ya_aplicada, true);
   assert.equal(insertions.length, 1);
 
-  const accrual = accrualFixture(balance);
-  const granted = await grantEngagementPointsForConfirmedGroup(accrual.client, { idGrupoCita: GROUP });
-  assert.deepEqual(granted, { titular: 1, acompanantes: 1 });
 });

@@ -7,7 +7,6 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createServer} from 'node:net';
 import {randomUUID} from 'node:crypto';
-import {grantEngagementPointsForConfirmedGroup} from '../src/services/pointsService.js';
 import {createCoverageTracker,consumeCoverageForServices} from '../src/services/membershipService.js';
 const BIN=process.env.MASTERFADE_PHASE02_PG_BIN;
 test('MF118: cobertura individual y MasterPuntos en PostgreSQL aislado',{skip:!BIN,timeout:90000},async t=>{
@@ -41,9 +40,9 @@ test('MF118: cobertura individual y MasterPuntos en PostgreSQL aislado',{skip:!B
  const sum=async id=>Number((await pool.query('SELECT balance_puntos FROM vw_points_balance WHERE id_cliente=$1',[id])).rows[0]?.balance_puntos||0);
  await t.test('confirmación no acredita; completada con membresía sí; reintentos no duplican',async()=>{
   const id=await insert('confirmada');await pool.query('INSERT INTO subscription_consumptions VALUES($1)',[id]);
-  assert.deepEqual(await grantEngagementPointsForConfirmedGroup(pool,{idGrupoCita:group}),{titular:0,acompanantes:0});assert.equal(await sum(client),0);
+  assert.equal(await sum(client),0);
   await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_cita=$1",[id]);assert.equal(await sum(client),1);
-  await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_cita=$1",[id]);await grantEngagementPointsForConfirmedGroup(pool,{idGrupoCita:group});assert.equal(await sum(client),1);
+  await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_cita=$1",[id]);assert.equal(await sum(client),1);
  });
  await t.test('hold/pendientes/cancelación/expiración no generan puntos; recompensa titular excluida',async()=>{
   for(const state of ['en_espera','pendiente_pago','cancelada','expirada','no_show','anulada'])await insert(state);
@@ -51,7 +50,7 @@ test('MF118: cobertura individual y MasterPuntos en PostgreSQL aislado',{skip:!B
  });
  await t.test('acompañante registrado recibe punto propio; sin Cliente vinculado no se acredita al titular',async()=>{
   const own=await insert('confirmada',2,companion),guest=await insert('confirmada',3,null);
-  await grantEngagementPointsForConfirmedGroup(pool,{idGrupoCita:group});assert.equal(await sum(client),1);assert.equal(await sum(companion),0);
+  assert.equal(await sum(client),1);assert.equal(await sum(companion),0);
   await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_cita=ANY($1::uuid[])",[[own,guest]]);assert.equal(await sum(companion),1);assert.equal(await sum(client),1);
  });
  await t.test('cobertura del titular no se transfiere; totales para uno y varios servicios',async()=>{

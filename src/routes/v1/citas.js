@@ -21,7 +21,6 @@ import {
 } from "../../services/membershipService.js";
 import {
   applyRewardRedeemForConfirmedGroup,
-  grantEngagementPointsForConfirmedGroup,
   normalizeRedeemContextToken,
   resolveRewardRedeemGateForCliente,
   resolveRedeemContextForHold,
@@ -2790,10 +2789,6 @@ export default async function citasRoutes(app) {
             clienteId,
             usuarioId: request.claims?.user?.id_usuario ?? null,
           });
-          step = "grantEngagementPointsForConfirmedGroup_already_confirmed";
-          await grantEngagementPointsForConfirmedGroup(dbClient, {
-            idGrupoCita: group.id_grupo_cita,
-          });
           step = "tx_commit_already_confirmed";
           await dbClient.query("COMMIT");
           txStarted = false;
@@ -2876,10 +2871,6 @@ export default async function citasRoutes(app) {
           rows: pendingRows,
           clienteId,
           usuarioId: request.claims?.user?.id_usuario ?? null,
-        });
-        step = "grantEngagementPointsForConfirmedGroup";
-        await grantEngagementPointsForConfirmedGroup(dbClient, {
-          idGrupoCita: group.id_grupo_cita,
         });
         step = "tx_commit";
         await dbClient.query("COMMIT");
