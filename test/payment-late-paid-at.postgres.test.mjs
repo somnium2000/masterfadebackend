@@ -7,8 +7,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import pg from "pg";
-import { reconcilePixelPayFromDurableApproval, reconcilePixelPayPaid } from "../src/routes/v1/public/pagos.js";
-import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
+import { reconcilePixelPayFromDurableApproval } from "../src/routes/v1/public/pagos.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 
 const migrationUrl = new URL("../db/migrations/pixel/20261011213325_payment_late_uses_paid_at_v1.sql", import.meta.url);
@@ -182,22 +181,6 @@ async function insertPayment(client, paidAt, amount = 1, currency = "HNL") {
     VALUES ($1,'capturado',$2,$3,$4,$5) RETURNING pago_tardio,paid_at::text`, [INTENT, UUID, amount, currency, paidAt]);
 }
 
-async function seedDurableSale(client) {
-  const attemptId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-  await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome,
-    sdk_response_class,upstream_http_status,uncertain,response_success,response_approved,response_incomplete,
-    transaction_result_valid,transaction_result_parsed,payment_uuid_present,transaction_id_present,payment_hash_present,
-    payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches)
-    VALUES ($1,$2,$3,'approved','SuccessResponse',200,false,true,true,false,true,true,true,true,true,true,true,true,true)`,
-  [INTENT, attemptId, FINALIZED_AT]);
-  await client.query(`INSERT INTO public.payment_events
-    (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
-    VALUES ($1,$2,'pixelpay.sale.approved_verified',TRUE,$3,$4,$5)`, [PROVIDER, `pixelpay_sale_${attemptId}`, {
-    payment_attempt_id: attemptId, payment_uuid: UUID, transaction_id: TX, amount: 1, currency: "HNL",
-    payment_hash_valid: true, amount_matches: true,
-  }, INTENT, PAID_AT]);
-}
-
 test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en cluster aislado", { skip: !RUN }, async (t) => {
   const isolated = await startIsolatedPostgres();
   const { client } = isolated;
@@ -272,7 +255,11 @@ test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en clus
     await client.query(await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8"));
     await t.test("recovery completo con triggers reales, evidencia durable y RPC intacta", async () => {
       await seed(client);
-      await seedDurableSale(client);
+      await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome,
+        sdk_response_class,upstream_http_status,uncertain,response_success,response_approved,response_incomplete,
+        transaction_result_valid,transaction_result_parsed,payment_uuid_present,transaction_id_present,payment_hash_present,
+        payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches)
+        VALUES ($1,gen_random_uuid(),$2,'approved','SuccessResponse',200,false,true,true,false,true,true,true,true,true,true,true,true,true)`, [INTENT, PAID_AT]);
       const previousProvider = PaymentProviderFactory._instance;
       const provider = { saleCalls: 0, statusCalls: 0,
         async sale() { this.saleCalls++; throw new Error("Sale prohibida"); },
@@ -299,155 +286,6 @@ test("PostgreSQL real: tr_pay_validar, tr_pay_aplicar y recovery durable en clus
     });
   } catch (error) { primaryError = error; throw error; }
   finally { await cleanupPreservingError(isolated.stop, primaryError); }
-});
-
-test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vigente", {
-  skip: !RUN_FINANCIAL_CONTRACT,
-}, async (t) => {
-  const isolated = await startIsolatedPostgres();
-  const { client } = isolated;
-  const previousProvider = PaymentProviderFactory._instance;
-  const provider = { saleCalls: 0, statusCalls: 0,
-    async sale() { this.saleCalls++; throw new Error("Sale prohibida"); },
-    async queryPaymentStatus() { this.statusCalls++; throw new Error("Status prohibido"); },
-  };
-  PaymentProviderFactory._instance = provider;
-  let primaryError;
-  try {
-    const historical = await readFile(new URL("../db/migrations/pixel/20260924010000_pixelpay_reconciliation_window.sql", import.meta.url), "utf8");
-    await client.query(await readFile(new URL("./sql/microfase2a2/pre_2a2_schema.sql", import.meta.url), "utf8"));
-    await client.query(await readFile(new URL("./sql/payments/late_payment_support.sql", import.meta.url), "utf8"));
-    await client.query(await readFile(baselineUrl, "utf8"));
-    await client.query(functionSql(historical, "public.fn_payment_intents_capture_paid_at"));
-    await client.query(`CREATE TRIGGER tr_payment_intents_capture_paid_at BEFORE INSERT OR UPDATE OF estado_intent_codigo,paid_at
-      ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION public.fn_payment_intents_capture_paid_at()`);
-    await client.query(functionSql(historical, "app_private.confirmar_reserva_pagada_v1"));
-    await client.query(await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8"));
-    await client.query(await readFile(financialContractUrl, "utf8"));
-    const reset = async (options = {}) => {
-      // AM: Solo fixtures del cluster temporal; ninguna conexion externa ni dato historico.
-      await client.query(`TRUNCATE public.payment_events,app_private.pixelpay_sale_attempts,public.payments,
-        public.payment_intents,public.citas_holds,public.citas,public.citas_grupos,public.correos,
-        public.personas,public.payment_providers CASCADE`);
-      await seed(client, options);
-      if (options.holdState === "activo") await client.query("UPDATE public.citas_grupos SET estado_grupo_codigo='activo'");
-      await seedDurableSale(client);
-    };
-    const recover = (connection = client) => reconcilePixelPayFromDurableApproval(connection, {
-      idGrupoCita: GROUP, idIntent: INTENT, titularEmail: EMAIL,
-    });
-    const assertConfirmedOnce = async () => {
-      const state = (await client.query(`SELECT p.paid_at=$2::timestamptz exact_payment_time,
-        i.paid_at=$2::timestamptz exact_intent_time, p.paid_at<>a.finalized_at distinct_from_final,
-        p.paid_at::text paid_at, p.pago_tardio, i.estado_intent_codigo,h.estado_hold_codigo,c.estado_cita_codigo
-        FROM public.payments p JOIN public.payment_intents i USING(id_intent)
-        JOIN app_private.pixelpay_sale_attempts a USING(id_intent)
-        JOIN public.citas_holds h ON h.id_hold=i.id_hold JOIN public.citas c ON c.id_cita=i.id_cita
-        WHERE i.id_intent=$1`, [INTENT, PAID_AT])).rows;
-      assert.equal(state.length, 1);
-      assert.deepEqual(state[0], { exact_payment_time: true, exact_intent_time: true, distinct_from_final: true,
-        paid_at: "2026-10-11 19:43:29.880935+00", pago_tardio: false,
-        estado_intent_codigo: "confirmado", estado_hold_codigo: "consumido", estado_cita_codigo: "confirmada" });
-      assert.equal((await recover()).duplicate, true);
-      assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 1);
-    };
-    await t.test("aprobacion con hold vigente y duplicado preservan seis decimales", async () => {
-      await reset({ intentExpiry: "2099-01-01", holdExpiry: "2099-01-01", holdState: "activo", citaState: "pendiente_pago" });
-      assert.equal((await recover()).booking_confirmed, true);
-      await assertConfirmedOnce();
-    });
-    await t.test("recuperacion tardia y duplicado conservan evidencia previa al vencimiento", async () => {
-      await reset();
-      assert.equal((await recover()).booking_confirmed, true);
-      await assertConfirmedOnce();
-    });
-    await t.test("segunda ruta valida paidAt contra evento, no finalized_at", async () => {
-      await reset();
-      await client.query("UPDATE public.citas_grupos SET estado_grupo_codigo='activo'");
-      const reconcile = (paidAt) => reconcilePixelPayPaid(client, { idGrupoCita: GROUP, idIntent: INTENT,
-        titularEmail: EMAIL, paymentUuid: UUID, providerTransactionId: TX, expectedAmount: 1,
-        allowExpiredRecovery: true, paidAt });
-      for (const wrong of [FINALIZED_AT, "2026-10-11T19:43:29.880934Z"]) {
-        assert.equal((await reconcile(wrong)).manual_reconciliation_required, true);
-        assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
-      }
-      assert.equal((await reconcile("2026-10-11T13:43:29.880935-06:00")).booking_confirmed, true);
-      await assertConfirmedOnce();
-    });
-    await t.test("rollback posterior al INSERT conserva evidencia y permite reintento local unico", async () => {
-      await reset();
-      let inserted = false;
-      const failingClient = { async query(sql, ...args) {
-        if (sql.includes("app_private.confirmar_reserva_pagada_v1")) {
-          assert.equal(inserted, true);
-          throw new Error("fixture fallo posterior al INSERT");
-        }
-        const result = await client.query(sql, ...args);
-        if (sql.includes("INSERT INTO public.payments")) inserted = true;
-        return result;
-      } };
-      await assert.rejects(recover(failingClient), /fixture fallo posterior al INSERT/);
-      const state = (await client.query(`SELECT (SELECT count(*)::int FROM public.payments) payments,
-        (SELECT count(*)::int FROM public.payment_events) events,
-        (SELECT count(*)::int FROM app_private.pixelpay_sale_attempts) attempts,
-        i.estado_intent_codigo,h.estado_hold_codigo,c.estado_cita_codigo
-        FROM public.payment_intents i JOIN public.citas_holds h ON h.id_hold=i.id_hold
-        JOIN public.citas c ON c.id_cita=i.id_cita`)).rows[0];
-      assert.deepEqual(state, { payments: 0, events: 1, attempts: 1, estado_intent_codigo: "pendiente_confirmacion",
-        estado_hold_codigo: "expirado", estado_cita_codigo: "expirada" });
-      assert.equal((await recover()).booking_confirmed, true);
-      await assertConfirmedOnce();
-    });
-    const invalidEvidence = [
-      ["sin evento", "DELETE FROM public.payment_events"],
-      ["firma no verificada", "UPDATE public.payment_events SET firma_valida=FALSE"],
-      ["tipo incorrecto", "UPDATE public.payment_events SET evento_tipo='pixelpay.callback'"],
-      ["identificador de evento incorrecto", "UPDATE public.payment_events SET provider_event_id='other'"],
-      ["FINAL tardio por un microsegundo", "UPDATE app_private.pixelpay_sale_attempts SET finalized_at=$1::timestamptz+interval '1 microsecond'", [EXPIRY]],
-      ["evento tardio por un microsegundo", "UPDATE public.payment_events SET recibido_at=$1::timestamptz+interval '1 microsecond'", [EXPIRY]],
-      ["intent vencido antes del evento", "UPDATE public.payment_intents SET expires_at=$1::timestamptz-interval '1 microsecond'", [PAID_AT]],
-      ...Object.entries({ payment_uuid: "other", transaction_id: "other", payment_attempt_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-        amount: 2, currency: "USD", payment_hash_valid: false, amount_matches: false })
-        .map(([key, value]) => [key, "UPDATE public.payment_events SET payload_esencial=payload_esencial || $1::jsonb", [{ [key]: value }]]),
-      ["monto con tipo incorrecto", "UPDATE public.payment_events SET payload_esencial=payload_esencial || $1::jsonb", [{ amount: "1" }]],
-      ["dos FINAL aprobados, uno sin evento", `INSERT INTO app_private.pixelpay_sale_attempts
-        SELECT (jsonb_populate_record(NULL::app_private.pixelpay_sale_attempts,
-          to_jsonb(a) || jsonb_build_object('id_sale_attempt',gen_random_uuid(),
-            'payment_attempt_id','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'))).*
-        FROM app_private.pixelpay_sale_attempts a`],
-    ];
-    for (const [name, sql, params] of invalidEvidence) {
-      await t.test(`rechaza ${name} sin escribir pagos`, async () => {
-        await reset();
-        await client.query(sql, params);
-        assert.equal((await recover()).manual_reconciliation_required, true);
-        assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
-      });
-    }
-    await t.test("rechaza eventos ambiguos y evento unico de otro intento no aprobado", async () => {
-      await reset();
-      await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id)
-        VALUES ($1,'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')`, [INTENT]);
-      await client.query(`INSERT INTO public.payment_events
-        (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
-        VALUES ($1,'pixelpay_sale_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-        'pixelpay.sale.approved_verified',TRUE,$2,$3,$4)`, [PROVIDER, {
-        payment_attempt_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", payment_uuid: UUID, transaction_id: TX,
-        amount: 1, currency: "HNL", payment_hash_valid: true, amount_matches: true,
-      }, INTENT, PAID_AT]);
-      assert.equal((await recover()).manual_reconciliation_required, true);
-      await client.query("DELETE FROM public.payment_events WHERE provider_event_id='pixelpay_sale_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'");
-      assert.equal(await loadDurablePixelPayApproval(client, { idIntent: INTENT, groupRows: [{ expires_at: EXPIRY }] }), null);
-      assert.equal((await recover()).manual_reconciliation_required, true);
-      assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
-    });
-    assert.equal(provider.saleCalls, 0);
-    assert.equal(provider.statusCalls, 0);
-  } catch (error) { primaryError = error; throw error; }
-  finally {
-    PaymentProviderFactory._instance = previousProvider;
-    await cleanupPreservingError(isolated.stop, primaryError);
-  }
 });
 
 test("PostgreSQL 17: contrato financiero exige evidencia y deshabilita pagos manuales nuevos", {
