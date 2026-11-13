@@ -78,6 +78,11 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
  CREATE TRIGGER tr_points_tx_apply_tipo_sign BEFORE INSERT OR UPDATE OF tipo_puntos_codigo,puntos ON points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_apply_tipo_sign();
  CREATE TRIGGER tr_points_cita_confirmada AFTER UPDATE ON citas FOR EACH ROW EXECUTE FUNCTION fn_trg_otorgar_puntos_por_cita();`);
  await pool.query(await source('db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql'));
+ await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pago_tardio boolean DEFAULT false;
+ ALTER TABLE citas ADD COLUMN IF NOT EXISTS moneda_codigo text DEFAULT 'HNL';
+ CREATE TABLE subscription_payments(id_payment uuid,id_suscripcion uuid,estado text,monto_hnl numeric,moneda_codigo text,paid_at timestamptz);
+ CREATE TABLE membership_purchase_orders(id_order uuid PRIMARY KEY,id_suscripcion uuid,id_cliente uuid,estado_orden_codigo text,total_hnl numeric,moneda_codigo text,paid_at timestamptz);`);
+ await pool.query(await source('db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql'));
  const branch=randomUUID(),barber=randomUUID(),barberPerson=randomUUID(),service=randomUUID(),extra=randomUUID();
  await pool.query("INSERT INTO sucursales(id_sucursal) VALUES($1)",[branch]);
  await pool.query("INSERT INTO personas(id_persona) VALUES($1)",[barberPerson]);
@@ -156,7 +161,8 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
   assert.equal((await pool.query('SELECT count(*)::int n FROM payment_intents WHERE id_grupo_cita=$1',[hold.id_grupo_cita])).rows[0].n,1);
   await Promise.all(rows.map(row=>pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_cita=$1",[row.id_cita])));
   await Promise.all(rows.map(row=>pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_cita=$1",[row.id_cita])));
-  assert.equal(await balance(actor),points-10+count);
+  // AM: Un pago mock no es evidencia financiera; completar tampoco acredita con la nueva migracion.
+  assert.equal(await balance(actor),points-10);
   for(const contact of contacts.filter(Boolean))assert.equal(await balance(contact),0);
  });
  for(const member of [false,true]) for(const count of [1,2,3,4]) await t.test(`saldo 9, VIP=${member}, ${count} acompanantes: reserva normal sin canje`,async()=>{
@@ -189,7 +195,7 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
   await invoke(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token});assert.equal(await balance(actor),0);
   await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_grupo_cita=$1",[hold.id_grupo_cita]);assert.equal(await balance(actor),0);
  });
- for(const count of [1,2,3,4])await t.test(`grupo ${count} con total configurado cero: solo un canje y puntos al completar invitados`,async()=>{
+ for(const count of [1,2,3,4])await t.test(`grupo ${count} con total configurado cero: solo un canje, sin puntos por servicios gratuitos`,async()=>{
   const actor=await owner(),reward=await prepare(actor),payload=payloadFor(Array(count).fill(null),reward.canje_context_token,{extras:false});
   payload.integrantes.slice(1).forEach(block=>{block.servicios=[{id_servicio:extra}];});
   await pool.query('UPDATE servicios_tarifas SET precio_hnl=0 WHERE id_servicio=$1',[extra]);
@@ -197,7 +203,7 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
    const hold=await invoke(actor,'/v1/citas/hold',payload);assert.equal(hold.total_pagar_hnl,0);
    const result=await invoke(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token});assert.equal(result.recompensa_utilizada.puntos_descontados,10);assert.equal(await balance(actor),0);
    await invoke(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token});assert.equal(await balance(actor),0);
-   await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_grupo_cita=$1",[hold.id_grupo_cita]);assert.equal(await balance(actor),count);
+   await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_grupo_cita=$1",[hold.id_grupo_cita]);assert.equal(await balance(actor),0);
    assert.equal((await pool.query('SELECT count(*)::int n FROM payment_intents WHERE id_grupo_cita=$1',[hold.id_grupo_cita])).rows[0].n,0);
   }finally{await pool.query('UPDATE servicios_tarifas SET precio_hnl=150 WHERE id_servicio=$1',[extra]);}
  });
@@ -240,7 +246,7 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
   const nextHold=await invoke(actor,'/v1/citas/hold',payloadFor([null,null,null],reward.canje_context_token)),intent=await createIntent(actor,nextHold);await pay(actor,nextHold,intent);
   const rows=(await pool.query('SELECT id_cita FROM citas WHERE id_grupo_cita=$1 ORDER BY orden_integrante',[nextHold.id_grupo_cita])).rows;
   for(const [i,state] of ['completada','cancelada','no_show','completada'].entries())await pool.query('UPDATE citas SET estado_cita_codigo=$1 WHERE id_cita=$2',[state,rows[i].id_cita]);
-  assert.equal(await balance(actor),1);
+  assert.equal(await balance(actor),0);
  });
  await t.test('dos servicios elegibles del mismo precio: confirma solo el servicio descontado del titular',async()=>{
   const actor=await owner();
