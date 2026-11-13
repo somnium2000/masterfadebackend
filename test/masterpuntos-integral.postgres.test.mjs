@@ -98,7 +98,7 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
     const group = randomUUID();
     await pool.query('INSERT INTO citas_grupos VALUES($1,$2)', [group, owner.id]);
     const id = await insert(owner, { group, reward: true, state: status });
-    await pool.query('INSERT INTO citas_detalles VALUES(gen_random_uuid(),$1,$2,100)', [id, owner.member ? memberService : service]);
+    await pool.query('INSERT INTO citas_detalles(id_cita_detalle,id_cita,id_servicio,subtotal_hnl) VALUES(gen_random_uuid(),$1,$2,100)', [id, owner.member ? memberService : service]);
     return { group, id };
   };
   const prepare = owner => redeemReward({ db: pool }, { idCliente: owner.id, idSucursal: branch, idServicioCanje: owner.member ? memberService : service });
@@ -589,7 +589,7 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
   await t.test('Finalizar atención y PATCH estado Completada acreditan a través de los controladores reales', async () => {
     for (const member of [false, true]) for (const patch of [false, true]) {
       const owner = await createClient(member), id = await insert(owner, { state: 'en_atencion' });
-      if (member) await pool.query('INSERT INTO citas_detalles VALUES(gen_random_uuid(),$1,$2,0)', [id, memberService]);
+      if (member) await pool.query('INSERT INTO citas_detalles(id_cita_detalle,id_cita,id_servicio,subtotal_hnl) VALUES(gen_random_uuid(),$1,$2,0)', [id, memberService]);
       const token = access(await createClient(), ['super_admin']);
       const response = await app.inject({ method: patch ? 'PATCH' : 'POST', url: `/v1/admin/citas/${id}/${patch ? 'estado' : 'finalizar-atencion'}`, headers: { cookie: `mf_session=${token}` }, payload: patch ? { estado_cita_codigo: 'completada' } : {} });
       assert.equal(response.statusCode, 200, response.body + ' ' + errors.at(-1)?.message);

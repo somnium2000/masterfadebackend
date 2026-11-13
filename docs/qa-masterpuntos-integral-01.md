@@ -1,5 +1,7 @@
 # QA-MASTERPUNTOS-INTEGRAL-01
 
+QA-MASTERPUNTOS-CANJE-GRUPAL-01, documentado al final, reemplaza la prohibicion de combinar canje del titular con acompanantes descrita en la auditoria anterior.
+
 La politica de beneficiarios de INTEGRAL-01 que se documenta a continuacion queda reemplazada, exclusivamente para grupos `cliente_autenticado`, por QA-MASTERPUNTOS-ACOMPANANTES-01 al final de este informe. Las ejecuciones anteriores se conservan como historial.
 
 ## Alcance y procedencia
@@ -263,3 +265,73 @@ Archivos de ACOMPANANTES-01 (los listados anteriores corresponden a tickets prev
 
 - Backend: `db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql`, `db/manual/masterpuntos_integral_preflight.sql`, `src/routes/v1/public/citas.js`, `test/masterpuntos-integral.postgres.test.mjs`, `test/public-guest-contact-qa02f.test.mjs`, `test/sql/masterpuntos-integral-fixture.sql` y este informe.
 - Frontend: `src/features/public/booking/PublicBookingFlow.jsx`, `src/features/public/booking/PublicBookingConfirmStep.jsx`, `src/features/public/booking/__tests__/bookingCompanions.mf118.test.jsx`, `test/companionsMf118.browser.mjs`.
+
+## QA-MASTERPUNTOS-CANJE-GRUPAL-01 — 13/11/2026
+
+### Alcance y causas reproducidas
+
+Bases de dev verificadas limpias y sincronizadas: backend `fa98cecbb51e0c9594774762df1fb70513932d47`, frontend `815f8fea22de3efe206d1d3386e95946d54f78b0`. Se conserva la atribucion al titular de ACOMPANANTES-01.
+
+1. El hold autenticado rechazaba cualquier grupo con contexto de recompensa mediante `POINTS_REDEEM_COMPANIONS_NOT_ALLOWED`. Se retira exclusivamente esa prohibicion. Se valida el orden secuencial de integrantes para impedir que una solicitud manipulada haga tratar a varios integrantes como titulares; devuelve 400 `POINTS_REDEEM_GROUP_ORDER_INVALID` sin crear operaciones. La prueba anterior reproducía un rechazo SQL con 500; ahora se valida antes del calculo y persistencia.
+2. Se reprodujo `POINTS_REDEEM_SERVICE_AMBIGUOUS` con dos servicios elegibles del titular de igual precio: el pago sintetico estaba registrado, pero la confirmacion no podia identificar el servicio canjeado. La finalizacion ahora utiliza el descuento persistido por linea para identificar una unica candidata. Conserva la resolucion anterior para registros historicos sin ese dato y el rechazo ante ambiguedad real. No reescribe datos ni asigna servicios arbitrariamente.
+3. El resumen podia presentar el importe de recompensa dentro de Descuento y otra vez como Cubierto por recompensa. Se separa visualmente la cobertura de los otros descuentos; el total del hold sigue siendo autoridad. Se explican los 10 puntos al confirmar, el saldo de extras/acompanantes y los puntos futuros de citas completadas elegibles.
+
+### Contratos conservados
+
+- Solo el servicio elegible seleccionado del titular recibe la recompensa. Los extras del titular y todos los servicios de acompanantes mantienen su precio configurado. No se aplica cobertura de membresia simultaneamente a la recompensa; tampoco se habilitan promociones incompatibles ni paquetes del titular.
+- La construccion canonica del hold, sus lineas, el total de grupo y los precios del intento/confirmacion no se modifican. Las pruebas comparan el total de respuesta con citas y detalles persistidos y con el importe del intento y del proveedor externo simulado. Un intento con importe divergente se rechaza antes de registrar pago/consumir puntos.
+- Se mantiene el canje obligatorio a partir de 10 puntos. Preparar y crear hold/intent no debita. Solo confirmar descuenta exactamente 10 una vez; fallos, pendientes y expiraciones no consumen. Reintentos y concurrencia conservan su idempotencia.
+- La cita canjeada del titular no acredita puntos al completarse, incluso con extras. Cada cita elegible completada de acompanante acredita +1 al titular mediante el SQL pendiente de ACOMPANANTES-01; canceladas y no_show no acreditan. No se acreditan puntos a las cuentas de acompanantes.
+- Roles, pertenencia, sucursal, elegibilidad por membresia, guards administrativos y comercio privado permanecen intactos. Ninguna ruta o proveedor se habilita en despliegues pausados.
+
+Endpoints cuyos comportamientos se verificaron con sus controladores originales: `POST /v1/citas/hold`, `POST /v1/citas/hold/:id_grupo_cita/confirmar`, `POST /v1/pagos/reservas/crear-intent`, `POST /v1/pagos/reservas/estado`. La confirmacion pagada aislada utiliza exclusivamente el endpoint mock existente en una App de prueba, sin pasarela ni tarjeta. No se modifica `public/pagos.js`, PixelPay ni TodoPago.
+
+### Integracion aislada
+
+La nueva suite `test/masterpuntos-group-redeem.postgres.test.mjs` crea un PostgreSQL 18.6 efimero, limitado a loopback. Carga el esquema sintetico existente, las migraciones originales de reserva canonica/idempotencia/confirmacion, los triggers originales y la propuesta manual pendiente. Todas esas ejecuciones SQL ocurren solamente en el cluster local, que se elimina al terminar.
+
+Fastify utiliza rutas, autenticacion criptografica, guardas de rol y servicios reales. Solo los perfiles/sesiones y el proveedor externo son fixtures; ningun handler comercial es sustituido. El proveedor de prueba registra los argumentos de creacion de intento y no ejecuta cobros. La confirmacion mock escribe y confirma exclusivamente pagos sinteticos con las funciones SQL originales. Las notificaciones tambien quedan en la base aislada; no existe transporte SMTP real.
+
+La App de prueba habilitada excluye los guards de pausa para ejercitar los controladores comerciales con el proveedor mock. Una segunda App incorpora los guards originales, `adminDataEntryMode=true`, `paymentProvider=disabled` y piloto privado deshabilitado: hold, confirmacion, intent, pago y preparacion de canje se rechazan antes de cualquier consulta SQL o efecto secundario. Las suites existentes de privateCommerce y adminDataEntry se ejecutan adicionalmente. Esto no cambia configuracion del workspace ni del despliegue.
+
+### Cobertura local
+
+| Caso | Archivo/test | Resultado |
+|---|---|---|
+| 10/20 puntos, VIP/sin VIP, 1-4 acompanantes registrados o invitados | Nueva suite PostgreSQL: 32 combinaciones | PASS |
+| 9 puntos, VIP/sin VIP, 1-4 acompanantes | Misma suite: 8 combinaciones normales, preparacion rechazada | PASS |
+| Extras del titular, servicio canjeado unico, total de hold/intent/confirmacion | Misma suite, consultas y RPC originales | PASS |
+| Contexto preparado, pago pendiente, fallido, expirado y hold vencido | Misma suite | PASS, sin descuento prematuro |
+| Total cero individual y grupos 1-4 con tarifas sinteticas cero para acompanantes | Misma suite | PASS, confirmacion sin intent y un solo debito |
+| Reintentos/concurrencia de confirmacion y finalizacion | Misma suite + suite integral anterior | PASS, sin duplicados |
+| Token ajeno/invalido, propietario ajeno, servicio ausente, paquetes del titular, orden duplicado e importe adulterado | Misma suite | PASS, sin consumo ni operacion indebida |
+| Cancelaciones, no_show, titular canjeado y finalizacion de acompanantes | Misma suite + integral anterior | PASS |
+| Dos servicios elegibles de igual precio | Misma suite | PASS tras reproducir y corregir ambiguedad |
+| Ausencia de recompensa elegible y recompensa de tarifa cero | Misma suite | PASS, bloqueos conservados |
+| Rechazo del comercio pausado antes de SQL | Misma suite + privateCommerce/adminDataEntry existentes | PASS |
+| Resumen de grupo con/sin hold, cobertura unica, importe y puntos futuros | `bookingCompanions.mf118.test.jsx` | PASS |
+| 10 puntos sin servicios disponibles | `MasterPuntos.qa18c.test.jsx` | PASS, aviso y boton deshabilitado |
+| App compilada, router/hooks/resumen originales, 1-4 acompanantes con/sin recompensa | `companionsMf118.browser.mjs` | PASS, 18 escenarios 390/1440 px |
+| Saldos, servicios, errores y comercio habilitado/pausado | `masterpuntosIntegral.browser.mjs` | PASS, 8 escenarios 390/1440 px, ambos temas |
+
+Comandos SQL/contactos y regresiones (el runtime PostgreSQL externo debe indicarse mediante `MASTERFADE_PHASE02_PG_BIN`):
+
+```powershell
+node --test test/masterpuntos-group-redeem.postgres.test.mjs test/masterpuntos-integral.postgres.test.mjs test/public-guest-contact-qa02f.test.mjs test/mf118-companions-points.postgres.test.mjs test/agenda-phase02.postgres.test.mjs test/cliente-plan-consumptions.postgres.test.mjs
+node --test test/client-points-rewards.qa-mp-client-02.test.mjs test/admin-points-rewards-permissions.qa15b.test.mjs test/admin-points-branch-scope.qa15a.test.mjs test/admin-points-idempotency.qa-mp-02.test.mjs test/masterpoints-readonly-expiration.qa-mp-01c.test.mjs test/admin-masterpoints-reads.qa15.test.mjs test/private-commerce.test.mjs test/canonical-booking.integration.test.mjs test/membership-financial-security.test.mjs test/membership-purchase-order-idempotency.test.mjs test/membership-purchase-branch-operability.test.mjs test/admin-booking-service.test.mjs test/microfase2a-booking.test.mjs test/booking-hold-orchestration.test.mjs test/booking-hold-route-orchestration.test.mjs test/admin-data-entry-mode.test.mjs
+```
+
+Frontend: las mismas 11 suites Vitest enumeradas en ACOMPANANTES-01; se amplian las pruebas de resumen y ausencia de servicios. Navegador: el mismo comando de ACOMPANANTES-01, con `MASTERFADE_CHROMIUM_CHANNEL=chrome`, `MASTERFADE_BROWSER_ENGINES=chromium`, runtime Playwright externo y preview local compilado en 4189. Se interceptan exclusivamente APIs externas; no hay holds, intents o cobros reales en navegador. Capturas en `%TEMP%/mf-points-companions-evidence/*-reward-true.png`.
+
+Archivos backend: `src/routes/v1/citas.js`, `src/services/pointsService.js`, `test/masterpuntos-group-redeem.postgres.test.mjs`, `test/masterpuntos-integral.postgres.test.mjs`, `test/public-guest-contact-qa02f.test.mjs`, `test/sql/masterpuntos-integral-fixture.sql` y este informe. El fixture anterior incorpora la columna fiscal de descuento que ya existe en el esquema real y se usan inserts de columnas explicitas.
+
+Archivos frontend: `src/features/public/booking/PublicBookingConfirmStep.jsx`, `src/features/public/booking/__tests__/bookingCompanions.mf118.test.jsx`, `src/features/cliente/pages/__tests__/MasterPuntos.qa18c.test.jsx`, `test/companionsMf118.browser.mjs`.
+
+### Bloqueos y pendientes reales
+
+- Con 10 o mas puntos y sin servicios elegibles, sigue siendo obligatorio canjear, pero no existe opcion valida. La preparacion devuelve `POINTS_REDEEM_SERVICE_FORBIDDEN`, la reserva normal conserva `REWARD_REDEEM_REQUIRED` y el frontend informa ausencia de servicios. Resolverlo requiere configuracion autorizada de servicios por condicion/sucursal o una nueva decision comercial, no omitir el gate.
+- Una tarifa cero del propio servicio canjeado no aporta cobertura monetaria y conserva `POINTS_REDEEM_NOT_APPLIED`, sin crear citas ni debitar puntos. Esto es distinto de una recompensa positiva que deja el total grupal en cero; ese caso sí confirma sin pago. No se cambia la regla para consumir 10 puntos por un servicio de precio cero.
+- Los archivos SQL manuales de completion/ciclos/preflight permanecen sin cambios y sin aplicacion remota. La acreditacion al completar requiere su revision y aplicacion manual autorizada en QA. Las pruebas locales no certifican los triggers remotos.
+- No se consultan ni modifican Supabase remoto, reservas/cuentas reales, variables del despliegue, main o Produccion. No hay merge ni despliegue manual. OAuth, correo real, WebKit y dispositivos fisicos no se presentan como ejecutados.
+
+Resultados finales CANJE-GRUPAL-01: **185/185 pruebas SQL/contactos/transiciones/planes PASS**, mas **323/323 regresiones backend PASS** (508 en total, cero omisiones). Frontend: **204/204 Vitest PASS** en 11 suites y **26/26 escenarios Chrome PASS** sobre build compilado, sin excepciones ni desbordamiento horizontal. Se revisaron las capturas de cuatro acompanantes con recompensa a 390 px oscuro y 1440 px claro. **ESLint de archivos afectados, sintaxis Node, build frontend y git diff --check PASS**. Build conserva el aviso existente de chunks mayores de 500 kB. Backend no dispone de script de build. No se afirma una suite global completa ni certificacion del entorno remoto.

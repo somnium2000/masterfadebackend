@@ -1511,9 +1511,9 @@ function normalizeHoldBlocksPayload(body) {
 
 function assertRewardRedeemExclusiveHold({ rewardRedeemContext, integrantes, codigoPromocional }) {
   if (!rewardRedeemContext) return;
-  if (Array.isArray(integrantes) && integrantes.length > 1) {
-    throw new AppError(409, "La recompensa aplica solo al titular y no combina con acompanantes.", {
-      code: "POINTS_REDEEM_COMPANIONS_NOT_ALLOWED",
+  if (Array.isArray(integrantes) && integrantes.some((item, index) => Number(item.orden_integrante ?? index + 1) !== index + 1)) {
+    throw new AppError(400, "Los integrantes deben mantener su orden en la reserva.", {
+      code: "POINTS_REDEEM_GROUP_ORDER_INVALID",
     });
   }
 

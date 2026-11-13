@@ -155,7 +155,7 @@ test('ACOMPANANTES-01: aviso para correos de acompanantes sin consultar identida
   assert.equal(queries, 0);
 });
 
-test('ACOMPANANTES-01: auditoria del bloqueo comercial de canje con 1-4 acompanantes', () => {
+test('ACOMPANANTES-01: canje del titular admite 1-4 acompanantes y conserva restricciones', () => {
   const source = readFileSync(new URL('../src/routes/v1/citas.js', import.meta.url), 'utf8');
   const exclusive = vm.runInNewContext('(' + extract(source, 'function assertRewardRedeemExclusiveHold(', 'function buildUniqueServiceIds(') + ')', {
     AppError: ErrorDouble, safeText: value => String(value || '').trim(),
@@ -163,7 +163,11 @@ test('ACOMPANANTES-01: auditoria del bloqueo comercial de canje con 1-4 acompana
   for (const count of [1, 2, 3, 4]) {
     const integrantes = Array.from({ length: count + 1 }, () => ({ selection_type: 'services' }));
     assert.doesNotThrow(() => exclusive({ integrantes, rewardRedeemContext: null }));
-    assert.throws(() => exclusive({ integrantes, rewardRedeemContext: {} }), error => error.code === 'POINTS_REDEEM_COMPANIONS_NOT_ALLOWED' && error.statusCode === 409);
+    assert.doesNotThrow(() => exclusive({ integrantes, rewardRedeemContext: {} }));
+    for (const change of [{selection_type:'package'}, {selection_type:'mixed'}, {id_paquete:group}]) {
+      assert.throws(() => exclusive({ integrantes: [{...integrantes[0],...change},...integrantes.slice(1)], rewardRedeemContext: {} }), error => error.code === 'POINTS_REDEEM_PACKAGE_NOT_ALLOWED');
+    }
+    assert.throws(() => exclusive({ integrantes, rewardRedeemContext: {}, codigoPromocional: 'PROMO' }), error => error.code === 'POINTS_REDEEM_PROMOTION_NOT_ALLOWED');
   }
   assert.match(source, /code: ['"]REWARD_REDEEM_REQUIRED['"]/);
 });

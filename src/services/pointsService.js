@@ -927,6 +927,7 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
       SELECT
         cd.id_servicio,
         COALESCE(cd.subtotal_hnl, 0)::numeric AS subtotal_hnl,
+        COALESCE(cd.descuento_hnl, 0)::numeric AS descuento_hnl,
         s.nombre_servicio
       FROM public.citas_detalles cd
       JOIN public.servicios s
@@ -981,6 +982,7 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
           id_servicio: validated.id_servicio,
           nombre_servicio: validated.nombre_servicio,
           subtotal_hnl: Number(detail.subtotal_hnl || 0),
+          descuento_hnl: Number(detail.descuento_hnl || 0),
         });
       } catch (error) {
         if (!(error instanceof AppError)) throw error;
@@ -996,7 +998,12 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
       [selectedService] = candidates;
     } else {
       const descuento = Number(titular.descuento_hnl || 0);
-      const candidatesByDiscount = candidates.filter((candidate) => Math.abs(Number(candidate.subtotal_hnl || 0) - descuento) < 0.01);
+      // AM: En reservas nuevas la linea descontada identifica el canje, aunque los extras cuesten lo mismo.
+      const persistedDiscountCandidates = candidates.filter((candidate) => candidate.descuento_hnl > 0
+        && Math.abs(candidate.descuento_hnl - descuento) < 0.01);
+      const candidatesByDiscount = persistedDiscountCandidates.length
+        ? persistedDiscountCandidates
+        : candidates.filter((candidate) => Math.abs(Number(candidate.subtotal_hnl || 0) - descuento) < 0.01);
       if (candidatesByDiscount.length !== 1) {
         throw new AppError(409, "No se pudo determinar de forma segura el servicio del canje", {
           code: "POINTS_REDEEM_SERVICE_AMBIGUOUS",
