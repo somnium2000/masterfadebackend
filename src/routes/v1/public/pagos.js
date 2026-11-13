@@ -1686,7 +1686,7 @@ export async function reconcilePixelPayPaid(client, {
         return { processed: false, manual_reconciliation_required: true, booking_confirmed: false,
           estado_intent_codigo: intent.estado_intent_codigo };
       }
-      paidAt = approval.finalized_at;
+      paidAt = approval.paid_at;
       allowExpiredRecovery = true;
     }
 
@@ -1761,10 +1761,10 @@ export async function reconcilePixelPayPaid(client, {
           && groupRows.every((row) => ["en_espera", "pendiente_pago", "expirada"].includes(row.estado_cita_codigo)
             && ["activo", "expirado"].includes(row.estado_hold_codigo));
         const durableApproval = allowExpiredRecovery && recoveryStatesValid
-          ? await loadDurablePixelPayApproval(client, { idIntent, groupRows,
+          ? await loadDurablePixelPayApproval(client, { idIntent, groupRows, expectedPaidAt: canonicalPaidAt,
             ...(fromDurableApproval ? { holdRows: lockedRecoveryHolds.rows } : {}) }) : null;
-        if (durableApproval && new Date(paidAt).getTime() === new Date(durableApproval.finalized_at).getTime()) {
-          canonicalPaidAt = durableApproval.finalized_at;
+        if (durableApproval) {
+          canonicalPaidAt = durableApproval.paid_at;
         } else {
           await client.query("COMMIT");
           return {
