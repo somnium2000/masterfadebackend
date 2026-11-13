@@ -19,6 +19,7 @@ import {
   parseDateOnly,
   resolveEffectiveDayAvailability,
   SLOT_INTERVAL_MINUTES,
+  SLOT_DISCARD_REASONS,
 } from "../../../services/agendaService.js";
 
 const requestIdSchema = { type: "string" };
@@ -453,6 +454,34 @@ function mapDiscardedReasonSummary(discarded) {
   return Array.from(counts.entries()).map(([code, count]) => ({ code, count }));
 }
 
+export function mapDiscardedSlotsForResponse(discarded) {
+  const reasonCodes = new Set(Object.values(SLOT_DISCARD_REASONS));
+  const safeDate = value => {
+    if (!value || !(typeof value === "string" || value instanceof Date)) return null;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  };
+  // AM: El diagnostico autorizado conserva tiempos y razones, nunca filas ni datos de clientes.
+  return (Array.isArray(discarded) ? discarded : []).map(entry => {
+    const details = {};
+    for (const key of ["interval_duration_min", "required_duration_min", "residual_before_min", "residual_after_min", "min_sellable_min"]) {
+      const value = entry?.details?.[key];
+      if (typeof value === "number" && Number.isFinite(value)) details[key] = value;
+    }
+    if (["branch_exceptions", "schedule_missing_or_closed"].includes(entry?.details?.reason)) {
+      details.reason = entry.details.reason;
+    }
+    return {
+      reason: reasonCodes.has(entry?.reason) ? entry.reason : SLOT_DISCARD_REASONS.RESOURCE_UNAVAILABLE,
+      inicio_at: safeDate(entry?.inicio_at),
+      fin_at: safeDate(entry?.fin_at),
+      intervalo_inicio_at: safeDate(entry?.intervalo_inicio_at),
+      intervalo_fin_at: safeDate(entry?.intervalo_fin_at),
+      details,
+    };
+  });
+}
+
 function mapTariffsForResponse(selection) {
   return (Array.isArray(selection?.items) ? selection.items : []).map((item) => ({
     id_servicio: item.id_servicio,
@@ -810,12 +839,11 @@ export default async function publicAgendaRoutes(app) {
         const horariosCurados = buildCuratedSlotExposure(horarios, {
           minSellableDurationMin,
         });
+        const discardedSlots = includeDebug && idBarbero ? mapDiscardedSlotsForResponse(availability?.discarded_slots) : [];
         const debugPayload = includeDebug
           ? {
-              discarded_reason_codes: idBarbero ? mapDiscardedReasonSummary(availability?.discarded_slots) : [],
-              discarded_slots: idBarbero && Array.isArray(availability?.discarded_slots)
-                ? availability.discarded_slots.slice(0, 120)
-                : [],
+              discarded_reason_codes: mapDiscardedReasonSummary(discardedSlots),
+              discarded_slots: discardedSlots.slice(0, 120),
               curated_ranking: buildCuratedSlotExposureDebug(horarios, {
                 minSellableDurationMin,
               }),
