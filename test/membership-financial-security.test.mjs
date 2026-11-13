@@ -293,13 +293,17 @@ function pixelPayProcessHarness({
       // AM: Fixtures activas verificadas para el guard de cuenta vigente.
       if (text.includes("AS deletion_identity_lock")) return { rows: [{ deletion_identity_lock: lockAvailable }] };
       if (text.includes("AS cliente_activo")) return { rows: [{ cliente_activo: true, cliente_deleted_at: null, anonimizado: false, usuario_activo: true, usuario_deleted_at: null, estado_acceso: "activo", eliminacion_en_curso: false, ...identity }] };
+      if (text.includes("AS evidence_within_validity")) return { rows: [{
+        evidence_within_validity: new Date(values[1]).getTime() <= Math.min(
+          new Date(row.intent_expires_at).getTime(), new Date(row.order_expires_at).getTime()),
+      }] };
       if (text === "BEGIN" || text.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
       if (text === "COMMIT") { state.commits += 1; return { rows: [] }; }
       if (text === "ROLLBACK") { state.rollbacks += 1; return { rows: [] }; }
       if (text.includes("pi.id_intent <> $4::uuid")) {
         return { rows: pendingScopeIntent ? [{ id_intent: pendingScopeIntent }] : [] };
       }
-      if (text.includes("FROM public.payment_intents pi") && text.includes("JOIN public.payment_events pe")) {
+      if (text.includes("FROM public.payment_intents pi") && text.includes("WITH valid_membership_events AS")) {
         const currentEvidence = durableEvidence || state.dynamicDurableEvidence;
         const currentVerifiedAt = durableVerifiedAt || state.dynamicVerifiedAt;
         return { rows: currentEvidence ? [{
@@ -316,6 +320,8 @@ function pixelPayProcessHarness({
           estado_orden_codigo: state.orderState,
           id_suscripcion: state.idSubscription,
           payload_esencial: currentEvidence,
+          within_validity: new Date(currentVerifiedAt).getTime() <= Math.min(
+            new Date(row.intent_expires_at).getTime(), new Date(row.order_expires_at).getTime()),
           verified_at: currentVerifiedAt instanceof Date
             && text.includes("to_char(pe.recibido_at AT TIME ZONE 'UTC'")
             ? currentVerifiedAt.toISOString()
@@ -773,10 +779,10 @@ test("aprobacion verificada recibida despues del vencimiento queda pendiente sin
   assert.equal(state.saleCalls, 1);
 });
 
-test("contrato SQL VIP no inventa paid_at y recupera el primer evento durable", () => {
+test("contrato SQL VIP no inventa paid_at y exige un evento durable valido unico", () => {
   const source = readFileSync(new URL("../src/services/membershipService.js", import.meta.url), "utf8");
   assert.doesNotMatch(source, /COALESCE\(\$6::timestamptz,\s*now\(\)\)/i);
-  assert.match(source, /ORDER BY pe\.recibido_at ASC/i);
+  assert.match(source, /SELECT count\(\*\) FROM valid_membership_events\) = 1/i);
   assert.doesNotMatch(source, /SET estado_orden_codigo = 'pagada',[\s\S]{0,120}paid_at = now\(\)/i);
 });
 

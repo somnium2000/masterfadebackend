@@ -16,6 +16,7 @@ import citas from "../src/routes/v1/citas.js";
 import pagos from "../src/routes/v1/pagos.js";
 import adminCitas from "../src/routes/v1/admin/citas.js";
 import adminMembresias from "../src/routes/v1/admin/membresias.js";
+import adminReportes from "../src/routes/v1/admin/reportes.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 
@@ -42,6 +43,7 @@ async function fixture(t, options = {}) {
     if (sql.includes("FROM public.seguridad_sesiones")) return { rows: options.revoked ? [] : [{ estado: "activa", ultimo_uso_at: new Date(), expira_at: new Date(Date.now() + 60000) }] };
     if (sql.includes("UPDATE public.seguridad_sesiones")) return { rows: [] };
     if (sql.includes("WITH base_user")) return { rows: [{ id_usuario: params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
+    if (options.businessQuery) return options.businessQuery(sql, params);
     state.unexpectedSql++; throw Error("Unexpected business SQL");
   }, connect: async () => { state.unexpectedSql++; throw Error("Business connection prohibited"); } });
   await app.register(fp(async a => a.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false, ...options.config }), { name: "env-plugin" }));
@@ -57,6 +59,7 @@ async function fixture(t, options = {}) {
   await app.register(publicPagos, { prefix: "/v1/pagos/reservas", authenticated: true });
   await app.register(adminCitas, { prefix: "/v1/admin/citas" });
   await app.register(adminMembresias, { prefix: "/v1/admin/membresias" });
+  await app.register(adminReportes, { prefix: "/v1/admin/reportes" });
   app.post("/v1/citas/probe", async () => { state.business++; return { ok: true }; });
   app.post("/v1/auth/register", async () => ({ presaleReached: true }));
   app.post("/v1/auth/login", async () => ({ presaleReached: true }));
@@ -169,6 +172,63 @@ test("callback reaches its own financial guard even in administrative mode", asy
   assert.equal(callback.statusCode, 503);
   assert.equal(callback.json().error.code, "PIXELPAY_WEBHOOK_DISABLED");
   assert.equal(f.state.unexpectedSql, 0);
+});
+
+test("compras suspendidas: conciliacion de reservas y membresias tambien queda bloqueada antes del negocio", async t => {
+  const f = await fixture(t, { env: { PRIVATE_COMMERCE_PILOT_ENABLED: "false" } });
+  let providerInitializations = 0;
+  const originalCreate = PaymentProviderFactory.create;
+  PaymentProviderFactory.create = () => { providerInitializations++; throw new Error("Provider prohibited"); };
+  t.after(() => { PaymentProviderFactory.create = originalCreate; });
+  const existingPayment = { id_grupo_cita: USER, id_intent: OTHER, titular_email: "existing@example.invalid" };
+  // AM: Caracterizar el bloqueo real pendiente; esto no acredita continuidad de conciliacion.
+  for (const [url, payload] of [
+    ["/v1/public/pagos/estado", existingPayment],
+    ["/v1/public/pagos/pixelpay/status", existingPayment],
+    ["/v1/pagos/reservas/estado", existingPayment],
+    ["/v1/pagos/reservas/pixelpay/status", existingPayment],
+    [`/v1/cliente/planes/pago-intent/${OTHER}/estado`, {}],
+    ["/v1/public/pagos/crear-intent", {}],
+    ["/v1/public/pagos/pixelpay/sale", {}],
+    ["/v1/cliente/planes/orden", {}],
+    ["/v1/cliente/planes/confirmar-pago", {}],
+  ]) {
+    const response = await f.app.inject({ method: "POST", url, headers: f.headers(), payload });
+    assert.equal(response.statusCode, 403, `${url}: ${response.body}`);
+    assert.equal(response.json().error.code, "PRIVATE_COMMERCE_RESTRICTED");
+  }
+  assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+  assert.equal(providerInitializations, 0);
+});
+
+test("compras suspendidas: contexto real de reportes sigue disponible solo con sesion y rol autorizado", async t => {
+  for (const [name, roles, authenticated, statusCode] of [
+    ["super_admin", ["super_admin"], true, 200],
+    ["cliente", ["cliente"], true, 403],
+    ["sin sesion", ["super_admin"], false, 401],
+  ]) {
+    await t.test(name, async sub => {
+      const reads = [];
+      const branch = { id_sucursal: USER, nombre_sucursal: "Synthetic branch" };
+      const f = await fixture(sub, { env: { PRIVATE_COMMERCE_PILOT_ENABLED: "false" }, roles,
+        businessQuery: async sql => {
+          reads.push(sql);
+          assert.doesNotMatch(sql, /\b(?:INSERT|UPDATE|DELETE|CALL)\b/i);
+          if (sql.includes("FROM public.sucursales")) return { rows: [branch] };
+          if (sql.includes("FROM public.empleados")) return { rows: [] };
+          throw new Error("Unexpected report query");
+        } });
+      const response = await f.app.inject({ url: "/v1/admin/reportes/contexto",
+        headers: authenticated ? f.headers() : {} });
+      assert.equal(response.statusCode, statusCode, response.body);
+      if (statusCode === 200) {
+        assert.deepEqual(response.json().data.sucursales, [branch]);
+        assert.deepEqual(response.json().data.barberos, []);
+        assert.equal(reads.length, 3);
+      } else assert.equal(reads.length, 0);
+      assert.equal(f.state.unexpectedSql, 0);
+    });
+  }
 });
 
 test("pilot off: maintenance and existing membership cancellations retain auth and role guards", async t => {

@@ -31,10 +31,10 @@ test("SDK no convierte transaction_date o transaction_time en evidencia temporal
   assert.doesNotMatch(source, /paidAt\s*:\s*result\?\.transaction_(?:date|time)/i);
 });
 
-test("membresias propagan el primer recibo durable sin fallback de reloj", async () => {
+test("membresias propagan recibo durable unico sin fallback de reloj", async () => {
   const source = await readFile(membershipUrl, "utf8");
 
-  assert.match(source, /ORDER BY pe\.recibido_at ASC/i);
+  assert.match(source, /SELECT count\(\*\) FROM valid_membership_events\) = 1/i);
   assert.match(source, /SELECT to_char\(min\(pe\.recibido_at\)/i);
   assert.doesNotMatch(source, /COALESCE\(\$6::timestamptz,\s*now\(\)\)/i);
   assert.doesNotMatch(source, /SET estado_orden_codigo = 'pagada',[\s\S]{0,120}paid_at = now\(\)/i);
