@@ -64,18 +64,65 @@ export function privateCommerceIpAllowed(request, config) {
 
 export default fp(async function privateCommerce(app) {
   const config = app.config.privateCommercePilot || resolvePrivateCommerceConfig(process.env);
+  const diagnosticsEnabled = process.env.PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED === "true";
   const verify = app.requireRoles([]);
+
+  function eligibilityResult(request, allowed, reason, identityEvaluated = false) {
+    if (diagnosticsEnabled) {
+      try {
+        const peer = request.raw.socket.remoteAddress;
+        const ip = request.ip;
+        const ipsCount = request.ips?.length || 0;
+        const peerMatchesProxy = config.proxies.includes(normalizeIp(peer));
+        if (reason === "IP_NOT_ALLOWED") {
+          reason = !config.proxies.length ? "DIRECT_IP_NOT_ALLOWED"
+            : !peerMatchesProxy ? "PROXY_PEER_NOT_ALLOWED"
+            : ipsCount !== 2 ? "PROXY_HOP_COUNT_INVALID" : "CLIENT_IP_NOT_ALLOWED";
+        }
+        request.log.info({
+          privateCommerceEligibility: {
+            reason,
+            tcp_peer: typeof peer === "string" && normalizeIp(peer) ? peer : null,
+            request_ip: typeof ip === "string" && normalizeIp(ip) ? ip : null,
+            request_ips_count: ipsCount,
+            proxy_peer_allowed: peerMatchesProxy,
+            tcp_peer_ip_allowed: config.ips.includes(normalizeIp(peer)),
+            request_ip_allowed: config.ips.includes(normalizeIp(ip)),
+            session_cookie_present: Boolean(request.cookies?.mf_session),
+            // AM: False identity flags are unevaluated until the existing auth guard succeeds.
+            identity_evaluated: identityEvaluated,
+            user_uuid_allowed: identityEvaluated && config.userIds.includes(String(request.auth?.sub || "").toLowerCase()),
+            claims_subject_matches: identityEvaluated && request.claims?.user?.id_usuario === request.auth?.sub,
+            active_client_resolved: identityEvaluated && UUID.test(String(request.claims?.cliente_id || "")),
+            client_role_present: identityEvaluated && request.claims?.roles?.includes("cliente") === true,
+          },
+        }, "Private commerce eligibility diagnostic");
+      } catch {
+        // AM: Temporary diagnostics must never affect authorization or response handling.
+      }
+    }
+    return allowed;
+  }
+
   async function eligible(request, reply) {
-    if (!config.enabled || app.config.adminDataEntryMode || app.config.paymentProvider !== "pixelpay"
-      || !privateCommerceIpAllowed(request, config)) return false;
-    if (!request.cookies?.mf_session) return false;
-    await verify(request, reply);
-    if (reply.sent) return false;
-    return config.userIds.includes(String(request.auth?.sub || "").toLowerCase())
-      && request.claims?.user?.id_usuario === request.auth?.sub
-      // AM: Eligibility promises both client flows; the server must resolve an active client and role.
-      && UUID.test(String(request.claims?.cliente_id || ""))
-      && request.claims?.roles?.includes("cliente") === true;
+    if (!config.enabled) return eligibilityResult(request, false, "PILOT_DISABLED");
+    if (app.config.adminDataEntryMode) return eligibilityResult(request, false, "ADMIN_DATA_ENTRY_MODE");
+    if (app.config.paymentProvider !== "pixelpay") return eligibilityResult(request, false, "PAYMENT_PROVIDER_NOT_PIXELPAY");
+    if (!privateCommerceIpAllowed(request, config)) return eligibilityResult(request, false, "IP_NOT_ALLOWED");
+    if (!request.cookies?.mf_session) return eligibilityResult(request, false, "SESSION_COOKIE_MISSING");
+    try {
+      await verify(request, reply);
+    } catch (error) {
+      eligibilityResult(request, false, "AUTH_VERIFICATION_ERROR");
+      throw error;
+    }
+    if (reply.sent) return eligibilityResult(request, false, "AUTH_GUARD_REPLIED");
+    if (!config.userIds.includes(String(request.auth?.sub || "").toLowerCase())) return eligibilityResult(request, false, "USER_UUID_NOT_ALLOWED", true);
+    if (request.claims?.user?.id_usuario !== request.auth?.sub) return eligibilityResult(request, false, "CLAIMS_SUBJECT_MISMATCH", true);
+    // AM: Eligibility promises both client flows; the server must resolve an active client and role.
+    if (!UUID.test(String(request.claims?.cliente_id || ""))) return eligibilityResult(request, false, "ACTIVE_CLIENT_NOT_RESOLVED", true);
+    if (request.claims?.roles?.includes("cliente") !== true) return eligibilityResult(request, false, "CLIENT_ROLE_MISSING", true);
+    return eligibilityResult(request, true, "ALLOWED", true);
   }
   app.addHook("onRequest", async (request, reply) => {
     if (!isPrivateCommerceRoute(request.method, request.routeOptions.url)) return;
