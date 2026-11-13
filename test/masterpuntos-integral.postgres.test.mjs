@@ -46,7 +46,7 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
   binary('initdb', ['-D', data, '-U', 'postgres', '-A', 'trust', '--encoding=UTF8', '--locale=C', '--no-sync']);
   binary('pg_ctl', ['-D', data, '-l', path.join(dir, 'pg.log'), '-o', `-h 127.0.0.1 -p ${port}`, '-w', 'start']);
   started = true;
-  pool = new pg.Pool({ host: '127.0.0.1', port, user: 'postgres', database: 'postgres', max: 6 });
+  pool = new pg.Pool({ host: '127.0.0.1', port, user: 'postgres', database: 'postgres', max: 6, options: '-c timezone=UTC' });
   await pool.query(await sqlFile('masterpuntos-integral-fixture.sql'));
   await pool.query(await sqlFile('masterpuntos-legacy-functions.sql'));
   await pool.query(await sqlFile('mf118-points-fixture.sql'));
@@ -123,6 +123,185 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
     assert.equal(await balance(owner.id), -10);
     await pool.query('DELETE FROM points_transactions WHERE id_cliente=$1', [owner.id]);
     await pool.query('DELETE FROM points_cycles WHERE id_cliente=$1', [owner.id]);
+  });
+  await t.test('PREFLIGHT-02: historia cerrada anterior al ciclo, sin cambios de datos', async suite => {
+    const readOnlySql = await readFile(new URL('../db/manual/masterpuntos_integral_preflight.sql', import.meta.url), 'utf8');
+    const proof = sql => sql.replace(/\r\n/g, '\n').split('-- AM: BEGIN HISTORICAL_DEBITS_PROOF\n')[1].split('-- AM: END HISTORICAL_DEBITS_PROOF')[0];
+    assert.equal(proof(migrationSql), proof(readOnlySql), 'Diagnostico y bloqueo utilizan exactamente la misma prueba');
+    const guard = migrationSql.slice(migrationSql.indexOf('DO $preflight$'), migrationSql.indexOf('$preflight$;') + '$preflight$;'.length);
+    const oldGuard = `DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM public.points_transactions debit
+        WHERE debit.puntos < 0 AND debit.tipo_puntos_codigo <> 'vencimiento' AND debit.id_cycle IS NULL
+          AND EXISTS (SELECT 1 FROM public.points_cycles pc
+            JOIN public.points_transactions credit ON credit.id_cycle = pc.id_cycle AND credit.puntos > 0
+            WHERE pc.id_cliente = debit.id_cliente AND pc.estado_ciclo_codigo = 'activo')) THEN
+        RAISE EXCEPTION 'MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED';
+      END IF; END $$;`;
+    const snapshot = async () => (await pool.query(`SELECT jsonb_build_object(
+      'movimientos', (SELECT jsonb_agg(to_jsonb(pt) ORDER BY pt.id_points_tx) FROM public.points_transactions pt),
+      'ciclos', (SELECT jsonb_agg(to_jsonb(pc) ORDER BY pc.id_cycle) FROM public.points_cycles pc),
+      'saldos', (SELECT jsonb_agg(to_jsonb(v) ORDER BY v.id_cliente) FROM public.vw_points_balance v)
+    ) AS data`)).rows[0].data;
+    const definitions = async () => (await pool.query(`SELECT p.oid::regprocedure::text AS firma, pg_get_functiondef(p.oid) AS definicion
+      FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+      WHERE n.nspname='public' AND p.proname IN ('fn_points_get_or_create_active_cycle','fn_points_tx_guard_acumular_final',
+        'fn_trg_otorgar_puntos_por_cita','fn_trg_otorgar_puntos_plan_confirmada') ORDER BY firma`)).rows;
+    const seed = async () => {
+      const owner = await createClient(), cycle = randomUUID(), plus = randomUUID(), minus = randomUUID(), current = randomUUID();
+      const anchor = new Date(Date.now() - 86400000), first = new Date(anchor.getTime() - 4 * 86400000), second = new Date(first.getTime() + 3600000);
+      await pool.query(`INSERT INTO public.points_cycles(id_cycle,id_cliente,primer_acumulado_at,vence_at,created_at,updated_at)
+        VALUES($1,$2,$3,$3::timestamptz+interval '12 months',$3,$3)`, [cycle, owner.id, anchor]);
+      await pool.query(`INSERT INTO public.points_transactions(id_points_tx,id_cliente,id_cycle,tipo_puntos_codigo,puntos,created_at,updated_at)
+        VALUES($1,$4,NULL,'ajustar',10,$5,$5),($2,$4,NULL,'canjear',-10,$6,$6),($3,$4,$7,'acumular',1,$8,$8)`,
+      [plus, minus, current, owner.id, first, second, cycle, anchor]);
+      return { ...owner, cycle, plus, minus, current, anchor, first, second };
+    };
+    // AM: Limpieza exclusiva de fixtures aleatorios en el cluster efimero; nunca registros remotos.
+    const clear = async owners => {
+      await pool.query('DELETE FROM public.points_transactions WHERE id_cliente=ANY($1::uuid[])', [owners.map(o => o.id)]);
+      await pool.query('DELETE FROM public.points_cycles WHERE id_cliente=ANY($1::uuid[])', [owners.map(o => o.id)]);
+    };
+    const inspect = async owner => {
+      const results = await pool.query(readOnlySql);
+      return results.find(result => result.fields.some(field => field.name === 'historico_compensado_seguro')).rows.find(row => row.id_cliente === owner.id);
+    };
+    await suite.test('caso observado +10/-10 anteriores y +1 vigente: pasa en UTC/Honduras, sin recalcular', async () => {
+      const owner = await seed();
+      try {
+        const before = await snapshot(), priorDefinitions = await definitions();
+        await assert.rejects(pool.query(oldGuard), /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+        for (const zone of ['UTC', 'America/Tegucigalpa']) {
+          const connection = await pool.connect();
+          try {
+            await connection.query("SELECT set_config('TimeZone',$1,false)", [zone]);
+            await connection.query(guard);
+          } finally { await connection.query("SET TimeZone='UTC'"); connection.release(); }
+        }
+        const report = await inspect(owner);
+        assert.equal(report.historico_compensado_seguro, true);
+        assert.deepEqual(report.motivos_revision, []);
+        assert.equal(Number(report.neto_historico), 0); assert.equal(Number(report.saldo_ciclo), 1);
+        assert.equal(Number(report.saldo_ledger), 1); assert.equal(report.saldo_efectivo, 1);
+        await pool.query(migrationSql.replace(/COMMIT;\s*$/, 'ROLLBACK;'));
+        assert.deepEqual(await definitions(), priorDefinitions, 'Reversion transaccional de DDL conserva las definiciones previas');
+        assert.deepEqual(await snapshot(), before);
+        await pool.query(migrationSql);
+        assert.deepEqual(await snapshot(), before, 'Incluso la aplicacion completa conserva cada fecha, punto y ciclo');
+      } finally { await clear([owner]); }
+    });
+    await suite.test('varios bloques historicos conocidos y totalmente compensados conservan saldo 1', async () => {
+      const owner = await seed();
+      try {
+        await pool.query(`INSERT INTO public.points_transactions(id_cliente,tipo_puntos_codigo,puntos,created_at,updated_at)
+          VALUES($1,'ajustar',3,$2::timestamptz+interval '2 hours',$2::timestamptz+interval '2 hours'),
+          ($1,'ajuste_resta',-3,$2::timestamptz+interval '3 hours',$2::timestamptz+interval '3 hours')`, [owner.id, owner.second]);
+        const before = await snapshot(); await pool.query(guard);
+        assert.equal((await inspect(owner)).historico_compensado_seguro, true);
+        assert.deepEqual(await snapshot(), before);
+      } finally { await clear([owner]); }
+    });
+    const negativeCases = [
+      ['diferencia positiva', o => pool.query('UPDATE points_transactions SET puntos=11 WHERE id_points_tx=$1', [o.plus]), 'historial_no_compensado'],
+      ['diferencia negativa', o => pool.query('UPDATE points_transactions SET puntos=9 WHERE id_points_tx=$1', [o.plus]), 'historial_no_compensado'],
+      ['neto cero con canje distinto de diez', o => pool.query('UPDATE points_transactions SET puntos=CASE WHEN id_points_tx=$1 THEN 11 ELSE -11 END WHERE id_points_tx=ANY($2::uuid[])', [o.plus, [o.plus, o.minus]]), 'tipos_o_signos_ambiguos'],
+      ['debito anterior al credito', o => pool.query(`UPDATE points_transactions SET created_at=$2::timestamptz-interval '1 hour',updated_at=$2::timestamptz-interval '1 hour' WHERE id_points_tx=$1`, [o.minus, o.first]), 'debito_sin_credito_previo'],
+      ['fechas empatadas', o => pool.query('UPDATE points_transactions SET created_at=$2,updated_at=$2 WHERE id_points_tx=$1', [o.minus, o.first]), 'orden_historico_ambiguo'],
+      ['debito dentro del ciclo', o => pool.query(`UPDATE points_transactions SET created_at=$2::timestamptz+interval '1 hour',updated_at=$2::timestamptz+interval '1 hour' WHERE id_points_tx=$1`, [o.minus, o.anchor]), 'periodos_superpuestos'],
+      ['limite exacto al inicio del ciclo', o => pool.query('UPDATE points_transactions SET created_at=$2,updated_at=$2 WHERE id_points_tx=$1', [o.minus, o.anchor]), 'periodos_superpuestos'],
+      ['edicion posterior de movimiento antiguo', o => pool.query(`UPDATE points_transactions SET updated_at=$2::timestamptz+interval '1 hour' WHERE id_points_tx=$1`, [o.plus, o.anchor]), 'periodos_superpuestos'],
+      ['fecha de creacion ausente', o => pool.query('UPDATE points_transactions SET created_at=NULL WHERE id_points_tx=$1', [o.plus]), 'fechas_no_verificables'],
+      ['fecha de modificacion ausente', o => pool.query('UPDATE points_transactions SET updated_at=NULL WHERE id_points_tx=$1', [o.plus]), 'fechas_no_verificables'],
+      ['modificacion anterior a creacion', o => pool.query(`UPDATE points_transactions SET updated_at=created_at-interval '1 second' WHERE id_points_tx=$1`, [o.plus]), 'fechas_no_verificables'],
+      ['fecha no finita', o => pool.query("UPDATE points_transactions SET created_at='-infinity' WHERE id_points_tx=$1", [o.plus]), 'fechas_no_verificables'],
+      ['tipo desconocido', o => pool.query('UPDATE points_transactions SET tipo_puntos_codigo=NULL WHERE id_points_tx=$1', [o.plus]), 'tipos_o_signos_ambiguos'],
+      ['tipo del debito desconocido', o => pool.query('UPDATE points_transactions SET tipo_puntos_codigo=NULL WHERE id_points_tx=$1', [o.minus]), 'tipos_o_signos_ambiguos'],
+      ['debito por vencimiento sin ciclo no se omite', o => pool.query("UPDATE points_transactions SET tipo_puntos_codigo='vencimiento' WHERE id_points_tx=$1", [o.minus]), 'tipos_o_signos_ambiguos'],
+      ['vencimiento individual sin ciclo', o => pool.query("UPDATE points_transactions SET vence_at=now()+interval '1 year' WHERE id_points_tx=$1", [o.plus]), 'vencimientos_historicos_ambiguos'],
+      ['credito del ciclo anterior a su inicio', o => pool.query(`UPDATE points_transactions SET created_at=$2::timestamptz-interval '1 second',updated_at=$2::timestamptz-interval '1 second' WHERE id_points_tx=$1`, [o.current, o.anchor]), 'movimientos_del_ciclo_inconsistentes'],
+      ['saldo actual negativo', o => pool.query("INSERT INTO points_transactions(id_cliente,id_cycle,tipo_puntos_codigo,puntos,created_at,updated_at) VALUES($1,$2,'ajuste_resta',-2,$3,$3)", [o.id, o.cycle, o.anchor]), 'saldo_inconsistente'],
+      ['movimientos de otro ciclo incluso con neto cero', o => pool.query(`WITH old_cycle AS (
+          INSERT INTO points_cycles(id_cliente,primer_acumulado_at,vence_at,estado_ciclo_codigo)
+          VALUES($1,$2::timestamptz-interval '2 years',$2::timestamptz-interval '1 year','cerrado') RETURNING id_cycle
+        ) INSERT INTO points_transactions(id_cliente,id_cycle,tipo_puntos_codigo,puntos,created_at,updated_at)
+        SELECT $1,old_cycle.id_cycle,v.tipo,v.puntos,$2::timestamptz-interval '2 years',$2::timestamptz-interval '2 years'
+        FROM old_cycle CROSS JOIN (VALUES('ajustar',5),('ajuste_resta',-5)) v(tipo,puntos)`, [o.id, o.anchor]), 'otros_ciclos_requieren_revision'],
+      ['vencimiento ambiguo sin ciclo aunque neto cero', o => pool.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos,created_at,updated_at) VALUES($1,'ajustar',1,$2::timestamptz+interval '2 hours',$2::timestamptz+interval '2 hours'),($1,'vencimiento',-1,$2::timestamptz+interval '3 hours',$2::timestamptz+interval '3 hours')", [o.id, o.second]), 'tipos_o_signos_ambiguos'],
+    ];
+    for (const [name, mutate, reason] of negativeCases) await suite.test('bloquea ' + name + ' sin modificar datos', async () => {
+      const owner = await seed();
+      try {
+        await mutate(owner); const before = await snapshot();
+        const report = await inspect(owner); assert.equal(report.historico_compensado_seguro, false);
+        assert.ok(report.motivos_revision.includes(reason), JSON.stringify(report.motivos_revision));
+        await assert.rejects(pool.query(guard), /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+        assert.deepEqual(await snapshot(), before);
+      } finally { await clear([owner]); }
+    });
+    await suite.test('no compensa saldos entre Clientes ni permite que un Cliente seguro oculte otro inconsistente', async () => {
+      const a = await seed(), b = await seed();
+      try {
+        await pool.query('UPDATE points_transactions SET puntos=11 WHERE id_points_tx=$1', [a.plus]);
+        await pool.query('UPDATE points_transactions SET puntos=9 WHERE id_points_tx=$1', [b.plus]);
+        assert.equal((await inspect(a)).historico_compensado_seguro, false);
+        assert.equal((await inspect(b)).historico_compensado_seguro, false);
+        await assert.rejects(pool.query(guard), /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+        await pool.query('UPDATE points_transactions SET puntos=10 WHERE id_points_tx=$1', [a.plus]);
+        assert.equal((await inspect(a)).historico_compensado_seguro, true);
+        await assert.rejects(pool.query(guard), /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+      } finally { await clear([a, b]); }
+    });
+    await suite.test('movimientos de otro ciclo o de otro Cliente no se asignan ni se compensan arbitrariamente', async () => {
+      const a = await seed(), b = await seed();
+      try {
+        await pool.query('UPDATE points_transactions SET id_cycle=$2 WHERE id_points_tx=$1', [b.current, a.cycle]);
+        const before = await snapshot();
+        const report = await inspect(a); assert.equal(report.historico_compensado_seguro, false);
+        assert.ok(report.motivos_revision.includes('movimientos_del_ciclo_inconsistentes'));
+        await assert.rejects(pool.query(guard), /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+        assert.deepEqual(await snapshot(), before);
+      } finally { await clear([a, b]); }
+    });
+    await suite.test('rechaza una diferencia entre la vista efectiva y el ledger; no corrige la vista ni el saldo', async () => {
+      const owner = await seed(), connection = await pool.connect();
+      const before = await snapshot(), priorDefinitions = await definitions();
+      try {
+        await connection.query('BEGIN');
+        // AM: Vista inconsistente sintetica, revertida junto con toda la transaccion local.
+        await connection.query('CREATE OR REPLACE VIEW public.vw_points_balance AS SELECT id_cliente,(sum(puntos)+1)::int AS balance_puntos FROM public.points_transactions GROUP BY id_cliente');
+        const report = (await connection.query(proof(migrationSql) + 'SELECT * FROM historical_debits_evaluation WHERE id_cliente=$1', [owner.id])).rows[0];
+        assert.ok(report.motivos_revision.includes('saldo_inconsistente'));
+        await assert.rejects(connection.query(guard), /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+      } finally {
+        await connection.query('ROLLBACK'); connection.release();
+        assert.deepEqual(await snapshot(), before); assert.deepEqual(await definitions(), priorDefinitions);
+        await clear([owner]);
+      }
+    });
+    await suite.test('la comprobacion definitiva espera escrituras concurrentes y revisa el saldo ya confirmado', async () => {
+      const owner = await seed(), writer = await pool.connect(), applying = await pool.connect();
+      let attempt;
+      try {
+        const priorDefinitions = await definitions();
+        await writer.query('BEGIN');
+        await writer.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos) VALUES($1,'ajustar',1)", [owner.id]);
+        attempt = applying.query(migrationSql).then(() => null, error => error);
+        let waiting = false;
+        for (let i = 0; i < 100 && !waiting; i++) {
+          waiting = (await pool.query("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted AND relation='public.points_transactions'::regclass) waiting", [applying.processID])).rows[0].waiting;
+          if (!waiting) await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        assert.equal(waiting, true, 'La migracion espera el lock del ledger');
+        await writer.query('COMMIT');
+        const before = await snapshot(), error = await attempt;
+        assert.match(error?.message || '', /MASTERPUNTOS_PREFLIGHT_HISTORICAL_DEBITS_REVIEW_REQUIRED/);
+        await applying.query('ROLLBACK');
+        assert.deepEqual(await snapshot(), before); assert.deepEqual(await definitions(), priorDefinitions);
+      } finally {
+        await writer.query('ROLLBACK');
+        if (attempt) await attempt;
+        await applying.query('ROLLBACK'); writer.release(); applying.release(); await clear([owner]);
+      }
+    });
   });
   await pool.query(migrationSql);
 
