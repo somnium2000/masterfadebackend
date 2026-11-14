@@ -741,7 +741,21 @@
     "prorettype_regtype_snapshot": "integer",
     "prokind_snapshot": "f",
     "prosrc_md5_lf": "8da336f77b4f237b0387d8d0cdb66c44",
-    "prosrc_sha256_lf": "de5f2185cb3e7b406422ecfbd7b8b2e0342278fd9f36bb43fa03e3f188f157e3"
+    "prosrc_sha256_lf": "de5f2185cb3e7b406422ecfbd7b8b2e0342278fd9f36bb43fa03e3f188f157e3",
+    "verified_variants_02b": [
+      {
+        "prosrc_md5_lf": "1fc9e808d8d6d56570897b5c84480144",
+        "definition_source": "db/migrations/20261030010000_masterpuntos_readonly_expiration_v1.sql",
+        "definition_source_line": 55,
+        "definition_source_commit": "500879c6837c332c7a7ce37531ed584f0528ba12",
+        "observed_environments": [
+          "qa",
+          "production"
+        ],
+        "semantic_review": "Cycle row locks, signed ledger balance and conflict-safe expiration; no appointment award.",
+        "observation_source": "User-supplied QA-SEGURIDAD-SUPABASE-02B read-only preflight hashes; source body verified locally, no remote SQL executed."
+      }
+    ]
   },
   {
     "schema": "public",
@@ -825,7 +839,20 @@
     "prokind_snapshot": "f",
     "prosrc_md5_lf": "25e47807f162b12b9de8c87e15a8248c",
     "prosrc_sha256_lf": "7ae20bb1c22e6d51b48c3e7f7078dd5a4b0f29d85db0f2e1d54363246291a53c",
-    "qa_prosrc_md5_lf": "4e28d76d27a4ece71cfbac08000354fc"
+    "qa_prosrc_md5_lf": "4e28d76d27a4ece71cfbac08000354fc",
+    "verified_variants_02b": [
+      {
+        "prosrc_md5_lf": "6ff488db9f5a4e7843b32dd978ae529a",
+        "definition_source": "db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql",
+        "definition_source_line": 149,
+        "definition_source_commit": "835ffb9c2a0779c0dfc120fac9c4040d33ab01cd",
+        "observed_environments": [
+          "qa"
+        ],
+        "semantic_review": "Confirmed paid appointment required; existing credit immutable; holder and 12-month active cycle validated.",
+        "observation_source": "User-supplied QA-SEGURIDAD-SUPABASE-02B read-only preflight hashes; source body verified locally, no remote SQL executed."
+      }
+    ]
   },
   {
     "schema": "public",
@@ -1639,7 +1666,20 @@
     "prokind_snapshot": "f",
     "prosrc_md5_lf": "b271a74a0fd9440113f62c331e8a7ea8",
     "prosrc_sha256_lf": "fd8c55866f3eba637f7fc669d2af3af423f77e1a8d19f4b7a316a4cb2bd063ea",
-    "qa_prosrc_md5_lf": "a5471f67639a089297e2384c4d6dd1dc"
+    "qa_prosrc_md5_lf": "a5471f67639a089297e2384c4d6dd1dc",
+    "verified_variants_02b": [
+      {
+        "prosrc_md5_lf": "8270cf772d8160350926c8762482ca4b",
+        "definition_source": "db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql",
+        "definition_source_line": 197,
+        "definition_source_commit": "835ffb9c2a0779c0dfc120fac9c4040d33ab01cd",
+        "observed_environments": [
+          "qa"
+        ],
+        "semantic_review": "Legacy completion hook intentionally returns NEW; paid-event hooks own the award.",
+        "observation_source": "User-supplied QA-SEGURIDAD-SUPABASE-02B read-only preflight hashes; source body verified locally, no remote SQL executed."
+      }
+    ]
   },
   {
     "schema": "public",

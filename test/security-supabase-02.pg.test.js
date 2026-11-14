@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import pg from "pg";
 import { startPostgres17 } from "./helpers/postgres17.mjs";
 
@@ -15,10 +16,48 @@ const preflight = await readFile(new URL(`${base}.preflight.sql`, manualRoot), "
 const fixture = await readFile(new URL("./sql/security-supabase-02-fixture.sql", import.meta.url), "utf8");
 const advisor = await readFile(new URL("./sql/security-supabase-02-advisor.sql", import.meta.url), "utf8");
 const rlsCases = await readFile(new URL("./sql/security-supabase-02-rls-cases.sql", import.meta.url), "utf8");
+const expirationCases = await readFile(new URL('./sql/security-supabase-02b-expiration-cases.sql', import.meta.url), 'utf8');
 const signatures = routines.map((r) => `${r.schema}.${r.name}(${r.args})`);
 const names = new Set(routines.map((r) => r.name));
 // AM | Match opt-in SQL suites: ordinary npm test does not require PostgreSQL.
 const runPostgres = Boolean(process.env.MASTERFADE_TEST_PG_BIN);
+// AM | Read the active versioned definition, never the commented rollback block.
+const verifiedVariants = [];
+for (const routine of routines) {
+  for (const review of routine.verified_variants_02b ?? []) {
+    const source = (await readFile(new URL(`../${review.definition_source}`, import.meta.url), 'utf8')).replaceAll('\r\n', '\n');
+    const start = source.indexOf(`CREATE OR REPLACE FUNCTION ${routine.schema}.${routine.name}(`);
+    assert.ok(start >= 0 && (start === 0 || source[start - 1] === '\n'));
+    const rest = source.slice(start);
+    const marker = rest.match(/\bAS\s+(\$[a-z_0-9]*\$)/i);
+    assert.ok(marker);
+    const bodyStart = marker.index + marker[0].length;
+    const end = rest.indexOf(marker[1], bodyStart);
+    assert.ok(end > bodyStart && rest[end + marker[1].length] === ';');
+    const body = rest.slice(bodyStart, end);
+    assert.equal(createHash('md5').update(body).digest('hex'), review.prosrc_md5_lf);
+    verifiedVariants.push({ ...review, routine, body, definition: rest.slice(0, end + marker[1].length + 1),
+      signature: `${routine.schema}.${routine.name}(${routine.args})` });
+  }
+}
+
+test('SECURITY02B: exact reviewed source hashes stay bound to their signatures in both manifests', () => {
+  assert.deepEqual(Object.fromEntries(verifiedVariants.map((v) => [v.signature, v.prosrc_md5_lf])), {
+    'public.fn_points_materialize_expired_cycles(uuid)': '1fc9e808d8d6d56570897b5c84480144',
+    'public.fn_points_tx_guard_acumular_final()': '6ff488db9f5a4e7843b32dd978ae529a',
+    'public.fn_trg_otorgar_puntos_por_cita()': '8270cf772d8160350926c8762482ca4b',
+  });
+  for (const sql of [migration, preflight]) {
+    const manifest = new Map([...sql.matchAll(/^\s*\('([^']+)', '(?:function|procedure)', ARRAY\[([^\]]*)\]/gm)]
+      .map((m) => [m[1], [...m[2].matchAll(/'([a-f0-9]{32})'/g)].map((h) => h[1])]));
+    assert.equal(manifest.size, 41);
+    for (const r of routines) {
+      assert.deepEqual(manifest.get(`${r.schema}.${r.name}(${r.args})`),
+        [...new Set([r.prosrc_md5_lf, r.qa_prosrc_md5_lf,
+          ...(r.verified_variants_02b ?? []).map((v) => v.prosrc_md5_lf)].filter(Boolean))]);
+    }
+  }
+});
 
 async function catalog(client) {
   return (await client.query(`
@@ -64,8 +103,12 @@ async function aborts(client, sql, pattern) {
   }
 }
 
-for (const environment of ["qa", "production"]) {
-  test(`SECURITY02 ${environment}: preflight, real bodies, permissions/RLS/triggers, Advisor, rollback`, { skip: !runPostgres }, async (t) => {
+for (const scenario of [
+  { environment: 'qa', observed: false }, { environment: 'production', observed: false },
+  { environment: 'qa', observed: true }, { environment: 'production', observed: true },
+]) {
+  const { environment, observed } = scenario;
+  test(`SECURITY02 ${environment}${observed ? ' verified 02B' : ''}: preflight, real bodies, permissions/RLS/triggers, Advisor, rollback`, { skip: !runPostgres }, async (t) => {
     const postgres = await startPostgres17();
     t.after(() => postgres.stop());
     const { client } = postgres;
@@ -75,7 +118,9 @@ for (const environment of ["qa", "production"]) {
       return priority(a) - priority(b);
     });
     for (const r of ordered) {
-      await client.query(environment === "qa" && r.qa_definition_override ? r.qa_definition_override : r.definition);
+      const variant = observed && verifiedVariants.find((v) => v.routine === r && v.observed_environments.includes(environment));
+      await client.query(variant ? variant.definition
+        : environment === "qa" && r.qa_definition_override ? r.qa_definition_override : r.definition);
     }
     await client.query(`
       CREATE TRIGGER tr_hold_unico BEFORE INSERT ON public.citas_holds
@@ -95,6 +140,26 @@ for (const environment of ["qa", "production"]) {
     const inspected = (await client.query(preflight)).rows;
     assert.equal(inspected.length, 41);
     assert.ok(inspected.every((r) => r.definition_status === 'KNOWN_DEFINITION'));
+    if (observed) {
+      for (const v of verifiedVariants.filter((v) => v.observed_environments.includes(environment))) {
+        assert.equal(inspected.find((r) => r.signature === v.signature).canonical_body_hash, v.prosrc_md5_lf);
+        // AM | Even a harmless unreviewed comment must still fail the exact hash guard.
+        await client.query(v.definition.replace(v.body, `${v.body}\n-- AM: unreviewed body sentinel\n`));
+        const changed = (await client.query(preflight)).rows.find((r) => r.signature === v.signature);
+        assert.equal(changed.definition_status, 'BODY_REVIEW');
+        await aborts(client, migration, /signature\/owner\/body\/security drift/);
+        await client.query(v.definition);
+      }
+      if (environment === 'qa') {
+        const noop = verifiedVariants.find((v) => v.routine.name === 'fn_trg_otorgar_puntos_por_cita');
+        const guard = verifiedVariants.find((v) => v.routine.name === 'fn_points_tx_guard_acumular_final');
+        await client.query(noop.definition.replace(noop.routine.name, guard.routine.name));
+        assert.equal((await client.query(preflight)).rows.find((r) => r.signature === guard.signature).definition_status, 'BODY_REVIEW');
+        await aborts(client, migration, /signature\/owner\/body\/security drift/);
+        await client.query(guard.definition);
+      }
+      assert.deepEqual(await catalog(client), initial, 'negative hash tests restore every original contract');
+    }
     assert.deepEqual(await findings(client), {
       function_search_path_mutable: environment === "qa" ? 31 : 36,
       anon_security_definer_function_executable: 2,
@@ -102,6 +167,7 @@ for (const environment of ["qa", "production"]) {
     });
     // AM | Existing RLS and trigger behavior must already pass before hardening.
     await client.query(rlsCases);
+    if (observed) await client.query(expirationCases);
 
     await client.query("GRANT CREATE ON SCHEMA public TO authenticated");
     await aborts(client, migration, /public allows client CREATE/);
@@ -159,6 +225,16 @@ for (const environment of ["qa", "production"]) {
       await concurrent.end();
     }
     assert.deepEqual(await catalog(client), applied, "concurrent applications serialize without permission drift");
+    if (!observed) {
+      // AM | A newly allowed body never authorizes overwriting an older backup.
+      const expiration = verifiedVariants.find((v) => v.routine.name === 'fn_points_materialize_expired_cycles');
+      const saved = (await client.query('SELECT pg_get_functiondef(to_regprocedure($1)) AS def', [expiration.signature])).rows[0].def;
+      await client.query(expiration.definition);
+      await aborts(client, rollback, /definition\/config drift/);
+      await aborts(client, migration, /backup identity\/body drift/);
+      await client.query(saved);
+      assert.deepEqual(await catalog(client), applied, 'approved drift cannot rebase the original backup');
+    }
     assert.deepEqual(await findings(client), {
       function_search_path_mutable: 0,
       anon_security_definer_function_executable: 0,
@@ -169,6 +245,7 @@ for (const environment of ["qa", "production"]) {
     assert.equal(backupInfo.length, 1, 'private default-deny backup has one justified INFO, no client policy');
     await client.query("SELECT set_config('qa_security02.expect_hardened','true',false)");
     await client.query(rlsCases);
+    if (observed) await client.query(expirationCases);
 
     const access = (await client.query(`SELECT
       has_function_privilege('anon','public.fn_hold_defaults_y_unico()','EXECUTE') AS anon_trigger,
@@ -193,6 +270,7 @@ for (const environment of ["qa", "production"]) {
     assert.deepEqual(await catalog(client), initial, "idempotent rollback");
     await client.query("SELECT set_config('qa_security02.expect_hardened','false',false)");
     await client.query(rlsCases);
+    if (observed) await client.query(expirationCases);
     await client.query("ALTER FUNCTION public.fn_set_updated_at() SET statement_timeout = '16s'");
     await aborts(client, migration, /post-rollback drift/);
     await client.query("ALTER FUNCTION public.fn_set_updated_at() SET statement_timeout = '15s'");

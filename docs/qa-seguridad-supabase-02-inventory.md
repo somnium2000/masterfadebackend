@@ -91,3 +91,9 @@ La rutina `fn_marcar_no_show(integer,integer)` tiene defaults locales 10 y 500. 
 El ajuste propuesto para los tres helpers es `pg_catalog, public, auth, pg_temp`, que mantiene los objetos públicos y de autenticación esperados y coloca el esquema temporal al final. La función conserva firma, propietario, cuerpo, condición SECURITY DEFINER y ACL; no se amplía el alcance de GRANT/REVOKE a esta dependencia. Los dos triggers privilegiados usan `pg_catalog, public, app_private, pg_temp`.
 
 Su definición literal proviene de `_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json`. El propietario `postgres` y el path histórico `public, auth` constan en `_QA_Certificacion_Local/QA-SEG-01-20261025/supabase-readonly.json`; no acreditan el propietario ni la ACL actuales. El fixture marca `dependency_target: true`, `qa_warning: false` y `production_warning: false`, y conserva hashes y tipo de retorno para el preflight.
+
+## Corrección QA-SEGURIDAD-SUPABASE-02B
+
+Los hashes comunicados por el preflight de lectura del usuario coinciden con definiciones activas versionadas: `fn_points_materialize_expired_cycles(uuid)` con `20261030010000_masterpuntos_readonly_expiration_v1.sql`, y `fn_points_tx_guard_acumular_final()` / `fn_trg_otorgar_puntos_por_cita()` con `20261113161929_masterpuntos_paid_confirmation_v1.sql`. Los inventarios registran estas tres variantes en `verified_variants_02b`, con hash LF, fuente, commit y entornos reportados. Las definiciones históricas y variantes anteriores se conservan.
+
+La lista permitida de cada firma se amplía en el SQL manual y su reporte de preflight, con revisión semántica y controles de rechazo por firma/cuerpo. Las guardas de propietario, contrato, ACL, respaldo y rollback permanecen iguales. [Informe 02B, comparación y pruebas](qa-seguridad-supabase-02b.md).
