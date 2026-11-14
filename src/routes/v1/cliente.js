@@ -18,6 +18,7 @@ import {
   cancelMembershipBySubscription,
   getClienteMembershipState,
   listClienteMembershipConsumptions,
+  listClienteMembershipConsumptionAppointments,
 } from "../../services/membershipService.js";
 import {
   confirmClientAccountDeletionRequest,
@@ -923,13 +924,16 @@ export default async function clienteRoutes(app) {
       page: { type: "integer", minimum: 1, maximum: 1000000, default: 1 },
       limit: { type: "integer", enum: [5], default: 5 },
       id_suscripcion: { type: "string", format: "uuid" },
+      agrupar_por: { type: "string", enum: ["cita"] },
     } } },
   }, async (request, reply) => {
     const context = ensureClienteContext(request);
     let client;
     try {
       client = await app.db.connect();
-      return sendOk(reply, await listClienteMembershipConsumptions(client, context.clienteId, {
+      const list = request.query.agrupar_por === "cita"
+        ? listClienteMembershipConsumptionAppointments : listClienteMembershipConsumptions;
+      return sendOk(reply, await list(client, context.clienteId, {
         page: request.query.page, idSuscripcion: request.query.id_suscripcion || null,
       }), { requestId: request.id });
     } catch (error) {
