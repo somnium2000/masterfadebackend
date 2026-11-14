@@ -283,6 +283,55 @@ test("simulador rechaza PixelPay y entornos no locales antes de consultar BD", a
   }
 });
 
+const authorizedSimulatorContext = Object.freeze({
+  paymentProvider: "todopago",
+  mode: "preprod_simulated",
+  simulatedEnabled: true,
+  qaPaymentSimulationEnabled: true,
+  membershipSimulatorEnabled: true,
+  vipPurchaseSimulationEnabled: true,
+  nodeEnv: "development",
+});
+
+for (const [amount, normalizedStatus, nextState] of [
+  [1.05, "FAILED", "fallido"],
+  [1.57, "PENDING", "pendiente_confirmacion"],
+]) {
+  test(`simulador VIP ${amount} persiste ${normalizedStatus} sin activar beneficios`, async () => {
+    const calls = [];
+    let eventPayload;
+    const client = {
+      async query(sql, params = []) {
+        const text = String(sql).replace(/\s+/g, " ").trim();
+        calls.push(text);
+        if (text.includes("FROM public.payment_intents pi")) {
+          return { rows: [intentRow("creado")], rowCount: 1 };
+        }
+        if (text.includes("INSERT INTO public.payment_events")) {
+          eventPayload = params[2];
+          return { rows: [], rowCount: 1 };
+        }
+        if (text.includes("UPDATE public.payment_intents")) {
+          assert.deepEqual(params, [INTENT, nextState]);
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`Unexpected simulator query: ${text.slice(0, 120)}`);
+      },
+    };
+    const result = await processMembershipSimulatorEvent(client, {
+      idPaymentIntent: INTENT,
+      clienteId: CLIENT,
+      montoPruebaHnl: amount,
+      serverContext: authorizedSimulatorContext,
+    });
+    assert.equal(result.normalized_status, normalizedStatus);
+    assert.equal(result.estado_intent_codigo, nextState);
+    assert.equal(eventPayload.monto_resuelto_hnl, amount);
+    assert.equal(eventPayload.monto_intent_hnl, 800);
+    assert.equal(calls.some((sql) => /INSERT INTO public\.(payments|subscriptions|subscription_payments)/.test(sql)), false);
+  });
+}
+
 test("estado simulado es una lectura local con validacion de propietario y proveedor", async () => {
   let calls = 0;
   const client = {
