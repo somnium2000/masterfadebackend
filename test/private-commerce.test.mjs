@@ -26,7 +26,8 @@ const protectedPaths = ["/v1/public/citas/hold", "/v1/public/citas/validar-conta
   "/v1/public/pagos/crear-intent", "/v1/public/pagos/pixelpay/sale", "/v1/public/pagos/pixelpay/status",
   "/v1/public/pagos/estado", "/v1/public/pagos/mock-completar", "/v1/public/pagos/simulator/event",
   "/v1/cliente/planes/orden", "/v1/cliente/planes/pago-intent", "/v1/cliente/planes/confirmar-pago",
-  "/v1/cliente/planes/adquirir", "/v1/cliente/planes/pago-intent/" + USER + "/estado"];
+  "/v1/cliente/planes/adquirir", "/v1/cliente/planes/pago-intent/" + USER + "/estado",
+  "/v1/citas/hold/" + USER + "/confirmar"];
 
 async function fixture(t, options = {}) {
   const previous = { ...process.env };
@@ -197,6 +198,9 @@ test("QA simulation opens only booking and TodoPago simulator routes", async t =
   for (const url of [...allowed, ...denied]) {
     app.post(url, async () => ({ reached: true }));
   }
+  app.post("/v1/citas/hold/:id_grupo_cita/confirmar", async () => ({ reached: true }));
+  app.post("/v1/citas/hold/:id_grupo_cita/confirmar-pago", async () => ({ reached: true }));
+  app.patch("/v1/citas/hold/:id_grupo_cita/confirmar", async () => ({ reached: true }));
 
   for (const url of allowed) {
     const response = await app.inject({ method: "POST", url, payload: {} });
@@ -206,6 +210,22 @@ test("QA simulation opens only booking and TodoPago simulator routes", async t =
   for (const url of denied) {
     const response = await app.inject({ method: "POST", url, payload: {} });
     assert.equal(response.statusCode, 403, `${url}: ${response.body}`);
+    assert.equal(response.json().error.code, "PRIVATE_COMMERCE_RESTRICTED");
+  }
+
+  const zeroTotalConfirmation = await app.inject({
+    method: "POST",
+    url: `/v1/citas/hold/${USER}/confirmar`,
+    payload: {},
+  });
+  assert.equal(zeroTotalConfirmation.statusCode, 200, zeroTotalConfirmation.body);
+  assert.equal(zeroTotalConfirmation.json().reached, true);
+  for (const request of [
+    { method: "POST", url: `/v1/citas/hold/${USER}/confirmar-pago` },
+    { method: "PATCH", url: `/v1/citas/hold/${USER}/confirmar` },
+  ]) {
+    const response = await app.inject({ ...request, payload: {} });
+    assert.equal(response.statusCode, 403, `${request.method} ${request.url}: ${response.body}`);
     assert.equal(response.json().error.code, "PRIVATE_COMMERCE_RESTRICTED");
   }
 

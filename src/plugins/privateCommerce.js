@@ -22,6 +22,7 @@ const QA_PAYMENT_SIMULATION_ROUTES = new Set([
   "POST /v1/public/citas/validar-titular",
   "POST /v1/public/citas/hold",
   "POST /v1/citas/hold",
+  "POST /v1/citas/hold/:id_grupo_cita/confirmar",
   "POST /v1/public/pagos/crear-intent",
   "POST /v1/public/pagos/estado",
   "POST /v1/public/pagos/simulator/event",
