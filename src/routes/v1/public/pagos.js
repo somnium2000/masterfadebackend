@@ -887,7 +887,7 @@ async function loadPublicGroup(client, { groupId, titularEmail, access = null })
       code: "PAGOS_AUTHENTICATED_GROUP_REQUIRED",
     });
   }
-  const authenticatedOwnerMatches = access?.mode !== "authenticated" || (
+  const authenticatedOwnerMatches = !["authenticated", "recovery"].includes(access?.mode) || (
     String(titular?.id_cliente_titular || "") === String(access.owner?.clienteId || "")
     && String(titular?.id_persona_titular || "") === String(access.owner?.personaId || "")
     && String(titular?.id_usuario_titular || "") === String(access.owner?.usuarioId || "")
@@ -1575,11 +1575,11 @@ async function confirmGroupAfterPaid(client, {
 }
 
 export async function reconcilePixelPayFromDurableApproval(client, {
-  idGrupoCita, idIntent, titularEmail, logger,
+  idGrupoCita, idIntent, titularEmail, logger, owner = null,
 }) {
   // AM: Entrada interna DB-only; no ruta publica, adaptador ni referencias suministradas por caller.
   return reconcilePixelPayPaid(client, {
-    idGrupoCita, idIntent, titularEmail, logger, fromDurableApproval: true,
+    idGrupoCita, idIntent, titularEmail, logger, fromDurableApproval: true, recoveryOwner: owner,
   });
 }
 
@@ -1593,20 +1593,47 @@ export async function reconcilePixelPayPaid(client, {
   paidAt = null,
   allowExpiredRecovery = false,
   fromDurableApproval = false,
+  recoveryOwner = null,
   logger,
 }) {
   await client.query("BEGIN");
   try {
+    const access = recoveryOwner ? { mode: "recovery", owner: recoveryOwner } : null;
+    if (recoveryOwner) {
+      // AM: Serializar con eliminacion antes de locks financieros; la nueva ruta nunca autoriza por correo.
+      const identityLock = await client.query(`SELECT pg_try_advisory_xact_lock(
+        hashtext('masterfade.account_deletion'), hashtext($1::text)) AS deletion_identity_lock`,
+      [recoveryOwner.usuarioId]);
+      if (identityLock.rows[0]?.deletion_identity_lock !== true) {
+        throw new AppError(409, "La cuenta no esta disponible para conciliacion", { code: "PAYMENT_RECOVERY_ACCOUNT_UNAVAILABLE" });
+      }
+      const identity = await client.query(`SELECT c.id_cliente
+        FROM public.clientes c
+        JOIN public.usuarios u ON u.id_usuario = c.id_usuario AND u.id_persona = c.id_persona
+        JOIN public.personas p ON p.id_persona = c.id_persona
+        WHERE c.id_cliente = $1::uuid AND c.id_persona = $2::uuid AND u.id_usuario = $3::uuid
+          AND c.estado IS TRUE AND c.deleted_at IS NULL AND c.anonimizado IS FALSE
+          AND u.estado IS TRUE AND u.deleted_at IS NULL
+          AND u.estado_acceso IS NOT NULL AND u.estado_acceso NOT IN ('inactivo','bloqueado')
+          AND p.deleted_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM app_private.solicitudes_eliminacion_cuenta d
+            WHERE (d.id_cliente = c.id_cliente OR d.id_usuario = u.id_usuario OR d.id_persona = p.id_persona)
+              AND d.estado_codigo IN ('procesando','storage_pendiente','auth_pendiente','completada'))
+        FOR SHARE OF c,u,p`, [recoveryOwner.clienteId, recoveryOwner.personaId, recoveryOwner.usuarioId]);
+      if (!identity.rows.length) {
+        throw new AppError(409, "La cuenta no esta disponible para conciliacion", { code: "PAYMENT_RECOVERY_ACCOUNT_UNAVAILABLE" });
+      }
+    }
     await client.query(
       "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
       [`pixelpay-sale:${idIntent}`]
     );
 
-    await loadPublicGroup(client, { groupId: idGrupoCita, titularEmail });
+    await loadPublicGroup(client, { groupId: idGrupoCita, titularEmail, access });
     const lockedIntentResult = await client.query(
       `SELECT pi.id_intent, pi.id_cita, pi.id_grupo_cita, pi.id_provider,
               pi.estado_intent_codigo, pi.monto_hnl, pi.moneda_codigo,
-              pi.referencia_externa, pi.provider_session_id, pi.expires_at,
+              pi.referencia_externa, pi.provider_session_id, pi.expires_at, pi.created_by_usuario_id,
               pp.codigo AS provider_code
        FROM public.payment_intents pi
        JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
@@ -1663,7 +1690,11 @@ export async function reconcilePixelPayPaid(client, {
        FOR UPDATE OF h`,
       [idGrupoCita]
     );
-    const groupRows = await loadPublicGroup(client, { groupId: idGrupoCita, titularEmail });
+    const groupRows = await loadPublicGroup(client, { groupId: idGrupoCita, titularEmail, access });
+    if (recoveryOwner && groupRows[0]?.origen_codigo === "cliente_autenticado"
+      && String(intent.created_by_usuario_id || "") !== String(recoveryOwner.usuarioId)) {
+      throw new AppError(403, "No tienes permiso para recuperar este pago", { code: "PAYMENT_RECOVERY_FORBIDDEN" });
+    }
 
     if (fromDurableApproval) {
       const statesValid = (intent.estado_intent_codigo === "pendiente_confirmacion"

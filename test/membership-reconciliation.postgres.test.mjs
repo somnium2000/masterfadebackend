@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import pg from "pg";
+import Fastify from "fastify";
+import paymentRecoveryRoutes from "../src/routes/v1/paymentRecovery.js";
+import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { startPostgres17 } from "./helpers/postgres17.mjs";
 import { processMembershipPixelPaySale, recoverMembershipPixelPayApproval } from "../src/services/membershipService.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
@@ -248,6 +251,34 @@ test("PostgreSQL 17 v2: recuperacion real de membresia exige evento canonico cor
       assert.equal((await recover()).duplicate, true);
       await assertOnce();
     } finally { await Promise.all(connections.map(c => c.end())); }
+  });
+  await t.test("HTTP con compras suspendidas recupera membresia propia una sola vez", async (sub) => {
+    await reset();
+    const pool = new pg.Pool(isolated.connectionOptions);
+    const app = Fastify();
+    app.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false });
+    app.decorate("db", pool);
+    const session = await installPrivatePilot(app, sub, { userId: IDs.user, clientId: IDs.client, enabled: false });
+    const query = pool.query.bind(pool);
+    pool.query = async (sql, params) => String(sql).includes("WITH base_user")
+      ? { rows: [{ id_usuario: IDs.user, id_persona: IDs.person, cliente_id: IDs.client, roles: ["cliente"] }] }
+      : query(sql, params);
+    await app.register(paymentRecoveryRoutes, { prefix: "/v1/cliente/pagos" });
+    const request = (method = "POST") => ({ method, url: `/v1/cliente/pagos/${IDs.intent}${method === "POST" ? "/conciliar" : ""}`,
+      headers: session.headers, ...(method === "POST" ? { payload: {} } : {}) });
+    try {
+      assert.equal((await app.inject(request("GET"))).json().data.estado_intent_codigo, "pendiente_confirmacion");
+      const recovered = await app.inject(request());
+      assert.equal(recovered.statusCode, 200, recovered.body);
+      assert.equal(recovered.json().data.estado, "activa");
+      assert.equal((await app.inject(request())).json().data.duplicate, true);
+      const read = await app.inject(request("GET"));
+      assert.equal(read.json().data.paid_at, "2026-11-13 12:00:00.123456+00");
+      await assertOnce();
+      await client.query("UPDATE membership_purchase_orders SET id_cliente=$1", [IDs.person]);
+      assert.equal((await app.inject(request())).statusCode, 404);
+      assert.equal((await client.query("SELECT count(*)::int count FROM subscriptions")).rows[0].count, 1);
+    } finally { await app.close(); await pool.end(); }
   });
   assert.equal(providerCalls, 0);
 });
