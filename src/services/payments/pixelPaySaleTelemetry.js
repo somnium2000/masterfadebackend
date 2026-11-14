@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { sanitizePixelPaySaleRuntimeDiagnostics } from "./pixelPaySaleRuntime.js";
 
 export const PIXELPAY_SALE_EVENT = Object.freeze({
   ATTEMPT_STARTED: "PIXELPAY_SALE_ATTEMPT_STARTED",
@@ -122,7 +123,7 @@ export function createPixelPaySaleAttempt(input = {}, { randomUUID = crypto.rand
     idIntent: text(input.idIntent, 120),
     orderId: text(input.orderId, 180),
     provider: "pixelpay",
-    env: "sandbox",
+    env: input.env === "live" ? "live" : "sandbox",
     amount: safeAmount(input.amount),
     currency: text(input.currency, 12)?.toUpperCase() || null,
   });
@@ -144,7 +145,18 @@ export function safePixelPayProviderResponseCode(value) {
 
 export function buildPixelPaySaleEvent(event, attempt, details = {}) {
   const inputErrorFields = safePixelPayInputErrorFields(details.inputErrorFields);
+  const runtime = sanitizePixelPaySaleRuntimeDiagnostics(details);
   return {
+    executionPhase: runtime.executionPhase,
+    httpResponseReceived: runtime.httpResponseReceived,
+    requestMayHaveBeenSent: runtime.requestMayHaveBeenSent,
+    sdkTransactionType: runtime.sdkTransactionType,
+    transportErrorCode: runtime.transportErrorCode,
+    wafChallenge: runtime.wafChallenge,
+    sdkStackFile: runtime.sdkStackFile,
+    sdkStackLine: runtime.sdkStackLine,
+    sdkStackColumn: runtime.sdkStackColumn,
+    referenceSymbol: runtime.referenceSymbol,
     event,
     timestamp: new Date().toISOString(),
     paymentAttemptId: attempt.paymentAttemptId,
