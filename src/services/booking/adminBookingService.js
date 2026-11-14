@@ -7,6 +7,7 @@ import {
   assertKnownIdempotencyState,
   buildAssignmentAttemptsFromIntegrantes,
   buildCanonicalReservationPayload,
+  buildMembershipConsumptionEvidence,
   buildReservationRequestFingerprint,
   createCanonicalReservation,
   finalizeReservationIdempotency,
@@ -1084,6 +1085,12 @@ async function createCanonicalAdminReservation(app, dbClient, {
     benefitContext,
     totalsByBenefit,
     selectedTotals,
+    membershipConsumption: buildMembershipConsumptionEvidence({
+      idSuscripcion: benefitContext.coverageTracker?.idSuscripcion || null,
+      integrantes: selectedIntegrantes,
+      canonicalResult,
+      defaultOriginCode: "admin_servicio_manual",
+    }),
   });
   await auditAdminBooking(dbClient, {
     request,
@@ -1295,6 +1302,7 @@ async function persistAdminBenefitSummary(dbClient, {
   benefitContext,
   totalsByBenefit,
   selectedTotals,
+  membershipConsumption,
 }) {
   const summary = buildAdminBenefitSummary({
     responsePayload,
@@ -1302,6 +1310,7 @@ async function persistAdminBenefitSummary(dbClient, {
     totalsByBenefit,
     selectedTotals,
   });
+  summary.membership_consumption = membershipConsumption;
   await dbClient.query(
     `
       INSERT INTO public.citas_admin_beneficios_resumen (
@@ -1392,8 +1401,10 @@ async function loadAdminHoldBenefitSummary(client, groupId) {
       code: "ADMIN_BOOKING_BENEFIT_SUMMARY_MISSING",
     });
   }
+  const visibleSummary = { ...(row.resumen_beneficios || {}) };
+  delete visibleSummary.membership_consumption;
   return {
-    resumen_beneficios: row.resumen_beneficios || {},
+    resumen_beneficios: visibleSummary,
     membresia_cubierto_hnl: normalizeMoney(row.descuento_membresia_hnl),
     recompensa_cubierto_hnl: normalizeMoney(row.descuento_recompensa_hnl),
     promocion_descuento_hnl: normalizeMoney(row.descuento_promocion_hnl),

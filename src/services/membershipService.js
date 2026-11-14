@@ -165,6 +165,12 @@ async function getMembershipCapabilities(client) {
             to_regclass('public.subscription_consumptions') IS NOT NULL AS has_subscription_consumptions,
             to_regclass('public.subscription_alert_events') IS NOT NULL AS has_subscription_alert_events,
             to_regclass('public.subscription_payments') IS NOT NULL AS has_subscription_payments,
+            (SELECT COUNT(*) = 3 FROM information_schema.columns
+              WHERE table_schema = 'app_private' AND table_name = 'reserva_idempotencia'
+                AND column_name IN ('response_payload', 'scope', 'id_grupo_cita')) AS has_reservation_idempotency,
+            (SELECT COUNT(*) = 2 FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = 'citas_admin_beneficios_resumen'
+                AND column_name IN ('resumen_beneficios', 'id_grupo_cita')) AS has_admin_benefits_summary,
             to_regclass('public.points_transactions') IS NOT NULL AS has_points_transactions
         `
       ),
@@ -197,6 +203,8 @@ async function getMembershipCapabilities(client) {
     hasSubscriptionConsumptions: Boolean(tableRow.has_subscription_consumptions),
     hasSubscriptionAlertEvents: Boolean(tableRow.has_subscription_alert_events),
     hasSubscriptionPayments: Boolean(tableRow.has_subscription_payments),
+    hasReservationIdempotency: Boolean(tableRow.has_reservation_idempotency),
+    hasAdminBenefitsSummary: Boolean(tableRow.has_admin_benefits_summary),
     hasPointsTransactions: Boolean(tableRow.has_points_transactions),
     hasSubsBeneficiosSnapshot: columnSet.has("subscriptions.beneficios_snapshot"),
     hasSubsSucursalContratada: columnSet.has("subscriptions.id_sucursal_contratada"),
@@ -3401,7 +3409,10 @@ async function listAppointmentServiceDetails(client, idCita) {
   const { rows } = await client.query(
     `
       SELECT
+        cd.id_cita_detalle,
+        cd.line_key,
         cd.id_servicio,
+        cd.cantidad,
         COALESCE(s.nombre_servicio, 'Servicio') AS nombre_servicio
       FROM public.citas_detalles cd
       LEFT JOIN public.servicios s
@@ -3416,63 +3427,83 @@ async function listAppointmentServiceDetails(client, idCita) {
 
 async function getOperationalConsumptionStateForAppointment(client, idCita) {
   const capabilities = await getMembershipCapabilities(client);
-  if (!capabilities.hasSubscriptionConsumptions) {
-    return {
-      hasService: false,
-      hasCourtesy: false,
-    };
-  }
-  const sourceKindClause = capabilities.hasSubcSourceKind
-    ? "AND sc.source_kind = 'appointment_completed'"
-    : "";
-  const invalidadoClause = capabilities.hasSubcInvalidado
-    ? "AND COALESCE(sc.invalidado, FALSE) IS FALSE"
-    : "";
+  if (!capabilities.hasSubscriptionConsumptions) return [];
   const { rows } = await client.query(
     `
       SELECT
-        COUNT(*) FILTER (WHERE sc.item_tipo = $3::text) AS service_count,
-        COUNT(*) FILTER (WHERE sc.item_tipo = $4::text) AS courtesy_count
+        sc.id_suscripcion, sc.id_cliente, sc.item_tipo, sc.id_servicio,
+        sc.cantidad, sc.source_key,
+        ${capabilities.hasSubsBeneficiosSnapshot ? 's.beneficios_snapshot' : `${EMPTY_SNAPSHOT_SQL_LITERAL}::jsonb AS beneficios_snapshot`}
       FROM public.subscription_consumptions sc
+      JOIN public.subscriptions s ON s.id_suscripcion = sc.id_suscripcion
       WHERE sc.id_cita = $1::uuid
-        AND sc.coverage_status = $2::text
-        ${sourceKindClause}
-        ${invalidadoClause}
     `,
-    [idCita, COVERAGE_STATUS.COVERED, MEMBERSHIP_CONSUMPTION_TYPES.SERVICE, MEMBERSHIP_CONSUMPTION_TYPES.COURTESY]
+    [idCita]
   );
-  return {
-    hasService: Number(rows?.[0]?.service_count || 0) > 0,
-    hasCourtesy: Number(rows?.[0]?.courtesy_count || 0) > 0,
-  };
+  return rows;
 }
 
-function pickServiceBenefitForConsumption(summary, appointmentServiceRows = []) {
+async function getAppointmentMembershipEvidence(client, idGrupoCita) {
+  const capabilities = await getMembershipCapabilities(client);
+  const sources = [];
+  if (capabilities.hasReservationIdempotency) {
+    sources.push(`SELECT response_payload->'membership_consumption' AS evidence
+      FROM app_private.reserva_idempotencia
+      WHERE id_grupo_cita = $1::uuid AND scope = 'auth:citas:hold'`);
+  }
+  if (capabilities.hasAdminBenefitsSummary) {
+    sources.push(`SELECT resumen_beneficios->'membership_consumption' AS evidence
+      FROM public.citas_admin_beneficios_resumen WHERE id_grupo_cita = $1::uuid`);
+  }
+  if (!sources.length || !idGrupoCita) return null;
+  const { rows } = await client.query(sources.join(' UNION ALL '), [idGrupoCita]);
+  const evidence = rows.map((row) => row.evidence).filter(Boolean);
+  // AM: Evidencias contradictorias requieren comparacion manual, nunca una cuota inferida.
+  if (evidence.length !== 1 || evidence[0]?.version !== 1) return null;
+  return evidence[0];
+}
+
+function pickServiceBenefitForConsumption(summary, appointmentServiceRows = [], coveredServices = []) {
   const byServiceId = new Map(
     (Array.isArray(summary?.servicios) ? summary.servicios : [])
       .filter((service) => service?.id_servicio)
       .map((service) => [service.id_servicio, service])
   );
 
-  for (const row of appointmentServiceRows) {
-    const idServicio = normalizeText(row?.id_servicio);
-    if (!idServicio) continue;
+  const detailsByKey = new Map(appointmentServiceRows.map((row) => [row.line_key, row]));
+  const remainingByService = new Map([...byServiceId].map(([id, benefit]) => [id, toInt(benefit.restante, 0)]));
+  const selected = new Map();
+  for (const covered of coveredServices) {
+    const row = detailsByKey.get(covered?.line_key);
+    const idServicio = normalizeText(covered?.id_servicio);
+    const quantity = Number(covered?.cantidad);
     const benefit = byServiceId.get(idServicio);
-    if (toInt(benefit?.restante, 0) > 0) {
-      return {
-        id_servicio: idServicio,
-        nombre: normalizeText(benefit?.nombre) || normalizeText(row?.nombre_servicio) || "Servicio",
-      };
+    if (!row || row.id_servicio !== idServicio || !benefit || !Number.isSafeInteger(quantity) || quantity <= 0) {
+      throw new AppError(409, "No se encontro un servicio valido para consumir en la membresia activa", {
+        code: "MEMBERSHIP_CONSUMPTION_SERVICE_NOT_MATCHED",
+      });
     }
+    const previousQuantity = selected.get(row.id_cita_detalle)?.cantidad || 0;
+    if (previousQuantity + quantity > toInt(row.cantidad, 0)) {
+      throw new AppError(409, "La cobertura de membresia no coincide con los servicios de la cita", {
+        code: "MEMBERSHIP_CONSUMPTION_SERVICE_NOT_MATCHED",
+      });
+    }
+    const remaining = remainingByService.get(idServicio) || 0;
+    if (quantity > remaining) {
+      throw new AppError(409, "La membresia no tiene servicios disponibles para completar esta cita", {
+        code: "MEMBERSHIP_CONSUMPTION_SERVICE_BALANCE_INSUFFICIENT",
+      });
+    }
+    remainingByService.set(idServicio, remaining - quantity);
+    selected.set(row.id_cita_detalle, {
+      id_cita_detalle: row.id_cita_detalle,
+      id_servicio: idServicio,
+      nombre: normalizeText(benefit.nombre) || normalizeText(row.nombre_servicio) || "Servicio",
+      cantidad: previousQuantity + quantity,
+    });
   }
-
-  const fallback = (Array.isArray(summary?.servicios) ? summary.servicios : [])
-    .find((service) => toInt(service?.restante, 0) > 0);
-  if (!fallback) return null;
-  return {
-    id_servicio: normalizeText(fallback.id_servicio),
-    nombre: normalizeText(fallback.nombre) || "Servicio",
-  };
+  return [...selected.values()];
 }
 
 function pickCourtesyBenefitForConsumption(summary) {
@@ -3500,6 +3531,49 @@ export async function consumeMembershipForCompletedAppointment(client, {
     return { aplicado: false, motivo: "sin_contexto_consumo" };
   }
 
+  const capabilities = await getMembershipCapabilities(client);
+  if (!capabilities.hasSubscriptions || !capabilities.hasSubscriptionConsumptions) {
+    return { aplicado: false, motivo: "sin_suscripcion_activa" };
+  }
+  // AM: Los llamadores conservan su transaccion; la cita serializa reintentos y el plan sus cuotas.
+  const { rows: appointmentRows } = await client.query(`
+    SELECT id_cita, id_cliente, id_sucursal, id_grupo_cita, orden_integrante, estado_cita_codigo
+    FROM public.citas WHERE id_cita = $1::uuid FOR UPDATE
+  `, [safeIdCita]);
+  const appointment = appointmentRows[0];
+  if (!appointment || appointment.id_cliente !== safeIdCliente || Number(appointment.orden_integrante || 1) > 1) {
+    return { aplicado: false, motivo: "sin_contexto_consumo" };
+  }
+  if (!safeIdSucursal || appointment.id_sucursal !== safeIdSucursal) {
+    throw new AppError(409, "La membresia activa no corresponde a la sucursal de la cita", {
+      code: "MEMBERSHIP_CONSUMPTION_BRANCH_MISMATCH",
+    });
+  }
+  const previousRows = await getOperationalConsumptionStateForAppointment(client, safeIdCita);
+  if (previousRows.length) {
+    // AM: Incluye claves legacy/invalidadas: no completar ni reasignar historicos automaticamente.
+    const previous = previousRows[0];
+    const consumptionRows = await getSubscriptionConsumptionRows(client, previous.id_suscripcion);
+    const summary = summarizeBenefits(normalizeBenefitsSnapshot(previous.beneficios_snapshot), consumptionRows);
+    return {
+      aplicado: false,
+      motivo: "consumo_ya_registrado",
+      id_suscripcion: previous.id_suscripcion,
+      resumen: summary,
+      ultimo_servicio_restante: Number(summary.totales.servicios_restantes || 0) === 1,
+    };
+  }
+  if (!["confirmada", "en_salon", "en_atencion", "completada"].includes(appointment.estado_cita_codigo)) {
+    return { aplicado: false, motivo: "cita_no_elegible" };
+  }
+  const evidence = await getAppointmentMembershipEvidence(client, appointment.id_grupo_cita);
+  const coveredAppointment = Array.isArray(evidence?.citas)
+    ? evidence.citas.find((row) => row.id_cita === safeIdCita)
+    : null;
+  const coveredServices = Array.isArray(coveredAppointment?.servicios) ? coveredAppointment.servicios : [];
+  if (evidence && coveredAppointment && !coveredServices.length) {
+    return { aplicado: false, motivo: "sin_evidencia_cobertura" };
+  }
   const lifecycle = await ensureSubscriptionLifecycle(client, safeIdCliente, { forUpdate: true });
   if (!lifecycle.active) {
     return { aplicado: false, motivo: "sin_suscripcion_activa" };
@@ -3507,7 +3581,21 @@ export async function consumeMembershipForCompletedAppointment(client, {
 
   const activeSubscription = lifecycle.active;
   const currentSummary = lifecycle.summary || summarizeBenefits(activeSubscription.beneficios_snapshot, activeSubscription.consumo_rows);
-  if (activeSubscription.id_sucursal_contratada && safeIdSucursal && activeSubscription.id_sucursal_contratada !== safeIdSucursal) {
+  const appointmentServiceRows = await listAppointmentServiceDetails(client, safeIdCita);
+  if (!evidence || !coveredAppointment) {
+    const includedIds = new Set(currentSummary.servicios.map((row) => row.id_servicio));
+    if (!appointmentServiceRows.some((row) => includedIds.has(row.id_servicio))) {
+      return { aplicado: false, motivo: "sin_evidencia_cobertura" };
+    }
+    throw new AppError(409, "La cobertura de esta cita requiere revision antes de registrar el consumo", {
+      code: "MEMBERSHIP_CONSUMPTION_EVIDENCE_REQUIRED",
+    });
+  }
+  if (evidence.id_suscripcion !== activeSubscription.id_suscripcion
+      || new Date(activeSubscription.inicio_at).getTime() > Date.now()) {
+    return { aplicado: false, motivo: "sin_suscripcion_activa" };
+  }
+  if (!activeSubscription.id_sucursal_contratada || activeSubscription.id_sucursal_contratada !== safeIdSucursal) {
     throw new AppError(409, "La membresia activa no corresponde a la sucursal de la cita", {
       code: "MEMBERSHIP_CONSUMPTION_BRANCH_MISMATCH",
       details: {
@@ -3518,36 +3606,13 @@ export async function consumeMembershipForCompletedAppointment(client, {
     });
   }
 
-  const consumptionState = await getOperationalConsumptionStateForAppointment(client, safeIdCita);
-  const alreadyHasService = Boolean(consumptionState?.hasService);
-  const alreadyHasCourtesy = Boolean(consumptionState?.hasCourtesy);
+  const selectedServices = pickServiceBenefitForConsumption(currentSummary, appointmentServiceRows, coveredServices);
   const eligibleCourtesies = (Array.isArray(currentSummary?.cortesias) ? currentSummary.cortesias : [])
     .filter((item) => Boolean(normalizeText(item?.id_cortesia)));
   const cortesiasTotales = eligibleCourtesies.reduce((acc, item) => acc + Number(item?.total || 0), 0);
   const cortesiasRestantes = eligibleCourtesies.reduce((acc, item) => acc + Number(item?.restante || 0), 0);
   const requiresCourtesyConsumption = cortesiasTotales > 0;
-  if (alreadyHasService && (!requiresCourtesyConsumption || alreadyHasCourtesy)) {
-    return {
-      aplicado: false,
-      motivo: "consumo_ya_registrado",
-      id_suscripcion: activeSubscription.id_suscripcion,
-      resumen: currentSummary,
-      ultimo_servicio_restante: Number(currentSummary?.totales?.servicios_restantes || 0) === 1,
-    };
-  }
-
-  const serviciosRestantes = Number(currentSummary?.totales?.servicios_restantes || 0);
-  if (!alreadyHasService && serviciosRestantes < 1) {
-    throw new AppError(409, "La membresia no tiene servicios disponibles para completar esta cita", {
-      code: "MEMBERSHIP_CONSUMPTION_SERVICE_BALANCE_INSUFFICIENT",
-      details: {
-        id_suscripcion: activeSubscription.id_suscripcion,
-        servicios_restantes: serviciosRestantes,
-      },
-    });
-  }
-
-  if (requiresCourtesyConsumption && !alreadyHasCourtesy && cortesiasRestantes < 1) {
+  if (requiresCourtesyConsumption && cortesiasRestantes < 1) {
     throw new AppError(409, "La membresia no tiene cortesias disponibles para completar esta cita", {
       code: "MEMBERSHIP_CONSUMPTION_COURTESY_BALANCE_INSUFFICIENT",
       details: {
@@ -3558,37 +3623,25 @@ export async function consumeMembershipForCompletedAppointment(client, {
   }
 
   const entries = [];
-  if (!alreadyHasService) {
-    const appointmentServiceRows = await listAppointmentServiceDetails(client, safeIdCita);
-    const selectedService = pickServiceBenefitForConsumption(currentSummary, appointmentServiceRows);
-    if (!selectedService?.id_servicio) {
-      throw new AppError(409, "No se encontro un servicio valido para consumir en la membresia activa", {
-        code: "MEMBERSHIP_CONSUMPTION_SERVICE_NOT_MATCHED",
-        details: {
-          id_suscripcion: activeSubscription.id_suscripcion,
-          id_cita: safeIdCita,
-        },
-      });
-    }
-
+  for (const selectedService of selectedServices) {
     entries.push({
       item_tipo: MEMBERSHIP_CONSUMPTION_TYPES.SERVICE,
       id_servicio: selectedService.id_servicio,
       id_cortesia: null,
       item_codigo: null,
       item_nombre: selectedService.nombre,
-      cantidad: 1,
+      cantidad: selectedService.cantidad,
       precio_unitario_hnl: 0,
       total_hnl: 0,
       coverage_status: COVERAGE_STATUS.COVERED,
-      source_key: `appointment:${safeIdCita}:${MEMBERSHIP_CONSUMPTION_TYPES.SERVICE}`,
+      source_key: `appointment:${safeIdCita}:${MEMBERSHIP_CONSUMPTION_TYPES.SERVICE}:${selectedService.id_cita_detalle}`,
       source_kind: "appointment_completed",
       invalidado: false,
       invalidado_motivo: null,
     });
   }
 
-  if (requiresCourtesyConsumption && !alreadyHasCourtesy) {
+  if (requiresCourtesyConsumption) {
     const selectedCourtesy = pickCourtesyBenefitForConsumption(currentSummary);
     if (!selectedCourtesy?.id_cortesia) {
       throw new AppError(409, "No se encontro una cortesia valida para consumir en la membresia activa", {
@@ -3645,9 +3698,9 @@ export async function consumeMembershipForCompletedAppointment(client, {
     motivo: "consumo_registrado",
     id_suscripcion: activeSubscription.id_suscripcion,
     consumos_registrados: entries.length,
-    consumo_servicio: alreadyHasService || entries.some((entry) => entry.item_tipo === MEMBERSHIP_CONSUMPTION_TYPES.SERVICE),
+    consumo_servicio: entries.some((entry) => entry.item_tipo === MEMBERSHIP_CONSUMPTION_TYPES.SERVICE),
     consumo_cortesia: requiresCourtesyConsumption
-      ? (alreadyHasCourtesy || entries.some((entry) => entry.item_tipo === MEMBERSHIP_CONSUMPTION_TYPES.COURTESY))
+      ? entries.some((entry) => entry.item_tipo === MEMBERSHIP_CONSUMPTION_TYPES.COURTESY)
       : false,
     ultimo_servicio_restante: Number(refreshedSummary?.totales?.servicios_restantes || 0) === 1,
     resumen: refreshedSummary,

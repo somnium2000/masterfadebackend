@@ -105,6 +105,7 @@ export async function finalizeReservationIdempotency(client, {
   requestFingerprint,
   responsePayload,
   statusCode = 201,
+  internalMetadata = null,
 } = {}) {
   await client.query(
     `
@@ -122,9 +123,71 @@ export async function finalizeReservationIdempotency(client, {
       {
         status_code: statusCode,
         data: responsePayload || null,
+        ...(internalMetadata?.membership_consumption
+          ? { membership_consumption: internalMetadata.membership_consumption }
+          : {}),
       },
     ]
   );
+}
+
+// AM: Evidencia interna de las unidades cubiertas; no modifica precios ni la respuesta HTTP.
+export function buildMembershipConsumptionEvidence({
+  idSuscripcion = null,
+  integrantes = [],
+  canonicalResult = {},
+  defaultOriginCode = "servicio_manual",
+} = {}) {
+  const fail = () => {
+    throw new AppError(409, "No se pudo verificar la cobertura de membresia de la reserva", {
+      code: "MEMBERSHIP_CONSUMPTION_EVIDENCE_INVALID",
+    });
+  };
+  const clean = (value) => String(value || "").trim();
+  const groupKey = (item) => [
+    clean(item?.id_servicio),
+    clean(item?.id_tarifa),
+    clean(item?.origen_item_codigo) || defaultOriginCode,
+  ].join("|");
+  const byOrder = new Map((Array.isArray(integrantes) ? integrantes : []).map((item, index) => [
+    Number(item?.orden_integrante || index + 1), item,
+  ]));
+  const blocks = Array.isArray(canonicalResult?.bloques) ? canonicalResult.bloques : [];
+  const subscriptionId = clean(idSuscripcion) || null;
+  const evidence = {
+    version: 1,
+    id_suscripcion: subscriptionId,
+    citas: blocks.map((block) => {
+      const order = Number(block?.orden_integrante || 0);
+      const integrante = byOrder.get(order);
+      const result = { id_cita: clean(block?.id_cita), servicios: [] };
+      if (order !== 1 || !integrante) return result;
+      const coverage = integrante._coverage || integrante._benefits?.coverage;
+      const serviceItems = integrante.selection?.serviceSelection?.items || integrante.serviceItems || [];
+      const details = new Map((Array.isArray(integrante.detailRows) ? integrante.detailRows : [])
+        .map((row) => [groupKey(row), row]));
+      const coveredByLine = new Map();
+      (Array.isArray(coverage?.items) ? coverage.items : []).forEach((item, index) => {
+        if (item?.coverage_status !== "cubierto_plan") return;
+        const source = serviceItems[index];
+        if (!source || clean(source.id_servicio) !== clean(item.id_servicio)) fail();
+        const detail = details.get(groupKey(source));
+        const quantity = Number(item.cantidad ?? 1);
+        if (!result.id_cita || !subscriptionId || !clean(detail?.line_key)
+          || !Number.isSafeInteger(quantity) || quantity < 1) fail();
+        const lineKey = clean(detail.line_key);
+        const current = coveredByLine.get(lineKey) || {
+          id_servicio: clean(item.id_servicio), line_key: lineKey, cantidad: 0,
+        };
+        current.cantidad += quantity;
+        if (current.cantidad > Number(detail.cantidad || 0)) fail();
+        coveredByLine.set(lineKey, current);
+      });
+      result.servicios = [...coveredByLine.values()];
+      return result;
+    }),
+  };
+  return evidence;
 }
 
 export function assertKnownIdempotencyState(state = {}) {
