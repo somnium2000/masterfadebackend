@@ -2,15 +2,16 @@ const SALE_ROUTE = "api/v2/transaction/sale";
 const EXECUTION_PHASES = new Set(["request_construction", "sdk_preparation", "sale_transport", "response_processing"]);
 const RUNTIME_CODES = new Set([
   "SDK_REFERENCE_ERROR", "SDK_RUNTIME_ERROR", "SDK_NETWORK_ERROR", "SDK_HTTP_TIMEOUT",
-  "SDK_RESPONSE_PARSE_ERROR", "SDK_BROWSER_ACTION_REQUIRED", "SDK_UPSTREAM_ERROR",
+  "SDK_RESPONSE_PARSE_ERROR", "SDK_BROWSER_ACTION_REQUIRED", "SDK_CONTINUATION_REQUIRED", "SDK_UPSTREAM_ERROR",
 ]);
 const ERROR_NAMES = new Set([
   "Error", "ReferenceError", "TypeError", "SyntaxError", "RangeError", "EvalError", "URIError",
   "AggregateError", "AxiosError", "AbortError", "InvalidCredentialsException",
   "FailedEncryptionException", "InvalidTransactionTypeException", "RunningTransactionException",
-  "PixelPayBrowserActionRequiredError",
+  "PixelPayContinuationRequiredError",
 ]);
 const REFERENCE_SYMBOLS = new Set(["document", "window", "DOMParser", "navigator", "atob", "Cardinal"]);
+const CONTINUATION_TYPES = new Set(["payload", "songbird", "router"]);
 const SDK_FILES = new Set([
   "lib/base/Helpers.js", "lib/base/ServiceBehaviour.js", "lib/base/RequestBehaviour.js", "lib/base/Response.js",
   "lib/services/Transaction.js", "lib/services/CardinalAuthentication.js",
@@ -27,6 +28,7 @@ const safeBoolean = value => typeof value === "boolean" ? value : null;
 const safePosition = value => Number.isInteger(value) && value > 0 && value <= 9999999 ? value : null;
 const safeStatus = value => Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
 const safeName = value => ERROR_NAMES.has(value) ? value : null;
+const safeContinuationType = value => CONTINUATION_TYPES.has(value) ? value : null;
 
 export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
   const input = source && typeof source === "object" ? source : {};
@@ -36,6 +38,7 @@ export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
     httpResponseReceived: safeBoolean(input.httpResponseReceived),
     requestMayHaveBeenSent: safeBoolean(input.requestMayHaveBeenSent),
     statusCode: safeStatus(input.statusCode),
+    sdkTransactionType: safeContinuationType(input.sdkTransactionType),
     sdkStackFile,
     sdkStackLine: sdkStackFile ? safePosition(input.sdkStackLine) : null,
     sdkStackColumn: sdkStackFile ? safePosition(input.sdkStackColumn) : null,
@@ -60,11 +63,11 @@ function sdkFrame(error) {
   return {};
 }
 
-export class PixelPayBrowserActionRequiredError extends Error {
-  constructor() {
-    super("PixelPay requires a browser action that cannot execute in this backend.");
-    this.name = "PixelPayBrowserActionRequiredError";
-    this.code = "SDK_BROWSER_ACTION_REQUIRED";
+export class PixelPayContinuationRequiredError extends Error {
+  constructor(transactionType) {
+    super("PixelPay returned a continuation that this backend cannot resolve automatically.");
+    this.name = "PixelPayContinuationRequiredError";
+    this.sdkTransactionType = safeContinuationType(transactionType);
     this.statusCode = 202;
     this.responseClass = "PayloadResponse";
   }
@@ -75,8 +78,10 @@ export function classifyPixelPaySaleRuntimeError(error, execution = {}) {
   const errorConstructorName = safeName(error?.constructor?.name);
   const context = sanitizePixelPaySaleRuntimeDiagnostics(execution);
   let safeMessageCode = "SDK_RUNTIME_ERROR";
-  if (error instanceof PixelPayBrowserActionRequiredError) {
-    safeMessageCode = "SDK_BROWSER_ACTION_REQUIRED";
+  if (error instanceof PixelPayContinuationRequiredError) {
+    context.sdkTransactionType = error.sdkTransactionType;
+    safeMessageCode = ["payload", "songbird"].includes(error.sdkTransactionType)
+      ? "SDK_BROWSER_ACTION_REQUIRED" : "SDK_CONTINUATION_REQUIRED";
   } else if (errorName === "ReferenceError" || errorConstructorName === "ReferenceError") {
     safeMessageCode = "SDK_REFERENCE_ERROR";
   } else if ((errorName === "SyntaxError" || errorConstructorName === "SyntaxError")
@@ -117,6 +122,7 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
       return {
         executionPhase: safe.executionPhase, httpResponseReceived: safe.httpResponseReceived,
         requestMayHaveBeenSent: safe.requestMayHaveBeenSent, statusCode: safe.statusCode,
+        sdkTransactionType: safe.sdkTransactionType,
       };
     }
 
@@ -166,7 +172,10 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
       this.saleResponsePending = false;
       const response = super.parseResponse(data, status);
       // AM: Contener el 202 antes de DOM/3DS/router; nunca ejecutar otra Sale ni convertirlo en aprobacion.
-      if (saleResponse && status === 202) throw new PixelPayBrowserActionRequiredError();
+      if (saleResponse && status === 202) {
+        this.saleExecution.sdkTransactionType = safeContinuationType(response?.data?.transaction_type);
+        throw new PixelPayContinuationRequiredError(this.saleExecution.sdkTransactionType);
+      }
       return response;
     }
 

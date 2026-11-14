@@ -150,6 +150,7 @@ export function buildPixelPaySaleEvent(event, attempt, details = {}) {
     executionPhase: runtime.executionPhase,
     httpResponseReceived: runtime.httpResponseReceived,
     requestMayHaveBeenSent: runtime.requestMayHaveBeenSent,
+    sdkTransactionType: runtime.sdkTransactionType,
     sdkStackFile: runtime.sdkStackFile,
     sdkStackLine: runtime.sdkStackLine,
     sdkStackColumn: runtime.sdkStackColumn,

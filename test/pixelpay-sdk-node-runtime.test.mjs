@@ -140,6 +140,7 @@ function report(t, label, run) {
     category: run.error?.safeMessageCode ?? run.result?.diagnostics?.safeMessageCode ?? null,
     phase: run.execution?.executionPhase, httpResponseReceived: run.execution?.httpResponseReceived,
     requestMayHaveBeenSent: run.execution?.requestMayHaveBeenSent,
+    sdkTransactionType: run.execution?.sdkTransactionType,
     statusCode: run.error?.statusCode ?? run.result?.statusCode ?? null, saleCalls: run.saleCalls }));
 }
 
@@ -205,21 +206,23 @@ test("B rechazo SDK real conserva respuesta contractual sin aprobacion", async (
   report(t, "B", run);
 });
 
-for (const [label, body] of [
+for (const [label, body, expectedType = null, expectedCode = "SDK_CONTINUATION_REQUIRED"] of [
   ["C 202 sin cuerpo", undefined], ["D 202 JSON", { success: true, data: { pending: true } }],
   ["E 202 estructura de error", { success: false, message: DATA_SENTINEL, errors: { financial_payload: DATA_SENTINEL } }],
-  ["202 payload", { success: true, data: { transaction_type: "payload", payload: DATA_SENTINEL } }],
-  ["202 songbird", { success: true, data: { transaction_type: "songbird", payload: DATA_SENTINEL } }],
+  ["202 payload", { success: true, data: { transaction_type: "payload", payload: DATA_SENTINEL } }, "payload", "SDK_BROWSER_ACTION_REQUIRED"],
+  ["202 songbird", { success: true, data: { transaction_type: "songbird", payload: DATA_SENTINEL } }, "songbird", "SDK_BROWSER_ACTION_REQUIRED"],
+  ["202 tipo desconocido", { success: true, data: { transaction_type: DATA_SENTINEL } }],
   ["202 router", { success: true, data: { transaction_type: "router", payload: Buffer.from(JSON.stringify({
     client_signature: "synthetic-router-signature", env: "live", auth_key: KEY, auth_hash: AUTH,
     endpoint: "https://synthetic-router.invalid",
-  })).toString("base64") } }],
+  })).toString("base64") } }, "router"],
 ]) test(`${label} queda incierto con HTTP preservado y sin ejecutar DOM`, async (t) => {
   mockTransport(202, body);
   const run = await execute();
   assert.equal(run.result, undefined);
   assert.equal(run.error.code, "PIXELPAY_NETWORK_ERROR");
-  assert.equal(run.error.safeMessageCode, "SDK_BROWSER_ACTION_REQUIRED");
+  assert.equal(run.error.safeMessageCode, expectedCode);
+  assert.equal(run.execution.sdkTransactionType, expectedType);
   assert.equal(run.error.uncertain, true);
   assert.equal(run.error.statusCode, 202);
   assert.equal(run.execution.httpResponseReceived, true);
@@ -228,6 +231,7 @@ for (const [label, body] of [
   assert.equal(run.saleCalls, 1);
   assert.notEqual(run.error.errorName, "ReferenceError");
   assert.equal(run.events.at(-1).event, "PIXELPAY_SALE_UNCERTAIN");
+  assert.equal(run.events.at(-1).sdkTransactionType, expectedType);
   report(t, label, run);
 });
 

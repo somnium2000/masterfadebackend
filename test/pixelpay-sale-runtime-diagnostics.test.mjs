@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyPixelPaySaleRuntimeError, sanitizePixelPaySaleRuntimeDiagnostics } from "../src/services/payments/pixelPaySaleRuntime.js";
+import { classifyPixelPaySaleRuntimeError, sanitizePixelPaySaleRuntimeDiagnostics, PixelPayContinuationRequiredError } from "../src/services/payments/pixelPaySaleRuntime.js";
 import { buildPixelPaySaleEvent, createPixelPaySaleAttempt } from "../src/services/payments/pixelPaySaleTelemetry.js";
 
 const received = { executionPhase: "response_processing", httpResponseReceived: true, requestMayHaveBeenSent: true, statusCode: 200 };
@@ -36,12 +36,24 @@ test("runtime logs retain only allowlisted symbol and relative SDK frame", () =>
   assert.doesNotMatch(JSON.stringify(event), /sentinel-secret|4111111111111111|987|evil[.]invalid|private/);
 });
 
+test("202 browser diagnostics require a known browser continuation", () => {
+  for (const type of ["payload", "songbird", "router", undefined, "sensitive-unknown-type"]) {
+    const details = classifyPixelPaySaleRuntimeError(new PixelPayContinuationRequiredError(type), { ...received, statusCode: 202 });
+    assert.equal(details.safeMessageCode, ["payload", "songbird"].includes(type)
+      ? "SDK_BROWSER_ACTION_REQUIRED" : "SDK_CONTINUATION_REQUIRED");
+    assert.equal(details.sdkTransactionType, ["payload", "songbird", "router"].includes(type) ? type : null);
+    const event = buildPixelPaySaleEvent("PIXELPAY_SALE_UNCERTAIN", createPixelPaySaleAttempt({}), details);
+    assert.equal(event.sdkTransactionType, details.sdkTransactionType);
+    assert.doesNotMatch(JSON.stringify(event), /sensitive-unknown-type/);
+  }
+});
+
 test("diagnostic sanitizer rejects injected filenames, symbols, phases and status", () => {
   const result = sanitizePixelPaySaleRuntimeDiagnostics({
     executionPhase: "secret", sdkStackFile: "../../secret.js", sdkStackLine: -1, sdkStackColumn: Infinity,
-    referenceSymbol: "secret", httpResponseReceived: "true", requestMayHaveBeenSent: "false", statusCode: "secret",
+    referenceSymbol: "secret", httpResponseReceived: "true", requestMayHaveBeenSent: "false", statusCode: "secret", sdkTransactionType: "secret",
   });
-  for (const key of ["executionPhase", "sdkStackFile", "sdkStackLine", "sdkStackColumn", "referenceSymbol", "httpResponseReceived", "requestMayHaveBeenSent", "statusCode"]) {
+  for (const key of ["executionPhase", "sdkStackFile", "sdkStackLine", "sdkStackColumn", "referenceSymbol", "httpResponseReceived", "requestMayHaveBeenSent", "statusCode", "sdkTransactionType"]) {
     assert.equal(result[key], null, key);
   }
 });
