@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import jwt from "jsonwebtoken";
 import auth from "../src/plugins/auth.js";
 import adminDataEntry from "../src/plugins/adminDataEntry.js";
-import gate, { resolvePrivateCommerceConfig } from "../src/plugins/privateCommerce.js";
+import gate, { resolvePrivateCommerceConfig, resolveQaSandboxBookingConfig } from "../src/plugins/privateCommerce.js";
 import { buildTrustProxy } from "../src/utils/trustProxy.js";
 import publicCitas from "../src/routes/v1/public/citas.js";
 import publicPagos from "../src/routes/v1/public/pagos.js";
@@ -46,7 +46,7 @@ async function fixture(t, options = {}) {
   app.decorate("db", { query: async (sql, params) => {
     if (sql.includes("FROM public.seguridad_sesiones")) return { rows: options.revoked ? [] : [{ estado: "activa", ultimo_uso_at: new Date(), expira_at: new Date(Date.now() + 60000) }] };
     if (sql.includes("UPDATE public.seguridad_sesiones")) return { rows: [] };
-    if (sql.includes("WITH base_user")) return { rows: [{ id_usuario: options.claimsMismatch ? OTHER : params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
+    if (sql.includes("WITH base_user")) return { rows: options.noClaims ? [] : [{ id_usuario: options.claimsMismatch ? OTHER : params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
     state.unexpectedSql++; throw Error("Unexpected business SQL");
   }, connect: async () => { state.unexpectedSql++; throw Error("Business connection prohibited"); } });
   await app.register(fp(async a => a.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false, ...options.config }), { name: "env-plugin" }));
@@ -489,4 +489,73 @@ test('revoked session emits no QA diagnostic even with pilot off', async t=>{
   const logs=[]; f.app.log.info=data=>{if(data.event==='QA_PRIVATE_COMMERCE_PROXY_DIAGNOSTIC')logs.push(data);};
   const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
   assert.deepEqual(r.json().data,{booking:false,vipPurchase:false}); assert.equal(logs.length,0);
+});
+
+const QA_BOOKING_IDENTITY = { ...QA_SDK, PIXELPAY_ENDPOINT: 'https://pixelpay.dev', PIXELPAY_APP_URL: 'https://pixelpay.dev',
+  QA_PRIVATE_COMMERCE_BOOKING_ENABLED: 'true', QA_PRIVATE_COMMERCE_USER_ID: USER,
+  PRIVATE_COMMERCE_PILOT_ENABLED: 'false', PRIVATE_COMMERCE_USER_IDS: undefined, PRIVATE_COMMERCE_IPS: undefined,
+  PRIVATE_COMMERCE_PROXY_IPS: undefined, QA_PRIVATE_COMMERCE_SALE_ENABLED: 'false' };
+
+test('QA identity booking defaults closed and rejects unsafe startup configuration', () => {
+  assert.equal(resolveQaSandboxBookingConfig({}).enabled, false);
+  assert.deepEqual(resolveQaSandboxBookingConfig(QA_BOOKING_IDENTITY).userIds, [USER]);
+  for (const patch of [
+    { QA_PRIVATE_COMMERCE_BOOKING_ENABLED:'yes' }, { QA_PRIVATE_COMMERCE_USER_ID:'' },
+    { QA_PRIVATE_COMMERCE_USER_ID:USER+','+OTHER }, { QA_PRIVATE_COMMERCE_USER_ID:'external-provider-id' },
+    { NODE_ENV:'production' }, { NODE_ENV:'staging' }, { ENTORNO:'production' },
+    { PIXELPAY_ENV:'live' }, { PIXELPAY_ENDPOINT:'https://pixelpay.app' }, { PIXELPAY_APP_URL:'https://pixelpay.app' },
+    { PAYMENT_PROVIDER:'todopago' }, { PIXELPAY_IMPLEMENTATION:'direct' },
+    { PRIVATE_COMMERCE_PILOT_ENABLED:'true' }, { QA_PRIVATE_COMMERCE_SALE_ENABLED:'true' },
+    { ENABLE_QA_PAYMENT_SIMULATION:'true' }, { ENABLE_QA_VIP_PURCHASE_SIMULATION:'true' },
+  ]) assert.throws(()=>resolveQaSandboxBookingConfig({...QA_BOOKING_IDENTITY,...patch}));
+});
+
+test('QA identity booking grants only verified owner, independently of TCP and forwarded headers', async t => {
+  const f=await fixture(t,{env:QA_BOOKING_IDENTITY});
+  for(const [remoteAddress,extra] of [
+    ['198.51.100.23',{}], ['10.0.0.99',{'x-forwarded-for':'invalid'}],
+    ['10.0.0.99',{'x-forwarded-for':'192.0.2.99, 198.51.100.42','x-real-ip':'192.0.2.100',forwarded:'for=192.0.2.1'}],
+  ]) {
+    const headers={...f.headers(),...extra};
+    const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress,headers});
+    assert.equal(r.statusCode,200); assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false});
+    for(const url of ['/v1/public/citas/hold','/v1/citas/hold','/v1/public/pagos/crear-intent','/v1/pagos/reservas/crear-intent','/v1/public/pagos/estado','/v1/pagos/reservas/estado']) {
+      const invalid=await f.app.inject({method:'POST',url,remoteAddress,headers,payload:{}});
+      assert.equal(invalid.statusCode,400,url+': original input validation remains');
+    }
+    for(const url of ['/v1/public/pagos/pixelpay/sale','/v1/pagos/reservas/pixelpay/sale','/v1/pagos/crear-intent',
+      '/v1/cliente/planes/orden','/v1/cliente/planes/pago-intent','/v1/cliente/planes/adquirir',
+      '/v1/cliente/planes/pago-intent/'+OTHER+'/estado','/v1/public/pagos/simulator/event','/v1/public/pagos/mock-completar',
+      '/v1/admin/citas/hold','/v1/citas/probe']) {
+      const denied=await f.app.inject({method:'POST',url,remoteAddress,headers,payload:{}});
+      assert.equal(denied.statusCode,403,url+': original guard must reject before handler');
+    }
+  }
+  assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+});
+
+for(const scenario of ['guest','other','tampered','revoked','no-client','invalid-client','no-role','identity-mismatch','inactive-user','csrf-missing','csrf-wrong','admin-mode']) {
+  test('QA identity booking rejects '+scenario, async t=>{
+    const f=await fixture(t,{env:QA_BOOKING_IDENTITY,revoked:scenario==='revoked',clientId:scenario==='no-client'?null:scenario==='invalid-client'?'invalid':OTHER,
+      roles:scenario==='no-role'?['super_admin']:['cliente'], claimsMismatch:scenario==='identity-mismatch',noClaims:scenario==='inactive-user',config:scenario==='admin-mode'?{adminDataEntryMode:true}:{}});
+    const headers=scenario==='guest'?{}:f.headers(scenario==='other'?OTHER:USER);
+    if(scenario==='tampered')headers.cookie+='tampered';
+    if(scenario==='csrf-missing')delete headers['x-csrf-token'];
+    if(scenario==='csrf-wrong')headers['x-csrf-token']='wrong';
+    Object.assign(headers,{'x-forwarded-for':IP,'x-real-ip':IP,'x-user-id':USER});
+    const denied=await f.app.inject({method:'POST',url:'/v1/public/citas/hold',remoteAddress:'10.0.0.99',headers,payload:{}});
+    assert.ok([401,403].includes(denied.statusCode),denied.body);
+    if(!scenario.startsWith('csrf-')) {
+      const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress:'10.0.0.99',headers});
+      if(r.statusCode===200)assert.deepEqual(r.json().data,{booking:false,vipPurchase:false,pixelpaySale:false});
+      else assert.equal(r.statusCode,401);
+    }
+    assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+  });
+}
+
+test('QA identity rollback returns to closed legacy mode and preserves default response shape', async t=>{
+  const f=await fixture(t,{env:{...QA_BOOKING_IDENTITY,QA_PRIVATE_COMMERCE_BOOKING_ENABLED:'false'}});
+  const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
+  assert.deepEqual(r.json().data,{booking:false,vipPurchase:false});
 });
