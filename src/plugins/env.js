@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
 import { resolvePrivateCommerceConfig } from "./privateCommerce.js";
+import { resolvePixelPayHostedConfig } from "../services/payments/pixelPayHosted.js";
 import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
 import {
   resolveQaPaymentSimulationConfig,
@@ -128,6 +129,7 @@ export function resolvePixelPayOrderCallbackUrl(rawValue, enabled = false) {
 async function envPlugin(app) {
   dotenv.config();
   const privateCommercePilot = resolvePrivateCommerceConfig(process.env);
+  const pixelPayHosted = resolvePixelPayHostedConfig(process.env);
   const qaPaymentSimulation = resolveQaPaymentSimulationConfig(process.env);
   const qaVipPurchaseSimulation = resolveQaVipPurchaseSimulationConfig(process.env);
 
@@ -211,6 +213,7 @@ async function envPlugin(app) {
   }
 
   const config = {
+    pixelPayHosted,
     privateCommercePilot,
     qaPaymentSimulation,
     qaVipPurchaseSimulation,

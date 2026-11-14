@@ -1,0 +1,39 @@
+{
+  "observedAt": "2026-11-14T12:15:47.694Z",
+  "transport": "Chrome navigation GET observed with CDP",
+  "request": {
+    "origin": "https://pixelpay.app",
+    "path": "/api/v2/transaction/hosted/sandbox",
+    "method": "GET",
+    "signedAccordingToDocumentedAlgorithm": true,
+    "jsonRequested": true,
+    "testCredentials": "public Hosted Sandbox fixture",
+    "syntheticIdentity": true,
+    "amount": "1.00",
+    "currency": "HNL",
+    "cardFields": false,
+    "callbackConfigured": false
+  },
+  "response": {
+    "status": 500,
+    "mimeType": "application/json",
+    "headers": {
+      "cf-ray": "a5a5f1906e764724-ATL",
+      "content-type": "application/json",
+      "date": "Sat, 14 Nov 2026 12:15:47 GMT",
+      "server": "cloudflare"
+    },
+    "body": {
+      "success": false,
+      "message": "El módulo de pago sandbox no existe"
+    },
+    "checkoutUrlReturned": false,
+    "challengeHeaderObserved": false
+  },
+  "limits": [
+    "No inference that the request signature was accepted.",
+    "No inference whether sandbox module was retired, disabled, renamed, or unavailable for this request.",
+    "No CAPTCHA solved, no cookie or token reused outside the browser, no WAF bypass.",
+    "Only the documented Sandbox route was navigated; no Live route or financial Status was called."
+  ]
+}
