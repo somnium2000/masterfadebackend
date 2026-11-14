@@ -35,7 +35,7 @@ const ajusteBodySchema = {
   required: ["accion", "puntos", "motivo"],
   properties: {
     accion: { type: "string", enum: ["sumar", "restar"] },
-    puntos: { type: "integer", minimum: 1 },
+    puntos: { type: "integer", minimum: 1, maximum: 2147483647 },
     motivo: { type: "string", minLength: 5, maxLength: 300 },
   },
   additionalProperties: false,
@@ -238,6 +238,14 @@ export default async function adminPointsRoutes(app) {
   app.post(
     "/clientes/:id_cliente/ajuste",
     {
+      preValidation: async (request, reply) => {
+        if (typeof request.body?.puntos !== "number") {
+          return sendError(reply, 400, "La cantidad de puntos debe ser un entero positivo", {
+            code: "POINTS_ADJUSTMENT_INVALID",
+            requestId: request.id,
+          });
+        }
+      },
       preHandler: app.requireRoles(ADMIN_ALLOWED_ROLES),
       schema: {
         params: idClienteParamSchema,

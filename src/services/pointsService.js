@@ -671,7 +671,7 @@ export async function searchActiveClientesForAdminPoints(app, {
 
 function assertPositiveIntegerPoints(value) {
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
+  if (typeof value !== "number" || !Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 2147483647) {
     throw new AppError(400, "puntos debe ser un entero mayor que 0", {
       code: "POINTS_ADJUSTMENT_INVALID",
       details: { puntos: value },
