@@ -4,6 +4,7 @@ import {
   buildMembershipConsumptionEvidence,
   finalizeReservationIdempotency,
   getReservationIdempotencyState,
+  loadMembershipConsumptionEvidence,
 } from "../src/services/bookingCanonicalReservationService.js";
 import { buildAppointmentDetailRows } from "../src/services/bookingReservationService.js";
 import { confirmAdminBookingHold } from "../src/services/booking/adminBookingService.js";
@@ -97,6 +98,48 @@ test("origen administrativo usa exactamente su linea y la cobertura interna admi
   assert.deepEqual(evidence([titular], { defaultOriginCode: "admin_servicio_manual" }).citas[0].servicios, [{
     id_servicio: SERVICE, line_key: titular.detailRows[0].line_key, cantidad: 1,
   }]);
+});
+
+test("productor vincula la cobertura a la clave real generada por el RPC", async () => {
+  const titular = fixture([{ id_servicio: SERVICE, precio_hnl: 100 }], ["cubierto_plan"]);
+  const actualKey = "clave-real-del-trigger-sin-paquete";
+  let reads = 0;
+  const db = { async query(sql, values) {
+    reads++;
+    assert.ok(sql.includes("FROM public.citas_detalles"));
+    assert.deepEqual(values, [[CITA]]);
+    return { rows: [{ id_cita: CITA, id_servicio: SERVICE, id_tarifa: null,
+      origen_item_codigo: "servicio_manual", cantidad: 1, line_key: actualKey }] };
+  } };
+  const result = await loadMembershipConsumptionEvidence(db, { idSuscripcion: SUB, integrantes: [titular],
+    canonicalResult: { bloques: [{ orden_integrante: 1, id_cita: CITA }] } });
+  assert.deepEqual(result.citas[0].servicios, [{ id_servicio: SERVICE, line_key: actualKey, cantidad: 1 }]);
+  assert.notEqual(result.citas[0].servicios[0].line_key, titular.detailRows[0].line_key);
+  assert.equal(reads, 1);
+});
+
+test("claves reales separadas conservan la cuota total y la unidad extra del mismo grupo", () => {
+  const items = Array.from({ length: 3 }, () => ({ id_servicio: SERVICE, precio_hnl: 100 }));
+  const titular = fixture(items, ["cubierto_plan", "cubierto_plan", "extra_pendiente"]);
+  const persistedDetails = ["paquete-real-a", "paquete-real-b", "extra-real-c"].map(line_key => ({
+    id_cita: CITA, id_servicio: SERVICE, id_tarifa: null, origen_item_codigo: "servicio_manual", cantidad: 1, line_key,
+  }));
+  assert.deepEqual(evidence([titular], { persistedDetails }).citas[0].servicios, [
+    { id_servicio: SERVICE, line_key: "paquete-real-a", cantidad: 1 },
+    { id_servicio: SERVICE, line_key: "paquete-real-b", cantidad: 1 },
+  ]);
+  assert.throws(() => evidence([titular], { persistedDetails: persistedDetails.slice(0, 1) }),
+    error => error.code === "MEMBERSHIP_CONSUMPTION_EVIDENCE_INVALID");
+  assert.throws(() => evidence([titular], { persistedDetails: persistedDetails.map(row => ({ ...row, id_tarifa: "otra-tarifa" })) }),
+    error => error.code === "MEMBERSHIP_CONSUMPTION_EVIDENCE_INVALID");
+});
+
+test("evidencia vacia no lee ni infiere cobertura de otras lineas", async () => {
+  const titular = fixture([{ id_servicio: SERVICE, precio_hnl: 100 }], ["extra_pendiente"]);
+  const db = { async query() { assert.fail("No debe consultar lineas sin unidades cubiertas"); } };
+  assert.deepEqual(await loadMembershipConsumptionEvidence(db, { integrantes: [titular],
+    canonicalResult: { bloques: [{ orden_integrante: 1, id_cita: CITA }] } }),
+  { version: 1, id_suscripcion: null, citas: [{ id_cita: CITA, servicios: [] }] });
 });
 
 test("evidencia incompleta o con cantidad superior a la linea falla antes de persistir", () => {

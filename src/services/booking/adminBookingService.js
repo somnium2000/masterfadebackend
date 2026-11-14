@@ -7,12 +7,12 @@ import {
   assertKnownIdempotencyState,
   buildAssignmentAttemptsFromIntegrantes,
   buildCanonicalReservationPayload,
-  buildMembershipConsumptionEvidence,
   buildReservationRequestFingerprint,
   createCanonicalReservation,
   finalizeReservationIdempotency,
   getReservationIdempotencyState,
   loadCanonicalPromotionDetailRows,
+  loadMembershipConsumptionEvidence,
   mapCanonicalReservationError,
   resolveReservationRequestId,
   selectCanonicalIntegrantesForResult,
@@ -1085,7 +1085,7 @@ async function createCanonicalAdminReservation(app, dbClient, {
     benefitContext,
     totalsByBenefit,
     selectedTotals,
-    membershipConsumption: buildMembershipConsumptionEvidence({
+    membershipConsumption: await loadMembershipConsumptionEvidence(dbClient, {
       idSuscripcion: benefitContext.coverageTracker?.idSuscripcion || null,
       integrantes: selectedIntegrantes,
       canonicalResult,

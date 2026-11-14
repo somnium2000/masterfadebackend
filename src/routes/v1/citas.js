@@ -41,12 +41,12 @@ import {
   assertKnownIdempotencyState,
   buildAssignmentAttemptsFromIntegrantes,
   buildCanonicalReservationPayload,
-  buildMembershipConsumptionEvidence,
   buildReservationRequestFingerprint,
   createCanonicalReservation,
   finalizeReservationIdempotency,
   getReservationIdempotencyState,
   loadCanonicalPromotionDetailRows,
+  loadMembershipConsumptionEvidence,
   mapCanonicalReservationError,
   resolveReservationRequestId,
   selectCanonicalIntegrantesForResult,
@@ -2573,7 +2573,7 @@ export default async function citasRoutes(app) {
           responsePayload: holdResponsePayload,
           statusCode: 201,
           internalMetadata: {
-            membership_consumption: buildMembershipConsumptionEvidence({
+            membership_consumption: await loadMembershipConsumptionEvidence(dbClient, {
               idSuscripcion: coverageTracker?.idSuscripcion || null,
               integrantes: selectedIntegrantes,
               canonicalResult,

@@ -284,6 +284,24 @@ test("QA-MEMBRESIAS-CONSUMO-01: cuotas, idempotencia y bloqueos en PostgreSQL 17
     assert.equal((await pool.query("SELECT COUNT(*)::int cantidad FROM subscription_consumptions WHERE item_tipo='cortesia'")).rows[0].cantidad, 1);
   });
 
+  await t.test("agotamiento total concurrente rechaza la segunda cita cubierta sin confirmarla gratis", async () => {
+    const f = await fixture({ quotas: [1, 0, 0], courtesyQuota: 1 });
+    const a = await appointment(f, [{ service: f.services[0] }]);
+    const b = await appointment(f, [{ service: f.services[0] }]);
+    const results = await Promise.allSettled([consume(f, a), consume(f, b)]);
+    const fulfilled = results.filter(result => result.status === "fulfilled");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(fulfilled[0].value.aplicado, true);
+    const rejected = results.filter(result => result.status === "rejected");
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].reason.code, "MEMBERSHIP_CONSUMPTION_SUBSCRIPTION_INACTIVE");
+    const ledgerA = await rows(a);
+    const ledgerB = await rows(b);
+    assert.deepEqual([ledgerA.length, ledgerB.length].sort(), [0, 2]);
+    assert.equal((await pool.query("SELECT SUM(cantidad)::int cantidad FROM subscription_consumptions WHERE item_tipo='servicio'")).rows[0].cantidad, 1);
+    assert.equal((await pool.query("SELECT SUM(cantidad)::int cantidad FROM subscription_consumptions WHERE item_tipo='cortesia'")).rows[0].cantidad, 1);
+  });
+
   await t.test("reintentos concurrentes de la misma cita conservan claves y cantidades", async () => {
     const f = await fixture();
     const cita = await appointment(f, f.services.map(service => ({ service })));
@@ -421,8 +439,13 @@ test("QA-MEMBRESIAS-CONSUMO-01: cuotas, idempotencia y bloqueos en PostgreSQL 17
     const f = await fixture();
     await pool.query("UPDATE subscriptions SET fin_at=now()-interval '1 minute' WHERE id_suscripcion=$1", [f.subscription]);
     const cita = await appointment(f, [{ service: f.services[0] }]);
-    assert.equal((await consume(f, cita)).aplicado, false);
+    await assert.rejects(consume(f, cita), error => error.code === "MEMBERSHIP_CONSUMPTION_SUBSCRIPTION_INACTIVE");
     assert.deepEqual(await rows(cita), []);
+    assert.deepEqual((await pool.query("SELECT estado_suscripcion_codigo,motivo_fin_codigo FROM subscriptions WHERE id_suscripcion=$1", [f.subscription])).rows[0],
+      { estado_suscripcion_codigo: "activa", motivo_fin_codigo: null });
+    const lifecycle = await ensureSubscriptionLifecycle(pool, f.client);
+    assert.equal(lifecycle.active, null);
+    assert.equal(lifecycle.finalizado_por, "tiempo");
     const subscription = (await pool.query("SELECT estado_suscripcion_codigo,motivo_fin_codigo FROM subscriptions WHERE id_suscripcion=$1", [f.subscription])).rows[0];
     assert.deepEqual(subscription, { estado_suscripcion_codigo: "vencida", motivo_fin_codigo: "tiempo" });
   });
@@ -431,7 +454,7 @@ test("QA-MEMBRESIAS-CONSUMO-01: cuotas, idempotencia y bloqueos en PostgreSQL 17
     const f = await fixture();
     await pool.query("UPDATE subscriptions SET inicio_at=now()+interval '2 days' WHERE id_suscripcion=$1", [f.subscription]);
     const cita = await appointment(f, [{ service: f.services[0] }]);
-    assert.equal((await consume(f, cita)).aplicado, false);
+    await assert.rejects(consume(f, cita), error => error.code === "MEMBERSHIP_CONSUMPTION_SUBSCRIPTION_INACTIVE");
     assert.deepEqual(await rows(cita), []);
     assert.equal((await pool.query("SELECT estado_suscripcion_codigo FROM subscriptions WHERE id_suscripcion=$1", [f.subscription])).rows[0].estado_suscripcion_codigo, "activa");
   });

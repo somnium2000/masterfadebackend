@@ -137,6 +137,7 @@ export function buildMembershipConsumptionEvidence({
   integrantes = [],
   canonicalResult = {},
   defaultOriginCode = "servicio_manual",
+  persistedDetails = null,
 } = {}) {
   const fail = () => {
     throw new AppError(409, "No se pudo verificar la cobertura de membresia de la reserva", {
@@ -164,30 +165,60 @@ export function buildMembershipConsumptionEvidence({
       if (order !== 1 || !integrante) return result;
       const coverage = integrante._coverage || integrante._benefits?.coverage;
       const serviceItems = integrante.selection?.serviceSelection?.items || integrante.serviceItems || [];
-      const details = new Map((Array.isArray(integrante.detailRows) ? integrante.detailRows : [])
-        .map((row) => [groupKey(row), row]));
+      const detailRows = persistedDetails === null
+        ? (Array.isArray(integrante.detailRows) ? integrante.detailRows : [])
+        : persistedDetails.filter((row) => clean(row.id_cita) === result.id_cita);
+      const details = new Map();
+      for (const row of detailRows) {
+        const key = groupKey(row);
+        const matches = details.get(key) || [];
+        matches.push(row);
+        details.set(key, matches);
+      }
       const coveredByLine = new Map();
       (Array.isArray(coverage?.items) ? coverage.items : []).forEach((item, index) => {
         if (item?.coverage_status !== "cubierto_plan") return;
         const source = serviceItems[index];
         if (!source || clean(source.id_servicio) !== clean(item.id_servicio)) fail();
-        const detail = details.get(groupKey(source));
         const quantity = Number(item.cantidad ?? 1);
-        if (!result.id_cita || !subscriptionId || !clean(detail?.line_key)
+        if (!result.id_cita || !subscriptionId
           || !Number.isSafeInteger(quantity) || quantity < 1) fail();
-        const lineKey = clean(detail.line_key);
-        const current = coveredByLine.get(lineKey) || {
-          id_servicio: clean(item.id_servicio), line_key: lineKey, cantidad: 0,
-        };
-        current.cantidad += quantity;
-        if (current.cantidad > Number(detail.cantidad || 0)) fail();
-        coveredByLine.set(lineKey, current);
+        let pending = quantity;
+        for (const detail of details.get(groupKey(source)) || []) {
+          if (!pending) break;
+          const lineKey = clean(detail.line_key);
+          const capacity = Number(detail.cantidad);
+          if (!lineKey || !Number.isSafeInteger(capacity) || capacity < 1) fail();
+          const current = coveredByLine.get(lineKey) || {
+            id_servicio: clean(item.id_servicio), line_key: lineKey, cantidad: 0,
+          };
+          const assigned = Math.min(pending, capacity - current.cantidad);
+          if (assigned <= 0) continue;
+          current.cantidad += assigned;
+          pending -= assigned;
+          coveredByLine.set(lineKey, current);
+        }
+        if (pending) fail();
       });
       result.servicios = [...coveredByLine.values()];
       return result;
     }),
   };
   return evidence;
+}
+
+// AM: El RPC puede generar sus propias claves; la evidencia usa las lineas realmente persistidas.
+export async function loadMembershipConsumptionEvidence(client, args = {}) {
+  const candidate = buildMembershipConsumptionEvidence(args);
+  if (!candidate.citas.some((row) => row.servicios.length)) return candidate;
+  const { rows } = await client.query(`
+    SELECT cd.id_cita, cd.line_key, cd.id_servicio, cd.id_tarifa,
+      cd.origen_item_codigo, cd.cantidad
+    FROM public.citas_detalles cd
+    WHERE cd.id_cita = ANY($1::uuid[])
+    ORDER BY cd.orden_linea ASC, cd.id_cita_detalle ASC
+  `, [candidate.citas.map((row) => row.id_cita)]);
+  return buildMembershipConsumptionEvidence({ ...args, persistedDetails: rows });
 }
 
 export function assertKnownIdempotencyState(state = {}) {

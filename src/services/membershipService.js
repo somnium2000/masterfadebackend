@@ -3576,6 +3576,11 @@ export async function consumeMembershipForCompletedAppointment(client, {
   }
   const lifecycle = await ensureSubscriptionLifecycle(client, safeIdCliente, { forUpdate: true });
   if (!lifecycle.active) {
+    if (coveredServices.length) {
+      throw new AppError(409, "La membresia no esta disponible para consumir los beneficios de esta cita", {
+        code: "MEMBERSHIP_CONSUMPTION_SUBSCRIPTION_INACTIVE",
+      });
+    }
     return { aplicado: false, motivo: "sin_suscripcion_activa" };
   }
 
@@ -3593,7 +3598,9 @@ export async function consumeMembershipForCompletedAppointment(client, {
   }
   if (evidence.id_suscripcion !== activeSubscription.id_suscripcion
       || new Date(activeSubscription.inicio_at).getTime() > Date.now()) {
-    return { aplicado: false, motivo: "sin_suscripcion_activa" };
+    throw new AppError(409, "La membresia no esta disponible para consumir los beneficios de esta cita", {
+      code: "MEMBERSHIP_CONSUMPTION_SUBSCRIPTION_INACTIVE",
+    });
   }
   if (!activeSubscription.id_sucursal_contratada || activeSubscription.id_sucursal_contratada !== safeIdSucursal) {
     throw new AppError(409, "La membresia activa no corresponde a la sucursal de la cita", {
