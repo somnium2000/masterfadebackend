@@ -3,6 +3,7 @@ const EXECUTION_PHASES = new Set(["request_construction", "sdk_preparation", "sa
 const RUNTIME_CODES = new Set([
   "SDK_REFERENCE_ERROR", "SDK_RUNTIME_ERROR", "SDK_NETWORK_ERROR", "SDK_HTTP_TIMEOUT",
   "SDK_RESPONSE_PARSE_ERROR", "SDK_BROWSER_ACTION_REQUIRED", "SDK_CONTINUATION_REQUIRED", "SDK_UPSTREAM_ERROR",
+  "SDK_DNS_ERROR", "SDK_TLS_ERROR", "SDK_WAF_CHALLENGE",
 ]);
 const ERROR_NAMES = new Set([
   "Error", "ReferenceError", "TypeError", "SyntaxError", "RangeError", "EvalError", "URIError",
@@ -21,14 +22,30 @@ const SDK_FILES = new Set([
   "lib/libraries/PayloadManager.js", "lib/libraries/PixelPayLoading.js",
   "lib/libraries/PixelPayModal.js", "lib/libraries/RouterManager.js",
 ]);
-const NETWORK_CODES = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNRESET", "ECONNREFUSED"]);
+const DNS_CODES = new Set(["ENOTFOUND", "EAI_AGAIN"]);
+const NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EPIPE"]);
 const TIMEOUT_CODES = new Set(["ETIMEDOUT", "ECONNABORTED"]);
+const TLS_CODES = new Set([
+  "EPROTO", "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_TLS_HANDSHAKE_TIMEOUT",
+  "ERR_SSL_WRONG_VERSION_NUMBER", "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+  "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE", "ERR_SSL_CERTIFICATE_VERIFY_FAILED",
+]);
+const TRANSPORT_CODES = new Set([...DNS_CODES, ...NETWORK_CODES, ...TIMEOUT_CODES, ...TLS_CODES]);
+const CONTENT_TYPES = new Set(["application/json", "text/html", "text/plain", "application/octet-stream"]);
 
 const safeBoolean = value => typeof value === "boolean" ? value : null;
 const safePosition = value => Number.isInteger(value) && value > 0 && value <= 9999999 ? value : null;
 const safeStatus = value => Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
 const safeName = value => ERROR_NAMES.has(value) ? value : null;
 const safeContinuationType = value => CONTINUATION_TYPES.has(value) ? value : null;
+const safeTransportCode = value => TRANSPORT_CODES.has(value) ? value : null;
+const safeContentType = value => {
+  const type = typeof value === "string" ? value.split(";", 1)[0].trim().toLowerCase() : null;
+  return CONTENT_TYPES.has(type) ? type : null;
+};
+const safeCfRay = value => typeof value === "string" && /^[a-fA-F0-9]{16,32}-[A-Z]{3}$/.test(value) ? value : null;
 
 export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
   const input = source && typeof source === "object" ? source : {};
@@ -39,6 +56,10 @@ export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
     requestMayHaveBeenSent: safeBoolean(input.requestMayHaveBeenSent),
     statusCode: safeStatus(input.statusCode),
     sdkTransactionType: safeContinuationType(input.sdkTransactionType),
+    transportErrorCode: safeTransportCode(input.transportErrorCode),
+    wafChallenge: safeBoolean(input.wafChallenge),
+    upstreamContentType: safeContentType(input.upstreamContentType),
+    cfRay: safeCfRay(input.cfRay),
     sdkStackFile,
     sdkStackLine: sdkStackFile ? safePosition(input.sdkStackLine) : null,
     sdkStackColumn: sdkStackFile ? safePosition(input.sdkStackColumn) : null,
@@ -89,18 +110,24 @@ export function classifyPixelPaySaleRuntimeError(error, execution = {}) {
     safeMessageCode = "SDK_RESPONSE_PARSE_ERROR";
   } else if (TIMEOUT_CODES.has(error?.code) || error?.message === "timeout of 60000ms exceeded") {
     safeMessageCode = "SDK_HTTP_TIMEOUT";
+  } else if (DNS_CODES.has(error?.code)) {
+    safeMessageCode = "SDK_DNS_ERROR";
+  } else if (TLS_CODES.has(error?.code)) {
+    safeMessageCode = "SDK_TLS_ERROR";
   } else if (NETWORK_CODES.has(error?.code) || error?.message === "Network Error") {
     safeMessageCode = "SDK_NETWORK_ERROR";
   } else if (context.httpResponseReceived === true && context.statusCode === 408) {
     safeMessageCode = "SDK_HTTP_TIMEOUT";
   } else if (!error && context.httpResponseReceived === true && context.statusCode >= 400) {
-    safeMessageCode = "SDK_UPSTREAM_ERROR";
+    safeMessageCode = context.statusCode === 403 && context.wafChallenge === true
+      ? "SDK_WAF_CHALLENGE" : "SDK_UPSTREAM_ERROR";
   }
   const reference = safeMessageCode === "SDK_REFERENCE_ERROR" && typeof error?.message === "string"
     ? /^(document|window|DOMParser|navigator|atob|Cardinal) is not defined$/.exec(error.message)?.[1]
     : null;
   return sanitizePixelPaySaleRuntimeDiagnostics({
     ...context, ...sdkFrame(error), referenceSymbol: reference, safeMessageCode,
+    transportErrorCode: safeTransportCode(error?.code) ?? context.transportErrorCode,
     errorName, errorConstructorName, sdkErrorName: errorConstructorName,
   });
 }
@@ -123,6 +150,8 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
         executionPhase: safe.executionPhase, httpResponseReceived: safe.httpResponseReceived,
         requestMayHaveBeenSent: safe.requestMayHaveBeenSent, statusCode: safe.statusCode,
         sdkTransactionType: safe.sdkTransactionType,
+        transportErrorCode: safe.transportErrorCode, wafChallenge: safe.wafChallenge,
+        upstreamContentType: safe.upstreamContentType, cfRay: safe.cfRay,
       };
     }
 
@@ -154,12 +183,19 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
           this.saleExecution.executionPhase = "response_processing";
           this.saleExecution.httpResponseReceived = true;
           this.saleExecution.statusCode = safeStatus(response?.status);
+          // AM: Conservar solo evidencia de cabeceras permitidas antes de que el SDK las descarte.
+          const headers = response?.headers;
+          const header = name => typeof headers?.get === "function" ? headers.get(name) : headers?.[name];
+          this.saleExecution.upstreamContentType = safeContentType(header("content-type"));
+          this.saleExecution.cfRay = safeCfRay(header("cf-ray"));
+          this.saleExecution.wafChallenge = header("cf-mitigated") === "challenge";
           this.saleResponsePending = true;
         };
         transport.interceptors.response.use(response => {
           received(response);
           return response;
         }, error => {
+          this.saleExecution.transportErrorCode = safeTransportCode(error?.code);
           if (error?.response) received(error.response);
           throw error;
         });

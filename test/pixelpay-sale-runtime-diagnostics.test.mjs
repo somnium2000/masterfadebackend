@@ -27,13 +27,16 @@ test("runtime logs retain only allowlisted symbol and relative SDK frame", () =>
   assert.equal(details.sdkStackFile, "lib/libraries/PayloadManager.js");
   assert.equal(details.sdkStackLine, 43);
   assert.equal(details.sdkStackColumn, 35);
-  const event = buildPixelPaySaleEvent("PIXELPAY_SALE_FAILED", createPixelPaySaleAttempt({ env: "live" }), {
-    ...details, message: secret, stack: error.stack, payload: { card_number: "4111111111111111", cvv: "987" },
+  // AM: Correlacion fija y CVV de cuatro digitos evitan coincidencias con UUID o milisegundos del reloj.
+  const event = buildPixelPaySaleEvent("PIXELPAY_SALE_FAILED", createPixelPaySaleAttempt({
+    env: "live", paymentAttemptId: "11111111-2222-4333-8444-555555555555",
+  }), {
+    ...details, message: secret, stack: error.stack, payload: { card_number: "4111111111111111", cvv: "9876" },
   });
   assert.equal(event.env, "live");
   assert.equal(event.httpResponseReceived, true);
   assert.equal(event.requestMayHaveBeenSent, true);
-  assert.doesNotMatch(JSON.stringify(event), /sentinel-secret|4111111111111111|987|evil[.]invalid|private/);
+  assert.doesNotMatch(JSON.stringify(event), /sentinel-secret|4111111111111111|9876|evil[.]invalid|private/);
 });
 
 test("202 browser diagnostics require a known browser continuation", () => {
@@ -56,4 +59,15 @@ test("diagnostic sanitizer rejects injected filenames, symbols, phases and statu
   for (const key of ["executionPhase", "sdkStackFile", "sdkStackLine", "sdkStackColumn", "referenceSymbol", "httpResponseReceived", "requestMayHaveBeenSent", "statusCode", "sdkTransactionType"]) {
     assert.equal(result[key], null, key);
   }
+});
+
+test("transport metadata retains only MIME and Cloudflare Ray formats", () => {
+  assert.equal(sanitizePixelPaySaleRuntimeDiagnostics({ cfRay: "safe-ray" }).cfRay, null);
+  assert.equal(sanitizePixelPaySaleRuntimeDiagnostics({ cfRay: "sentinel-secret" }).cfRay, null);
+  assert.equal(sanitizePixelPaySaleRuntimeDiagnostics({ upstreamContentType: "sentinel-secret" }).upstreamContentType, null);
+  const allowed = sanitizePixelPaySaleRuntimeDiagnostics({
+    cfRay: "0123456789abcdef-TST", upstreamContentType: "text/html; charset=UTF-8",
+  });
+  assert.equal(allowed.cfRay, "0123456789abcdef-TST");
+  assert.equal(allowed.upstreamContentType, "text/html");
 });

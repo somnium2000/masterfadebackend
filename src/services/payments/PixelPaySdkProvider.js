@@ -1,5 +1,5 @@
 import PixelPaySdk from "@pixelpay/sdk-core";
-import { createPixelPayNodeSaleTransaction, classifyPixelPaySaleRuntimeError } from "./pixelPaySaleRuntime.js";
+import { createPixelPayNodeSaleTransaction, classifyPixelPaySaleRuntimeError, sanitizePixelPaySaleRuntimeDiagnostics } from "./pixelPaySaleRuntime.js";
 import { capturePixelPayStatusShape, emitPixelPayStatusShape } from "./pixelPayStatusShapeProbe.js";
 import { createHash } from "node:crypto";
 import { PaymentProvider } from "./PaymentProvider.js";
@@ -242,6 +242,17 @@ function responseStatus(response) {
 
 function responseSuccess(response) {
   return typeof response?.success === "boolean" ? response.success : null;
+}
+
+function readSafeSaleHttpMetadata(source, execution) {
+  // AM: Un null de una respuesta observada es definitivo; el fallback legacy tambien pasa por la allowlist.
+  const metadata = readPixelPayHttpMetadata(source);
+  const safe = sanitizePixelPaySaleRuntimeDiagnostics(execution?.httpResponseReceived === true ? execution : {
+    statusCode: source?.statusCode ?? metadata.statusCode,
+    upstreamContentType: source?.upstreamContentType ?? metadata.contentType,
+    cfRay: source?.cfRay ?? metadata.cfRay,
+  });
+  return { statusCode: safe.statusCode, contentType: safe.upstreamContentType, cfRay: safe.cfRay };
 }
 
 function strictStatusText(value) {
@@ -666,11 +677,11 @@ export class PixelPaySdkProvider extends PaymentProvider {
       response = await transaction.doSale(saleRequest);
       return this.completeSaleResponse(input, attempt, logger, startedAt, inputDiagnostics, transaction, response);
     } catch (error) {
-      const metadata = readPixelPayHttpMetadata(error);
-      const runtimeDiagnostics = classifyPixelPaySaleRuntimeError(error,
-        sdkInvoked ? transaction?.getSaleExecutionDiagnostics?.() : {
+      const execution = sdkInvoked ? transaction?.getSaleExecutionDiagnostics?.() : {
           executionPhase: "request_construction", httpResponseReceived: false, requestMayHaveBeenSent: false,
-        });
+        };
+      const metadata = readSafeSaleHttpMetadata(error, execution);
+      const runtimeDiagnostics = classifyPixelPaySaleRuntimeError(error, execution);
       const { errorConstructorName, errorName } = runtimeDiagnostics;
       const safeMessageCode = error instanceof PixelPaySdkError
         ? error.code
@@ -687,8 +698,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
         outcome: error instanceof PixelPaySdkError && error.uncertain === false && !sdkInvoked
           ? PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE
           : PIXELPAY_SALE_OUTCOME.UNCERTAIN,
-        contentType: error?.upstreamContentType ?? metadata.contentType,
-        cfRay: error?.cfRay ?? metadata.cfRay,
+        contentType: metadata.contentType,
+        cfRay: metadata.cfRay,
         cardExpireFormatValid: error?.cardExpireFormatValid ?? inputDiagnostics.cardExpireFormatValid,
         cardExpireFuture: error?.cardExpireFuture ?? inputDiagnostics.cardExpireFuture,
         billingAddressLength: error?.billingAddressLength ?? inputDiagnostics.billingAddressLength,
@@ -700,6 +711,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
       if (error instanceof PixelPaySdkError) {
         if (sdkInvoked) error.uncertain = true;
         error.runtimeDiagnostics = runtimeDiagnostics;
+        error.upstreamContentType = metadata.contentType;
+        error.cfRay = metadata.cfRay;
         error.paymentAttemptId = attempt.paymentAttemptId;
         error.cardExpireFormatValid ??= inputDiagnostics.cardExpireFormatValid;
         error.cardExpireFuture ??= inputDiagnostics.cardExpireFuture;
@@ -714,8 +727,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
         errorConstructorName,
         responseClass: safeClassName(error?.response),
         safeMessageCode,
-        upstreamContentType: metadata.contentType,
-        cfRay: metadata.cfRay,
+        upstreamContentType: details.contentType,
+        cfRay: details.cfRay,
         paymentAttemptId: attempt.paymentAttemptId,
         runtimeDiagnostics,
         ...inputDiagnostics,
@@ -777,7 +790,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionId,
     });
     const inputErrors = readPixelPayInputErrors(response?.errors);
-    const responseMetadata = readPixelPayHttpMetadata(response);
+    const responseMetadata = readSafeSaleHttpMetadata(response, execution);
     const diagnostics = {
       paymentAttemptId: attempt.paymentAttemptId,
       sdkResponseClass: safeClassName(response),

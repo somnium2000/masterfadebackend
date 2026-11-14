@@ -423,14 +423,14 @@ test("createPixelPaySaleAttempt genera fallback solo si el UUID externo no fue p
 test("telemetria registra FAILED y UNCERTAIN cuando doSale lanza antes de responder", async () => {
   const logger = makeTelemetryLogger();
   const failure = Object.assign(new Error("sensitive provider detail"), {
-    response: { status: 503, headers: { "content-type": "text/html", "cf-ray": "safe-ray" } },
+    response: { status: 503, headers: { "content-type": "text/html", "cf-ray": "0123456789abcdef-TST" } },
   });
   const fake = makeFakeSdk({ saleError: failure });
   await assert.rejects(
     makeProvider(fake).sale(saleInput, { requestId: "req-failed", idIntent: "intent-failed", logger }),
     (error) => error.code === "PIXELPAY_NETWORK_ERROR"
       && error.statusCode === 503
-      && error.cfRay === "safe-ray"
+      && error.cfRay === "0123456789abcdef-TST"
   );
   assert.deepEqual(logger.events.map((entry) => entry.event), [
     PIXELPAY_SALE_EVENT.ATTEMPT_STARTED,
@@ -798,7 +798,10 @@ test("SDK conserva solo response_code de formato seguro y nunca response_reason"
           }),
         }),
       });
-      const result = await makeProvider(fake).sale(saleInput);
+      // AM: Un UUID fijo evita falsos positivos de los centinelas de privacidad.
+      const result = await makeProvider(fake).sale(saleInput, {
+        paymentAttemptId: "11111111-2222-4333-8444-555555555555",
+      });
       assert.equal(result.diagnostics.providerResponseCode, scenario.expected);
       assert.equal(JSON.stringify(result.diagnostics).includes("response_reason"), false);
       assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(SECRET));

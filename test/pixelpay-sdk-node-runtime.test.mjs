@@ -8,6 +8,10 @@ const require = createRequire(import.meta.url);
 const blockedNetwork = [];
 const restorations = [];
 let allowedLoopbackPort = null;
+let dnsFixtureLookup = false;
+const DNS_FIXTURE_HOST = "pixelpay-dns-fixture.invalid";
+const nativeDatagramSocket = require("node:dgram").createSocket;
+const nativeDatagramSend = require("node:dgram").Socket.prototype.send;
 
 function loopbackAllowed(args) {
   let first = args[0];
@@ -15,10 +19,11 @@ function loopbackAllowed(args) {
   if (typeof first === "string" || first instanceof URL) {
     try {
       const url = new URL(first);
-      return url.protocol === "http:" && url.hostname === "127.0.0.1" && Number(url.port) === allowedLoopbackPort;
+      return ["http:", "https:"].includes(url.protocol) && url.hostname === "127.0.0.1" && Number(url.port) === allowedLoopbackPort;
     } catch { return false; }
   }
   const options = first && typeof first === "object" ? first : { port: first, host: args[1] };
+  if (dnsFixtureLookup && Number(options.port) === 1 && (options.hostname || options.host) === DNS_FIXTURE_HOST) return true;
   return allowedLoopbackPort !== null && Number(options.port) === allowedLoopbackPort
     && (options.hostname || options.host) === "127.0.0.1";
 }
@@ -38,9 +43,9 @@ function replace(target, key, allowLoopback = false, allowLiteralLookup = false)
 
 // AM: Bloquear todas las salidas antes de cargar SDK/Axios; solo G permite su puerto local efimero.
 for (const [name, methods, local] of [
-  ["node:http", ["request", "get"], true], ["node:https", ["request", "get"], false],
+  ["node:http", ["request", "get"], true], ["node:https", ["request", "get"], true],
   ["node:http2", ["connect"], false], ["node:net", ["connect", "createConnection"], true],
-  ["node:tls", ["connect"], false], ["node:dgram", ["createSocket"], false],
+  ["node:tls", ["connect"], true], ["node:dgram", ["createSocket"], false],
   ["node:child_process", ["exec", "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork"], false],
 ]) for (const method of methods) replace(require(name), method, local);
 replace(require("node:net").Socket.prototype, "connect", true);
@@ -58,7 +63,8 @@ const nacl = (await import("tweetnacl")).default;
 const { PixelPaySdkProvider } = await import("../src/services/payments/PixelPaySdkProvider.js");
 const originalAdapter = axios.defaults.adapter;
 const realHttpAdapter = axios.getAdapter("http");
-const publicKey = Buffer.from(nacl.box.keyPair().publicKey).toString("base64");
+const merchantKeyPair = nacl.box.keyPair();
+const publicKey = Buffer.from(merchantKeyPair.publicKey).toString("base64");
 const ENDPOINT = "https://synthetic-pixelpay.invalid";
 const KEY = "synthetic-key-not-real";
 const SECRET = "synthetic-secret-not-real";
@@ -117,7 +123,7 @@ axios.defaults.adapter = async (config) => {
   assert.notEqual(route, "unexpected");
   calls.push({ route, method: config.method });
   const response = await transport(config, route);
-  return { ...response, statusText: String(response.status), headers: { "content-type": "application/json" }, config };
+  return { ...response, statusText: String(response.status), headers: response.headers || { "content-type": "application/json" }, config };
 };
 
 async function execute(provider = makeProvider(), saleInput = input()) {
@@ -141,6 +147,8 @@ function report(t, label, run) {
     phase: run.execution?.executionPhase, httpResponseReceived: run.execution?.httpResponseReceived,
     requestMayHaveBeenSent: run.execution?.requestMayHaveBeenSent,
     sdkTransactionType: run.execution?.sdkTransactionType,
+    transportErrorCode: run.execution?.transportErrorCode, wafChallenge: run.execution?.wafChallenge,
+    upstreamContentType: run.execution?.upstreamContentType,
     statusCode: run.error?.statusCode ?? run.result?.statusCode ?? null, saleCalls: run.saleCalls }));
 }
 
@@ -397,4 +405,187 @@ test("HTTP400 conserva rechazo contractual y solo campos de error permitidos", a
   assert.equal(run.saleCalls, 1);
   assert.deepEqual(run.result.diagnostics.inputErrorFields, ["billing_state"]);
   report(t, "HTTP400", run);
+});
+
+for (const [label, overrides, field] of [
+  ["hash invalido", { payment_hash: "synthetic-invalid-hash" }, "paymentHashValid"],
+  ["monto distinto", { transaction_amount: 2, transaction_approved_amount: 2 }, "amountMatches"],
+]) test(`HTTP200 ${label} nunca aprueba ni repite Sale`, async (t) => {
+  mockTransport(200, { success: true, data: approved(overrides) });
+  const run = await execute();
+  assert.equal(run.error, undefined);
+  assert.equal(run.result.approved, false);
+  assert.equal(run.result.outcome, "uncertain");
+  assert.equal(run.result[field], false);
+  assert.equal(run.saleCalls, 1);
+  assert.equal(run.execution.httpResponseReceived, true);
+  report(t, `HTTP200_${field}`, run);
+});
+
+test("SDK real cifra datos antes del transporte y se descifran solo con clave sintetica local", async (t) => {
+  mockTransport(200, { success: true, data: approved() });
+  const mock = transport;
+  let encryptedFields = 0;
+  transport = async (config, route) => {
+    if (route === "sale") {
+      const body = JSON.parse(config.data);
+      const secureHeader = config.headers.get("x-auth-secure");
+      assert.equal(typeof secureHeader, "string");
+      const sharedKey = nacl.box.before(Buffer.from(secureHeader, "base64"), merchantKeyPair.secretKey);
+      for (const [field, expected] of [
+        ["card_number", input().card.number], ["card_cvv", input().card.cvv],
+        ["card_expire", input().card.expire], ["card_holder", input().card.holder],
+        ["customer_name", input().customer.name], ["customer_email", input().customer.email],
+      ]) {
+        assert.equal(typeof body[field], "string");
+        assert.equal(body[field] === expected, false, "The SDK emitted plaintext");
+        const [ciphertext, nonce] = body[field].split("|");
+        const cleartext = nacl.box.open.after(Buffer.from(ciphertext, "base64"), Buffer.from(nonce, "base64"), sharedKey);
+        assert.equal(cleartext !== null, true, "Local synthetic key could not decrypt SDK ciphertext");
+        assert.equal(Buffer.from(cleartext).toString() === expected, true, "SDK encrypted content differs");
+        encryptedFields += 1;
+      }
+    }
+    return mock(config, route);
+  };
+  const run = await execute();
+  assert.equal(run.result.approved, true);
+  assert.equal(encryptedFields, 6);
+  assert.equal(run.saleCalls, 1);
+  report(t, "SDK_REAL_ENCRYPTION", run);
+});
+
+for (const [label, headers, body, expectedCode, expectedWaf, expectedMime] of [
+  ["WAF challenge", { "content-type": "text/html; charset=UTF-8", "cf-mitigated": "challenge", "cf-ray": "0123456789abcdef-TST" },
+    `<html>${DATA_SENTINEL}</html>`, "SDK_WAF_CHALLENGE", true, "text/html"],
+  ["proveedor JSON", { "content-type": "application/json", "cf-ray": "fedcba9876543210-TST" },
+    { success: false, message: DATA_SENTINEL }, "SDK_UPSTREAM_ERROR", false, "application/json"],
+  ["HTML sin challenge", { "content-type": "text/html", "cf-ray": "fedcba9876543210-TST" },
+    `<html>${DATA_SENTINEL}</html>`, "SDK_UPSTREAM_ERROR", false, "text/html"],
+]) test(`HTTP403 ${label} conserva evidencia segura sin confundir WAF con proveedor`, async (t) => {
+  mockTransport(403, body);
+  const mock = transport;
+  transport = async (config, route) => ({ ...await mock(config, route), ...(route === "sale" ? { headers } : {}) });
+  const run = await execute();
+  assert.equal(run.error, undefined);
+  assert.equal(run.result.approved, false);
+  assert.equal(run.result.statusCode, 403);
+  assert.equal(run.result.diagnostics.safeMessageCode, expectedCode);
+  assert.equal(run.execution.wafChallenge, expectedWaf);
+  assert.equal(run.execution.httpResponseReceived, true);
+  assert.equal(run.execution.upstreamContentType, expectedMime);
+  assert.equal(run.execution.cfRay, headers["cf-ray"]);
+  assert.equal(run.saleCalls, 1);
+  assert.equal(run.events.at(-1).wafChallenge, expectedWaf);
+  report(t, `HTTP403_${expectedWaf ? "WAF" : "PROVIDER"}`, run);
+});
+
+test("DNS NXDOMAIN real simulado por UDP local conserva categoria y no envia HTTP", async (t) => {
+  // AM: El resolver usa un unico servidor DNS local y la fixture responde solo a 127.0.0.1.
+  const server = nativeDatagramSocket("udp4");
+  let dnsQueries = 0;
+  server.on("message", (packet, remote) => {
+    assert.equal(remote.address, "127.0.0.1");
+    dnsQueries += 1;
+    let end = 12;
+    while (packet[end] !== 0) end += packet[end] + 1;
+    const response = Buffer.from(packet.subarray(0, end + 5));
+    response.writeUInt16BE(0x8183, 2);
+    response.writeUInt16BE(0, 6);
+    response.writeUInt16BE(0, 8);
+    response.writeUInt16BE(0, 10);
+    nativeDatagramSend.call(server, response, remote.port, "127.0.0.1");
+  });
+  server.bind({ address: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  const resolver = new (require("node:dns").promises.Resolver)({ timeout: 10000, tries: 1 });
+  resolver.setServers([`127.0.0.1:${server.address().port}`]);
+  dnsFixtureLookup = true;
+  let originalNetworkCode;
+  try {
+    mockTransport(0, undefined);
+    const mock = transport;
+    transport = async (config, route) => {
+      if (route !== "sale") return mock(config, route);
+      const lookup = (_hostname, _options, callback) => {
+        resolver.resolve4(DNS_FIXTURE_HOST).then(
+          () => callback(new Error("DNS fixture unexpectedly resolved; connection prohibited")),
+          error => { originalNetworkCode = error.code; callback(error); }
+        );
+      };
+      return realHttpAdapter({ ...config, baseURL: `http://${DNS_FIXTURE_HOST}:1`, url: "/never-sent",
+        lookup, proxy: false, maxRedirects: 0 });
+    };
+    const run = await execute();
+    assert.equal(dnsQueries, 1);
+    assert.equal(originalNetworkCode, "ENOTFOUND");
+    assert.equal(run.error.safeMessageCode, "SDK_DNS_ERROR");
+    assert.equal(run.execution.transportErrorCode, "ENOTFOUND");
+    assert.equal(run.error.uncertain, true);
+    assert.equal(run.execution.executionPhase, "sale_transport");
+    assert.equal(run.execution.httpResponseReceived, false);
+    assert.equal(run.error.statusCode, null);
+    assert.equal(run.saleCalls, 1);
+    report(t, "REAL_DNS_NXDOMAIN_LOOPBACK", run);
+  } finally {
+    dnsFixtureLookup = false;
+    resolver.cancel();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("fallo TLS real en loopback se distingue de runtime y de respuesta HTTP", async (t) => {
+  const sockets = new Set();
+  let receivedClientHello = false;
+  const server = require("node:net").createServer(socket => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.on("close", () => sockets.delete(socket));
+    socket.once("data", bytes => {
+      receivedClientHello = bytes.length > 0;
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    });
+  });
+  server.listen({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  allowedLoopbackPort = server.address().port;
+  let originalNetworkCode;
+  try {
+    mockTransport(0, undefined);
+    const mock = transport;
+    transport = async (config, route) => {
+      if (route !== "sale") return mock(config, route);
+      try { return await realHttpAdapter({ ...config, baseURL: `https://127.0.0.1:${allowedLoopbackPort}`,
+        url: "/local-tls-failure", proxy: false, maxRedirects: 0 }); }
+      catch (error) { originalNetworkCode = error.code; throw error; }
+    };
+    const run = await execute();
+    assert.equal(receivedClientHello, true);
+    assert.equal(originalNetworkCode, "EPROTO");
+    assert.equal(run.error.safeMessageCode, "SDK_TLS_ERROR");
+    assert.equal(run.execution.transportErrorCode, "EPROTO");
+    assert.equal(run.error.uncertain, true);
+    assert.equal(run.execution.executionPhase, "sale_transport");
+    assert.equal(run.execution.httpResponseReceived, false);
+    assert.equal(run.error.statusCode, null);
+    assert.equal(run.saleCalls, 1);
+    report(t, "REAL_TLS_FAILURE_LOOPBACK", run);
+  } finally {
+    allowedLoopbackPort = null;
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
+
+test("cabeceras rechazadas por sanitizador no reaparecen por fallback de un error Axios", async () => {
+  mockTransport(0, undefined, { error: config => new axios.AxiosError(DATA_SENTINEL, "ERR_BAD_RESPONSE", config, {}, {
+    status: 500, headers: { "content-type": DATA_SENTINEL, "cf-ray": KEY }, data: DATA_SENTINEL,
+  }) });
+  const run = await execute();
+  assert.equal(run.error.uncertain, true);
+  assert.equal(run.error.statusCode, 500);
+  assert.equal(run.execution.upstreamContentType, null);
+  assert.equal(run.execution.cfRay, null);
+  assert.equal(run.error.upstreamContentType, null);
+  assert.equal(run.error.cfRay, null);
 });
