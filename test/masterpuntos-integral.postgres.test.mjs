@@ -16,6 +16,7 @@ import privateCommerce from '../src/plugins/privateCommerce.js';
 import operationalRoutes from '../src/routes/v1/admin/citas.js';
 import clientePointsRoutes from '../src/routes/v1/clientePoints.js';
 import publicCitasRoutes from '../src/routes/v1/public/citas.js';
+import adminPointsRoutes from '../src/routes/v1/admin/puntos.js';
 import {
   addManualPointsAdjustment, applyRewardRedeemForConfirmedGroup, getClientePointsSummary, redeemReward,
   resolveRedeemContextForHold, resolveRewardRedeemGateForCliente,
@@ -558,7 +559,84 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
   await app.register(operationalRoutes, { prefix: '/v1/admin/citas' });
   await app.register(clientePointsRoutes, { prefix: '/v1/cliente/puntos' });
   await app.register(publicCitasRoutes, { prefix: '/v1/public/citas' });
+  await app.register(adminPointsRoutes, { prefix: '/v1/admin/puntos' });
   await app.ready();
+  await t.test('AJUSTE-ADMIN-01: admin suma/resta, historial inmutable, autor, reintento y compensacion', async () => {
+    const owner = await createClient(), actor = await createClient(), token = access(actor, ['admin']);
+    const adjust = (accion, puntos, key = randomUUID(), authToken = token) => app.inject({ method: 'POST',
+      url: `/v1/admin/puntos/clientes/${owner.id}/ajuste`, headers: { cookie: `mf_session=${authToken}`, 'x-idempotency-key': key },
+      payload: { accion, puntos, motivo: 'Correccion manual sintetica' } });
+    const addition = await adjust('sumar', 9);
+    assert.equal(addition.statusCode, 200, addition.body); assert.equal(addition.json().data.saldo_actual, 9);
+    const before = (await pool.query('SELECT * FROM points_transactions WHERE id_points_tx=$1', [addition.json().data.id_points_tx])).rows[0];
+    const key = randomUUID(), subtraction = await adjust('restar', 4, key);
+    assert.equal(subtraction.statusCode, 200, subtraction.body);
+    assert.equal(subtraction.json().data.puntos, -4); assert.equal(subtraction.json().data.saldo_actual, 5);
+    const replay = await adjust('restar', 4, key);
+    assert.equal(replay.statusCode, 200, replay.body); assert.equal(replay.json().data.idempotent_replay, true);
+    assert.equal(replay.json().data.id_points_tx, subtraction.json().data.id_points_tx);
+    assert.equal((await adjust('restar', 3, key)).statusCode, 409);
+    assert.deepEqual((await pool.query('SELECT * FROM points_transactions WHERE id_points_tx=$1', [before.id_points_tx])).rows[0], before);
+    const ledger = (await pool.query('SELECT puntos,motivo,creado_por_usuario_id,id_cycle FROM points_transactions WHERE id_cliente=$1', [owner.id])).rows;
+    assert.deepEqual(ledger.map(row => row.puntos).sort((a,b) => a-b), [-4, 9]);
+    assert.ok(ledger.every(row => row.motivo === 'Correccion manual sintetica' && row.creado_por_usuario_id === actor.user && row.id_cycle));
+    const summaryResponse = await app.inject({ url: `/v1/admin/puntos/clientes/${owner.id}/resumen`, headers: { cookie: `mf_session=${token}` } });
+    assert.equal(summaryResponse.statusCode, 200, summaryResponse.body);
+    assert.equal(summaryResponse.json().data.saldo_total, 5);
+    assert.deepEqual(summaryResponse.json().data.historial.map(row => row.puntos).sort((a,b) => a-b), [-4, 9]);
+    assert.equal((await adjust('restar', 6)).statusCode, 422);
+    assert.equal(await balance(owner.id), 5);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM app_private.points_manual_adjustment_idempotency WHERE id_cliente=$1', [owner.id])).rows[0].n, 2);
+    assert.equal((await adjust('restar', 5)).statusCode, 200); assert.equal(await balance(owner.id), 0);
+    const prior = (await pool.query('SELECT * FROM points_transactions WHERE id_cliente=$1 ORDER BY id_points_tx', [owner.id])).rows;
+    const compensation = await adjust('sumar', 5);
+    assert.equal(compensation.statusCode, 200, compensation.body); assert.equal(await balance(owner.id), 5);
+    assert.deepEqual((await pool.query('SELECT * FROM points_transactions WHERE id_points_tx=ANY($1::uuid[]) ORDER BY id_points_tx', [prior.map(row => row.id_points_tx)])).rows, prior);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM points_transactions WHERE id_cliente=$1', [owner.id])).rows[0].n, 4);
+  });
+  await t.test('AJUSTE-ADMIN-01: cantidades/motivos invalidos, auth, alcance y clientes no elegibles sin escrituras', async () => {
+    const owner = await createClient(), actor = await createClient(), token = access(actor, ['admin']);
+    const snapshot = async () => (await pool.query(`SELECT jsonb_build_object(
+      'ledger',(SELECT jsonb_agg(to_jsonb(pt)) FROM points_transactions pt WHERE id_cliente=$1),
+      'keys',(SELECT jsonb_agg(to_jsonb(k)) FROM app_private.points_manual_adjustment_idempotency k WHERE id_cliente=$1)) AS data`, [owner.id])).rows[0].data;
+    const initial = await snapshot();
+    const adjust = (authToken, payload = {}) => app.inject({ method: 'POST', url: `/v1/admin/puntos/clientes/${owner.id}/ajuste`,
+      headers: { ...(authToken ? { cookie: `mf_session=${authToken}` } : {}), 'x-idempotency-key': randomUUID() },
+      payload: { accion: 'restar', puntos: 1, motivo: 'Correccion sintetica', ...payload } });
+    for (const accion of ['sumar', 'restar']) {
+      for (const puntos of [-1, 0, 1.5, 2147483648, Number.MAX_SAFE_INTEGER + 1, 'abc', '2', true, null, [], {}]) {
+        const response = await adjust(token, { accion, puntos });
+        assert.equal(response.statusCode, 400, JSON.stringify({ accion, puntos }) + response.body);
+      }
+      for (const motivo of ['', 'abcd', '     ', 'x'.repeat(301)]) assert.equal((await adjust(token, { accion, motivo })).statusCode, 400);
+      for (const roles of [['cliente'], ['barbero']]) assert.equal((await adjust(access(await createClient(), roles), { accion })).statusCode, 403);
+      assert.equal((await adjust(null, { accion })).statusCode, 401);
+    }
+    assert.equal((await adjust(token, { accion: 'desconocida' })).statusCode, 400);
+    assert.equal((await adjust(access(actor, ['admin'], otherBranch))).statusCode, 403);
+    for (const [table, idColumn, column, value] of [['clientes','id_cliente','estado',false], ['usuarios','id_usuario','estado_acceso','bloqueado']]) {
+      await pool.query(`UPDATE ${table} SET ${column}=$2 WHERE ${idColumn}=$1`, [table === 'clientes' ? owner.id : owner.user, value]);
+      for (const accion of ['sumar', 'restar']) assert.ok([403,404,409].includes((await adjust(token, { accion })).statusCode));
+      await pool.query(`UPDATE ${table} SET ${column}=$2 WHERE ${idColumn}=$1`, [table === 'clientes' ? owner.id : owner.user, table === 'clientes' ? true : 'activo']);
+    }
+    assert.deepEqual(await snapshot(), initial);
+  });
+  await t.test('AJUSTE-ADMIN-01: restas concurrentes y claves repetidas conservan saldo y atomicidad', async () => {
+    const owner = await createClient(), actor = await createClient(), token = access(actor, ['admin']);
+    const adjust = (accion, puntos, key = randomUUID()) => app.inject({ method: 'POST', url: `/v1/admin/puntos/clientes/${owner.id}/ajuste`,
+      headers: { cookie: `mf_session=${token}`, 'x-idempotency-key': key }, payload: { accion, puntos, motivo: 'Concurrencia sintetica' } });
+    const addKey = randomUUID(), additions = await Promise.all([adjust('sumar', 9, addKey), adjust('sumar', 9, addKey)]);
+    assert.ok(additions.every(row => row.statusCode === 200)); assert.equal(await balance(owner.id), 9);
+    const subtractKey = randomUUID(), repeated = await Promise.all([adjust('restar', 2, subtractKey), adjust('restar', 2, subtractKey)]);
+    assert.ok(repeated.every(row => row.statusCode === 200)); assert.equal(await balance(owner.id), 7);
+    assert.equal(repeated.filter(row => row.json().data.idempotent_replay).length, 1);
+    const competing = await Promise.all([adjust('restar', 5), adjust('restar', 5)]);
+    assert.deepEqual(competing.map(row => row.statusCode).sort(), [200, 422]); assert.equal(await balance(owner.id), 2);
+    const mixed = await Promise.all([adjust('sumar', 2), adjust('restar', 1)]);
+    assert.ok(mixed.every(row => row.statusCode === 200)); assert.equal(await balance(owner.id), 3);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM points_transactions WHERE id_cliente=$1', [owner.id])).rows[0].n, 5);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM app_private.points_manual_adjustment_idempotency WHERE id_cliente=$1 AND completed_at IS NOT NULL', [owner.id])).rows[0].n, 5);
+  });
   await t.test('ACOMPANANTES-01: correos registrados y nuevos, 1-4 contactos, aviso uniforme sin enumeracion', async () => {
     const companion = await createClient(), registered = 'registered@example.test';
     await pool.query('INSERT INTO correos VALUES(gen_random_uuid(),$1,$2,NULL,true,true)', [companion.person, registered]);
