@@ -613,7 +613,7 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
       assert.equal((await adjust(null, { accion })).statusCode, 401);
     }
     assert.equal((await adjust(token, { accion: 'desconocida' })).statusCode, 400);
-    assert.equal((await adjust(access(actor, ['admin'], otherBranch))).statusCode, 403);
+    assert.equal((await adjust(access(actor, ['admin'], otherBranch))).statusCode, 422);
     for (const [table, idColumn, column, value] of [['clientes','id_cliente','estado',false], ['usuarios','id_usuario','estado_acceso','bloqueado']]) {
       await pool.query(`UPDATE ${table} SET ${column}=$2 WHERE ${idColumn}=$1`, [table === 'clientes' ? owner.id : owner.user, value]);
       for (const accion of ['sumar', 'restar']) assert.ok([403,404,409].includes((await adjust(token, { accion })).statusCode));
@@ -636,6 +636,47 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
     assert.ok(mixed.every(row => row.statusCode === 200)); assert.equal(await balance(owner.id), 3);
     assert.equal((await pool.query('SELECT count(*)::int n FROM points_transactions WHERE id_cliente=$1', [owner.id])).rows[0].n, 5);
     assert.equal((await pool.query('SELECT count(*)::int n FROM app_private.points_manual_adjustment_idempotency WHERE id_cliente=$1 AND completed_at IS NOT NULL', [owner.id])).rows[0].n, 5);
+  });
+  for (const role of ['admin', 'super_admin']) await t.test(`ADMIN-02: ${role} ajusta cliente de otra sucursal, 5 a 7 a 4, saldo y atomicidad`, async () => {
+    const owner = await createClient(), actor = await createClient(), token = access(actor, [role]);
+    await pool.query('UPDATE clientes SET id_sucursal_origen=$2 WHERE id_cliente=$1', [owner.id, otherBranch]);
+    const adjust = (accion, puntos, key = randomUUID()) => app.inject({ method: 'POST',
+      url: `/v1/admin/puntos/clientes/${owner.id}/ajuste`, headers: { cookie: `mf_session=${token}`, 'x-idempotency-key': key },
+      payload: { accion, puntos, motivo: 'Ajuste manual entre sucursales' } });
+    const seed = await adjust('sumar', 5);
+    assert.equal(seed.statusCode, 200, seed.body); assert.equal(await balance(owner.id), 5);
+    const addition = await adjust('sumar', 2);
+    assert.equal(addition.statusCode, 200, addition.body); assert.equal(await balance(owner.id), 7);
+    const previous = (await pool.query('SELECT * FROM points_transactions WHERE id_cliente=$1 ORDER BY id_points_tx', [owner.id])).rows;
+    const key = randomUUID(), subtraction = await adjust('restar', 3, key);
+    assert.equal(subtraction.statusCode, 200, subtraction.body); assert.equal(await balance(owner.id), 4);
+    assert.equal(subtraction.json().data.puntos, -3);
+    const movement = (await pool.query('SELECT * FROM points_transactions WHERE id_points_tx=$1', [subtraction.json().data.id_points_tx])).rows[0];
+    assert.equal(movement.motivo, 'Ajuste manual entre sucursales'); assert.equal(movement.creado_por_usuario_id, actor.user);
+    assert.equal(movement.id_sucursal_origen, otherBranch);
+    assert.deepEqual((await pool.query('SELECT * FROM points_transactions WHERE id_points_tx=ANY($1::uuid[]) ORDER BY id_points_tx', [previous.map(row => row.id_points_tx)])).rows, previous);
+    const replay = await adjust('restar', 3, key);
+    assert.equal(replay.statusCode, 200); assert.equal(replay.json().data.id_points_tx, subtraction.json().data.id_points_tx);
+    assert.equal(replay.json().data.idempotent_replay, true); assert.equal(await balance(owner.id), 4);
+    assert.equal((await adjust('restar', 2, key)).statusCode, 409);
+    const beforeRejected = (await pool.query('SELECT * FROM points_transactions WHERE id_cliente=$1 ORDER BY id_points_tx', [owner.id])).rows;
+    assert.equal((await adjust('restar', 5)).statusCode, 422); assert.equal(await balance(owner.id), 4);
+    assert.deepEqual((await pool.query('SELECT * FROM points_transactions WHERE id_cliente=$1 ORDER BY id_points_tx', [owner.id])).rows, beforeRejected);
+    assert.equal((await adjust('restar', 4)).statusCode, 200); assert.equal(await balance(owner.id), 0);
+    assert.equal((await adjust('restar', 1)).statusCode, 422); assert.equal(await balance(owner.id), 0);
+    assert.equal((await adjust('sumar', 5)).statusCode, 200);
+    const competing = await Promise.all([adjust('restar', 3), adjust('restar', 3)]);
+    assert.deepEqual(competing.map(row => row.statusCode).sort(), [200, 422]); assert.equal(await balance(owner.id), 2);
+    const concurrentKey = randomUUID(), repeated = await Promise.all([adjust('restar', 1, concurrentKey), adjust('restar', 1, concurrentKey)]);
+    assert.ok(repeated.every(row => row.statusCode === 200)); assert.equal(await balance(owner.id), 1);
+    assert.equal(repeated.filter(row => row.json().data.idempotent_replay).length, 1);
+    const ledgerCount = (await pool.query('SELECT count(*)::int n FROM points_transactions WHERE id_cliente=$1', [owner.id])).rows[0].n;
+    assert.equal(ledgerCount, 7);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM app_private.points_manual_adjustment_idempotency WHERE id_cliente=$1', [owner.id])).rows[0].n, ledgerCount);
+    const restricted = { idCliente: owner.id, accion: 'restar', puntos: 1, motivo: 'Ajuste de alcance restringido',
+      usuarioAdmin: { id_usuario: actor.user }, claims: { roles: ['admin'], branch_ids: [branch], user: { id_usuario: actor.user } }, idempotencyKey: randomUUID(), allowGlobalAssignment: false };
+    await assert.rejects(addManualPointsAdjustment({ db: pool }, restricted), { statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN' });
+    assert.equal(await balance(owner.id), 1);
   });
   await t.test('ACOMPANANTES-01: correos registrados y nuevos, 1-4 contactos, aviso uniforme sin enumeracion', async () => {
     const companion = await createClient(), registered = 'registered@example.test';

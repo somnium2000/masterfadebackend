@@ -1300,7 +1300,7 @@ export async function addManualPointsAdjustment(app, {
   try {
     await dbClient.query("BEGIN");
     await lockClientePointsScope(dbClient, safeClienteId);
-    if (safeAccion === "restar" || !allowGlobalAssignment) {
+    if (!allowGlobalAssignment) {
       await assertClienteInAdminPointsScope(dbClient, safeClienteId, scope);
     }
     const cliente = await ensureClienteActivo(dbClient, safeClienteId, { requireRegisteredUser: true });
