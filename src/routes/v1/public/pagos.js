@@ -22,6 +22,8 @@ import {
   STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
 } from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
+import { registerHostedBookingRoutes } from "./pixelPayHosted.js";
+import { hostedStatusPayload, loadHostedSession } from "../../../services/payments/pixelPayHosted.js";
 import { resolvePixelPayStatusCandidate } from "../../../services/payments/pixelPayStatusCandidate.js";
 import {
   pixelPayStatusTransportOnRequest,
@@ -114,9 +116,11 @@ function resolveCustomerName(groupRows) {
   return name;
 }
 
-function buildPublicPaymentIntentPayload(row, pricing, launch = null) {
+function buildPublicPaymentIntentPayload(row, pricing, launch = null, hostedAvailable = false) {
   return {
     id_intent: row.id_intent,
+    payment_channel: row.payment_channel || "sdk",
+    hosted_available: hostedAvailable,
     payment_url: row.link_pago_url ?? null,
     launch,
     expires_at: new Date(row.expires_at).toISOString(),
@@ -927,6 +931,7 @@ async function loadPublicIntentForGroup(client, {
     `
       SELECT
         pi.id_intent,
+        COALESCE(to_jsonb(pi)->>'payment_channel', 'sdk') AS payment_channel,
         pi.id_cita,
         pi.id_hold,
         pi.id_provider,
@@ -1916,6 +1921,8 @@ export default async function publicPagosRoutes(app, options = {}) {
   const paymentAccess = (request) => authenticated
     ? { mode: "authenticated", owner: resolveAuthenticatedPaymentOwner(request) }
     : { mode: "public" };
+  registerHostedBookingRoutes(app, { routeGuard, paymentAccess, loadPublicIntentForGroup, assertPublicGroupPayable,
+    resolveGroupExpiresAt, recalculateGroupPromotionsForPayment });
   app.post("/crear-intent", {
     ...routeGuard,
     schema: {
@@ -1966,6 +1973,12 @@ export default async function publicPagosRoutes(app, options = {}) {
       const provider = await ensureProvider(dbClient, providerCode);
       const anchor = groupRows[0];
       const totalGroup = normalizeMoney(pricing.total_hnl);
+      if (app.config?.pixelPayHosted?.enabled === true) {
+        const previousHosted = await dbClient.query("SELECT id_intent FROM app_private.pixelpay_hosted_sessions WHERE id_grupo_cita = $1::uuid", [idGrupoCita]);
+        if (previousHosted.rows.length) {
+          throw new AppError(409, "Ya existe un pago seguro para esta reserva. Consulta su estado", { code: "PIXELPAY_HOSTED_PREVIOUS_ATTEMPT_EXISTS" });
+        }
+      }
       if (totalGroup <= 0) {
         throw new AppError(409, "La reserva no tiene saldo pendiente de pago", {
           code: "PUBLIC_PAGOS_GROUP_NO_PENDING_BALANCE",
@@ -1973,7 +1986,8 @@ export default async function publicPagosRoutes(app, options = {}) {
       }
       const existingIntent = await dbClient.query(
         `
-          SELECT id_intent, id_hold, link_pago_url, referencia_externa, idempotency_key, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo
+          SELECT id_intent, id_hold, link_pago_url, referencia_externa, idempotency_key, expires_at, monto_hnl, moneda_codigo, estado_intent_codigo,
+            COALESCE(to_jsonb(payment_intents)->>'payment_channel', 'sdk') AS payment_channel
             FROM public.payment_intents
             WHERE id_cita = $1::uuid
               AND id_provider = $2::uuid
@@ -1993,7 +2007,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           inTransaction = false;
           return sendOk(
             reply,
-            buildPublicPaymentIntentPayload(existingIntent.rows[0], pricing, null)
+            buildPublicPaymentIntentPayload(existingIntent.rows[0], pricing, null, app.config?.pixelPayHosted?.enabled === true)
           );
         } else {
           const expiredMismatchedIntent = await dbClient.query(
@@ -2083,7 +2097,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         });
         return sendOk(
           reply,
-          buildPublicPaymentIntentPayload(directIntent, phaseAPricing, null),
+          buildPublicPaymentIntentPayload(directIntent, phaseAPricing, null, app.config?.pixelPayHosted?.enabled === true),
           { statusCode: 201 }
         );
       }
@@ -2340,6 +2354,9 @@ export default async function publicPagosRoutes(app, options = {}) {
         access,
       });
       const intent = loaded.intent;
+      if (intent.payment_channel === "hosted") {
+        throw new AppError(409, "La orden pertenece al canal de pago seguro", { code: "PIXELPAY_PAYMENT_CHANNEL_MISMATCH" });
+      }
       if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
         throw new AppError(409, "El intent no pertenece a PixelPay", {
           code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
@@ -2623,6 +2640,9 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
         });
       }
+      if (intent.payment_channel === "hosted") {
+        throw new AppError(409, "Consulta el estado del pago seguro", { code: "PIXELPAY_PAYMENT_CHANNEL_MISMATCH" });
+      }
       const statusCandidate = await resolvePixelPayStatusCandidate(app.db, intent);
       const paymentUuid = statusCandidate.paymentUuid;
       const usesObservedCandidate = statusCandidate.source === "observed_untrusted";
@@ -2766,6 +2786,12 @@ export default async function publicPagosRoutes(app, options = {}) {
         expectedAmountHnl: currentTotal,
         access,
       });
+      if (intent.payment_channel === "hosted") {
+        const session = await loadHostedSession(app.db, idIntent);
+        if (!session) throw new AppError(409, "El pago seguro requiere revision", { code: "PIXELPAY_HOSTED_SESSION_NOT_FOUND" });
+        return sendOk(reply, { ...hostedStatusPayload(session, intent, Date.now(), groupRows), id_grupo_cita: idGrupoCita,
+          hosted_available: app.config?.pixelPayHosted?.enabled === true, monto_hnl: Number(intent.monto_hnl), moneda_codigo: intent.moneda_codigo });
+      }
       const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "") === "confirmada");
       const intentState = safeText(intent.estado_intent_codigo)?.toLowerCase() || "";
       const bookingConfirmed = allConfirmed && intentState === "confirmado";
@@ -2786,6 +2812,8 @@ export default async function publicPagosRoutes(app, options = {}) {
       return sendOk(reply, {
         id_intent: idIntent,
         estado_intent_codigo: intent.estado_intent_codigo,
+        payment_channel: intent.payment_channel || "sdk",
+        hosted_available: app.config?.pixelPayHosted?.enabled === true,
         booking_confirmed: bookingConfirmed,
         expires_at: intent.expires_at ? new Date(intent.expires_at).toISOString() : null,
         monto_hnl: Number(intent.monto_hnl || 0),

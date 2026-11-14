@@ -66,6 +66,7 @@ export function isPrivateCommerceRoute(method, route) {
   if (MAINTENANCE_ROUTES.has(`${method} ${path}`)) return false;
   // AM: Callbacks settle existing financial evidence independently of the owner's session/IP.
   if (path === "/v1/pagos/webhook/:proveedor") return false;
+  if (path === "/v1/pagos/pixelpay/hosted/callback") return false;
   if (/^\/v1\/(?:public\/)?pagos(?:\/|$)/.test(path)) return true;
   if (/^\/v1\/(?:public\/)?citas(?:\/|$)/.test(path)) return !["GET"].includes(method);
   if (/^\/v1\/cliente\/planes(?:\/|$)/.test(path)) return method !== "GET";

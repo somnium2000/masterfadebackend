@@ -129,6 +129,7 @@ export default fp(async function adminDataEntryPlugin(app) {
     // AM: Existing callbacks retain their own financial verification even during pilot rollback.
     if (method === 'POST' && normalizedRoute === '/v1/pagos/webhook/:proveedor'
       && String(request.params?.proveedor || '').toLowerCase() === 'pixelpay') return;
+    if (method === 'POST' && normalizedRoute === '/v1/pagos/pixelpay/hosted/callback') return;
     const isAdministrativeOperation = administrativeOperationPrefixes.some(prefix => (
       normalizedRoute === prefix || normalizedRoute.startsWith(prefix + '/')
     ));

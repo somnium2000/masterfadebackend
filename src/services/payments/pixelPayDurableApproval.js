@@ -6,6 +6,11 @@ export async function loadDurablePixelPayApproval(client, { idIntent, groupRows,
   const result = await client.query(
     `SELECT finalized_at::text AS finalized_at FROM app_private.pixelpay_sale_attempts
      WHERE id_intent = $1::uuid AND outcome = 'approved'
+       AND EXISTS (
+         SELECT 1 FROM public.payment_intents pi
+         WHERE pi.id_intent = $1::uuid
+           AND COALESCE(to_jsonb(pi)->>'payment_channel', 'sdk') = 'sdk'
+       )
        AND sdk_response_class = 'SuccessResponse' AND upstream_http_status = 200
        AND finalized_at IS NOT NULL AND finalized_at <= $2::timestamptz
        AND finalized_at <= (

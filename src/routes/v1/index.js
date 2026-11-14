@@ -7,6 +7,7 @@ import clienteRoutes from "./cliente.js";
 import clientePointsRoutes from "./clientePoints.js";
 import citasRoutes from "./citas.js";
 import pagosRoutes from "./pagos.js";
+import pixelPayHostedCallbackRoutes from "./pixelPayHostedCallback.js";
 import bookingPaymentRoutes from "./public/pagos.js";
 import publicRoutes from "./public/index.js";
 import storageRoutes from "./storage.js";
@@ -22,6 +23,7 @@ export default async function v1Routes(app) {
   await app.register(storageRoutes, { prefix: "/v1/storage" });
   await app.register(citasRoutes, { prefix: "/v1/citas" });
   await app.register(pagosRoutes, { prefix: "/v1/pagos" });
+  await app.register(pixelPayHostedCallbackRoutes, { prefix: "/v1/pagos/pixelpay/hosted" });
   await app.register(bookingPaymentRoutes, { prefix: "/v1/pagos/reservas", authenticated: true });
   await app.register(adminRoutes, { prefix: "/v1/admin" });
 }
