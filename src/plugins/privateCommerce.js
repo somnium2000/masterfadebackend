@@ -1,6 +1,7 @@
 import net from "node:net";
 import fp from "fastify-plugin";
 import { sendError } from "../utils/errors.js";
+import { createQaCommerceDiagnostic } from "../utils/qaCommerceDiagnostic.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -116,17 +117,27 @@ export default fp(async function privateCommerce(app) {
   const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const qaVipPurchaseSimulationEnabled = app.config.qaVipPurchaseSimulation?.enabled === true;
   const verify = app.requireRoles([]);
-  async function eligible(request, reply) {
-    if (!config.enabled || app.config.adminDataEntryMode || app.config.paymentProvider !== "pixelpay"
-      || !privateCommerceIpAllowed(request, config)) return false;
-    if (!request.cookies?.mf_session) return false;
+  const diagnose = createQaCommerceDiagnostic(app, config);
+  async function eligible(request, reply, report = () => {}) {
+    const deny = code => { report(code); return false; };
+    if (!config.enabled) return deny('PILOT_DISABLED');
+    if (app.config.adminDataEntryMode) return deny('ADMIN_DATA_ENTRY');
+    if (app.config.paymentProvider !== "pixelpay") return deny('PROVIDER_NOT_PIXELPAY');
+    if (!privateCommerceIpAllowed(request, config)) {
+      const peer = normalizeIp(request.raw.socket.remoteAddress);
+      return deny(!config.proxies.length ? 'DIRECT_IP_NOT_ALLOWED'
+        : !config.proxies.includes(peer) ? 'PROXY_PEER_NOT_ALLOWED'
+          : request.ips?.length !== 2 ? 'PROXY_CHAIN_LENGTH' : 'CLIENT_IP_NOT_ALLOWED');
+    }
+    if (!request.cookies?.mf_session) return deny('SESSION_MISSING');
     await verify(request, reply);
-    if (reply.sent) return false;
-    return config.userIds.includes(String(request.auth?.sub || "").toLowerCase())
-      && request.claims?.user?.id_usuario === request.auth?.sub
-      // AM: Eligibility promises both client flows; the server must resolve an active client and role.
-      && UUID.test(String(request.claims?.cliente_id || ""))
-      && request.claims?.roles?.includes("cliente") === true;
+    if (reply.sent) return deny('AUTH_CONTEXT_REJECTED');
+    if (!config.userIds.includes(String(request.auth?.sub || "").toLowerCase())) return deny('USER_NOT_ALLOWED');
+    if (request.claims?.user?.id_usuario !== request.auth?.sub) return deny('IDENTITY_MISMATCH');
+    if (!UUID.test(String(request.claims?.cliente_id || ""))) return deny('CLIENT_NOT_ACTIVE');
+    if (request.claims?.roles?.includes("cliente") !== true) return deny('ROLE_NOT_CLIENT');
+    report('ELIGIBLE');
+    return true;
   }
   app.addHook("onRequest", async (request, reply) => {
     if (!isPrivateCommerceRoute(request.method, request.routeOptions.url)) return;
@@ -154,9 +165,12 @@ export default fp(async function privateCommerce(app) {
   app.get("/v1/commerce/eligibility", async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
     if (qaPaymentSimulationEnabled) {
+      await diagnose(request, 'QA_SIMULATION');
       return { ok: true, data: { booking: true, vipPurchase: qaVipPurchaseSimulationEnabled } };
     }
-    const allowed = await eligible(request, reply);
+    let reason = 'AUTH_CONTEXT_REJECTED';
+    const allowed = await eligible(request, reply, code => { reason = code; });
+    await diagnose(request, reason);
     if (reply.sent) return;
     return { ok: true, data: { booking: allowed, vipPurchase: config.qaCapabilities ? false : allowed } };
   });
