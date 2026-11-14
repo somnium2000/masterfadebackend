@@ -121,7 +121,10 @@ test('02G: migración, permisos y servicio con PostgreSQL 17 desechable real', {
       assert.deepEqual(columns, ['id','email','id_correo','original_persona_id','auth_user_id','token_hash','expires_at','last_sent_at','state','result_persona_id','result_cliente_id','completed_at','created_at'].sort());
       const constraints = (await admin.query("SELECT contype FROM pg_constraint WHERE conrelid='app_private.guest_registration_requests'::regclass")).rows;
       for (const type of ['p','u','f','c']) assert.ok(constraints.some(r => r.contype === type));
-      await assert.rejects(admin.query(migration), e => e.code === '42P07');
+      await assert.rejects(admin.query(migration), {
+        code: 'P0001',
+        message: 'MF_GUEST_REGISTRATION_REQUESTS_ALREADY_EXISTS_REQUIRES_MANUAL_COMPARISON',
+      });
       await admin.query('ROLLBACK');
       assert.equal((await admin.query('SELECT count(*)::int n FROM app_private.guest_registration_requests')).rows[0].n, 0);
     });
