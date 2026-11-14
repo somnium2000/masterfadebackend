@@ -107,9 +107,11 @@ test('PostgreSQL 17: migracion Hosted serializa canales y conserva callbacks sin
       CREATE SCHEMA app_private;
       CREATE TABLE payment_providers(id_provider uuid PRIMARY KEY, codigo text);
       CREATE TABLE citas_grupos(id_grupo_cita uuid PRIMARY KEY);
+      CREATE TABLE citas(id_cita uuid PRIMARY KEY, id_grupo_cita uuid REFERENCES citas_grupos);
       CREATE TABLE payment_intents(
         id_intent uuid PRIMARY KEY, id_provider uuid REFERENCES payment_providers,
         id_cita uuid, id_hold uuid, created_by_usuario_id uuid,
+        origen_pago_codigo text NOT NULL DEFAULT 'cita',
         id_grupo_cita uuid REFERENCES citas_grupos, orden_compra text UNIQUE,
         monto_hnl numeric(12,2), moneda_codigo text DEFAULT 'HNL',
         estado_intent_codigo text DEFAULT 'pendiente_confirmacion', paid_at timestamptz,
@@ -118,6 +120,13 @@ test('PostgreSQL 17: migracion Hosted serializa canales y conserva callbacks sin
       CREATE TABLE payments(id_intent uuid REFERENCES payment_intents, estado_pago_codigo text, paid_at timestamptz);
       CREATE TABLE app_private.pixelpay_sale_attempts(id_intent uuid REFERENCES payment_intents);
     `);
+    const canonicalSql = await readFile(new URL('../db/migrations/20260701_microfase_2a2_reconciliacion_transaccional.sql', import.meta.url), 'utf8');
+    const normalizerStart = canonicalSql.indexOf('CREATE OR REPLACE FUNCTION public.fn_payment_intents_set_group()');
+    const normalizerEnd = canonicalSql.indexOf('$function$;', normalizerStart) + '$function$;'.length;
+    assert.ok(normalizerStart >= 0 && normalizerEnd > normalizerStart);
+    await client.query(canonicalSql.slice(normalizerStart, normalizerEnd));
+    await client.query(`CREATE TRIGGER tr_payment_intents_set_group BEFORE INSERT OR UPDATE ON payment_intents
+      FOR EACH ROW EXECUTE FUNCTION public.fn_payment_intents_set_group()`);
     await client.query('INSERT INTO payment_providers VALUES ($1,$2)', [providerId, 'pixelpay']);
     for (const migration of ['20261114010000_pixelpay_hosted_qa.sql', '20261114120000_pixelpay_hosted_financial_guard.sql']) {
       await client.query(await readFile(new URL(`../db/migrations/pixel/${migration}`, import.meta.url), 'utf8'));
@@ -154,6 +163,13 @@ test('PostgreSQL 17: migracion Hosted serializa canales y conserva callbacks sin
       await assert.rejects(client.query("UPDATE payment_intents SET payment_channel='sdk' WHERE id_intent=$1", [hosted.id]), /MF_HOSTED_PAYMENT_CHANNEL_IMMUTABLE/);
       await assert.rejects(client.query('UPDATE app_private.pixelpay_hosted_sessions SET amount_hnl=101 WHERE id_intent=$1', [hosted.id]), /MF_HOSTED_SESSION_IDENTITY_IMMUTABLE/);
       await assert.rejects(client.query('INSERT INTO app_private.pixelpay_sale_attempts VALUES ($1)', [hostedOther.id]), /MF_HOSTED_PAYMENT_CHANNEL_MISMATCH/);
+    });
+    await t.test('INSERT legacy sin grupo deriva otra cita del mismo grupo antes de rechazar orden duplicada', async () => {
+      const anotherCita = randomUUID();
+      const anotherIntent = randomUUID();
+      await client.query('INSERT INTO citas VALUES ($1,$2)', [anotherCita, hosted.group]);
+      await assert.rejects(client.query(`INSERT INTO payment_intents(id_intent,id_provider,id_cita,orden_compra,monto_hnl)
+        VALUES ($1,$2,$3,$4,100)`, [anotherIntent, providerId, anotherCita, `MF-PIXELPAY-${anotherIntent.replaceAll('-', '').toUpperCase()}`]), /MF_HOSTED_GROUP_ORDER_EXISTS/);
     });
     await t.test('Callback concurrente duplicado se registra una vez sin pago ni confirmacion', async () => {
       const responses = await Promise.all([processHostedCallback({ db, config, body: body(hosted) }), processHostedCallback({ db, config, body: body(hosted) })]);

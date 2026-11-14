@@ -96,7 +96,8 @@ BEGIN
   END IF;
   RETURN NEW;
 END $mf$;
-CREATE TRIGGER tr_guard_pixelpay_payment_channel BEFORE INSERT OR UPDATE OF payment_channel,id_provider,id_grupo_cita,id_cita,id_hold,created_by_usuario_id,orden_compra,monto_hnl,moneda_codigo ON public.payment_intents
+-- AM: Ejecutar despues de tr_payment_intents_set_group cubre INSERT legacy sin grupo explicito.
+CREATE TRIGGER tr_payment_intents_zz_guard_hosted_channel BEFORE INSERT OR UPDATE OF payment_channel,id_provider,id_grupo_cita,id_cita,id_hold,created_by_usuario_id,orden_compra,monto_hnl,moneda_codigo ON public.payment_intents
   FOR EACH ROW EXECUTE FUNCTION app_private.guard_pixelpay_payment_channel_v1();
 CREATE TRIGGER tr_guard_pixelpay_sdk_channel BEFORE INSERT ON app_private.pixelpay_sale_attempts
   FOR EACH ROW EXECUTE FUNCTION app_private.guard_pixelpay_payment_channel_v1();

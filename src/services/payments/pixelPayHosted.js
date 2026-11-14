@@ -4,7 +4,14 @@ import { AppError } from "../../utils/errors.js";
 export const HOSTED_CONFIRMATION_BLOCKED = "PIXELPAY_HOSTED_CONFIRMATION_BLOCKED";
 export const HOSTED_SANDBOX_ENDPOINT = "https://pixelpay.app/api/v2/transaction/hosted/sandbox";
 const CHECKOUT_ORIGINS = new Set(["https://pixelpay.app", "https://www.pixelpay.app", "https://pixelpay.dev"]);
-const CHECKOUT_PATH = /^\/sandbox\/[A-Za-z0-9_-]+\/checkout(?:\/[A-Za-z0-9_-]+)?\/?$/;
+const CHECKOUT_PATH = /^\/sandbox\/[A-Za-z0-9_-]+\/checkout(?:\/example)?\/?$/;
+const CHECKOUT_QUERY_VALUES = {
+  success: /^(?:0|1)$/,
+  slug: /^sandbox$/,
+  merchant: /^sandbox$/,
+  lang: /^(?:es|en)$/,
+  payload: /^[A-Za-z0-9+/_-]+={0,2}$/,
+};
 const text = value => String(value ?? "").trim();
 
 function fail(status, code, message = "No se pudo iniciar el pago seguro") {
@@ -47,10 +54,27 @@ export function hostedRequestSignature({ keyId, secretKey, appUrl }, orderId) {
 }
 
 export function validateHostedCheckoutUrl(value) {
-  let url;
-  try { url = new URL(text(value)); } catch { fail(502, "PIXELPAY_HOSTED_URL_INVALID"); }
-  if (!CHECKOUT_ORIGINS.has(url.origin) || url.username || url.password || url.port || url.hash
-    || !CHECKOUT_PATH.test(url.pathname) || url.href.length > 16000) fail(502, "PIXELPAY_HOSTED_URL_INVALID");
+  // AM: Solo el ejemplo Hosted Sandbox acredita esta ruta; las rutas comerciales no acreditan ambiente.
+  const inspect = (candidate, depth = 0) => {
+    if (typeof candidate !== "string" || candidate.length > 16000 || candidate.includes("\\")
+      || [...candidate].some(character => character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127)) return null;
+    let parsed;
+    try { parsed = new URL(candidate); } catch { return null; }
+    if (!CHECKOUT_ORIGINS.has(parsed.origin) || parsed.username || parsed.password || parsed.port || parsed.hash
+      || !CHECKOUT_PATH.test(parsed.pathname)) return null;
+    const seen = new Set();
+    for (const [key, queryValue] of parsed.searchParams) {
+      if (seen.has(key)) return null;
+      seen.add(key);
+      if (key === "url") {
+        const nested = depth === 0 ? inspect(queryValue, 1) : null;
+        if (!nested || nested.origin !== parsed.origin || nested.pathname !== parsed.pathname) return null;
+      } else if (!Object.hasOwn(CHECKOUT_QUERY_VALUES, key) || !CHECKOUT_QUERY_VALUES[key].test(queryValue)) return null;
+    }
+    return parsed;
+  };
+  const url = inspect(value);
+  if (!url) fail(502, "PIXELPAY_HOSTED_URL_INVALID");
   return url.href;
 }
 

@@ -2,6 +2,8 @@
 
 Fecha de investigacion: 14 de noviembre de 2026. Este documento describe un candidato de codigo y migraciones; no acredita un despliegue ni un pago aprobado.
 
+Actualizacion acotada posterior a la primera entrega: [diagnostico Sandbox y bloqueo actual](pixelpay-hosted-sandbox-diagnosis.md), [contrato de consulta financiera](pixelpay-hosted-verification-contract.md) y [revision independiente de migraciones/coexistencia](pixelpay-hosted-qa-coexistence.md). La nueva evidencia distingue challenge Cloudflare de HTTP500 JSON por modulo no disponible. La migracion candidata cambio el orden de un trigger; sus resultados PostgreSQL anteriores no se presentan como validacion de esa modificacion, que no se aplico.
+
 ## Alcance y viabilidad
 
 Hosted es una alternativa oficial de redireccionamiento, separada de la Sale SDK. PixelPay aloja captura de tarjeta, billing y 3DS. La arquitectura de MasterFade permite crear una orden canonica y un hold, vincular un canal durable, solicitar un checkout desde backend y recuperar su estado al volver. No se reciben PAN/CVV en este canal.
@@ -37,6 +39,23 @@ Referencias revisadas por MCP, web y directamente en la pestana Chrome del usuar
 | Idempotencia | No se encontro garantia oficial de creacion idempotente, clave idempotency ni API Hosted de cancelacion/consulta financiera. Guardar claim durable antes de HTTP y no reemitir ante incertidumbre. |
 
 La traduccion [Hosted EN](https://pixelpay.zendesk.com/hc/en-us/articles/26775620656148-Hosted-Payment-Gateway) introduce ambiguedad sobre Secret Key prehasheada. No se implementa fallback entre formulas. Se requiere un vector oficial aplicable a la cuenta.
+
+### Contrato y limite de URL de checkout en QA
+
+Las fuentes no publican una gramatica exhaustiva de URL ni garantizan que cualquier checkout alojado en un dominio PixelPay sea Sandbox. Se distinguen estas formas:
+
+| Forma de ruta | Evidencia y decision QA |
+| --- | --- |
+| `/sandbox/<token>/checkout/example` | Ejemplo explicito de [Hosted Sandbox EN](https://pixelpay.zendesk.com/hc/en-us/articles/26640565481748-SandBox-PixelPay-Hosted-Payment) y [guia Sandbox](https://docs.pixelpay.com/page/sandbox/hosted-payment). Permitida en los origenes exactos revisados; tambien se conserva la variante sin `/example`. |
+| `/<comercio>/P-<uuid>/checkout` | El callback de [Hosted ES](https://pixelpay.zendesk.com/hc/es-419/articles/360039834392-Hosted-Payment-Gateway) muestra esta forma en `pixelpay.dev`. Es evidencia de Hosted general, no prueba de ambiente Sandbox; bloqueada en este candidato QA. |
+| `/<comercio>/<identificador-opaco>/checkout` | Ejemplo de [Hosted EN](https://pixelpay.zendesk.com/hc/en-us/articles/26775620656148-Hosted-Payment-Gateway). Tampoco demuestra Sandbox; bloqueada. |
+| `/<comercio>/S-<uuid>/checkout` | No se obtuvo contrato Hosted oficial ni respuesta Sandbox autentica que demuestre esta forma. Un prefijo observado en SDK no basta para permitirla en Hosted; bloqueada hasta nueva evidencia. |
+
+Backend y frontend aplican la misma politica: HTTPS, origen exacto `https://pixelpay.app`, `https://www.pixelpay.app` o `https://pixelpay.dev`, sin credenciales, puertos alternativos, fragmentos, controles, rutas codificadas ambiguas ni sufijos arbitrarios. No se amplia a todas las rutas `*/checkout` para acomodar ejemplos comerciales.
+
+La query permite `success=0|1`, `slug=sandbox`, `merchant=sandbox`, `payload` con alfabeto Base64 y la opcion inerte `lang=es|en`. El ejemplo Sandbox EN incluye `url=`: solo se acepta un nivel, con el mismo origen y ruta de checkout que la URL exterior, y los mismos controles. Se rechazan destinos directos externos, otra ruta/token de checkout anidado, cadenas `url=` de mas de un nivel, parametros duplicados y overrides directos `_callback`, `_complete`, `_cancel`, `redirect` o `next` en query.
+
+`payload` permanece opaco; el validador no verifica la orden ni los destinos internos de ese contenido, ni garantiza las redirecciones posteriores del checkout. Su contenido no acredita ambiente, titular ni pago y no sustituye los parametros canonicos que genera el backend. El ejemplo publico contiene retornos/callback de terceros y se usa solo como referencia documental; no se ejecutan esos destinos en las pruebas. Falta una URL devuelta por una creacion Sandbox exitosa para demostrar compatibilidad real. Si la cuenta devuelve otra forma, se necesita evidencia del proveedor y una revision contextual de ambos validadores antes de activar; no se habilita Live por relajar esta frontera.
 
 ## Bloqueo de autenticacion
 
@@ -91,20 +110,20 @@ No se atribuye ese resultado a la cuenta MasterFade ni a una causa de firma: el 
 
 ## Matriz de validacion
 
-Resultados finales del backend: **404 pruebas aprobadas, 0 fallos, 0 omitidas**, en dos ejecuciones complementarias. `npm run lint -- --quiet` y `git diff --check` terminaron con codigo 0. No se ejecuto la suite completa del repositorio; la seleccion cubre Hosted, SDK, callbacks, permisos, piloto, modo deshabilitado y controles financieros afectados.
+Validacion inicial del backend: **404 pruebas aprobadas, 0 fallos, 0 omitidas**, en dos ejecuciones complementarias previas al ajuste de orden de trigger. En la continuacion acotada pasaron **417 pruebas sin aplicar SQL**, incluyendo diagnostico, vectores sinteticos financieros, matriz de configuracion y regresiones Hosted/SDK/callback/propiedad/piloto. `npm run lint -- --quiet` y `git diff --check` correctos. La regresion PostgreSQL con normalizador real se preparo pero no se ejecuto en esta continuacion. No se ejecuto la suite completa del repositorio.
 
-Comandos ejecutados:
+Comandos de la validacion inicial, anteriores al ajuste del trigger (registro historico, no prueba de la migracion actual):
 
 ```powershell
 node --test test/pixelpay-hosted.test.mjs test/pixelpay-hosted-routes.test.mjs test/pixelpay-sdk-provider.test.mjs test/pixelpay-sale-guard.test.mjs test/pixelpay-webhook-safety.test.mjs test/microfase2a2-public-pagos-routes.test.mjs test/private-commerce.test.mjs test/payment-disabled-mode.test.mjs
 # 380 PASS
 node --test test/pixelpay-hosted-financial-guards.postgres.test.mjs test/pixelpay-financial-evidence-contract.test.mjs test/pixelpay-reconciliation-window-contract.test.mjs
-# 24 PASS; ambas migraciones y carreras reales en PostgreSQL 17 temporal local
+# 24 PASS historicos; candidatas anteriores al ajuste de orden, en PostgreSQL 17 temporal local
 npm run lint -- --quiet
 git diff --check
 ```
 
-El entorno restringido bloqueo inicialmente localhost (`EACCES`); la misma prueba se ejecuto con acceso local autorizado y paso. El fixture se actualizo durante desarrollo para el contrato final del receptor y las invariantes de insercion; los resultados anteriores se reemplazan por la pasada final sobre codigo estable indicada arriba. No se usaron bases compartidas para tests.
+En la validacion inicial el entorno restringido bloqueo localhost (`EACCES`); la prueba se ejecuto con acceso local autorizado y paso. Esos resultados corresponden a la candidata anterior al ajuste de orden del trigger. La continuacion no aplico SQL; la regresion PostgreSQL actualizada queda pendiente. No se usaron bases compartidas para tests.
 
 Evidencia externa sanitizada: [POST Sandbox](evidence/pixelpay-hosted-sandbox-20261114.json). Separar pruebas sinteticas locales de evidencia real del proveedor.
 

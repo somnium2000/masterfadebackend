@@ -79,6 +79,41 @@ test("solo permite URLs HTTPS de checkout Sandbox oficiales sin credenciales ni 
   }
 });
 
+test("formas comerciales Hosted documentadas no acreditan Sandbox, incluido S sin contrato Hosted", () => {
+  for (const url of [
+    "https://pixelpay.dev/pruebas-maria-3/P-a039903a-449c-4911-bf43-85b776284e97/checkout",
+    "https://www.pixelpay.app/my_company/1dab5ed0/checkout",
+    "https://pixelpay.dev/masterfade/S-a039903a-449c-4911-bf43-85b776284e97/checkout",
+    "https://pixelpay.app/masterfade/S-a039903a-449c-4911-bf43-85b776284e97/checkout",
+  ]) assert.throws(() => validateHostedCheckoutUrl(url), error => error.code === "PIXELPAY_HOSTED_URL_INVALID");
+});
+
+test("query documental Sandbox permite payload opaco y un enlace anidado al mismo checkout", () => {
+  const base = "https://pixelpay.app/sandbox/ZvCAXse0zn/checkout/example";
+  const nested = `${base}?success=0&slug=sandbox&merchant=sandbox&payload=eyJfb3JkZXJfaWQiOiJmaXh0dXJlIn0%3D`;
+  const url = `${base}?success=1&slug=sandbox&merchant=sandbox&payload=eyJfb3JkZXJfaWQiOiJmaXh0dXJlIn0%3D&url=${encodeURIComponent(nested)}`;
+  assert.equal(validateHostedCheckoutUrl(url), url);
+  assert.equal(validateHostedCheckoutUrl(`${base}?lang=es`), `${base}?lang=es`);
+});
+
+test("query de checkout rechaza overrides de callback, redirects, nesting ajeno y ambiguo", () => {
+  const base = "https://pixelpay.app/sandbox/ZvCAXse0zn/checkout/example";
+  for (const query of [
+    "url=https%3A%2F%2Fevil.test%2Fcheckout", "url=%2F%2Fevil.test%2Fcheckout",
+    `url=${encodeURIComponent(base.replace("ZvCAXse0zn", "otra-orden"))}`,
+    `url=${encodeURIComponent(base.replace("pixelpay.app", "pixelpay.dev"))}`,
+    `url=${encodeURIComponent(`${base}?url=${encodeURIComponent(base)}`)}`,
+    "redirect=https%3A%2F%2Fevil.test", "next=https%3A%2F%2Fevil.test", "callback=https%3A%2F%2Fevil.test",
+    "_callback=https%3A%2F%2Fevil.test", "_complete=https%3A%2F%2Fevil.test", "_cancel=https%3A%2F%2Fevil.test",
+    "merchant=masterfade", "slug=other", "success=paid", "success=1&success=0", "lang=es&lang=en",
+    "%72edirect=https%3A%2F%2Fevil.test", "payload=not%25base64", "toString=unsafe",
+  ]) assert.throws(() => validateHostedCheckoutUrl(`${base}?${query}`), error => error.code === "PIXELPAY_HOSTED_URL_INVALID");
+  assert.throws(() => validateHostedCheckoutUrl(`${base}/redirect`));
+  assert.throws(() => validateHostedCheckoutUrl(` ${base}`));
+  assert.throws(() => validateHostedCheckoutUrl(`${base}\n`));
+  assert.throws(() => validateHostedCheckoutUrl(`${base}?payload=${"a".repeat(16000)}`));
+});
+
 test("request real de adaptador solo apunta Sandbox, sin redirects y sin datos de tarjeta", async () => {
   let calls = 0;
   const url = await requestHostedCheckout(config, order, { fetchImpl: async (url, request) => {
