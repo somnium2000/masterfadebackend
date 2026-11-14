@@ -110,6 +110,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924011000_assert_pixelpay_reconciliation_window.sql
       - name: Run tests
         run: npm test
+      - name: Validate zero-total reward confirmation in isolated PostgreSQL
+        env:
+          MASTERFADE_PHASE02_PG_BIN: ${{ env.MASTERFADE_TEST_PG_BIN }}
+        run: node --test test/masterpuntos-group-redeem.postgres.test.mjs
       - name: Run database preflight
         env:
           DATABASE_URL: postgresql://supabase_admin:postgres@localhost:5432/postgres
