@@ -18,6 +18,7 @@ import adminCitas from "../src/routes/v1/admin/citas.js";
 import adminMembresias from "../src/routes/v1/admin/membresias.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
+import { sendError } from "../src/utils/errors.js";
 
 const USER = crypto.randomUUID(), OTHER = crypto.randomUUID();
 const SECRET = crypto.randomBytes(40).toString("hex");
@@ -38,11 +39,12 @@ async function fixture(t, options = {}) {
   for (const [key, value] of Object.entries(options.env || {})) if (value === undefined) delete process.env[key];
   t.after(() => { for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key]; Object.assign(process.env, previous); });
   const app = Fastify({ trustProxy: buildTrustProxy("true") });
+  app.setErrorHandler((error, request, reply) => sendError(reply, error.statusCode || 500, 'Solicitud invalida', { code: error.code }));
   const state = { business: 0, unexpectedSql: 0 };
   app.decorate("db", { query: async (sql, params) => {
     if (sql.includes("FROM public.seguridad_sesiones")) return { rows: options.revoked ? [] : [{ estado: "activa", ultimo_uso_at: new Date(), expira_at: new Date(Date.now() + 60000) }] };
     if (sql.includes("UPDATE public.seguridad_sesiones")) return { rows: [] };
-    if (sql.includes("WITH base_user")) return { rows: [{ id_usuario: params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
+    if (sql.includes("WITH base_user")) return { rows: [{ id_usuario: options.claimsMismatch ? OTHER : params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
     state.unexpectedSql++; throw Error("Unexpected business SQL");
   }, connect: async () => { state.unexpectedSql++; throw Error("Business connection prohibited"); } });
   await app.register(fp(async a => a.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false, ...options.config }), { name: "env-plugin" }));
@@ -327,4 +329,73 @@ test("eligible session still requires CSRF on commercial mutations", async t => 
   assert.equal(response.statusCode, 403);
   assert.equal(response.json().error.code, "CSRF_TOKEN_INVALID");
   assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+});
+
+const QA_SDK = { ENTORNO: 'qa', NODE_ENV: 'development', PAYMENT_PROVIDER: 'pixelpay',
+  PIXELPAY_IMPLEMENTATION: 'sdk', PIXELPAY_ENV: 'sandbox' };
+
+test('QA pilot grants booking only and blocks all VIP and Sale aliases before handlers', async t => {
+  let providerCalls = 0;
+  const originalCreate = PaymentProviderFactory.create;
+  PaymentProviderFactory.create = () => { providerCalls++; throw new Error('Provider forbidden'); };
+  t.after(() => { PaymentProviderFactory.create = originalCreate; });
+  const f = await fixture(t, { env: QA_SDK });
+  assert.deepEqual((await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: IP, headers: f.headers() })).json().data,
+    { booking: true, vipPurchase: false });
+  for (const url of ['/v1/public/citas/hold', '/v1/citas/hold', '/v1/public/pagos/crear-intent', '/v1/pagos/reservas/crear-intent',
+    '/v1/public/pagos/estado', '/v1/pagos/reservas/estado', '/v1/public/pagos/pixelpay/status', '/v1/pagos/reservas/pixelpay/status',
+    '/v1/cliente/planes/pago-intent/invalid/estado']) {
+    const r = await f.app.inject({ method: 'POST', url, remoteAddress: IP, headers: f.headers(), payload: {} });
+    assert.equal(r.statusCode, 400, `${url}: original schema must reject empty input: ${r.body}`);
+  }
+  for (const url of ['/v1/cliente/planes/orden', '/v1/cliente/planes/pago-intent', '/v1/cliente/planes/adquirir',
+    '/v1/cliente/planes/confirmar-pago', '/v1/cliente/planes/simulator/event', '/v1/citas/probe',
+    '/v1/public/pagos/pixelpay/sale', '/v1/pagos/reservas/pixelpay/sale', '/v1/pagos/crear-intent',
+    '/v1/public/pagos/mock-completar', '/v1/public/pagos/simulator/event']) {
+    assert.equal((await f.app.inject({ method: 'POST', url, remoteAddress: IP, headers: f.headers(), payload: {} })).statusCode, 403, url);
+  }
+  assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+  assert.equal(providerCalls, 0);
+});
+
+test('QA explicit immediate proxy preserves independent booking eligibility', async t => {
+  const f = await fixture(t, { env: { ...QA_SDK, PRIVATE_COMMERCE_PROXY_IPS: '10.0.0.2' } });
+  const response = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.2',
+    headers: { ...f.headers(), 'x-forwarded-for': IP } });
+  assert.deepEqual(response.json().data, { booking: true, vipPurchase: false });
+});
+
+for (const scenario of ['disabled', 'other', 'guest', 'admin', 'inactive', 'mismatch', 'ip', 'proxy', 'chain', 'csrf-missing', 'csrf-wrong']) {
+  test(`QA booking isolation: ${scenario}`, async t => {
+    const f = await fixture(t, { env: { ...QA_SDK, ...(scenario === 'disabled' ? { PRIVATE_COMMERCE_PILOT_ENABLED: 'false' } : {}),
+      ...(['proxy', 'chain'].includes(scenario) ? { PRIVATE_COMMERCE_PROXY_IPS: '10.0.0.2' } : {}) },
+      ...(scenario === 'inactive' ? { clientId: null } : {}), ...(scenario === 'admin' ? { roles: ['super_admin'] } : {}),
+      claimsMismatch: scenario === 'mismatch' });
+    const headers = scenario === 'guest' ? {} : f.headers(scenario === 'other' ? OTHER : USER);
+    if (scenario === 'csrf-missing') delete headers['x-csrf-token'];
+    if (scenario === 'csrf-wrong') headers['x-csrf-token'] = 'incorrect';
+    headers['x-forwarded-for'] = scenario === 'chain' ? `${IP}, 198.51.100.2` : IP;
+    const remoteAddress = scenario === 'chain' ? '10.0.0.2' : ['ip', 'proxy'].includes(scenario) ? '198.51.100.2' : IP;
+    const r = await f.app.inject({ method: 'POST', url: '/v1/public/citas/hold', headers, remoteAddress, payload: {} });
+    assert.ok([401, 403].includes(r.statusCode), r.body);
+    assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+  });
+}
+
+test('QA Sale opt-in is independent, default false, and never grants VIP', async t => {
+  assert.equal(resolvePrivateCommerceConfig(QA_SDK).saleEnabled, false);
+  for (const env of [{ QA_PRIVATE_COMMERCE_SALE_ENABLED: 'true' }, { ...QA_SDK, QA_PRIVATE_COMMERCE_SALE_ENABLED: 'yes' },
+    { ...QA_SDK, PIXELPAY_ENV: 'live', QA_PRIVATE_COMMERCE_SALE_ENABLED: 'true' }]) assert.throws(() => resolvePrivateCommerceConfig(env));
+  const f = await fixture(t, { env: { ...QA_SDK, QA_PRIVATE_COMMERCE_SALE_ENABLED: 'true' } });
+  for (const url of ['/v1/public/pagos/pixelpay/sale', '/v1/pagos/reservas/pixelpay/sale']) {
+    assert.equal((await f.app.inject({ method: 'POST', url, remoteAddress: IP, headers: f.headers(), payload: {} })).statusCode, 400);
+  }
+  assert.equal((await f.app.inject({ method: 'POST', url: '/v1/cliente/planes/orden', remoteAddress: IP, headers: f.headers(), payload: {} })).statusCode, 403);
+  assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+});
+
+test('QA configuration rejects invalid UUIDs, multiple owners and incompatible proxy trust', () => {
+  const valid = { ...QA_SDK, PRIVATE_COMMERCE_PILOT_ENABLED: 'true', PRIVATE_COMMERCE_USER_IDS: USER, PRIVATE_COMMERCE_IPS: IP };
+  for (const patch of [{ PRIVATE_COMMERCE_USER_IDS: `${USER},${OTHER}` }, { PRIVATE_COMMERCE_USER_IDS: 'google-provider-id' },
+    { PRIVATE_COMMERCE_PROXY_IPS: '10.0.0.2', TRUST_PROXY: 'false' }]) assert.throws(() => resolvePrivateCommerceConfig({ ...valid, ...patch }));
 });

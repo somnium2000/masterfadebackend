@@ -36,6 +36,17 @@ const QA_VIP_PURCHASE_SIMULATION_ROUTES = new Set([
   "POST /v1/cliente/planes/simulator/event",
   "POST /v1/cliente/planes/pago-intent/:id_payment_intent/estado",
 ]);
+// AM: Exact booking routes only; a booking permission never implies a provider charge.
+const QA_PILOT_BOOKING_ROUTES = new Set([
+  ...[...QA_PAYMENT_SIMULATION_ROUTES].filter(route => !route.endsWith('/simulator/event')),
+  'POST /v1/public/pagos/pixelpay/status',
+  'POST /v1/pagos/reservas/pixelpay/status',
+  'POST /v1/cliente/planes/pago-intent/:id_payment_intent/estado',
+]);
+const QA_PILOT_SALE_ROUTES = new Set([
+  'POST /v1/public/pagos/pixelpay/sale',
+  'POST /v1/pagos/reservas/pixelpay/sale',
+]);
 const normalizeIp = value => {
   const text = String(value || "").trim();
   const ip = text.startsWith("::ffff:") ? text.slice(7) : text;
@@ -44,6 +55,15 @@ const normalizeIp = value => {
 };
 
 export function resolvePrivateCommerceConfig(env) {
+  const normalized = name => String(env[name] || '').trim().toLowerCase();
+  const qaCapabilities = normalized('ENTORNO') === 'qa';
+  const qaSandbox = qaCapabilities && normalized('NODE_ENV') === 'development'
+    && normalized('PAYMENT_PROVIDER') === 'pixelpay' && normalized('PIXELPAY_IMPLEMENTATION') === 'sdk'
+    && normalized('PIXELPAY_ENV') === 'sandbox';
+  const saleFlag = String(env.QA_PRIVATE_COMMERCE_SALE_ENABLED || 'false').trim();
+  if (!['true', 'false'].includes(saleFlag) || (saleFlag === 'true' && !qaSandbox)) {
+    throw new Error('QA_PRIVATE_COMMERCE_SALE_ENABLED requiere QA development y PixelPay SDK Sandbox.');
+  }
   const flag = String(env.PRIVATE_COMMERCE_PILOT_ENABLED || "false").trim();
   if (!["true", "false"].includes(flag)) throw new Error("PRIVATE_COMMERCE_PILOT_ENABLED invalido. Usa true o false.");
   const list = name => String(env[name] || "").split(",").map(x => x.trim()).filter(Boolean);
@@ -57,7 +77,7 @@ export function resolvePrivateCommerceConfig(env) {
   if (flag === "true" && proxies.length && !["true", "1", "yes", "on"].includes(String(env.TRUST_PROXY).trim().toLowerCase())) {
     throw new Error("El piloto privado con proxy requiere TRUST_PROXY activo y un unico proxy que sobrescriba X-Forwarded-For.");
   }
-  return Object.freeze({ enabled: flag === "true", userIds: userIds.map(id => id.toLowerCase()), ips: ips.map(normalizeIp), proxies: proxies.map(normalizeIp) });
+  return Object.freeze({ enabled: flag === "true", qaCapabilities, saleEnabled: saleFlag === 'true', userIds: userIds.map(id => id.toLowerCase()), ips: ips.map(normalizeIp), proxies: proxies.map(normalizeIp) });
 }
 
 export function isPrivateCommerceRoute(method, route) {
@@ -115,6 +135,13 @@ export default fp(async function privateCommerce(app) {
     if (qaVipPurchaseSimulationEnabled
       && isQaVipPurchaseSimulationRoute(request.method, request.routeOptions.url)) return;
     if (await eligible(request, reply)) {
+      if (config.qaCapabilities) {
+        const route = `${request.method} ${String(request.routeOptions.url || '').replace(/\/$/, '')}`;
+        if (!QA_PILOT_BOOKING_ROUTES.has(route)
+          && !(config.saleEnabled && QA_PILOT_SALE_ROUTES.has(route))) {
+          return sendError(reply, 403, 'Operacion comercial no disponible.', { code: 'PRIVATE_COMMERCE_RESTRICTED' });
+        }
+      }
       // AM: Public booking now uses a session too; keep it protected against cross-site mutations.
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)
         && (!request.cookies?.mf_csrf || request.cookies.mf_csrf !== request.headers["x-csrf-token"])) {
@@ -131,6 +158,6 @@ export default fp(async function privateCommerce(app) {
     }
     const allowed = await eligible(request, reply);
     if (reply.sent) return;
-    return { ok: true, data: { booking: allowed, vipPurchase: allowed } };
+    return { ok: true, data: { booking: allowed, vipPurchase: config.qaCapabilities ? false : allowed } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });
