@@ -755,6 +755,7 @@ test("diagnostico SDK distingue parse fallido sin exponer la excepcion", async (
 });
 
 test("SDK conserva solo response_code de formato seguro y nunca response_reason", async (t) => {
+  const paymentAttemptId = "aabbccdd-2222-4333-8444-555555555555";
   for (const scenario of [
     { name: "codigo alfanumerico oficial", responseCode: "05", expected: "05" },
     { name: "codigo desconocido pero seguro", responseCode: "N7", expected: "N7" },
@@ -774,7 +775,9 @@ test("SDK conserva solo response_code de formato seguro y nunca response_reason"
           }),
         }),
       });
-      const result = await makeProvider(fake).sale(saleInput);
+      const result = await makeProvider(fake).sale(saleInput, { paymentAttemptId });
+      assert.equal(result.paymentAttemptId, paymentAttemptId);
+      assert.equal(result.diagnostics.paymentAttemptId, paymentAttemptId);
       assert.equal(result.diagnostics.providerResponseCode, scenario.expected);
       assert.equal(JSON.stringify(result.diagnostics).includes("response_reason"), false);
       assert.doesNotMatch(JSON.stringify(result.diagnostics), new RegExp(SECRET));
