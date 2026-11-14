@@ -2238,6 +2238,79 @@ export async function reconcileMembershipPixelPayStatus(app, {
   }
 }
 
+export async function readMembershipSimulatedPaymentStatus(client, {
+  idPaymentIntent,
+  clienteId,
+} = {}) {
+  const safeIntentId = normalizeText(idPaymentIntent);
+  const safeClienteId = normalizeText(clienteId);
+  if (!safeIntentId || !safeClienteId) {
+    throw new AppError(400, "El intent y el cliente son obligatorios", {
+      code: "MEMBERSHIP_SIMULATED_STATUS_INVALID_INPUT",
+    });
+  }
+
+  const { rows } = await client.query(
+    `
+      SELECT pi.id_intent, pi.origen_pago_codigo, pi.estado_intent_codigo,
+             pp.codigo AS provider_code, mpo.id_cliente, mpo.estado_orden_codigo,
+             mpo.id_suscripcion
+      FROM public.payment_intents pi
+      JOIN public.membership_purchase_orders mpo
+        ON mpo.id_order = pi.id_membership_order
+      JOIN public.payment_providers pp
+        ON pp.id_provider = pi.id_provider
+      WHERE pi.id_intent = $1::uuid
+      LIMIT 1
+    `,
+    [safeIntentId]
+  );
+  const intent = rows?.[0] ?? null;
+  if (!intent) {
+    throw new AppError(404, "Intent de pago no encontrado", {
+      code: "MEMBERSHIP_PAYMENT_INTENT_NOT_FOUND",
+    });
+  }
+  if (normalizeText(intent.id_cliente) !== safeClienteId) {
+    throw new AppError(403, "La orden de membresia no pertenece al cliente autenticado", {
+      code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+    });
+  }
+  if (normalizeText(intent.origen_pago_codigo).toLowerCase() !== "membership"
+    || normalizeText(intent.provider_code).toLowerCase() !== "todopago") {
+    throw new AppError(409, "El intent no pertenece al simulador de membresias", {
+      code: "MEMBERSHIP_SIMULATED_STATUS_PROVIDER_MISMATCH",
+    });
+  }
+
+  const intentState = normalizeText(intent.estado_intent_codigo).toLowerCase();
+  const orderState = normalizeText(intent.estado_orden_codigo).toLowerCase();
+  if (intentState === "confirmado" && orderState === "pagada" && intent.id_suscripcion) {
+    return {
+      normalized_status: "PAGADO",
+      estado_intent_codigo: intentState,
+      id_suscripcion: intent.id_suscripcion,
+      provider: "todopago",
+      simulated: true,
+    };
+  }
+  if (["fallido", "cancelado", "cancelada"].includes(intentState)
+    || ["fallida", "cancelada"].includes(orderState)) {
+    return {
+      normalized_status: "RECHAZADO",
+      estado_intent_codigo: intentState,
+      provider: "todopago",
+      simulated: true,
+    };
+  }
+  return {
+    normalized_status: "PENDIENTE",
+    estado_intent_codigo: intentState,
+    provider: "todopago",
+    simulated: true,
+  };
+}
+
 async function persistVerifiedMembershipPixelPayEvidence(app, {
   intent,
   saleResult,
@@ -2584,8 +2657,10 @@ export async function processMembershipSimulatorEvent(client, {
     normalizeText(serverContext?.paymentProvider).toLowerCase() === "todopago"
     && normalizeText(serverContext?.mode).toLowerCase() === "preprod_simulated"
     && serverContext?.simulatedEnabled === true
-    && serverContext?.explicitlyEnabled === true
-    && ["development", "test"].includes(normalizeText(serverContext?.nodeEnv).toLowerCase())
+    && serverContext?.qaPaymentSimulationEnabled === true
+    && serverContext?.membershipSimulatorEnabled === true
+    && serverContext?.vipPurchaseSimulationEnabled === true
+    && normalizeText(serverContext?.nodeEnv).toLowerCase() === "development"
   );
   if (!simulatorAllowed) {
     throw new AppError(409, "El simulador de pagos no esta disponible en este entorno", {

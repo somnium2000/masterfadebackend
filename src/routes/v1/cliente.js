@@ -12,6 +12,7 @@ import {
   createMembershipOrderPaymentIntent,
   processMembershipPixelPaySale,
   reconcileMembershipPixelPayStatus,
+  readMembershipSimulatedPaymentStatus,
   processMembershipSimulatorEvent,
   cancelMembership,
   cancelMembershipBySubscription,
@@ -1155,11 +1156,7 @@ export default async function clienteRoutes(app) {
     },
     async (request, reply) => {
       if (
-        app.config?.paymentProvider !== "todopago"
-        || app.config?.todoPago?.mode !== "preprod_simulated"
-        || app.config?.todoPago?.simulatedEnabled !== true
-        || !["development", "test"].includes(String(app.config?.nodeEnv || "").toLowerCase())
-        || process.env.MEMBERSHIP_PAYMENT_SIMULATOR_ENABLED !== "true"
+        app.config?.qaVipPurchaseSimulation?.enabled !== true
       ) {
         return sendError(reply, 409, "El simulador de pagos no esta disponible en este entorno.", {
           code: "CLIENTE_MEMBERSHIP_SIMULATOR_DISABLED",
@@ -1183,7 +1180,9 @@ export default async function clienteRoutes(app) {
             paymentProvider: app.config.paymentProvider,
             mode: app.config.todoPago.mode,
             simulatedEnabled: app.config.todoPago.simulatedEnabled,
-            explicitlyEnabled: process.env.MEMBERSHIP_PAYMENT_SIMULATOR_ENABLED === "true",
+            qaPaymentSimulationEnabled: app.config.qaPaymentSimulation?.enabled === true,
+            membershipSimulatorEnabled: app.config.qaVipPurchaseSimulation?.enabled === true,
+            vipPurchaseSimulationEnabled: app.config.qaVipPurchaseSimulation?.enabled === true,
             nodeEnv: app.config.nodeEnv,
           },
         });
@@ -1250,6 +1249,12 @@ export default async function clienteRoutes(app) {
     },
     async (request, reply) => {
       const context = ensureClienteContext(request);
+      if (app.config?.paymentProvider !== "pixelpay") {
+        return sendError(reply, 409, "PixelPay no esta disponible en este entorno.", {
+          code: "MEMBERSHIP_PIXELPAY_DISABLED",
+          requestId: request.id,
+        });
+      }
       if (!request.body?.card || !request.body?.billing) {
         return sendError(reply, 400, "Faltan los datos requeridos para procesar el pago", {
           code: "MEMBERSHIP_PIXELPAY_PAYMENT_DATA_REQUIRED",
@@ -1295,6 +1300,24 @@ export default async function clienteRoutes(app) {
     async (request, reply) => {
       const context = ensureClienteContext(request);
       try {
+        if (app.config?.qaVipPurchaseSimulation?.enabled === true) {
+          const client = await app.db.connect();
+          try {
+            const result = await readMembershipSimulatedPaymentStatus(client, {
+              idPaymentIntent: request.params.id_payment_intent,
+              clienteId: context.clienteId,
+            });
+            return sendOk(reply, result, { requestId: request.id });
+          } finally {
+            client.release();
+          }
+        }
+        if (app.config?.paymentProvider !== "pixelpay") {
+          return sendError(reply, 409, "La consulta de estado de PixelPay no esta disponible.", {
+            code: "MEMBERSHIP_PIXELPAY_DISABLED",
+            requestId: request.id,
+          });
+        }
         const result = await reconcileMembershipPixelPayStatus(app, {
           idPaymentIntent: request.params.id_payment_intent,
           clienteId: context.clienteId,
