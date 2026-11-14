@@ -19,6 +19,8 @@ import adminMembresias from "../src/routes/v1/admin/membresias.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { sendError } from "../src/utils/errors.js";
+import { createQaCommerceDiagnostic } from '../src/utils/qaCommerceDiagnostic.js';
+import { validateActiveSession } from '../src/services/securityService.js';
 
 const USER = crypto.randomUUID(), OTHER = crypto.randomUUID();
 const SECRET = crypto.randomBytes(40).toString("hex");
@@ -398,4 +400,93 @@ test('QA configuration rejects invalid UUIDs, multiple owners and incompatible p
   const valid = { ...QA_SDK, PRIVATE_COMMERCE_PILOT_ENABLED: 'true', PRIVATE_COMMERCE_USER_IDS: USER, PRIVATE_COMMERCE_IPS: IP };
   for (const patch of [{ PRIVATE_COMMERCE_USER_IDS: `${USER},${OTHER}` }, { PRIVATE_COMMERCE_USER_IDS: 'google-provider-id' },
     { PRIVATE_COMMERCE_PROXY_IPS: '10.0.0.2', TRUST_PROXY: 'false' }]) assert.throws(() => resolvePrivateCommerceConfig({ ...valid, ...patch }));
+});
+
+test('QA diagnostic: real auth, no response change or session write with pilot disabled', async t => {
+  const f = await fixture(t, { env: { NODE_ENV: 'development', ENTORNO: 'qa', PRIVATE_COMMERCE_PILOT_ENABLED: 'false', PRIVATE_COMMERCE_PROXY_IPS: '10.0.0.2', QA_PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED: 'true', QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL: new Date(Date.now()+60000).toISOString() } });
+  const logs = [], queries = [];
+  f.app.log.info = data => { if (data.event === 'QA_PRIVATE_COMMERCE_PROXY_DIAGNOSTIC') logs.push(data); };
+  const original = f.app.db.query;
+  f.app.db.query = async (sql, params) => { queries.push(sql); return original(sql, params); };
+  const headers = { ...f.headers(), 'x-forwarded-for': IP };
+  const r = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.2', headers });
+  assert.equal(r.statusCode, 200);
+  assert.deepEqual(r.json().data, { booking: false, vipPurchase: false });
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].reason, 'PILOT_DISABLED');
+  assert.equal(logs[0].ipsLength, 2);
+  assert.equal(logs[0].fastifyTrustsPeer, true);
+  assert.equal(logs[0].peerAllowlisted, true);
+  assert.equal(logs[0].clientAllowlisted, true);
+  assert.equal(queries.filter(sql => /UPDATE|INSERT|DELETE/.test(sql)).length, 0);
+  const serialized = JSON.stringify(logs);
+  for (const secret of [IP, '10.0.0.2', USER, OTHER, headers.cookie, SECRET]) assert.ok(!serialized.includes(secret));
+  assert.equal(f.state.business, 0);
+  const bad = await f.app.inject({ url: '/v1/commerce/eligibility', headers: { cookie: 'mf_session=invalid' } });
+  assert.deepEqual(bad.json().data, { booking: false, vipPurchase: false });
+  assert.equal(logs.length, 1);
+});
+
+for (const scope of [{}, { NODE_ENV: 'production', ENTORNO: 'qa' }, { NODE_ENV: 'development', ENTORNO: 'production' }]) {
+  test('diagnostic off or outside QA emits nothing '+JSON.stringify(scope), async t => {
+    const f = await fixture(t, { env: { PRIVATE_COMMERCE_PILOT_ENABLED: 'false', QA_PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED: Object.keys(scope).length ? 'true' : 'false', QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL: new Date(Date.now()+60000).toISOString(), ...scope } });
+    const logs=[]; f.app.log.info = data => { if (data.event === 'QA_PRIVATE_COMMERCE_PROXY_DIAGNOSTIC') logs.push(data); };
+    await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
+    assert.equal(logs.length,0);
+  });
+}
+
+test('diagnostic fixed expiry, restart expiry, cap, concurrency, route scope and no untrusted strings', async () => {
+  let now=1000000, tick=0, calls=0; const logs=[];
+  const env={NODE_ENV:'development', ENTORNO:'qa', QA_PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED:'true', QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL:new Date(now+60000).toISOString()};
+  const app={initialConfig:{trustProxy:buildTrustProxy('true')}, log:{info:x=>logs.push(x)}, authenticate:async (r,_reply,opts)=>{ assert.equal(opts.readOnly,true); calls++; r.auth={sub:USER}; }};
+  const config={ips:[IP],proxies:['10.0.0.2']};
+  const request={method:'GET',routeOptions:{url:'/v1/commerce/eligibility'},cookies:{mf_session:'synthetic'},raw:{socket:{remoteAddress:'10.0.0.2'}},ip:IP,ips:['10.0.0.2',IP], id:USER};
+  const create=()=>createQaCommerceDiagnostic(app,config,env,()=>now,()=>tick);
+  const diag=create();
+  await diag({...request,method:'POST'},'ELIGIBLE');
+  await diag({...request,routeOptions:{url:'/other'}},'ELIGIBLE');
+  await diag({...request,cookies:{}},'ELIGIBLE');
+  assert.equal(calls,0);
+  await Promise.all(Array.from({length:10},()=>diag(request,'untrusted-secret')));
+  assert.equal(calls,5); assert.equal(logs.length,5);
+  assert.equal(logs[0].requestId,'[request masked]'); assert.equal(logs[0].reason,'UNKNOWN');
+  now+=60000; await create()(request,'ELIGIBLE'); assert.equal(calls,5);
+  now=1000000; const monotonicDiag=create(); tick=600000; await monotonicDiag(request,'ELIGIBLE'); assert.equal(calls,5);
+  tick=0; env.QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL=new Date(now+600001).toISOString(); await create()(request,'ELIGIBLE'); assert.equal(calls,5);
+  for (const scope of [{NODE_ENV:'production',ENTORNO:'qa'},{NODE_ENV:'development',ENTORNO:'production'}]) {
+    env.QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL=new Date(now+60000).toISOString();
+    await createQaCommerceDiagnostic(app,config,{...env,...scope},()=>now,()=>tick)(request,'ELIGIBLE');
+  }
+  assert.equal(calls,5);
+});
+
+for (const mode of ['active','expired','idle','revoked']) test('diagnostic read-only session validator: '+mode, async t => {
+  const f=await fixture(t); const sqls=[];
+  f.app.db.query=async sql=> {sqls.push(sql); return {rows:[{estado:mode==='revoked'?'revocada':'activa', ultimo_uso_at:new Date(mode==='idle'?0:Date.now()),expira_at:new Date(mode==='expired'?0:Date.now()+60000)}]};};
+  const r=await validateActiveSession(f.app,{log:{warn(){},error(){}}},{id_usuario:USER,sid:USER,jti:OTHER},{readOnly:true});
+  assert.equal(r.ok,mode==='active'); assert.equal(sqls.length,1); assert.match(sqls[0],/SELECT/);
+});
+
+test('QA diagnostic observes real chains and spoofing without granting VIP or Sale', async t => {
+  const f=await fixture(t,{env:{NODE_ENV:'development',ENTORNO:'qa',PRIVATE_COMMERCE_PROXY_IPS:'10.0.0.2',QA_PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED:'true',QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL:new Date(Date.now()+60000).toISOString()}});
+  const logs=[]; f.app.log.info=data=>{if(data.event==='QA_PRIVATE_COMMERCE_PROXY_DIAGNOSTIC')logs.push(data);};
+  for (const [peer,xff,reason,length] of [['10.0.0.2',IP,'ELIGIBLE',2],['10.0.0.2',null,'PROXY_CHAIN_LENGTH',1],['198.51.100.2',IP,'PROXY_PEER_NOT_ALLOWED',1],['10.0.0.2',IP+', 198.51.100.2','CLIENT_IP_NOT_ALLOWED',2]]) {
+    const headers=f.headers(); if(xff)headers['x-forwarded-for']=xff;
+    const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress:peer,headers});
+    assert.deepEqual(r.json().data,{booking:reason==='ELIGIBLE',vipPurchase:false});
+    assert.equal(logs.at(-1).reason,reason); assert.equal(logs.at(-1).ipsLength,length);
+  }
+  for(const url of ['/v1/public/pagos/pixelpay/sale','/v1/cliente/planes/orden']) {
+    const r=await f.app.inject({method:'POST',url,remoteAddress:'10.0.0.2',headers:{...f.headers(),'x-forwarded-for':IP},payload:{}});
+    assert.equal(r.statusCode,403);
+  }
+  assert.equal(logs.length,4); assert.equal(f.state.business,0); assert.equal(f.state.unexpectedSql,0);
+});
+
+test('revoked session emits no QA diagnostic even with pilot off', async t=>{
+  const f=await fixture(t,{revoked:true,env:{NODE_ENV:'development',ENTORNO:'qa',PRIVATE_COMMERCE_PILOT_ENABLED:'false',QA_PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED:'true',QA_PRIVATE_COMMERCE_DIAGNOSTICS_UNTIL:new Date(Date.now()+60000).toISOString()}});
+  const logs=[]; f.app.log.info=data=>{if(data.event==='QA_PRIVATE_COMMERCE_PROXY_DIAGNOSTIC')logs.push(data);};
+  const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
+  assert.deepEqual(r.json().data,{booking:false,vipPurchase:false}); assert.equal(logs.length,0);
 });
