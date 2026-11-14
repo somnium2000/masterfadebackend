@@ -48,6 +48,9 @@ const QA_PILOT_SALE_ROUTES = new Set([
   'POST /v1/public/pagos/pixelpay/sale',
   'POST /v1/pagos/reservas/pixelpay/sale',
 ]);
+// AM: Account-scoped QA booking never grants VIP, simulated payment or provider Sale.
+const QA_SANDBOX_BOOKING_ROUTES = new Set([...QA_PILOT_BOOKING_ROUTES]
+  .filter(route => !route.startsWith('POST /v1/cliente/planes/')));
 const normalizeIp = value => {
   const text = String(value || "").trim();
   const ip = text.startsWith("::ffff:") ? text.slice(7) : text;
@@ -79,6 +82,25 @@ export function resolvePrivateCommerceConfig(env) {
     throw new Error("El piloto privado con proxy requiere TRUST_PROXY activo y un unico proxy que sobrescriba X-Forwarded-For.");
   }
   return Object.freeze({ enabled: flag === "true", qaCapabilities, saleEnabled: saleFlag === 'true', userIds: userIds.map(id => id.toLowerCase()), ips: ips.map(normalizeIp), proxies: proxies.map(normalizeIp) });
+}
+
+export function resolveQaSandboxBookingConfig(env) {
+  const flag = String(env.QA_PRIVATE_COMMERCE_BOOKING_ENABLED || 'false').trim();
+  if (!['true', 'false'].includes(flag)) throw new Error('QA_PRIVATE_COMMERCE_BOOKING_ENABLED invalido.');
+  if (flag === 'false') return Object.freeze({ enabled: false, userIds: [] });
+  const userId = String(env.QA_PRIVATE_COMMERCE_USER_ID || '').trim();
+  const sandboxUrl = value => String(value || '').trim().replace(/\/$/, '') === 'https://pixelpay.dev';
+  if (env.NODE_ENV !== 'development' || env.ENTORNO !== 'qa'
+    || env.PAYMENT_PROVIDER !== 'pixelpay' || env.PIXELPAY_IMPLEMENTATION !== 'sdk'
+    || env.PIXELPAY_ENV !== 'sandbox' || !sandboxUrl(env.PIXELPAY_ENDPOINT) || !sandboxUrl(env.PIXELPAY_APP_URL)
+    || String(env.PRIVATE_COMMERCE_PILOT_ENABLED || 'false').trim() !== 'false'
+    || String(env.QA_PRIVATE_COMMERCE_SALE_ENABLED || 'false').trim() !== 'false'
+    || String(env.ENABLE_QA_PAYMENT_SIMULATION || 'false').trim() !== 'false'
+    || String(env.ENABLE_QA_VIP_PURCHASE_SIMULATION || 'false').trim() !== 'false'
+    || !UUID.test(userId)) {
+    throw new Error('QA booking requiere development/qa, SDK Sandbox, un UUID interno y piloto, Sale y simuladores desactivados.');
+  }
+  return Object.freeze({ enabled: true, userIds: [userId.toLowerCase()] });
 }
 
 export function isPrivateCommerceRoute(method, route) {
@@ -114,16 +136,21 @@ export function privateCommerceIpAllowed(request, config) {
 
 export default fp(async function privateCommerce(app) {
   const config = app.config.privateCommercePilot || resolvePrivateCommerceConfig(process.env);
+  const qaBooking = resolveQaSandboxBookingConfig(process.env);
+  if (qaBooking.enabled && (config.enabled || config.saleEnabled)) throw new Error('QA booking no permite piloto ni Sale activos.');
   const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const qaVipPurchaseSimulationEnabled = app.config.qaVipPurchaseSimulation?.enabled === true;
+  if (qaBooking.enabled && (qaPaymentSimulationEnabled || qaVipPurchaseSimulationEnabled)) {
+    throw new Error('QA booking SDK no permite simuladores.');
+  }
   const verify = app.requireRoles([]);
   const diagnose = createQaCommerceDiagnostic(app, config);
   async function eligible(request, reply, report = () => {}) {
     const deny = code => { report(code); return false; };
-    if (!config.enabled) return deny('PILOT_DISABLED');
+    if (!config.enabled && !qaBooking.enabled) return deny('PILOT_DISABLED');
     if (app.config.adminDataEntryMode) return deny('ADMIN_DATA_ENTRY');
     if (app.config.paymentProvider !== "pixelpay") return deny('PROVIDER_NOT_PIXELPAY');
-    if (!privateCommerceIpAllowed(request, config)) {
+    if (!qaBooking.enabled && !privateCommerceIpAllowed(request, config)) {
       const peer = normalizeIp(request.raw.socket.remoteAddress);
       return deny(!config.proxies.length ? 'DIRECT_IP_NOT_ALLOWED'
         : !config.proxies.includes(peer) ? 'PROXY_PEER_NOT_ALLOWED'
@@ -132,7 +159,7 @@ export default fp(async function privateCommerce(app) {
     if (!request.cookies?.mf_session) return deny('SESSION_MISSING');
     await verify(request, reply);
     if (reply.sent) return deny('AUTH_CONTEXT_REJECTED');
-    if (!config.userIds.includes(String(request.auth?.sub || "").toLowerCase())) return deny('USER_NOT_ALLOWED');
+    if (!(qaBooking.enabled ? qaBooking.userIds : config.userIds).includes(String(request.auth?.sub || "").toLowerCase())) return deny('USER_NOT_ALLOWED');
     if (request.claims?.user?.id_usuario !== request.auth?.sub) return deny('IDENTITY_MISMATCH');
     if (!UUID.test(String(request.claims?.cliente_id || ""))) return deny('CLIENT_NOT_ACTIVE');
     if (request.claims?.roles?.includes("cliente") !== true) return deny('ROLE_NOT_CLIENT');
@@ -146,10 +173,11 @@ export default fp(async function privateCommerce(app) {
     if (qaVipPurchaseSimulationEnabled
       && isQaVipPurchaseSimulationRoute(request.method, request.routeOptions.url)) return;
     if (await eligible(request, reply)) {
-      if (config.qaCapabilities) {
+      if (qaBooking.enabled || config.qaCapabilities) {
         const route = `${request.method} ${String(request.routeOptions.url || '').replace(/\/$/, '')}`;
-        if (!QA_PILOT_BOOKING_ROUTES.has(route)
-          && !(config.saleEnabled && QA_PILOT_SALE_ROUTES.has(route))) {
+        const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route)
+          : QA_PILOT_BOOKING_ROUTES.has(route) || (config.saleEnabled && QA_PILOT_SALE_ROUTES.has(route));
+        if (!routeAllowed) {
           return sendError(reply, 403, 'Operacion comercial no disponible.', { code: 'PRIVATE_COMMERCE_RESTRICTED' });
         }
       }
@@ -172,6 +200,7 @@ export default fp(async function privateCommerce(app) {
     const allowed = await eligible(request, reply, code => { reason = code; });
     await diagnose(request, reason);
     if (reply.sent) return;
-    return { ok: true, data: { booking: allowed, vipPurchase: config.qaCapabilities ? false : allowed } };
+    return { ok: true, data: { booking: allowed, vipPurchase: qaBooking.enabled || config.qaCapabilities ? false : allowed,
+      ...(qaBooking.enabled ? { pixelpaySale: false } : {}) } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });
