@@ -7,6 +7,9 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import pg from "pg";
+import Fastify from "fastify";
+import paymentRecoveryRoutes from "../src/routes/v1/paymentRecovery.js";
+import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { reconcilePixelPayFromDurableApproval, reconcilePixelPayPaid } from "../src/routes/v1/public/pagos.js";
 import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
@@ -109,7 +112,7 @@ async function startIsolatedPostgres({ serverOptions = [] } = {}) {
     // AM: Borrar solo el directorio exclusivo creado por mkdtemp, nunca un cluster existente.
     assert.equal(path.dirname(directory), path.resolve(tmpdir()));
     assert.ok(path.basename(directory).startsWith("masterfade-late-payment-pg-"));
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     cleaned = true;
   };
   try {
@@ -477,6 +480,64 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       assert.equal(await loadDurablePixelPayApproval(client, { idIntent: INTENT, groupRows: [{ expires_at: EXPIRY }] }), null);
       assert.equal((await recover()).manual_reconciliation_required, true);
       assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
+    });
+    await t.test("HTTP con compras suspendidas recupera solo la reserva propia sin proveedor", async (sub) => {
+      await reset();
+      // AM: Ampliar solo el esquema sintetico local para el contexto de identidad autenticada.
+      await client.query(`ALTER TABLE public.clientes ADD COLUMN anonimizado boolean NOT NULL DEFAULT false;
+        ALTER TABLE public.usuarios ADD COLUMN estado_acceso text NOT NULL DEFAULT 'activo';
+        CREATE TABLE app_private.solicitudes_eliminacion_cuenta
+          (id_cliente uuid,id_usuario uuid,id_persona uuid,estado_codigo text);
+        CREATE TABLE public.membership_purchase_orders (id_order uuid PRIMARY KEY,id_cliente uuid,id_usuario uuid);
+        CREATE TABLE public.points_transactions (id_cliente uuid,puntos integer);
+        CREATE FUNCTION public.fn_points_materialize_expired_cycles(uuid) RETURNS integer
+          LANGUAGE sql AS 'SELECT 0';
+        CREATE FUNCTION public.fn_points_get_effective_rule(uuid) RETURNS TABLE(puntos_para_premio integer)
+          LANGUAGE sql AS 'SELECT 10'`);
+      // AM: Puntos fuera de alcance: fixture al tope, sin canje ni ciclos; triggers financieros reales intactos.
+      await client.query("INSERT INTO public.points_transactions VALUES($1,10)", [PERSON]);
+      await client.query("INSERT INTO public.usuarios(id_usuario,id_persona) VALUES($1,$1)", [PERSON]);
+      await client.query("INSERT INTO public.clientes(id_cliente,id_persona,id_usuario) VALUES($1,$1,$1)", [PERSON]);
+      await client.query(`UPDATE public.citas_grupos SET id_cliente_titular=$1,id_usuario_titular=$1,
+        origen_codigo='cliente_autenticado'`, [PERSON]);
+      await client.query("UPDATE public.citas SET id_cliente=$1", [PERSON]);
+      await client.query("UPDATE public.payment_intents SET created_by_usuario_id=$1", [PERSON]);
+      const pool = new pg.Pool({ host: "127.0.0.1", port: client.connectionParameters.port,
+        user: "postgres", password: "", database: "postgres", ssl: false });
+      const app = Fastify();
+      app.decorate("config", { paymentProvider: "pixelpay", adminDataEntryMode: false });
+      app.decorate("db", pool);
+      const session = await installPrivatePilot(app, sub, { userId: PERSON, clientId: PERSON, enabled: false });
+      await app.register(paymentRecoveryRoutes, { prefix: "/v1/cliente/pagos" });
+      const request = (method = "POST") => ({ method, url: `/v1/cliente/pagos/${INTENT}${method === "POST" ? "/conciliar" : ""}`,
+        headers: session.headers, ...(method === "POST" ? { payload: {} } : {}) });
+      try {
+        assert.equal((await app.inject(request("GET"))).json().data.estado_intent_codigo, "pendiente_confirmacion");
+        const recovered = await app.inject(request());
+        assert.equal(recovered.statusCode, 200, recovered.body);
+        assert.equal(recovered.json().data.booking_confirmed, true);
+        assert.equal((await app.inject(request())).json().data.duplicate, true);
+        const read = await app.inject(request("GET"));
+        assert.equal(read.json().data.paid_at, "2026-10-11 19:43:29.880935+00");
+        await assertConfirmedOnce();
+        await client.query("BEGIN");
+        try {
+          await client.query("SELECT pg_advisory_xact_lock(hashtext('masterfade.account_deletion'),hashtext($1::text))", [PERSON]);
+          assert.equal((await app.inject(request())).statusCode, 409);
+        } finally { await client.query("ROLLBACK"); }
+        // AM: El creador de un intent publico puede ser del sistema; la titularidad exige los tres IDs.
+        await client.query("UPDATE public.citas_grupos SET origen_codigo='publico'");
+        await client.query("UPDATE public.payment_intents SET created_by_usuario_id=$1", [BARBER]);
+        assert.equal((await app.inject(request())).json().data.duplicate, true);
+        // AM: Un cambio de propietario posterior al precheck no puede superar el control bajo locks.
+        await assert.rejects(reconcilePixelPayFromDurableApproval(client, {
+          idGrupoCita: GROUP, idIntent: INTENT, titularEmail: EMAIL,
+          owner: { clienteId: PERSON, personaId: PERSON, usuarioId: BARBER },
+        }), { code: "PAYMENT_RECOVERY_ACCOUNT_UNAVAILABLE" });
+        await client.query("UPDATE public.clientes SET anonimizado=TRUE");
+        assert.equal((await app.inject(request())).statusCode, 403);
+        assert.equal((await client.query("SELECT count(*)::int count FROM payments")).rows[0].count, 1);
+      } finally { await app.close(); await pool.end(); }
     });
     assert.equal(provider.saleCalls, 0);
     assert.equal(provider.statusCalls, 0);
