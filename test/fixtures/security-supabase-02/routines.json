@@ -1,0 +1,2138 @@
+[
+  {
+    "schema": "public",
+    "name": "fn_agenda_excepciones_sucursal_bloques_validar_modo",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_agenda_excepciones_sucursal_bloques_validar_modo()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nDECLARE\r\n  v_modo text;\r\nBEGIN\r\n  SELECT e.modo_excepcion_codigo\r\n    INTO v_modo\r\n  FROM public.agenda_excepciones_sucursal e\r\n  WHERE e.id_excepcion_sucursal = NEW.id_excepcion_sucursal;\r\n\r\n  IF v_modo IS NULL THEN\r\n    RAISE EXCEPTION 'La excepción de sucursal no existe.'\r\n      USING ERRCODE = '23503';\r\n  END IF;\r\n\r\n  IF v_modo = 'cierre_total' THEN\r\n    RAISE EXCEPTION 'cierre_total no permite bloques horarios.'\r\n      USING ERRCODE = '23514';\r\n  END IF;\r\n\r\n  IF v_modo NOT IN ('cierre_parcial', 'horario_especial', 'apertura_extra') THEN\r\n    RAISE EXCEPTION 'Modo de excepción de sucursal no soporta bloques horarios.'\r\n      USING ERRCODE = '23514';\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": null,
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "d22b4024d252b463eb1f35d01167830c",
+    "prosrc_sha256": "9f8501dc9b2b3354d421afe0c9da3d773440e2b0f901ae9ebc60bb8f205693c5",
+    "prosrc": "\r\nDECLARE\r\n  v_modo text;\r\nBEGIN\r\n  SELECT e.modo_excepcion_codigo\r\n    INTO v_modo\r\n  FROM public.agenda_excepciones_sucursal e\r\n  WHERE e.id_excepcion_sucursal = NEW.id_excepcion_sucursal;\r\n\r\n  IF v_modo IS NULL THEN\r\n    RAISE EXCEPTION 'La excepción de sucursal no existe.'\r\n      USING ERRCODE = '23503';\r\n  END IF;\r\n\r\n  IF v_modo = 'cierre_total' THEN\r\n    RAISE EXCEPTION 'cierre_total no permite bloques horarios.'\r\n      USING ERRCODE = '23514';\r\n  END IF;\r\n\r\n  IF v_modo NOT IN ('cierre_parcial', 'horario_especial', 'apertura_extra') THEN\r\n    RAISE EXCEPTION 'Modo de excepción de sucursal no soporta bloques horarios.'\r\n      USING ERRCODE = '23514';\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal_bloques",
+          "name": "tr_validar_agenda_excepciones_sucursal_bloques_modo",
+          "definition": "CREATE TRIGGER tr_validar_agenda_excepciones_sucursal_bloques_modo BEFORE INSERT OR UPDATE ON public.agenda_excepciones_sucursal_bloques FOR EACH ROW EXECUTE FUNCTION fn_agenda_excepciones_sucursal_bloques_validar_modo()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal_bloques",
+          "name": "tr_validar_agenda_excepciones_sucursal_bloques_modo",
+          "definition": "CREATE TRIGGER tr_validar_agenda_excepciones_sucursal_bloques_modo BEFORE INSERT OR UPDATE ON public.agenda_excepciones_sucursal_bloques FOR EACH ROW EXECUTE FUNCTION fn_agenda_excepciones_sucursal_bloques_validar_modo()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "b7f1fd429da5b143d2e6f634a6687b77",
+    "prosrc_sha256_lf": "6b65c0c246b2723f1378dd44b848428cfd32df4ecea46a9e27548e4d749a6eef"
+  },
+  {
+    "schema": "public",
+    "name": "fn_agenda_excepciones_sucursal_validar_compatibilidad",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_agenda_excepciones_sucursal_validar_compatibilidad()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nBEGIN\r\n  IF NEW.modo_excepcion_codigo = 'cierre_total' THEN\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal e\r\n      WHERE e.id_sucursal = NEW.id_sucursal\r\n        AND e.fecha = NEW.fecha\r\n        AND e.id_excepcion_sucursal <> NEW.id_excepcion_sucursal\r\n    ) THEN\r\n      RAISE EXCEPTION 'No se puede registrar cierre_total junto con otras excepciones de sucursal para la misma fecha.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  ELSE\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal e\r\n      WHERE e.id_sucursal = NEW.id_sucursal\r\n        AND e.fecha = NEW.fecha\r\n        AND e.id_excepcion_sucursal <> NEW.id_excepcion_sucursal\r\n        AND e.modo_excepcion_codigo = 'cierre_total'\r\n    ) THEN\r\n      RAISE EXCEPTION 'No se puede registrar una excepción de sucursal cuando ya existe cierre_total para la misma fecha.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  END IF;\r\n\r\n  IF NEW.modo_excepcion_codigo IN ('horario_especial', 'apertura_extra') THEN\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal e\r\n      WHERE e.id_sucursal = NEW.id_sucursal\r\n        AND e.fecha = NEW.fecha\r\n        AND e.id_excepcion_sucursal <> NEW.id_excepcion_sucursal\r\n        AND e.modo_excepcion_codigo IN ('horario_especial', 'apertura_extra')\r\n    ) THEN\r\n      RAISE EXCEPTION 'No se puede combinar horario_especial y apertura_extra en la misma sucursal y fecha.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  END IF;\r\n\r\n  IF NEW.modo_excepcion_codigo = 'cierre_total' THEN\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal_bloques b\r\n      WHERE b.id_excepcion_sucursal = NEW.id_excepcion_sucursal\r\n    ) THEN\r\n      RAISE EXCEPTION 'cierre_total no debe tener bloques horarios.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": null,
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "040ab427b3dffd7f271fd977a586ee17",
+    "prosrc_sha256": "cfbeff142c09572f1acefc1dbce56c38a51f9dcf601bc6b3249105dbb071020d",
+    "prosrc": "\r\nBEGIN\r\n  IF NEW.modo_excepcion_codigo = 'cierre_total' THEN\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal e\r\n      WHERE e.id_sucursal = NEW.id_sucursal\r\n        AND e.fecha = NEW.fecha\r\n        AND e.id_excepcion_sucursal <> NEW.id_excepcion_sucursal\r\n    ) THEN\r\n      RAISE EXCEPTION 'No se puede registrar cierre_total junto con otras excepciones de sucursal para la misma fecha.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  ELSE\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal e\r\n      WHERE e.id_sucursal = NEW.id_sucursal\r\n        AND e.fecha = NEW.fecha\r\n        AND e.id_excepcion_sucursal <> NEW.id_excepcion_sucursal\r\n        AND e.modo_excepcion_codigo = 'cierre_total'\r\n    ) THEN\r\n      RAISE EXCEPTION 'No se puede registrar una excepción de sucursal cuando ya existe cierre_total para la misma fecha.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  END IF;\r\n\r\n  IF NEW.modo_excepcion_codigo IN ('horario_especial', 'apertura_extra') THEN\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal e\r\n      WHERE e.id_sucursal = NEW.id_sucursal\r\n        AND e.fecha = NEW.fecha\r\n        AND e.id_excepcion_sucursal <> NEW.id_excepcion_sucursal\r\n        AND e.modo_excepcion_codigo IN ('horario_especial', 'apertura_extra')\r\n    ) THEN\r\n      RAISE EXCEPTION 'No se puede combinar horario_especial y apertura_extra en la misma sucursal y fecha.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  END IF;\r\n\r\n  IF NEW.modo_excepcion_codigo = 'cierre_total' THEN\r\n    IF EXISTS (\r\n      SELECT 1\r\n      FROM public.agenda_excepciones_sucursal_bloques b\r\n      WHERE b.id_excepcion_sucursal = NEW.id_excepcion_sucursal\r\n    ) THEN\r\n      RAISE EXCEPTION 'cierre_total no debe tener bloques horarios.'\r\n        USING ERRCODE = '23514';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal",
+          "name": "tr_validar_agenda_excepciones_sucursal",
+          "definition": "CREATE TRIGGER tr_validar_agenda_excepciones_sucursal BEFORE INSERT OR UPDATE ON public.agenda_excepciones_sucursal FOR EACH ROW EXECUTE FUNCTION fn_agenda_excepciones_sucursal_validar_compatibilidad()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal",
+          "name": "tr_validar_agenda_excepciones_sucursal",
+          "definition": "CREATE TRIGGER tr_validar_agenda_excepciones_sucursal BEFORE INSERT OR UPDATE ON public.agenda_excepciones_sucursal FOR EACH ROW EXECUTE FUNCTION fn_agenda_excepciones_sucursal_validar_compatibilidad()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "fce621274910e0365e87f6ee4b9c7669",
+    "prosrc_sha256_lf": "bdf2bdf87d4e880c669d91f7f328230fbffe0ad1e12d6a11864721a8f9ae04ea"
+  },
+  {
+    "schema": "public",
+    "name": "fn_bloquear_delete_fisico",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_bloquear_delete_fisico()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nBEGIN\r\n  RAISE EXCEPTION\r\n    USING ERRCODE = 'P0001',\r\n          MESSAGE = format(\r\n            'DELETE físico bloqueado en %I. Use inactivación o borrado lógico.',\r\n            TG_TABLE_NAME\r\n          );\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "47f244622d8cbee96ea778ae4421453b",
+    "prosrc_sha256": "aec06cdff85c5dcdbbb0e0b2459b27cf4953f87367d92c6e80abb95898e90f5e",
+    "prosrc": "\r\nBEGIN\r\n  RAISE EXCEPTION\r\n    USING ERRCODE = 'P0001',\r\n          MESSAGE = format(\r\n            'DELETE físico bloqueado en %I. Use inactivación o borrado lógico.',\r\n            TG_TABLE_NAME\r\n          );\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "correos",
+          "name": "trg_bloquear_delete_correos",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_correos BEFORE DELETE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "trg_bloquear_delete_personas",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_personas BEFORE DELETE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "usuarios",
+          "name": "trg_bloquear_delete_usuarios",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_usuarios BEFORE DELETE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "trg_bloquear_delete_roles_usuarios",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_roles_usuarios BEFORE DELETE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "trg_bloquear_delete_empleados",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_empleados BEFORE DELETE ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "correos",
+          "name": "trg_bloquear_delete_correos",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_correos BEFORE DELETE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "trg_bloquear_delete_personas",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_personas BEFORE DELETE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "usuarios",
+          "name": "trg_bloquear_delete_usuarios",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_usuarios BEFORE DELETE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "trg_bloquear_delete_empleados",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_empleados BEFORE DELETE ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        },
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "trg_bloquear_delete_roles_usuarios",
+          "definition": "CREATE TRIGGER trg_bloquear_delete_roles_usuarios BEFORE DELETE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "4dc9aadcf54d803079c7a6d07f44c8e2",
+    "prosrc_sha256_lf": "0a7e2b11b277615b1dc344d422d7eed5af4437a552b19259c4dd2f89a948c665"
+  },
+  {
+    "schema": "public",
+    "name": "fn_bloquear_persona_cliente_empleado",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_bloquear_persona_cliente_empleado()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  IF TG_TABLE_NAME = 'empleados' THEN\n    IF EXISTS (\n      SELECT 1\n      FROM public.clientes c\n      WHERE c.id_persona = NEW.id_persona\n        AND c.deleted_at IS NULL\n    ) THEN\n      RAISE EXCEPTION 'La persona ya existe como cliente y no puede crearse como empleado';\n    END IF;\n  ELSIF TG_TABLE_NAME = 'clientes' THEN\n    IF EXISTS (\n      SELECT 1\n      FROM public.empleados e\n      WHERE e.id_persona = NEW.id_persona\n        AND e.deleted_at IS NULL\n    ) THEN\n      RAISE EXCEPTION 'La persona ya existe como empleado y no puede crearse como cliente';\n    END IF;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "56b7d42510a2fae394a7f810566f7428",
+    "prosrc_sha256": "12c56a89ccbef7ba0086fb1c7787705cbcc1a13c7807307991e393a8fdc922a1",
+    "prosrc": "\nBEGIN\n  IF TG_TABLE_NAME = 'empleados' THEN\n    IF EXISTS (\n      SELECT 1\n      FROM public.clientes c\n      WHERE c.id_persona = NEW.id_persona\n        AND c.deleted_at IS NULL\n    ) THEN\n      RAISE EXCEPTION 'La persona ya existe como cliente y no puede crearse como empleado';\n    END IF;\n  ELSIF TG_TABLE_NAME = 'clientes' THEN\n    IF EXISTS (\n      SELECT 1\n      FROM public.empleados e\n      WHERE e.id_persona = NEW.id_persona\n        AND e.deleted_at IS NULL\n    ) THEN\n      RAISE EXCEPTION 'La persona ya existe como empleado y no puede crearse como cliente';\n    END IF;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "clientes",
+          "name": "trg_bloquear_persona_empleado_en_clientes",
+          "definition": "CREATE TRIGGER trg_bloquear_persona_empleado_en_clientes BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.clientes FOR EACH ROW WHEN ((new.deleted_at IS NULL)) EXECUTE FUNCTION fn_bloquear_persona_cliente_empleado()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "trg_bloquear_persona_cliente_en_empleados",
+          "definition": "CREATE TRIGGER trg_bloquear_persona_cliente_en_empleados BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.empleados FOR EACH ROW WHEN ((new.deleted_at IS NULL)) EXECUTE FUNCTION fn_bloquear_persona_cliente_empleado()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "trg_bloquear_persona_cliente_en_empleados",
+          "definition": "CREATE TRIGGER trg_bloquear_persona_cliente_en_empleados BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.empleados FOR EACH ROW WHEN ((new.deleted_at IS NULL)) EXECUTE FUNCTION fn_bloquear_persona_cliente_empleado()"
+        },
+        {
+          "schema": "public",
+          "table": "clientes",
+          "name": "trg_bloquear_persona_empleado_en_clientes",
+          "definition": "CREATE TRIGGER trg_bloquear_persona_empleado_en_clientes BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.clientes FOR EACH ROW WHEN ((new.deleted_at IS NULL)) EXECUTE FUNCTION fn_bloquear_persona_cliente_empleado()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "56b7d42510a2fae394a7f810566f7428",
+    "prosrc_sha256_lf": "12c56a89ccbef7ba0086fb1c7787705cbcc1a13c7807307991e393a8fdc922a1"
+  },
+  {
+    "schema": "public",
+    "name": "fn_citas_grupos_set_defaults",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_citas_grupos_set_defaults()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  IF NEW.id_grupo_cita IS NULL THEN\n    NEW.id_grupo_cita := gen_random_uuid();\n  END IF;\n\n  IF NEW.codigo_reserva IS NULL OR btrim(NEW.codigo_reserva) = '' THEN\n    NEW.codigo_reserva :=\n      'MF-RSV-' ||\n      to_char(COALESCE(NEW.created_at, now()), 'YYYYMMDD') ||\n      '-' ||\n      upper(left(replace(NEW.id_grupo_cita::text, '-', ''), 8));\n  END IF;\n\n  IF NEW.origen_codigo IS NULL OR btrim(NEW.origen_codigo) = '' THEN\n    NEW.origen_codigo := 'publico';\n  END IF;\n\n  IF NEW.total_hnl IS NULL THEN\n    NEW.total_hnl := 0;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "30442740a082a123e54e69c3784d24db",
+    "prosrc_sha256": "8d1c7abb8f2433d852394989928a66581c205cf31df596545440f5f40da31182",
+    "prosrc": "\nBEGIN\n  IF NEW.id_grupo_cita IS NULL THEN\n    NEW.id_grupo_cita := gen_random_uuid();\n  END IF;\n\n  IF NEW.codigo_reserva IS NULL OR btrim(NEW.codigo_reserva) = '' THEN\n    NEW.codigo_reserva :=\n      'MF-RSV-' ||\n      to_char(COALESCE(NEW.created_at, now()), 'YYYYMMDD') ||\n      '-' ||\n      upper(left(replace(NEW.id_grupo_cita::text, '-', ''), 8));\n  END IF;\n\n  IF NEW.origen_codigo IS NULL OR btrim(NEW.origen_codigo) = '' THEN\n    NEW.origen_codigo := 'publico';\n  END IF;\n\n  IF NEW.total_hnl IS NULL THEN\n    NEW.total_hnl := 0;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "citas_grupos",
+          "name": "tr_citas_grupos_set_defaults",
+          "definition": "CREATE TRIGGER tr_citas_grupos_set_defaults BEFORE INSERT ON public.citas_grupos FOR EACH ROW EXECUTE FUNCTION fn_citas_grupos_set_defaults()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "citas_grupos",
+          "name": "tr_citas_grupos_set_defaults",
+          "definition": "CREATE TRIGGER tr_citas_grupos_set_defaults BEFORE INSERT ON public.citas_grupos FOR EACH ROW EXECUTE FUNCTION fn_citas_grupos_set_defaults()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "30442740a082a123e54e69c3784d24db",
+    "prosrc_sha256_lf": "8d1c7abb8f2433d852394989928a66581c205cf31df596545440f5f40da31182"
+  },
+  {
+    "schema": "public",
+    "name": "fn_citas_integrantes_set_updated_at",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_citas_integrantes_set_updated_at()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261",
+    "prosrc": "\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "citas_integrantes",
+          "name": "tr_citas_integrantes_set_updated_at",
+          "definition": "CREATE TRIGGER tr_citas_integrantes_set_updated_at BEFORE UPDATE ON public.citas_integrantes FOR EACH ROW EXECUTE FUNCTION fn_citas_integrantes_set_updated_at()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "citas_integrantes",
+          "name": "tr_citas_integrantes_set_updated_at",
+          "definition": "CREATE TRIGGER tr_citas_integrantes_set_updated_at BEFORE UPDATE ON public.citas_integrantes FOR EACH ROW EXECUTE FUNCTION fn_citas_integrantes_set_updated_at()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256_lf": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261"
+  },
+  {
+    "schema": "public",
+    "name": "fn_citas_integrantes_validate_limits",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_citas_integrantes_validate_limits()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_total_integrantes integer;\n  v_total_acompanantes integer;\nBEGIN\n  SELECT COUNT(*)\n  INTO v_total_integrantes\n  FROM public.citas_integrantes ci\n  WHERE ci.id_grupo_cita = NEW.id_grupo_cita\n    AND ci.id_cita_integrante <> NEW.id_cita_integrante;\n\n  IF v_total_integrantes >= 5 THEN\n    RAISE EXCEPTION 'MAX_INTEGRANTES_GRUPO_EXCEEDED';\n  END IF;\n\n  IF NEW.rol_integrante_codigo = 'acompanante' THEN\n    SELECT COUNT(*)\n    INTO v_total_acompanantes\n    FROM public.citas_integrantes ci\n    WHERE ci.id_grupo_cita = NEW.id_grupo_cita\n      AND ci.rol_integrante_codigo = 'acompanante'\n      AND ci.id_cita_integrante <> NEW.id_cita_integrante;\n\n    IF v_total_acompanantes >= 4 THEN\n      RAISE EXCEPTION 'MAX_ACOMPANANTES_EXCEEDED';\n    END IF;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "72a2a7e18406fe35f707809efc9d6445",
+    "prosrc_sha256": "3e8387b1dcbd356312c9e7bc0af58e45b75e1dd3aa133820b29c7a667ac5555b",
+    "prosrc": "\nDECLARE\n  v_total_integrantes integer;\n  v_total_acompanantes integer;\nBEGIN\n  SELECT COUNT(*)\n  INTO v_total_integrantes\n  FROM public.citas_integrantes ci\n  WHERE ci.id_grupo_cita = NEW.id_grupo_cita\n    AND ci.id_cita_integrante <> NEW.id_cita_integrante;\n\n  IF v_total_integrantes >= 5 THEN\n    RAISE EXCEPTION 'MAX_INTEGRANTES_GRUPO_EXCEEDED';\n  END IF;\n\n  IF NEW.rol_integrante_codigo = 'acompanante' THEN\n    SELECT COUNT(*)\n    INTO v_total_acompanantes\n    FROM public.citas_integrantes ci\n    WHERE ci.id_grupo_cita = NEW.id_grupo_cita\n      AND ci.rol_integrante_codigo = 'acompanante'\n      AND ci.id_cita_integrante <> NEW.id_cita_integrante;\n\n    IF v_total_acompanantes >= 4 THEN\n      RAISE EXCEPTION 'MAX_ACOMPANANTES_EXCEEDED';\n    END IF;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "citas_integrantes",
+          "name": "tr_citas_integrantes_validate_limits",
+          "definition": "CREATE TRIGGER tr_citas_integrantes_validate_limits BEFORE INSERT OR UPDATE ON public.citas_integrantes FOR EACH ROW EXECUTE FUNCTION fn_citas_integrantes_validate_limits()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "citas_integrantes",
+          "name": "tr_citas_integrantes_validate_limits",
+          "definition": "CREATE TRIGGER tr_citas_integrantes_validate_limits BEFORE INSERT OR UPDATE ON public.citas_integrantes FOR EACH ROW EXECUTE FUNCTION fn_citas_integrantes_validate_limits()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "72a2a7e18406fe35f707809efc9d6445",
+    "prosrc_sha256_lf": "3e8387b1dcbd356312c9e7bc0af58e45b75e1dd3aa133820b29c7a667ac5555b"
+  },
+  {
+    "schema": "public",
+    "name": "fn_citas_set_integrante_from_legacy",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_citas_set_integrante_from_legacy()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_id_cita_integrante uuid;\n  v_id_usuario uuid;\nBEGIN\n  IF NEW.id_cita_integrante IS NOT NULL THEN\n    RETURN NEW;\n  END IF;\n\n  IF NEW.id_grupo_cita IS NULL OR NEW.orden_integrante IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT ci.id_cita_integrante\n  INTO v_id_cita_integrante\n  FROM public.citas_integrantes ci\n  WHERE ci.id_grupo_cita = NEW.id_grupo_cita\n    AND ci.orden_integrante = NEW.orden_integrante\n  LIMIT 1;\n\n  IF v_id_cita_integrante IS NOT NULL THEN\n    NEW.id_cita_integrante := v_id_cita_integrante;\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(\n    (\n      SELECT cl.id_usuario\n      FROM public.clientes cl\n      WHERE cl.id_cliente = NEW.id_cliente\n      LIMIT 1\n    ),\n    (\n      SELECT u.id_usuario\n      FROM public.usuarios u\n      WHERE u.id_persona = NEW.id_persona_cliente\n        AND u.deleted_at IS NULL\n        AND u.estado = true\n      ORDER BY u.created_at DESC\n      LIMIT 1\n    )\n  )\n  INTO v_id_usuario;\n\n  INSERT INTO public.citas_integrantes (\n      id_grupo_cita,\n      orden_integrante,\n      rol_integrante_codigo,\n      tipo_cliente_codigo,\n      id_usuario,\n      id_persona,\n      id_cliente,\n      contacto_nombre_snapshot,\n      contacto_email_snapshot,\n      contacto_telefono_snapshot,\n      alias_integrante,\n      created_at,\n      updated_at\n  )\n  VALUES (\n      NEW.id_grupo_cita,\n      NEW.orden_integrante,\n      CASE\n        WHEN NEW.orden_integrante = 1 THEN 'titular'\n        ELSE 'acompanante'\n      END,\n      CASE\n        WHEN NEW.id_cliente IS NOT NULL OR v_id_usuario IS NOT NULL THEN 'autenticado'\n        ELSE 'invitado'\n      END,\n      v_id_usuario,\n      NEW.id_persona_cliente,\n      NEW.id_cliente,\n      COALESCE(\n        NULLIF(btrim(NEW.contacto_nombre), ''),\n        NULLIF(btrim(NEW.alias_integrante), ''),\n        'Cliente'\n      ),\n      NULLIF(lower(btrim(NEW.contacto_email)), ''),\n      NULLIF(btrim(NEW.contacto_telefono), ''),\n      NULLIF(btrim(NEW.alias_integrante), ''),\n      COALESCE(NEW.created_at, now()),\n      now()\n  )\n  ON CONFLICT (id_grupo_cita, orden_integrante)\n  DO UPDATE\n  SET updated_at = public.citas_integrantes.updated_at\n  RETURNING id_cita_integrante\n  INTO v_id_cita_integrante;\n\n  NEW.id_cita_integrante := v_id_cita_integrante;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "41fefd2ea50288d4874e8947cf75f1c5",
+    "prosrc_sha256": "672f35999261263a645c100cb24c94a9de270fc660e5ac368ec14111334730e1",
+    "prosrc": "\nDECLARE\n  v_id_cita_integrante uuid;\n  v_id_usuario uuid;\nBEGIN\n  IF NEW.id_cita_integrante IS NOT NULL THEN\n    RETURN NEW;\n  END IF;\n\n  IF NEW.id_grupo_cita IS NULL OR NEW.orden_integrante IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT ci.id_cita_integrante\n  INTO v_id_cita_integrante\n  FROM public.citas_integrantes ci\n  WHERE ci.id_grupo_cita = NEW.id_grupo_cita\n    AND ci.orden_integrante = NEW.orden_integrante\n  LIMIT 1;\n\n  IF v_id_cita_integrante IS NOT NULL THEN\n    NEW.id_cita_integrante := v_id_cita_integrante;\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(\n    (\n      SELECT cl.id_usuario\n      FROM public.clientes cl\n      WHERE cl.id_cliente = NEW.id_cliente\n      LIMIT 1\n    ),\n    (\n      SELECT u.id_usuario\n      FROM public.usuarios u\n      WHERE u.id_persona = NEW.id_persona_cliente\n        AND u.deleted_at IS NULL\n        AND u.estado = true\n      ORDER BY u.created_at DESC\n      LIMIT 1\n    )\n  )\n  INTO v_id_usuario;\n\n  INSERT INTO public.citas_integrantes (\n      id_grupo_cita,\n      orden_integrante,\n      rol_integrante_codigo,\n      tipo_cliente_codigo,\n      id_usuario,\n      id_persona,\n      id_cliente,\n      contacto_nombre_snapshot,\n      contacto_email_snapshot,\n      contacto_telefono_snapshot,\n      alias_integrante,\n      created_at,\n      updated_at\n  )\n  VALUES (\n      NEW.id_grupo_cita,\n      NEW.orden_integrante,\n      CASE\n        WHEN NEW.orden_integrante = 1 THEN 'titular'\n        ELSE 'acompanante'\n      END,\n      CASE\n        WHEN NEW.id_cliente IS NOT NULL OR v_id_usuario IS NOT NULL THEN 'autenticado'\n        ELSE 'invitado'\n      END,\n      v_id_usuario,\n      NEW.id_persona_cliente,\n      NEW.id_cliente,\n      COALESCE(\n        NULLIF(btrim(NEW.contacto_nombre), ''),\n        NULLIF(btrim(NEW.alias_integrante), ''),\n        'Cliente'\n      ),\n      NULLIF(lower(btrim(NEW.contacto_email)), ''),\n      NULLIF(btrim(NEW.contacto_telefono), ''),\n      NULLIF(btrim(NEW.alias_integrante), ''),\n      COALESCE(NEW.created_at, now()),\n      now()\n  )\n  ON CONFLICT (id_grupo_cita, orden_integrante)\n  DO UPDATE\n  SET updated_at = public.citas_integrantes.updated_at\n  RETURNING id_cita_integrante\n  INTO v_id_cita_integrante;\n\n  NEW.id_cita_integrante := v_id_cita_integrante;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_citas_set_integrante_from_legacy",
+          "definition": "CREATE TRIGGER tr_citas_set_integrante_from_legacy BEFORE INSERT OR UPDATE OF id_cita_integrante, id_grupo_cita, orden_integrante, id_cliente, id_persona_cliente, contacto_nombre, contacto_email, contacto_telefono, alias_integrante ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_citas_set_integrante_from_legacy()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_citas_set_integrante_from_legacy",
+          "definition": "CREATE TRIGGER tr_citas_set_integrante_from_legacy BEFORE INSERT OR UPDATE OF id_cita_integrante, id_grupo_cita, orden_integrante, id_cliente, id_persona_cliente, contacto_nombre, contacto_email, contacto_telefono, alias_integrante ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_citas_set_integrante_from_legacy()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "41fefd2ea50288d4874e8947cf75f1c5",
+    "prosrc_sha256_lf": "672f35999261263a645c100cb24c94a9de270fc660e5ac368ec14111334730e1"
+  },
+  {
+    "schema": "public",
+    "name": "fn_comprobantes_agendamiento_set_defaults",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_comprobantes_agendamiento_set_defaults()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  IF NEW.codigo_comprobante IS NULL OR btrim(NEW.codigo_comprobante) = '' THEN\n    NEW.codigo_comprobante :=\n      'MF-COMP-' ||\n      to_char(COALESCE(NEW.created_at, now()), 'YYYYMMDD') ||\n      '-' ||\n      upper(left(replace(COALESCE(NEW.id_comprobante_agendamiento, gen_random_uuid())::text, '-', ''), 8));\n  END IF;\n\n  NEW.updated_at := now();\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "5823059c60bd5159e094bbda1fa2cafa",
+    "prosrc_sha256": "769afe8dc11b48688db40d0815dea501c0deb516566162d2cef67fff8cdec730",
+    "prosrc": "\nBEGIN\n  IF NEW.codigo_comprobante IS NULL OR btrim(NEW.codigo_comprobante) = '' THEN\n    NEW.codigo_comprobante :=\n      'MF-COMP-' ||\n      to_char(COALESCE(NEW.created_at, now()), 'YYYYMMDD') ||\n      '-' ||\n      upper(left(replace(COALESCE(NEW.id_comprobante_agendamiento, gen_random_uuid())::text, '-', ''), 8));\n  END IF;\n\n  NEW.updated_at := now();\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "comprobantes_agendamiento",
+          "name": "tr_comprobantes_agendamiento_set_defaults",
+          "definition": "CREATE TRIGGER tr_comprobantes_agendamiento_set_defaults BEFORE INSERT OR UPDATE ON public.comprobantes_agendamiento FOR EACH ROW EXECUTE FUNCTION fn_comprobantes_agendamiento_set_defaults()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "comprobantes_agendamiento",
+          "name": "tr_comprobantes_agendamiento_set_defaults",
+          "definition": "CREATE TRIGGER tr_comprobantes_agendamiento_set_defaults BEFORE INSERT OR UPDATE ON public.comprobantes_agendamiento FOR EACH ROW EXECUTE FUNCTION fn_comprobantes_agendamiento_set_defaults()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "5823059c60bd5159e094bbda1fa2cafa",
+    "prosrc_sha256_lf": "769afe8dc11b48688db40d0815dea501c0deb516566162d2cef67fff8cdec730"
+  },
+  {
+    "schema": "public",
+    "name": "fn_comprobantes_destinatarios_set_updated_at",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_comprobantes_destinatarios_set_updated_at()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261",
+    "prosrc": "\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "comprobantes_agendamiento_destinatarios",
+          "name": "tr_comprobantes_destinatarios_set_updated_at",
+          "definition": "CREATE TRIGGER tr_comprobantes_destinatarios_set_updated_at BEFORE UPDATE ON public.comprobantes_agendamiento_destinatarios FOR EACH ROW EXECUTE FUNCTION fn_comprobantes_destinatarios_set_updated_at()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "comprobantes_agendamiento_destinatarios",
+          "name": "tr_comprobantes_destinatarios_set_updated_at",
+          "definition": "CREATE TRIGGER tr_comprobantes_destinatarios_set_updated_at BEFORE UPDATE ON public.comprobantes_agendamiento_destinatarios FOR EACH ROW EXECUTE FUNCTION fn_comprobantes_destinatarios_set_updated_at()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256_lf": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261"
+  },
+  {
+    "schema": "public",
+    "name": "fn_desactivar_tarifas_base_de_servicio",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_desactivar_tarifas_base_de_servicio()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  IF OLD.activo = TRUE AND NEW.activo = FALSE THEN\n    UPDATE public.servicios_tarifas\n    SET\n      activo = FALSE,\n      updated_at = NOW()\n    WHERE id_servicio = NEW.id_servicio\n      AND deleted_at IS NULL\n      AND id_empleado IS NULL\n      AND activo = TRUE;\n  END IF;\n\n  RETURN NULL;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "fc102cad03011adda030e0631f482264",
+    "prosrc_sha256": "1c0697e6424a16df89b5fca55a15f132dbfa137d9ebef8a8b961525abb677f75",
+    "prosrc": "\nBEGIN\n  IF OLD.activo = TRUE AND NEW.activo = FALSE THEN\n    UPDATE public.servicios_tarifas\n    SET\n      activo = FALSE,\n      updated_at = NOW()\n    WHERE id_servicio = NEW.id_servicio\n      AND deleted_at IS NULL\n      AND id_empleado IS NULL\n      AND activo = TRUE;\n  END IF;\n\n  RETURN NULL;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "trg_desactivar_tarifas_base_de_servicio",
+          "definition": "CREATE TRIGGER trg_desactivar_tarifas_base_de_servicio AFTER UPDATE OF activo ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_desactivar_tarifas_base_de_servicio()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "trg_desactivar_tarifas_base_de_servicio",
+          "definition": "CREATE TRIGGER trg_desactivar_tarifas_base_de_servicio AFTER UPDATE OF activo ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_desactivar_tarifas_base_de_servicio()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "fc102cad03011adda030e0631f482264",
+    "prosrc_sha256_lf": "1c0697e6424a16df89b5fca55a15f132dbfa137d9ebef8a8b961525abb677f75"
+  },
+  {
+    "schema": "public",
+    "name": "fn_facturas_set_updated_at",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_facturas_set_updated_at()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261",
+    "prosrc": "\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "facturas",
+          "name": "tr_facturas_set_updated_at",
+          "definition": "CREATE TRIGGER tr_facturas_set_updated_at BEFORE UPDATE ON public.facturas FOR EACH ROW EXECUTE FUNCTION fn_facturas_set_updated_at()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "facturas",
+          "name": "tr_facturas_set_updated_at",
+          "definition": "CREATE TRIGGER tr_facturas_set_updated_at BEFORE UPDATE ON public.facturas FOR EACH ROW EXECUTE FUNCTION fn_facturas_set_updated_at()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256_lf": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261"
+  },
+  {
+    "schema": "public",
+    "name": "fn_guardar_desactivacion_servicio",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_guardar_desactivacion_servicio()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  IF OLD.activo = TRUE AND NEW.activo = FALSE THEN\n\n    IF EXISTS (\n      SELECT 1\n      FROM public.paquetes_detalles pd\n      JOIN public.paquetes p\n        ON p.id_paquete = pd.id_paquete\n      WHERE pd.id_servicio = OLD.id_servicio\n        AND p.deleted_at IS NULL\n        AND p.activo = TRUE\n    ) THEN\n      RAISE EXCEPTION 'No se puede desactivar el servicio porque está ligado a paquetes activos. Debe quitarse primero de esos paquetes.';\n    END IF;\n\n    IF EXISTS (\n      SELECT 1\n      FROM public.points_rule_services prs\n      JOIN public.points_rules pr\n        ON pr.id_rule = prs.id_rule\n      WHERE prs.id_servicio = OLD.id_servicio\n        AND pr.activo = TRUE\n    ) THEN\n      RAISE EXCEPTION 'No se puede desactivar el servicio porque está ligado a reglas activas. Debe quitarse primero de esas reglas.';\n    END IF;\n\n    NEW.agendable := FALSE;\n    NEW.visible_publico := FALSE;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "31abab3e1bdace55a2eaf282ec503d04",
+    "prosrc_sha256": "9b7a18a383d69a9f763204cdc04153c11462c59de911a6fa98a6867a69c471cd",
+    "prosrc": "\nBEGIN\n  IF OLD.activo = TRUE AND NEW.activo = FALSE THEN\n\n    IF EXISTS (\n      SELECT 1\n      FROM public.paquetes_detalles pd\n      JOIN public.paquetes p\n        ON p.id_paquete = pd.id_paquete\n      WHERE pd.id_servicio = OLD.id_servicio\n        AND p.deleted_at IS NULL\n        AND p.activo = TRUE\n    ) THEN\n      RAISE EXCEPTION 'No se puede desactivar el servicio porque está ligado a paquetes activos. Debe quitarse primero de esos paquetes.';\n    END IF;\n\n    IF EXISTS (\n      SELECT 1\n      FROM public.points_rule_services prs\n      JOIN public.points_rules pr\n        ON pr.id_rule = prs.id_rule\n      WHERE prs.id_servicio = OLD.id_servicio\n        AND pr.activo = TRUE\n    ) THEN\n      RAISE EXCEPTION 'No se puede desactivar el servicio porque está ligado a reglas activas. Debe quitarse primero de esas reglas.';\n    END IF;\n\n    NEW.agendable := FALSE;\n    NEW.visible_publico := FALSE;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "trg_guardar_desactivacion_servicio",
+          "definition": "CREATE TRIGGER trg_guardar_desactivacion_servicio BEFORE UPDATE OF activo ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_guardar_desactivacion_servicio()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "trg_guardar_desactivacion_servicio",
+          "definition": "CREATE TRIGGER trg_guardar_desactivacion_servicio BEFORE UPDATE OF activo ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_guardar_desactivacion_servicio()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "31abab3e1bdace55a2eaf282ec503d04",
+    "prosrc_sha256_lf": "9b7a18a383d69a9f763204cdc04153c11462c59de911a6fa98a6867a69c471cd"
+  },
+  {
+    "schema": "public",
+    "name": "fn_marcar_no_show",
+    "args": "integer, integer",
+    "kind": "procedure",
+    "definition": "CREATE PROCEDURE public.fn_marcar_no_show(IN p_minutos integer DEFAULT 10, IN p_limite integer DEFAULT 500)\n    LANGUAGE plpgsql\n    AS $$\nBEGIN\n  WITH objetivos AS (\n    SELECT id_cita\n    FROM citas\n    WHERE estado_cita_codigo IN ('confirmada','en_salon')\n      AND llegada_real_at IS NULL\n      AND inicio_at <= (now() - make_interval(mins => p_minutos))\n      AND deleted_at IS NULL\n    ORDER BY inicio_at ASC\n    LIMIT p_limite\n  )\n  UPDATE citas c\n  SET estado_cita_codigo = 'no_show',\n      no_show_at = now(),\n      updated_at = now()\n  FROM objetivos o\n  WHERE c.id_cita = o.id_cita;\nEND;\n$$;",
+    "source": "database/BD-PG.sql schema-only extraction",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "078aba2a9a1da944b163b1ab1c1b605b",
+    "prosrc_sha256": "75adc2f158a9812ed1f66ea688f81206b3df8f443dc7de1f8ec71502a25bc612",
+    "prosrc": "\nBEGIN\n  WITH objetivos AS (\n    SELECT id_cita\n    FROM citas\n    WHERE estado_cita_codigo IN ('confirmada','en_salon')\n      AND llegada_real_at IS NULL\n      AND inicio_at <= (now() - make_interval(mins => p_minutos))\n      AND deleted_at IS NULL\n    ORDER BY inicio_at ASC\n    LIMIT p_limite\n  )\n  UPDATE citas c\n  SET estado_cita_codigo = 'no_show',\n      no_show_at = now(),\n      updated_at = now()\n  FROM objetivos o\n  WHERE c.id_cita = o.id_cita;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "returns_declaration": null,
+    "prorettype_regtype_snapshot": "void",
+    "prokind_snapshot": "p",
+    "prosrc_md5_lf": "078aba2a9a1da944b163b1ab1c1b605b",
+    "prosrc_sha256_lf": "75adc2f158a9812ed1f66ea688f81206b3df8f443dc7de1f8ec71502a25bc612"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_estado_final_cita",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_estado_final_cita()\n RETURNS text\n LANGUAGE plpgsql\n STABLE\nAS $function$\nDECLARE\n  v_estado text;\nBEGIN\n  SELECT ec.estado_cita_codigo\n  INTO v_estado\n  FROM public.estados_cita ec\n  WHERE lower(trim(ec.estado_cita_codigo)) IN ('completada','atendida','finalizada')\n  ORDER BY\n    CASE lower(trim(ec.estado_cita_codigo))\n      WHEN 'completada' THEN 1\n      WHEN 'atendida' THEN 2\n      WHEN 'finalizada' THEN 3\n      ELSE 99\n    END\n  LIMIT 1;\n\n  IF v_estado IS NULL THEN\n    v_estado := 'completada';\n  END IF;\n\n  RETURN v_estado;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "38b27cac561d41e078a3f53775e4a429",
+    "prosrc_sha256": "807ed45bd07bfbedd23959ceef9323c2d13d9758ff1f0398be8e93428da19135",
+    "prosrc": "\nDECLARE\n  v_estado text;\nBEGIN\n  SELECT ec.estado_cita_codigo\n  INTO v_estado\n  FROM public.estados_cita ec\n  WHERE lower(trim(ec.estado_cita_codigo)) IN ('completada','atendida','finalizada')\n  ORDER BY\n    CASE lower(trim(ec.estado_cita_codigo))\n      WHEN 'completada' THEN 1\n      WHEN 'atendida' THEN 2\n      WHEN 'finalizada' THEN 3\n      ELSE 99\n    END\n  LIMIT 1;\n\n  IF v_estado IS NULL THEN\n    v_estado := 'completada';\n  END IF;\n\n  RETURN v_estado;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "returns_declaration": "text",
+    "prorettype_regtype_snapshot": "text",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "38b27cac561d41e078a3f53775e4a429",
+    "prosrc_sha256_lf": "807ed45bd07bfbedd23959ceef9323c2d13d9758ff1f0398be8e93428da19135"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_get_effective_rule",
+    "args": "uuid",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_get_effective_rule(p_id_sucursal uuid)\n RETURNS TABLE(id_rule uuid, id_sucursal uuid, umbral_monto_hnl numeric, puntos_por_cita integer, puntos_para_premio integer, expiracion_meses integer, activo boolean)\n LANGUAGE sql\n STABLE\nAS $function$\n  SELECT\n    pr.id_rule,\n    pr.id_sucursal,\n    pr.umbral_monto_hnl,\n    pr.puntos_por_cita,\n    pr.puntos_para_premio,\n    pr.expiracion_meses,\n    pr.activo\n  FROM public.points_rules pr\n  WHERE pr.activo IS TRUE\n    AND (pr.id_sucursal = p_id_sucursal OR pr.id_sucursal IS NULL)\n  ORDER BY\n    CASE WHEN pr.id_sucursal = p_id_sucursal THEN 0 ELSE 1 END,\n    pr.updated_at DESC,\n    pr.created_at DESC,\n    pr.id_rule DESC\n  LIMIT 1\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "27b895e6f146655df078882c50a9911b",
+    "prosrc_sha256": "4401fb3bb0e310793e83200a1723bf08d3e66a7ed63b56b2d6b0b20ef539c286",
+    "prosrc": "\n  SELECT\n    pr.id_rule,\n    pr.id_sucursal,\n    pr.umbral_monto_hnl,\n    pr.puntos_por_cita,\n    pr.puntos_para_premio,\n    pr.expiracion_meses,\n    pr.activo\n  FROM public.points_rules pr\n  WHERE pr.activo IS TRUE\n    AND (pr.id_sucursal = p_id_sucursal OR pr.id_sucursal IS NULL)\n  ORDER BY\n    CASE WHEN pr.id_sucursal = p_id_sucursal THEN 0 ELSE 1 END,\n    pr.updated_at DESC,\n    pr.created_at DESC,\n    pr.id_rule DESC\n  LIMIT 1\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "returns_declaration": "TABLE(id_rule uuid, id_sucursal uuid, umbral_monto_hnl numeric, puntos_por_cita integer, puntos_para_premio integer, expiracion_meses integer, activo boolean)",
+    "prorettype_regtype_snapshot": "record",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "27b895e6f146655df078882c50a9911b",
+    "prosrc_sha256_lf": "4401fb3bb0e310793e83200a1723bf08d3e66a7ed63b56b2d6b0b20ef539c286"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_get_or_create_active_cycle",
+    "args": "uuid, integer, timestamp with time zone",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_get_or_create_active_cycle(p_id_cliente uuid, p_expiracion_meses integer, p_anchor_at timestamp with time zone DEFAULT now())\n RETURNS TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_anchor timestamptz;\n  v_inserted public.points_cycles%ROWTYPE;\nBEGIN\n  PERFORM public.fn_points_materialize_expired_cycles(p_id_cliente);\n\n  SELECT pc.id_cycle, pc.primer_acumulado_at, pc.vence_at\n  INTO id_cycle, primer_acumulado_at, vence_at\n  FROM public.points_cycles pc\n  WHERE pc.id_cliente = p_id_cliente\n    AND pc.estado_ciclo_codigo = 'activo'\n    AND pc.vence_at > now()\n  ORDER BY pc.primer_acumulado_at ASC\n  LIMIT 1;\n\n  IF id_cycle IS NOT NULL THEN\n    RETURN NEXT;\n    RETURN;\n  END IF;\n\n  v_anchor := COALESCE(p_anchor_at, now());\n\n  BEGIN\n    INSERT INTO public.points_cycles (\n      id_cliente,\n      primer_acumulado_at,\n      vence_at,\n      estado_ciclo_codigo\n    )\n    VALUES (\n      p_id_cliente,\n      v_anchor,\n      v_anchor + make_interval(months => GREATEST(p_expiracion_meses, 1)),\n      'activo'\n    )\n    RETURNING * INTO v_inserted;\n  EXCEPTION WHEN unique_violation THEN\n    SELECT *\n    INTO v_inserted\n    FROM public.points_cycles\n    WHERE id_cliente = p_id_cliente\n      AND estado_ciclo_codigo = 'activo'\n    ORDER BY primer_acumulado_at ASC\n    LIMIT 1;\n  END;\n\n  id_cycle := v_inserted.id_cycle;\n  primer_acumulado_at := v_inserted.primer_acumulado_at;\n  vence_at := v_inserted.vence_at;\n  RETURN NEXT;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": false,
+    "production_warning": true,
+    "prosrc_md5": "a38d0b9a382ab61dc7468198b6d45229",
+    "prosrc_sha256": "12236f4ccc12cbef1b4cf53e1528372d83f0a9630ad72102d7ee9bd515245c51",
+    "prosrc": "\nDECLARE\n  v_anchor timestamptz;\n  v_inserted public.points_cycles%ROWTYPE;\nBEGIN\n  PERFORM public.fn_points_materialize_expired_cycles(p_id_cliente);\n\n  SELECT pc.id_cycle, pc.primer_acumulado_at, pc.vence_at\n  INTO id_cycle, primer_acumulado_at, vence_at\n  FROM public.points_cycles pc\n  WHERE pc.id_cliente = p_id_cliente\n    AND pc.estado_ciclo_codigo = 'activo'\n    AND pc.vence_at > now()\n  ORDER BY pc.primer_acumulado_at ASC\n  LIMIT 1;\n\n  IF id_cycle IS NOT NULL THEN\n    RETURN NEXT;\n    RETURN;\n  END IF;\n\n  v_anchor := COALESCE(p_anchor_at, now());\n\n  BEGIN\n    INSERT INTO public.points_cycles (\n      id_cliente,\n      primer_acumulado_at,\n      vence_at,\n      estado_ciclo_codigo\n    )\n    VALUES (\n      p_id_cliente,\n      v_anchor,\n      v_anchor + make_interval(months => GREATEST(p_expiracion_meses, 1)),\n      'activo'\n    )\n    RETURNING * INTO v_inserted;\n  EXCEPTION WHEN unique_violation THEN\n    SELECT *\n    INTO v_inserted\n    FROM public.points_cycles\n    WHERE id_cliente = p_id_cliente\n      AND estado_ciclo_codigo = 'activo'\n    ORDER BY primer_acumulado_at ASC\n    LIMIT 1;\n  END;\n\n  id_cycle := v_inserted.id_cycle;\n  primer_acumulado_at := v_inserted.primer_acumulado_at;\n  vence_at := v_inserted.vence_at;\n  RETURN NEXT;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "qa_definition_override": "CREATE OR REPLACE FUNCTION public.fn_points_get_or_create_active_cycle(\n  p_id_cliente uuid, p_expiracion_meses integer, p_anchor_at timestamptz DEFAULT now()\n) RETURNS TABLE(id_cycle uuid, primer_acumulado_at timestamptz, vence_at timestamptz)\nLANGUAGE plpgsql SET search_path = pg_catalog, public AS $function$\nDECLARE\n  v_cycle public.points_cycles%ROWTYPE;\n  v_anchor timestamptz := COALESCE(p_anchor_at, now());\nBEGIN\n  IF p_id_cliente IS NULL OR COALESCE(p_expiracion_meses, 12) <> 12 OR v_anchor > now() THEN\n    RAISE EXCEPTION 'MASTERPUNTOS_CYCLE_ARGUMENT_INVALID' USING ERRCODE = '22023';\n  END IF;\n  PERFORM pg_advisory_xact_lock(hashtext(p_id_cliente::text));\n  PERFORM public.fn_points_materialize_expired_cycles(p_id_cliente);\n  SELECT pc.* INTO v_cycle FROM public.points_cycles pc\n  WHERE pc.id_cliente = p_id_cliente AND pc.estado_ciclo_codigo = 'activo'\n  ORDER BY pc.primer_acumulado_at ASC, pc.id_cycle ASC LIMIT 1 FOR UPDATE OF pc;\n  IF v_cycle.id_cycle IS NOT NULL THEN\n    IF NOT EXISTS (SELECT 1 FROM public.points_transactions pt WHERE pt.id_cycle = v_cycle.id_cycle) THEN\n      -- AM: Un ciclo previo vacio empieza al recibir su primera acreditacion, nunca al reservar.\n      UPDATE public.points_cycles pc\n      SET primer_acumulado_at = v_anchor, vence_at = v_anchor + interval '12 months', updated_at = now()\n      WHERE pc.id_cycle = v_cycle.id_cycle RETURNING pc.* INTO v_cycle;\n    ELSIF v_cycle.vence_at IS NULL THEN\n      RAISE EXCEPTION 'MASTERPUNTOS_HISTORICAL_CYCLE_REVIEW_REQUIRED';\n    END IF;\n  ELSE\n    INSERT INTO public.points_cycles (id_cliente, primer_acumulado_at, vence_at, estado_ciclo_codigo)\n    VALUES (p_id_cliente, v_anchor, v_anchor + interval '12 months', 'activo') RETURNING * INTO v_cycle;\n  END IF;\n  RETURN QUERY SELECT v_cycle.id_cycle, v_cycle.primer_acumulado_at, v_cycle.vence_at;\nEND;\n$function$;",
+    "qa_definition_source": "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql",
+    "qa_prosrc_md5": "00ae108a843def22ce1b8e732e9a75ba",
+    "returns_declaration": "TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)",
+    "prorettype_regtype_snapshot": "record",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "a38d0b9a382ab61dc7468198b6d45229",
+    "prosrc_sha256_lf": "12236f4ccc12cbef1b4cf53e1528372d83f0a9630ad72102d7ee9bd515245c51",
+    "qa_prosrc_md5_lf": "00ae108a843def22ce1b8e732e9a75ba"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_get_or_create_active_cycle",
+    "args": "uuid, timestamp with time zone",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_get_or_create_active_cycle(p_id_cliente uuid, p_anchor_at timestamp with time zone DEFAULT now())\n RETURNS TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_inserted public.points_cycles%ROWTYPE;\nBEGIN\n  SELECT pc.id_cycle, pc.primer_acumulado_at, pc.vence_at\n  INTO id_cycle, primer_acumulado_at, vence_at\n  FROM public.points_cycles pc\n  WHERE pc.id_cliente = p_id_cliente\n    AND pc.estado_ciclo_codigo = 'activo'\n    AND (pc.vence_at IS NULL OR pc.vence_at > now())\n  ORDER BY pc.primer_acumulado_at DESC NULLS LAST\n  LIMIT 1;\n\n  IF id_cycle IS NOT NULL THEN\n    RETURN NEXT;\n    RETURN;\n  END IF;\n\n  INSERT INTO public.points_cycles (\n    id_cliente,\n    primer_acumulado_at,\n    vence_at,\n    estado_ciclo_codigo\n  )\n  VALUES (\n    p_id_cliente,\n    COALESCE(p_anchor_at, now()),\n    NULL,\n    'activo'\n  )\n  RETURNING * INTO v_inserted;\n\n  id_cycle := v_inserted.id_cycle;\n  primer_acumulado_at := v_inserted.primer_acumulado_at;\n  vence_at := v_inserted.vence_at;\n\n  RETURN NEXT;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": false,
+    "production_warning": true,
+    "prosrc_md5": "6be79dd3b72e1d7a05016a613bf4a53d",
+    "prosrc_sha256": "8a32014b243cd8c49ddae8c76457f7faef486ffc124a04be3333aec2d6d72429",
+    "prosrc": "\nDECLARE\n  v_inserted public.points_cycles%ROWTYPE;\nBEGIN\n  SELECT pc.id_cycle, pc.primer_acumulado_at, pc.vence_at\n  INTO id_cycle, primer_acumulado_at, vence_at\n  FROM public.points_cycles pc\n  WHERE pc.id_cliente = p_id_cliente\n    AND pc.estado_ciclo_codigo = 'activo'\n    AND (pc.vence_at IS NULL OR pc.vence_at > now())\n  ORDER BY pc.primer_acumulado_at DESC NULLS LAST\n  LIMIT 1;\n\n  IF id_cycle IS NOT NULL THEN\n    RETURN NEXT;\n    RETURN;\n  END IF;\n\n  INSERT INTO public.points_cycles (\n    id_cliente,\n    primer_acumulado_at,\n    vence_at,\n    estado_ciclo_codigo\n  )\n  VALUES (\n    p_id_cliente,\n    COALESCE(p_anchor_at, now()),\n    NULL,\n    'activo'\n  )\n  RETURNING * INTO v_inserted;\n\n  id_cycle := v_inserted.id_cycle;\n  primer_acumulado_at := v_inserted.primer_acumulado_at;\n  vence_at := v_inserted.vence_at;\n\n  RETURN NEXT;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "qa_definition_override": "CREATE OR REPLACE FUNCTION public.fn_points_get_or_create_active_cycle(\n  p_id_cliente uuid, p_anchor_at timestamptz DEFAULT now()\n) RETURNS TABLE(id_cycle uuid, primer_acumulado_at timestamptz, vence_at timestamptz)\nLANGUAGE sql SET search_path = pg_catalog, public AS $function$\n  SELECT * FROM public.fn_points_get_or_create_active_cycle(p_id_cliente, 12, p_anchor_at)\n$function$;",
+    "qa_definition_source": "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql",
+    "qa_prosrc_md5": "cb533a2e649d94d0c9d3ac78bd310e95",
+    "returns_declaration": "TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)",
+    "prorettype_regtype_snapshot": "record",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "6be79dd3b72e1d7a05016a613bf4a53d",
+    "prosrc_sha256_lf": "8a32014b243cd8c49ddae8c76457f7faef486ffc124a04be3333aec2d6d72429",
+    "qa_prosrc_md5_lf": "cb533a2e649d94d0c9d3ac78bd310e95"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_materialize_expired_cycles",
+    "args": "uuid",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_materialize_expired_cycles(p_id_cliente uuid DEFAULT NULL::uuid)\n RETURNS integer\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_cycle record;\n  v_balance integer;\n  v_total integer := 0;\nBEGIN\n  FOR v_cycle IN\n    SELECT pc.id_cycle, pc.id_cliente, pc.vence_at\n    FROM public.points_cycles pc\n    WHERE pc.estado_ciclo_codigo = 'activo'\n      AND pc.vence_at <= now()\n      AND (p_id_cliente IS NULL OR pc.id_cliente = p_id_cliente)\n  LOOP\n\n    -- FIX CRÍTICO:\n    -- points_transactions.puntos YA tiene el signo aplicado por trigger.\n    -- NO se debe multiplicar otra vez por tipos_puntos.signo.\n    SELECT COALESCE(SUM(pt.puntos), 0)::integer\n    INTO v_balance\n    FROM public.points_transactions pt\n    WHERE pt.id_cycle = v_cycle.id_cycle;\n\n    IF v_balance > 0\n      AND NOT EXISTS (\n        SELECT 1\n        FROM public.points_transactions pt\n        WHERE pt.id_cycle = v_cycle.id_cycle\n          AND pt.tipo_puntos_codigo = 'vencimiento'\n      )\n    THEN\n      INSERT INTO public.points_transactions (\n        id_cliente,\n        id_cycle,\n        tipo_puntos_codigo,\n        puntos,\n        vence_at,\n        motivo,\n        created_at,\n        updated_at\n      )\n      VALUES (\n        v_cycle.id_cliente,\n        v_cycle.id_cycle,\n        'vencimiento',\n        v_balance,\n        v_cycle.vence_at,\n        'Vencimiento automatico del ciclo',\n        now(),\n        now()\n      );\n    END IF;\n\n    UPDATE public.points_cycles\n    SET estado_ciclo_codigo = 'expirado',\n        updated_at = now()\n    WHERE id_cycle = v_cycle.id_cycle\n      AND estado_ciclo_codigo = 'activo';\n\n    v_total := v_total + 1;\n  END LOOP;\n\n  RETURN v_total;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "8da336f77b4f237b0387d8d0cdb66c44",
+    "prosrc_sha256": "de5f2185cb3e7b406422ecfbd7b8b2e0342278fd9f36bb43fa03e3f188f157e3",
+    "prosrc": "\nDECLARE\n  v_cycle record;\n  v_balance integer;\n  v_total integer := 0;\nBEGIN\n  FOR v_cycle IN\n    SELECT pc.id_cycle, pc.id_cliente, pc.vence_at\n    FROM public.points_cycles pc\n    WHERE pc.estado_ciclo_codigo = 'activo'\n      AND pc.vence_at <= now()\n      AND (p_id_cliente IS NULL OR pc.id_cliente = p_id_cliente)\n  LOOP\n\n    -- FIX CRÍTICO:\n    -- points_transactions.puntos YA tiene el signo aplicado por trigger.\n    -- NO se debe multiplicar otra vez por tipos_puntos.signo.\n    SELECT COALESCE(SUM(pt.puntos), 0)::integer\n    INTO v_balance\n    FROM public.points_transactions pt\n    WHERE pt.id_cycle = v_cycle.id_cycle;\n\n    IF v_balance > 0\n      AND NOT EXISTS (\n        SELECT 1\n        FROM public.points_transactions pt\n        WHERE pt.id_cycle = v_cycle.id_cycle\n          AND pt.tipo_puntos_codigo = 'vencimiento'\n      )\n    THEN\n      INSERT INTO public.points_transactions (\n        id_cliente,\n        id_cycle,\n        tipo_puntos_codigo,\n        puntos,\n        vence_at,\n        motivo,\n        created_at,\n        updated_at\n      )\n      VALUES (\n        v_cycle.id_cliente,\n        v_cycle.id_cycle,\n        'vencimiento',\n        v_balance,\n        v_cycle.vence_at,\n        'Vencimiento automatico del ciclo',\n        now(),\n        now()\n      );\n    END IF;\n\n    UPDATE public.points_cycles\n    SET estado_ciclo_codigo = 'expirado',\n        updated_at = now()\n    WHERE id_cycle = v_cycle.id_cycle\n      AND estado_ciclo_codigo = 'activo';\n\n    v_total := v_total + 1;\n  END LOOP;\n\n  RETURN v_total;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "returns_declaration": "integer",
+    "prorettype_regtype_snapshot": "integer",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "8da336f77b4f237b0387d8d0cdb66c44",
+    "prosrc_sha256_lf": "de5f2185cb3e7b406422ecfbd7b8b2e0342278fd9f36bb43fa03e3f188f157e3"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_tx_apply_tipo_sign",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_tx_apply_tipo_sign()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_signo integer;\nBEGIN\n  IF NEW.puntos = 0 THEN\n    RAISE EXCEPTION 'points_transactions.puntos no puede ser 0';\n  END IF;\n\n  SELECT tp.signo\n  INTO v_signo\n  FROM public.tipos_puntos tp\n  WHERE tp.tipo_puntos_codigo = NEW.tipo_puntos_codigo\n  LIMIT 1;\n\n  IF v_signo = 1 THEN\n    NEW.puntos := abs(NEW.puntos);\n  ELSIF v_signo = -1 THEN\n    NEW.puntos := -abs(NEW.puntos);\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "d9e9c315c1cfb417de0945ccc1b91e07",
+    "prosrc_sha256": "33a5e8e6edb373180c7abf58a5702cb2680699e01f8c12b862bcb7db67fd8322",
+    "prosrc": "\nDECLARE\n  v_signo integer;\nBEGIN\n  IF NEW.puntos = 0 THEN\n    RAISE EXCEPTION 'points_transactions.puntos no puede ser 0';\n  END IF;\n\n  SELECT tp.signo\n  INTO v_signo\n  FROM public.tipos_puntos tp\n  WHERE tp.tipo_puntos_codigo = NEW.tipo_puntos_codigo\n  LIMIT 1;\n\n  IF v_signo = 1 THEN\n    NEW.puntos := abs(NEW.puntos);\n  ELSIF v_signo = -1 THEN\n    NEW.puntos := -abs(NEW.puntos);\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "points_transactions",
+          "name": "tr_points_tx_apply_tipo_sign",
+          "definition": "CREATE TRIGGER tr_points_tx_apply_tipo_sign BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, puntos ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_apply_tipo_sign()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "points_transactions",
+          "name": "tr_points_tx_apply_tipo_sign",
+          "definition": "CREATE TRIGGER tr_points_tx_apply_tipo_sign BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, puntos ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_apply_tipo_sign()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "d9e9c315c1cfb417de0945ccc1b91e07",
+    "prosrc_sha256_lf": "33a5e8e6edb373180c7abf58a5702cb2680699e01f8c12b862bcb7db67fd8322"
+  },
+  {
+    "schema": "public",
+    "name": "fn_points_tx_guard_acumular_final",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_points_tx_guard_acumular_final()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_estado_final text;\n  v_estado_cita text;\n  v_orden integer;\n  v_es_canje boolean;\n  v_origen text;\nBEGIN\n  IF NEW.tipo_puntos_codigo <> 'acumular' OR NEW.id_cita IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT public.fn_points_estado_final_cita() INTO v_estado_final;\n\n  SELECT\n    c.estado_cita_codigo,\n    COALESCE(c.orden_integrante, 1),\n    COALESCE(c.es_canje_recompensa, false)\n  INTO v_estado_cita, v_orden, v_es_canje\n  FROM public.citas c\n  WHERE c.id_cita = NEW.id_cita\n    AND c.deleted_at IS NULL\n  LIMIT 1;\n\n  IF NOT FOUND THEN\n    RETURN NEW;\n  END IF;\n\n  IF v_estado_cita IS DISTINCT FROM v_estado_final THEN\n    RETURN NULL;\n  END IF;\n\n  v_origen := COALESCE(\n    NULLIF(trim(NEW.origen_punto_codigo), ''),\n    CASE WHEN v_orden > 1 THEN 'integrante' ELSE 'titular' END\n  );\n\n  NEW.origen_punto_codigo := v_origen;\n\n  IF v_es_canje IS TRUE AND v_origen = 'titular' THEN\n    RETURN NULL;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": false,
+    "production_warning": true,
+    "prosrc_md5": "25e47807f162b12b9de8c87e15a8248c",
+    "prosrc_sha256": "7ae20bb1c22e6d51b48c3e7f7078dd5a4b0f29d85db0f2e1d54363246291a53c",
+    "prosrc": "\nDECLARE\n  v_estado_final text;\n  v_estado_cita text;\n  v_orden integer;\n  v_es_canje boolean;\n  v_origen text;\nBEGIN\n  IF NEW.tipo_puntos_codigo <> 'acumular' OR NEW.id_cita IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT public.fn_points_estado_final_cita() INTO v_estado_final;\n\n  SELECT\n    c.estado_cita_codigo,\n    COALESCE(c.orden_integrante, 1),\n    COALESCE(c.es_canje_recompensa, false)\n  INTO v_estado_cita, v_orden, v_es_canje\n  FROM public.citas c\n  WHERE c.id_cita = NEW.id_cita\n    AND c.deleted_at IS NULL\n  LIMIT 1;\n\n  IF NOT FOUND THEN\n    RETURN NEW;\n  END IF;\n\n  IF v_estado_cita IS DISTINCT FROM v_estado_final THEN\n    RETURN NULL;\n  END IF;\n\n  v_origen := COALESCE(\n    NULLIF(trim(NEW.origen_punto_codigo), ''),\n    CASE WHEN v_orden > 1 THEN 'integrante' ELSE 'titular' END\n  );\n\n  NEW.origen_punto_codigo := v_origen;\n\n  IF v_es_canje IS TRUE AND v_origen = 'titular' THEN\n    RETURN NULL;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "points_transactions",
+          "name": "tr_points_tx_guard_acumular_final",
+          "definition": "CREATE TRIGGER tr_points_tx_guard_acumular_final BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, id_cita, origen_punto_codigo ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_guard_acumular_final()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "points_transactions",
+          "name": "tr_points_tx_guard_acumular_final",
+          "definition": "CREATE TRIGGER tr_points_tx_guard_acumular_final BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, id_cita, origen_punto_codigo ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_guard_acumular_final()"
+        }
+      ]
+    },
+    "qa_definition_override": "CREATE OR REPLACE FUNCTION public.fn_points_tx_guard_acumular_final() RETURNS trigger\nLANGUAGE plpgsql SET search_path = pg_catalog, public AS $function$\nDECLARE v_cita public.citas%ROWTYPE; v_beneficiario uuid;\nBEGIN\n  IF NEW.tipo_puntos_codigo <> 'acumular' OR NEW.id_cita IS NULL THEN RETURN NEW; END IF;\n  SELECT c.* INTO v_cita FROM public.citas c\n  WHERE c.id_cita = NEW.id_cita AND c.deleted_at IS NULL;\n  IF NOT FOUND THEN RETURN NULL; END IF;\n  v_beneficiario := v_cita.id_cliente;\n  IF v_cita.id_grupo_cita IS NOT NULL THEN\n    SELECT CASE WHEN cg.origen_codigo = 'cliente_autenticado' THEN cg.id_cliente_titular ELSE v_cita.id_cliente END\n    INTO v_beneficiario FROM public.citas_grupos cg WHERE cg.id_grupo_cita = v_cita.id_grupo_cita;\n    IF NOT FOUND THEN RETURN NULL; END IF;\n  END IF;\n  IF v_cita.estado_cita_codigo <> 'completada'\n     OR v_beneficiario IS NULL OR v_beneficiario IS DISTINCT FROM NEW.id_cliente\n     OR (COALESCE(v_cita.es_canje_recompensa, false) AND COALESCE(v_cita.orden_integrante, 1) <= 1) THEN\n    RETURN NULL;\n  END IF;\n  NEW.origen_punto_codigo := CASE WHEN COALESCE(v_cita.orden_integrante, 1) > 1 THEN 'integrante' ELSE 'titular' END;\n  NEW.puntos := 1;\n  RETURN NEW;\nEND;\n$function$;",
+    "qa_definition_source": "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql",
+    "qa_prosrc_md5": "4e28d76d27a4ece71cfbac08000354fc",
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "25e47807f162b12b9de8c87e15a8248c",
+    "prosrc_sha256_lf": "7ae20bb1c22e6d51b48c3e7f7078dd5a4b0f29d85db0f2e1d54363246291a53c",
+    "qa_prosrc_md5_lf": "4e28d76d27a4ece71cfbac08000354fc"
+  },
+  {
+    "schema": "public",
+    "name": "fn_prevent_block_protected_correo",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_prevent_block_protected_correo()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nBEGIN\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    JOIN public.usuarios u\r\n      ON u.id_usuario = apu.id_usuario\r\n    WHERE u.id_persona = NEW.id_persona\r\n      AND lower(apu.email) = lower(NEW.direccion_correo::text)\r\n      AND apu.activo IS TRUE\r\n  ) THEN\r\n    IF NEW.deleted_at IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_EMAIL_CANNOT_BE_DELETED';\r\n    END IF;\r\n\r\n    IF NEW.es_principal IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_EMAIL_MUST_BE_PRIMARY';\r\n    END IF;\r\n\r\n    IF NEW.verificado IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_EMAIL_MUST_BE_VERIFIED';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": null,
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "2dc14d8febcbc50350f637def7b83e0f",
+    "prosrc_sha256": "b96eb4e864890d8e576cd4ff493dbf4094453d3ffa89cb3e9b1e5882d1485372",
+    "prosrc": "\r\nBEGIN\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    JOIN public.usuarios u\r\n      ON u.id_usuario = apu.id_usuario\r\n    WHERE u.id_persona = NEW.id_persona\r\n      AND lower(apu.email) = lower(NEW.direccion_correo::text)\r\n      AND apu.activo IS TRUE\r\n  ) THEN\r\n    IF NEW.deleted_at IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_EMAIL_CANNOT_BE_DELETED';\r\n    END IF;\r\n\r\n    IF NEW.es_principal IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_EMAIL_MUST_BE_PRIMARY';\r\n    END IF;\r\n\r\n    IF NEW.verificado IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_EMAIL_MUST_BE_VERIFIED';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "correos",
+          "name": "tr_prevent_block_protected_correo",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_correo BEFORE UPDATE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_correo()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "correos",
+          "name": "tr_prevent_block_protected_correo",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_correo BEFORE UPDATE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_correo()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "08f9e5c93d55cf921e7d32eb3bc5ed15",
+    "prosrc_sha256_lf": "f1ff6f8fe164317ca570217ac8ed0791bae7fddf95e48a8a78fbfe5635dd33ee"
+  },
+  {
+    "schema": "public",
+    "name": "fn_prevent_block_protected_persona",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_prevent_block_protected_persona()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nBEGIN\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    JOIN public.usuarios u\r\n      ON u.id_usuario = apu.id_usuario\r\n    WHERE u.id_persona = NEW.id_persona\r\n      AND apu.activo IS TRUE\r\n  ) THEN\r\n    IF NEW.deleted_at IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_PERSONA_CANNOT_BE_DELETED';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": null,
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "2b06cba7b21221d6789ab333dfbe234e",
+    "prosrc_sha256": "854bbb16e45cc572740392108713fe2ef1ad4624942731be5583bef50848a184",
+    "prosrc": "\r\nBEGIN\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    JOIN public.usuarios u\r\n      ON u.id_usuario = apu.id_usuario\r\n    WHERE u.id_persona = NEW.id_persona\r\n      AND apu.activo IS TRUE\r\n  ) THEN\r\n    IF NEW.deleted_at IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_PERSONA_CANNOT_BE_DELETED';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "tr_prevent_block_protected_persona",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_persona BEFORE UPDATE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_persona()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "tr_prevent_block_protected_persona",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_persona BEFORE UPDATE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_persona()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "cae50000e7933616b7d51470839c056a",
+    "prosrc_sha256_lf": "839ac13971e1ecfe15637c026dc0c71fb0bf3790736febe3512163b4269aa314"
+  },
+  {
+    "schema": "public",
+    "name": "fn_prevent_block_protected_role",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_prevent_block_protected_role()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nDECLARE\r\n  v_super_admin_rol uuid;\r\nBEGIN\r\n  SELECT id_rol\r\n  INTO v_super_admin_rol\r\n  FROM public.roles\r\n  WHERE lower(nombre) = 'super_admin'\r\n  LIMIT 1;\r\n\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    WHERE apu.id_usuario = NEW.id_usuario\r\n      AND apu.activo IS TRUE\r\n  )\r\n  AND NEW.id_rol = v_super_admin_rol THEN\r\n\r\n    IF NEW.activo IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_SUPER_ADMIN_ROLE_CANNOT_BE_DISABLED';\r\n    END IF;\r\n\r\n    IF NEW.id_sucursal IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_SUPER_ADMIN_ROLE_MUST_BE_GLOBAL';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": null,
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "afad426a76d8503ae8753944aaa978ad",
+    "prosrc_sha256": "ed770668f05142c5d3760fd5c5559a72e20b6301d56cab2d7c78cf8c93e4bff0",
+    "prosrc": "\r\nDECLARE\r\n  v_super_admin_rol uuid;\r\nBEGIN\r\n  SELECT id_rol\r\n  INTO v_super_admin_rol\r\n  FROM public.roles\r\n  WHERE lower(nombre) = 'super_admin'\r\n  LIMIT 1;\r\n\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    WHERE apu.id_usuario = NEW.id_usuario\r\n      AND apu.activo IS TRUE\r\n  )\r\n  AND NEW.id_rol = v_super_admin_rol THEN\r\n\r\n    IF NEW.activo IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_SUPER_ADMIN_ROLE_CANNOT_BE_DISABLED';\r\n    END IF;\r\n\r\n    IF NEW.id_sucursal IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_SUPER_ADMIN_ROLE_MUST_BE_GLOBAL';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "tr_prevent_block_protected_role",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_role BEFORE UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_role()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "tr_prevent_block_protected_role",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_role BEFORE UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_role()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "e2f0a78d7a2c712bb6afeb339c9d7c6c",
+    "prosrc_sha256_lf": "f88728b32de18dc4235aada0ec4770ea5a1f3b12b64d7a19b51bbcfea54e3774"
+  },
+  {
+    "schema": "public",
+    "name": "fn_prevent_block_protected_usuario",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_prevent_block_protected_usuario()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nBEGIN\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    WHERE apu.id_usuario = NEW.id_usuario\r\n      AND apu.activo IS TRUE\r\n  ) THEN\r\n    IF NEW.estado IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_USER_CANNOT_BE_DISABLED';\r\n    END IF;\r\n\r\n    IF NEW.deleted_at IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_USER_CANNOT_BE_DELETED';\r\n    END IF;\r\n\r\n    IF NEW.estado_acceso IS DISTINCT FROM 'activo' THEN\r\n      RAISE EXCEPTION 'ROOT_USER_CANNOT_BE_BLOCKED';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": null,
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "5a84454db69c740b361b8dc33db427e3",
+    "prosrc_sha256": "482671c9e35d361d5d1d00fa297365dae7077cc00a9d833a91cb4fb73d90034c",
+    "prosrc": "\r\nBEGIN\r\n  IF EXISTS (\r\n    SELECT 1\r\n    FROM public.app_protected_users apu\r\n    WHERE apu.id_usuario = NEW.id_usuario\r\n      AND apu.activo IS TRUE\r\n  ) THEN\r\n    IF NEW.estado IS DISTINCT FROM true THEN\r\n      RAISE EXCEPTION 'ROOT_USER_CANNOT_BE_DISABLED';\r\n    END IF;\r\n\r\n    IF NEW.deleted_at IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROOT_USER_CANNOT_BE_DELETED';\r\n    END IF;\r\n\r\n    IF NEW.estado_acceso IS DISTINCT FROM 'activo' THEN\r\n      RAISE EXCEPTION 'ROOT_USER_CANNOT_BE_BLOCKED';\r\n    END IF;\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "usuarios",
+          "name": "tr_prevent_block_protected_usuario",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_usuario BEFORE UPDATE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_usuario()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "usuarios",
+          "name": "tr_prevent_block_protected_usuario",
+          "definition": "CREATE TRIGGER tr_prevent_block_protected_usuario BEFORE UPDATE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_usuario()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "85b8212c6b1966571f2cb756b1b98ec6",
+    "prosrc_sha256_lf": "310199553dc7ff4dcd59b9f34c1ac188b49bf85133bddb693eea20783014e9f5"
+  },
+  {
+    "schema": "public",
+    "name": "fn_set_updated_at",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_set_updated_at()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261",
+    "prosrc": "\nBEGIN\n  NEW.updated_at := now();\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "points_transactions",
+          "name": "tr_set_updated_at_points_transactions",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_transactions BEFORE UPDATE ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_holds",
+          "name": "tr_set_updated_at_citas_holds",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_holds BEFORE UPDATE ON public.citas_holds FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_rules",
+          "name": "tr_set_updated_at_points_rules",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_rules BEFORE UPDATE ON public.points_rules FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "payments",
+          "name": "tr_set_updated_at_payments",
+          "definition": "CREATE TRIGGER tr_set_updated_at_payments BEFORE UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "payment_intents",
+          "name": "tr_set_updated_at_payment_intents",
+          "definition": "CREATE TRIGGER tr_set_updated_at_payment_intents BEFORE UPDATE ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_reagendaciones",
+          "name": "tr_set_updated_at_citas_reagendaciones",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_reagendaciones BEFORE UPDATE ON public.citas_reagendaciones FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "archivos",
+          "name": "tr_set_updated_at_archivos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_archivos BEFORE UPDATE ON public.archivos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "correos",
+          "name": "tr_set_updated_at_correos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_correos BEFORE UPDATE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "tr_set_updated_at_personas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_personas BEFORE UPDATE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "payment_providers",
+          "name": "tr_set_updated_at_payment_providers",
+          "definition": "CREATE TRIGGER tr_set_updated_at_payment_providers BEFORE UPDATE ON public.payment_providers FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_legacy_migrations",
+          "name": "tr_set_updated_at_points_legacy_migrations",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_legacy_migrations BEFORE UPDATE ON public.points_legacy_migrations FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "roles",
+          "name": "tr_set_updated_at_roles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_roles BEFORE UPDATE ON public.roles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "permisos",
+          "name": "tr_set_updated_at_permisos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_permisos BEFORE UPDATE ON public.permisos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "pantallas",
+          "name": "tr_set_updated_at_pantallas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_pantallas BEFORE UPDATE ON public.pantallas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "roles_pantallas_permisos",
+          "name": "tr_set_updated_at_roles_pantallas_permisos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_roles_pantallas_permisos BEFORE UPDATE ON public.roles_pantallas_permisos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "usuarios",
+          "name": "tr_set_updated_at_usuarios",
+          "definition": "CREATE TRIGGER tr_set_updated_at_usuarios BEFORE UPDATE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "membership_purchase_orders",
+          "name": "tr_set_updated_at_membership_purchase_orders",
+          "definition": "CREATE TRIGGER tr_set_updated_at_membership_purchase_orders BEFORE UPDATE ON public.membership_purchase_orders FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "subscription_payments",
+          "name": "tr_set_updated_at_subscription_payments",
+          "definition": "CREATE TRIGGER tr_set_updated_at_subscription_payments BEFORE UPDATE ON public.subscription_payments FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "subscriptions",
+          "name": "tr_set_updated_at_subscriptions",
+          "definition": "CREATE TRIGGER tr_set_updated_at_subscriptions BEFORE UPDATE ON public.subscriptions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "notificaciones_email",
+          "name": "tr_set_updated_at_notificaciones_email",
+          "definition": "CREATE TRIGGER tr_set_updated_at_notificaciones_email BEFORE UPDATE ON public.notificaciones_email FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_cycles",
+          "name": "tr_set_updated_at_points_cycles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_cycles BEFORE UPDATE ON public.points_cycles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "horarios_semanales_sucursales",
+          "name": "tr_set_updated_at_horarios_semanales_sucursales",
+          "definition": "CREATE TRIGGER tr_set_updated_at_horarios_semanales_sucursales BEFORE UPDATE ON public.horarios_semanales_sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "horarios_semanales_sucursales_bloques",
+          "name": "tr_set_updated_at_horarios_semanales_sucursales_bloques",
+          "definition": "CREATE TRIGGER tr_set_updated_at_horarios_semanales_sucursales_bloques BEFORE UPDATE ON public.horarios_semanales_sucursales_bloques FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "bloqueos_agenda",
+          "name": "tr_set_updated_at_bloqueos_agenda",
+          "definition": "CREATE TRIGGER tr_set_updated_at_bloqueos_agenda BEFORE UPDATE ON public.bloqueos_agenda FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes_detalles",
+          "name": "tr_set_updated_at_paquetes_detalles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_paquetes_detalles BEFORE UPDATE ON public.paquetes_detalles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "tr_set_updated_at_servicios",
+          "definition": "CREATE TRIGGER tr_set_updated_at_servicios BEFORE UPDATE ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "cortesias",
+          "name": "tr_set_updated_at_cortesias",
+          "definition": "CREATE TRIGGER tr_set_updated_at_cortesias BEFORE UPDATE ON public.cortesias FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "cortesias_sucursales",
+          "name": "tr_set_updated_at_cortesias_sucursales",
+          "definition": "CREATE TRIGGER tr_set_updated_at_cortesias_sucursales BEFORE UPDATE ON public.cortesias_sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_set_updated_at_citas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas BEFORE UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal",
+          "name": "tr_set_updated_at_agenda_excepciones_sucursal",
+          "definition": "CREATE TRIGGER tr_set_updated_at_agenda_excepciones_sucursal BEFORE UPDATE ON public.agenda_excepciones_sucursal FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal_bloques",
+          "name": "tr_set_updated_at_agenda_excepciones_sucursal_bloques",
+          "definition": "CREATE TRIGGER tr_set_updated_at_agenda_excepciones_sucursal_bloques BEFORE UPDATE ON public.agenda_excepciones_sucursal_bloques FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "agenda_bloqueos_empleados",
+          "name": "tr_set_updated_at_agenda_bloqueos_empleados",
+          "definition": "CREATE TRIGGER tr_set_updated_at_agenda_bloqueos_empleados BEFORE UPDATE ON public.agenda_bloqueos_empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_grupos",
+          "name": "tr_set_updated_at_citas_grupos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_grupos BEFORE UPDATE ON public.citas_grupos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "membership_plans",
+          "name": "tr_set_updated_at_membership_plans",
+          "definition": "CREATE TRIGGER tr_set_updated_at_membership_plans BEFORE UPDATE ON public.membership_plans FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_detalles",
+          "name": "tr_set_updated_at_citas_detalles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_detalles BEFORE UPDATE ON public.citas_detalles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "storage_assets",
+          "name": "tr_set_updated_at_storage_assets",
+          "definition": "CREATE TRIGGER tr_set_updated_at_storage_assets BEFORE UPDATE ON public.storage_assets FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "servicios_tarifas",
+          "name": "tr_set_updated_at_servicios_tarifas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_servicios_tarifas BEFORE UPDATE ON public.servicios_tarifas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "horarios_semanales_empleados",
+          "name": "tr_set_updated_at_horarios_semanales_empleados",
+          "definition": "CREATE TRIGGER tr_set_updated_at_horarios_semanales_empleados BEFORE UPDATE ON public.horarios_semanales_empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "parametros_sucursal",
+          "name": "tr_set_updated_at_parametros_sucursal",
+          "definition": "CREATE TRIGGER tr_set_updated_at_parametros_sucursal BEFORE UPDATE ON public.parametros_sucursal FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "parametros_sistema",
+          "name": "tr_set_updated_at_parametros_sistema",
+          "definition": "CREATE TRIGGER tr_set_updated_at_parametros_sistema BEFORE UPDATE ON public.parametros_sistema FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "sucursales",
+          "name": "tr_set_updated_at_sucursales",
+          "definition": "CREATE TRIGGER tr_set_updated_at_sucursales BEFORE UPDATE ON public.sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "empresas",
+          "name": "tr_set_updated_at_empresas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_empresas BEFORE UPDATE ON public.empresas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "tr_set_updated_at_roles_usuarios",
+          "definition": "CREATE TRIGGER tr_set_updated_at_roles_usuarios BEFORE UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "clientes",
+          "name": "tr_set_updated_at_clientes",
+          "definition": "CREATE TRIGGER tr_set_updated_at_clientes BEFORE UPDATE ON public.clientes FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes",
+          "name": "tr_set_updated_at_paquetes",
+          "definition": "CREATE TRIGGER tr_set_updated_at_paquetes BEFORE UPDATE ON public.paquetes FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "tr_set_updated_at_empleados",
+          "definition": "CREATE TRIGGER tr_set_updated_at_empleados BEFORE UPDATE ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal",
+          "name": "tr_set_updated_at_agenda_excepciones_sucursal",
+          "definition": "CREATE TRIGGER tr_set_updated_at_agenda_excepciones_sucursal BEFORE UPDATE ON public.agenda_excepciones_sucursal FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "agenda_excepciones_sucursal_bloques",
+          "name": "tr_set_updated_at_agenda_excepciones_sucursal_bloques",
+          "definition": "CREATE TRIGGER tr_set_updated_at_agenda_excepciones_sucursal_bloques BEFORE UPDATE ON public.agenda_excepciones_sucursal_bloques FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "agenda_bloqueos_empleados",
+          "name": "tr_set_updated_at_agenda_bloqueos_empleados",
+          "definition": "CREATE TRIGGER tr_set_updated_at_agenda_bloqueos_empleados BEFORE UPDATE ON public.agenda_bloqueos_empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_transactions",
+          "name": "tr_set_updated_at_points_transactions",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_transactions BEFORE UPDATE ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_holds",
+          "name": "tr_set_updated_at_citas_holds",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_holds BEFORE UPDATE ON public.citas_holds FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_rules",
+          "name": "tr_set_updated_at_points_rules",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_rules BEFORE UPDATE ON public.points_rules FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "payments",
+          "name": "tr_set_updated_at_payments",
+          "definition": "CREATE TRIGGER tr_set_updated_at_payments BEFORE UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_reagendaciones",
+          "name": "tr_set_updated_at_citas_reagendaciones",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_reagendaciones BEFORE UPDATE ON public.citas_reagendaciones FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "archivos",
+          "name": "tr_set_updated_at_archivos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_archivos BEFORE UPDATE ON public.archivos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "correos",
+          "name": "tr_set_updated_at_correos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_correos BEFORE UPDATE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "tr_set_updated_at_personas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_personas BEFORE UPDATE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "payment_providers",
+          "name": "tr_set_updated_at_payment_providers",
+          "definition": "CREATE TRIGGER tr_set_updated_at_payment_providers BEFORE UPDATE ON public.payment_providers FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_legacy_migrations",
+          "name": "tr_set_updated_at_points_legacy_migrations",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_legacy_migrations BEFORE UPDATE ON public.points_legacy_migrations FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "roles",
+          "name": "tr_set_updated_at_roles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_roles BEFORE UPDATE ON public.roles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "permisos",
+          "name": "tr_set_updated_at_permisos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_permisos BEFORE UPDATE ON public.permisos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "pantallas",
+          "name": "tr_set_updated_at_pantallas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_pantallas BEFORE UPDATE ON public.pantallas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "roles_pantallas_permisos",
+          "name": "tr_set_updated_at_roles_pantallas_permisos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_roles_pantallas_permisos BEFORE UPDATE ON public.roles_pantallas_permisos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "membership_purchase_orders",
+          "name": "tr_set_updated_at_membership_purchase_orders",
+          "definition": "CREATE TRIGGER tr_set_updated_at_membership_purchase_orders BEFORE UPDATE ON public.membership_purchase_orders FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "usuarios",
+          "name": "tr_set_updated_at_usuarios",
+          "definition": "CREATE TRIGGER tr_set_updated_at_usuarios BEFORE UPDATE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "subscription_payments",
+          "name": "tr_set_updated_at_subscription_payments",
+          "definition": "CREATE TRIGGER tr_set_updated_at_subscription_payments BEFORE UPDATE ON public.subscription_payments FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "subscriptions",
+          "name": "tr_set_updated_at_subscriptions",
+          "definition": "CREATE TRIGGER tr_set_updated_at_subscriptions BEFORE UPDATE ON public.subscriptions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "notificaciones_email",
+          "name": "tr_set_updated_at_notificaciones_email",
+          "definition": "CREATE TRIGGER tr_set_updated_at_notificaciones_email BEFORE UPDATE ON public.notificaciones_email FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "points_cycles",
+          "name": "tr_set_updated_at_points_cycles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_points_cycles BEFORE UPDATE ON public.points_cycles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "payment_intents",
+          "name": "tr_set_updated_at_payment_intents",
+          "definition": "CREATE TRIGGER tr_set_updated_at_payment_intents BEFORE UPDATE ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "horarios_semanales_sucursales",
+          "name": "tr_set_updated_at_horarios_semanales_sucursales",
+          "definition": "CREATE TRIGGER tr_set_updated_at_horarios_semanales_sucursales BEFORE UPDATE ON public.horarios_semanales_sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "horarios_semanales_sucursales_bloques",
+          "name": "tr_set_updated_at_horarios_semanales_sucursales_bloques",
+          "definition": "CREATE TRIGGER tr_set_updated_at_horarios_semanales_sucursales_bloques BEFORE UPDATE ON public.horarios_semanales_sucursales_bloques FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "bloqueos_agenda",
+          "name": "tr_set_updated_at_bloqueos_agenda",
+          "definition": "CREATE TRIGGER tr_set_updated_at_bloqueos_agenda BEFORE UPDATE ON public.bloqueos_agenda FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes_detalles",
+          "name": "tr_set_updated_at_paquetes_detalles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_paquetes_detalles BEFORE UPDATE ON public.paquetes_detalles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "tr_set_updated_at_servicios",
+          "definition": "CREATE TRIGGER tr_set_updated_at_servicios BEFORE UPDATE ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "cortesias",
+          "name": "tr_set_updated_at_cortesias",
+          "definition": "CREATE TRIGGER tr_set_updated_at_cortesias BEFORE UPDATE ON public.cortesias FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "cortesias_sucursales",
+          "name": "tr_set_updated_at_cortesias_sucursales",
+          "definition": "CREATE TRIGGER tr_set_updated_at_cortesias_sucursales BEFORE UPDATE ON public.cortesias_sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_set_updated_at_citas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas BEFORE UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_grupos",
+          "name": "tr_set_updated_at_citas_grupos",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_grupos BEFORE UPDATE ON public.citas_grupos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "membership_plans",
+          "name": "tr_set_updated_at_membership_plans",
+          "definition": "CREATE TRIGGER tr_set_updated_at_membership_plans BEFORE UPDATE ON public.membership_plans FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "citas_detalles",
+          "name": "tr_set_updated_at_citas_detalles",
+          "definition": "CREATE TRIGGER tr_set_updated_at_citas_detalles BEFORE UPDATE ON public.citas_detalles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "storage_assets",
+          "name": "tr_set_updated_at_storage_assets",
+          "definition": "CREATE TRIGGER tr_set_updated_at_storage_assets BEFORE UPDATE ON public.storage_assets FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "servicios_tarifas",
+          "name": "tr_set_updated_at_servicios_tarifas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_servicios_tarifas BEFORE UPDATE ON public.servicios_tarifas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "horarios_semanales_empleados",
+          "name": "tr_set_updated_at_horarios_semanales_empleados",
+          "definition": "CREATE TRIGGER tr_set_updated_at_horarios_semanales_empleados BEFORE UPDATE ON public.horarios_semanales_empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "tr_set_updated_at_empleados",
+          "definition": "CREATE TRIGGER tr_set_updated_at_empleados BEFORE UPDATE ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "parametros_sucursal",
+          "name": "tr_set_updated_at_parametros_sucursal",
+          "definition": "CREATE TRIGGER tr_set_updated_at_parametros_sucursal BEFORE UPDATE ON public.parametros_sucursal FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "parametros_sistema",
+          "name": "tr_set_updated_at_parametros_sistema",
+          "definition": "CREATE TRIGGER tr_set_updated_at_parametros_sistema BEFORE UPDATE ON public.parametros_sistema FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "sucursales",
+          "name": "tr_set_updated_at_sucursales",
+          "definition": "CREATE TRIGGER tr_set_updated_at_sucursales BEFORE UPDATE ON public.sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "empresas",
+          "name": "tr_set_updated_at_empresas",
+          "definition": "CREATE TRIGGER tr_set_updated_at_empresas BEFORE UPDATE ON public.empresas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "tr_set_updated_at_roles_usuarios",
+          "definition": "CREATE TRIGGER tr_set_updated_at_roles_usuarios BEFORE UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "clientes",
+          "name": "tr_set_updated_at_clientes",
+          "definition": "CREATE TRIGGER tr_set_updated_at_clientes BEFORE UPDATE ON public.clientes FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes",
+          "name": "tr_set_updated_at_paquetes",
+          "definition": "CREATE TRIGGER tr_set_updated_at_paquetes BEFORE UPDATE ON public.paquetes FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "prosrc_sha256_lf": "42bbab957ef0446fcfebf4936a8fc1b27986e1a1a3ba349937141bb528507261"
+  },
+  {
+    "schema": "public",
+    "name": "fn_trg_otorgar_puntos_plan_confirmada",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_plan_confirmada()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": false,
+    "production_warning": true,
+    "prosrc_md5": "d28d6871c43022fd0950f4ec9f973972",
+    "prosrc_sha256": "9471e343376819d38df0c67c4c7cedc8bdf07761cbed9a654a4197374e6e698e",
+    "prosrc": "\nBEGIN\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [],
+      "production": []
+    },
+    "qa_definition_override": "CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_plan_confirmada() RETURNS trigger\nLANGUAGE plpgsql SET search_path = pg_catalog, public AS $function$\nBEGIN RETURN NEW; END;\n$function$;",
+    "qa_definition_source": "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql",
+    "qa_prosrc_md5": "8270cf772d8160350926c8762482ca4b",
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "d28d6871c43022fd0950f4ec9f973972",
+    "prosrc_sha256_lf": "9471e343376819d38df0c67c4c7cedc8bdf07761cbed9a654a4197374e6e698e",
+    "qa_prosrc_md5_lf": "8270cf772d8160350926c8762482ca4b"
+  },
+  {
+    "schema": "public",
+    "name": "fn_trg_otorgar_puntos_por_cita",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_por_cita()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_estado_final text;\n  v_origen text;\n  v_puntos_por_cita integer := 1;\n  v_cycle record;\n  v_cliente_usuario uuid;\nBEGIN\n  SELECT public.fn_points_estado_final_cita() INTO v_estado_final;\n\n  IF TG_OP = 'INSERT' THEN\n    IF NEW.estado_cita_codigo IS DISTINCT FROM v_estado_final THEN\n      RETURN NEW;\n    END IF;\n  ELSIF TG_OP = 'UPDATE' THEN\n    IF NOT (\n      OLD.estado_cita_codigo IS DISTINCT FROM NEW.estado_cita_codigo\n      AND NEW.estado_cita_codigo = v_estado_final\n    ) THEN\n      RETURN NEW;\n    END IF;\n  ELSE\n    RETURN NEW;\n  END IF;\n\n  IF NEW.id_cliente IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  v_origen := CASE\n    WHEN COALESCE(NEW.orden_integrante, 1) > 1 THEN 'integrante'\n    ELSE 'titular'\n  END;\n\n  IF COALESCE(NEW.es_canje_recompensa, false) IS TRUE AND v_origen = 'titular' THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(pr.puntos_por_cita, 1)\n  INTO v_puntos_por_cita\n  FROM public.points_rules pr\n  WHERE pr.activo IS TRUE\n    AND (pr.id_sucursal = NEW.id_sucursal OR pr.id_sucursal IS NULL)\n  ORDER BY\n    CASE WHEN pr.id_sucursal = NEW.id_sucursal THEN 0 ELSE 1 END,\n    pr.updated_at DESC NULLS LAST,\n    pr.created_at DESC NULLS LAST\n  LIMIT 1;\n\n  SELECT *\n  INTO v_cycle\n  FROM public.fn_points_get_or_create_active_cycle(\n    NEW.id_cliente,\n    COALESCE(NEW.inicio_at, now())\n  )\n  LIMIT 1;\n\n  SELECT c.id_usuario\n  INTO v_cliente_usuario\n  FROM public.clientes c\n  WHERE c.id_cliente = NEW.id_cliente\n    AND c.deleted_at IS NULL\n  LIMIT 1;\n\n  INSERT INTO public.points_transactions (\n    id_cliente,\n    id_cita,\n    id_cycle,\n    id_sucursal_origen,\n    tipo_puntos_codigo,\n    origen_punto_codigo,\n    puntos,\n    vence_at,\n    motivo,\n    creado_por_usuario_id,\n    created_at,\n    updated_at\n  )\n  VALUES (\n    NEW.id_cliente,\n    NEW.id_cita,\n    v_cycle.id_cycle,\n    NEW.id_sucursal,\n    'acumular',\n    v_origen,\n    GREATEST(1, COALESCE(v_puntos_por_cita, 1)),\n    v_cycle.vence_at,\n    CASE WHEN v_origen = 'integrante'\n      THEN 'Punto por acompañante en visita completada'\n      ELSE 'Punto por visita completada del titular'\n    END,\n    COALESCE(NEW.creada_por_usuario_id, v_cliente_usuario),\n    now(),\n    now()\n  )\n  ON CONFLICT DO NOTHING;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": false,
+    "production_warning": true,
+    "prosrc_md5": "b271a74a0fd9440113f62c331e8a7ea8",
+    "prosrc_sha256": "fd8c55866f3eba637f7fc669d2af3af423f77e1a8d19f4b7a316a4cb2bd063ea",
+    "prosrc": "\nDECLARE\n  v_estado_final text;\n  v_origen text;\n  v_puntos_por_cita integer := 1;\n  v_cycle record;\n  v_cliente_usuario uuid;\nBEGIN\n  SELECT public.fn_points_estado_final_cita() INTO v_estado_final;\n\n  IF TG_OP = 'INSERT' THEN\n    IF NEW.estado_cita_codigo IS DISTINCT FROM v_estado_final THEN\n      RETURN NEW;\n    END IF;\n  ELSIF TG_OP = 'UPDATE' THEN\n    IF NOT (\n      OLD.estado_cita_codigo IS DISTINCT FROM NEW.estado_cita_codigo\n      AND NEW.estado_cita_codigo = v_estado_final\n    ) THEN\n      RETURN NEW;\n    END IF;\n  ELSE\n    RETURN NEW;\n  END IF;\n\n  IF NEW.id_cliente IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  v_origen := CASE\n    WHEN COALESCE(NEW.orden_integrante, 1) > 1 THEN 'integrante'\n    ELSE 'titular'\n  END;\n\n  IF COALESCE(NEW.es_canje_recompensa, false) IS TRUE AND v_origen = 'titular' THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(pr.puntos_por_cita, 1)\n  INTO v_puntos_por_cita\n  FROM public.points_rules pr\n  WHERE pr.activo IS TRUE\n    AND (pr.id_sucursal = NEW.id_sucursal OR pr.id_sucursal IS NULL)\n  ORDER BY\n    CASE WHEN pr.id_sucursal = NEW.id_sucursal THEN 0 ELSE 1 END,\n    pr.updated_at DESC NULLS LAST,\n    pr.created_at DESC NULLS LAST\n  LIMIT 1;\n\n  SELECT *\n  INTO v_cycle\n  FROM public.fn_points_get_or_create_active_cycle(\n    NEW.id_cliente,\n    COALESCE(NEW.inicio_at, now())\n  )\n  LIMIT 1;\n\n  SELECT c.id_usuario\n  INTO v_cliente_usuario\n  FROM public.clientes c\n  WHERE c.id_cliente = NEW.id_cliente\n    AND c.deleted_at IS NULL\n  LIMIT 1;\n\n  INSERT INTO public.points_transactions (\n    id_cliente,\n    id_cita,\n    id_cycle,\n    id_sucursal_origen,\n    tipo_puntos_codigo,\n    origen_punto_codigo,\n    puntos,\n    vence_at,\n    motivo,\n    creado_por_usuario_id,\n    created_at,\n    updated_at\n  )\n  VALUES (\n    NEW.id_cliente,\n    NEW.id_cita,\n    v_cycle.id_cycle,\n    NEW.id_sucursal,\n    'acumular',\n    v_origen,\n    GREATEST(1, COALESCE(v_puntos_por_cita, 1)),\n    v_cycle.vence_at,\n    CASE WHEN v_origen = 'integrante'\n      THEN 'Punto por acompañante en visita completada'\n      ELSE 'Punto por visita completada del titular'\n    END,\n    COALESCE(NEW.creada_por_usuario_id, v_cliente_usuario),\n    now(),\n    now()\n  )\n  ON CONFLICT DO NOTHING;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_points_cita_confirmada",
+          "definition": "CREATE TRIGGER tr_points_cita_confirmada AFTER UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_otorgar_puntos_por_cita()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_points_cita_confirmada",
+          "definition": "CREATE TRIGGER tr_points_cita_confirmada AFTER UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_otorgar_puntos_por_cita()"
+        }
+      ]
+    },
+    "qa_definition_override": "CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_por_cita() RETURNS trigger\nLANGUAGE plpgsql SET search_path = pg_catalog, public AS $function$\nDECLARE v_cycle record; v_usuario uuid; v_origen text; v_beneficiario uuid;\nBEGIN\n  IF NEW.estado_cita_codigo <> 'completada' OR NEW.deleted_at IS NOT NULL THEN RETURN NEW; END IF;\n  IF TG_OP = 'UPDATE' THEN\n    IF OLD.estado_cita_codigo IS NOT DISTINCT FROM NEW.estado_cita_codigo THEN RETURN NEW; END IF;\n  END IF;\n  -- AM: El grupo autenticado define al beneficiario; nunca se altera la identidad de la cita.\n  v_beneficiario := NEW.id_cliente;\n  IF NEW.id_grupo_cita IS NOT NULL THEN\n    SELECT CASE WHEN cg.origen_codigo = 'cliente_autenticado' THEN cg.id_cliente_titular ELSE NEW.id_cliente END\n    INTO v_beneficiario FROM public.citas_grupos cg WHERE cg.id_grupo_cita = NEW.id_grupo_cita;\n    IF NOT FOUND THEN RETURN NEW; END IF;\n  END IF;\n  IF v_beneficiario IS NULL THEN RETURN NEW; END IF;\n  v_origen := CASE WHEN COALESCE(NEW.orden_integrante, 1) > 1 THEN 'integrante' ELSE 'titular' END;\n  IF COALESCE(NEW.es_canje_recompensa, false) AND v_origen = 'titular' THEN RETURN NEW; END IF;\n  SELECT c.id_usuario INTO v_usuario FROM public.clientes c\n  WHERE c.id_cliente = v_beneficiario AND c.deleted_at IS NULL;\n  IF NOT FOUND THEN RETURN NEW; END IF;\n  PERFORM pg_advisory_xact_lock(hashtext(v_beneficiario::text));\n  IF EXISTS (SELECT 1 FROM public.points_transactions pt WHERE pt.id_cita = NEW.id_cita AND pt.tipo_puntos_codigo = 'acumular') THEN RETURN NEW; END IF;\n  SELECT * INTO v_cycle FROM public.fn_points_get_or_create_active_cycle(v_beneficiario, 12, now());\n  INSERT INTO public.points_transactions (\n    id_cliente, id_cita, id_cycle, id_sucursal_origen, tipo_puntos_codigo,\n    origen_punto_codigo, puntos, vence_at, motivo, creado_por_usuario_id, created_at, updated_at\n  ) VALUES (\n    v_beneficiario, NEW.id_cita, v_cycle.id_cycle, NEW.id_sucursal, 'acumular',\n    v_origen, 1, v_cycle.vence_at,\n    CASE WHEN v_origen = 'integrante' THEN 'Punto por acompañante en visita completada' ELSE 'Punto por visita completada del titular' END,\n    COALESCE(NEW.creada_por_usuario_id, v_usuario), now(), now()\n  ) ON CONFLICT DO NOTHING;\n  RETURN NEW;\nEND;\n$function$;",
+    "qa_definition_source": "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql",
+    "qa_prosrc_md5": "a5471f67639a089297e2384c4d6dd1dc",
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "b271a74a0fd9440113f62c331e8a7ea8",
+    "prosrc_sha256_lf": "fd8c55866f3eba637f7fc669d2af3af423f77e1a8d19f4b7a316a4cb2bd063ea",
+    "qa_prosrc_md5_lf": "a5471f67639a089297e2384c4d6dd1dc"
+  },
+  {
+    "schema": "public",
+    "name": "fn_trg_roles_usuarios_unicidad_scope",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_trg_roles_usuarios_unicidad_scope()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\r\nDECLARE\r\n  v_nombre_rol text;\r\n  v_existe boolean;\r\nBEGIN\r\n  SELECT lower(nombre)\r\n  INTO v_nombre_rol\r\n  FROM public.roles\r\n  WHERE id_rol = NEW.id_rol;\r\n\r\n  IF v_nombre_rol IN ('super_admin', 'cliente', 'root') THEN\r\n    IF NEW.id_sucursal IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROL_GLOBAL_NO_DEBE_TENER_SUCURSAL';\r\n    END IF;\r\n  ELSE\r\n    IF NEW.id_sucursal IS NULL THEN\r\n      RAISE EXCEPTION 'ROL_REQUIERE_SUCURSAL';\r\n    END IF;\r\n  END IF;\r\n\r\n  SELECT EXISTS (\r\n    SELECT 1\r\n    FROM public.roles_usuarios ru\r\n    WHERE ru.id_rol = NEW.id_rol\r\n      AND ru.id_usuario = NEW.id_usuario\r\n      AND ru.id_sucursal IS NOT DISTINCT FROM NEW.id_sucursal\r\n      AND (TG_OP = 'INSERT' OR ru.id_rol_usuario <> NEW.id_rol_usuario)\r\n  )\r\n  INTO v_existe;\r\n\r\n  IF v_existe THEN\r\n    RAISE EXCEPTION 'ROL_USUARIO_DUPLICADO_MISMO_SCOPE';\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "896fbcfb6beffcd7c9e9d139358c72ca",
+    "prosrc_sha256": "e9c99192c6f02a7e58dc1ed76296fe9aa4f7824cc6fa8226aa88caad1e1dce89",
+    "prosrc": "\r\nDECLARE\r\n  v_nombre_rol text;\r\n  v_existe boolean;\r\nBEGIN\r\n  SELECT lower(nombre)\r\n  INTO v_nombre_rol\r\n  FROM public.roles\r\n  WHERE id_rol = NEW.id_rol;\r\n\r\n  IF v_nombre_rol IN ('super_admin', 'cliente', 'root') THEN\r\n    IF NEW.id_sucursal IS NOT NULL THEN\r\n      RAISE EXCEPTION 'ROL_GLOBAL_NO_DEBE_TENER_SUCURSAL';\r\n    END IF;\r\n  ELSE\r\n    IF NEW.id_sucursal IS NULL THEN\r\n      RAISE EXCEPTION 'ROL_REQUIERE_SUCURSAL';\r\n    END IF;\r\n  END IF;\r\n\r\n  SELECT EXISTS (\r\n    SELECT 1\r\n    FROM public.roles_usuarios ru\r\n    WHERE ru.id_rol = NEW.id_rol\r\n      AND ru.id_usuario = NEW.id_usuario\r\n      AND ru.id_sucursal IS NOT DISTINCT FROM NEW.id_sucursal\r\n      AND (TG_OP = 'INSERT' OR ru.id_rol_usuario <> NEW.id_rol_usuario)\r\n  )\r\n  INTO v_existe;\r\n\r\n  IF v_existe THEN\r\n    RAISE EXCEPTION 'ROL_USUARIO_DUPLICADO_MISMO_SCOPE';\r\n  END IF;\r\n\r\n  RETURN NEW;\r\nEND;\r\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "tr_ru_unicidad_scope",
+          "definition": "CREATE TRIGGER tr_ru_unicidad_scope BEFORE INSERT OR UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_trg_roles_usuarios_unicidad_scope()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "roles_usuarios",
+          "name": "tr_ru_unicidad_scope",
+          "definition": "CREATE TRIGGER tr_ru_unicidad_scope BEFORE INSERT OR UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_trg_roles_usuarios_unicidad_scope()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "b35bcc38f4d9a303d946a57f45dc0306",
+    "prosrc_sha256_lf": "34f5577d9555155e7022421cd5110773234f737ba291f9e1f3c37817abe4b828"
+  },
+  {
+    "schema": "public",
+    "name": "fn_trg_validar_cliente_persona_en_cita",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_trg_validar_cliente_persona_en_cita()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_persona_cliente uuid;\nBEGIN\n  IF NEW.id_cliente IS NOT NULL THEN\n    SELECT id_persona INTO v_persona_cliente FROM clientes WHERE id_cliente = NEW.id_cliente;\n    IF v_persona_cliente IS DISTINCT FROM NEW.id_persona_cliente THEN\n      RAISE EXCEPTION 'CLIENTE_NO_COINCIDE_CON_PERSONA_EN_CITA';\n    END IF;\n  END IF;\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "804968e5011334975898f0f92c3d2a22",
+    "prosrc_sha256": "c491ad5494ef4910f8e0f65654e5b9bb678c8e763a58714e45e3f5251cd15704",
+    "prosrc": "\nDECLARE\n  v_persona_cliente uuid;\nBEGIN\n  IF NEW.id_cliente IS NOT NULL THEN\n    SELECT id_persona INTO v_persona_cliente FROM clientes WHERE id_cliente = NEW.id_cliente;\n    IF v_persona_cliente IS DISTINCT FROM NEW.id_persona_cliente THEN\n      RAISE EXCEPTION 'CLIENTE_NO_COINCIDE_CON_PERSONA_EN_CITA';\n    END IF;\n  END IF;\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_citas_validar_cliente_persona",
+          "definition": "CREATE TRIGGER tr_citas_validar_cliente_persona BEFORE INSERT OR UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_validar_cliente_persona_en_cita()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "citas",
+          "name": "tr_citas_validar_cliente_persona",
+          "definition": "CREATE TRIGGER tr_citas_validar_cliente_persona BEFORE INSERT OR UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_validar_cliente_persona_en_cita()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "804968e5011334975898f0f92c3d2a22",
+    "prosrc_sha256_lf": "c491ad5494ef4910f8e0f65654e5b9bb678c8e763a58714e45e3f5251cd15704"
+  },
+  {
+    "schema": "public",
+    "name": "fn_validar_paquete_activo_minimo_servicios",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_validar_paquete_activo_minimo_servicios()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_id_paquete uuid;\nBEGIN\n  v_id_paquete := COALESCE(NEW.id_paquete, OLD.id_paquete);\n\n  IF EXISTS (\n    SELECT 1\n    FROM public.paquetes p\n    WHERE p.id_paquete = v_id_paquete\n      AND p.deleted_at IS NULL\n      AND p.activo = TRUE\n      AND (\n        SELECT COUNT(*)\n        FROM public.paquetes_detalles pd\n        JOIN public.servicios s\n          ON s.id_servicio = pd.id_servicio\n        WHERE pd.id_paquete = p.id_paquete\n          AND s.activo = TRUE\n          AND s.deleted_at IS NULL\n      ) < 2\n  ) THEN\n    RAISE EXCEPTION 'El paquete activo debe tener al menos 2 servicios activos';\n  END IF;\n\n  RETURN NULL;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "66bd226e1771837b8532cad439e5ddb3",
+    "prosrc_sha256": "57524785c83730656883855ad59764df2fb9b268969d532444face41b6c1fe63",
+    "prosrc": "\nDECLARE\n  v_id_paquete uuid;\nBEGIN\n  v_id_paquete := COALESCE(NEW.id_paquete, OLD.id_paquete);\n\n  IF EXISTS (\n    SELECT 1\n    FROM public.paquetes p\n    WHERE p.id_paquete = v_id_paquete\n      AND p.deleted_at IS NULL\n      AND p.activo = TRUE\n      AND (\n        SELECT COUNT(*)\n        FROM public.paquetes_detalles pd\n        JOIN public.servicios s\n          ON s.id_servicio = pd.id_servicio\n        WHERE pd.id_paquete = p.id_paquete\n          AND s.activo = TRUE\n          AND s.deleted_at IS NULL\n      ) < 2\n  ) THEN\n    RAISE EXCEPTION 'El paquete activo debe tener al menos 2 servicios activos';\n  END IF;\n\n  RETURN NULL;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "paquetes_detalles",
+          "name": "trg_validar_paquete_activo_minimo_servicios_en_detalles",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_minimo_servicios_en_detalles AFTER INSERT OR DELETE OR UPDATE ON public.paquetes_detalles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_minimo_servicios()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes",
+          "name": "trg_validar_paquete_activo_minimo_servicios_en_paquetes",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_minimo_servicios_en_paquetes AFTER INSERT OR UPDATE OF activo, deleted_at ON public.paquetes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_minimo_servicios()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "paquetes_detalles",
+          "name": "trg_validar_paquete_activo_minimo_servicios_en_detalles",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_minimo_servicios_en_detalles AFTER INSERT OR DELETE OR UPDATE ON public.paquetes_detalles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_minimo_servicios()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes",
+          "name": "trg_validar_paquete_activo_minimo_servicios_en_paquetes",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_minimo_servicios_en_paquetes AFTER INSERT OR UPDATE OF activo, deleted_at ON public.paquetes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_minimo_servicios()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "66bd226e1771837b8532cad439e5ddb3",
+    "prosrc_sha256_lf": "57524785c83730656883855ad59764df2fb9b268969d532444face41b6c1fe63"
+  },
+  {
+    "schema": "public",
+    "name": "fn_validar_paquete_activo_sin_servicios_inactivos",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_validar_paquete_activo_sin_servicios_inactivos()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_id_paquete uuid;\nBEGIN\n  v_id_paquete := COALESCE(NEW.id_paquete, OLD.id_paquete);\n\n  IF EXISTS (\n    SELECT 1\n    FROM public.paquetes p\n    JOIN public.paquetes_detalles pd\n      ON pd.id_paquete = p.id_paquete\n    JOIN public.servicios s\n      ON s.id_servicio = pd.id_servicio\n    WHERE p.id_paquete = v_id_paquete\n      AND p.deleted_at IS NULL\n      AND p.activo = TRUE\n      AND (s.activo = FALSE OR s.deleted_at IS NOT NULL)\n  ) THEN\n    RAISE EXCEPTION 'El paquete activo no puede contener servicios inactivos';\n  END IF;\n\n  RETURN NULL;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "9f36d7892d1ce610990354708cc635f1",
+    "prosrc_sha256": "c000547746e80e7b9579d5250f42b53345f912ddbdb571ad40cdb3d2b49c404d",
+    "prosrc": "\nDECLARE\n  v_id_paquete uuid;\nBEGIN\n  v_id_paquete := COALESCE(NEW.id_paquete, OLD.id_paquete);\n\n  IF EXISTS (\n    SELECT 1\n    FROM public.paquetes p\n    JOIN public.paquetes_detalles pd\n      ON pd.id_paquete = p.id_paquete\n    JOIN public.servicios s\n      ON s.id_servicio = pd.id_servicio\n    WHERE p.id_paquete = v_id_paquete\n      AND p.deleted_at IS NULL\n      AND p.activo = TRUE\n      AND (s.activo = FALSE OR s.deleted_at IS NOT NULL)\n  ) THEN\n    RAISE EXCEPTION 'El paquete activo no puede contener servicios inactivos';\n  END IF;\n\n  RETURN NULL;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "paquetes_detalles",
+          "name": "trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles AFTER INSERT OR DELETE OR UPDATE ON public.paquetes_detalles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_sin_servicios_inactivos()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes",
+          "name": "trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes AFTER INSERT OR UPDATE OF activo, deleted_at ON public.paquetes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_sin_servicios_inactivos()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "paquetes_detalles",
+          "name": "trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles AFTER INSERT OR DELETE OR UPDATE ON public.paquetes_detalles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_sin_servicios_inactivos()"
+        },
+        {
+          "schema": "public",
+          "table": "paquetes",
+          "name": "trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes AFTER INSERT OR UPDATE OF activo, deleted_at ON public.paquetes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_sin_servicios_inactivos()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "9f36d7892d1ce610990354708cc635f1",
+    "prosrc_sha256_lf": "c000547746e80e7b9579d5250f42b53345f912ddbdb571ad40cdb3d2b49c404d"
+  },
+  {
+    "schema": "public",
+    "name": "fn_validar_persona_empleado_campos_obligatorios",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_validar_persona_empleado_campos_obligatorios()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_dni text;\n  v_telefono text;\n  v_existe_empleado_activo boolean;\nBEGIN\n  -- Caso A: se inserta/actualiza empleado\n  IF TG_TABLE_NAME = 'empleados' THEN\n    -- Si el registro de empleado se está soft-deleteando, no validar\n    IF NEW.deleted_at IS NOT NULL THEN\n      RETURN NEW;\n    END IF;\n\n    SELECT\n      regexp_replace(COALESCE(p.dni, ''), '\\D', '', 'g'),\n      BTRIM(COALESCE(p.telefono_principal, ''))\n    INTO\n      v_dni,\n      v_telefono\n    FROM public.personas p\n    WHERE p.id_persona = NEW.id_persona\n      AND p.deleted_at IS NULL;\n\n    IF NOT FOUND THEN\n      RAISE EXCEPTION\n        USING ERRCODE = '23514',\n              MESSAGE = 'No se puede crear/actualizar empleado: la persona asociada no existe o está eliminada.';\n    END IF;\n\n    IF v_dni = '' THEN\n      RAISE EXCEPTION\n        USING ERRCODE = '23514',\n              MESSAGE = 'No se puede crear/actualizar empleado: el DNI es obligatorio para empleados.';\n    END IF;\n\n    IF v_telefono = '' THEN\n      RAISE EXCEPTION\n        USING ERRCODE = '23514',\n              MESSAGE = 'No se puede crear/actualizar empleado: el teléfono principal es obligatorio para empleados.';\n    END IF;\n\n    RETURN NEW;\n  END IF;\n\n  -- Caso B: se actualiza persona que ya está vinculada a un empleado activo\n  IF TG_TABLE_NAME = 'personas' THEN\n    SELECT EXISTS (\n      SELECT 1\n      FROM public.empleados e\n      WHERE e.id_persona = NEW.id_persona\n        AND e.deleted_at IS NULL\n    )\n    INTO v_existe_empleado_activo;\n\n    IF v_existe_empleado_activo THEN\n      IF regexp_replace(COALESCE(NEW.dni, ''), '\\D', '', 'g') = '' THEN\n        RAISE EXCEPTION\n          USING ERRCODE = '23514',\n                MESSAGE = 'No se puede actualizar la persona: el DNI es obligatorio porque está vinculada a un empleado activo.';\n      END IF;\n\n      IF BTRIM(COALESCE(NEW.telefono_principal, '')) = '' THEN\n        RAISE EXCEPTION\n          USING ERRCODE = '23514',\n                MESSAGE = 'No se puede actualizar la persona: el teléfono principal es obligatorio porque está vinculada a un empleado activo.';\n      END IF;\n    END IF;\n\n    RETURN NEW;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "2b2b513e8938f017bc635d58c2e6ed5c",
+    "prosrc_sha256": "7a08f427db2ebd747f1fe231691e44dacebdf78783037173cfce020d11bf9dc1",
+    "prosrc": "\nDECLARE\n  v_dni text;\n  v_telefono text;\n  v_existe_empleado_activo boolean;\nBEGIN\n  -- Caso A: se inserta/actualiza empleado\n  IF TG_TABLE_NAME = 'empleados' THEN\n    -- Si el registro de empleado se está soft-deleteando, no validar\n    IF NEW.deleted_at IS NOT NULL THEN\n      RETURN NEW;\n    END IF;\n\n    SELECT\n      regexp_replace(COALESCE(p.dni, ''), '\\D', '', 'g'),\n      BTRIM(COALESCE(p.telefono_principal, ''))\n    INTO\n      v_dni,\n      v_telefono\n    FROM public.personas p\n    WHERE p.id_persona = NEW.id_persona\n      AND p.deleted_at IS NULL;\n\n    IF NOT FOUND THEN\n      RAISE EXCEPTION\n        USING ERRCODE = '23514',\n              MESSAGE = 'No se puede crear/actualizar empleado: la persona asociada no existe o está eliminada.';\n    END IF;\n\n    IF v_dni = '' THEN\n      RAISE EXCEPTION\n        USING ERRCODE = '23514',\n              MESSAGE = 'No se puede crear/actualizar empleado: el DNI es obligatorio para empleados.';\n    END IF;\n\n    IF v_telefono = '' THEN\n      RAISE EXCEPTION\n        USING ERRCODE = '23514',\n              MESSAGE = 'No se puede crear/actualizar empleado: el teléfono principal es obligatorio para empleados.';\n    END IF;\n\n    RETURN NEW;\n  END IF;\n\n  -- Caso B: se actualiza persona que ya está vinculada a un empleado activo\n  IF TG_TABLE_NAME = 'personas' THEN\n    SELECT EXISTS (\n      SELECT 1\n      FROM public.empleados e\n      WHERE e.id_persona = NEW.id_persona\n        AND e.deleted_at IS NULL\n    )\n    INTO v_existe_empleado_activo;\n\n    IF v_existe_empleado_activo THEN\n      IF regexp_replace(COALESCE(NEW.dni, ''), '\\D', '', 'g') = '' THEN\n        RAISE EXCEPTION\n          USING ERRCODE = '23514',\n                MESSAGE = 'No se puede actualizar la persona: el DNI es obligatorio porque está vinculada a un empleado activo.';\n      END IF;\n\n      IF BTRIM(COALESCE(NEW.telefono_principal, '')) = '' THEN\n        RAISE EXCEPTION\n          USING ERRCODE = '23514',\n                MESSAGE = 'No se puede actualizar la persona: el teléfono principal es obligatorio porque está vinculada a un empleado activo.';\n      END IF;\n    END IF;\n\n    RETURN NEW;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "trg_validar_empleado_campos_obligatorios_personas",
+          "definition": "CREATE TRIGGER trg_validar_empleado_campos_obligatorios_personas BEFORE UPDATE OF dni, telefono_principal, deleted_at ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_validar_persona_empleado_campos_obligatorios()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "trg_validar_empleado_campos_obligatorios_empleados",
+          "definition": "CREATE TRIGGER trg_validar_empleado_campos_obligatorios_empleados BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_validar_persona_empleado_campos_obligatorios()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "personas",
+          "name": "trg_validar_empleado_campos_obligatorios_personas",
+          "definition": "CREATE TRIGGER trg_validar_empleado_campos_obligatorios_personas BEFORE UPDATE OF dni, telefono_principal, deleted_at ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_validar_persona_empleado_campos_obligatorios()"
+        },
+        {
+          "schema": "public",
+          "table": "empleados",
+          "name": "trg_validar_empleado_campos_obligatorios_empleados",
+          "definition": "CREATE TRIGGER trg_validar_empleado_campos_obligatorios_empleados BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_validar_persona_empleado_campos_obligatorios()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "2b2b513e8938f017bc635d58c2e6ed5c",
+    "prosrc_sha256_lf": "7a08f427db2ebd747f1fe231691e44dacebdf78783037173cfce020d11bf9dc1"
+  },
+  {
+    "schema": "public",
+    "name": "fn_validar_servicio_activo_con_tarifa_base",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_validar_servicio_activo_con_tarifa_base()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_id_servicio uuid;\nBEGIN\n  v_id_servicio := COALESCE(NEW.id_servicio, OLD.id_servicio);\n\n  IF EXISTS (\n    SELECT 1\n    FROM public.servicios s\n    WHERE s.id_servicio = v_id_servicio\n      AND s.deleted_at IS NULL\n      AND s.activo = TRUE\n      AND NOT EXISTS (\n        SELECT 1\n        FROM public.servicios_tarifas st\n        WHERE st.id_servicio = s.id_servicio\n          AND st.deleted_at IS NULL\n          AND st.activo = TRUE\n          AND st.id_empleado IS NULL\n      )\n  ) THEN\n    RAISE EXCEPTION 'El servicio activo debe tener una tarifa base activa por sucursal';\n  END IF;\n\n  RETURN NULL;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "016ee021bb845a57158a5ffefe1c1630",
+    "prosrc_sha256": "a2514ef8a1ef4df2377a0e186adc8bda59837f3070430d24975c311012c1dc32",
+    "prosrc": "\nDECLARE\n  v_id_servicio uuid;\nBEGIN\n  v_id_servicio := COALESCE(NEW.id_servicio, OLD.id_servicio);\n\n  IF EXISTS (\n    SELECT 1\n    FROM public.servicios s\n    WHERE s.id_servicio = v_id_servicio\n      AND s.deleted_at IS NULL\n      AND s.activo = TRUE\n      AND NOT EXISTS (\n        SELECT 1\n        FROM public.servicios_tarifas st\n        WHERE st.id_servicio = s.id_servicio\n          AND st.deleted_at IS NULL\n          AND st.activo = TRUE\n          AND st.id_empleado IS NULL\n      )\n  ) THEN\n    RAISE EXCEPTION 'El servicio activo debe tener una tarifa base activa por sucursal';\n  END IF;\n\n  RETURN NULL;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "trg_validar_servicio_activo_con_tarifa_en_servicios",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_servicio_activo_con_tarifa_en_servicios AFTER INSERT OR UPDATE OF activo, deleted_at ON public.servicios DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_servicio_activo_con_tarifa_base()"
+        },
+        {
+          "schema": "public",
+          "table": "servicios_tarifas",
+          "name": "trg_validar_servicio_activo_con_tarifa_en_tarifas",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_servicio_activo_con_tarifa_en_tarifas AFTER INSERT OR DELETE OR UPDATE ON public.servicios_tarifas DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_servicio_activo_con_tarifa_base()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "servicios",
+          "name": "trg_validar_servicio_activo_con_tarifa_en_servicios",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_servicio_activo_con_tarifa_en_servicios AFTER INSERT OR UPDATE OF activo, deleted_at ON public.servicios DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_servicio_activo_con_tarifa_base()"
+        },
+        {
+          "schema": "public",
+          "table": "servicios_tarifas",
+          "name": "trg_validar_servicio_activo_con_tarifa_en_tarifas",
+          "definition": "CREATE CONSTRAINT TRIGGER trg_validar_servicio_activo_con_tarifa_en_tarifas AFTER INSERT OR DELETE OR UPDATE ON public.servicios_tarifas DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_servicio_activo_con_tarifa_base()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "016ee021bb845a57158a5ffefe1c1630",
+    "prosrc_sha256_lf": "a2514ef8a1ef4df2377a0e186adc8bda59837f3070430d24975c311012c1dc32"
+  },
+  {
+    "schema": "public",
+    "name": "set_current_timestamp_updated_at",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.set_current_timestamp_updated_at()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nbegin\n  new.updated_at = now();\n  return new;\nend;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "9b1889f56258bf9d6554213c05019c76",
+    "prosrc_sha256": "3c6d6c41d6262a20e7c102dbd49bb3383bd86a4138c8a3ab6b9b04a1ec2420a5",
+    "prosrc": "\nbegin\n  new.updated_at = now();\n  return new;\nend;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "barberos_perfiles_publicos",
+          "name": "trg_barberos_perfiles_publicos_updated_at",
+          "definition": "CREATE TRIGGER trg_barberos_perfiles_publicos_updated_at BEFORE UPDATE ON public.barberos_perfiles_publicos FOR EACH ROW EXECUTE FUNCTION set_current_timestamp_updated_at()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "barberos_perfiles_publicos",
+          "name": "trg_barberos_perfiles_publicos_updated_at",
+          "definition": "CREATE TRIGGER trg_barberos_perfiles_publicos_updated_at BEFORE UPDATE ON public.barberos_perfiles_publicos FOR EACH ROW EXECUTE FUNCTION set_current_timestamp_updated_at()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "9b1889f56258bf9d6554213c05019c76",
+    "prosrc_sha256_lf": "3c6d6c41d6262a20e7c102dbd49bb3383bd86a4138c8a3ab6b9b04a1ec2420a5"
+  },
+  {
+    "schema": "public",
+    "name": "validate_membership_plan_beneficios",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.validate_membership_plan_beneficios()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  servicios_count INT;\nBEGIN\n  IF NEW.beneficios IS NULL THEN\n    RAISE EXCEPTION 'PLAN_BENEFICIOS_REQUIRED';\n  END IF;\n\n  -- Validar que exista array de servicios\n  IF NOT (NEW.beneficios ? 'servicios') THEN\n    RAISE EXCEPTION 'PLAN_SERVICIOS_REQUIRED';\n  END IF;\n\n  SELECT jsonb_array_length(NEW.beneficios->'servicios')\n  INTO servicios_count;\n\n  IF servicios_count < 1 THEN\n    RAISE EXCEPTION 'PLAN_SERVICIOS_MIN_REQUIRED';\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": false,
+    "qa_warning": true,
+    "production_warning": true,
+    "prosrc_md5": "30211caf31b6be34f745c27ade950b42",
+    "prosrc_sha256": "3fd6991ff009af2886dcfd06fe067280f84c8fd1b75c446fdbaffae11bde6619",
+    "prosrc": "\nDECLARE\n  servicios_count INT;\nBEGIN\n  IF NEW.beneficios IS NULL THEN\n    RAISE EXCEPTION 'PLAN_BENEFICIOS_REQUIRED';\n  END IF;\n\n  -- Validar que exista array de servicios\n  IF NOT (NEW.beneficios ? 'servicios') THEN\n    RAISE EXCEPTION 'PLAN_SERVICIOS_REQUIRED';\n  END IF;\n\n  SELECT jsonb_array_length(NEW.beneficios->'servicios')\n  INTO servicios_count;\n\n  IF servicios_count < 1 THEN\n    RAISE EXCEPTION 'PLAN_SERVICIOS_MIN_REQUIRED';\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "triggers_snapshot": {
+      "qa": [
+        {
+          "schema": "public",
+          "table": "membership_plans",
+          "name": "trg_validate_plan_beneficios",
+          "definition": "CREATE TRIGGER trg_validate_plan_beneficios BEFORE INSERT OR UPDATE ON public.membership_plans FOR EACH ROW EXECUTE FUNCTION validate_membership_plan_beneficios()"
+        }
+      ],
+      "production": [
+        {
+          "schema": "public",
+          "table": "membership_plans",
+          "name": "trg_validate_plan_beneficios",
+          "definition": "CREATE TRIGGER trg_validate_plan_beneficios BEFORE INSERT OR UPDATE ON public.membership_plans FOR EACH ROW EXECUTE FUNCTION validate_membership_plan_beneficios()"
+        }
+      ]
+    },
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "30211caf31b6be34f745c27ade950b42",
+    "prosrc_sha256_lf": "3fd6991ff009af2886dcfd06fe067280f84c8fd1b75c446fdbaffae11bde6619"
+  },
+  {
+    "schema": "public",
+    "name": "fn_citas_detalles_line_identity_v2",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_citas_detalles_line_identity_v2()\n RETURNS trigger\n LANGUAGE plpgsql\n SECURITY DEFINER\n SET search_path TO 'pg_catalog', 'public', 'app_private'\nAS $function$\nDECLARE\n  v_orden_integrante integer;\n  v_next_order integer;\n  v_occurrence integer;\n  v_expected_key text;\nBEGIN\n  IF TG_OP = 'UPDATE' THEN\n    IF NEW.id_cita IS DISTINCT FROM OLD.id_cita\n       OR NEW.id_servicio IS DISTINCT FROM OLD.id_servicio\n       OR NEW.id_tarifa IS DISTINCT FROM OLD.id_tarifa\n       OR NEW.origen_item_codigo IS DISTINCT FROM OLD.origen_item_codigo\n       OR NEW.orden_linea IS DISTINCT FROM OLD.orden_linea\n       OR NEW.line_key IS DISTINCT FROM OLD.line_key THEN\n      RAISE EXCEPTION USING\n        ERRCODE = 'P0001',\n        MESSAGE = 'MF_BOOKING_LINE_IDENTITY_IMMUTABLE';\n    END IF;\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(c.orden_integrante, 1)\n  INTO v_orden_integrante\n  FROM public.citas c\n  WHERE c.id_cita = NEW.id_cita;\n\n  IF NOT FOUND THEN\n    RAISE EXCEPTION USING\n      ERRCODE = '23503',\n      MESSAGE = 'MF_BOOKING_LINE_APPOINTMENT_NOT_FOUND';\n  END IF;\n\n  IF NEW.orden_linea IS NULL OR NEW.orden_linea < 1 THEN\n    SELECT COALESCE(max(cd.orden_linea), 0) + 1\n    INTO v_next_order\n    FROM public.citas_detalles cd\n    WHERE cd.id_cita = NEW.id_cita;\n    NEW.orden_linea := GREATEST(1, COALESCE(v_next_order, 1));\n  END IF;\n\n  SELECT count(*)::integer + 1\n  INTO v_occurrence\n  FROM public.citas_detalles cd\n  WHERE cd.id_cita = NEW.id_cita\n    AND cd.id_servicio = NEW.id_servicio\n    AND cd.id_tarifa IS NOT DISTINCT FROM NEW.id_tarifa\n    AND cd.origen_item_codigo = NEW.origen_item_codigo;\n\n  v_expected_key := app_private.build_booking_line_key_v1(\n    v_orden_integrante,\n    NEW.id_servicio,\n    NEW.id_tarifa,\n    NEW.origen_item_codigo,\n    v_occurrence\n  );\n\n  IF NULLIF(btrim(NEW.line_key), '') IS NULL THEN\n    NEW.line_key := v_expected_key;\n  ELSIF NEW.line_key IS DISTINCT FROM v_expected_key THEN\n    RAISE EXCEPTION USING\n      ERRCODE = 'P0001',\n      MESSAGE = 'MF_BOOKING_LINE_KEY_MISMATCH',\n      DETAIL = format('expected=%s received=%s', v_expected_key, NEW.line_key);\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_provenance": "QA-SEG-01-20261025/supabase-readonly.json",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": true,
+    "qa_warning": false,
+    "production_warning": false,
+    "prosrc_md5": "e0529d5052325541fa66519eae480ec9",
+    "prosrc_sha256": "c972c166403b74581f0bb3ecdc27154ce55e70c5b5e13d90566bb1facb3c1800",
+    "prosrc": "\nDECLARE\n  v_orden_integrante integer;\n  v_next_order integer;\n  v_occurrence integer;\n  v_expected_key text;\nBEGIN\n  IF TG_OP = 'UPDATE' THEN\n    IF NEW.id_cita IS DISTINCT FROM OLD.id_cita\n       OR NEW.id_servicio IS DISTINCT FROM OLD.id_servicio\n       OR NEW.id_tarifa IS DISTINCT FROM OLD.id_tarifa\n       OR NEW.origen_item_codigo IS DISTINCT FROM OLD.origen_item_codigo\n       OR NEW.orden_linea IS DISTINCT FROM OLD.orden_linea\n       OR NEW.line_key IS DISTINCT FROM OLD.line_key THEN\n      RAISE EXCEPTION USING\n        ERRCODE = 'P0001',\n        MESSAGE = 'MF_BOOKING_LINE_IDENTITY_IMMUTABLE';\n    END IF;\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(c.orden_integrante, 1)\n  INTO v_orden_integrante\n  FROM public.citas c\n  WHERE c.id_cita = NEW.id_cita;\n\n  IF NOT FOUND THEN\n    RAISE EXCEPTION USING\n      ERRCODE = '23503',\n      MESSAGE = 'MF_BOOKING_LINE_APPOINTMENT_NOT_FOUND';\n  END IF;\n\n  IF NEW.orden_linea IS NULL OR NEW.orden_linea < 1 THEN\n    SELECT COALESCE(max(cd.orden_linea), 0) + 1\n    INTO v_next_order\n    FROM public.citas_detalles cd\n    WHERE cd.id_cita = NEW.id_cita;\n    NEW.orden_linea := GREATEST(1, COALESCE(v_next_order, 1));\n  END IF;\n\n  SELECT count(*)::integer + 1\n  INTO v_occurrence\n  FROM public.citas_detalles cd\n  WHERE cd.id_cita = NEW.id_cita\n    AND cd.id_servicio = NEW.id_servicio\n    AND cd.id_tarifa IS NOT DISTINCT FROM NEW.id_tarifa\n    AND cd.origen_item_codigo = NEW.origen_item_codigo;\n\n  v_expected_key := app_private.build_booking_line_key_v1(\n    v_orden_integrante,\n    NEW.id_servicio,\n    NEW.id_tarifa,\n    NEW.origen_item_codigo,\n    v_occurrence\n  );\n\n  IF NULLIF(btrim(NEW.line_key), '') IS NULL THEN\n    NEW.line_key := v_expected_key;\n  ELSIF NEW.line_key IS DISTINCT FROM v_expected_key THEN\n    RAISE EXCEPTION USING\n      ERRCODE = 'P0001',\n      MESSAGE = 'MF_BOOKING_LINE_KEY_MISMATCH',\n      DETAIL = format('expected=%s received=%s', v_expected_key, NEW.line_key);\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "e0529d5052325541fa66519eae480ec9",
+    "prosrc_sha256_lf": "c972c166403b74581f0bb3ecdc27154ce55e70c5b5e13d90566bb1facb3c1800"
+  },
+  {
+    "schema": "public",
+    "name": "fn_hold_defaults_y_unico",
+    "args": "",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_hold_defaults_y_unico()\n RETURNS trigger\n LANGUAGE plpgsql\n SECURITY DEFINER\n SET search_path TO 'pg_catalog', 'public', 'app_private'\nAS $function$\nDECLARE\n  v_existe boolean;\n  v_ahora timestamptz := clock_timestamp();\nBEGIN\n  IF NEW.expires_at IS NULL THEN\n    NEW.expires_at := v_ahora\n      + make_interval(mins => app_private.obtener_hold_ttl_min_v1());\n  END IF;\n\n  IF NEW.expires_at <= v_ahora THEN\n    RAISE EXCEPTION USING\n      ERRCODE = '22023',\n      MESSAGE = 'MF_HOLD_EXPIRY_MUST_BE_FUTURE';\n  END IF;\n\n  IF NEW.expires_at > v_ahora + interval '120 minutes' THEN\n    RAISE EXCEPTION USING\n      ERRCODE = '22023',\n      MESSAGE = 'MF_HOLD_EXPIRY_EXCEEDS_MAXIMUM';\n  END IF;\n\n  IF NEW.estado_hold_codigo IS NULL OR btrim(NEW.estado_hold_codigo) = '' THEN\n    NEW.estado_hold_codigo := 'activo';\n  END IF;\n\n  IF NEW.id_usuario IS NOT NULL\n     AND NEW.estado_hold_codigo = 'activo' THEN\n    PERFORM pg_advisory_xact_lock(\n      hashtextextended('masterfade:active-hold-user:' || NEW.id_usuario::text, 0)\n    );\n\n    PERFORM app_private.expirar_reservas_vencidas_v1(\n      100,\n      v_ahora,\n      NULL,\n      NULL,\n      NULL,\n      NULL,\n      NEW.id_usuario\n    );\n\n    SELECT EXISTS (\n      SELECT 1\n      FROM public.citas_holds h\n      WHERE h.id_usuario = NEW.id_usuario\n        AND h.estado_hold_codigo = 'activo'\n        AND h.expires_at > v_ahora\n        AND h.id_cita <> NEW.id_cita\n    )\n    INTO v_existe;\n\n    IF v_existe THEN\n      RAISE EXCEPTION USING\n        ERRCODE = 'P0001',\n        MESSAGE = 'YA_EXISTE_HOLD_ACTIVO_PARA_USUARIO';\n    END IF;\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_provenance": "QA-SEG-01-20261025/supabase-readonly.json",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": true,
+    "qa_warning": false,
+    "production_warning": false,
+    "prosrc_md5": "cdb2df6f06d291d52b40ae7ebd2a92a7",
+    "prosrc_sha256": "17fb89cc86330e95056f300337132cbb1894076bce063e7a6a6ae2a1c0964bfc",
+    "prosrc": "\nDECLARE\n  v_existe boolean;\n  v_ahora timestamptz := clock_timestamp();\nBEGIN\n  IF NEW.expires_at IS NULL THEN\n    NEW.expires_at := v_ahora\n      + make_interval(mins => app_private.obtener_hold_ttl_min_v1());\n  END IF;\n\n  IF NEW.expires_at <= v_ahora THEN\n    RAISE EXCEPTION USING\n      ERRCODE = '22023',\n      MESSAGE = 'MF_HOLD_EXPIRY_MUST_BE_FUTURE';\n  END IF;\n\n  IF NEW.expires_at > v_ahora + interval '120 minutes' THEN\n    RAISE EXCEPTION USING\n      ERRCODE = '22023',\n      MESSAGE = 'MF_HOLD_EXPIRY_EXCEEDS_MAXIMUM';\n  END IF;\n\n  IF NEW.estado_hold_codigo IS NULL OR btrim(NEW.estado_hold_codigo) = '' THEN\n    NEW.estado_hold_codigo := 'activo';\n  END IF;\n\n  IF NEW.id_usuario IS NOT NULL\n     AND NEW.estado_hold_codigo = 'activo' THEN\n    PERFORM pg_advisory_xact_lock(\n      hashtextextended('masterfade:active-hold-user:' || NEW.id_usuario::text, 0)\n    );\n\n    PERFORM app_private.expirar_reservas_vencidas_v1(\n      100,\n      v_ahora,\n      NULL,\n      NULL,\n      NULL,\n      NULL,\n      NEW.id_usuario\n    );\n\n    SELECT EXISTS (\n      SELECT 1\n      FROM public.citas_holds h\n      WHERE h.id_usuario = NEW.id_usuario\n        AND h.estado_hold_codigo = 'activo'\n        AND h.expires_at > v_ahora\n        AND h.id_cita <> NEW.id_cita\n    )\n    INTO v_existe;\n\n    IF v_existe THEN\n      RAISE EXCEPTION USING\n        ERRCODE = 'P0001',\n        MESSAGE = 'YA_EXISTE_HOLD_ACTIVO_PARA_USUARIO';\n    END IF;\n  END IF;\n\n  RETURN NEW;\nEND;\n",
+    "returns_declaration": "trigger",
+    "prorettype_regtype_snapshot": "trigger",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "cdb2df6f06d291d52b40ae7ebd2a92a7",
+    "prosrc_sha256_lf": "17fb89cc86330e95056f300337132cbb1894076bce063e7a6a6ae2a1c0964bfc"
+  },
+  {
+    "schema": "public",
+    "name": "fn_es_admin_de_sucursal",
+    "args": "uuid, uuid",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_es_admin_de_sucursal(p_uid uuid, p_sucursal uuid)\n RETURNS boolean\n LANGUAGE sql\n STABLE SECURITY DEFINER\n SET search_path TO 'public', 'auth'\nAS $function$\n  SELECT\n    public.fn_is_super_admin(p_uid)\n    OR EXISTS (\n      SELECT 1\n      FROM roles_usuarios ru\n      JOIN roles r ON r.id_rol = ru.id_rol\n      WHERE ru.id_usuario = p_uid\n        AND ru.activo = true\n        AND r.nombre = 'admin'\n        AND ru.id_sucursal = p_sucursal\n    );\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_provenance": "QA-SEG-01-20261025/supabase-readonly.json",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": true,
+    "qa_warning": false,
+    "production_warning": false,
+    "prosrc_md5": "9bad3022eac86ec52bd7902a0fe515f6",
+    "prosrc_sha256": "03f8c3556b26677bf90fb0181da12292e1a1f36e7d76dd81a66f9adab08cc910",
+    "prosrc": "\n  SELECT\n    public.fn_is_super_admin(p_uid)\n    OR EXISTS (\n      SELECT 1\n      FROM roles_usuarios ru\n      JOIN roles r ON r.id_rol = ru.id_rol\n      WHERE ru.id_usuario = p_uid\n        AND ru.activo = true\n        AND r.nombre = 'admin'\n        AND ru.id_sucursal = p_sucursal\n    );\n",
+    "returns_declaration": "boolean",
+    "prorettype_regtype_snapshot": "boolean",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "9bad3022eac86ec52bd7902a0fe515f6",
+    "prosrc_sha256_lf": "03f8c3556b26677bf90fb0181da12292e1a1f36e7d76dd81a66f9adab08cc910"
+  },
+  {
+    "schema": "public",
+    "name": "fn_is_super_admin",
+    "args": "uuid",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_is_super_admin(p_uid uuid)\n RETURNS boolean\n LANGUAGE sql\n STABLE SECURITY DEFINER\n SET search_path TO 'public', 'auth'\nAS $function$\n  SELECT public.fn_has_role(p_uid, 'super_admin');\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_provenance": "QA-SEG-01-20261025/supabase-readonly.json",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": true,
+    "qa_warning": false,
+    "production_warning": false,
+    "prosrc_md5": "478c6d1cd1c85e02fcc87a4a14c93be5",
+    "prosrc_sha256": "8e3b2fbc48584d2af38350ff852ace734ae5e13fdd354437b70f09bbff639277",
+    "prosrc": "\n  SELECT public.fn_has_role(p_uid, 'super_admin');\n",
+    "returns_declaration": "boolean",
+    "prorettype_regtype_snapshot": "boolean",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "478c6d1cd1c85e02fcc87a4a14c93be5",
+    "prosrc_sha256_lf": "8e3b2fbc48584d2af38350ff852ace734ae5e13fdd354437b70f09bbff639277"
+  },
+  {
+    "schema": "public",
+    "name": "fn_has_role",
+    "args": "uuid, text",
+    "kind": "function",
+    "definition": "CREATE OR REPLACE FUNCTION public.fn_has_role(p_uid uuid, p_role_name text)\n RETURNS boolean\n LANGUAGE sql\n STABLE SECURITY DEFINER\n SET search_path TO 'public', 'auth'\nAS $function$\n  SELECT EXISTS (\n    SELECT 1\n    FROM roles_usuarios ru\n    JOIN roles r ON r.id_rol = ru.id_rol\n    WHERE ru.id_usuario = p_uid\n      AND ru.activo = true\n      AND r.nombre = p_role_name\n  );\n$function$\n",
+    "source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+    "owner_snapshot": "postgres",
+    "owner_provenance": "_QA_Certificacion_Local/QA-SEG-01-20261025/supabase-readonly.json",
+    "owner_current_qa": null,
+    "owner_current_production": null,
+    "security_definer_snapshot": true,
+    "qa_warning": false,
+    "production_warning": false,
+    "dependency_target": true,
+    "dependency_of": [
+      "public.fn_is_super_admin(uuid)"
+    ],
+    "change_scope": "search_path only; preserve EXECUTE ACL",
+    "prosrc_md5": "1d9b2c65d020c49ec142a62ed70ee868",
+    "prosrc_sha256": "f5c54d54d6f52ce7958ca58ddae286c829caed37514d1814314a553db3f0c2ae",
+    "prosrc": "\n  SELECT EXISTS (\n    SELECT 1\n    FROM roles_usuarios ru\n    JOIN roles r ON r.id_rol = ru.id_rol\n    WHERE ru.id_usuario = p_uid\n      AND ru.activo = true\n      AND r.nombre = p_role_name\n  );\n",
+    "returns_declaration": "boolean",
+    "prorettype_regtype_snapshot": "boolean",
+    "prokind_snapshot": "f",
+    "prosrc_md5_lf": "1d9b2c65d020c49ec142a62ed70ee868",
+    "prosrc_sha256_lf": "f5c54d54d6f52ce7958ca58ddae286c829caed37514d1814314a553db3f0c2ae",
+    "config_snapshot": [
+      "search_path=public, auth"
+    ],
+    "transitive_dependency_of": [
+      "public.fn_es_admin_de_sucursal(uuid, uuid)"
+    ]
+  }
+]

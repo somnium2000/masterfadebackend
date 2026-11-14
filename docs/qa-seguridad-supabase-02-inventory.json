@@ -1,0 +1,1192 @@
+{
+  "task": "QA-SEGURIDAD-SUPABASE-02",
+  "advisors_observed_at": {
+    "qa": "2026-11-13T23:49:50.675Z",
+    "production": "2026-11-13T23:49:50.847Z"
+  },
+  "provenance_notes": [
+    "Current Advisor output contains names but not argument signatures, owners or function bodies.",
+    "Signatures/bodies use local snapshots from 2026-10-28 plus original local dump for the procedure. Owners are not asserted current.",
+    "Trigger dependency lists are snapshot observations, not exhaustive runtime pg_depend."
+  ],
+  "counts": {
+    "qa_findings": 31,
+    "production_findings": 36,
+    "unique_names_production": 35,
+    "manifest_routines": 36
+  },
+  "routines": [
+    {
+      "schema": "public",
+      "name": "fn_agenda_excepciones_sucursal_bloques_validar_modo",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": null,
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "7eed7db0e9baa4f3929d1cdeb17f79c75542ad5b0caddaa89609506123400de9",
+      "triggers_snapshot": {
+        "qa": [
+          "public.agenda_excepciones_sucursal_bloques:tr_validar_agenda_excepciones_sucursal_bloques_modo"
+        ],
+        "production": [
+          "public.agenda_excepciones_sucursal_bloques:tr_validar_agenda_excepciones_sucursal_bloques_modo"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.agenda_excepciones_sucursal",
+        "public.fn_agenda_excepciones_sucursal_bloques_validar_modo"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_agenda_excepciones_sucursal_validar_compatibilidad",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": null,
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "de26bdc671f3da045685eca0ff370c828745a454b2f49c0c530d6076af9761f9",
+      "triggers_snapshot": {
+        "qa": [
+          "public.agenda_excepciones_sucursal:tr_validar_agenda_excepciones_sucursal"
+        ],
+        "production": [
+          "public.agenda_excepciones_sucursal:tr_validar_agenda_excepciones_sucursal"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.agenda_excepciones_sucursal",
+        "public.agenda_excepciones_sucursal_bloques",
+        "public.fn_agenda_excepciones_sucursal_validar_compatibilidad"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_bloquear_delete_fisico",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "ad850a94fbe9364d76f68cc4626563caefc6f5ebfe8e81f7882e135647b46811",
+      "triggers_snapshot": {
+        "qa": [
+          "public.correos:trg_bloquear_delete_correos",
+          "public.personas:trg_bloquear_delete_personas",
+          "public.usuarios:trg_bloquear_delete_usuarios",
+          "public.roles_usuarios:trg_bloquear_delete_roles_usuarios",
+          "public.empleados:trg_bloquear_delete_empleados"
+        ],
+        "production": [
+          "public.correos:trg_bloquear_delete_correos",
+          "public.personas:trg_bloquear_delete_personas",
+          "public.usuarios:trg_bloquear_delete_usuarios",
+          "public.empleados:trg_bloquear_delete_empleados",
+          "public.roles_usuarios:trg_bloquear_delete_roles_usuarios"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_bloquear_delete_fisico"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_bloquear_persona_cliente_empleado",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "4ead4a7b86d453251b5d017e914dde9aca7c0e0bb70465b8ef0e3f8ab2f312d0",
+      "triggers_snapshot": {
+        "qa": [
+          "public.clientes:trg_bloquear_persona_empleado_en_clientes",
+          "public.empleados:trg_bloquear_persona_cliente_en_empleados"
+        ],
+        "production": [
+          "public.empleados:trg_bloquear_persona_cliente_en_empleados",
+          "public.clientes:trg_bloquear_persona_empleado_en_clientes"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.clientes",
+        "public.empleados",
+        "public.fn_bloquear_persona_cliente_empleado"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_citas_grupos_set_defaults",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "cb136c34c50e997e9681f09bc7e23bfed25a9b1bbfdfe6800d480832d2b68ea6",
+      "triggers_snapshot": {
+        "qa": [
+          "public.citas_grupos:tr_citas_grupos_set_defaults"
+        ],
+        "production": [
+          "public.citas_grupos:tr_citas_grupos_set_defaults"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_citas_grupos_set_defaults"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_citas_integrantes_set_updated_at",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "9d90a0579f9e82e99e37bedb4caf681474cf842450fbcfca45413b73bd285607",
+      "triggers_snapshot": {
+        "qa": [
+          "public.citas_integrantes:tr_citas_integrantes_set_updated_at"
+        ],
+        "production": [
+          "public.citas_integrantes:tr_citas_integrantes_set_updated_at"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_citas_integrantes_set_updated_at"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_citas_integrantes_validate_limits",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "23560ef6f7bb85fd024d2331b6727053f7e70a98c8fedec66064dc66799e68ef",
+      "triggers_snapshot": {
+        "qa": [
+          "public.citas_integrantes:tr_citas_integrantes_validate_limits"
+        ],
+        "production": [
+          "public.citas_integrantes:tr_citas_integrantes_validate_limits"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.citas_integrantes",
+        "public.fn_citas_integrantes_validate_limits"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_citas_set_integrante_from_legacy",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "75adc5a7e61f1bee3bbd47b87eaafcce582bb5c184bdb992d6fada9b9982e7a6",
+      "triggers_snapshot": {
+        "qa": [
+          "public.citas:tr_citas_set_integrante_from_legacy"
+        ],
+        "production": [
+          "public.citas:tr_citas_set_integrante_from_legacy"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.citas_integrantes",
+        "public.clientes",
+        "public.fn_citas_set_integrante_from_legacy",
+        "public.usuarios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_comprobantes_agendamiento_set_defaults",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "ba60edb0b4c9c360324330cda7e62df2bb82c3b92b74cb1668ea4133f7006265",
+      "triggers_snapshot": {
+        "qa": [
+          "public.comprobantes_agendamiento:tr_comprobantes_agendamiento_set_defaults"
+        ],
+        "production": [
+          "public.comprobantes_agendamiento:tr_comprobantes_agendamiento_set_defaults"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_comprobantes_agendamiento_set_defaults"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_comprobantes_destinatarios_set_updated_at",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "262d83ebafe5941868b01d268841c782dfa7f0cf0afe78b7ec3ee941e60ed4d7",
+      "triggers_snapshot": {
+        "qa": [
+          "public.comprobantes_agendamiento_destinatarios:tr_comprobantes_destinatarios_set_updated_at"
+        ],
+        "production": [
+          "public.comprobantes_agendamiento_destinatarios:tr_comprobantes_destinatarios_set_updated_at"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_comprobantes_destinatarios_set_updated_at"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_desactivar_tarifas_base_de_servicio",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "866693436b6493d3d3f45701e11d68db5473bb7b5ae9dec7b7c70cae99c9bab6",
+      "triggers_snapshot": {
+        "qa": [
+          "public.servicios:trg_desactivar_tarifas_base_de_servicio"
+        ],
+        "production": [
+          "public.servicios:trg_desactivar_tarifas_base_de_servicio"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_desactivar_tarifas_base_de_servicio",
+        "public.servicios_tarifas"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_facturas_set_updated_at",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "ab54d3b39df7d757bd277deb8ea64a4b903fdd72a3dc129f68498e368a9211ac",
+      "triggers_snapshot": {
+        "qa": [
+          "public.facturas:tr_facturas_set_updated_at"
+        ],
+        "production": [
+          "public.facturas:tr_facturas_set_updated_at"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_facturas_set_updated_at"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_guardar_desactivacion_servicio",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "953fdd3585f96a0fe8010c621ec0ec22b7198c489a1b782a18a19bf981664f8b",
+      "triggers_snapshot": {
+        "qa": [
+          "public.servicios:trg_guardar_desactivacion_servicio"
+        ],
+        "production": [
+          "public.servicios:trg_guardar_desactivacion_servicio"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_guardar_desactivacion_servicio",
+        "public.paquetes",
+        "public.paquetes_detalles",
+        "public.points_rule_services",
+        "public.points_rules"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_marcar_no_show",
+      "identity_arguments": "integer, integer",
+      "kind": "procedure",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "database/BD-PG.sql schema-only extraction",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "38dd3473465e06484b634cd9d4cfea7e12b1254daa507168e43703ca2a85bdca",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.fn_marcar_no_show"
+      ],
+      "returns_declaration": null,
+      "prorettype_regtype_snapshot": "void",
+      "prokind_snapshot": "p"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_estado_final_cita",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "d08c934db738bc899d5a580faefa94fb22d9210afdbca88bb2e005250e15e10e",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.estados_cita",
+        "public.fn_points_estado_final_cita"
+      ],
+      "returns_declaration": "text",
+      "prorettype_regtype_snapshot": "text",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_get_effective_rule",
+      "identity_arguments": "uuid",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "2c67a2a8c6b91afb72494498b1054b7936d2ff1f5dde8a4d956132929e214bd0",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.fn_points_get_effective_rule",
+        "public.points_rules"
+      ],
+      "returns_declaration": "TABLE(id_rule uuid, id_sucursal uuid, umbral_monto_hnl numeric, puntos_por_cita integer, puntos_para_premio integer, expiracion_meses integer, activo boolean)",
+      "prorettype_regtype_snapshot": "record",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_get_or_create_active_cycle",
+      "identity_arguments": "uuid, integer, timestamp with time zone",
+      "kind": "function",
+      "observed_search_path_warning_qa": false,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "faf79a247ea2d09d808a39e901f5556590f5b87fab06d403c407414b6e3a3605",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.fn_points_get_or_create_active_cycle",
+        "public.fn_points_materialize_expired_cycles",
+        "public.points_cycles"
+      ],
+      "returns_declaration": "TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)",
+      "prorettype_regtype_snapshot": "record",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_get_or_create_active_cycle",
+      "identity_arguments": "uuid, timestamp with time zone",
+      "kind": "function",
+      "observed_search_path_warning_qa": false,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "053b816b6fdb017dd4b5cf7043dd10603cb8fa18c2afec97c95452ff301793ed",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.fn_points_get_or_create_active_cycle",
+        "public.points_cycles"
+      ],
+      "returns_declaration": "TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)",
+      "prorettype_regtype_snapshot": "record",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_materialize_expired_cycles",
+      "identity_arguments": "uuid",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "d1f5d867b908d56299c12c074ffcf8810ffe7a83ed580be0e80edeb4cb437965",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.fn_points_materialize_expired_cycles",
+        "public.points_cycles",
+        "public.points_transactions"
+      ],
+      "returns_declaration": "integer",
+      "prorettype_regtype_snapshot": "integer",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_tx_apply_tipo_sign",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "74a47ca446590de362adc3c9c31b90dd64cf22e0870e7f826215f6dd7845282c",
+      "triggers_snapshot": {
+        "qa": [
+          "public.points_transactions:tr_points_tx_apply_tipo_sign"
+        ],
+        "production": [
+          "public.points_transactions:tr_points_tx_apply_tipo_sign"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_points_tx_apply_tipo_sign",
+        "public.tipos_puntos"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_points_tx_guard_acumular_final",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": false,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "d9341f3a23a8d431f2548f7b1c26d483c79d1701df2f990bdb91a9b56cf02cc6",
+      "triggers_snapshot": {
+        "qa": [
+          "public.points_transactions:tr_points_tx_guard_acumular_final"
+        ],
+        "production": [
+          "public.points_transactions:tr_points_tx_guard_acumular_final"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.citas",
+        "public.fn_points_estado_final_cita",
+        "public.fn_points_tx_guard_acumular_final"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_prevent_block_protected_correo",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": null,
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "f10c238bdd14fbeca3f2f0546fd243590ebe4d880f7fa1dd134f2962ff1ad975",
+      "triggers_snapshot": {
+        "qa": [
+          "public.correos:tr_prevent_block_protected_correo"
+        ],
+        "production": [
+          "public.correos:tr_prevent_block_protected_correo"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.app_protected_users",
+        "public.fn_prevent_block_protected_correo",
+        "public.usuarios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_prevent_block_protected_persona",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": null,
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "605f5ca073ae621a0207d3e77c92947e92d22a6829c3712c42e018beafd779d2",
+      "triggers_snapshot": {
+        "qa": [
+          "public.personas:tr_prevent_block_protected_persona"
+        ],
+        "production": [
+          "public.personas:tr_prevent_block_protected_persona"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.app_protected_users",
+        "public.fn_prevent_block_protected_persona",
+        "public.usuarios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_prevent_block_protected_role",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": null,
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "5d87246200681c764fb9d611387c7b45acd247bece6dbf3e3ca9ddac37f11440",
+      "triggers_snapshot": {
+        "qa": [
+          "public.roles_usuarios:tr_prevent_block_protected_role"
+        ],
+        "production": [
+          "public.roles_usuarios:tr_prevent_block_protected_role"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.app_protected_users",
+        "public.fn_prevent_block_protected_role",
+        "public.roles"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_prevent_block_protected_usuario",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": null,
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "570a442034ded483cad7beb79c049e081e41af48c57cf5a0073372901ae4df25",
+      "triggers_snapshot": {
+        "qa": [
+          "public.usuarios:tr_prevent_block_protected_usuario"
+        ],
+        "production": [
+          "public.usuarios:tr_prevent_block_protected_usuario"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.app_protected_users",
+        "public.fn_prevent_block_protected_usuario"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_set_updated_at",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "dbe2f6b546a8b807961fa42688af20f4f611e5d46eee30ab4e603dc23326a198",
+      "triggers_snapshot": {
+        "qa": [
+          "public.points_transactions:tr_set_updated_at_points_transactions",
+          "public.citas_holds:tr_set_updated_at_citas_holds",
+          "public.points_rules:tr_set_updated_at_points_rules",
+          "public.payments:tr_set_updated_at_payments",
+          "public.payment_intents:tr_set_updated_at_payment_intents",
+          "public.citas_reagendaciones:tr_set_updated_at_citas_reagendaciones",
+          "public.archivos:tr_set_updated_at_archivos",
+          "public.correos:tr_set_updated_at_correos",
+          "public.personas:tr_set_updated_at_personas",
+          "public.payment_providers:tr_set_updated_at_payment_providers",
+          "public.points_legacy_migrations:tr_set_updated_at_points_legacy_migrations",
+          "public.roles:tr_set_updated_at_roles",
+          "public.permisos:tr_set_updated_at_permisos",
+          "public.pantallas:tr_set_updated_at_pantallas",
+          "public.roles_pantallas_permisos:tr_set_updated_at_roles_pantallas_permisos",
+          "public.usuarios:tr_set_updated_at_usuarios",
+          "public.membership_purchase_orders:tr_set_updated_at_membership_purchase_orders",
+          "public.subscription_payments:tr_set_updated_at_subscription_payments",
+          "public.subscriptions:tr_set_updated_at_subscriptions",
+          "public.notificaciones_email:tr_set_updated_at_notificaciones_email",
+          "public.points_cycles:tr_set_updated_at_points_cycles",
+          "public.horarios_semanales_sucursales:tr_set_updated_at_horarios_semanales_sucursales",
+          "public.horarios_semanales_sucursales_bloques:tr_set_updated_at_horarios_semanales_sucursales_bloques",
+          "public.bloqueos_agenda:tr_set_updated_at_bloqueos_agenda",
+          "public.paquetes_detalles:tr_set_updated_at_paquetes_detalles",
+          "public.servicios:tr_set_updated_at_servicios",
+          "public.cortesias:tr_set_updated_at_cortesias",
+          "public.cortesias_sucursales:tr_set_updated_at_cortesias_sucursales",
+          "public.citas:tr_set_updated_at_citas",
+          "public.agenda_excepciones_sucursal:tr_set_updated_at_agenda_excepciones_sucursal",
+          "public.agenda_excepciones_sucursal_bloques:tr_set_updated_at_agenda_excepciones_sucursal_bloques",
+          "public.agenda_bloqueos_empleados:tr_set_updated_at_agenda_bloqueos_empleados",
+          "public.citas_grupos:tr_set_updated_at_citas_grupos",
+          "public.membership_plans:tr_set_updated_at_membership_plans",
+          "public.citas_detalles:tr_set_updated_at_citas_detalles",
+          "public.storage_assets:tr_set_updated_at_storage_assets",
+          "public.servicios_tarifas:tr_set_updated_at_servicios_tarifas",
+          "public.horarios_semanales_empleados:tr_set_updated_at_horarios_semanales_empleados",
+          "public.parametros_sucursal:tr_set_updated_at_parametros_sucursal",
+          "public.parametros_sistema:tr_set_updated_at_parametros_sistema",
+          "public.sucursales:tr_set_updated_at_sucursales",
+          "public.empresas:tr_set_updated_at_empresas",
+          "public.roles_usuarios:tr_set_updated_at_roles_usuarios",
+          "public.clientes:tr_set_updated_at_clientes",
+          "public.paquetes:tr_set_updated_at_paquetes",
+          "public.empleados:tr_set_updated_at_empleados"
+        ],
+        "production": [
+          "public.agenda_excepciones_sucursal:tr_set_updated_at_agenda_excepciones_sucursal",
+          "public.agenda_excepciones_sucursal_bloques:tr_set_updated_at_agenda_excepciones_sucursal_bloques",
+          "public.agenda_bloqueos_empleados:tr_set_updated_at_agenda_bloqueos_empleados",
+          "public.points_transactions:tr_set_updated_at_points_transactions",
+          "public.citas_holds:tr_set_updated_at_citas_holds",
+          "public.points_rules:tr_set_updated_at_points_rules",
+          "public.payments:tr_set_updated_at_payments",
+          "public.citas_reagendaciones:tr_set_updated_at_citas_reagendaciones",
+          "public.archivos:tr_set_updated_at_archivos",
+          "public.correos:tr_set_updated_at_correos",
+          "public.personas:tr_set_updated_at_personas",
+          "public.payment_providers:tr_set_updated_at_payment_providers",
+          "public.points_legacy_migrations:tr_set_updated_at_points_legacy_migrations",
+          "public.roles:tr_set_updated_at_roles",
+          "public.permisos:tr_set_updated_at_permisos",
+          "public.pantallas:tr_set_updated_at_pantallas",
+          "public.roles_pantallas_permisos:tr_set_updated_at_roles_pantallas_permisos",
+          "public.membership_purchase_orders:tr_set_updated_at_membership_purchase_orders",
+          "public.usuarios:tr_set_updated_at_usuarios",
+          "public.subscription_payments:tr_set_updated_at_subscription_payments",
+          "public.subscriptions:tr_set_updated_at_subscriptions",
+          "public.notificaciones_email:tr_set_updated_at_notificaciones_email",
+          "public.points_cycles:tr_set_updated_at_points_cycles",
+          "public.payment_intents:tr_set_updated_at_payment_intents",
+          "public.horarios_semanales_sucursales:tr_set_updated_at_horarios_semanales_sucursales",
+          "public.horarios_semanales_sucursales_bloques:tr_set_updated_at_horarios_semanales_sucursales_bloques",
+          "public.bloqueos_agenda:tr_set_updated_at_bloqueos_agenda",
+          "public.paquetes_detalles:tr_set_updated_at_paquetes_detalles",
+          "public.servicios:tr_set_updated_at_servicios",
+          "public.cortesias:tr_set_updated_at_cortesias",
+          "public.cortesias_sucursales:tr_set_updated_at_cortesias_sucursales",
+          "public.citas:tr_set_updated_at_citas",
+          "public.citas_grupos:tr_set_updated_at_citas_grupos",
+          "public.membership_plans:tr_set_updated_at_membership_plans",
+          "public.citas_detalles:tr_set_updated_at_citas_detalles",
+          "public.storage_assets:tr_set_updated_at_storage_assets",
+          "public.servicios_tarifas:tr_set_updated_at_servicios_tarifas",
+          "public.horarios_semanales_empleados:tr_set_updated_at_horarios_semanales_empleados",
+          "public.empleados:tr_set_updated_at_empleados",
+          "public.parametros_sucursal:tr_set_updated_at_parametros_sucursal",
+          "public.parametros_sistema:tr_set_updated_at_parametros_sistema",
+          "public.sucursales:tr_set_updated_at_sucursales",
+          "public.empresas:tr_set_updated_at_empresas",
+          "public.roles_usuarios:tr_set_updated_at_roles_usuarios",
+          "public.clientes:tr_set_updated_at_clientes",
+          "public.paquetes:tr_set_updated_at_paquetes"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_set_updated_at"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_trg_otorgar_puntos_plan_confirmada",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": false,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "0e67e75f2d07c1122baed6dc3b93c2cdb7a022b3f0cbf43312df19fe393a4f6e",
+      "triggers_snapshot": {
+        "qa": [],
+        "production": []
+      },
+      "explicit_schema_references": [
+        "public.fn_trg_otorgar_puntos_plan_confirmada"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_trg_otorgar_puntos_por_cita",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": false,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "b56094178b1be3fa6fe98115f746fb3867c112c9c3fc5da2e4b979cb121d1960",
+      "triggers_snapshot": {
+        "qa": [
+          "public.citas:tr_points_cita_confirmada"
+        ],
+        "production": [
+          "public.citas:tr_points_cita_confirmada"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.clientes",
+        "public.fn_points_estado_final_cita",
+        "public.fn_points_get_or_create_active_cycle",
+        "public.fn_trg_otorgar_puntos_por_cita",
+        "public.points_rules",
+        "public.points_transactions"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_trg_roles_usuarios_unicidad_scope",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "537bb8c34ce3bee345002247398fd3cdd0b23bb481acef3963b7a928fe76806d",
+      "triggers_snapshot": {
+        "qa": [
+          "public.roles_usuarios:tr_ru_unicidad_scope"
+        ],
+        "production": [
+          "public.roles_usuarios:tr_ru_unicidad_scope"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_trg_roles_usuarios_unicidad_scope",
+        "public.roles",
+        "public.roles_usuarios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_trg_validar_cliente_persona_en_cita",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "64ce8f138dcda8f3d7144a220bbbca0a5d960236db7902bc0231d4f5cb497e5c",
+      "triggers_snapshot": {
+        "qa": [
+          "public.citas:tr_citas_validar_cliente_persona"
+        ],
+        "production": [
+          "public.citas:tr_citas_validar_cliente_persona"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_trg_validar_cliente_persona_en_cita"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_validar_paquete_activo_minimo_servicios",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "aa06f4aa0ee1d0339ba2454f1c14eeaacb51ed29f66aa321100b496208d39d69",
+      "triggers_snapshot": {
+        "qa": [
+          "public.paquetes_detalles:trg_validar_paquete_activo_minimo_servicios_en_detalles",
+          "public.paquetes:trg_validar_paquete_activo_minimo_servicios_en_paquetes"
+        ],
+        "production": [
+          "public.paquetes_detalles:trg_validar_paquete_activo_minimo_servicios_en_detalles",
+          "public.paquetes:trg_validar_paquete_activo_minimo_servicios_en_paquetes"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_validar_paquete_activo_minimo_servicios",
+        "public.paquetes",
+        "public.paquetes_detalles",
+        "public.servicios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_validar_paquete_activo_sin_servicios_inactivos",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "36608cdcc39ea5743bec591cb04df750ea468f1e56a446068afc3303aad75e83",
+      "triggers_snapshot": {
+        "qa": [
+          "public.paquetes_detalles:trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles",
+          "public.paquetes:trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes"
+        ],
+        "production": [
+          "public.paquetes_detalles:trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles",
+          "public.paquetes:trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_validar_paquete_activo_sin_servicios_inactivos",
+        "public.paquetes",
+        "public.paquetes_detalles",
+        "public.servicios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_validar_persona_empleado_campos_obligatorios",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "d01fdf1877797dee43cba2abdb0b2a172a6522094287544903c469a0452da06c",
+      "triggers_snapshot": {
+        "qa": [
+          "public.personas:trg_validar_empleado_campos_obligatorios_personas",
+          "public.empleados:trg_validar_empleado_campos_obligatorios_empleados"
+        ],
+        "production": [
+          "public.personas:trg_validar_empleado_campos_obligatorios_personas",
+          "public.empleados:trg_validar_empleado_campos_obligatorios_empleados"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.empleados",
+        "public.fn_validar_persona_empleado_campos_obligatorios",
+        "public.personas"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "fn_validar_servicio_activo_con_tarifa_base",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "695a3d24a3bcdd874a34061db92808e767917e3531689398826d4112d0fc0926",
+      "triggers_snapshot": {
+        "qa": [
+          "public.servicios:trg_validar_servicio_activo_con_tarifa_en_servicios",
+          "public.servicios_tarifas:trg_validar_servicio_activo_con_tarifa_en_tarifas"
+        ],
+        "production": [
+          "public.servicios:trg_validar_servicio_activo_con_tarifa_en_servicios",
+          "public.servicios_tarifas:trg_validar_servicio_activo_con_tarifa_en_tarifas"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.fn_validar_servicio_activo_con_tarifa_base",
+        "public.servicios",
+        "public.servicios_tarifas"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "set_current_timestamp_updated_at",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "1e2a645dd24951cb2ba4d498eb2230781dce37b446e3e3a007c82cae5a7bb172",
+      "triggers_snapshot": {
+        "qa": [
+          "public.barberos_perfiles_publicos:trg_barberos_perfiles_publicos_updated_at"
+        ],
+        "production": [
+          "public.barberos_perfiles_publicos:trg_barberos_perfiles_publicos_updated_at"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.set_current_timestamp_updated_at"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    },
+    {
+      "schema": "public",
+      "name": "validate_membership_plan_beneficios",
+      "identity_arguments": "",
+      "kind": "function",
+      "observed_search_path_warning_qa": true,
+      "observed_search_path_warning_production": true,
+      "definition_source": "_ADMIN-DATA-ENTRY-20261028/sql-validation/prod-functions.json",
+      "owner_local_dump": "postgres",
+      "owner_current_qa": null,
+      "owner_current_production": null,
+      "security_definer_snapshot": false,
+      "config_snapshot": null,
+      "definition_sha256": "aaf946a9323ec1078068da0787fd278eda2cf01fcee01a3f036e381005e36e82",
+      "triggers_snapshot": {
+        "qa": [
+          "public.membership_plans:trg_validate_plan_beneficios"
+        ],
+        "production": [
+          "public.membership_plans:trg_validate_plan_beneficios"
+        ]
+      },
+      "explicit_schema_references": [
+        "public.validate_membership_plan_beneficios"
+      ],
+      "returns_declaration": "trigger",
+      "prorettype_regtype_snapshot": "trigger",
+      "prokind_snapshot": "f"
+    }
+  ]
+}
