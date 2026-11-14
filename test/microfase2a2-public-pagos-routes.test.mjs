@@ -495,6 +495,7 @@ function createPagosClient({
           referencia_externa: null,
           idempotency_key: params[5],
           expires_at: params[6],
+          created_by_usuario_id: params[7],
           monto_hnl: "115.00",
           moneda_codigo: "HNL",
           estado_intent_codigo: "creado",
@@ -770,10 +771,17 @@ async function createPagosApp(client, {
       return connectFactory ? connectFactory() : client;
     },
     async query(sql, params = []) {
+      if (privatePilot?.publicCommerce && sql.includes("FROM public.clientes c") && sql.includes("c.anonimizado")) {
+        return { rows: params[0] === CLIENT_A && params[1] === USER_A && params[2] === USER_A
+          ? [{ id_cliente: CLIENT_A }] : [] };
+      }
       return client.query(sql, params);
     },
   });
-  if (privatePilot) app.pilotRequest = await installPrivatePilot(app, privatePilot.t, { userId: USER_A, clientId: CLIENT_A });
+  if (privatePilot?.publicCommerce) app.config.publicCommerce = privatePilot.publicCommerce;
+  if (privatePilot) app.pilotRequest = await installPrivatePilot(app, privatePilot.t, {
+    userId: USER_A, clientId: CLIENT_A, enabled: privatePilot.enabled ?? true,
+  });
   await app.register(publicPagosRoutes, {
     prefix: authenticated ? "/v1/pagos/reservas" : "/v1/public/pagos",
     authenticated,
@@ -802,6 +810,40 @@ test("private pilot: crear intent y Sale verificada confirman la reserva una sol
   await app.inject({ ...app.pilotRequest, method: "POST", url: "/v1/public/pagos/pixelpay/sale", payload });
   assert.equal(provider.saleCalls, 1);
   assert.equal(client.getPayments().length, 1);
+});
+
+test("public booking sin piloto usa pago autenticado y rechaza otro titular sin segundo cobro", async t => {
+  const provider = { saleCalls: 0, async sale() { this.saleCalls++; return {
+    outcome: "approved", paymentUuid: "P-PUBLIC-OWNED", transactionId: "TX-PUBLIC-OWNED",
+    paymentHashValid: true, amountMatches: true,
+  }; } };
+  const client = createPagosClient({ providerCode: "pixelpay", groupClientId: CLIENT_A,
+    groupPersonId: USER_A, groupUserId: USER_A, groupOrigin: "cliente_autenticado" });
+  const app = await createPagosApp(client, { providerCode: "pixelpay", providerAdapter: provider, authenticated: true,
+    privatePilot: { t, enabled: false, publicCommerce: { bookingEnabled: true, vipPurchaseEnabled: false } } });
+  t.after(() => app.close());
+  const created = await app.inject({ ...app.pilotRequest, method: "POST",
+    url: "/v1/pagos/reservas/crear-intent", payload: publicIntentPayload() });
+  assert.equal(created.statusCode, 201, created.body);
+  const payload = { ...pixelPaySalePayload(), id_intent: created.json().data.id_intent };
+  const paid = await app.inject({ ...app.pilotRequest, method: "POST", url: "/v1/pagos/reservas/pixelpay/sale", payload });
+  assert.equal(paid.statusCode, 200, paid.body);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getGroupState()[0].estado_cita_codigo, "confirmada");
+  await app.inject({ ...app.pilotRequest, method: "POST", url: "/v1/pagos/reservas/pixelpay/sale", payload });
+  assert.equal(provider.saleCalls, 1);
+  assert.equal(client.getPayments().length, 1);
+
+  const foreign = createPagosClient({ providerCode: "pixelpay", groupClientId: CLIENT_A,
+    groupPersonId: USER_A, groupUserId: CITA_B, groupOrigin: "cliente_autenticado" });
+  const otherApp = await createPagosApp(foreign, { providerCode: "pixelpay", providerAdapter: provider, authenticated: true,
+    privatePilot: { t, enabled: false, publicCommerce: { bookingEnabled: true, vipPurchaseEnabled: false } } });
+  t.after(() => otherApp.close());
+  const denied = await otherApp.inject({ ...otherApp.pilotRequest, method: "POST",
+    url: "/v1/pagos/reservas/crear-intent", payload: publicIntentPayload() });
+  assert.equal(denied.statusCode, 403, denied.body);
+  assert.equal(foreign.getPayments().length, 0);
+  assert.equal(provider.saleCalls, 1);
 });
 
 function assertStatusTransportCorrelation(logs, requestId, httpStatus) {

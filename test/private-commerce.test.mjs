@@ -94,7 +94,7 @@ test("authorized session and direct IP reach guarded handler; roles alone cannot
   assert.equal(response.statusCode, 200);
   assert.equal(f.state.business, 1);
   const eligibility = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: IP, headers: f.headers() });
-  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: true });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: true, publicBooking: false, publicVipPurchase: false });
   assert.match(eligibility.headers["cache-control"], /no-store/);
   const validation = await f.app.inject({ method: "POST", url: "/v1/public/pagos/pixelpay/sale", remoteAddress: IP, headers: f.headers(), payload: {} });
   assert.equal(validation.statusCode, 400);
@@ -121,7 +121,7 @@ test("eligibility is false for guests, other accounts and owners without a valid
       const response = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: IP,
         headers: scenario === "guest" ? {} : f.headers(scenario === "other-user" ? OTHER : USER) });
       assert.equal(response.statusCode, 200, response.body);
-      assert.deepEqual(response.json().data, { booking: false, vipPurchase: false });
+      assert.deepEqual(response.json().data, { booking: false, vipPurchase: false, publicBooking: false, publicVipPurchase: false });
       assert.match(response.headers["cache-control"], /no-store/);
       const denial = await f.app.inject({ method: "POST", url: "/v1/public/pagos/crear-intent", remoteAddress: IP,
         headers: scenario === "guest" ? {} : f.headers(scenario === "other-user" ? OTHER : USER), payload: {} });
@@ -145,11 +145,11 @@ test("proxy eligibility probe never creates business data and ignores spoofed ex
     const response = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: peer,
       headers: { ...f.headers(owner ? USER : OTHER), "x-forwarded-for": forwarded, "x-real-ip": IP, forwarded: `for=${IP}` } });
     assert.equal(response.statusCode, 200, response.body);
-    assert.deepEqual(response.json().data, { booking: expected, vipPurchase: expected });
+    assert.deepEqual(response.json().data, { booking: expected, vipPurchase: expected, publicBooking: false, publicVipPurchase: false });
   }
   const guest = await f.app.inject({ url: "/v1/commerce/eligibility", remoteAddress: "10.0.0.2", headers: { "x-forwarded-for": IP } });
   assert.equal(guest.statusCode, 200, guest.body);
-  assert.deepEqual(guest.json().data, { booking: false, vipPurchase: false });
+  assert.deepEqual(guest.json().data, { booking: false, vipPurchase: false, publicBooking: false, publicVipPurchase: false });
   assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
   assert.equal(providerCalls, 0);
 });
