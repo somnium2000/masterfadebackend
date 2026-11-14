@@ -1,4 +1,5 @@
 import PixelPaySdk from "@pixelpay/sdk-core";
+import { createPixelPayNodeSaleTransaction, classifyPixelPaySaleRuntimeError, sanitizePixelPaySaleRuntimeDiagnostics } from "./pixelPaySaleRuntime.js";
 import { capturePixelPayStatusShape, emitPixelPayStatusShape } from "./pixelPayStatusShapeProbe.js";
 import { createHash } from "node:crypto";
 import { PaymentProvider } from "./PaymentProvider.js";
@@ -242,6 +243,17 @@ function responseSuccess(response) {
   return typeof response?.success === "boolean" ? response.success : null;
 }
 
+function readSafeSaleHttpMetadata(source, execution) {
+  // AM: Un null de una respuesta observada es definitivo; el fallback legacy tambien pasa por la allowlist.
+  const metadata = readPixelPayHttpMetadata(source);
+  const safe = sanitizePixelPaySaleRuntimeDiagnostics(execution?.httpResponseReceived === true ? execution : {
+    statusCode: source?.statusCode ?? metadata.statusCode,
+    upstreamContentType: source?.upstreamContentType ?? metadata.contentType,
+    cfRay: source?.cfRay ?? metadata.cfRay,
+  });
+  return { statusCode: safe.statusCode, contentType: safe.upstreamContentType, cfRay: safe.cfRay };
+}
+
 export function classifySdkFailureMessage(response) {
   if (responseStatus(response) === 408 || safeClassName(response) === "TimeoutResponse") {
     return "SDK_UPSTREAM_TIMEOUT";
@@ -300,6 +312,7 @@ export class PixelPaySdkError extends Error {
     cardExpireFuture = null,
     billingAddressLength = null,
     providerDiagnostics = null,
+    runtimeDiagnostics = null,
   } = {}) {
     super(message);
     this.name = "PixelPaySdkError";
@@ -325,6 +338,7 @@ export class PixelPaySdkError extends Error {
       ? billingAddressLength
       : null;
     this.providerDiagnostics = providerDiagnostics;
+    this.runtimeDiagnostics = runtimeDiagnostics;
   }
 }
 
@@ -358,7 +372,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     this.sdk.Services.Transaction.withConcurrency();
   }
 
-  createTransaction(signature) {
+  createTransaction(signature, { sale = false } = {}) {
     const settings = new this.sdk.Models.Settings();
     if (this.env === "sandbox") {
       settings.setupSandbox();
@@ -371,7 +385,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
       settings.setupEnvironment("live");
     }
     settings.setupHeaders({ "x-client-signature": signature });
-    return new this.sdk.Services.Transaction(settings);
+    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings)
+      : new this.sdk.Services.Transaction(settings);
   }
 
   static sha512(value) {
@@ -499,7 +514,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     }
   }
 
-  readTransactionResult(response) {
+  readTransactionResult(response, onParseError) {
     const TransactionResult = this.sdk.Entities.TransactionResult;
     const valid = TransactionResult.validateResponse(response) === true;
     const dataPresent = Boolean(objectOrNull(response?.data));
@@ -509,13 +524,14 @@ export class PixelPaySdkProvider extends PaymentProvider {
     try {
       const result = objectOrNull(TransactionResult.fromResponse(response));
       return { result, valid, dataPresent, parsed: Boolean(result) };
-    } catch {
+    } catch (error) {
+      onParseError?.(error);
       return { result: null, valid, dataPresent, parsed: false };
     }
   }
 
   async sale(input = {}, telemetryContext = {}) {
-    const attempt = createPixelPaySaleAttempt({ ...input, ...telemetryContext });
+    const attempt = createPixelPaySaleAttempt({ ...input, ...telemetryContext, env: this.env });
     const logger = telemetryContext.logger;
     const startedAt = Date.now();
     const referenceDate = this.now();
@@ -524,6 +540,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
 
     let response;
     let transaction;
+    let sdkInvoked = false;
     try {
       const signature = createPixelPaySaleSignature({
         secretKey: this.secretKey,
@@ -531,34 +548,39 @@ export class PixelPaySdkProvider extends PaymentProvider {
         orderId: input.orderId,
         appUrl: this.appUrl,
       });
-      transaction = this.createTransaction(signature);
+      transaction = this.createTransaction(signature, { sale: true });
       const saleRequest = this.buildSaleRequest(input, referenceDate);
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
         durationMs: Date.now() - startedAt,
         ...inputDiagnostics,
       });
+      sdkInvoked = true;
       response = await transaction.doSale(saleRequest);
+      return this.completeSaleResponse(input, attempt, logger, startedAt, inputDiagnostics, transaction, response);
     } catch (error) {
-      const metadata = readPixelPayHttpMetadata(error);
-      const errorConstructorName = safeClassName(error);
-      const errorName = safeIdentifier(error?.name);
-      const classifiedFailure = classifySdkFailureMessage(error);
+      const execution = sdkInvoked ? transaction?.getSaleExecutionDiagnostics?.() : {
+          executionPhase: "request_construction", httpResponseReceived: false, requestMayHaveBeenSent: false,
+        };
+      const metadata = readSafeSaleHttpMetadata(error, execution);
+      const runtimeDiagnostics = classifyPixelPaySaleRuntimeError(error, execution);
+      const { errorConstructorName, errorName } = runtimeDiagnostics;
       const safeMessageCode = error instanceof PixelPaySdkError
         ? error.code
-        : classifiedFailure === "SDK_HTTP_TIMEOUT" ? classifiedFailure : "SDK_NETWORK_ERROR";
+        : runtimeDiagnostics.safeMessageCode;
       const details = {
+        ...runtimeDiagnostics,
         durationMs: Date.now() - startedAt,
-        statusCode: error?.statusCode ?? metadata.statusCode,
+        statusCode: runtimeDiagnostics.statusCode ?? error?.statusCode ?? metadata.statusCode,
         responseClass: error?.responseClass,
         errorName,
         errorConstructorName,
         sdkErrorName: error?.sdkErrorName ?? errorConstructorName,
         safeMessageCode,
-        outcome: error?.uncertain === false
+        outcome: error instanceof PixelPaySdkError && error.uncertain === false && !sdkInvoked
           ? PIXELPAY_SALE_OUTCOME.REQUEST_ERROR_DEFINITIVE
           : PIXELPAY_SALE_OUTCOME.UNCERTAIN,
-        contentType: error?.upstreamContentType ?? metadata.contentType,
-        cfRay: error?.cfRay ?? metadata.cfRay,
+        contentType: metadata.contentType,
+        cfRay: metadata.cfRay,
         cardExpireFormatValid: error?.cardExpireFormatValid ?? inputDiagnostics.cardExpireFormatValid,
         cardExpireFuture: error?.cardExpireFuture ?? inputDiagnostics.cardExpireFuture,
         billingAddressLength: error?.billingAddressLength ?? inputDiagnostics.billingAddressLength,
@@ -568,6 +590,10 @@ export class PixelPaySdkProvider extends PaymentProvider {
         emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.UNCERTAIN, attempt, details);
       }
       if (error instanceof PixelPaySdkError) {
+        if (sdkInvoked) error.uncertain = true;
+        error.runtimeDiagnostics = runtimeDiagnostics;
+        error.upstreamContentType = metadata.contentType;
+        error.cfRay = metadata.cfRay;
         error.paymentAttemptId = attempt.paymentAttemptId;
         error.cardExpireFormatValid ??= inputDiagnostics.cardExpireFormatValid;
         error.cardExpireFuture ??= inputDiagnostics.cardExpireFuture;
@@ -576,21 +602,30 @@ export class PixelPaySdkProvider extends PaymentProvider {
       }
       throw new PixelPaySdkError("PIXELPAY_NETWORK_ERROR", "No fue posible confirmar la respuesta de PixelPay.", {
         uncertain: true,
-        statusCode: metadata.statusCode,
+        statusCode: details.statusCode,
         sdkErrorName: errorConstructorName,
         errorName,
         errorConstructorName,
         responseClass: safeClassName(error?.response),
         safeMessageCode,
-        upstreamContentType: metadata.contentType,
-        cfRay: metadata.cfRay,
+        upstreamContentType: details.contentType,
+        cfRay: details.cfRay,
         paymentAttemptId: attempt.paymentAttemptId,
+        runtimeDiagnostics,
         ...inputDiagnostics,
       });
     }
+  }
 
+  completeSaleResponse(input, attempt, logger, startedAt, inputDiagnostics, transaction, response) {
     const statusCode = responseStatus(response);
-    const transactionResult = this.readTransactionResult(response);
+    const execution = transaction?.getSaleExecutionDiagnostics?.();
+    const upstreamFailure = execution?.httpResponseReceived === true && statusCode >= 400
+      ? classifyPixelPaySaleRuntimeError(null, execution) : null;
+    let parseFailure;
+    const transactionResult = this.readTransactionResult(response, (error) => {
+      parseFailure = classifyPixelPaySaleRuntimeError(error, transaction?.getSaleExecutionDiagnostics?.());
+    });
     const result = transactionResult.result;
     const paymentUuid = text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
@@ -636,13 +671,13 @@ export class PixelPaySdkProvider extends PaymentProvider {
       transactionId,
     });
     const inputErrors = readPixelPayInputErrors(response?.errors);
-    const responseMetadata = readPixelPayHttpMetadata(response);
+    const responseMetadata = readSafeSaleHttpMetadata(response, execution);
     const diagnostics = {
       paymentAttemptId: attempt.paymentAttemptId,
       sdkResponseClass: safeClassName(response),
       statusCode,
       responseSuccess: responseSuccess(response),
-      safeMessageCode: classifySdkFailureMessage(response),
+      safeMessageCode: parseFailure?.safeMessageCode ?? upstreamFailure?.safeMessageCode ?? classifySdkFailureMessage(response),
       transactionResultValid: transactionResult.valid,
       transactionResultDataPresent: transactionResult.dataPresent,
       transactionResultParsed: transactionResult.parsed,
@@ -667,6 +702,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
     };
 
     const telemetryDetails = {
+      ...transaction?.getSaleExecutionDiagnostics?.(),
+      ...parseFailure,
       durationMs: Date.now() - startedAt,
       responseClass: diagnostics.sdkResponseClass,
       statusCode,
