@@ -176,6 +176,34 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
  for(const member of [false,true]) for(const count of [1,2,3,4]) await t.test(`saldo 9, VIP=${member}, ${count} acompanantes: reserva normal sin canje`,async()=>{
   const actor=await owner(9,member);await assert.rejects(prepare(actor),{code:'POINTS_REDEEM_INSUFFICIENT_BALANCE'});
   const hold=await invoke(actor,'/v1/citas/hold',payloadFor(Array(count).fill(null),null,{extras:false}));assert.equal(hold.total_pagar_hnl,(count+(member?0:1))*300);assert.equal(await balance(actor),9);
+  const persisted=(await pool.query("SELECT response_payload FROM app_private.reserva_idempotencia WHERE id_grupo_cita=$1 AND scope='auth:citas:hold'",[hold.id_grupo_cita])).rows;
+  assert.equal(persisted.length,1);
+  const evidence=persisted[0].response_payload.membership_consumption;
+  assert.equal(evidence.version,1);assert.equal(evidence.id_suscripcion,member?hold.membresia.id_suscripcion:null);
+  assert.equal(evidence.citas.length,count+1);
+  const appointments=(await pool.query('SELECT id_cita,orden_integrante FROM citas WHERE id_grupo_cita=$1 ORDER BY orden_integrante',[hold.id_grupo_cita])).rows;
+  for(const appointment of appointments){
+   const covered=evidence.citas.find(row=>row.id_cita===appointment.id_cita);assert.ok(covered);
+   if(member&&Number(appointment.orden_integrante)===1){
+    const detail=(await pool.query('SELECT line_key,id_servicio,cantidad FROM citas_detalles WHERE id_cita=$1',[appointment.id_cita])).rows;
+    assert.equal(detail.length,1);assert.deepEqual(covered.servicios,[{id_servicio:service,line_key:detail[0].line_key,cantidad:1}]);
+   }else assert.deepEqual(covered.servicios,[]);
+  }
+  assert.equal(Object.hasOwn(hold,'membership_consumption'),false);
+  assert.equal(Object.hasOwn(persisted[0].response_payload.data,'membership_consumption'),false);
+ });
+ await t.test('cuota VIP no disponible revierte confirmacion HTTP y no deja consumos ni puntos',async()=>{
+  const actor=await owner(9,true);
+  const hold=await invoke(actor,'/v1/citas/hold',payloadFor([],null,{extras:false}));
+  await pool.query("UPDATE subscriptions SET estado_suscripcion_codigo='vencida',motivo_fin_codigo='agotamiento' WHERE id_cliente=$1",[actor.id]);
+  const before=(await pool.query('SELECT id_cita,estado_cita_codigo FROM citas WHERE id_grupo_cita=$1',[hold.id_grupo_cita])).rows;
+  assert.equal(before.length,1);assert.equal(before[0].estado_cita_codigo,'en_espera');
+  const response=await inject(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{});
+  assert.equal(response.statusCode,409,response.body);
+  assert.equal(response.json().error.code,'MEMBERSHIP_CONSUMPTION_SUBSCRIPTION_INACTIVE');
+  assert.deepEqual((await pool.query('SELECT id_cita,estado_cita_codigo FROM citas WHERE id_grupo_cita=$1',[hold.id_grupo_cita])).rows,before);
+  assert.equal((await pool.query('SELECT COUNT(*)::int n FROM subscription_consumptions WHERE id_cita=$1',[before[0].id_cita])).rows[0].n,0);
+  assert.equal(await balance(actor),9);
  });
  await t.test('sin servicios elegibles mantiene gate obligatorio y mensaje de ausencia',async()=>{
   const actor=await owner();await pool.query('UPDATE points_rule_services SET habilitado=false');

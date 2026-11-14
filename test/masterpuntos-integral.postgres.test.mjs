@@ -50,6 +50,9 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
   started = true;
   pool = new pg.Pool({ host: '127.0.0.1', port, user: 'postgres', database: 'postgres', max: 6, options: '-c timezone=UTC' });
   await pool.query(await sqlFile('masterpuntos-integral-fixture.sql'));
+  // AM: El consumidor usa identidad de linea y cobertura persistida, igual que el esquema vigente.
+  await pool.query(`ALTER TABLE citas_detalles ADD COLUMN line_key text, ADD COLUMN cantidad int DEFAULT 1;
+    CREATE TABLE citas_admin_beneficios_resumen(id_grupo_cita uuid PRIMARY KEY,resumen_beneficios jsonb NOT NULL)`);
   await pool.query(await sqlFile('masterpuntos-legacy-functions.sql'));
   await pool.query(await sqlFile('mf118-points-fixture.sql'));
   await pool.query(await readFile(new URL('../db/migrations/20261030010000_masterpuntos_readonly_expiration_v1.sql', import.meta.url), 'utf8'));
@@ -707,8 +710,18 @@ test('MasterPuntos integral: PostgreSQL real aislado, ciclos, controladores y ca
   });
   await t.test('Finalizar atención y PATCH estado Completada acreditan a través de los controladores reales', async () => {
     for (const member of [false, true]) for (const patch of [false, true]) {
-      const owner = await createClient(member), id = await insert(owner, { state: 'en_atencion' });
-      if (member) await pool.query('INSERT INTO citas_detalles(id_cita_detalle,id_cita,id_servicio,subtotal_hnl) VALUES(gen_random_uuid(),$1,$2,0)', [id, memberService]);
+      const owner = await createClient(member), group = randomUUID();
+      await pool.query('INSERT INTO citas_grupos(id_grupo_cita,id_cliente_titular) VALUES($1,$2)', [group, owner.id]);
+      const id = await insert(owner, { state: 'en_atencion', group });
+      if (member) {
+        const lineKey = `fixture:${id}`;
+        await pool.query('INSERT INTO citas_detalles(id_cita_detalle,id_cita,id_servicio,subtotal_hnl,line_key,cantidad) VALUES(gen_random_uuid(),$1,$2,0,$3,1)', [id, memberService, lineKey]);
+        const subscription = (await pool.query('SELECT id_suscripcion FROM subscriptions WHERE id_cliente=$1', [owner.id])).rows[0];
+        await pool.query('INSERT INTO citas_admin_beneficios_resumen VALUES($1,$2)', [group, { membership_consumption: {
+          version: 1, id_suscripcion: subscription.id_suscripcion,
+          citas: [{ id_cita: id, servicios: [{ id_servicio: memberService, line_key: lineKey, cantidad: 1 }] }],
+        } }]);
+      }
       const token = access(await createClient(), ['super_admin']);
       const response = await app.inject({ method: patch ? 'PATCH' : 'POST', url: `/v1/admin/citas/${id}/${patch ? 'estado' : 'finalizar-atencion'}`, headers: { cookie: `mf_session=${token}` }, payload: patch ? { estado_cita_codigo: 'completada' } : {} });
       assert.equal(response.statusCode, 200, response.body + ' ' + errors.at(-1)?.message);

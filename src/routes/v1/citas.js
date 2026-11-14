@@ -46,6 +46,7 @@ import {
   finalizeReservationIdempotency,
   getReservationIdempotencyState,
   loadCanonicalPromotionDetailRows,
+  loadMembershipConsumptionEvidence,
   mapCanonicalReservationError,
   resolveReservationRequestId,
   selectCanonicalIntegrantesForResult,
@@ -1238,6 +1239,8 @@ async function consumeMembershipForConfirmedRows(client, request, {
         },
         "No se pudo registrar consumo de membresia para cita confirmada"
       );
+      // AM: La confirmacion y sus consumos deben confirmarse o revertirse juntos.
+      throw membershipError;
     }
   }
 }
@@ -2569,6 +2572,13 @@ export default async function citasRoutes(app) {
           requestFingerprint,
           responsePayload: holdResponsePayload,
           statusCode: 201,
+          internalMetadata: {
+            membership_consumption: await loadMembershipConsumptionEvidence(dbClient, {
+              idSuscripcion: coverageTracker?.idSuscripcion || null,
+              integrantes: selectedIntegrantes,
+              canonicalResult,
+            }),
+          },
         });
         return holdResponsePayload;
           },
