@@ -233,6 +233,52 @@ test("QA simulation opens only booking and TodoPago simulator routes", async t =
   assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false });
 });
 
+test("QA VIP switch opens only the simulated membership flow and safe status read", async t => {
+  const app = Fastify();
+  app.decorate("config", {
+    paymentProvider: "todopago",
+    adminDataEntryMode: false,
+    privateCommercePilot: { enabled: false, userIds: [], ips: [], proxies: [] },
+    qaPaymentSimulation: { enabled: true },
+    qaVipPurchaseSimulation: { enabled: true },
+  });
+  app.decorate("requireRoles", () => async () => {});
+  await app.register(fp(async () => {}, { name: "env-plugin" }));
+  await app.register(gate);
+  t.after(() => app.close());
+
+  const allowedRoutes = [
+    ["/v1/cliente/planes/orden", "/v1/cliente/planes/orden"],
+    ["/v1/cliente/planes/pago-intent", "/v1/cliente/planes/pago-intent"],
+    ["/v1/cliente/planes/simulator/event", "/v1/cliente/planes/simulator/event"],
+    [
+      "/v1/cliente/planes/pago-intent/:id_payment_intent/estado",
+      `/v1/cliente/planes/pago-intent/${USER}/estado`,
+    ],
+  ];
+  const denied = [
+    "/v1/cliente/planes/confirmar-pago",
+    "/v1/cliente/planes/adquirir",
+    "/v1/admin/membresias/clientes/probe",
+  ];
+  for (const [route] of allowedRoutes) app.post(route, async () => ({ reached: true }));
+  for (const route of denied) app.post(route, async () => ({ reached: true }));
+
+  for (const [, url] of allowedRoutes) {
+    const response = await app.inject({ method: "POST", url, payload: {} });
+    assert.equal(response.statusCode, 200, `${url}: ${response.body}`);
+    assert.equal(response.json().reached, true);
+  }
+  for (const url of denied) {
+    const response = await app.inject({ method: "POST", url, payload: {} });
+    assert.equal(response.statusCode, 403, `${url}: ${response.body}`);
+    assert.equal(response.json().error.code, "PRIVATE_COMMERCE_RESTRICTED");
+  }
+
+  const eligibility = await app.inject({ url: "/v1/commerce/eligibility" });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: true });
+});
+
 test("callback reaches its own financial guard even in administrative mode", async t => {
   const f = await fixture(t, { env: { PRIVATE_COMMERCE_PILOT_ENABLED: "false" }, config: { adminDataEntryMode: true } });
   const callback = await f.app.inject({ method: "POST", url: "/v1/pagos/webhook/pixelpay", remoteAddress: "198.51.100.2", payload: {} });
