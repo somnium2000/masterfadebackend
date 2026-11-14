@@ -20,7 +20,7 @@ import publicPagosRoutes from '../src/routes/v1/public/pagos.js';
 import { redeemReward, getClientePointsSummary } from '../src/services/pointsService.js';
 import { PaymentProviderFactory } from '../src/services/payments/PaymentProviderFactory.js';
 
-const BIN=process.env.MASTERFADE_PHASE02_PG_BIN||process.env.MASTERFADE_TEST_PG_BIN;
+const BIN=process.env.MASTERFADE_PHASE02_PG_BIN;
 const source=file=>readFile(new URL('../'+file,import.meta.url),'utf8');
 // AM: Controladores y SQL canonico originales; todas las identidades y fechas son sinteticas.
 test('CANJE-GRUPAL-01: hold, intent, confirmacion y puntos con PostgreSQL real', {skip:!BIN,timeout:240000}, async t=>{
