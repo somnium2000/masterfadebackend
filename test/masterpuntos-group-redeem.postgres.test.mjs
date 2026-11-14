@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, rm, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -30,7 +30,8 @@ test('CANJE-GRUPAL-01: hold, intent, confirmacion y puntos con PostgreSQL real',
  t.after(async()=>{if(qaConfirmApp)await qaConfirmApp.close();if(app)await app.close();if(pool)await pool.end();if(started)binary('pg_ctl',['-D',data,'-m','fast','-w','stop']);assert.equal(path.dirname(directory),path.resolve(tmpdir()));assert.ok(path.basename(directory).startsWith('mf-group-redeem-'));await rm(directory,{recursive:true,force:true});});
  const socket=createServer();await new Promise(resolve=>socket.listen(0,'127.0.0.1',resolve));const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
  binary('initdb',['-D',data,'-U','postgres','-A','trust','--encoding=UTF8','--locale=C','--no-sync']);
- binary('pg_ctl',['-D',data,'-l',path.join(directory,'postgres.log'),'-o',`-h 127.0.0.1 -p ${port}`,'-w','start']);started=true;
+ await appendFile(path.join(data,'postgresql.conf'),`\nlisten_addresses='127.0.0.1'\nport=${port}\nunix_socket_directories=''\n`);
+ binary('pg_ctl',['-D',data,'-l',path.join(directory,'postgres.log'),'-w','start']);started=true;
  pool=new pg.Pool({host:'127.0.0.1',port,user:'postgres',database:'postgres',max:8});
  await pool.query(await source('test/sql/microfase2a2/ci_cron_bootstrap.sql'));
  await pool.query(await source('test/sql/microfase2a2/pre_2a2_schema.sql'));
