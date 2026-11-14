@@ -2714,13 +2714,17 @@ export default async function citasRoutes(app) {
         step = "expireReservationsBestEffort";
         await expireReservationsBestEffort(dbClient, request, "citas_hold_confirm");
 
-        step = "loadGroup";
+        // AM: El lock del grupo serializa reintentos antes de leer citas y ejecutar efectos de confirmacion.
+        step = "tx_begin_and_lock_group";
+        await dbClient.query("BEGIN");
+        txStarted = true;
         const groupResult = await dbClient.query(
           `
             SELECT id_grupo_cita, id_cliente_titular, id_persona_titular, estado_grupo_codigo
             FROM public.citas_grupos
             WHERE id_grupo_cita = $1::uuid
             LIMIT 1
+            FOR UPDATE
           `,
           [groupId]
         );
@@ -2766,9 +2770,6 @@ export default async function citasRoutes(app) {
             saldo_actual: null,
             mensaje: "No se aplico canje en esta confirmacion.",
           };
-          step = "tx_begin_already_confirmed";
-          await dbClient.query("BEGIN");
-          txStarted = true;
           step = "applyRewardRedeemForConfirmedGroup_already_confirmed";
           rewardFinalization = await applyRewardRedeemForConfirmedGroup(dbClient, {
             idGrupoCita: group.id_grupo_cita,
@@ -2843,9 +2844,6 @@ export default async function citasRoutes(app) {
           }
         }
 
-        step = "tx_begin";
-        await dbClient.query("BEGIN");
-        txStarted = true;
         const citaIds = pendingRows.map((row) => row.id_cita);
         step = "confirmAppointmentsWithoutPayment";
         await confirmAppointmentsWithoutPayment(dbClient, {

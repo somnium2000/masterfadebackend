@@ -20,7 +20,7 @@ import publicPagosRoutes from '../src/routes/v1/public/pagos.js';
 import { redeemReward, getClientePointsSummary } from '../src/services/pointsService.js';
 import { PaymentProviderFactory } from '../src/services/payments/PaymentProviderFactory.js';
 
-const BIN=process.env.MASTERFADE_PHASE02_PG_BIN;
+const BIN=process.env.MASTERFADE_PHASE02_PG_BIN||process.env.MASTERFADE_TEST_PG_BIN;
 const source=file=>readFile(new URL('../'+file,import.meta.url),'utf8');
 // AM: Controladores y SQL canonico originales; todas las identidades y fechas son sinteticas.
 test('CANJE-GRUPAL-01: hold, intent, confirmacion y puntos con PostgreSQL real', {skip:!BIN,timeout:240000}, async t=>{
@@ -95,9 +95,12 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
  const launches=[];const originalProvider=PaymentProviderFactory.create;t.after(()=>{PaymentProviderFactory.create=originalProvider;});
  PaymentProviderFactory.create=()=>({async createIntent(args){launches.push(args);return {providerIntentId:randomUUID(),paymentUrl:'https://fixture.invalid/payment',launch:{type:'redirect',action:'https://fixture.invalid/payment',method:'GET',fields:{}}};}});
  const profiles=new Map(),errors=[];process.env.JWT_SECRET=randomBytes(48).toString('hex');
+ let confirmationRace=null;
+ const armConfirmationRace=groupId=>{let release;const ready=new Promise(resolve=>{release=resolve;});confirmationRace={groupId:String(groupId),arrivals:0,ready,release};};
  let dbQueries=0;
  const query=async(client,sql,params)=>{
   dbQueries++;
+  if(confirmationRace&&sql.includes('SELECT id_grupo_cita, id_cliente_titular, id_persona_titular, estado_grupo_codigo')&&String(params?.[0]||'')===confirmationRace.groupId){confirmationRace.arrivals++;if(confirmationRace.arrivals===2)confirmationRace.release();await confirmationRace.ready;}
   if(sql.includes('WITH base_user'))return {rows:profiles.has(params[0])?[profiles.get(params[0])]:[]};
   if(sql.includes('token_jti_hash = $3'))return {rows:[{estado:'activa',ultimo_uso_at:new Date(),expira_at:new Date(Date.now()+3600000),revocada_at:null}]};
   return client.query(sql,params).catch(error=>{errors.push({message:error.message,sql});throw error;});
@@ -105,8 +108,10 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
  const db={query:(sql,params)=>query(pool,sql,params),async connect(){const client=await pool.connect();return{query:(sql,params)=>query(client,sql,params),release:()=>client.release()};}};
  app=Fastify();app.decorate('db',db);app.decorate('config',{paymentProvider:'mock',bookingIsvEnabled:false,qaPaymentSimulation:{enabled:true},privateCommercePilot:{enabled:false,userIds:[],ips:[],proxies:[]}});
  await app.register(fp(async()=>{},{name:'env-plugin'}));await app.register(cookie);await app.register(auth);await app.register(citasRoutes,{prefix:'/v1/citas'});await app.register(publicPagosRoutes,{prefix:'/v1/pagos/reservas',authenticated:true});await app.ready();
- qaConfirmApp=Fastify();qaConfirmApp.decorate('db',db);qaConfirmApp.decorate('config',{paymentProvider:'todopago',bookingIsvEnabled:false,qaPaymentSimulation:{enabled:true},privateCommercePilot:{enabled:false,userIds:[],ips:[],proxies:[]}});
+ let emailsSent=0;
+ qaConfirmApp=Fastify();qaConfirmApp.decorate('db',db);qaConfirmApp.decorate('config',{paymentProvider:'todopago',bookingIsvEnabled:false,qaPaymentSimulation:{enabled:true},privateCommercePilot:{enabled:false,userIds:[],ips:[],proxies:[]}});qaConfirmApp.decorate('mailer',{configured:true,sendMail:async()=>{emailsSent++;return{sent:true};}});
  await qaConfirmApp.register(fp(async()=>{},{name:'env-plugin'}));await qaConfirmApp.register(cookie);await qaConfirmApp.register(auth);await qaConfirmApp.register(privateCommerce);await qaConfirmApp.register(citasRoutes,{prefix:'/v1/citas'});await qaConfirmApp.ready();
+ const unauthenticated=await qaConfirmApp.inject({method:'POST',url:`/v1/citas/hold/${randomUUID()}/confirmar`,payload:{}});assert.equal(unauthenticated.statusCode,401,unauthenticated.body);
  const plan=randomUUID();await pool.query("INSERT INTO membership_plans(id_plan,nombre_plan,descripcion,periodo_membresia_codigo,categoria_nivel) VALUES($1,'VIP fixture','Grupo','mensual',1)",[plan]);
  const owner=async(points=10,member=false)=>{
   const id=randomUUID(),person=randomUUID(),user=randomUUID(),email=user+'@example.test';
@@ -196,6 +201,7 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
   const paymentsBefore=Number((await pool.query('SELECT count(*)::int n FROM payments')).rows[0].n);
   const eventsBefore=Number((await pool.query('SELECT count(*)::int n FROM payment_events')).rows[0].n);
   const launchesBefore=launches.length;
+  const emailsBefore=emailsSent;
   const result=ok(await inject(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token},randomUUID(),qaConfirmApp));
   assert.equal(result.confirmado_sin_pago,true);assert.equal(result.estado_grupo_codigo,'confirmada');assert.equal(result.total_pagar_hnl,0);assert.equal(result.recompensa_utilizada.puntos_descontados,10);assert.equal(result.citas_confirmadas_count,1);
   const replay=ok(await inject(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token},randomUUID(),qaConfirmApp));
@@ -205,8 +211,20 @@ CREATE TABLE promociones(id_promocion uuid,titulo text,estado boolean,mecanica t
   assert.equal(Number((await pool.query('SELECT count(*)::int n FROM payments')).rows[0].n),paymentsBefore);
   assert.equal(Number((await pool.query('SELECT count(*)::int n FROM payment_events')).rows[0].n),eventsBefore);
   assert.equal(launches.length,launchesBefore);
+  assert.equal(emailsSent,emailsBefore+1);
   assert.equal((await pool.query("SELECT count(*)::int n FROM citas WHERE id_grupo_cita=$1 AND estado_cita_codigo='confirmada'",[hold.id_grupo_cita])).rows[0].n,1);
   await pool.query("UPDATE citas SET estado_cita_codigo='completada' WHERE id_grupo_cita=$1",[hold.id_grupo_cita]);assert.equal(await balance(actor),0);
+ });
+ await t.test('dos confirmaciones simultaneas serializan efectos y correo',async()=>{
+  const actor=await owner(),reward=await prepare(actor),hold=await invoke(actor,'/v1/citas/hold',payloadFor([],reward.canje_context_token,{extras:false}));
+  const auditBefore=Number((await pool.query("SELECT count(*)::int n FROM audit_logs WHERE accion='cita_confirmada_sin_pago'")).rows[0].n),emailsBefore=emailsSent;
+  armConfirmationRace(hold.id_grupo_cita);
+  const responses=await Promise.all([inject(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token},randomUUID(),qaConfirmApp),inject(actor,`/v1/citas/hold/${hold.id_grupo_cita}/confirmar`,{canje_context_token:reward.canje_context_token},randomUUID(),qaConfirmApp)]);confirmationRace=null;
+  for(const response of responses)assert.equal(response.statusCode,200,response.body);
+  assert.deepEqual(responses.map(response=>response.json().data.ya_confirmadas).sort(),[false,true]);
+  assert.equal(emailsSent,emailsBefore+1);
+  assert.equal(Number((await pool.query("SELECT count(*)::int n FROM audit_logs WHERE accion='cita_confirmada_sin_pago'")).rows[0].n),auditBefore+1);
+  assert.equal((await pool.query("SELECT count(*)::int n FROM points_transactions WHERE id_cliente=$1 AND tipo_puntos_codigo='canjear'",[actor.id])).rows[0].n,1);assert.equal(await balance(actor),0);
  });
  await t.test('confirmacion sin pago conserva propietario y vencimiento del hold',async()=>{
   const actor=await owner(),other=await owner(),reward=await prepare(actor),hold=await invoke(actor,'/v1/citas/hold',payloadFor([],reward.canje_context_token,{extras:false}));
