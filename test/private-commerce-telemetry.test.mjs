@@ -129,6 +129,7 @@ test("diagnostics preserve HTTP results and auth work for every eligibility bran
     assert.equal(on.response.statusCode, scenario.status || 200);
     if (!scenario.status) assert.deepEqual(on.response.json().data, {
       booking: scenario.allowed === true, vipPurchase: scenario.allowed === true,
+      publicBooking: false, publicVipPurchase: false,
     });
     assert.equal(on.response.statusCode, off.response.statusCode);
     assert.equal(on.response.body, off.response.body);
@@ -149,7 +150,7 @@ test("diagnostics are disabled by default and only the server flag true enables 
       headers: { "x-private-commerce-diagnostics-enabled": "true" },
     });
     assert.equal(f.logs.length, 0);
-    assert.deepEqual(f.response.json().data, { booking: true, vipPurchase: true });
+    assert.deepEqual(f.response.json().data, { booking: true, vipPurchase: true, publicBooking: false, publicVipPurchase: false });
   }
 });
 
@@ -168,7 +169,7 @@ test("diagnostics whitelist IPs, counts, booleans and a fixed reason without sen
   for (const sensitive of [f.token, SECRET, USER, OTHER, CLIENT, "synthetic-csrf", "synthetic-authorization-secret", "synthetic-forged-user", "synthetic-untrusted-ip"]) {
     assert.equal(serialized.includes(sensitive), false);
   }
-  assert.deepEqual(f.response.json(), { ok: true, data: { booking: true, vipPurchase: true } });
+  assert.deepEqual(f.response.json(), { ok: true, data: { booking: true, vipPurchase: true, publicBooking: false, publicVipPurchase: false } });
 });
 
 test("rejected peer logs network mismatch without authenticating or guessing identity", async t => {

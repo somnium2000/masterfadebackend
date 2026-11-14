@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import fp from "fastify-plugin";
-import { resolvePrivateCommerceConfig } from "./privateCommerce.js";
+import { resolvePrivateCommerceConfig, resolvePublicCommerceConfig } from "./privateCommerce.js";
 import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
 
 export function resolvePixelPayStatusShapeProbeEnabled(env) {
@@ -124,6 +124,7 @@ export function resolvePixelPayOrderCallbackUrl(rawValue, enabled = false) {
 async function envPlugin(app) {
   dotenv.config();
   const privateCommercePilot = resolvePrivateCommerceConfig(process.env);
+  const publicCommerce = resolvePublicCommerceConfig(process.env);
 
   const nodeEnv = normalizeNodeEnv(process.env.NODE_ENV || process.env.ENTORNO);
   // AM: Administrative mode and disabled provider are a fail-closed configuration pair.
@@ -206,6 +207,7 @@ async function envPlugin(app) {
 
   const config = {
     privateCommercePilot,
+    publicCommerce,
     nodeEnv,
     adminDataEntryMode,
     isProduction: isProdOrStaging,

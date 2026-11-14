@@ -1,6 +1,7 @@
 import net from "node:net";
 import fp from "fastify-plugin";
 import { sendError } from "../utils/errors.js";
+import { parseStrictBooleanEnv } from "../config/bookingConfig.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -17,6 +18,25 @@ const MAINTENANCE_ROUTES = new Set([
   "POST /v1/admin/citas/dias-inhabilitados", "DELETE /v1/admin/citas/dias-inhabilitados",
   "DELETE /v1/admin/citas/dias-inhabilitados/:id", "PATCH /v1/admin/citas/parametros",
 ]);
+// AM: Public admission only covers existing client flows, never admin, simulators or generic prefixes.
+const PUBLIC_BOOKING_ROUTES = new Set([
+  "POST /v1/public/citas/validar-contactos",
+  "POST /v1/citas/hold", "POST /v1/citas/hold/:id_grupo_cita/confirmar",
+  "POST /v1/citas/pendiente/:id_grupo_cita/retomar",
+  ...["crear-intent", "pixelpay/sale", "pixelpay/status", "estado"]
+    .map(path => `POST /v1/pagos/reservas/${path}`),
+]);
+const PUBLIC_VIP_ROUTES = new Set([
+  "POST /v1/cliente/planes/orden", "POST /v1/cliente/planes/pago-intent",
+  "POST /v1/cliente/planes/confirmar-pago", "POST /v1/cliente/planes/pago-intent/:id_payment_intent/estado",
+]);
+
+export function resolvePublicCommerceConfig(env) {
+  return Object.freeze({
+    bookingEnabled: parseStrictBooleanEnv(env.PUBLIC_BOOKING_ENABLED, { name: "PUBLIC_BOOKING_ENABLED", defaultValue: false }),
+    vipPurchaseEnabled: parseStrictBooleanEnv(env.PUBLIC_VIP_PURCHASE_ENABLED, { name: "PUBLIC_VIP_PURCHASE_ENABLED", defaultValue: false }),
+  });
+}
 const normalizeIp = value => {
   const text = String(value || "").trim();
   const ip = text.startsWith("::ffff:") ? text.slice(7) : text;
@@ -66,6 +86,31 @@ export default fp(async function privateCommerce(app) {
   const config = app.config.privateCommercePilot || resolvePrivateCommerceConfig(process.env);
   const diagnosticsEnabled = process.env.PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED === "true";
   const verify = app.requireRoles([]);
+  const verifyClient = app.requireRoles(["cliente"]);
+  const publicConfig = app.config.publicCommerce || resolvePublicCommerceConfig(process.env);
+  const publicAvailable = () => ({
+    publicBooking: app.config.paymentProvider === "pixelpay" && !app.config.adminDataEntryMode && publicConfig.bookingEnabled === true,
+    publicVipPurchase: app.config.paymentProvider === "pixelpay" && !app.config.adminDataEntryMode && publicConfig.vipPurchaseEnabled === true,
+  });
+
+  async function publicClient(request, reply, { probe = false } = {}) {
+    if (!request.cookies?.mf_session) return false;
+    await (probe ? verify : verifyClient)(request, reply);
+    if (reply.sent) return false;
+    if (request.claims?.user?.id_usuario !== request.auth?.sub
+      || !UUID.test(String(request.claims?.cliente_id || ""))
+      || !UUID.test(String(request.claims?.user?.id_persona || ""))
+      || request.claims?.roles?.includes("cliente") !== true) return false;
+    const active = await app.db.query(`SELECT c.id_cliente
+      FROM public.clientes c JOIN public.usuarios u ON u.id_usuario=c.id_usuario AND u.id_persona=c.id_persona
+      JOIN public.personas p ON p.id_persona=c.id_persona
+      WHERE c.id_cliente=$1::uuid AND c.id_usuario=$2::uuid AND c.id_persona=$3::uuid
+        AND c.estado IS TRUE AND c.deleted_at IS NULL AND c.anonimizado IS FALSE
+        AND u.estado IS TRUE AND u.deleted_at IS NULL
+        AND u.estado_acceso NOT IN ('inactivo','bloqueado') AND p.deleted_at IS NULL`,
+    [request.claims.cliente_id, request.auth.sub, request.claims.user.id_persona]);
+    return active.rows.length === 1;
+  }
 
   function eligibilityResult(request, allowed, reason, identityEvaluated = false) {
     if (diagnosticsEnabled) {
@@ -126,7 +171,11 @@ export default fp(async function privateCommerce(app) {
   }
   app.addHook("onRequest", async (request, reply) => {
     if (!isPrivateCommerceRoute(request.method, request.routeOptions.url)) return;
-    if (await eligible(request, reply)) {
+    const available = publicAvailable();
+    const key = `${request.method} ${String(request.routeOptions.url || "").replace(/\/$/, "")}`;
+    const publicAdmission = (available.publicBooking && PUBLIC_BOOKING_ROUTES.has(key))
+      || (available.publicVipPurchase && PUBLIC_VIP_ROUTES.has(key));
+    if (publicAdmission ? await publicClient(request, reply) : await eligible(request, reply)) {
       // AM: Public booking now uses a session too; keep it protected against cross-site mutations.
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)
         && (!request.cookies?.mf_csrf || request.cookies.mf_csrf !== request.headers["x-csrf-token"])) {
@@ -138,8 +187,16 @@ export default fp(async function privateCommerce(app) {
   });
   app.get("/v1/commerce/eligibility", async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
-    const allowed = await eligible(request, reply);
+    const available = publicAvailable();
+    const publiclyEligible = (available.publicBooking || available.publicVipPurchase)
+      ? await publicClient(request, reply, { probe: true }) : false;
     if (reply.sent) return;
-    return { ok: true, data: { booking: allowed, vipPurchase: allowed } };
+    const allowed = publiclyEligible ? false : await eligible(request, reply);
+    if (reply.sent) return;
+    return { ok: true, data: {
+      booking: allowed || (available.publicBooking && publiclyEligible),
+      vipPurchase: allowed || (available.publicVipPurchase && publiclyEligible),
+      ...available,
+    } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });
