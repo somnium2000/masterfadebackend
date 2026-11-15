@@ -12,6 +12,7 @@ import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDu
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { processPixelPayOrderCallback } from "../src/routes/v1/pagos.js";
 import { closeCompletedPixelPayCallback, PIXELPAY_CALLBACK_CLOSED_RESULT } from "../src/services/payments/pixelPayCallbackReceipt.js";
+import { loadPixelPayQaOrigin } from '../src/services/payments/pixelPayQaOrigin.js';
 
 const migrationUrl = new URL("../db/migrations/pixel/20261011213325_payment_late_uses_paid_at_v1.sql", import.meta.url);
 const baselineUrl = new URL("./sql/payments/qa_payment_triggers_20261011.sql", import.meta.url);
@@ -185,14 +186,14 @@ async function insertPayment(client, paidAt, amount = 1, currency = "HNL") {
     VALUES ($1,'capturado',$2,$3,$4,$5) RETURNING pago_tardio,paid_at::text`, [INTENT, UUID, amount, currency, paidAt]);
 }
 
-async function seedDurableSale(client) {
+async function seedDurableSale(client, qaTestOrigin = null) {
   const attemptId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome,
     sdk_response_class,upstream_http_status,uncertain,response_success,response_approved,response_incomplete,
     transaction_result_valid,transaction_result_parsed,payment_uuid_present,transaction_id_present,payment_hash_present,
-    payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches)
-    VALUES ($1,$2,$3,'approved','SuccessResponse',200,false,true,true,false,true,true,true,true,true,true,true,true,true)`,
-  [INTENT, attemptId, FINALIZED_AT]);
+    payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches${qaTestOrigin?',qa_test_origin':''})
+    VALUES ($1,$2,$3,'approved','SuccessResponse',200,false,true,true,false,true,true,true,true,true,true,true,true,true${qaTestOrigin?',$4::text':''})`,
+  [INTENT, attemptId, FINALIZED_AT,...(qaTestOrigin?[qaTestOrigin]:[])]);
   await client.query(`INSERT INTO public.payment_events
     (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
     VALUES ($1,$2,'pixelpay.sale.approved_verified',TRUE,$3,$4,$5)`, [PROVIDER, `pixelpay_sale_${attemptId}`, {
@@ -344,6 +345,7 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       )`);
     await client.query(functionSql(await readFile(new URL("../db/migrations/20261030010000_masterpuntos_readonly_expiration_v1.sql", import.meta.url), "utf8"),
       "public.fn_points_materialize_expired_cycles"));
+    await client.query(await readFile(new URL('../db/migrations/pixel/20261115233000_pixelpay_qa_test_origin.sql',import.meta.url),'utf8'));
     const reset = async (options = {}) => {
       // AM: Solo fixtures del cluster temporal; ninguna conexion externa ni dato historico.
       await client.query(`TRUNCATE public.payment_events,app_private.pixelpay_sale_attempts,public.payments,
@@ -351,7 +353,7 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
         public.personas,public.payment_providers,app_private.solicitudes_eliminacion_cuenta CASCADE`);
       await seed(client, options);
       if (options.holdState === "activo") await client.query("UPDATE public.citas_grupos SET estado_grupo_codigo='activo'");
-      await seedDurableSale(client);
+      await seedDurableSale(client, options.qaTestOrigin);
     };
     const recover = (connection = client, options = {}) => reconcilePixelPayFromDurableApproval(connection, {
       idGrupoCita: GROUP, idIntent: INTENT, titularEmail: EMAIL, ...options,
@@ -402,7 +404,7 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       };
       try {
         await ct.test("confirmado: callback y duplicado no consultan Status ni cambian evidencia", async () => {
-          await reset();
+          await reset({qaTestOrigin:'sandbox_session'});
           await recover();
           const first = await callback();
           assert.equal(first.extension_pending, false);
@@ -413,6 +415,7 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
           assert.equal(second.duplicate, true);
           assert.deepEqual(await assertClosed(), receipt);
           assert.equal(callbackProvider.statusCalls, 0);
+          assert.equal(await loadPixelPayQaOrigin(client,INTENT),'sandbox_session');
           await assertConfirmedOnce();
         });
         await ct.test("callback temprano sin Sale queda pendiente y COMMIT financiero posterior lo cierra", async () => {

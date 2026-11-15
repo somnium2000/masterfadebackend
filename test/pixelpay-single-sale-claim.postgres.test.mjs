@@ -9,6 +9,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import pg from 'pg';
 import { createPixelPaySaleAttemptRecord, finalizePixelPaySaleAttempt } from '../src/services/payments/pixelPaySaleAttemptStore.js';
+import { loadPixelPayQaOrigin } from '../src/services/payments/pixelPayQaOrigin.js';
+import { resolveQaPixelPay3dsDiagnostic } from '../src/services/payments/qaPixelPay3dsDiagnostic.js';
 
 const RUN = process.env.RUN_PIXELPAY_SINGLE_SALE_CLAIM_PG === 'true';
 const INTENT = '11111111-1111-4111-8111-111111111111';
@@ -110,6 +112,7 @@ test('PostgreSQL17: RPC y START durable permiten un solo claim Sale por intent',
       await client.query(await readFile(new URL(`../db/migrations/pixel/${file}`, import.meta.url), 'utf8'));
     }
     let simulatedPosts = 0;
+    await client.query(await readFile(new URL('../db/migrations/pixel/20261115233000_pixelpay_qa_test_origin.sql',import.meta.url),'utf8'));
     const reset = async (expired = false) => {
       simulatedPosts = 0;
       await client.query('TRUNCATE app_private.pixelpay_sale_attempts,public.payment_intents,public.citas_holds,public.citas');
@@ -118,18 +121,18 @@ test('PostgreSQL17: RPC y START durable permiten un solo claim Sale por intent',
       await client.query(`INSERT INTO public.citas VALUES ($1,$2,NULL,'pendiente_pago')`, [CITA, GROUP]);
       await client.query(`INSERT INTO public.citas_holds VALUES ($1,$2,'activo',clock_timestamp()+($3::integer*interval '1 minute'),now())`, [HOLD, CITA, expired ? -1 : 2]);
     };
-    const start = async (connection, group = GROUP) => {
-      await connection.query('SELECT app_private.proteger_reserva_pago_v1($1::uuid,$2::uuid)', [INTENT, group]);
+    const start = async (connection, group = GROUP, id = INTENT, qaTestOrigin = null) => {
+      await connection.query('SELECT app_private.proteger_reserva_pago_v1($1::uuid,$2::uuid)', [id, group]);
       const attempt = crypto.randomUUID();
-      await createPixelPaySaleAttemptRecord(connection, { idIntent: INTENT, paymentAttemptId: attempt, requestId: 'qa-single-claim',
+      await createPixelPaySaleAttemptRecord(connection, { idIntent: id, qaTestOrigin, paymentAttemptId: attempt, requestId: 'qa-single-claim',
         cardExpireFormatValid: true, cardExpireFuture: true, billingAddressLength: 18 });
       return attempt;
     };
-    const claim = async (connection = client, { group = GROUP, crash = false, rollback = false } = {}) => {
+    const claim = async (connection = client, { group = GROUP, id = INTENT, qaTestOrigin = null, crash = false, rollback = false } = {}) => {
       await connection.query('BEGIN');
       let attempt;
       try {
-        attempt = await start(connection, group);
+        attempt = await start(connection, group, id, qaTestOrigin);
         if (rollback) throw new Error('Injected before COMMIT');
         await connection.query('COMMIT');
       } catch (error) { await connection.query('ROLLBACK'); throw error; }
@@ -216,6 +219,35 @@ test('PostgreSQL17: RPC y START durable permiten un solo claim Sale por intent',
       const before=(await client.query('SELECT expires_at FROM public.citas_holds')).rows[0].expires_at;
       await claim();const after=(await client.query('SELECT expires_at FROM public.citas_holds')).rows[0].expires_at;
       assert.equal(after.getTime(),before.getTime());
+    });
+    await t.test('QA markers survive disabled session and a new PG connection; independent intents never release either claim',async()=>{
+      await reset();
+      const other=crypto.randomUUID(),otherCita=crypto.randomUUID(),otherHold=crypto.randomUUID();
+      await client.query(`INSERT INTO payment_intents VALUES($1,$2,'cita','link_generado',clock_timestamp()+interval '30 minutes',now());`,[other,OTHER_GROUP]);
+      await client.query(`INSERT INTO citas VALUES($1,$2,NULL,'pendiente_pago')`,[otherCita,OTHER_GROUP]);
+      await client.query(`INSERT INTO citas_holds VALUES($1,$2,'activo',clock_timestamp()+interval '30 minutes',now())`,[otherHold,otherCita]);
+      await assert.rejects(claim(client,{qaTestOrigin:'sandbox_session',rollback:true}));
+      assert.equal(await loadPixelPayQaOrigin(client,INTENT),null);
+      const first=await claim(client,{qaTestOrigin:'sandbox_session'});
+      await finalizePixelPaySaleAttempt(client,{paymentAttemptId:first,outcome:'uncertain',statusCode:202,safeMessageCode:'SDK_NETWORK_ERROR'});
+      await claim(client,{id:other,group:OTHER_GROUP,qaTestOrigin:'sandbox_session'});
+      assert.equal(resolveQaPixelPay3dsDiagnostic({}).enabled,false);
+      const restarted=new pg.Client(options);await restarted.connect();
+      try{
+        for(const id of [INTENT,other])assert.equal(await loadPixelPayQaOrigin(restarted,id),'sandbox_session');
+        const states=(await restarted.query('SELECT id_intent,outcome,qa_test_origin FROM app_private.pixelpay_sale_attempts')).rows;
+        assert.equal(states.find(r=>r.id_intent===INTENT).outcome,'uncertain');assert.equal(states.find(r=>r.id_intent===other).outcome,null);
+        await assert.rejects(claim(restarted,{qaTestOrigin:'sandbox_session'}),/MF_PAYMENT_INTENT_STATE_INVALID/);
+        for(const sql of ['UPDATE app_private.pixelpay_sale_attempts SET qa_test_origin=NULL',
+          "UPDATE app_private.pixelpay_sale_attempts SET qa_test_origin='3ds_diagnostic'",'DELETE FROM app_private.pixelpay_sale_attempts']){
+          await assert.rejects(restarted.query(sql),/PIXELPAY_QA_ORIGIN_IMMUTABLE/);
+        }
+        assert.equal((await state()).attempts,1);
+      }finally{await restarted.end();}
+    });
+    await t.test('ordinary attempts remain unmarked and cannot be relabelled later',async()=>{
+      await reset();await claim();assert.equal(await loadPixelPayQaOrigin(client,INTENT),null);
+      await assert.rejects(client.query("UPDATE app_private.pixelpay_sale_attempts SET qa_test_origin='sandbox_session'"),/PIXELPAY_QA_ORIGIN_IMMUTABLE/);
     });
     assert.equal(externalConnections, 0);
   } finally {

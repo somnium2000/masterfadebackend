@@ -338,9 +338,14 @@ function createPagosClient({
           id_sale_attempt: params[1], id_intent: params[0], payment_attempt_id: params[1],
           request_id: params[2], card_expire_format_valid: params[3], card_expire_future: params[4],
           billing_address_length: params[5], finalized_at: null,
+          qa_test_origin: params[6] || null,
         };
         saleAttempts.push(row);
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
+      }
+      if (text.includes("SELECT to_jsonb(a)->>'qa_test_origin'")) {
+        return { rows: saleAttempts.filter(row=>row.id_intent===params[0]&&row.qa_test_origin)
+          .map(row=>({qa_test_origin:row.qa_test_origin})).slice(0,1) };
       }
       if (text.includes('SELECT EXISTS(SELECT 1 FROM app_private.pixelpay_sale_attempts WHERE id_intent=')) {
         return { rows: [{ attempted: saleAttempts.some(row=>row.id_intent===params[0]) }] };
@@ -2666,6 +2671,20 @@ async function recoverLocally(client, overrides = {}) {
   }
 }
 
+test('marked QA Status after shutdown recovers authentic durable v2 approval locally, once, with no provider calls',async t=>{
+  const client=localRecoveryClient({initialSaleAttempts:[durableApprovalFixture({qa_test_origin:'sandbox_session'})]});
+  let external=0;
+  const app=await createPagosApp(client,{providerCode:'pixelpay',qa3dsDiagnostic:resolveQaPixelPay3dsDiagnostic({}),
+    providerAdapter:{async sale(){external++;},async queryPaymentStatus(){external++;}}});
+  t.after(()=>app.close());
+  for(let i=0;i<2;i++){
+    const response=await app.inject({method:'POST',url:'/v1/public/pagos/pixelpay/status',payload:{id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com'}});
+    assert.equal(response.statusCode,200,response.body);assert.equal(response.json().data.booking_confirmed,true);
+  }
+  assert.equal(external,0);assert.equal(client.getPayments().length,1);
+  assert.equal(client.getPayments()[0].paid_at,durableEventFixture().recibido_at);
+});
+
 test("durable recovery local: aprobado pre-expiry recupera grupo sin Sale/Status y es idempotente", async () => {
   const client = localRecoveryClient();
   const result = await recoverLocally(client);
@@ -4251,8 +4270,30 @@ test('QA session: two new intents each allow one initial Sale; reload/replay nev
     const send=()=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),id_intent:id}});
     const first=await send();assert.equal(first.statusCode,202,first.body);assert.equal(first.json().data.qa_sandbox_session,true);
     assert.equal((await send()).statusCode,409);assert.equal(client.getSaleAttempts().length,1);
+    assert.equal(client.getSaleAttempts()[0].qa_test_origin,'sandbox_session');
+    assert.ok(client.calls.findIndex(c=>c.sql.includes('INSERT INTO app_private.pixelpay_sale_attempts'))
+      < client.calls.findIndex(c=>c.sql==='COMMIT'));
     assert.equal(client.getPayments().length,0);assert.equal(client.getPaymentEvents().length,0);
     await app.close();
+    // AM: New Fastify instance and disabled policy model a restart without any target UUID.
+    let externalStatuses=0;
+    const restarted=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
+      qa3dsDiagnostic:resolveQaPixelPay3dsDiagnostic({}),providerAdapter:{async queryPaymentStatus(){externalStatuses++;},
+        async sale(){dispatches++;throw new Error('Unexpected replay');}}});
+    t.after(()=>restarted.close());
+    const stateBody={id_grupo_cita:GROUP_A,id_intent:id,titular_email:'cliente@example.com'};
+    const status=await restarted.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/status',payload:stateBody});
+    assert.equal(status.statusCode,403,status.body);
+    const local=await restarted.inject({method:'POST',url:'/v1/pagos/reservas/estado',payload:stateBody});
+    assert.equal(local.statusCode,200);assert.equal(local.json().data.qa_sandbox_session,true);
+    assert.equal(local.json().data.pending_confirmation,true);
+    const replay=await restarted.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),id_intent:id}});
+    assert.equal(replay.statusCode,409);assert.equal(externalStatuses,0);
+    await restarted.close();
+    const publicAlias=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:{async queryPaymentStatus(){externalStatuses++;}}});
+    t.after(()=>publicAlias.close());
+    const bypass=await publicAlias.inject({method:'POST',url:'/v1/public/pagos/pixelpay/status',payload:stateBody});
+    assert.equal(bypass.statusCode,403);assert.equal(externalStatuses,0);await publicAlias.close();
   }
   assert.equal(dispatches,2);
 });
