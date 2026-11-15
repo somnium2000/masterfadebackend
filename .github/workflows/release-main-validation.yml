@@ -1,0 +1,76 @@
+name: Release main validation
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  backend:
+    if: startsWith(github.head_ref, 'release/prod-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: B0-PR117
+            ref: 245fdeced344b46aab86249162c30f8eaebc4066
+          - target: D1
+            ref: ${{ github.event.pull_request.head.sha }}
+    env:
+      TZ: UTC
+      PGTZ: UTC
+      MASTERFADE_TEST_PG_BIN: /usr/lib/postgresql/17/bin
+      MASTERFADE_PHASE02_PG_BIN: /usr/lib/postgresql/17/bin
+      RUN_PAYMENT_LATE_PG_INTEGRATION: 'true'
+      RUN_FINANCIAL_CONTRACT_PG: 'true'
+      RUN_MEMBERSHIP_RECONCILIATION_PG: 'true'
+      RUN_MEMBERSHIP_PAYMENT_IDENTITY_PG: 'true'
+      RUN_PIXELPAY_RESPONSE_CODE_PG: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - name: PostgreSQL 17 local tooling
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-17
+          "$MASTERFADE_TEST_PG_BIN/postgres" --version
+      - name: Isolate Unix sockets for immutable PostgreSQL fixtures
+        run: |
+          test_bin="$RUNNER_TEMP/release-postgres-bin"
+          mkdir -p "$test_bin"
+          for binary in /usr/lib/postgresql/17/bin/*; do ln -s "$binary" "$test_bin/$(basename "$binary")"; done
+          rm "$test_bin/initdb"
+          cat > "$test_bin/initdb" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          args=("$@")
+          data_path=''
+          while (($#)); do
+            if [[ "$1" == '-D' ]]; then data_path="$2"; break; fi
+            shift
+          done
+          /usr/lib/postgresql/17/bin/initdb "${args[@]}"
+          if [[ -n "$data_path" ]]; then
+            [[ "$data_path" == /tmp/* || "$data_path" == "$RUNNER_TEMP"/* ]]
+            printf "\nunix_socket_directories = ''\n" >> "$data_path/postgresql.conf"
+          fi
+          SH
+          chmod +x "$test_bin/initdb"
+          echo "MASTERFADE_TEST_PG_BIN=$test_bin" >> "$GITHUB_ENV"
+          echo "MASTERFADE_PHASE02_PG_BIN=$test_bin" >> "$GITHUB_ENV"
+      - run: git rev-parse HEAD
+      - run: node --test --test-concurrency=2
+      - run: npm run lint
+      - run: git diff --check
+      - name: Identity in an ephemeral local database
+        if: matrix.target == 'D1'
+        run: node scripts/release-identity-postgres.mjs
