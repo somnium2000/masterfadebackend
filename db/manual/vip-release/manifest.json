@@ -1,0 +1,12 @@
+{
+  "base": "32e05f8e0e04e53279099a52d5d9f4eaaa84c9ad",
+  "qa_source": "9bd3bfacbd83967d55e6cbb0d2f086cd92806feb",
+  "captured_at": {
+    "prod": "2026-11-15T22:04:54.526211+00:00",
+    "qa": "2026-11-15T22:04:55.527405+00:00"
+  },
+  "database_writes_required": false,
+  "producer_contract": "membership_consumption version 1, persisted from canonical lines by trusted server",
+  "producer_integrated_in_main": false,
+  "decision": "NO-GO operativo hasta productor certificado; sin SQL de backfill ni cambios a checkout/reservas del companero"
+}
