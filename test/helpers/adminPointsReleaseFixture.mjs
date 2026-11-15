@@ -28,6 +28,11 @@ export async function createAdminPointsReleaseFixture() {
   };
   try {
     await pool.query((await readFile(new URL('../sql/admin-masterpoints-release.fixture.sql', import.meta.url), 'utf8')).replace(/\r\n/g, '\n'));
+    // AM: Release10 usa el overload productivo tambien para asociar ajustes al ciclo.
+    const catalog = JSON.parse(await readFile(new URL('../fixtures/masterpuntos-release10/prod-catalog.json', import.meta.url), 'utf8'));
+    for (const routine of catalog.functions.filter(f => f.signature.startsWith('fn_points_get_or_create_active_cycle('))) {
+      await pool.query(routine.definition);
+    }
     const branch = randomUUID(), otherBranch = randomUUID();
     await pool.query("INSERT INTO sucursales(id_sucursal,id_empresa,nombre_sucursal) VALUES($1,$3,'Centro sintetico'),($2,$3,'Otra sintetica')", [branch, otherBranch, randomUUID()]);
     await pool.query("INSERT INTO tipos_puntos(tipo_puntos_codigo,descripcion,signo) VALUES('ajustar','Ajuste administrativo',1),('ajuste_resta','Resta administrativa',-1),('vencimiento','Vencimiento',-1)");

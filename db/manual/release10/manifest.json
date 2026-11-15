@@ -1,0 +1,102 @@
+{
+  "base": "3a77863",
+  "qa_project": "jgipiyhjtpgyaujfhghf",
+  "prod_project": "pdzsmkjnyazpkoocjbpw",
+  "sources": {
+    "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql": "211a3dfb034f9dd83df0021ad8e89c6ad58ca2d1315cb54814bb03c87f0ba5ad",
+    "db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql": "bcfbaf4ff3c74b1b298fc2f378c2990c4a18fcc234e1657924ca9604071194bc"
+  },
+  "qa_functions": [
+    {
+      "signature": "app_private.points_appointment_paid_v1(uuid)",
+      "hash": "663537c379708916af32a983c04bd4cd"
+    },
+    {
+      "signature": "app_private.points_award_paid_appointment_v1(uuid)",
+      "hash": "e8912101bcf8da89a498de48b530928e"
+    },
+    {
+      "signature": "app_private.points_award_paid_event_v1()",
+      "hash": "6234460cf41408ba70f151d2613246af"
+    },
+    {
+      "signature": "app_private.points_payment_valid_v1(uuid)",
+      "hash": "fd02d98719e13fef3b90356343f318c4"
+    },
+    {
+      "signature": "public.fn_points_estado_final_cita()",
+      "hash": "7fb6bdfda4c090baa1cc35217fb793b7"
+    },
+    {
+      "signature": "public.fn_points_get_effective_rule(uuid)",
+      "hash": "66f5ab15eeca8e37248f9dcfcb47ad4f"
+    },
+    {
+      "signature": "public.fn_points_get_or_create_active_cycle(uuid,integer,timestamp with time zone)",
+      "hash": "a19921956d5cba6513a6834f76b3a11a"
+    },
+    {
+      "signature": "public.fn_points_get_or_create_active_cycle(uuid,timestamp with time zone)",
+      "hash": "bf11db33b109b40df887e26780a29ef4"
+    },
+    {
+      "signature": "public.fn_points_materialize_expired_cycles(uuid)",
+      "hash": "64f4a8091790eeeaf5887fb505edaf61"
+    },
+    {
+      "signature": "public.fn_points_tx_apply_tipo_sign()",
+      "hash": "880bc208992a8e325add77fe7edf467f"
+    },
+    {
+      "signature": "public.fn_points_tx_guard_acumular_final()",
+      "hash": "e5721692abbd0a4e16bf7cfdcad7a0fb"
+    },
+    {
+      "signature": "public.fn_trg_otorgar_puntos_plan_confirmada()",
+      "hash": "e2f678a29bd43bbc93c459ce5d6e2a76"
+    },
+    {
+      "signature": "public.fn_trg_otorgar_puntos_por_cita()",
+      "hash": "444831d3bffad0afb238a2801833fbda"
+    }
+  ],
+  "prod_functions": [
+    {
+      "signature": "public.fn_points_estado_final_cita()",
+      "hash": "4dfc98cfab7a75463c5c83174052bcec"
+    },
+    {
+      "signature": "public.fn_points_get_effective_rule(uuid)",
+      "hash": "a683ccd7ac0e7b57692f08b2f3a0de4b"
+    },
+    {
+      "signature": "public.fn_points_get_or_create_active_cycle(uuid,integer,timestamp with time zone)",
+      "hash": "4920fc016184b7946b64df47dabbfc8e"
+    },
+    {
+      "signature": "public.fn_points_get_or_create_active_cycle(uuid,timestamp with time zone)",
+      "hash": "f493e6430190188179dc3010df3af753"
+    },
+    {
+      "signature": "public.fn_points_materialize_expired_cycles(uuid)",
+      "hash": "5448c179064e0e830e3ac7759d47cf5f"
+    },
+    {
+      "signature": "public.fn_points_tx_apply_tipo_sign()",
+      "hash": "9cbd32e13662f771108d7cc7b6a049d1"
+    },
+    {
+      "signature": "public.fn_points_tx_guard_acumular_final()",
+      "hash": "b574793906178b14218d867aea5fdb2d"
+    },
+    {
+      "signature": "public.fn_trg_otorgar_puntos_plan_confirmada()",
+      "hash": "8fca75d897f52916538b04d82dcdc5ef"
+    },
+    {
+      "signature": "public.fn_trg_otorgar_puntos_por_cita()",
+      "hash": "99e0f5af5be5cf544855d0ba85ae7f26"
+    }
+  ],
+  "note": "Catalogos sin datos personales. Aplicacion manual; no registra migraciones ajenas como aplicadas."
+}

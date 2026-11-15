@@ -1,0 +1,3179 @@
+{
+  "version": "PostgreSQL 17.6 on aarch64-unknown-linux-gnu, compiled by gcc (GCC) 15.2.0, 64-bit",
+  "triggers": [
+    {
+      "name": "tr_audit_points_rules",
+      "table": "points_rules",
+      "enabled": "O",
+      "function": "fn_auditar_bitacora()",
+      "definition": "CREATE TRIGGER tr_audit_points_rules AFTER INSERT OR DELETE OR UPDATE ON public.points_rules FOR EACH ROW EXECUTE FUNCTION fn_auditar_bitacora('id_rule')"
+    },
+    {
+      "name": "tr_audit_points_transactions",
+      "table": "points_transactions",
+      "enabled": "O",
+      "function": "fn_auditar_bitacora()",
+      "definition": "CREATE TRIGGER tr_audit_points_transactions AFTER INSERT OR DELETE OR UPDATE ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_auditar_bitacora('id_points_tx')"
+    },
+    {
+      "name": "tr_points_cita_confirmada",
+      "table": "citas",
+      "enabled": "O",
+      "function": "fn_trg_otorgar_puntos_por_cita()",
+      "definition": "CREATE TRIGGER tr_points_cita_confirmada AFTER UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_otorgar_puntos_por_cita()"
+    },
+    {
+      "name": "tr_points_paid_citas",
+      "table": "citas",
+      "enabled": "O",
+      "function": "app_private.points_award_paid_event_v1()",
+      "definition": "CREATE CONSTRAINT TRIGGER tr_points_paid_citas AFTER INSERT OR UPDATE ON public.citas DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app_private.points_award_paid_event_v1()"
+    },
+    {
+      "name": "tr_points_paid_payment_intents",
+      "table": "payment_intents",
+      "enabled": "O",
+      "function": "app_private.points_award_paid_event_v1()",
+      "definition": "CREATE CONSTRAINT TRIGGER tr_points_paid_payment_intents AFTER INSERT OR UPDATE ON public.payment_intents DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app_private.points_award_paid_event_v1()"
+    },
+    {
+      "name": "tr_points_paid_payments",
+      "table": "payments",
+      "enabled": "O",
+      "function": "app_private.points_award_paid_event_v1()",
+      "definition": "CREATE CONSTRAINT TRIGGER tr_points_paid_payments AFTER INSERT OR UPDATE ON public.payments DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app_private.points_award_paid_event_v1()"
+    },
+    {
+      "name": "tr_points_paid_subscription_consumptions",
+      "table": "subscription_consumptions",
+      "enabled": "O",
+      "function": "app_private.points_award_paid_event_v1()",
+      "definition": "CREATE CONSTRAINT TRIGGER tr_points_paid_subscription_consumptions AFTER INSERT OR UPDATE ON public.subscription_consumptions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app_private.points_award_paid_event_v1()"
+    },
+    {
+      "name": "tr_points_tx_apply_tipo_sign",
+      "table": "points_transactions",
+      "enabled": "O",
+      "function": "fn_points_tx_apply_tipo_sign()",
+      "definition": "CREATE TRIGGER tr_points_tx_apply_tipo_sign BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, puntos ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_apply_tipo_sign()"
+    },
+    {
+      "name": "tr_points_tx_guard_acumular_final",
+      "table": "points_transactions",
+      "enabled": "O",
+      "function": "fn_points_tx_guard_acumular_final()",
+      "definition": "CREATE TRIGGER tr_points_tx_guard_acumular_final BEFORE INSERT OR UPDATE ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_guard_acumular_final()"
+    },
+    {
+      "name": "tr_set_updated_at_points_cycles",
+      "table": "points_cycles",
+      "enabled": "O",
+      "function": "fn_set_updated_at()",
+      "definition": "CREATE TRIGGER tr_set_updated_at_points_cycles BEFORE UPDATE ON public.points_cycles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+    },
+    {
+      "name": "tr_set_updated_at_points_legacy_migrations",
+      "table": "points_legacy_migrations",
+      "enabled": "O",
+      "function": "fn_set_updated_at()",
+      "definition": "CREATE TRIGGER tr_set_updated_at_points_legacy_migrations BEFORE UPDATE ON public.points_legacy_migrations FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+    },
+    {
+      "name": "tr_set_updated_at_points_rules",
+      "table": "points_rules",
+      "enabled": "O",
+      "function": "fn_set_updated_at()",
+      "definition": "CREATE TRIGGER tr_set_updated_at_points_rules BEFORE UPDATE ON public.points_rules FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+    },
+    {
+      "name": "tr_set_updated_at_points_transactions",
+      "table": "points_transactions",
+      "enabled": "O",
+      "function": "fn_set_updated_at()",
+      "definition": "CREATE TRIGGER tr_set_updated_at_points_transactions BEFORE UPDATE ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+    }
+  ],
+  "functions": [
+    {
+      "acl": [
+        "postgres=X/postgres"
+      ],
+      "hash": "663537c379708916af32a983c04bd4cd",
+      "owner": "postgres",
+      "signature": "app_private.points_appointment_paid_v1(uuid)",
+      "definition": "CREATE OR REPLACE FUNCTION app_private.points_appointment_paid_v1(p_id_cita uuid)\n RETURNS boolean\n LANGUAGE sql\n STABLE\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\n  SELECT EXISTS (\n    SELECT 1 FROM public.citas c WHERE c.id_cita = p_id_cita\n      AND c.deleted_at IS NULL AND c.estado_cita_codigo = 'confirmada'\n      AND NOT (COALESCE(c.es_canje_recompensa, false) AND COALESCE(c.orden_integrante, 1) <= 1)\n      AND (\n        (c.total_pagar_hnl > 0 AND EXISTS (\n          SELECT 1 FROM public.payment_intents pi JOIN public.payments p ON p.id_intent = pi.id_intent\n          WHERE pi.origen_pago_codigo = 'cita' AND app_private.points_payment_valid_v1(p.id_payment)\n            AND pi.moneda_codigo = c.moneda_codigo\n            AND (\n              (c.id_grupo_cita IS NULL AND pi.id_grupo_cita IS NULL AND pi.id_cita = c.id_cita\n                AND pi.monto_hnl = c.total_pagar_hnl)\n              OR (c.id_grupo_cita IS NOT NULL\n                AND ((pi.id_grupo_cita = c.id_grupo_cita AND (pi.id_cita IS NULL OR EXISTS (\n                  SELECT 1 FROM public.citas anchor WHERE anchor.id_cita = pi.id_cita\n                    AND anchor.id_grupo_cita = c.id_grupo_cita AND anchor.deleted_at IS NULL)))\n                  OR (pi.id_grupo_cita IS NULL AND EXISTS (\n                  SELECT 1 FROM public.citas anchor WHERE anchor.id_cita = pi.id_cita\n                    AND anchor.id_grupo_cita = c.id_grupo_cita AND anchor.deleted_at IS NULL)))\n                AND pi.monto_hnl = (SELECT sum(g.total_pagar_hnl) FROM public.citas g\n                  WHERE g.id_grupo_cita = c.id_grupo_cita AND g.deleted_at IS NULL))\n            )\n        ))\n        OR EXISTS (\n          SELECT 1 FROM public.subscription_consumptions sc\n          JOIN public.subscriptions s ON s.id_suscripcion = sc.id_suscripcion AND s.id_cliente = sc.id_cliente\n          JOIN public.subscription_payments sp ON sp.id_suscripcion = s.id_suscripcion\n          JOIN public.payments p ON p.id_payment = sp.id_payment\n          JOIN public.payment_intents pi ON pi.id_intent = p.id_intent AND pi.origen_pago_codigo = 'membership'\n          JOIN public.membership_purchase_orders mpo ON mpo.id_order = pi.id_membership_order\n            AND mpo.id_suscripcion = s.id_suscripcion AND mpo.id_cliente = s.id_cliente\n          WHERE sc.id_cita = c.id_cita AND sc.id_cliente = c.id_cliente\n            AND sc.coverage_status = 'cubierto_plan' AND sc.invalidado IS FALSE\n            AND sc.item_tipo = 'servicio' AND sc.id_servicio IS NOT NULL\n            AND EXISTS (SELECT 1 FROM public.citas_detalles cd\n              WHERE cd.id_cita = c.id_cita AND cd.id_servicio = sc.id_servicio)\n            AND (s.estado_suscripcion_codigo = 'activa'\n              OR (s.estado_suscripcion_codigo = 'vencida' AND s.motivo_fin_codigo = 'agotamiento'))\n            AND s.id_sucursal_contratada = c.id_sucursal\n            AND s.inicio_at <= sc.created_at AND s.fin_at > sc.created_at\n            AND sp.estado = 'pagado' AND sp.paid_at IS NOT NULL AND sp.paid_at <= clock_timestamp()\n            AND sp.monto_hnl = p.monto_hnl AND sp.moneda_codigo = p.moneda_codigo\n            AND mpo.estado_orden_codigo = 'pagada' AND mpo.paid_at IS NOT NULL\n            AND mpo.total_hnl = p.monto_hnl AND mpo.moneda_codigo = p.moneda_codigo\n            AND app_private.points_payment_valid_v1(p.id_payment)\n        )\n      )\n  )\n$function$\n"
+    },
+    {
+      "acl": [
+        "postgres=X/postgres"
+      ],
+      "hash": "e8912101bcf8da89a498de48b530928e",
+      "owner": "postgres",
+      "signature": "app_private.points_award_paid_appointment_v1(uuid)",
+      "definition": "CREATE OR REPLACE FUNCTION app_private.points_award_paid_appointment_v1(p_id_cita uuid)\n RETURNS void\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\nDECLARE v_cita public.citas%ROWTYPE; v_beneficiario uuid; v_usuario uuid; v_cycle record; v_origen text;\nBEGIN\n  SELECT * INTO v_cita FROM public.citas WHERE id_cita = p_id_cita;\n  IF NOT FOUND OR NOT app_private.points_appointment_paid_v1(p_id_cita) THEN RETURN; END IF;\n  v_beneficiario := v_cita.id_cliente;\n  IF v_cita.id_grupo_cita IS NOT NULL THEN\n    SELECT CASE WHEN cg.origen_codigo = 'cliente_autenticado' THEN cg.id_cliente_titular ELSE v_cita.id_cliente END\n    INTO v_beneficiario FROM public.citas_grupos cg WHERE cg.id_grupo_cita = v_cita.id_grupo_cita;\n    IF NOT FOUND THEN RETURN; END IF;\n  END IF;\n  IF v_beneficiario IS NULL THEN RETURN; END IF;\n  SELECT id_usuario INTO v_usuario FROM public.clientes WHERE id_cliente = v_beneficiario AND deleted_at IS NULL;\n  IF NOT FOUND THEN RETURN; END IF;\n  PERFORM pg_advisory_xact_lock(hashtext(v_beneficiario::text));\n  IF EXISTS (SELECT 1 FROM public.points_transactions WHERE id_cita = p_id_cita AND tipo_puntos_codigo = 'acumular') THEN RETURN; END IF;\n  SELECT * INTO v_cycle FROM public.fn_points_get_or_create_active_cycle(v_beneficiario, 12, now());\n  v_origen := CASE WHEN COALESCE(v_cita.orden_integrante, 1) > 1 THEN 'integrante' ELSE 'titular' END;\n  INSERT INTO public.points_transactions (id_cliente, id_cita, id_cycle, id_sucursal_origen,\n    tipo_puntos_codigo, origen_punto_codigo, puntos, vence_at, motivo, creado_por_usuario_id)\n  VALUES (v_beneficiario, p_id_cita, v_cycle.id_cycle, v_cita.id_sucursal, 'acumular', v_origen, 1, v_cycle.vence_at,\n    CASE WHEN v_origen = 'integrante' THEN 'Punto por acompañante con pago y reserva confirmados'\n      ELSE 'Punto del titular con pago y reserva confirmados' END, COALESCE(v_cita.creada_por_usuario_id, v_usuario))\n  ON CONFLICT DO NOTHING;\nEND;\n$function$\n"
+    },
+    {
+      "acl": [
+        "postgres=X/postgres"
+      ],
+      "hash": "6234460cf41408ba70f151d2613246af",
+      "owner": "postgres",
+      "signature": "app_private.points_award_paid_event_v1()",
+      "definition": "CREATE OR REPLACE FUNCTION app_private.points_award_paid_event_v1()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\nDECLARE v_intent public.payment_intents%ROWTYPE; v_id_cita uuid;\nBEGIN\n  IF TG_TABLE_NAME = 'citas' THEN\n    IF NEW.estado_cita_codigo <> 'confirmada' THEN RETURN NEW; END IF;\n    IF TG_OP = 'UPDATE' THEN\n      IF OLD.estado_cita_codigo IS NOT DISTINCT FROM NEW.estado_cita_codigo THEN RETURN NEW; END IF;\n    END IF;\n    PERFORM app_private.points_award_paid_appointment_v1(NEW.id_cita);\n  ELSIF TG_TABLE_NAME = 'subscription_consumptions' THEN\n    IF NEW.coverage_status <> 'cubierto_plan' OR NEW.invalidado IS NOT FALSE THEN RETURN NEW; END IF;\n    IF TG_OP = 'UPDATE' THEN\n      IF ROW(OLD.id_cita, OLD.id_suscripcion, OLD.coverage_status, OLD.invalidado, OLD.id_servicio)\n        IS NOT DISTINCT FROM ROW(NEW.id_cita, NEW.id_suscripcion, NEW.coverage_status, NEW.invalidado, NEW.id_servicio) THEN RETURN NEW; END IF;\n    END IF;\n    PERFORM app_private.points_award_paid_appointment_v1(NEW.id_cita);\n  ELSE\n    IF TG_TABLE_NAME = 'payment_intents' THEN\n      IF NEW.estado_intent_codigo <> 'confirmado' THEN RETURN NEW; END IF;\n      IF TG_OP = 'UPDATE' THEN\n        IF OLD.estado_intent_codigo IS NOT DISTINCT FROM NEW.estado_intent_codigo THEN RETURN NEW; END IF;\n      END IF;\n    ELSIF TG_OP = 'UPDATE' THEN\n      IF ROW(OLD.estado_pago_codigo, OLD.pago_tardio) IS NOT DISTINCT FROM ROW(NEW.estado_pago_codigo, NEW.pago_tardio) THEN RETURN NEW; END IF;\n    END IF;\n    SELECT * INTO v_intent FROM public.payment_intents WHERE id_intent = NEW.id_intent;\n    IF NOT FOUND OR v_intent.origen_pago_codigo <> 'cita' THEN RETURN NEW; END IF;\n    FOR v_id_cita IN SELECT c.id_cita FROM public.citas c WHERE c.deleted_at IS NULL\n      AND (c.id_cita = v_intent.id_cita OR c.id_grupo_cita = v_intent.id_grupo_cita\n        OR (v_intent.id_grupo_cita IS NULL AND c.id_grupo_cita = (\n          SELECT anchor.id_grupo_cita FROM public.citas anchor WHERE anchor.id_cita = v_intent.id_cita)))\n      ORDER BY c.id_cita\n    LOOP PERFORM app_private.points_award_paid_appointment_v1(v_id_cita); END LOOP;\n  END IF;\n  RETURN NEW;\nEND;\n$function$\n"
+    },
+    {
+      "acl": [
+        "postgres=X/postgres"
+      ],
+      "hash": "fd02d98719e13fef3b90356343f318c4",
+      "owner": "postgres",
+      "signature": "app_private.points_payment_valid_v1(uuid)",
+      "definition": "CREATE OR REPLACE FUNCTION app_private.points_payment_valid_v1(p_id_payment uuid)\n RETURNS boolean\n LANGUAGE sql\n STABLE\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\n  SELECT EXISTS (\n    SELECT 1 FROM public.payments p\n    JOIN public.payment_intents pi ON pi.id_intent = p.id_intent\n    JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider\n    WHERE p.id_payment = p_id_payment\n      AND p.estado_pago_codigo IN ('capturado', 'conciliado', 'manual_pagado')\n      AND p.pago_tardio IS FALSE AND pi.estado_intent_codigo = 'confirmado'\n      AND p.paid_at IS NOT NULL AND p.paid_at <= clock_timestamp()\n      AND p.monto_hnl > 0 AND p.monto_hnl = pi.monto_hnl\n      AND p.moneda_codigo = pi.moneda_codigo\n      AND NULLIF(btrim(p.provider_tx_id), '') IS NOT NULL\n      AND pp.codigo IN ('pixelpay', 'todopago')\n      AND p.provider_tx_id NOT LIKE 'tx_mock_%' AND p.provider_tx_id NOT LIKE 'todopago_sim_%'\n      AND NOT EXISTS (SELECT 1 FROM public.payment_events pe WHERE pe.id_intent = pi.id_intent\n        AND (pe.evento_tipo IN ('payment.simulated.result', 'membership.simulated.result')\n          OR pe.payload_esencial->>'mode' = 'preprod_simulated'))\n  )\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "7fb6bdfda4c090baa1cc35217fb793b7",
+      "owner": "postgres",
+      "signature": "fn_points_estado_final_cita()",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_estado_final_cita()\n RETURNS text\n LANGUAGE plpgsql\n STABLE\n SET search_path TO 'pg_catalog', 'public', 'pg_temp'\nAS $function$\nDECLARE\n  v_estado text;\nBEGIN\n  SELECT ec.estado_cita_codigo\n  INTO v_estado\n  FROM public.estados_cita ec\n  WHERE lower(trim(ec.estado_cita_codigo)) IN ('completada','atendida','finalizada')\n  ORDER BY\n    CASE lower(trim(ec.estado_cita_codigo))\n      WHEN 'completada' THEN 1\n      WHEN 'atendida' THEN 2\n      WHEN 'finalizada' THEN 3\n      ELSE 99\n    END\n  LIMIT 1;\n\n  IF v_estado IS NULL THEN\n    v_estado := 'completada';\n  END IF;\n\n  RETURN v_estado;\nEND;\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "66f5ab15eeca8e37248f9dcfcb47ad4f",
+      "owner": "postgres",
+      "signature": "fn_points_get_effective_rule(uuid)",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_get_effective_rule(p_id_sucursal uuid)\n RETURNS TABLE(id_rule uuid, id_sucursal uuid, umbral_monto_hnl numeric, puntos_por_cita integer, puntos_para_premio integer, expiracion_meses integer, activo boolean)\n LANGUAGE sql\n STABLE\n SET search_path TO 'pg_catalog', 'public', 'pg_temp'\nAS $function$\n  SELECT\n    pr.id_rule,\n    pr.id_sucursal,\n    pr.umbral_monto_hnl,\n    pr.puntos_por_cita,\n    pr.puntos_para_premio,\n    pr.expiracion_meses,\n    pr.activo\n  FROM public.points_rules pr\n  WHERE pr.activo IS TRUE\n    AND (pr.id_sucursal = p_id_sucursal OR pr.id_sucursal IS NULL)\n  ORDER BY\n    CASE WHEN pr.id_sucursal = p_id_sucursal THEN 0 ELSE 1 END,\n    pr.updated_at DESC,\n    pr.created_at DESC,\n    pr.id_rule DESC\n  LIMIT 1\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "a19921956d5cba6513a6834f76b3a11a",
+      "owner": "postgres",
+      "signature": "fn_points_get_or_create_active_cycle(uuid,integer,timestamp with time zone)",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_get_or_create_active_cycle(p_id_cliente uuid, p_expiracion_meses integer, p_anchor_at timestamp with time zone DEFAULT now())\n RETURNS TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\nDECLARE\n  v_cycle public.points_cycles%ROWTYPE;\n  v_anchor timestamptz := COALESCE(p_anchor_at, now());\nBEGIN\n  IF p_id_cliente IS NULL OR COALESCE(p_expiracion_meses, 12) <> 12 OR v_anchor > now() THEN\n    RAISE EXCEPTION 'MASTERPUNTOS_CYCLE_ARGUMENT_INVALID' USING ERRCODE = '22023';\n  END IF;\n  PERFORM pg_advisory_xact_lock(hashtext(p_id_cliente::text));\n  PERFORM public.fn_points_materialize_expired_cycles(p_id_cliente);\n  SELECT pc.* INTO v_cycle FROM public.points_cycles pc\n  WHERE pc.id_cliente = p_id_cliente AND pc.estado_ciclo_codigo = 'activo'\n  ORDER BY pc.primer_acumulado_at ASC, pc.id_cycle ASC LIMIT 1 FOR UPDATE OF pc;\n  IF v_cycle.id_cycle IS NOT NULL THEN\n    IF NOT EXISTS (SELECT 1 FROM public.points_transactions pt WHERE pt.id_cycle = v_cycle.id_cycle) THEN\n      -- AM: Un ciclo previo vacio empieza al recibir su primera acreditacion, nunca al reservar.\n      UPDATE public.points_cycles pc\n      SET primer_acumulado_at = v_anchor, vence_at = v_anchor + interval '12 months', updated_at = now()\n      WHERE pc.id_cycle = v_cycle.id_cycle RETURNING pc.* INTO v_cycle;\n    ELSIF v_cycle.vence_at IS NULL THEN\n      RAISE EXCEPTION 'MASTERPUNTOS_HISTORICAL_CYCLE_REVIEW_REQUIRED';\n    END IF;\n  ELSE\n    INSERT INTO public.points_cycles (id_cliente, primer_acumulado_at, vence_at, estado_ciclo_codigo)\n    VALUES (p_id_cliente, v_anchor, v_anchor + interval '12 months', 'activo') RETURNING * INTO v_cycle;\n  END IF;\n  RETURN QUERY SELECT v_cycle.id_cycle, v_cycle.primer_acumulado_at, v_cycle.vence_at;\nEND;\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "bf11db33b109b40df887e26780a29ef4",
+      "owner": "postgres",
+      "signature": "fn_points_get_or_create_active_cycle(uuid,timestamp with time zone)",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_get_or_create_active_cycle(p_id_cliente uuid, p_anchor_at timestamp with time zone DEFAULT now())\n RETURNS TABLE(id_cycle uuid, primer_acumulado_at timestamp with time zone, vence_at timestamp with time zone)\n LANGUAGE sql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\n  SELECT * FROM public.fn_points_get_or_create_active_cycle(p_id_cliente, 12, p_anchor_at)\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "64f4a8091790eeeaf5887fb505edaf61",
+      "owner": "postgres",
+      "signature": "fn_points_materialize_expired_cycles(uuid)",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_materialize_expired_cycles(p_id_cliente uuid DEFAULT NULL::uuid)\n RETURNS integer\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public', 'pg_temp'\nAS $function$\nDECLARE\n  v_cycle record;\n  v_balance integer;\n  v_total integer := 0;\nBEGIN\n  FOR v_cycle IN\n    SELECT\n      pc.id_cycle,\n      pc.id_cliente,\n      pc.vence_at\n    FROM public.points_cycles pc\n    WHERE pc.estado_ciclo_codigo = 'activo'\n      AND pc.vence_at <= now()\n      AND (p_id_cliente IS NULL OR pc.id_cliente = p_id_cliente)\n    ORDER BY pc.id_cycle\n    FOR UPDATE OF pc\n  LOOP\n    SELECT COALESCE(SUM(pt.puntos), 0)::integer\n      INTO v_balance\n    FROM public.points_transactions pt\n    WHERE pt.id_cycle = v_cycle.id_cycle;\n\n    IF v_balance > 0 THEN\n      INSERT INTO public.points_transactions (\n        id_cliente,\n        id_cycle,\n        tipo_puntos_codigo,\n        puntos,\n        vence_at,\n        motivo,\n        created_at,\n        updated_at\n      )\n      VALUES (\n        v_cycle.id_cliente,\n        v_cycle.id_cycle,\n        'vencimiento',\n        v_balance,\n        v_cycle.vence_at,\n        'Vencimiento automatico del ciclo',\n        now(),\n        now()\n      )\n      ON CONFLICT (id_cycle, tipo_puntos_codigo)\n        WHERE id_cycle IS NOT NULL\n          AND tipo_puntos_codigo = 'vencimiento'\n      DO NOTHING;\n    END IF;\n\n    UPDATE public.points_cycles\n    SET estado_ciclo_codigo = 'expirado',\n        updated_at = now()\n    WHERE id_cycle = v_cycle.id_cycle\n      AND estado_ciclo_codigo = 'activo';\n\n    IF FOUND THEN\n      v_total := v_total + 1;\n    END IF;\n  END LOOP;\n\n  RETURN v_total;\nEND;\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "880bc208992a8e325add77fe7edf467f",
+      "owner": "postgres",
+      "signature": "fn_points_tx_apply_tipo_sign()",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_tx_apply_tipo_sign()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public', 'pg_temp'\nAS $function$\nDECLARE\n  v_signo integer;\nBEGIN\n  IF NEW.puntos = 0 THEN\n    RAISE EXCEPTION 'points_transactions.puntos no puede ser 0';\n  END IF;\n\n  SELECT tp.signo\n  INTO v_signo\n  FROM public.tipos_puntos tp\n  WHERE tp.tipo_puntos_codigo = NEW.tipo_puntos_codigo\n  LIMIT 1;\n\n  IF v_signo = 1 THEN\n    NEW.puntos := abs(NEW.puntos);\n  ELSIF v_signo = -1 THEN\n    NEW.puntos := -abs(NEW.puntos);\n  END IF;\n\n  RETURN NEW;\nEND;\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "e5721692abbd0a4e16bf7cfdcad7a0fb",
+      "owner": "postgres",
+      "signature": "fn_points_tx_guard_acumular_final()",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_points_tx_guard_acumular_final()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\nDECLARE v_cita public.citas%ROWTYPE; v_beneficiario uuid; v_vence_at timestamptz;\nBEGIN\n  -- AM: Una acreditacion existente no se revierte por no_show ni se reescribe como otra acreditacion.\n  IF TG_OP = 'UPDATE' THEN\n    IF OLD.tipo_puntos_codigo = 'acumular' AND OLD.id_cita IS NOT NULL THEN\n      IF ROW(NEW.id_cliente, NEW.id_cita, NEW.id_cycle, NEW.tipo_puntos_codigo, NEW.origen_punto_codigo, NEW.puntos)\n        IS DISTINCT FROM ROW(OLD.id_cliente, OLD.id_cita, OLD.id_cycle, OLD.tipo_puntos_codigo, OLD.origen_punto_codigo, OLD.puntos) THEN\n        RAISE EXCEPTION 'MASTERPUNTOS_PAID_CREDIT_IMMUTABLE' USING ERRCODE = '23514';\n      END IF;\n      RETURN NEW;\n    END IF;\n  END IF;\n  IF NEW.tipo_puntos_codigo <> 'acumular' OR NEW.id_cita IS NULL THEN RETURN NEW; END IF;\n  IF NOT app_private.points_appointment_paid_v1(NEW.id_cita) THEN RETURN NULL; END IF;\n  SELECT * INTO v_cita FROM public.citas WHERE id_cita = NEW.id_cita;\n  v_beneficiario := v_cita.id_cliente;\n  IF v_cita.id_grupo_cita IS NOT NULL THEN\n    SELECT CASE WHEN cg.origen_codigo = 'cliente_autenticado' THEN cg.id_cliente_titular ELSE v_cita.id_cliente END\n    INTO v_beneficiario FROM public.citas_grupos cg WHERE cg.id_grupo_cita = v_cita.id_grupo_cita;\n    IF NOT FOUND THEN RETURN NULL; END IF;\n  END IF;\n  IF v_beneficiario IS NULL OR v_beneficiario IS DISTINCT FROM NEW.id_cliente THEN RETURN NULL; END IF;\n  SELECT pc.vence_at INTO v_vence_at FROM public.points_cycles pc\n    WHERE pc.id_cycle = NEW.id_cycle AND pc.id_cliente = v_beneficiario\n      AND pc.estado_ciclo_codigo = 'activo' AND pc.vence_at > now()\n      AND pc.vence_at = pc.primer_acumulado_at + interval '12 months';\n  IF NOT FOUND THEN RETURN NULL; END IF;\n  NEW.origen_punto_codigo := CASE WHEN COALESCE(v_cita.orden_integrante, 1) > 1 THEN 'integrante' ELSE 'titular' END;\n  NEW.id_sucursal_origen := v_cita.id_sucursal;\n  NEW.vence_at := v_vence_at;\n  NEW.puntos := 1;\n  RETURN NEW;\nEND;\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "e2f678a29bd43bbc93c459ce5d6e2a76",
+      "owner": "postgres",
+      "signature": "fn_trg_otorgar_puntos_plan_confirmada()",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_plan_confirmada()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\nBEGIN RETURN NEW; END;\n$function$\n"
+    },
+    {
+      "acl": null,
+      "hash": "444831d3bffad0afb238a2801833fbda",
+      "owner": "postgres",
+      "signature": "fn_trg_otorgar_puntos_por_cita()",
+      "definition": "CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_por_cita()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'public'\nAS $function$\nBEGIN RETURN NEW; END;\n$function$\n"
+    }
+  ],
+  "migrations": [
+    {
+      "name": "am_prepare_service_reset_mapping",
+      "version": "20260614054724"
+    },
+    {
+      "name": "add_unique_normalized_cortesias_name",
+      "version": "20260615000852"
+    },
+    {
+      "name": "add_unique_normalized_paquetes_name_alive",
+      "version": "20260615003909"
+    },
+    {
+      "name": "add_unique_normalized_membership_plans_name_global",
+      "version": "20260616021336"
+    },
+    {
+      "name": "fase_2a_agenda_eventos_outbox_v1",
+      "version": "20260703010000"
+    },
+    {
+      "name": "fase_2a2_agenda_outbox_fuentes_disponibilidad_v1",
+      "version": "20260703020000"
+    },
+    {
+      "name": "add_points_rule_services_cliente_condicion",
+      "version": "20260703223553"
+    },
+    {
+      "name": "add_points_rule_services_puntos_canje",
+      "version": "20260703223602"
+    },
+    {
+      "name": "add_points_rule_services_habilitado_column",
+      "version": "20260703223612"
+    },
+    {
+      "name": "add_points_rule_services_visible_cliente",
+      "version": "20260703223616"
+    },
+    {
+      "name": "add_points_rule_services_orden_visual",
+      "version": "20260703223620"
+    },
+    {
+      "name": "add_points_rule_services_updated_at",
+      "version": "20260703223624"
+    },
+    {
+      "name": "default_points_rule_services_habilitado_bool",
+      "version": "20260703223644"
+    },
+    {
+      "name": "default_points_rule_services_visible_cliente",
+      "version": "20260703223647"
+    },
+    {
+      "name": "default_points_rule_services_orden",
+      "version": "20260703223651"
+    },
+    {
+      "name": "check_prs_puntos_canje_positive",
+      "version": "20260703223712"
+    },
+    {
+      "name": "check_prs_orden_visual_positive",
+      "version": "20260703223715"
+    },
+    {
+      "name": "replace_points_rule_services_unique_by_condition",
+      "version": "20260703223719"
+    },
+    {
+      "name": "index_points_rule_services_config_lookup",
+      "version": "20260703223725"
+    },
+    {
+      "name": "create_vw_points_redemption_services",
+      "version": "20260703223730"
+    },
+    {
+      "name": "default_prs_updated_clock",
+      "version": "20260703223830"
+    },
+    {
+      "name": "not_null_prs_config_columns",
+      "version": "20260703223836"
+    },
+    {
+      "name": "create_vw_prs_active",
+      "version": "20260703224326"
+    },
+    {
+      "name": "cuenta_eliminacion_solicitudes_control_v1",
+      "version": "20260711015701"
+    },
+    {
+      "name": "cuenta_eliminacion_solicitudes_fk_indexes_v1",
+      "version": "20260711015805"
+    },
+    {
+      "name": "cuenta_eliminacion_alinear_app_private_v1",
+      "version": "20260711015905"
+    },
+    {
+      "name": "cuenta_eliminacion_auth_desacople_seguro_v1",
+      "version": "20260711021809"
+    },
+    {
+      "name": "points_balance_signed_transactions_v1",
+      "version": "20260711143241"
+    },
+    {
+      "name": "account_deletion_session_reason_v1",
+      "version": "20260711144946"
+    },
+    {
+      "name": "account_deletion_pii_redaction_helper_v1",
+      "version": "20260711150309"
+    },
+    {
+      "name": "account_deletion_execution_token_v1",
+      "version": "20260711163541"
+    },
+    {
+      "name": "account_deletion_execution_token_terminal_replay_v1",
+      "version": "20260711163730"
+    },
+    {
+      "name": "pixelpay_sale_attempts",
+      "version": "20261011183722"
+    },
+    {
+      "name": "payment_late_uses_paid_at_v1",
+      "version": "20261011222347"
+    },
+    {
+      "name": "membership_purchase_order_idempotency",
+      "version": "20261016150116"
+    },
+    {
+      "name": "pixelpay_uncertain_observed_identifiers",
+      "version": "20261018002700"
+    },
+    {
+      "name": "pixelpay_observed_payment_uuid_opaque",
+      "version": "20261018150608"
+    },
+    {
+      "name": "qa_employee_lifecycle_roles_20261021",
+      "version": "20261022015352"
+    },
+    {
+      "name": "qa_sucursal_active_dependency_guards_20261021",
+      "version": "20261022015448"
+    },
+    {
+      "name": "guest_registration_requests_02g_20261019",
+      "version": "20261023025126"
+    },
+    {
+      "name": "masterpuntos_readonly_expiration_v1",
+      "version": "20261030133938"
+    },
+    {
+      "name": "auth_password_reset_session_reason_v1",
+      "version": "20261030211140"
+    },
+    {
+      "name": "masterpuntos_manual_adjustment_idempotency_v1",
+      "version": "20261031143653"
+    },
+    {
+      "name": "financial_paid_at_contract_v2",
+      "version": "20261101190921"
+    },
+    {
+      "name": "promos_b_hold_and_group_contract",
+      "version": "20261101194723"
+    },
+    {
+      "name": "payment_status_checks_precondition_failed",
+      "version": "20261104045924"
+    },
+    {
+      "name": "pixelpay_uncertain_expiration_evidence",
+      "version": "20261107022929"
+    },
+    {
+      "name": "qa_masterpuntos_completion_cycles_v1_20261113",
+      "version": "20261113160737"
+    },
+    {
+      "name": "qa_masterpuntos_paid_confirmation_v1_20261113",
+      "version": "20261113165354"
+    },
+    {
+      "name": "qa_seguridad_supabase_02_routine_hardening_20261113",
+      "version": "20261114003629"
+    }
+  ],
+  "rls": [
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": false,
+      "name": "points_cycles",
+      "force": false
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": false,
+      "name": "points_legacy_migrations",
+      "force": false
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": false,
+      "name": "points_rule_services",
+      "force": false
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": false,
+      "name": "points_rules",
+      "force": false
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": true,
+      "name": "points_transactions",
+      "force": false
+    }
+  ],
+  "views": [
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "name": "vw_points_balance",
+      "options": null,
+      "definition": " WITH ledger_balance AS (\n         SELECT pt.id_cliente,\n            COALESCE(sum(pt.puntos), 0::bigint) AS ledger_points\n           FROM points_transactions pt\n          GROUP BY pt.id_cliente\n        ), pending_expired_cycles AS (\n         SELECT pc.id_cliente,\n            pc.id_cycle,\n            COALESCE(sum(pt.puntos), 0::bigint) AS remaining_points\n           FROM points_cycles pc\n             JOIN points_transactions pt ON pt.id_cycle = pc.id_cycle\n          WHERE pc.estado_ciclo_codigo = 'activo'::text AND pc.vence_at IS NOT NULL AND pc.vence_at <= now()\n          GROUP BY pc.id_cliente, pc.id_cycle\n        ), pending_expiration_by_client AS (\n         SELECT pec.id_cliente,\n            COALESCE(sum(\n                CASE\n                    WHEN pec.remaining_points > 0 THEN pec.remaining_points\n                    ELSE 0::bigint\n                END), 0::bigint::numeric) AS pending_expired_points\n           FROM pending_expired_cycles pec\n          GROUP BY pec.id_cliente\n        )\n SELECT lb.id_cliente,\n    (lb.ledger_points::numeric - COALESCE(pe.pending_expired_points, 0::bigint::numeric))::integer AS balance_puntos\n   FROM ledger_balance lb\n     LEFT JOIN pending_expiration_by_client pe ON pe.id_cliente = lb.id_cliente;"
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "name": "vw_points_redemption_services",
+      "options": null,
+      "definition": " SELECT prs.id_rule_service,\n    pr.id_rule,\n    pr.id_sucursal,\n    prs.cliente_condicion_codigo,\n    prs.id_servicio,\n    s.nombre_servicio,\n    s.descripcion AS descripcion_servicio,\n    s.grupo_catalogo,\n    COALESCE(prs.puntos_canje, pr.puntos_para_premio) AS puntos_requeridos,\n    prs.puntos_canje AS puntos_canje_override,\n    pr.puntos_para_premio AS puntos_para_premio_regla,\n    prs.habilitado AS regla_servicio_activa,\n    prs.visible_cliente,\n    prs.orden_visual,\n    pr.activo AS regla_puntos_activa,\n    s.activo AS servicio_activo,\n    s.visible_publico AS servicio_visible_publico,\n    s.agendable AS servicio_agendable,\n    prs.created_at,\n    prs.updated_at\n   FROM points_rule_services prs\n     JOIN points_rules pr ON pr.id_rule = prs.id_rule\n     JOIN servicios s ON s.id_servicio = prs.id_servicio\n  WHERE s.deleted_at IS NULL;"
+    }
+  ],
+  "columns": [
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "citas",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_empleado_barbero",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona_cliente",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "creada_por_usuario_id",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "asignada_automaticamente",
+      "type": "bool",
+      "table": "citas",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "estado_cita_codigo",
+      "type": "text",
+      "table": "citas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "inicio_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "fin_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "duracion_total_min",
+      "type": "int4",
+      "table": "citas",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "buffer_total_min",
+      "type": "int4",
+      "table": "citas",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "subtotal_servicios_hnl",
+      "type": "numeric",
+      "table": "citas",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_hnl",
+      "type": "numeric",
+      "table": "citas",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_pagar_hnl",
+      "type": "numeric",
+      "table": "citas",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "moneda_codigo",
+      "type": "text",
+      "table": "citas",
+      "default": "'HNL'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "notas",
+      "type": "text",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "llegada_real_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "no_show_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "orden_integrante",
+      "type": "int4",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "alias_integrante",
+      "type": "text",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "contacto_nombre",
+      "type": "text",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "contacto_email",
+      "type": "text",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "contacto_telefono",
+      "type": "text",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "selection_type",
+      "type": "text",
+      "table": "citas",
+      "default": "'services'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_paquete",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "atencion_iniciada_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "atencion_finalizada_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "retraso_inicio_min",
+      "type": "int4",
+      "table": "citas",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "es_canje_recompensa",
+      "type": "bool",
+      "table": "citas",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita_integrante",
+      "type": "uuid",
+      "table": "citas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cita_detalle",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "cantidad",
+      "type": "int4",
+      "table": "citas_detalles",
+      "default": "1",
+      "nullable": "NO"
+    },
+    {
+      "name": "duracion_min",
+      "type": "int4",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "buffer_min",
+      "type": "int4",
+      "table": "citas_detalles",
+      "default": "5",
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_unitario_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "subtotal_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas_detalles",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas_detalles",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita_paquete",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "origen_item_codigo",
+      "type": "text",
+      "table": "citas_detalles",
+      "default": "'servicio_manual'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_servicio_snapshot",
+      "type": "text",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_referencia_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "isv_porcentaje",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "isv_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_linea_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_tarifa",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "incluye_isv_snapshot",
+      "type": "bool",
+      "table": "citas_detalles",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "line_key",
+      "type": "text",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_linea",
+      "type": "int4",
+      "table": "citas_detalles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona_titular",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cliente_titular",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_grupo_codigo",
+      "type": "text",
+      "table": "citas_grupos",
+      "default": "'activo'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "notas",
+      "type": "text",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas_grupos",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas_grupos",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "codigo_reserva",
+      "type": "text",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_usuario_titular",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "origen_codigo",
+      "type": "text",
+      "table": "citas_grupos",
+      "default": "'publico'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_hnl",
+      "type": "numeric",
+      "table": "citas_grupos",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "release_token",
+      "type": "text",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "release_token_hash",
+      "type": "text",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "release_token_created_at",
+      "type": "timestamptz",
+      "table": "citas_grupos",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "clientes",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona",
+      "type": "uuid",
+      "table": "clientes",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_usuario",
+      "type": "uuid",
+      "table": "clientes",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "fecha_ingreso",
+      "type": "date",
+      "table": "clientes",
+      "default": "CURRENT_DATE",
+      "nullable": "NO"
+    },
+    {
+      "name": "estado",
+      "type": "bool",
+      "table": "clientes",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "consentimiento_marketing",
+      "type": "bool",
+      "table": "clientes",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "acepta_terminos",
+      "type": "bool",
+      "table": "clientes",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "preferencias",
+      "type": "jsonb",
+      "table": "clientes",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "anonimizado",
+      "type": "bool",
+      "table": "clientes",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "clientes",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "clientes",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "clientes",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_sucursal_origen",
+      "type": "uuid",
+      "table": "clientes",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "acepta_terminos_at",
+      "type": "timestamptz",
+      "table": "clientes",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "consentimiento_marketing_at",
+      "type": "timestamptz",
+      "table": "clientes",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_cita_codigo",
+      "type": "text",
+      "table": "estados_cita",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "estados_cita",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "membership_plans",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_plan",
+      "type": "text",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_hnl",
+      "type": "numeric",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "periodo_membresia_codigo",
+      "type": "text",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "beneficios",
+      "type": "jsonb",
+      "table": "membership_plans",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "membership_plans",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "membership_plans",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "membership_plans",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "categoria_nivel",
+      "type": "int2",
+      "table": "membership_plans",
+      "default": "1",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_intent",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_provider",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_hold",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_intent_codigo",
+      "type": "text",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "monto_hnl",
+      "type": "numeric",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "moneda_codigo",
+      "type": "text",
+      "table": "payment_intents",
+      "default": "'HNL'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "link_pago_url",
+      "type": "text",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "referencia_externa",
+      "type": "text",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "idempotency_key",
+      "type": "text",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "expires_at",
+      "type": "timestamptz",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_by_usuario_id",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "payment_intents",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "payment_intents",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_membership_order",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "origen_pago_codigo",
+      "type": "text",
+      "table": "payment_intents",
+      "default": "'cita'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "paid_at",
+      "type": "timestamptz",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "orden_compra",
+      "type": "text",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "provider_session_id",
+      "type": "text",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "launch_expires_at",
+      "type": "timestamptz",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "last_verified_at",
+      "type": "timestamptz",
+      "table": "payment_intents",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "verification_attempts",
+      "type": "int4",
+      "table": "payment_intents",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_payment",
+      "type": "uuid",
+      "table": "payments",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_intent",
+      "type": "uuid",
+      "table": "payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "estado_pago_codigo",
+      "type": "text",
+      "table": "payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "provider_tx_id",
+      "type": "text",
+      "table": "payments",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "monto_hnl",
+      "type": "numeric",
+      "table": "payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "moneda_codigo",
+      "type": "text",
+      "table": "payments",
+      "default": "'HNL'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "paid_at",
+      "type": "timestamptz",
+      "table": "payments",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "pago_tardio",
+      "type": "bool",
+      "table": "payments",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "registrado_manualmente",
+      "type": "bool",
+      "table": "payments",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "registrado_por_usuario_id",
+      "type": "uuid",
+      "table": "payments",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "payments",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "payments",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona",
+      "type": "uuid",
+      "table": "personas",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombres",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "apellidos",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "fecha_nacimiento",
+      "type": "date",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "genero_codigo",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "dni",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "rtn",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "telefono_principal",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "direccion_texto",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "observaciones",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "personas",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "personas",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "foto_perfil_asset_id",
+      "type": "uuid",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "foto_perfil_path",
+      "type": "text",
+      "table": "personas",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cycle",
+      "type": "uuid",
+      "table": "points_cycles",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "points_cycles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "primer_acumulado_at",
+      "type": "timestamptz",
+      "table": "points_cycles",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "vence_at",
+      "type": "timestamptz",
+      "table": "points_cycles",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_ciclo_codigo",
+      "type": "text",
+      "table": "points_cycles",
+      "default": "'activo'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "points_cycles",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "points_cycles",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_migracion",
+      "type": "uuid",
+      "table": "points_legacy_migrations",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "points_legacy_migrations",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_points_tx",
+      "type": "uuid",
+      "table": "points_legacy_migrations",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "puntos_migrados",
+      "type": "int4",
+      "table": "points_legacy_migrations",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "motivo",
+      "type": "text",
+      "table": "points_legacy_migrations",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "creado_por_usuario_id",
+      "type": "uuid",
+      "table": "points_legacy_migrations",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "points_legacy_migrations",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "points_legacy_migrations",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_rule_service",
+      "type": "uuid",
+      "table": "points_rule_services",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_rule",
+      "type": "uuid",
+      "table": "points_rule_services",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "points_rule_services",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "points_rule_services",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "cliente_condicion_codigo",
+      "type": "text",
+      "table": "points_rule_services",
+      "default": "'sin_membresia'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "puntos_canje",
+      "type": "int4",
+      "table": "points_rule_services",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "habilitado",
+      "type": "bool",
+      "table": "points_rule_services",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "visible_cliente",
+      "type": "bool",
+      "table": "points_rule_services",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_visual",
+      "type": "int4",
+      "table": "points_rule_services",
+      "default": "100",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "points_rule_services",
+      "default": "statement_timestamp()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_rule",
+      "type": "uuid",
+      "table": "points_rules",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "points_rules",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "umbral_monto_hnl",
+      "type": "numeric",
+      "table": "points_rules",
+      "default": "250",
+      "nullable": "NO"
+    },
+    {
+      "name": "puntos_por_cita",
+      "type": "int4",
+      "table": "points_rules",
+      "default": "1",
+      "nullable": "NO"
+    },
+    {
+      "name": "puntos_para_premio",
+      "type": "int4",
+      "table": "points_rules",
+      "default": "10",
+      "nullable": "NO"
+    },
+    {
+      "name": "expiracion_meses",
+      "type": "int4",
+      "table": "points_rules",
+      "default": "12",
+      "nullable": "YES"
+    },
+    {
+      "name": "servicios_redimibles",
+      "type": "_text",
+      "table": "points_rules",
+      "default": "ARRAY['corte'::text, 'barba'::text]",
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "points_rules",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "points_rules",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "points_rules",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_points_tx",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "tipo_puntos_codigo",
+      "type": "text",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "puntos",
+      "type": "int4",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "vence_at",
+      "type": "timestamptz",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "motivo",
+      "type": "text",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "creado_por_usuario_id",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "points_transactions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "points_transactions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cycle",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_sucursal_origen",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_servicio_canje",
+      "type": "uuid",
+      "table": "points_transactions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "origen_punto_codigo",
+      "type": "text",
+      "table": "points_transactions",
+      "default": "'titular'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "servicios",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_servicio",
+      "type": "text",
+      "table": "servicios",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "servicios",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "duracion_min",
+      "type": "int4",
+      "table": "servicios",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "buffer_min",
+      "type": "int4",
+      "table": "servicios",
+      "default": "5",
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "servicios",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "servicios",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "servicios",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "servicios",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "grupo_catalogo",
+      "type": "text",
+      "table": "servicios",
+      "default": "'barberia'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "visible_publico",
+      "type": "bool",
+      "table": "servicios",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "agendable",
+      "type": "bool",
+      "table": "servicios",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_visual",
+      "type": "int4",
+      "table": "servicios",
+      "default": "100",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_consumo",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_integrante",
+      "type": "int4",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "item_tipo",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "item_codigo",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "item_nombre",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "cantidad",
+      "type": "int4",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_unitario_hnl",
+      "type": "numeric",
+      "table": "subscription_consumptions",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_hnl",
+      "type": "numeric",
+      "table": "subscription_consumptions",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "coverage_status",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "source_key",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "subscription_consumptions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "subscription_consumptions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cortesia",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "source_kind",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "invalidado",
+      "type": "bool",
+      "table": "subscription_consumptions",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "invalidado_motivo",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "subscriptions",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "estado_suscripcion_codigo",
+      "type": "text",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "inicio_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "fin_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "renovacion_auto",
+      "type": "bool",
+      "table": "subscriptions",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "cancelada_al_fin",
+      "type": "bool",
+      "table": "subscriptions",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_by_usuario_id",
+      "type": "uuid",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "beneficios_snapshot",
+      "type": "jsonb",
+      "table": "subscriptions",
+      "default": "'{\"items\": [], \"version\": 1}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal_contratada",
+      "type": "uuid",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "motivo_fin_codigo",
+      "type": "text",
+      "table": "subscriptions",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "sucursales",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_empresa",
+      "type": "uuid",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_sucursal",
+      "type": "text",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "direccion_texto",
+      "type": "text",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "telefono_texto",
+      "type": "text",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_correo",
+      "type": "uuid",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "fecha_inauguracion",
+      "type": "date",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado",
+      "type": "bool",
+      "table": "sucursales",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "sucursales",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "sucursales",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "sucursales",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "tipo_puntos_codigo",
+      "type": "text",
+      "table": "tipos_puntos",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "tipos_puntos",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "signo",
+      "type": "int4",
+      "table": "tipos_puntos",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_usuario",
+      "type": "uuid",
+      "table": "usuarios",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona",
+      "type": "uuid",
+      "table": "usuarios",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "estado",
+      "type": "bool",
+      "table": "usuarios",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "usuarios",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "usuarios",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "usuarios",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "password_hash",
+      "type": "text",
+      "table": "usuarios",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_acceso",
+      "type": "text",
+      "table": "usuarios",
+      "default": "'pendiente_password'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "credenciales_completadas_at",
+      "type": "timestamptz",
+      "table": "usuarios",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "ultimo_login_at",
+      "type": "timestamptz",
+      "table": "usuarios",
+      "default": null,
+      "nullable": "YES"
+    }
+  ],
+  "indexes": [
+    {
+      "name": "citas_pkey",
+      "table": "citas",
+      "definition": "CREATE UNIQUE INDEX citas_pkey ON public.citas USING btree (id_cita)"
+    },
+    {
+      "name": "ex_citas_solape_barbero",
+      "table": "citas",
+      "definition": "CREATE INDEX ex_citas_solape_barbero ON public.citas USING gist (id_empleado_barbero, tstzrange(inicio_at, fin_at, '[)'::text)) WHERE ((deleted_at IS NULL) AND (estado_cita_codigo = ANY (ARRAY['en_espera'::text, 'pendiente_pago'::text, 'confirmada'::text, 'en_salon'::text, 'en_atencion'::text])))"
+    },
+    {
+      "name": "idx_citas_attention_state",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_attention_state ON public.citas USING btree (id_empleado_barbero, estado_cita_codigo, inicio_at) WHERE (deleted_at IS NULL)"
+    },
+    {
+      "name": "idx_citas_barbero",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_barbero ON public.citas USING btree (id_empleado_barbero)"
+    },
+    {
+      "name": "idx_citas_barbero_fecha_scope",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_barbero_fecha_scope ON public.citas USING btree (id_empleado_barbero, inicio_at) WHERE (deleted_at IS NULL)"
+    },
+    {
+      "name": "idx_citas_cliente",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_cliente ON public.citas USING btree (id_cliente) WHERE (id_cliente IS NOT NULL)"
+    },
+    {
+      "name": "idx_citas_estado",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_estado ON public.citas USING btree (estado_cita_codigo)"
+    },
+    {
+      "name": "idx_citas_id_cita_integrante",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_id_cita_integrante ON public.citas USING btree (id_cita_integrante)"
+    },
+    {
+      "name": "idx_citas_id_grupo_cita",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_id_grupo_cita ON public.citas USING btree (id_grupo_cita)"
+    },
+    {
+      "name": "idx_citas_operativas_scope",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_operativas_scope ON public.citas USING btree (id_sucursal, estado_cita_codigo, inicio_at) WHERE (deleted_at IS NULL)"
+    },
+    {
+      "name": "idx_citas_persona_cliente",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_persona_cliente ON public.citas USING btree (id_persona_cliente)"
+    },
+    {
+      "name": "idx_citas_sucursal",
+      "table": "citas",
+      "definition": "CREATE INDEX idx_citas_sucursal ON public.citas USING btree (id_sucursal)"
+    },
+    {
+      "name": "uq_citas_grupo_orden",
+      "table": "citas",
+      "definition": "CREATE UNIQUE INDEX uq_citas_grupo_orden ON public.citas USING btree (id_grupo_cita, orden_integrante)"
+    },
+    {
+      "name": "idx_int_cita",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_int_cita ON public.payment_intents USING btree (id_cita)"
+    },
+    {
+      "name": "idx_int_creador_estado",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_int_creador_estado ON public.payment_intents USING btree (created_by_usuario_id, estado_intent_codigo)"
+    },
+    {
+      "name": "idx_int_membership_order",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_int_membership_order ON public.payment_intents USING btree (id_membership_order)"
+    },
+    {
+      "name": "idx_int_origen_estado",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_int_origen_estado ON public.payment_intents USING btree (origen_pago_codigo, estado_intent_codigo, created_at DESC)"
+    },
+    {
+      "name": "idx_payment_intents_activos_expires",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_payment_intents_activos_expires ON public.payment_intents USING btree (expires_at, id_grupo_cita, id_cita, id_hold) WHERE (estado_intent_codigo = ANY (ARRAY['creado'::text, 'link_generado'::text, 'pendiente_confirmacion'::text]))"
+    },
+    {
+      "name": "idx_payment_intents_id_grupo_cita",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_payment_intents_id_grupo_cita ON public.payment_intents USING btree (id_grupo_cita) WHERE (id_grupo_cita IS NOT NULL)"
+    },
+    {
+      "name": "idx_payment_intents_provider_order",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_payment_intents_provider_order ON public.payment_intents USING btree (id_provider, orden_compra) WHERE ((id_provider IS NOT NULL) AND (orden_compra IS NOT NULL))"
+    },
+    {
+      "name": "idx_payment_intents_provider_session",
+      "table": "payment_intents",
+      "definition": "CREATE INDEX idx_payment_intents_provider_session ON public.payment_intents USING btree (id_provider, provider_session_id) WHERE ((id_provider IS NOT NULL) AND (provider_session_id IS NOT NULL))"
+    },
+    {
+      "name": "payment_intents_pkey",
+      "table": "payment_intents",
+      "definition": "CREATE UNIQUE INDEX payment_intents_pkey ON public.payment_intents USING btree (id_intent)"
+    },
+    {
+      "name": "uq_intent_idempotency",
+      "table": "payment_intents",
+      "definition": "CREATE UNIQUE INDEX uq_intent_idempotency ON public.payment_intents USING btree (id_provider, idempotency_key)"
+    },
+    {
+      "name": "idx_pay_intent",
+      "table": "payments",
+      "definition": "CREATE INDEX idx_pay_intent ON public.payments USING btree (id_intent)"
+    },
+    {
+      "name": "payments_pkey",
+      "table": "payments",
+      "definition": "CREATE UNIQUE INDEX payments_pkey ON public.payments USING btree (id_payment)"
+    },
+    {
+      "name": "uq_payment_provider_tx",
+      "table": "payments",
+      "definition": "CREATE UNIQUE INDEX uq_payment_provider_tx ON public.payments USING btree (provider_tx_id)"
+    },
+    {
+      "name": "idx_points_cycles_cliente",
+      "table": "points_cycles",
+      "definition": "CREATE INDEX idx_points_cycles_cliente ON public.points_cycles USING btree (id_cliente)"
+    },
+    {
+      "name": "idx_points_cycles_vence",
+      "table": "points_cycles",
+      "definition": "CREATE INDEX idx_points_cycles_vence ON public.points_cycles USING btree (vence_at)"
+    },
+    {
+      "name": "points_cycles_pkey",
+      "table": "points_cycles",
+      "definition": "CREATE UNIQUE INDEX points_cycles_pkey ON public.points_cycles USING btree (id_cycle)"
+    },
+    {
+      "name": "uq_points_cycle_active_cliente",
+      "table": "points_cycles",
+      "definition": "CREATE UNIQUE INDEX uq_points_cycle_active_cliente ON public.points_cycles USING btree (id_cliente) WHERE (estado_ciclo_codigo = 'activo'::text)"
+    },
+    {
+      "name": "idx_points_legacy_migrations_created_at",
+      "table": "points_legacy_migrations",
+      "definition": "CREATE INDEX idx_points_legacy_migrations_created_at ON public.points_legacy_migrations USING btree (created_at DESC)"
+    },
+    {
+      "name": "points_legacy_migrations_pkey",
+      "table": "points_legacy_migrations",
+      "definition": "CREATE UNIQUE INDEX points_legacy_migrations_pkey ON public.points_legacy_migrations USING btree (id_migracion)"
+    },
+    {
+      "name": "unique_cliente_legacy_migration",
+      "table": "points_legacy_migrations",
+      "definition": "CREATE UNIQUE INDEX unique_cliente_legacy_migration ON public.points_legacy_migrations USING btree (id_cliente)"
+    },
+    {
+      "name": "unique_legacy_migration_per_client",
+      "table": "points_legacy_migrations",
+      "definition": "CREATE UNIQUE INDEX unique_legacy_migration_per_client ON public.points_legacy_migrations USING btree (id_cliente)"
+    },
+    {
+      "name": "uq_points_legacy_migrations_cliente",
+      "table": "points_legacy_migrations",
+      "definition": "CREATE UNIQUE INDEX uq_points_legacy_migrations_cliente ON public.points_legacy_migrations USING btree (id_cliente)"
+    },
+    {
+      "name": "idx_points_rule_services_rule",
+      "table": "points_rule_services",
+      "definition": "CREATE INDEX idx_points_rule_services_rule ON public.points_rule_services USING btree (id_rule)"
+    },
+    {
+      "name": "idx_points_rule_services_service",
+      "table": "points_rule_services",
+      "definition": "CREATE INDEX idx_points_rule_services_service ON public.points_rule_services USING btree (id_servicio)"
+    },
+    {
+      "name": "idx_prs_condicion_lookup",
+      "table": "points_rule_services",
+      "definition": "CREATE INDEX idx_prs_condicion_lookup ON public.points_rule_services USING btree (cliente_condicion_codigo, habilitado, visible_cliente, orden_visual)"
+    },
+    {
+      "name": "idx_prs_servicio_lookup",
+      "table": "points_rule_services",
+      "definition": "CREATE INDEX idx_prs_servicio_lookup ON public.points_rule_services USING btree (id_servicio, habilitado)"
+    },
+    {
+      "name": "points_rule_services_pkey",
+      "table": "points_rule_services",
+      "definition": "CREATE UNIQUE INDEX points_rule_services_pkey ON public.points_rule_services USING btree (id_rule_service)"
+    },
+    {
+      "name": "uq_prs_rule_service_condition",
+      "table": "points_rule_services",
+      "definition": "CREATE UNIQUE INDEX uq_prs_rule_service_condition ON public.points_rule_services USING btree (id_rule, id_servicio, cliente_condicion_codigo)"
+    },
+    {
+      "name": "points_rules_pkey",
+      "table": "points_rules",
+      "definition": "CREATE UNIQUE INDEX points_rules_pkey ON public.points_rules USING btree (id_rule)"
+    },
+    {
+      "name": "idx_points_tx_cita",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_cita ON public.points_transactions USING btree (id_cita)"
+    },
+    {
+      "name": "idx_points_tx_cita_origen_acumular",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_cita_origen_acumular ON public.points_transactions USING btree (id_cita, origen_punto_codigo) WHERE (tipo_puntos_codigo = 'acumular'::text)"
+    },
+    {
+      "name": "idx_points_tx_cliente",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_cliente ON public.points_transactions USING btree (id_cliente)"
+    },
+    {
+      "name": "idx_points_tx_cliente_created_at_desc",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_cliente_created_at_desc ON public.points_transactions USING btree (id_cliente, created_at DESC)"
+    },
+    {
+      "name": "idx_points_tx_cliente_cycle",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_cliente_cycle ON public.points_transactions USING btree (id_cliente, id_cycle)"
+    },
+    {
+      "name": "idx_points_tx_cycle",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_cycle ON public.points_transactions USING btree (id_cycle)"
+    },
+    {
+      "name": "idx_points_tx_tipo",
+      "table": "points_transactions",
+      "definition": "CREATE INDEX idx_points_tx_tipo ON public.points_transactions USING btree (tipo_puntos_codigo)"
+    },
+    {
+      "name": "points_transactions_pkey",
+      "table": "points_transactions",
+      "definition": "CREATE UNIQUE INDEX points_transactions_pkey ON public.points_transactions USING btree (id_points_tx)"
+    },
+    {
+      "name": "uq_points_tx_acumular_cita_tipo_origen_norm",
+      "table": "points_transactions",
+      "definition": "CREATE UNIQUE INDEX uq_points_tx_acumular_cita_tipo_origen_norm ON public.points_transactions USING btree (id_cita, tipo_puntos_codigo, COALESCE(origen_punto_codigo, 'titular'::text)) WHERE ((tipo_puntos_codigo = 'acumular'::text) AND (id_cita IS NOT NULL))"
+    },
+    {
+      "name": "uq_points_tx_acumular_por_cita",
+      "table": "points_transactions",
+      "definition": "CREATE UNIQUE INDEX uq_points_tx_acumular_por_cita ON public.points_transactions USING btree (id_cita, tipo_puntos_codigo) WHERE ((id_cita IS NOT NULL) AND (tipo_puntos_codigo = 'acumular'::text))"
+    },
+    {
+      "name": "uq_points_tx_canje_por_cita",
+      "table": "points_transactions",
+      "definition": "CREATE UNIQUE INDEX uq_points_tx_canje_por_cita ON public.points_transactions USING btree (id_cliente, id_cita, tipo_puntos_codigo) WHERE ((tipo_puntos_codigo = 'canjear'::text) AND (id_cita IS NOT NULL))"
+    },
+    {
+      "name": "uq_points_tx_ganancia_por_cita_origen",
+      "table": "points_transactions",
+      "definition": "CREATE UNIQUE INDEX uq_points_tx_ganancia_por_cita_origen ON public.points_transactions USING btree (id_cita, tipo_puntos_codigo, origen_punto_codigo) WHERE ((id_cita IS NOT NULL) AND (tipo_puntos_codigo = 'acumular'::text))"
+    },
+    {
+      "name": "uq_points_tx_vencimiento_por_cycle",
+      "table": "points_transactions",
+      "definition": "CREATE UNIQUE INDEX uq_points_tx_vencimiento_por_cycle ON public.points_transactions USING btree (id_cycle, tipo_puntos_codigo) WHERE ((id_cycle IS NOT NULL) AND (tipo_puntos_codigo = 'vencimiento'::text))"
+    },
+    {
+      "name": "idx_subc_cita",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_cita ON public.subscription_consumptions USING btree (id_cita)"
+    },
+    {
+      "name": "idx_subc_cliente",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_cliente ON public.subscription_consumptions USING btree (id_cliente, created_at DESC)"
+    },
+    {
+      "name": "idx_subc_coverage",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_coverage ON public.subscription_consumptions USING btree (coverage_status, created_at DESC)"
+    },
+    {
+      "name": "idx_subc_id_cortesia",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_id_cortesia ON public.subscription_consumptions USING btree (id_cortesia)"
+    },
+    {
+      "name": "idx_subc_invalidado_created",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_invalidado_created ON public.subscription_consumptions USING btree (invalidado, created_at DESC)"
+    },
+    {
+      "name": "idx_subc_source_kind",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_source_kind ON public.subscription_consumptions USING btree (source_kind)"
+    },
+    {
+      "name": "idx_subc_suscripcion",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subc_suscripcion ON public.subscription_consumptions USING btree (id_suscripcion, created_at DESC)"
+    },
+    {
+      "name": "idx_subscription_consumptions_cliente_created",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subscription_consumptions_cliente_created ON public.subscription_consumptions USING btree (id_cliente, created_at DESC)"
+    },
+    {
+      "name": "idx_subscription_consumptions_suscripcion_created",
+      "table": "subscription_consumptions",
+      "definition": "CREATE INDEX idx_subscription_consumptions_suscripcion_created ON public.subscription_consumptions USING btree (id_suscripcion, created_at DESC)"
+    },
+    {
+      "name": "subscription_consumptions_pkey",
+      "table": "subscription_consumptions",
+      "definition": "CREATE UNIQUE INDEX subscription_consumptions_pkey ON public.subscription_consumptions USING btree (id_consumo)"
+    },
+    {
+      "name": "uq_subc_source_key",
+      "table": "subscription_consumptions",
+      "definition": "CREATE UNIQUE INDEX uq_subc_source_key ON public.subscription_consumptions USING btree (source_key)"
+    }
+  ],
+  "policies": [
+    {
+      "cmd": "SELECT",
+      "qual": "(fn_is_super_admin(auth.uid()) OR (id_cliente = fn_cliente_id_por_uid(auth.uid())))",
+      "roles": [
+        "authenticated"
+      ],
+      "tablename": "points_transactions",
+      "permissive": "PERMISSIVE",
+      "policyname": "p_points_select_self",
+      "schemaname": "public",
+      "with_check": null
+    }
+  ],
+  "constraints": [
+    {
+      "name": "citas_pkey",
+      "table": "citas",
+      "definition": "PRIMARY KEY (id_cita)"
+    },
+    {
+      "name": "ck_cita_montos",
+      "table": "citas",
+      "definition": "CHECK (((subtotal_servicios_hnl >= (0)::numeric) AND (descuento_hnl >= (0)::numeric) AND (total_pagar_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "ck_cita_rango",
+      "table": "citas",
+      "definition": "CHECK ((fin_at > inicio_at))"
+    },
+    {
+      "name": "ck_citas_orden_integrante_pos",
+      "table": "citas",
+      "definition": "CHECK (((orden_integrante IS NULL) OR (orden_integrante > 0)))"
+    },
+    {
+      "name": "ck_citas_persona_cliente_requerida",
+      "table": "citas",
+      "definition": "CHECK (((id_persona_cliente IS NOT NULL) OR ((id_grupo_cita IS NOT NULL) AND (orden_integrante IS NOT NULL) AND (orden_integrante > 1))))"
+    },
+    {
+      "name": "ck_citas_retraso_inicio_min_non_negative",
+      "table": "citas",
+      "definition": "CHECK ((retraso_inicio_min >= 0))"
+    },
+    {
+      "name": "ck_citas_selection_type",
+      "table": "citas",
+      "definition": "CHECK ((selection_type = ANY (ARRAY['services'::text, 'package'::text, 'mixed'::text])))"
+    },
+    {
+      "name": "ex_citas_solape_barbero",
+      "table": "citas",
+      "definition": "EXCLUDE USING gist (id_empleado_barbero WITH =, tstzrange(inicio_at, fin_at, '[)'::text) WITH &&) WHERE (((deleted_at IS NULL) AND (estado_cita_codigo = ANY (ARRAY['en_espera'::text, 'pendiente_pago'::text, 'confirmada'::text, 'en_salon'::text, 'en_atencion'::text]))))"
+    },
+    {
+      "name": "fk_cita_barbero",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_empleado_barbero) REFERENCES empleados(id_empleado) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_cliente",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_cita_creador",
+      "table": "citas",
+      "definition": "FOREIGN KEY (creada_por_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_estado",
+      "table": "citas",
+      "definition": "FOREIGN KEY (estado_cita_codigo) REFERENCES estados_cita(estado_cita_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_moneda",
+      "table": "citas",
+      "definition": "FOREIGN KEY (moneda_codigo) REFERENCES monedas(moneda_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_persona_cliente",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_persona_cliente) REFERENCES personas(id_persona) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_sucursal",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_sucursal) REFERENCES sucursales(id_sucursal) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_citas_grupo",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_grupo_cita) REFERENCES citas_grupos(id_grupo_cita) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_citas_integrante",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_cita_integrante) REFERENCES citas_integrantes(id_cita_integrante) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_citas_paquete",
+      "table": "citas",
+      "definition": "FOREIGN KEY (id_paquete) REFERENCES paquetes(id_paquete) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "tr_points_paid_citas",
+      "table": "citas",
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      "name": "uq_citas_grupo_orden",
+      "table": "citas",
+      "definition": "UNIQUE (id_grupo_cita, orden_integrante)"
+    },
+    {
+      "name": "ck_payment_intents_origen_pago",
+      "table": "payment_intents",
+      "definition": "CHECK ((origen_pago_codigo = ANY (ARRAY['cita'::text, 'membership'::text])))"
+    },
+    {
+      "name": "ck_payment_intents_target_xor",
+      "table": "payment_intents",
+      "definition": "CHECK ((((origen_pago_codigo = 'cita'::text) AND (id_cita IS NOT NULL) AND (id_membership_order IS NULL)) OR ((origen_pago_codigo = 'membership'::text) AND (id_cita IS NULL) AND (id_hold IS NULL) AND (id_membership_order IS NOT NULL))))"
+    },
+    {
+      "name": "ck_payment_intents_verification_attempts_nonnegative",
+      "table": "payment_intents",
+      "definition": "CHECK ((verification_attempts >= 0))"
+    },
+    {
+      "name": "fk_int_cita",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (id_cita) REFERENCES citas(id_cita) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_int_creador",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (created_by_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_int_estado",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (estado_intent_codigo) REFERENCES estados_intent_pago(estado_intent_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_int_hold",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (id_hold) REFERENCES citas_holds(id_hold) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_int_membership_order",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (id_membership_order) REFERENCES membership_purchase_orders(id_order) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_int_moneda",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (moneda_codigo) REFERENCES monedas(moneda_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_int_provider",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (id_provider) REFERENCES payment_providers(id_provider) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_payment_intents_grupo_cita",
+      "table": "payment_intents",
+      "definition": "FOREIGN KEY (id_grupo_cita) REFERENCES citas_grupos(id_grupo_cita) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "payment_intents_pkey",
+      "table": "payment_intents",
+      "definition": "PRIMARY KEY (id_intent)"
+    },
+    {
+      "name": "tr_points_paid_payment_intents",
+      "table": "payment_intents",
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      "name": "uq_intent_idempotency",
+      "table": "payment_intents",
+      "definition": "UNIQUE (id_provider, idempotency_key)"
+    },
+    {
+      "name": "ck_pago_montos",
+      "table": "payments",
+      "definition": "CHECK ((monto_hnl >= (0)::numeric))"
+    },
+    {
+      "name": "fk_pay_estado",
+      "table": "payments",
+      "definition": "FOREIGN KEY (estado_pago_codigo) REFERENCES estados_pago(estado_pago_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_pay_intent",
+      "table": "payments",
+      "definition": "FOREIGN KEY (id_intent) REFERENCES payment_intents(id_intent) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_pay_moneda",
+      "table": "payments",
+      "definition": "FOREIGN KEY (moneda_codigo) REFERENCES monedas(moneda_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_pay_registrador",
+      "table": "payments",
+      "definition": "FOREIGN KEY (registrado_por_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "payments_pkey",
+      "table": "payments",
+      "definition": "PRIMARY KEY (id_payment)"
+    },
+    {
+      "name": "tr_points_paid_payments",
+      "table": "payments",
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      "name": "uq_payment_provider_tx",
+      "table": "payments",
+      "definition": "UNIQUE (provider_tx_id)"
+    },
+    {
+      "name": "ck_points_cycle_range",
+      "table": "points_cycles",
+      "definition": "CHECK (((vence_at IS NULL) OR (vence_at > primer_acumulado_at)))"
+    },
+    {
+      "name": "ck_points_cycle_status",
+      "table": "points_cycles",
+      "definition": "CHECK ((estado_ciclo_codigo = ANY (ARRAY['activo'::text, 'expirado'::text, 'cerrado'::text])))"
+    },
+    {
+      "name": "fk_points_cycles_cliente",
+      "table": "points_cycles",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "points_cycles_pkey",
+      "table": "points_cycles",
+      "definition": "PRIMARY KEY (id_cycle)"
+    },
+    {
+      "name": "ck_points_legacy_migrations_puntos",
+      "table": "points_legacy_migrations",
+      "definition": "CHECK ((puntos_migrados > 0))"
+    },
+    {
+      "name": "fk_points_legacy_migrations_cliente",
+      "table": "points_legacy_migrations",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_points_legacy_migrations_tx",
+      "table": "points_legacy_migrations",
+      "definition": "FOREIGN KEY (id_points_tx) REFERENCES points_transactions(id_points_tx) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_points_legacy_migrations_usuario",
+      "table": "points_legacy_migrations",
+      "definition": "FOREIGN KEY (creado_por_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "points_legacy_migrations_pkey",
+      "table": "points_legacy_migrations",
+      "definition": "PRIMARY KEY (id_migracion)"
+    },
+    {
+      "name": "unique_cliente_legacy_migration",
+      "table": "points_legacy_migrations",
+      "definition": "UNIQUE (id_cliente)"
+    },
+    {
+      "name": "unique_legacy_migration_per_client",
+      "table": "points_legacy_migrations",
+      "definition": "UNIQUE (id_cliente)"
+    },
+    {
+      "name": "uq_points_legacy_migrations_cliente",
+      "table": "points_legacy_migrations",
+      "definition": "UNIQUE (id_cliente)"
+    },
+    {
+      "name": "ck_prs_cliente_condicion",
+      "table": "points_rule_services",
+      "definition": "CHECK ((cliente_condicion_codigo = ANY (ARRAY['sin_membresia'::text, 'con_membresia'::text])))"
+    },
+    {
+      "name": "ck_prs_orden_visual_pos",
+      "table": "points_rule_services",
+      "definition": "CHECK ((orden_visual >= 0))"
+    },
+    {
+      "name": "ck_prs_puntos_canje_pos",
+      "table": "points_rule_services",
+      "definition": "CHECK (((puntos_canje > 0) OR (puntos_canje IS NULL)))"
+    },
+    {
+      "name": "fk_points_rule_services_rule",
+      "table": "points_rule_services",
+      "definition": "FOREIGN KEY (id_rule) REFERENCES points_rules(id_rule) ON UPDATE CASCADE ON DELETE CASCADE"
+    },
+    {
+      "name": "fk_points_rule_services_service",
+      "table": "points_rule_services",
+      "definition": "FOREIGN KEY (id_servicio) REFERENCES servicios(id_servicio) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "points_rule_services_pkey",
+      "table": "points_rule_services",
+      "definition": "PRIMARY KEY (id_rule_service)"
+    },
+    {
+      "name": "ck_points_rule_exp",
+      "table": "points_rules",
+      "definition": "CHECK (((expiracion_meses IS NULL) OR (expiracion_meses >= 0)))"
+    },
+    {
+      "name": "ck_points_rule_puntos",
+      "table": "points_rules",
+      "definition": "CHECK (((puntos_por_cita > 0) AND (puntos_para_premio > 0)))"
+    },
+    {
+      "name": "ck_points_rule_umbral",
+      "table": "points_rules",
+      "definition": "CHECK ((umbral_monto_hnl >= (0)::numeric))"
+    },
+    {
+      "name": "fk_pr_sucursal",
+      "table": "points_rules",
+      "definition": "FOREIGN KEY (id_sucursal) REFERENCES sucursales(id_sucursal) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "points_rules_pkey",
+      "table": "points_rules",
+      "definition": "PRIMARY KEY (id_rule)"
+    },
+    {
+      "name": "ck_points_tx_origen",
+      "table": "points_transactions",
+      "definition": "CHECK ((origen_punto_codigo = ANY (ARRAY['titular'::text, 'integrante'::text, 'sistema'::text])))"
+    },
+    {
+      "name": "ck_points_tx_puntos_non_zero",
+      "table": "points_transactions",
+      "definition": "CHECK ((puntos <> 0))"
+    },
+    {
+      "name": "fk_pt_cita",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (id_cita) REFERENCES citas(id_cita) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_pt_cliente",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_pt_creador",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (creado_por_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_pt_cycle",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (id_cycle) REFERENCES points_cycles(id_cycle) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_pt_servicio_canje",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (id_servicio_canje) REFERENCES servicios(id_servicio) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_pt_sucursal",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (id_sucursal_origen) REFERENCES sucursales(id_sucursal) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_pt_tipo",
+      "table": "points_transactions",
+      "definition": "FOREIGN KEY (tipo_puntos_codigo) REFERENCES tipos_puntos(tipo_puntos_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "points_transactions_pkey",
+      "table": "points_transactions",
+      "definition": "PRIMARY KEY (id_points_tx)"
+    },
+    {
+      "name": "ck_subc_cantidad",
+      "table": "subscription_consumptions",
+      "definition": "CHECK ((cantidad > 0))"
+    },
+    {
+      "name": "ck_subc_coverage_status",
+      "table": "subscription_consumptions",
+      "definition": "CHECK ((coverage_status = ANY (ARRAY['cubierto_plan'::text, 'extra_pendiente'::text, 'extra_pagado'::text])))"
+    },
+    {
+      "name": "ck_subc_item_tipo",
+      "table": "subscription_consumptions",
+      "definition": "CHECK ((item_tipo = ANY (ARRAY['servicio'::text, 'cortesia'::text])))"
+    },
+    {
+      "name": "ck_subc_precios",
+      "table": "subscription_consumptions",
+      "definition": "CHECK (((precio_unitario_hnl >= (0)::numeric) AND (total_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "fk_subc_cita",
+      "table": "subscription_consumptions",
+      "definition": "FOREIGN KEY (id_cita) REFERENCES citas(id_cita) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_subc_cliente",
+      "table": "subscription_consumptions",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_subc_servicio",
+      "table": "subscription_consumptions",
+      "definition": "FOREIGN KEY (id_servicio) REFERENCES servicios(id_servicio) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_subc_sub",
+      "table": "subscription_consumptions",
+      "definition": "FOREIGN KEY (id_suscripcion) REFERENCES subscriptions(id_suscripcion) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "subscription_consumptions_id_cortesia_fkey",
+      "table": "subscription_consumptions",
+      "definition": "FOREIGN KEY (id_cortesia) REFERENCES cortesias(id)"
+    },
+    {
+      "name": "subscription_consumptions_pkey",
+      "table": "subscription_consumptions",
+      "definition": "PRIMARY KEY (id_consumo)"
+    },
+    {
+      "name": "tr_points_paid_subscription_consumptions",
+      "table": "subscription_consumptions",
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      "name": "uq_subc_source_key",
+      "table": "subscription_consumptions",
+      "definition": "UNIQUE (source_key)"
+    },
+    {
+      "name": "ck_sub_motivo_fin",
+      "table": "subscriptions",
+      "definition": "CHECK (((motivo_fin_codigo IS NULL) OR (motivo_fin_codigo = ANY (ARRAY['tiempo'::text, 'agotamiento'::text, 'reemplazo'::text, 'cancelacion'::text, 'eliminacion_cuenta'::text]))))"
+    },
+    {
+      "name": "fk_sub_cliente",
+      "table": "subscriptions",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_sub_creador",
+      "table": "subscriptions",
+      "definition": "FOREIGN KEY (created_by_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_sub_estado",
+      "table": "subscriptions",
+      "definition": "FOREIGN KEY (estado_suscripcion_codigo) REFERENCES estados_suscripcion(estado_suscripcion_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_sub_plan",
+      "table": "subscriptions",
+      "definition": "FOREIGN KEY (id_plan) REFERENCES membership_plans(id_plan) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_sub_sucursal_contratada",
+      "table": "subscriptions",
+      "definition": "FOREIGN KEY (id_sucursal_contratada) REFERENCES sucursales(id_sucursal) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "subscriptions_pkey",
+      "table": "subscriptions",
+      "definition": "PRIMARY KEY (id_suscripcion)"
+    },
+    {
+      "name": "tipos_puntos_pkey",
+      "table": "tipos_puntos",
+      "definition": "PRIMARY KEY (tipo_puntos_codigo)"
+    },
+    {
+      "name": "tipos_puntos_signo_check",
+      "table": "tipos_puntos",
+      "definition": "CHECK ((signo = ANY (ARRAY['-1'::integer, 1])))"
+    }
+  ]
+}

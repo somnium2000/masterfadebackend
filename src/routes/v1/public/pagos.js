@@ -34,7 +34,7 @@ import {
 } from "../../../services/payments/pixelPayCardEnvironment.js";
 export { assertPixelPayCardAllowedForEnvironment, assertPixelPaySandboxCardAllowed };
 export { buildSafeProviderErrorDiagnostic, buildSafePixelPaySdkDiagnostics };
-import { applyRewardRedeemForConfirmedGroup, grantEngagementPointsForConfirmedGroup } from "../../../services/pointsService.js";
+import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
 import { resolveTodoPagoSimulatedResponse } from "../../../services/payments/todopagoSimulatedResponses.js";
 import {
   markPromotionUsagesForGroup,
@@ -1565,7 +1565,6 @@ async function confirmGroupAfterPaid(client, {
   });
 
   await queuePostPaymentEmails(client, { idGrupoCita, totalGrupo });
-  await grantEngagementPointsForConfirmedGroup(client, { idGrupoCita });
   return {
     id_grupo_cita: idGrupoCita,
     total_hnl: totalGrupo,

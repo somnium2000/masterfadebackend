@@ -21,7 +21,6 @@ import {
 } from "../../services/membershipService.js";
 import {
   applyRewardRedeemForConfirmedGroup,
-  grantEngagementPointsForConfirmedGroup,
   normalizeRedeemContextToken,
   resolveRewardRedeemGateForCliente,
   resolveRedeemContextForHold,
@@ -1512,9 +1511,9 @@ function normalizeHoldBlocksPayload(body) {
 
 function assertRewardRedeemExclusiveHold({ rewardRedeemContext, integrantes, codigoPromocional }) {
   if (!rewardRedeemContext) return;
-  if (Array.isArray(integrantes) && integrantes.length > 1) {
-    throw new AppError(409, "La recompensa aplica solo al titular y no combina con acompanantes.", {
-      code: "POINTS_REDEEM_COMPANIONS_NOT_ALLOWED",
+  if (Array.isArray(integrantes) && integrantes.some((item, index) => Number(item.orden_integrante ?? index + 1) !== index + 1)) {
+    throw new AppError(400, "Los integrantes deben mantener su orden en la reserva.", {
+      code: "POINTS_REDEEM_GROUP_ORDER_INVALID",
     });
   }
 
@@ -2715,13 +2714,17 @@ export default async function citasRoutes(app) {
         step = "expireReservationsBestEffort";
         await expireReservationsBestEffort(dbClient, request, "citas_hold_confirm");
 
-        step = "loadGroup";
+        // AM: Serializa el canje de total cero y sus reintentos antes de leer efectos previos.
+        step = "tx_begin_and_lock_group";
+        await dbClient.query("BEGIN");
+        txStarted = true;
         const groupResult = await dbClient.query(
           `
             SELECT id_grupo_cita, id_cliente_titular, id_persona_titular, estado_grupo_codigo
             FROM public.citas_grupos
             WHERE id_grupo_cita = $1::uuid
             LIMIT 1
+            FOR UPDATE
           `,
           [groupId]
         );
@@ -2767,9 +2770,6 @@ export default async function citasRoutes(app) {
             saldo_actual: null,
             mensaje: "No se aplico canje en esta confirmacion.",
           };
-          step = "tx_begin_already_confirmed";
-          await dbClient.query("BEGIN");
-          txStarted = true;
           step = "applyRewardRedeemForConfirmedGroup_already_confirmed";
           rewardFinalization = await applyRewardRedeemForConfirmedGroup(dbClient, {
             idGrupoCita: group.id_grupo_cita,
@@ -2789,10 +2789,6 @@ export default async function citasRoutes(app) {
             rows,
             clienteId,
             usuarioId: request.claims?.user?.id_usuario ?? null,
-          });
-          step = "grantEngagementPointsForConfirmedGroup_already_confirmed";
-          await grantEngagementPointsForConfirmedGroup(dbClient, {
-            idGrupoCita: group.id_grupo_cita,
           });
           step = "tx_commit_already_confirmed";
           await dbClient.query("COMMIT");
@@ -2848,9 +2844,6 @@ export default async function citasRoutes(app) {
           }
         }
 
-        step = "tx_begin";
-        await dbClient.query("BEGIN");
-        txStarted = true;
         const citaIds = pendingRows.map((row) => row.id_cita);
         step = "confirmAppointmentsWithoutPayment";
         await confirmAppointmentsWithoutPayment(dbClient, {
@@ -2876,10 +2869,6 @@ export default async function citasRoutes(app) {
           rows: pendingRows,
           clienteId,
           usuarioId: request.claims?.user?.id_usuario ?? null,
-        });
-        step = "grantEngagementPointsForConfirmedGroup";
-        await grantEngagementPointsForConfirmedGroup(dbClient, {
-          idGrupoCita: group.id_grupo_cita,
         });
         step = "tx_commit";
         await dbClient.query("COMMIT");
