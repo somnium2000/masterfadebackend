@@ -109,6 +109,7 @@ function createExecutionClient({
       if (/^COMMIT$/i.test(text)) return { rows: [] };
       if (/^ROLLBACK$/i.test(text)) return { rows: [] };
       if (text.includes("pg_advisory_xact_lock")) return { rows: [{ locked: true }] };
+      if (text.includes("pg_advisory_lock") || text.includes("pg_advisory_unlock")) return { rows: [{ locked: true }] };
       if (text.includes("fn_points_materialize_expired_cycles")) {
         pointsState.materialized = true;
         return { rows: [{ fn_points_materialize_expired_cycles: 1 }] };
@@ -515,10 +516,26 @@ test("wrapper usa transaccion serializable y advisory lock", async () => {
     traceRequestId: TRACE_ID,
   });
 
-  assert.equal(client.calls[0].sql, "BEGIN ISOLATION LEVEL SERIALIZABLE");
-  assert.ok(client.calls[1].sql.includes("pg_advisory_xact_lock"));
-  assert.equal(client.calls[1].params[0], USUARIO_ID);
+  assert.ok(client.calls[0].sql.includes("pg_advisory_lock"));
+  assert.equal(client.calls[1].sql, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+  assert.ok(client.calls[2].sql.includes("pg_advisory_xact_lock"));
+  assert.equal(client.calls[0].params[0], USUARIO_ID);
+  assert.equal(client.calls[2].params[0], USUARIO_ID);
   assert.ok(client.calls.some((call) => call.sql === "COMMIT"));
+  assert.ok(client.calls.some((call) => call.sql.includes("pg_advisory_unlock")));
+});
+
+test("descarta la conexión si no puede liberar el bloqueo de sesión", async () => {
+  const client = createExecutionClient({ throwOn: sql => sql.includes("pg_advisory_unlock") });
+  let releaseError;
+  const release = client.release.bind(client);
+  client.release = error => { releaseError = error; release(); };
+  const result = await runClientAccountDeletionInternal(makeApp(client), {
+    deletionRequestId: REQUEST_ID, clienteId: CLIENTE_ID, personaId: PERSONA_ID,
+    usuarioId: USUARIO_ID, authenticatedAt: freshIso(), traceRequestId: TRACE_ID,
+  });
+  assert.equal(result.processed, true);
+  assert.ok(releaseError instanceof Error);
 });
 
 test("consultas no modifican tablas PII prohibidas", async () => {
