@@ -19,6 +19,8 @@ import { PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS } from "../src/services/payments/p
 import { createHangingPgPool } from "./helpers/hangingPgPool.mjs";
 import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
+import { resolveQaPixelPay3dsDiagnostic } from '../src/services/payments/qaPixelPay3dsDiagnostic.js';
+import { QA_PIXELPAY_CASE29_VISA } from './fixtures/qa-pixelpay-case29.mjs';
 
 const GROUP_A = "11111111-2222-4333-8444-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
@@ -339,6 +341,9 @@ function createPagosClient({
         };
         saleAttempts.push(row);
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
+      }
+      if (text.includes('SELECT EXISTS(SELECT 1 FROM app_private.pixelpay_sale_attempts WHERE id_intent=')) {
+        return { rows: [{ attempted: saleAttempts.some(row=>row.id_intent===params[0]) }] };
       }
       if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) {
         assert.equal(transactionSnapshot, null, "FINAL debe usar autocommit fuera del claim");
@@ -770,6 +775,7 @@ async function createPagosApp(client, {
   claims = null,
   privatePilot = null,
   config = {},
+  qa3dsDiagnostic = null,
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -782,6 +788,7 @@ async function createPagosApp(client, {
         }
       : false,
   });
+  if (qa3dsDiagnostic) app.decorate('qaPixelPay3dsDiagnostic', qa3dsDiagnostic);
   app.decorate("config", {
     paymentProvider: providerCode,
     pixelPayEnv: "sandbox",
@@ -4207,3 +4214,83 @@ test("ruta real POST /v1/public/pagos/crear-intent conserva intent local si fall
   assert.ok(client.calls.some((call) => call.sql === "ROLLBACK"));
   await app.close();
 });
+
+// AM: Real authenticated route orchestration with FakeDB; PG RPC/locks run in a separate suite.
+function diagnosticPolicy() {
+  return resolveQaPixelPay3dsDiagnostic({NODE_ENV:'development',ENTORNO:'qa',PAYMENT_PROVIDER:'pixelpay',
+    PIXELPAY_IMPLEMENTATION:'sdk',PIXELPAY_ENV:'sandbox',PIXELPAY_ENDPOINT:'https://pixelpay.dev',PIXELPAY_APP_URL:'https://pixelpay.dev',
+    QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true',QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:INTENT_A,
+    QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL:new Date(Date.now()+8*60000).toISOString()},{bookingEnabled:true});
+}
+function diagnosticRouteClient({intentPatch={},...options}={}) {
+  return createPagosClient({providerCode:'pixelpay',amountHnl:1,groupClientId:CLIENT_A,groupPersonId:USER_A,groupUserId:USER_A,
+    groupOrigin:'cliente_autenticado',existingIntent:{id_intent:INTENT_A,id_provider:PROVIDER_A,id_cita:CITA_A,id_hold:HOLD_A,
+      id_grupo_cita:GROUP_A,estado_intent_codigo:'link_generado',expires_at:'2099-01-01T16:00:00.000Z',monto_hnl:'1.00',moneda_codigo:'HNL',
+      orden_compra:buildProviderOrderReference({providerCode:'pixelpay',idIntent:INTENT_A}),created_by_usuario_id:USER_A,...intentPatch},...options});
+}
+const diagnosticOwnerClaims={cliente_id:CLIENT_A,user:{id_usuario:USER_A,id_persona:USER_A}};
+const diagnosticCard={card_number:QA_PIXELPAY_CASE29_VISA};
+const diagnosticPayload=()=>({...pixelPaySalePayload(),...diagnosticCard,card_expire:'2812'});
+
+test('QA diagnostic authenticated handler: canonical one-HNL claim COMMIT then single202, reload local and no second Sale',async t=>{
+  const client=diagnosticRouteClient();
+  let dispatches=0;
+  const provider={async sale(input,context){
+    dispatches++;
+    assert.equal(input.amount,1); assert.equal(input.currency,'HNL');
+    assert.equal(context.qa3dsDiagnostic,true); assert.equal(client.getSaleAttempts().length,1);
+    assert.equal(client.getActiveIntent().estado_intent_codigo,'pendiente_confirmacion');
+    assert.equal(client.calls.at(-1).sql,'COMMIT');
+    throw Object.assign(new Error('Synthetic202'),{code:'PIXELPAY_NETWORK_ERROR',uncertain:true,statusCode:202,
+      runtimeDiagnostics:{qa3dsObservation:{upstream_http_status:202,response_class:'PayloadResponse',transaction_type:'songbird',
+        continuation_required:true,opaque_payload_present:true,public_key_request_attempted:true,public_key_response_received:true,
+        public_key_http_status:200,public_key_obtained:true,encryption_completed:true,stopped_before_continuation:true}}});
+  }};
+  const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:provider,authenticated:true,claims:diagnosticOwnerClaims,qa3dsDiagnostic:diagnosticPolicy()});
+  t.after(()=>app.close());
+  const send=payload=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload});
+  const first=await send(diagnosticPayload());
+  assert.equal(first.statusCode,202); assert.equal(first.json().data.qa_3ds_diagnostic,true);
+  assert.equal(first.json().data.pending_confirmation,true); assert.equal(first.json().data.qa_3ds_observation.stopped_before_continuation,true);
+  assert.equal(dispatches,1); assert.equal(client.getSaleAttempts()[0].outcome,'uncertain');
+  assert.equal(client.getPayments().length,0); assert.equal(client.getPaymentEvents().length,0);
+  assert.equal((await send(diagnosticPayload())).statusCode,409); assert.equal(dispatches,1);
+  for(const fields of [{authentication_identifier:'foreign'}, {authentication_request:true}, {continue_success:false},
+    {payload:'opaque',identifier:'foreign'}, {amount:2,currency:'USD'}]) {
+    assert.equal((await send({...diagnosticPayload(),...fields})).statusCode,400); assert.equal(dispatches,1);
+  }
+  for(const phase of ['lookup','continue','finalize']) {
+    const continuation=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/'+phase,payload:{id_intent:INTENT_A}});
+    assert.equal(continuation.statusCode,404); assert.equal(dispatches,1);
+  }
+  app.qaPixelPay3dsDiagnostic=resolveQaPixelPay3dsDiagnostic({QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:INTENT_A});
+  const local=await app.inject({method:'POST',url:'/v1/pagos/reservas/estado',payload:{id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com'}});
+  assert.equal(local.statusCode,200); assert.equal(local.json().data.qa_3ds_diagnostic,true);
+  assert.equal(local.json().data.estado_intent_codigo,'pendiente_confirmacion'); assert.equal(dispatches,1);
+  assert.equal((await send(diagnosticPayload())).statusCode,403); assert.equal(dispatches,1);
+  const serialized=JSON.stringify({first:first.json(),local:local.json(),attempts:client.getSaleAttempts(),calls:client.calls});
+  assert.equal(serialized.includes(diagnosticCard.card_number),false);
+  assert.equal(serialized.includes('"card_cvv"'),false); assert.equal(serialized.includes('"payload":"opaque"'),false);
+});
+
+for(const [scenario,options,claims,payloadPatch] of [
+  ['foreign-owner',{}, {...diagnosticOwnerClaims,cliente_id:CLIENT_B},{}],
+  ['foreign-target',{},diagnosticOwnerClaims,{id_intent:USER_B}],
+  ['history',{initialSaleAttempts:[{id_intent:INTENT_A,payment_attempt_id:USER_B}]},diagnosticOwnerClaims,{}],
+  ['intent-reference',{intentPatch:{referencia_externa:'previous'}},diagnosticOwnerClaims,{}],
+  ['provider-session',{intentPatch:{provider_session_id:'previous'}},diagnosticOwnerClaims,{}],
+  ['hosted-link',{intentPatch:{link_pago_url:'https://provider.invalid'}},diagnosticOwnerClaims,{}],
+  ['two-HNL',{amountHnl:2,intentPatch:{monto_hnl:'2.00'}},diagnosticOwnerClaims,{}],
+  ['wrong-currency',{intentPatch:{moneda_codigo:'USD'}},diagnosticOwnerClaims,{}],
+  ['expired-second-hold',{groupSize:2,secondHoldExpiresAt:'2000-01-01T00:00:00.000Z'},diagnosticOwnerClaims,{}],
+]) {
+  test('QA diagnostic complete payload denied before provider: '+scenario,async t=>{
+    const client=diagnosticRouteClient(options); let dispatches=0;
+    const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:{async sale(){dispatches++;throw new Error('unexpected provider');}},
+      authenticated:true,claims,qa3dsDiagnostic:diagnosticPolicy()});
+    t.after(()=>app.close());
+    const response=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),...payloadPatch}});
+    assert.ok([403,409].includes(response.statusCode)); assert.equal(dispatches,0);
+    assert.equal(client.getPayments().length,0); assert.equal(client.getPaymentEvents().length,0);
+  });
+}

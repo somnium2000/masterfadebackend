@@ -518,7 +518,7 @@ test('QA identity booking grants only verified owner, independently of TCP and f
   ]) {
     const headers={...f.headers(),...extra};
     const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress,headers});
-    assert.equal(r.statusCode,200); assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false});
+    assert.equal(r.statusCode,200); assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:false});
     for(const url of ['/v1/public/citas/hold','/v1/citas/hold','/v1/public/pagos/crear-intent','/v1/pagos/reservas/crear-intent','/v1/public/pagos/estado','/v1/pagos/reservas/estado']) {
       const invalid=await f.app.inject({method:'POST',url,remoteAddress,headers,payload:{}});
       assert.equal(invalid.statusCode,400,url+': original input validation remains');
@@ -547,7 +547,7 @@ for(const scenario of ['guest','other','tampered','revoked','no-client','invalid
     assert.ok([401,403].includes(denied.statusCode),denied.body);
     if(!scenario.startsWith('csrf-')) {
       const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress:'10.0.0.99',headers});
-      if(r.statusCode===200)assert.deepEqual(r.json().data,{booking:false,vipPurchase:false,pixelpaySale:false});
+      if(r.statusCode===200)assert.deepEqual(r.json().data,{booking:false,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:false});
       else assert.equal(r.statusCode,401);
     }
     assert.deepEqual(f.state,{business:0,unexpectedSql:0});
@@ -586,7 +586,7 @@ test('QA Sandbox Sale grants only the authenticated reservation Sale route and p
   t.after(() => { PaymentProviderFactory.create = originalCreate; });
   const headers = { ...f.headers(), 'x-forwarded-for': 'invalid', 'x-real-ip': IP };
   const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.99', headers });
-  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: true });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: true, pixelpay3dsDiagnostic: false });
   for (const url of ['/v1/pagos/reservas/pixelpay/sale', '/v1/public/citas/hold', '/v1/public/pagos/crear-intent']) {
     const response = await f.app.inject({ method: 'POST', url, remoteAddress: '10.0.0.99', headers, payload: {} });
     assert.equal(response.statusCode, 400, url + ': original payload validation must remain');
@@ -618,7 +618,7 @@ for (const scenario of ['guest','other','tampered','revoked','no-client','invali
     }
     if (!scenario.startsWith('csrf-')) {
       const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.99', headers });
-      if (eligibility.statusCode === 200) assert.deepEqual(eligibility.json().data, { booking: false, vipPurchase: false, pixelpaySale: false });
+      if (eligibility.statusCode === 200) assert.deepEqual(eligibility.json().data, { booking: false, vipPurchase: false, pixelpaySale: false, pixelpay3dsDiagnostic: false });
       else assert.equal(eligibility.statusCode, 401);
     }
     assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
@@ -628,10 +628,69 @@ for (const scenario of ['guest','other','tampered','revoked','no-client','invali
 test('QA Sandbox Sale rollback leaves booking available while blocking charges again', async t => {
   const f = await fixture(t, { env: { ...QA_SANDBOX_SALE_IDENTITY, QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED: 'false' } });
   const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', headers: f.headers() });
-  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: false });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: false, pixelpay3dsDiagnostic: false });
   for (const url of ['/v1/public/pagos/pixelpay/sale', '/v1/pagos/reservas/pixelpay/sale']) {
     const denied = await f.app.inject({ method: 'POST', url, headers: f.headers(), payload: {} });
     assert.equal(denied.statusCode, 403);
   }
   assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+});
+
+const QA_DIAG_TARGET = '11111111-1111-4111-8111-111111111111';
+const diagnosticEnv = () => ({ ...QA_BOOKING_IDENTITY, QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED:'false',
+  QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true', QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:QA_DIAG_TARGET,
+  QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL:new Date(Date.now()+8*60000).toISOString() });
+
+test('QA 3DS capability is separate, exact-account authenticated route only, with no provider operations',async t=>{
+  const f=await fixture(t,{env:diagnosticEnv(),roles:['cliente']});
+  const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
+  assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:true});
+  const allowed=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET}});
+  assert.equal(allowed.statusCode,400,'ordinary required fields remain required');
+  for(const url of ['/v1/public/pagos/pixelpay/sale','/v1/cliente/planes/orden','/v1/public/pagos/simulator/event']) {
+    assert.equal((await f.app.inject({method:'POST',url,headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET}})).statusCode,403);
+  }
+  for(const field of ['authentication_identifier','authentication_request','payload','op','amount','qa3dsDiagnostic','continue_success']) {
+    const invalid=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET,[field]:'synthetic'}});
+    assert.equal(invalid.statusCode,400); assert.equal(invalid.json().error.code,'QA_3DS_INITIAL_ONLY');
+  }
+  const foreign=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers:f.headers(),payload:{id_intent:OTHER}});
+  assert.equal(foreign.statusCode,403); assert.equal(foreign.json().error.code,'QA_3DS_DIAGNOSTIC_RESTRICTED');
+  assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+});
+for(const scenario of ['guest','other','revoked','no-client','no-role','identity-mismatch','csrf-missing','csrf-wrong']) {
+  test('QA 3DS diagnostic keeps identity/session/CSRF denial: '+scenario,async t=>{
+    const f=await fixture(t,{env:diagnosticEnv(),revoked:scenario==='revoked',clientId:scenario==='no-client'?null:OTHER,
+      roles:scenario==='no-role'?['super_admin']:['cliente'],claimsMismatch:scenario==='identity-mismatch'});
+    const headers=scenario==='guest'?{}:f.headers(scenario==='other'?OTHER:USER);
+    if(scenario==='csrf-missing')delete headers['x-csrf-token'];
+    if(scenario==='csrf-wrong')headers['x-csrf-token']='wrong';
+    const r=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers,payload:{id_intent:QA_DIAG_TARGET}});
+    assert.ok([401,403].includes(r.statusCode)); assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+  });
+}
+for(const enabled of ['true','false']) {
+  test('targeted external Status remains denied with diagnostic flag '+enabled,async t=>{
+    const f=await fixture(t,{env:{...diagnosticEnv(),QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:enabled},roles:['cliente']});
+    for(const url of ['/v1/pagos/reservas/pixelpay/status','/v1/public/pagos/pixelpay/status']) {
+      const r=await f.app.inject({method:'POST',url,headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET,id_grupo_cita:OTHER,titular_email:'synthetic@example.invalid'}});
+      assert.equal(r.statusCode,403); assert.equal(r.json().error.code,'QA_3DS_EXTERNAL_STATUS_DISABLED');
+    }
+    assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+  });
+}
+
+test('expired diagnostic capability closes Sale while retained target still blocks external Status',async t=>{
+  const f=await fixture(t,{env:diagnosticEnv(),roles:['cliente']});
+  const originalNow=Date.now;
+  try {
+    Date.now=()=>originalNow()+9*60000;
+    const eligibility=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
+    assert.equal(eligibility.json().data.pixelpay3dsDiagnostic,false);
+    const sale=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET}});
+    assert.equal(sale.statusCode,403);
+    const status=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/status',headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET,id_grupo_cita:OTHER,titular_email:'synthetic@example.invalid'}});
+    assert.equal(status.statusCode,403); assert.equal(status.json().error.code,'QA_3DS_EXTERNAL_STATUS_DISABLED');
+  } finally { Date.now=originalNow; }
+  assert.deepEqual(f.state,{business:0,unexpectedSql:0});
 });

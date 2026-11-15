@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
+import { assertQa3dsCardAllowed, assertQa3dsFreshIntent, assertQa3dsInitialPayload, isQa3dsIntent, qa3dsWindowOpen, sanitizeQa3dsObservation } from '../../../services/payments/qaPixelPay3dsDiagnostic.js';
 import {
   HONDURAS_ISO_3166_2_CODES,
   PIXELPAY_SALE_OUTCOME,
@@ -936,6 +937,7 @@ async function loadPublicIntentForGroup(client, {
         pi.monto_hnl,
         pi.moneda_codigo,
         pi.referencia_externa,
+        pi.link_pago_url,
         pi.orden_compra,
         pi.provider_session_id,
         pi.idempotency_key,
@@ -2313,6 +2315,16 @@ export default async function publicPagosRoutes(app, options = {}) {
 
   app.post("/pixelpay/sale", {
     ...routeGuard,
+    preValidation: async request => {
+      // AM: Reject continuation/proxy fields before AJV can remove extra properties.
+      if (app.qaPixelPay3dsDiagnostic?.enabled === true || isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent)) {
+        if (!authenticated || !isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent)
+          || !qa3dsWindowOpen(app.qaPixelPay3dsDiagnostic)) {
+          throw new AppError(403, 'Observacion Sandbox no disponible.', { code: 'QA_3DS_DIAGNOSTIC_RESTRICTED' });
+        }
+        assertQa3dsInitialPayload(request.body);
+      }
+    },
     config: {
       rateLimit: buildPixelPaySaleRateLimitConfig(),
     },
@@ -2345,9 +2357,16 @@ export default async function publicPagosRoutes(app, options = {}) {
     let dbClient = await app.db.connect();
     let inTransaction = false;
     let claim = null;
+    const qa3dsTarget = isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent);
+    const diagnosticFields = observation => qa3dsTarget ? { qa_3ds_diagnostic: true,
+      ...(observation ? { qa_3ds_observation: sanitizeQa3dsObservation(observation) } : {}) } : {};
     try {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
       const idIntent = assertUuid(request.body?.id_intent, "id_intent");
+      if ((qa3dsTarget || app.qaPixelPay3dsDiagnostic?.enabled === true)
+        && (!qa3dsTarget || !authenticated || !qa3dsWindowOpen(app.qaPixelPay3dsDiagnostic))) {
+        throw new AppError(403, 'Observacion Sandbox no disponible.', { code: 'QA_3DS_DIAGNOSTIC_RESTRICTED' });
+      }
       const titularEmail = normalizeEmail(request.body?.titular_email);
       await dbClient.query("BEGIN");
       inTransaction = true;
@@ -2388,6 +2407,11 @@ export default async function publicPagosRoutes(app, options = {}) {
         access,
       });
       const intent = loaded.intent;
+      if (qa3dsTarget) {
+        const history = await dbClient.query('SELECT EXISTS(SELECT 1 FROM app_private.pixelpay_sale_attempts WHERE id_intent=$1::uuid) AS attempted', [idIntent]);
+        assertQa3dsFreshIntent(app.qaPixelPay3dsDiagnostic, intent, totalHnl, history.rows[0]?.attempted !== false);
+        assertQa3dsCardAllowed(request.body.card_number);
+      }
       if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
         throw new AppError(409, "El intent no pertenece a PixelPay", {
           code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
@@ -2414,7 +2438,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PIXELPAY_ORDER_ID_MISSING",
         });
       }
-      assertPixelPayCardAllowedForEnvironment(request.body.card_number, app.config?.pixelPayEnv);
+      if (!qa3dsTarget) assertPixelPayCardAllowedForEnvironment(request.body.card_number, app.config?.pixelPayEnv);
       const claimed = await dbClient.query(
         `SELECT app_private.proteger_reserva_pago_v1(
            $1::uuid, $2::uuid
@@ -2481,6 +2505,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           idIntent,
           paymentAttemptId: claim.paymentAttemptId,
           logger: request.log,
+          qa3dsDiagnostic: qa3dsTarget,
         });
       } catch (providerError) {
         const diagnostic = buildSafeProviderErrorDiagnostic(providerError, request.id);
@@ -2512,6 +2537,7 @@ export default async function publicPagosRoutes(app, options = {}) {
             processed: false,
             pending_confirmation: true,
             estado_intent_codigo: "pendiente_confirmacion",
+            ...diagnosticFields(providerError?.runtimeDiagnostics?.qa3dsObservation),
           }, { statusCode: 202 });
         }
         return sendError(reply, 502, "No fue posible procesar el pago", {
@@ -2575,6 +2601,7 @@ export default async function publicPagosRoutes(app, options = {}) {
             outcome: saleResult.outcome,
             statusCode: diagnostics?.statusCode ?? saleResult.statusCode,
           }),
+          ...diagnosticFields(saleResult.qa3dsObservation),
         }, { statusCode: keepPending ? 202 : 200 });
       }
 
@@ -2608,7 +2635,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         paidAt: durableApproval.verifiedAt,
         logger: request.log,
       });
-      return sendOk(reply, reconciled);
+      return sendOk(reply, { ...reconciled, ...diagnosticFields(saleResult.qa3dsObservation) });
     } catch (error) {
       if (inTransaction && dbClient) {
         try { await dbClient.query("ROLLBACK"); } catch { /* no-op */ }
@@ -2840,6 +2867,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         monto_hnl: Number(intent.monto_hnl || 0),
         moneda_codigo: intent.moneda_codigo || "HNL",
         id_grupo_cita: idGrupoCita,
+        ...(isQa3dsIntent(app.qaPixelPay3dsDiagnostic, idIntent) ? { qa_3ds_diagnostic: true } : {}),
       });
     } catch (error) {
       if (error instanceof AppError) {
