@@ -1,0 +1,22 @@
+{
+  "fn_points_get_effective_rule": {
+    "catalog_definition_hash": "a683ccd7ac0e7b57692f08b2f3a0de4b",
+    "export_body_sha256": "4401fb3bb0e310793e83200a1723bf08d3e66a7ed63b56b2d6b0b20ef539c286",
+    "export_definition_sha256": "2c67a2a8c6b91afb72494498b1054b7936d2ff1f5dde8a4d956132929e214bd0"
+  },
+  "fn_points_materialize_expired_cycles": {
+    "catalog_definition_hash": "5448c179064e0e830e3ac7759d47cf5f",
+    "export_body_sha256": "4b74614acb6b9c91a00ef2c217cd37b6a4cd7e6ed808874b10148a76dded3a1d",
+    "export_definition_sha256": "41473b3422c722c0cf53565c744d72ad3e6409856130511aa36d1d06cc927b55"
+  },
+  "fn_points_tx_apply_tipo_sign": {
+    "catalog_definition_hash": "9cbd32e13662f771108d7cc7b6a049d1",
+    "export_body_sha256": "33a5e8e6edb373180c7abf58a5702cb2680699e01f8c12b862bcb7db67fd8322",
+    "export_definition_sha256": "74a47ca446590de362adc3c9c31b90dd64cf22e0870e7f826215f6dd7845282c"
+  },
+  "fn_points_tx_guard_acumular_final": {
+    "catalog_definition_hash": "b574793906178b14218d867aea5fdb2d",
+    "export_body_sha256": "7ae20bb1c22e6d51b48c3e7f7078dd5a4b0f29d85db0f2e1d54363246291a53c",
+    "export_definition_sha256": "d9341f3a23a8d431f2548f7b1c26d483c79d1701df2f990bdb91a9b56cf02cc6"
+  }
+}
