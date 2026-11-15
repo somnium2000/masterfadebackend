@@ -1,0 +1,49 @@
+name: Release main validation
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  backend:
+    if: startsWith(github.head_ref, 'release/prod-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: B0-PR117
+            ref: 245fdeced344b46aab86249162c30f8eaebc4066
+          - target: D1
+            ref: ${{ github.event.pull_request.head.sha }}
+    env:
+      TZ: UTC
+      PGTZ: UTC
+      MASTERFADE_TEST_PG_BIN: /usr/lib/postgresql/17/bin
+      MASTERFADE_PHASE02_PG_BIN: /usr/lib/postgresql/17/bin
+      RUN_PAYMENT_LATE_PG_INTEGRATION: 'true'
+      RUN_FINANCIAL_CONTRACT_PG: 'true'
+      RUN_MEMBERSHIP_RECONCILIATION_PG: 'true'
+      RUN_MEMBERSHIP_PAYMENT_IDENTITY_PG: 'true'
+      RUN_PIXELPAY_RESPONSE_CODE_PG: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - name: PostgreSQL 17 local tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-17
+          "$MASTERFADE_TEST_PG_BIN/postgres" --version
+      - run: git rev-parse HEAD
+      - run: node --test --test-concurrency=2
+      - run: npm run lint
+      - run: git diff --check
+      - name: Identity in an ephemeral local database
+        if: matrix.target == 'D1'
+        run: node scripts/release-identity-postgres.mjs
