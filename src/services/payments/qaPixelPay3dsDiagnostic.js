@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { AppError } from '../../utils/errors.js';
+import { OFFICIAL_QA_CARD_HASHES } from './qaPixelPayOfficialCases.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CARD_HASHES = new Set([
@@ -10,27 +11,35 @@ const RESPONSE_CLASSES = new Set(['Response', 'Object', 'ErrorResponse', 'Failur
   'TimeoutResponse', 'SuccessResponse', 'PreconditionalResponse', 'PaymentDeclinedResponse', 'PayloadResponse',
   'NotFoundResponse', 'NoAccessResponse', 'NetworkFailureResponse']);
 export const QA_3DS_WINDOW_MS = 10 * 60 * 1000;
+export const QA_SANDBOX_SESSION_MS = 4 * 60 * 60 * 1000;
 
 export function resolveQaPixelPay3dsDiagnostic(env, { bookingEnabled = false, now = Date.now() } = {}) {
-  const flag = String(env.QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED || 'false').trim();
+  const sessionFlag = String(env.QA_PIXELPAY_SANDBOX_SESSION_ENABLED || 'false').trim();
+  if (!['true', 'false'].includes(sessionFlag)) throw new Error('Sesion Sandbox invalida.');
+  const sessionMode = sessionFlag === 'true';
+  if (sessionMode && String(env.QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED || 'false').trim() !== 'false') {
+    throw new Error('Usa sesion Sandbox o diagnostico por intent, no ambos.');
+  }
+  const flag = sessionMode ? 'true' : String(env.QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED || 'false').trim();
   const intentId = String(env.QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID || '').trim().toLowerCase();
   if (!['true', 'false'].includes(flag) || (intentId && !UUID.test(intentId))) throw new Error('Configuracion de diagnostico QA 3DS invalida.');
   if (flag === 'false') return Object.freeze({ enabled: false, intentId: intentId || null, until: 0 });
-  const untilText = String(env.QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL || '').trim();
+  const untilText = String((sessionMode ? env.QA_PIXELPAY_SANDBOX_SESSION_UNTIL : env.QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL) || '').trim();
   const until = Date.parse(untilText);
   const url = value => String(value || '').trim().replace(/\/$/, '') === 'https://pixelpay.dev';
   const off = name => String(env[name] || 'false').trim() === 'false';
-  if (!bookingEnabled || !intentId || env.NODE_ENV !== 'development' || env.ENTORNO !== 'qa'
+  if (!bookingEnabled || (!sessionMode && !intentId) || env.NODE_ENV !== 'development' || env.ENTORNO !== 'qa'
     || env.PAYMENT_PROVIDER !== 'pixelpay' || env.PIXELPAY_IMPLEMENTATION !== 'sdk' || env.PIXELPAY_ENV !== 'sandbox'
     || !url(env.PIXELPAY_ENDPOINT) || !url(env.PIXELPAY_APP_URL)
     || !off('QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED') || !off('QA_PRIVATE_COMMERCE_SALE_ENABLED')
     || !off('PRIVATE_COMMERCE_PILOT_ENABLED') || !off('ENABLE_QA_PAYMENT_SIMULATION') || !off('ENABLE_QA_VIP_PURCHASE_SIMULATION')
     || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(untilText)
     || !Number.isFinite(until) || ![new Date(until).toISOString(), new Date(until).toISOString().replace('.000Z', 'Z')].includes(untilText)
-    || until > now + QA_3DS_WINDOW_MS) {
+    || until > now + (sessionMode ? QA_SANDBOX_SESSION_MS : QA_3DS_WINDOW_MS)) {
     throw new Error('Diagnostico QA 3DS requiere una cuenta QA Sandbox, un intent nuevo y una ventana UTC de hasta diez minutos.');
   }
-  return Object.freeze({ enabled: true, intentId, until });
+  return Object.freeze({ enabled: true, intentId: sessionMode ? null : intentId, until,
+    ...(sessionMode ? { sessionMode: true, since: now } : {}) });
 }
 
 export function qa3dsWindowOpen(config, now = Date.now()) {
@@ -38,14 +47,16 @@ export function qa3dsWindowOpen(config, now = Date.now()) {
 }
 
 export function isQa3dsIntent(config, intentId) {
+  // AM: Session scope never grants identity; the existing backend session/owner gate remains mandatory.
+  if (config?.sessionMode === true) return typeof intentId === 'string' && UUID.test(intentId);
   return Boolean(config?.intentId && typeof intentId === 'string' && config.intentId === intentId.toLowerCase());
 }
 
-export function isQa3dsCardHashAllowed(hash) { return CARD_HASHES.has(hash); }
+export function isQa3dsCardHashAllowed(hash, config) { return (config?.sessionMode ? OFFICIAL_QA_CARD_HASHES : CARD_HASHES).has(hash); }
 
-export function assertQa3dsCardAllowed(cardNumber) {
+export function assertQa3dsCardAllowed(cardNumber, config) {
   const normalized = String(cardNumber || '').replace(/\D+/g, '');
-  if (!isQa3dsCardHashAllowed(createHash('sha256').update(normalized).digest('hex'))) {
+  if (!isQa3dsCardHashAllowed(createHash('sha256').update(normalized).digest('hex'), config)) {
     throw new AppError(422, 'La tarjeta no pertenece al caso oficial autorizado para esta observacion.', { code: 'QA_3DS_CARD_NOT_ALLOWED' });
   }
 }
@@ -63,6 +74,7 @@ export function assertQa3dsFreshIntent(config, intent, amount, hasPreviousAttemp
     throw new AppError(403, 'Observacion Sandbox no disponible.', { code: 'QA_3DS_DIAGNOSTIC_RESTRICTED' });
   }
   if (intent.estado_intent_codigo !== 'link_generado' || hasPreviousAttempt || intent.referencia_externa
+    || (config.sessionMode && (!Number.isFinite(Date.parse(intent.created_at)) || Date.parse(intent.created_at) < config.since || Date.parse(intent.created_at) > now))
     || intent.provider_session_id || intent.link_pago_url || Number(amount) !== 1 || Number(intent.monto_hnl) !== 1 || intent.moneda_codigo !== 'HNL'
     || intent.orden_compra !== `MF-PIXELPAY-${intent.id_intent.replaceAll('-', '').toUpperCase()}`) {
     throw new AppError(409, 'La observacion requiere una orden nueva de un lempira.', { code: 'QA_3DS_FRESH_INTENT_REQUIRED' });

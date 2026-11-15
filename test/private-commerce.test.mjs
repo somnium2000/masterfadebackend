@@ -642,6 +642,20 @@ const diagnosticEnv = () => ({ ...QA_BOOKING_IDENTITY, QA_PRIVATE_COMMERCE_SANDB
   QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true', QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:QA_DIAG_TARGET,
   QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL:new Date(Date.now()+8*60000).toISOString() });
 
+for(const scenario of ['owner','guest','other','revoked','csrf-missing','no-role'])test('multi-intent QA session keeps backend identity/CSRF and no VIP: '+scenario,async t=>{
+  const f=await fixture(t,{env:{...diagnosticEnv(),QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'false',QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:'',
+    QA_PIXELPAY_SANDBOX_SESSION_ENABLED:'true',QA_PIXELPAY_SANDBOX_SESSION_UNTIL:new Date(Date.now()+3600000).toISOString()},
+    roles:scenario==='no-role'?['super_admin']:['cliente'],revoked:scenario==='revoked'});
+  const headers=scenario==='guest'?{}:f.headers(scenario==='other'?OTHER:USER);
+  if(scenario==='csrf-missing')delete headers['x-csrf-token'];
+  for(const id of [USER,OTHER]){
+    const r=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers,payload:{id_intent:id}});
+    assert.equal(r.statusCode,scenario==='owner'?400:scenario==='revoked'?401:403);
+  }
+  assert.equal((await f.app.inject({method:'POST',url:'/v1/cliente/planes/orden',headers,payload:{}})).statusCode,scenario==='revoked'?401:403);
+  assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+});
+
 test('Songbird bridge capability is explicit, separate from Sale/VIP, and does not accredit the default contract',async t=>{
   const f=await fixture(t,{env:{...diagnosticEnv(),QA_PIXELPAY_SONGBIRD_BRIDGE_ENABLED:'true',
     QA_PIXELPAY_SONGBIRD_BRIDGE_KEY:Buffer.alloc(32,8).toString('base64')},roles:['cliente']});

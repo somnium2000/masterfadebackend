@@ -4094,7 +4094,9 @@ test("Status correlaciona entrada y salida con X-Request-Id seguro", async () =>
   assert.equal(completed?.client_request_id, requestId);
   assert.equal(completed?.http_status, 200);
   assert.equal(typeof completed?.duration_ms, "number");
-  const transportLogs = JSON.stringify([received, completed]);
+  // AM: Numeric logger metadata can coincidentally contain the three-digit CVV sentinel.
+  const transportLogs = JSON.stringify([received, completed], (key,value) =>
+    ['time','pid'].includes(key) && typeof value === 'number' ? undefined : value);
   assert.doesNotMatch(
     transportLogs,
     /privacy-status@example\.com|payment-uuid-correlation|transaction-id-private|transaction-reference-private|observed-payment-uuid-untrusted-private|auth-hash-private|session-secret-private|csrf-secret-private|4111111111111111|999/i
@@ -4233,6 +4235,27 @@ function diagnosticRouteClient({intentPatch={},...options}={}) {
 const diagnosticOwnerClaims={cliente_id:CLIENT_A,user:{id_usuario:USER_A,id_persona:USER_A}};
 const diagnosticCard={card_number:QA_PIXELPAY_CASE29_VISA};
 const diagnosticPayload=()=>({...pixelPaySalePayload(),...diagnosticCard,card_expire:'2812'});
+
+test('QA session: two new intents each allow one initial Sale; reload/replay never dispatches again or captures',async t=>{
+  const now=Date.now();
+  const policy=resolveQaPixelPay3dsDiagnostic({NODE_ENV:'development',ENTORNO:'qa',PAYMENT_PROVIDER:'pixelpay',PIXELPAY_IMPLEMENTATION:'sdk',
+    PIXELPAY_ENV:'sandbox',PIXELPAY_ENDPOINT:'https://pixelpay.dev',PIXELPAY_APP_URL:'https://pixelpay.dev',
+    QA_PIXELPAY_SANDBOX_SESSION_ENABLED:'true',QA_PIXELPAY_SANDBOX_SESSION_UNTIL:new Date(now+3600000).toISOString()},{bookingEnabled:true,now});
+  let dispatches=0;
+  for(const id of [INTENT_A,USER_B]){
+    const client=diagnosticRouteClient({intentPatch:{id_intent:id,created_at:new Date(now).toISOString(),
+      orden_compra:buildProviderOrderReference({providerCode:'pixelpay',idIntent:id})}});
+    const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,qa3dsDiagnostic:policy,
+      providerAdapter:{async sale(){dispatches++;throw Object.assign(new Error('synthetic202'),{uncertain:true,code:'PIXELPAY_NETWORK_ERROR',statusCode:202});}}});
+    t.after(()=>app.close());
+    const send=()=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),id_intent:id}});
+    const first=await send();assert.equal(first.statusCode,202,first.body);assert.equal(first.json().data.qa_sandbox_session,true);
+    assert.equal((await send()).statusCode,409);assert.equal(client.getSaleAttempts().length,1);
+    assert.equal(client.getPayments().length,0);assert.equal(client.getPaymentEvents().length,0);
+    await app.close();
+  }
+  assert.equal(dispatches,2);
+});
 
 test('Songbird state reserve commits with START before one initial dispatch and never releases the financial claim',async t=>{
   const client=diagnosticRouteClient();let reserved=false;let dispatches=0;let delivered=0;

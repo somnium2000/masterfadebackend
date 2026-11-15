@@ -8,6 +8,29 @@ const env = { NODE_ENV:'development', ENTORNO:'qa', PAYMENT_PROVIDER:'pixelpay',
   PIXELPAY_ENDPOINT:'https://pixelpay.dev', PIXELPAY_APP_URL:'https://pixelpay.dev', QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true',
   QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:ID, QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL:'2026-11-15T12:08:00Z' };
 const config = () => resolveQaPixelPay3dsDiagnostic(env, {bookingEnabled:true,now});
+const sessionEnv={...env,QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'false',QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:'',
+  QA_PIXELPAY_SANDBOX_SESSION_ENABLED:'true',QA_PIXELPAY_SANDBOX_SESSION_UNTIL:'2026-11-15T16:00:00Z'};
+
+test('one QA session accepts several fresh independent canonical intents, expires and never accepts historical/replayed contexts',()=>{
+  const cfg=resolveQaPixelPay3dsDiagnostic(sessionEnv,{bookingEnabled:true,now});
+  assert.equal(cfg.sessionMode,true);assert.equal(cfg.intentId,null);
+  for(const id of [ID,'22222222-2222-4222-8222-222222222222']){
+    const item={...intent(),id_intent:id,created_at:new Date(now).toISOString(),orden_compra:`MF-PIXELPAY-${id.replaceAll('-','').toUpperCase()}`};
+    assert.doesNotThrow(()=>assertQa3dsFreshIntent(cfg,item,1,false,now));
+    assert.throws(()=>assertQa3dsFreshIntent(cfg,item,1,true,now));
+    assert.throws(()=>assertQa3dsFreshIntent(cfg,{...item,created_at:'2026-11-14T00:00:00Z'},1,false,now));
+    assert.throws(()=>assertQa3dsFreshIntent(cfg,item,1,false,cfg.until));
+  }
+  assert.equal(isQa3dsCardHashAllowed('9bbef19476623ca56c17da75fd57734dbf82530686043a6e491c6d71befe8f6e',cfg),true);
+  assert.equal(isQa3dsCardHashAllowed('not-official',cfg),false);
+});
+test('session cannot coexist with per-intent diagnostics, Live, VIP, simulator or general Sale',()=>{
+  for(const patch of [{QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true'},{PIXELPAY_ENV:'live'},{NODE_ENV:'production'},
+    {ENTORNO:'production'},{QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED:'true'},{ENABLE_QA_VIP_PURCHASE_SIMULATION:'true'},
+    {QA_PIXELPAY_SANDBOX_SESSION_UNTIL:'2026-11-15T16:00:01Z'},{QA_PIXELPAY_SANDBOX_SESSION_ENABLED:'yes'}]){
+    assert.throws(()=>resolveQaPixelPay3dsDiagnostic({...sessionEnv,...patch},{bookingEnabled:true,now}));
+  }
+});
 const intent = () => ({id_intent:ID,estado_intent_codigo:'link_generado',monto_hnl:1,moneda_codigo:'HNL',orden_compra:`MF-PIXELPAY-${ID.replaceAll('-','').toUpperCase()}`});
 
 test('3DS observation defaults off; retained target stays identifiable after rollback',()=>{
