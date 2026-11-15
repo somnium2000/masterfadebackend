@@ -372,7 +372,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     this.sdk.Services.Transaction.withConcurrency();
   }
 
-  createTransaction(signature, { sale = false, qa3dsDiagnostic = false } = {}) {
+  createTransaction(signature, { sale = false, qa3dsDiagnostic = false, onSongbirdPayload } = {}) {
     const settings = new this.sdk.Models.Settings();
     if (this.env === "sandbox") {
       settings.setupSandbox();
@@ -385,7 +385,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       settings.setupEnvironment("live");
     }
     settings.setupHeaders({ "x-client-signature": signature });
-    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings, { qa3dsDiagnostic })
+    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings, { qa3dsDiagnostic, onSongbirdPayload })
       : new this.sdk.Services.Transaction(settings);
   }
 
@@ -541,6 +541,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     let response;
     let transaction;
     let sdkInvoked = false;
+    let pendingSongbird = null;
     try {
       const signature = createPixelPaySaleSignature({
         secretKey: this.secretKey,
@@ -548,7 +549,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
         orderId: input.orderId,
         appUrl: this.appUrl,
       });
-      transaction = this.createTransaction(signature, { sale: true, qa3dsDiagnostic: telemetryContext.qa3dsDiagnostic === true });
+      transaction = this.createTransaction(signature, { sale: true, qa3dsDiagnostic: telemetryContext.qa3dsDiagnostic === true,
+        onSongbirdPayload: typeof telemetryContext.onSongbirdRequired === 'function' ? payload => { pendingSongbird = { payload }; } : undefined });
       const saleRequest = this.buildSaleRequest(input, referenceDate);
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
         durationMs: Date.now() - startedAt,
@@ -558,6 +560,14 @@ export class PixelPaySdkProvider extends PaymentProvider {
       response = await transaction.doSale(saleRequest);
       return this.completeSaleResponse(input, attempt, logger, startedAt, inputDiagnostics, transaction, response);
     } catch (error) {
+      if (pendingSongbird) {
+        try { await telemetryContext.onSongbirdRequired(pendingSongbird.payload); }
+        catch {
+          // AM: A handoff write failure cannot release the financial claim or cause another Sale.
+          try { logger?.error?.({ event: 'PIXELPAY_SONGBIRD_HANDOFF_PERSISTENCE_FAILED', paymentAttemptId: attempt.paymentAttemptId }, 'No se pudo guardar la autenticacion'); }
+          catch { /* AM: Logger failures never release an uncertain financial claim. */ }
+        } finally { delete pendingSongbird.payload; }
+      }
       const execution = sdkInvoked ? transaction?.getSaleExecutionDiagnostics?.() : {
           executionPhase: "request_construction", httpResponseReceived: false, requestMayHaveBeenSent: false,
         };

@@ -135,7 +135,7 @@ export function classifyPixelPaySaleRuntimeError(error, execution = {}) {
   });
 }
 
-export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnostic = false } = {}) {
+export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnostic = false, onSongbirdPayload } = {}) {
   class NodeSaleTransaction extends sdk.Services.Transaction {
     constructor(configuration) {
       super(configuration);
@@ -248,6 +248,10 @@ export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnost
       // AM: Contener el 202 antes de DOM/3DS/router; nunca ejecutar otra Sale ni convertirlo en aprobacion.
       if (saleResponse && status === 202) {
         this.saleExecution.sdkTransactionType = safeContinuationType(response?.data?.transaction_type);
+        // AM: Transient server-only handoff sink; never attach opaque data to errors or diagnostics.
+        if (qa3dsDiagnostic && response?.data?.transaction_type === 'songbird' && typeof onSongbirdPayload === 'function') {
+          onSongbirdPayload(response?.data?.payload);
+        }
         throw new PixelPayContinuationRequiredError(this.saleExecution.sdkTransactionType);
       }
       return response;

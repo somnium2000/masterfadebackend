@@ -1966,6 +1966,52 @@ export default async function publicPagosRoutes(app, options = {}) {
   const paymentAccess = (request) => authenticated
     ? { mode: "authenticated", owner: resolveAuthenticatedPaymentOwner(request) }
     : { mode: "public" };
+  if (authenticated) app.post('/pixelpay/3ds/bridge', {
+    ...routeGuard,
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    preValidation: async request => {
+      const fields = ['id_grupo_cita','id_intent','titular_email','action'];
+      if (['setup','validated','interrupt'].includes(request.body?.action)) fields.push('lease_id');
+      if (request.body?.action === 'setup') fields.push('reference');
+      if (request.body?.action === 'validated') fields.push('jwt');
+      if (!request.body || Object.keys(request.body).some(key=>!fields.includes(key))) {
+        throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
+      }
+    },
+    schema: { body: { type:'object',additionalProperties:false, required:['id_grupo_cita','id_intent','titular_email','action'],
+      properties: { id_grupo_cita:{type:'string',format:'uuid'}, id_intent:{type:'string',format:'uuid'},
+        titular_email:{type:'string',format:'email',maxLength:160}, action:{enum:['status','claim','setup','validated','interrupt']},
+        lease_id:{type:'string',format:'uuid'}, reference:{type:'string',maxLength:160}, jwt:{type:'string',maxLength:16000} } } },
+  }, async (request,reply)=>{
+    reply.header('Cache-Control','private, no-store');
+    const body=request.body;
+    const bridge=app.songbirdBridge;
+    if (!bridge?.config.qa || !isQa3dsIntent(app.qaPixelPay3dsDiagnostic,body.id_intent)) {
+      throw new AppError(403,'Autenticacion no disponible.',{code:'SONGBIRD_QA_ONLY'});
+    }
+    const access=paymentAccess(request);
+    const {groupRows}=await loadPublicIntentForGroup(app.db,{groupId:body.id_grupo_cita,idIntent:body.id_intent,
+      titularEmail:normalizeEmail(body.titular_email),access});
+    if (!['status','interrupt'].includes(body.action)) {
+      if (!bridge.config.enabled || !qa3dsWindowOpen(app.qaPixelPay3dsDiagnostic)) {
+        throw new AppError(403,'Autenticacion no disponible.',{code:'SONGBIRD_DISABLED'});
+      }
+      assertPublicGroupPayable(groupRows); resolveGroupExpiresAt(groupRows);
+    }
+    const owner=access.owner.usuarioId;
+    let result;
+    try {
+      if (body.action==='status') result=await bridge.status(body.id_intent,owner);
+      else if (body.action==='claim') result=await bridge.claim(body.id_intent,owner);
+      else if (body.action==='interrupt') result=await bridge.interrupt(body.id_intent,owner,body.lease_id);
+      else result=await bridge.step(body.id_intent,owner,body.action,body.lease_id,body.action==='setup'?body.reference:body.jwt);
+    } catch(error) {
+      if (body.action==='status' && error.code==='42P01') result={state:'unavailable',can_start:false,can_resume:false,financial_finalization_enabled:false};
+      else if(error instanceof AppError) throw error;
+      else throw new AppError(503,'Autenticacion no disponible.',{code:'SONGBIRD_STATE_UNAVAILABLE'});
+    }
+    return sendOk(reply,result);
+  });
   app.post("/crear-intent", {
     ...routeGuard,
     schema: {
@@ -2462,6 +2508,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         currency: "HNL",
         customerName: resolveCustomerName(groupRows),
         paymentAttemptId: crypto.randomUUID(),
+        protectionExpiresAt: claimed.rows[0].protection_expires_at,
       };
       const expiry = inspectPixelPayCardExpire(request.body.card_expire);
       await createPixelPaySaleAttemptRecord(dbClient, {
@@ -2472,6 +2519,12 @@ export default async function publicPagosRoutes(app, options = {}) {
         cardExpireFuture: expiry.future,
         billingAddressLength: String(request.body.billing_address).trim().length,
       });
+      if (qa3dsTarget && app.songbirdBridge?.config.enabled) {
+        // AM: Reserve durable bridge state with START, before the only initial financial dispatch.
+        await app.songbirdBridge.reserve(dbClient, { idIntent, paymentAttemptId: claim.paymentAttemptId,
+          ownerId: access.owner.usuarioId, groupId: idGrupoCita, orderId: claim.orderId,
+          amount: claim.amount, currency: claim.currency, expiresAt: claim.protectionExpiresAt });
+      }
       await dbClient.query("COMMIT");
       inTransaction = false;
       dbClient.release();
@@ -2506,6 +2559,9 @@ export default async function publicPagosRoutes(app, options = {}) {
           paymentAttemptId: claim.paymentAttemptId,
           logger: request.log,
           qa3dsDiagnostic: qa3dsTarget,
+          ...(qa3dsTarget && app.songbirdBridge?.config.enabled ? {
+            onSongbirdRequired: payload => app.songbirdBridge.capture(idIntent, access.owner.usuarioId, payload),
+          } : {}),
         });
       } catch (providerError) {
         const diagnostic = buildSafeProviderErrorDiagnostic(providerError, request.id);

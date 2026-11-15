@@ -3,6 +3,8 @@ import fp from "fastify-plugin";
 import { sendError } from "../utils/errors.js";
 import { createQaCommerceDiagnostic } from "../utils/qaCommerceDiagnostic.js";
 import { isQa3dsIntent, qa3dsWindowOpen, resolveQaPixelPay3dsDiagnostic } from '../services/payments/qaPixelPay3dsDiagnostic.js';
+import { resolveSongbirdBridgeConfig, SongbirdBridge } from '../services/payments/songbirdBridge.js';
+import { SongbirdRepository } from '../services/payments/songbirdRepository.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -152,6 +154,8 @@ export default fp(async function privateCommerce(app) {
   const qaSale = resolveQaSandboxSaleConfig(process.env);
   const qa3ds = resolveQaPixelPay3dsDiagnostic(process.env, { bookingEnabled: qaBooking.enabled });
   app.decorate('qaPixelPay3dsDiagnostic', qa3ds);
+  const bridgeConfig = resolveSongbirdBridgeConfig(process.env, qa3ds);
+  app.decorate('songbirdBridge', new SongbirdBridge({ repository: new SongbirdRepository(app.db), config: bridgeConfig }));
   if (qaBooking.enabled && (config.enabled || config.saleEnabled)) throw new Error('QA booking no permite piloto ni Sale legado activos.');
   const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const qaVipPurchaseSimulationEnabled = app.config.qaVipPurchaseSimulation?.enabled === true;
@@ -190,7 +194,9 @@ export default fp(async function privateCommerce(app) {
     if (await eligible(request, reply)) {
       if (qaBooking.enabled || config.qaCapabilities) {
         const route = `${request.method} ${String(request.routeOptions.url || '').replace(/\/$/, '')}`;
-        const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route) || ((qaSale.enabled || qa3dsWindowOpen(qa3ds)) && QA_SANDBOX_SALE_ROUTES.has(route))
+        const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route)
+          || route === 'POST /v1/pagos/reservas/pixelpay/3ds/bridge'
+          || ((qaSale.enabled || qa3dsWindowOpen(qa3ds)) && QA_SANDBOX_SALE_ROUTES.has(route))
           : QA_PILOT_BOOKING_ROUTES.has(route) || (config.saleEnabled && QA_PILOT_SALE_ROUTES.has(route));
         if (!routeAllowed) {
           return sendError(reply, 403, 'Operacion comercial no disponible.', { code: 'PRIVATE_COMMERCE_RESTRICTED' });
@@ -225,6 +231,7 @@ export default fp(async function privateCommerce(app) {
     if (reply.sent) return;
     return { ok: true, data: { booking: allowed, vipPurchase: qaBooking.enabled || config.qaCapabilities ? false : allowed,
       ...(qaBooking.enabled ? { pixelpaySale: allowed && qaSale.enabled,
-        pixelpay3dsDiagnostic: allowed && qa3dsWindowOpen(qa3ds) } : {}) } };
+        pixelpay3dsDiagnostic: allowed && qa3dsWindowOpen(qa3ds),
+        pixelpaySongbirdBridge: allowed && bridgeConfig.enabled } : {}) } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });
