@@ -52,6 +52,7 @@ function callbackFixture({
   statusError = null,
   intentOverrides = {},
   saleEvidence = true,
+  capturedPayment = false,
 } = {}) {
   const queries = [];
   const event = { exists: duplicate, result: eventResult, claimedAt: null };
@@ -64,12 +65,18 @@ function callbackFixture({
     monto_hnl: "100.00",
     moneda_codigo: "HNL",
     estado_intent_codigo: "pendiente_confirmacion",
+    origen_pago_codigo: "cita",
     ...intentOverrides,
   };
   const client = {
     async query(sql, params = []) {
       const text = String(sql);
       queries.push({ text, params });
+      if (text.includes("WITH verified_sale AS")) {
+        if (!capturedPayment || !saleEvidence || intent.estado_intent_codigo !== "confirmado" || intent.origen_pago_codigo !== "cita") return { rows: [] };
+        event.result = "sale_durable_ya_conciliada";
+        return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+      }
       if (text.includes("FROM public.payment_intents pi")) return { rows: [intent] };
       if (text.includes("pixelpay.sale.approved_verified")) {
         return { rows: saleEvidence ? [{ verified: 1 }] : [] };
@@ -78,6 +85,9 @@ function callbackFixture({
         if (event.exists) return { rows: [] };
         event.exists = true;
         return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+      }
+      if (text.includes("SELECT resultado_procesamiento FROM public.payment_events")) {
+        return { rows: [{ resultado_procesamiento: event.result }] };
       }
       if (text.includes("status_consulta_en_curso")) {
         const retryable = event.result == null || [
@@ -104,7 +114,19 @@ function callbackFixture({
     async query(sql, params = []) {
       const text = String(sql);
       queries.push({ text, params });
-      if (text.includes("UPDATE public.payment_events") && params[2]) event.result = params[2];
+      if (text.includes("WITH verified_sale AS")) {
+        if (!capturedPayment || !saleEvidence || intent.estado_intent_codigo !== "confirmado" || intent.origen_pago_codigo !== "cita") return { rows: [] };
+        event.result = "sale_durable_ya_conciliada";
+        return { rows: [{ id_event: "33333333-3333-4333-8333-333333333333" }] };
+      }
+      if (text.includes("UPDATE public.payment_events") && params[2]) {
+        if (event.result === "sale_durable_ya_conciliada" && text.includes("IS DISTINCT FROM $4")) return { rows: [] };
+        event.result = params[2];
+        return { rows: [{ resultado_procesamiento: event.result }] };
+      }
+      if (text.includes("SELECT resultado_procesamiento FROM public.payment_events")) {
+        return { rows: [{ resultado_procesamiento: event.result }] };
+      }
       return { rows: [] };
     },
   };
@@ -128,7 +150,7 @@ function callbackFixture({
       };
     },
   };
-  return { db, provider, queries, event };
+  return { db, provider, queries, event, intent };
 }
 
 const validCallback = {
@@ -466,6 +488,29 @@ test("callback ya verificado responde idempotente sin repetir Status", async () 
   assert.equal(statusCalls, 0);
 });
 
+test("callback de intent confirmado y pago capturado durable no inicia Status ni queda pendiente", async () => {
+  const fixture = callbackFixture({
+    intentOverrides: { estado_intent_codigo: "confirmado" },
+    capturedPayment: true,
+    status: { approved: false, providerContractValid: false },
+  });
+  let statusCalls = 0;
+  const originalStatus = fixture.provider.queryPaymentStatus;
+  fixture.provider.queryPaymentStatus = async (...args) => { statusCalls += 1; return originalStatus(...args); };
+  const result = await processPixelPayOrderCallback({
+    db: fixture.db,
+    provider: fixture.provider,
+    body: validCallback,
+    requestId: "req-confirmed-callback-synthetic",
+  });
+  assert.equal(statusCalls, 0);
+  assert.equal(result.extension_pending, false);
+  assert.equal(result.processed, false);
+  assert.equal(fixture.queries.some(({ text }) => text.includes("INSERT INTO public.payments")), false);
+  const received = fixture.queries.find(({ text }) => text.includes("pixelpay.order_callback.received"));
+  assert.match(received.text, /'pixelpay\.order_callback\.received', FALSE/);
+});
+
 test("identificadores auxiliares distintos deduplican por identidad financiera", async () => {
   const fixture = callbackFixture();
   const first = await processPixelPayOrderCallback({
@@ -653,7 +698,7 @@ test("callback de intent confirmado no duplica pago ni modifica paid_at", async 
   assert.equal(result.processed, false);
   assert.equal(fixture.queries.some(({ text }) => /INSERT INTO public\.payments/i.test(text)), false);
   assert.equal(fixture.queries.some(({ text }) => /UPDATE public\.payment_intents/i.test(text)), false);
-  assert.equal(fixture.queries.some(({ text }) => /paid_at/i.test(text)), false);
+  assert.equal(fixture.queries.some(({ text }) => /UPDATE public\.payments/i.test(text)), false);
 });
 
 test("callback conserva compatibilidad independiente con aliases anteriores", async () => {

@@ -311,6 +311,7 @@ function createPagosClient({
       params = typeof sql === "object" ? sql.values ?? params : params;
       const text = typeof sql === "object" ? sql.text : String(sql);
       calls.push({ sql: text, params });
+      if (text.includes('WITH verified_sale AS (') && text.includes('UPDATE public.payment_events callback')) return { rows: [] };
       if (text === "BEGIN") {
         transactionSnapshot = structuredClone({ activeIntent, groupState, payments, paymentEvents, saleAttempts, groupStateCode });
         return { rows: [] };
@@ -2153,7 +2154,7 @@ for (const scenario of [
         assert.equal(critical[0].paymentAttemptId, row.payment_attempt_id);
         assert.equal(critical[0].err, undefined);
       }
-      const diagnosticWrites = client.calls.filter((call) => call.sql.includes("app_private.pixelpay_sale_attempts"));
+      const diagnosticWrites = client.calls.filter((call) => /(?:INSERT INTO|UPDATE) app_private\.pixelpay_sale_attempts/.test(call.sql));
       assert.equal(diagnosticWrites.length, 2);
       assert.doesNotMatch(JSON.stringify({ sqlParams: diagnosticWrites.map((call) => call.params), row, logs }),
         /4111111111111111|5555555555554444|"999"|secret-value|secretKey-value|authHash-value|hash-privado|CLIENTE PRUEBA|Calle QA|"2807"/);
@@ -2402,6 +2403,46 @@ function reconcileFixture(client, overrides = {}) {
   });
 }
 
+for (const duplicate of [false, true]) {
+  for (const failure of ['none', 'bookkeeping', 'logger']) {
+    test(`callback bookkeeping es posterior al COMMIT y no altera finanzas: duplicate=${duplicate}, fallo=${failure}`, async () => {
+      const client = createPagosClient({ providerCode: 'pixelpay',
+        existingIntent: reconciliationIntent({ estado_intent_codigo: duplicate ? 'confirmado' : 'pendiente_confirmacion' }),
+        initialPayments: duplicate ? [{ id_intent: INTENT_A, provider_tx_id: 'PAYMENT-UUID-NEW', estado_pago_codigo: 'capturado' }] : [],
+      });
+      const query = client.query.bind(client);
+      let committed = false;
+      let auxiliaryCalls = 0;
+      const warnings = [];
+      client.query = async (sql, params) => {
+        if (sql === 'COMMIT') {
+          const result = await query(sql, params);
+          committed = true;
+          return result;
+        }
+        if (committed) {
+          assert.match(sql, /UPDATE public\.payment_events/);
+          auxiliaryCalls++;
+          if (failure !== 'none') throw Error('Injected callback bookkeeping failure');
+          return { rows: [] };
+        }
+        return query(sql, params);
+      };
+      const result = await reconcileFixture(client, { logger: { warn(entry) {
+        warnings.push(entry);
+        if (failure === 'logger') throw Error('Injected logger failure');
+      } } });
+      assert.equal(result.booking_confirmed, true);
+      assert.equal(result.duplicate, duplicate);
+      assert.equal(auxiliaryCalls, 1);
+      assert.equal(client.getPayments().length, 1);
+      assert.equal(client.getActiveIntent().estado_intent_codigo, 'confirmado');
+      assert.deepEqual(warnings, failure === 'none' ? [] : [{ event: 'PIXELPAY_CALLBACK_BOOKKEEPING_PENDING' }]);
+      assert.equal(client.calls.some(call => call.sql === 'ROLLBACK'), false);
+    });
+  }
+}
+
 test("transactionId repetido y UUID distinto no colisionan, incluyendo caso real QA", async () => {
   for (const [tx, historicalUuid, newUuid] of [
     ["TX-SANDBOX-REPEATED", "PAYMENT-UUID-OLD", "PAYMENT-UUID-NEW"],
@@ -2443,7 +2484,10 @@ test("UUID nuevo idempotente ejecuta confirmacion y efectos postpago solo una ve
   assert.equal(repeated.duplicate, true);
   assert.equal(client.getPayments().length, 1);
   assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
-  const repeatedSql = client.calls.slice(callsAfterFirst).map((call) => call.sql).join("\n");
+  const repeatedCalls = client.calls.slice(callsAfterFirst);
+  const closureCalls = repeatedCalls.filter(call => call.sql.includes('WITH verified_sale AS (') && call.sql.includes('UPDATE public.payment_events callback'));
+  assert.equal(closureCalls.length, 1);
+  const repeatedSql = repeatedCalls.filter(call => !closureCalls.includes(call)).map((call) => call.sql).join("\n");
   assert.doesNotMatch(repeatedSql, /INSERT INTO|UPDATE public\.|promociones|notificaciones_email|puntos/i);
 });
 
@@ -2630,7 +2674,10 @@ test("durable recovery local: aprobado pre-expiry recupera grupo sin Sale/Status
   assert.equal((await recoverLocally(client)).duplicate, true);
   assert.equal(client.getPayments().length, 1);
   assert.equal(client.calls.filter((call) => call.sql.includes("app_private.confirmar_reserva_pagada_v1")).length, 1);
-  assert.doesNotMatch(client.calls.slice(afterFirst).map((call) => call.sql).join("\n"),
+  const afterDuplicate = client.calls.slice(afterFirst);
+  const callbackClosures = afterDuplicate.filter(call => call.sql.includes('WITH verified_sale AS (') && call.sql.includes('UPDATE public.payment_events callback'));
+  assert.equal(callbackClosures.length, 1);
+  assert.doesNotMatch(afterDuplicate.filter(call => !callbackClosures.includes(call)).map((call) => call.sql).join("\n"),
     /INSERT INTO|UPDATE public\.|promociones|notificaciones_email|puntos/i);
   const approvalQuery = client.calls.findIndex((call) => call.sql.includes("WITH approved_attempts AS"));
   assert.ok(client.calls.findIndex((call) => call.sql.includes("FOR UPDATE OF h")) < approvalQuery);

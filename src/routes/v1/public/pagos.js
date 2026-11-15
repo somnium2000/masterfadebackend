@@ -22,6 +22,7 @@ import {
   STATUS_RECONCILIATION_BLOCKED_BY_PROVIDER_CONTRACT,
 } from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
+import { closeCompletedPixelPayCallback } from "../../../services/payments/pixelPayCallbackReceipt.js";
 import { resolvePixelPayStatusCandidate } from "../../../services/payments/pixelPayStatusCandidate.js";
 import {
   pixelPayStatusTransportOnRequest,
@@ -1573,6 +1574,17 @@ async function confirmGroupAfterPaid(client, {
   };
 }
 
+async function closeCallbackReceiptBestEffort(client, idIntent, logger) {
+  // AM: Bookkeeping after COMMIT cannot invalidate an already captured payment.
+  try {
+    await closeCompletedPixelPayCallback(client, { idIntent });
+  } catch {
+    try {
+      logger?.warn?.({ event: "PIXELPAY_CALLBACK_BOOKKEEPING_PENDING" }, "Callback pendiente de cierre operacional");
+    } catch { /* AM: Un fallo del logger tampoco altera la respuesta financiera. */ }
+  }
+}
+
 export async function reconcilePixelPayFromDurableApproval(client, {
   idGrupoCita, idIntent, titularEmail, logger, owner = null,
 }) {
@@ -1759,6 +1771,7 @@ export async function reconcilePixelPayPaid(client, {
     }
     if (existingPayment && intent.estado_intent_codigo === "confirmado") {
       await client.query("COMMIT");
+      await closeCallbackReceiptBestEffort(client, idIntent, logger);
       return {
         processed: false,
         duplicate: true,
@@ -1868,6 +1881,7 @@ export async function reconcilePixelPayPaid(client, {
       );
     }
     await client.query("COMMIT");
+    await closeCallbackReceiptBestEffort(client, idIntent, logger);
     return {
       processed: !existingPayment,
       duplicate: Boolean(existingPayment),

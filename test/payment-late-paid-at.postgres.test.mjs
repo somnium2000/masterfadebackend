@@ -10,6 +10,8 @@ import pg from "pg";
 import { buildProviderOrderReference, reconcilePixelPayFromDurableApproval, reconcilePixelPayPaid } from "../src/routes/v1/public/pagos.js";
 import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
+import { processPixelPayOrderCallback } from "../src/routes/v1/pagos.js";
+import { closeCompletedPixelPayCallback, PIXELPAY_CALLBACK_CLOSED_RESULT } from "../src/services/payments/pixelPayCallbackReceipt.js";
 
 const migrationUrl = new URL("../db/migrations/pixel/20261011213325_payment_late_uses_paid_at_v1.sql", import.meta.url);
 const baselineUrl = new URL("./sql/payments/qa_payment_triggers_20261011.sql", import.meta.url);
@@ -325,6 +327,12 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
     await client.query(functionSql(historical, "app_private.confirmar_reserva_pagada_v1"));
     await client.query(await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8"));
     await client.query(await readFile(financialContractUrl, "utf8"));
+    // AM: La funcion sintetica de auditoria usa una tabla sin esquema; conservarla con RPC SECURITY DEFINER real.
+    await client.query("ALTER FUNCTION public.fn_auditar_bitacora() SET search_path = pg_catalog, public");
+    await client.query(`ALTER TABLE public.payment_intents
+      ADD COLUMN last_verified_at timestamptz, ADD COLUMN verification_attempts integer NOT NULL DEFAULT 0`);
+    await client.query(await readFile(new URL("../db/migrations/pixel/20260923020000_payment_status_checks_v1.sql", import.meta.url), "utf8"));
+    await client.query(await readFile(new URL("../db/migrations/pixel/20261104013000_payment_status_checks_precondition_failed.sql", import.meta.url), "utf8"));
     await client.query(`ALTER TABLE public.clientes ADD COLUMN anonimizado boolean NOT NULL DEFAULT false;
       ALTER TABLE public.usuarios ADD COLUMN estado_acceso text NOT NULL DEFAULT 'activo';
       CREATE TABLE app_private.solicitudes_eliminacion_cuenta (
@@ -363,6 +371,181 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       assert.equal((await recover()).duplicate, true);
       assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 1);
     };
+    await t.test("callback: cierre operativo con contabilidad v2 y carreras reales", async (ct) => {
+      const pool = new pg.Pool({ host: "127.0.0.1", port: client.connectionParameters.port,
+        user: "postgres", password: "", database: "postgres", ssl: false, max: 3, query_timeout: 10000 });
+      const body = { order: buildProviderOrderReference({ providerCode: "pixelpay", idIntent: INTENT }),
+        uuid: "CALLBACK-AUX-SYNTHETIC", transaction_id: "CALLBACK-TX-SYNTHETIC", payment_hash: "fixture-hash",
+        amount: 1, currency: "HNL", status: "PAID" };
+      const callbackProvider = { statusCalls: 0,
+        verifyPaymentHash(hash, order) { return hash === body.payment_hash && order === body.order; },
+        async queryPaymentStatus() { this.statusCalls++; throw new Error("Status inesperado"); },
+      };
+      const callback = (db = pool, currentProvider = callbackProvider) => processPixelPayOrderCallback({
+        db, provider: currentProvider, body, requestId: "synthetic-callback-v2", retryCooldownSeconds: 0,
+      });
+      const rawReceipt = async () => (await client.query(`SELECT firma_valida,resultado_procesamiento,
+        payload_esencial,id_payment,procesado_at::text FROM public.payment_events
+        WHERE evento_tipo='pixelpay.order_callback.received'`)).rows[0];
+      const assertClosed = async () => {
+        const receipt = await rawReceipt();
+        assert.equal(receipt.resultado_procesamiento, PIXELPAY_CALLBACK_CLOSED_RESULT);
+        assert.equal(receipt.firma_valida, false);
+        assert.equal(receipt.payload_esencial.callback_uuid_matches, false);
+        assert.equal(receipt.payload_esencial.callback_transaction_id_matches, false);
+        const payment = (await client.query("SELECT id_payment,paid_at::text FROM public.payments WHERE id_intent=$1", [INTENT])).rows;
+        assert.equal(payment.length, 1);
+        assert.equal(receipt.id_payment, payment[0].id_payment);
+        assert.equal(payment[0].paid_at, "2026-10-11 19:43:29.880935+00");
+        assert.equal((await client.query("SELECT count(*)::int n FROM public.payment_events WHERE evento_tipo='pixelpay.order_callback.status_verified'")).rows[0].n, 0);
+        return receipt;
+      };
+      try {
+        await ct.test("confirmado: callback y duplicado no consultan Status ni cambian evidencia", async () => {
+          await reset();
+          await recover();
+          const first = await callback();
+          assert.equal(first.extension_pending, false);
+          assert.equal(first.duplicate, false);
+          const receipt = await assertClosed();
+          const second = await callback();
+          assert.equal(second.extension_pending, false);
+          assert.equal(second.duplicate, true);
+          assert.deepEqual(await assertClosed(), receipt);
+          assert.equal(callbackProvider.statusCalls, 0);
+          await assertConfirmedOnce();
+        });
+        await ct.test("callback temprano sin Sale queda pendiente y COMMIT financiero posterior lo cierra", async () => {
+          await reset();
+          const sale = (await client.query("DELETE FROM public.payment_events RETURNING provider_event_id,payload_esencial,recibido_at::text")).rows[0];
+          assert.equal((await callback()).extension_pending, true);
+          assert.equal((await rawReceipt()).resultado_procesamiento, "sale_evidence_missing_pending");
+          await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,firma_valida,
+            payload_esencial,id_intent,recibido_at) VALUES ($1,$2,'pixelpay.sale.approved_verified',true,$3,$4,$5)`,
+          [PROVIDER, sale.provider_event_id, sale.payload_esencial, INTENT, sale.recibido_at]);
+          await recover();
+          await assertClosed();
+          assert.equal(callbackProvider.statusCalls, 0);
+        });
+        for (const outcome of ["incomplete", "412"]) {
+          await ct.test(`Status ${outcome} en vuelo no reabre cierre confirmado desde otra conexion`, async () => {
+            await reset();
+            let signalStarted;
+            let settleStatus;
+            const started = new Promise(resolve => { signalStarted = resolve; });
+            const deferred = new Promise(resolve => { settleStatus = resolve; });
+            let calls = 0;
+            const controlledProvider = { ...callbackProvider, async queryPaymentStatus() {
+              calls++; signalStarted(); await deferred;
+              if (outcome === "412") throw Object.assign(new Error("synthetic precondition"), {
+                code: "PIXELPAY_STATUS_PRECONDITION_FAILED", statusCode: 412 });
+              return { ok: true, success: true, statusCode: 200, status: "COMPLETED", incomplete: true };
+            } };
+            const pending = callback(pool, controlledProvider);
+            try {
+              await Promise.race([started, pending.then(() => { throw new Error("callback termino antes de Status"); })]);
+              assert.equal((await rawReceipt()).resultado_procesamiento, "status_consulta_en_curso");
+              assert.equal((await recover()).booking_confirmed, true);
+              await assertClosed();
+            } finally { settleStatus(); }
+            assert.equal((await pending).extension_pending, false);
+            await assertClosed();
+            assert.equal(calls, 1);
+            const checks = (await client.query("SELECT resultado_consulta_codigo,http_status FROM app_private.payment_status_checks WHERE id_intent=$1", [INTENT])).rows;
+            assert.deepEqual(checks, [{ resultado_consulta_codigo: outcome === "412" ? "precondicion_fallida" : "respuesta_invalida",
+              http_status: outcome === "412" ? 412 : 200 }]);
+          });
+        }
+        await ct.test("escritura pendiente posterior a prueba local respeta cierre concurrente", async () => {
+          await reset();
+          let signalWriter;
+          let releaseWriter;
+          const writerReached = new Promise(resolve => { signalWriter = resolve; });
+          const writerGate = new Promise(resolve => { releaseWriter = resolve; });
+          const gatedDb = { connect: () => pool.connect(), async query(sql, params) {
+            if (sql.includes("IS DISTINCT FROM $4::text")) { signalWriter(); await writerGate; }
+            return pool.query(sql, params);
+          } };
+          const controlledProvider = { ...callbackProvider, async queryPaymentStatus() {
+            return { ok: true, success: true, statusCode: 200, status: "COMPLETED", incomplete: true };
+          } };
+          const pending = callback(gatedDb, controlledProvider);
+          try {
+            await Promise.race([writerReached, pending.then(() => { throw new Error("callback termino antes de escritura"); })]);
+            await recover(); await assertClosed();
+          }
+          finally { releaseWriter(); }
+          assert.equal((await pending).extension_pending, false);
+          await assertClosed();
+        });
+        for (const [label, sql, params = []] of [
+          ["firma Sale falsa", "UPDATE public.payment_events SET firma_valida=false WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["sin Sale", "DELETE FROM public.payment_events WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["UUID distinto", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"payment_uuid\":\"OTHER\"}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["transaccion distinta", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"transaction_id\":\"OTHER\"}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["monto distinto", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"amount\":2}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["hash no valido", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"payment_hash_valid\":false}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["paid_at distinto por microsegundo", "UPDATE public.payment_events SET recibido_at=recibido_at+interval '1 microsecond' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["FINAL incierto", "UPDATE app_private.pixelpay_sale_attempts SET uncertain=true"],
+          ["FINAL tardio", "UPDATE app_private.pixelpay_sale_attempts SET finalized_at=$1::timestamptz+interval '1 microsecond'", [EXPIRY]],
+          ["hold no consumido", "UPDATE public.citas_holds SET estado_hold_codigo='expirado'"],
+          ["hold vencio antes del evento", "UPDATE public.citas_holds SET expires_at=$1::timestamptz-interval '1 microsecond'", [PAID_AT]],
+          ["cita no confirmada", "UPDATE public.citas SET estado_cita_codigo='expirada'"],
+          ["orden no canonica", "UPDATE public.payment_intents SET orden_compra='OTHER'"],
+          ["moneda correlacionada distinta de HNL", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"currency":"USD"}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET moneda_codigo='USD'; UPDATE public.payments SET moneda_codigo='USD'`],
+          ["monto correlacionado cero", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"amount":0}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET monto_hnl=0; UPDATE public.payments SET monto_hnl=0`],
+          ["UUID correlacionado vacio", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"payment_uuid":" "}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET provider_session_id=' '; UPDATE public.payments SET provider_tx_id=' '`],
+          ["transaccion correlacionada vacia", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"transaction_id":" "}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET referencia_externa=' '`],
+        ]) {
+          await ct.test(`cierre falla cerrado: ${label}`, async () => {
+            await reset(); await recover();
+            await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,id_intent,
+              resultado_procesamiento) VALUES ($1,'synthetic-receipt','pixelpay.order_callback.received',$2,'status_incierto_pendiente')`, [PROVIDER, INTENT]);
+            await client.query("BEGIN");
+            try {
+              await client.query(sql, params);
+              assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), false);
+              assert.equal((await rawReceipt()).resultado_procesamiento, "status_incierto_pendiente");
+            } finally { await client.query("ROLLBACK"); }
+          });
+        }
+        await ct.test("identificadores opacos iguales con roles correlacionados permiten cierre", async () => {
+          await reset(); await recover();
+          await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,id_intent,
+            resultado_procesamiento) VALUES ($1,'synthetic-receipt','pixelpay.order_callback.received',$2,'status_incierto_pendiente')`, [PROVIDER, INTENT]);
+          // AM: Cada identificador conserva su correlacion; el contrato no exige que sus valores difieran.
+          await client.query(`UPDATE public.payment_events SET payload_esencial=jsonb_set(payload_esencial,'{transaction_id}',payload_esencial->'payment_uuid')
+            WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET referencia_externa=provider_session_id`);
+          const paymentsBefore = (await client.query("SELECT * FROM public.payments WHERE id_intent=$1", [INTENT])).rows;
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          const receipt = await rawReceipt();
+          assert.equal(receipt.resultado_procesamiento, PIXELPAY_CALLBACK_CLOSED_RESULT);
+          assert.equal(receipt.firma_valida, false);
+          assert.equal(receipt.id_payment, paymentsBefore[0].id_payment);
+          assert.deepEqual((await client.query("SELECT * FROM public.payments WHERE id_intent=$1", [INTENT])).rows, paymentsBefore);
+        });
+        await ct.test("rollback del cierre no modifica recibo ni contabilidad; reintento local idempotente", async () => {
+          await reset(); await recover();
+          await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,id_intent,
+            resultado_procesamiento) VALUES ($1,'synthetic-receipt','pixelpay.order_callback.received',$2,'status_incierto_pendiente')`, [PROVIDER, INTENT]);
+          const before = await rawReceipt();
+          await client.query("BEGIN");
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          await client.query("ROLLBACK");
+          assert.deepEqual(await rawReceipt(), before);
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          const once = await rawReceipt();
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          assert.deepEqual(await rawReceipt(), once);
+          await assertConfirmedOnce();
+        });
+      } finally { await pool.end(); }
+    });
     await t.test("aprobacion con hold vigente y duplicado preservan seis decimales", async () => {
       await reset({ intentExpiry: "2099-01-01", holdExpiry: "2099-01-01", holdState: "activo", citaState: "pendiente_pago" });
       assert.equal((await recover()).booking_confirmed, true);
