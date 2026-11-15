@@ -201,6 +201,8 @@ test('AM: pagos conserva evidencia y rechaza recuperar cuenta eliminada', async 
     monto_hnl: 100, moneda_codigo: 'HNL', origen_pago_codigo: 'membership', id_sucursal: id(23),
     intent_expires_at: '2026-01-02T00:00:00Z', order_expires_at: '2026-01-02T00:00:00Z',
     verified_at: '2026-01-01T00:00:00Z',
+      // AM: Campo calculado por el SQL productivo: verified_at precede a ambos vencimientos del fixture.
+      within_validity: true,
     plan_snapshot: { beneficios: {}, periodo_membresia_codigo: 'mensual' },
     payload_esencial: { id_intent: intent, id_order: order, provider: 'pixelpay', payment_hash_valid: true,
       amount_matches: true, amount: 100, currency: 'HNL', payment_uuid: 'synthetic', transaction_id: 'synthetic' } };
@@ -208,6 +210,8 @@ test('AM: pagos conserva evidencia y rechaza recuperar cuenta eliminada', async 
   await assert.rejects(recoverMembershipPixelPayApproval({ async query(sql) {
     calls.push(sql);
     if (sql.includes('AS deletion_identity_lock')) return { rows: [{ deletion_identity_lock: true }] };
+      // AM: La revalidacion SQL bajo locks conserva los mismos vencimientos sinteticos anteriores.
+      if (sql.includes('AS evidence_within_validity')) return { rows: [{ evidence_within_validity: true }] };
     if (sql.includes('AS cliente_activo')) return { rows: [{ cliente_activo: false, cliente_deleted_at: new Date(), anonimizado: true, usuario_activo: false, estado_acceso: 'inactivo', eliminacion_en_curso: true }] };
     if (sql.includes('FROM public.payment_intents pi')) return { rows: [row] };
     throw new Error('Unexpected recovery query');
