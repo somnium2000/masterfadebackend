@@ -1,0 +1,17 @@
+{
+  "base": "3a77863038f866f2b30787a8e67cf69bd8e8adaa",
+  "qa_reference": "73f1537",
+  "candidate123": "57ca040ab6641896558fd939e282406acfcd6ff3",
+  "captured_at": {
+    "qa": "2026-11-15T14:15:43.471552+00:00",
+    "prod": "2026-11-15T14:15:44.489154+00:00"
+  },
+  "source_sha256": "200fad91768a66ac1e99b166cbe3683bb88e3ea6100bb7b5c5c29f215e3cd49f",
+  "states": [
+    "PROD_CURRENT",
+    "PROD_HARDENED",
+    "RELEASE10_CURRENT",
+    "RELEASE10_HARDENED"
+  ],
+  "scope": "metadata only; no commercial bodies, rows, policies, owners or bindings changed"
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "state": "PROD_CURRENT",
+    "mismatches": 0,
+    "trusted": true
+  },
+  {
+    "state": "PROD_HARDENED",
+    "mismatches": 41,
+    "trusted": true
+  },
+  {
+    "state": "RELEASE10_CURRENT",
+    "mismatches": 9,
+    "trusted": true
+  },
+  {
+    "state": "RELEASE10_HARDENED",
+    "mismatches": 41,
+    "trusted": true
+  }
+]
