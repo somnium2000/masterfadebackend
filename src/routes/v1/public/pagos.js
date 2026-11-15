@@ -3,6 +3,7 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
 import { assertQa3dsCardAllowed, assertQa3dsFreshIntent, assertQa3dsInitialPayload, isQa3dsIntent, qa3dsWindowOpen, sanitizeQa3dsObservation } from '../../../services/payments/qaPixelPay3dsDiagnostic.js';
+import { loadPixelPayQaOrigin, pixelPayQaFlags } from '../../../services/payments/pixelPayQaOrigin.js';
 import {
   HONDURAS_ISO_3166_2_CODES,
   PIXELPAY_SALE_OUTCOME,
@@ -2455,6 +2456,9 @@ export default async function publicPagosRoutes(app, options = {}) {
         access,
       });
       const intent = loaded.intent;
+      if (await loadPixelPayQaOrigin(dbClient, idIntent)) {
+        throw new AppError(409, 'Este intento QA ya fue iniciado. No repitas el pago.', { code: 'QA_3DS_FRESH_INTENT_REQUIRED' });
+      }
       if (qa3dsTarget) {
         const history = await dbClient.query('SELECT EXISTS(SELECT 1 FROM app_private.pixelpay_sale_attempts WHERE id_intent=$1::uuid) AS attempted', [idIntent]);
         assertQa3dsFreshIntent(app.qaPixelPay3dsDiagnostic, intent, totalHnl, history.rows[0]?.attempted !== false);
@@ -2515,6 +2519,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       const expiry = inspectPixelPayCardExpire(request.body.card_expire);
       await createPixelPaySaleAttemptRecord(dbClient, {
         idIntent,
+        qaTestOrigin: qa3dsTarget ? app.qaPixelPay3dsDiagnostic.sessionMode ? 'sandbox_session' : '3ds_diagnostic' : null,
         paymentAttemptId: claim.paymentAttemptId,
         requestId: safePixelPayRequestId(request.id),
         cardExpireFormatValid: expiry.formatValid,
@@ -2756,6 +2761,23 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH",
         });
       }
+      const qaOrigin = await loadPixelPayQaOrigin(app.db, idIntent);
+      if (qaOrigin) {
+        // AM: Recover only from existing v2 proof; no provider call, even when session flags are gone.
+        if (intent.provider_session_id && intent.referencia_externa) {
+          const recoveryClient = await app.db.connect();
+          try {
+            const recovered = await reconcilePixelPayFromDurableApproval(recoveryClient, {
+              idGrupoCita, idIntent, titularEmail, logger: request.log,
+              owner: access.mode === 'authenticated' ? access.owner : null,
+            });
+            if (recovered.booking_confirmed === true) return sendOk(reply, {
+              ...recovered, id_intent: idIntent, id_grupo_cita: idGrupoCita, ...pixelPayQaFlags(qaOrigin),
+            });
+          } finally { recoveryClient.release(); }
+        }
+        throw new AppError(403, 'Este intento QA solo permite consultar su estado local.', { code: 'QA_3DS_EXTERNAL_STATUS_DISABLED' });
+      }
       const statusCandidate = await resolvePixelPayStatusCandidate(app.db, intent);
       const paymentUuid = statusCandidate.paymentUuid;
       const usesObservedCandidate = statusCandidate.source === "observed_untrusted";
@@ -2903,6 +2925,11 @@ export default async function publicPagosRoutes(app, options = {}) {
       const allConfirmed = groupRows.every((row) => String(row.estado_cita_codigo || "") === "confirmada");
       const intentState = safeText(intent.estado_intent_codigo)?.toLowerCase() || "";
       const bookingConfirmed = allConfirmed && intentState === "confirmado";
+      const qaOrigin = safeText(intent.provider_code)?.toLowerCase() === 'pixelpay'
+        ? await loadPixelPayQaOrigin(app.db, idIntent) : null;
+      const activeQaSelection = isQa3dsIntent(app.qaPixelPay3dsDiagnostic, idIntent)
+        && (!app.qaPixelPay3dsDiagnostic.sessionMode || (qa3dsWindowOpen(app.qaPixelPay3dsDiagnostic)
+          && intentState === 'link_generado' && Date.parse(intent.created_at) >= app.qaPixelPay3dsDiagnostic.since));
       if (bookingConfirmed) {
         try {
           await dispatchPostPaymentEmails(app.db, {
@@ -2925,8 +2952,10 @@ export default async function publicPagosRoutes(app, options = {}) {
         monto_hnl: Number(intent.monto_hnl || 0),
         moneda_codigo: intent.moneda_codigo || "HNL",
         id_grupo_cita: idGrupoCita,
-        ...(isQa3dsIntent(app.qaPixelPay3dsDiagnostic, idIntent) ? { qa_3ds_diagnostic: true,
-          ...(app.qaPixelPay3dsDiagnostic.sessionMode ? { qa_sandbox_session: true } : {}) } : {}),
+        ...(qaOrigin ? { ...pixelPayQaFlags(qaOrigin),
+          pending_confirmation: !bookingConfirmed && ['pendiente_confirmacion', 'expirado'].includes(intentState) }
+          : activeQaSelection ? { qa_3ds_diagnostic: true,
+            ...(app.qaPixelPay3dsDiagnostic.sessionMode ? { qa_sandbox_session: true } : {}) } : {}),
       });
     } catch (error) {
       if (error instanceof AppError) {
