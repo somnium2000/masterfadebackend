@@ -1,5 +1,8 @@
 # MASTERFADE — PROD-RELEASE-INTEGRACION-10
 
+> AM: Documento historico anterior a SEGURIDAD-02. Sustituido por [CIERRE-CODEXA.md](CIERRE-CODEXA.md).
+> Sus cifras, hashes y procedimiento previo no son entradas autorizables de la ventana actual.
+
 Fecha: 15/11/2026, America/Tegucigalpa. Candidato backend `release/prod-masterpuntos-functional`, basado en `origin/main` `3a77863`. No se fusiona `dev`. No autoriza merge, despliegue, activacion ni escrituras remotas.
 
 ## Decision actual

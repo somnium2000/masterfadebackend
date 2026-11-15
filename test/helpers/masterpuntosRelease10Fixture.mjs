@@ -6,11 +6,11 @@ import { startPostgres17 } from './postgres17.mjs';
 // AM: Catalogo remoto sin filas personales. Este helper solo inicia PostgreSQL 17 en loopback.
 export async function createMasterpuntosRelease10Fixture() {
   const isolated = await startPostgres17();
-  const pool = new pg.Pool({ ...isolated.connectionOptions, max: 8 });
+  const pool = new pg.Pool({ ...isolated.connectionOptions, max: 8, options:'-c timezone=UTC' });
   const source = async file => (await readFile(new URL('../../' + file, import.meta.url), 'utf8')).replace(/\r\n/g,'\n');
-  const prod = JSON.parse(await source('test/fixtures/masterpuntos-release10/prod-catalog.json'));
-  const extra = JSON.parse(await source('test/fixtures/masterpuntos-release10/prod-extra.json'));
-  const keys = JSON.parse(await source('test/fixtures/masterpuntos-release10/prod-primary-keys.json'));
+  const prod = JSON.parse(await source('test/fixtures/masterpuntos-release10/current/prod-catalog.json'));
+  const extra = JSON.parse(await source('test/fixtures/masterpuntos-release10/current/prod-extra.json'));
+  const keys = prod.constraints.filter(c=>c.definition.startsWith('PRIMARY KEY'));
   const close = async () => { await pool.end(); await isolated.stop(); };
   try {
     await pool.query('CREATE SCHEMA app_private; CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;');
@@ -31,6 +31,13 @@ export async function createMasterpuntosRelease10Fixture() {
     for (const i of prod.indexes.filter(i=>i.table.startsWith('points_') && !keys.some(k=>k.name===i.name)
       && !prod.constraints.some(c=>c.name===i.name && c.definition.startsWith('UNIQUE')))) await pool.query(i.definition);
     for (const f of prod.functions) await pool.query(f.definition);
+    // AM: Respaldo SEGURIDAD-02 real, con OID locales; su contenido nunca se rebaselina durante la transicion.
+    const securitySql=await source('db/manual/20261113235412_seguridad_supabase_02_routine_hardening.sql');
+    await pool.query(securitySql.slice(securitySql.indexOf('CREATE TABLE IF NOT EXISTS app_private.security02_routine_backup'),securitySql.indexOf('DO $apply$')));
+    for(const saved of prod.security_backup){
+      const local=(await pool.query('SELECT to_regprocedure($1)::oid oid',[saved.signature])).rows[0].oid;
+      await pool.query('INSERT INTO app_private.security02_routine_backup SELECT * FROM jsonb_populate_record(NULL::app_private.security02_routine_backup,$1::jsonb)',[JSON.stringify({...saved,routine_oid:local})]);
+    }
     for (const v of prod.views) await pool.query(`CREATE VIEW public.${v.name} AS ${v.definition}`);
     for (const t of prod.triggers.filter(t=>t.name.startsWith('tr_points_'))) await pool.query(t.definition);
     for (const t of extra.types) await pool.query('INSERT INTO tipos_puntos(tipo_puntos_codigo,descripcion,signo) VALUES($1,$2,$3)',[t.tipo_puntos_codigo,t.descripcion,t.signo]);

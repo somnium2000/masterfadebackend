@@ -11,8 +11,8 @@ test('Release10: cuerpos PROD efectivos, transicion atomica a QA y reversion con
       const checks=results.flatMap(r=>r.rows).filter(r=>'affected'in r);
       assert.ok(checks.length>0);assert.deepEqual(checks.filter(r=>Number(r.affected)!==0),[]);};
     const assertTarget = async () => {
-      const qa=JSON.parse(await f.source('test/fixtures/masterpuntos-release10/qa-catalog.json'));
-      for(const fn of qa.functions){const signature=fn.signature.startsWith('app_private.')?fn.signature:'public.'+fn.signature;
+      const qa=JSON.parse(await f.source('db/manual/release10/manifest.json'));
+      for(const fn of qa.qa_functions){const signature=fn.signature;
         assert.equal((await f.pool.query('SELECT md5(pg_get_functiondef($1::regprocedure)) hash',[signature])).rows[0].hash,fn.hash,signature);}
     };
     await t.test('los nueve cuerpos PROD y sus triggers corresponden al catalogo actual',async()=>{
@@ -24,6 +24,7 @@ test('Release10: cuerpos PROD efectivos, transicion atomica a QA y reversion con
       ['trigger deshabilitado',"ALTER TABLE citas DISABLE TRIGGER tr_points_cita_confirmada",'CATALOG_DRIFT'],
       ['indice unico ausente',"DROP INDEX uq_points_tx_canje_por_cita",'REQUIRED_UNIQUE_INDEXES'],
       ['regla incompatible',"UPDATE points_rules SET expiracion_meses=1",'RULE_REVIEW'],
+      ['respaldo SEGURIDAD-02 distinto',"UPDATE app_private.security02_routine_backup SET path_changed=false WHERE signature='public.fn_points_estado_final_cita()'",'SECURITY02_BACKUP_DRIFT'],
     ])await t.test('preflight bloquea '+name+' y conserva todo',async()=>{
       const before=await f.snapshot(),c=await f.pool.connect();try{
         await c.query('BEGIN');await c.query(mutation);
@@ -38,6 +39,19 @@ test('Release10: cuerpos PROD efectivos, transicion atomica a QA y reversion con
       // AM: Se completa exclusivamente el historial sintetico para probar un bloque cerrado autorizado.
       await f.pool.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos) VALUES($1,'ajuste_resta',5)",[actor.id]);
       allZero(await f.run('00-preflight.sql'));
+    });
+    await t.test('14 movimientos administrativos legitimos y 69 puntos: bloqueo explicito sin regularizacion',async()=>{
+      const owners=await Promise.all(Array.from({length:12},()=>f.owner()));const c=await f.pool.connect();
+      try{
+        await c.query('BEGIN');
+        for(let i=0;i<12;i++)await c.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos,created_at,updated_at) VALUES($1,'ajustar',5,now()-interval '1 day'+$2*interval '1 second',now()-interval '1 day'+$2*interval '1 second')",[owners[i].id,i]);
+        await c.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos,created_at,updated_at) VALUES($1,'ajustar',13,now()-interval '2 hours',now()-interval '2 hours'),($1,'ajuste_resta',-4,now()-interval '1 hour',now()-interval '1 hour')",[owners[0].id]);
+        const before=(await c.query('SELECT jsonb_agg(to_jsonb(t) ORDER BY id_points_tx) data,sum(puntos)::int net,count(*)::int rows FROM points_transactions t WHERE id_cliente=ANY($1::uuid[])',[owners.map(o=>o.id)])).rows[0];assert.equal(before.net,69);assert.equal(before.rows,14);
+        const readChecks=(await f.sql('00-preflight.sql')).replace(/^BEGIN ISOLATION[^\n]+\n/m,'').replace(/^COMMIT;\s*$/m,'');
+        const checks=(await c.query(readChecks)).flatMap(r=>r.rows);
+        assert.equal(Number(checks.find(r=>r.code==='HISTORICAL_UNCYCLED_REVIEW').affected),12);
+        await assert.rejects(c.query(await f.sql('10-apply.sql')),/HISTORICAL_UNCYCLED_REVIEW/);await c.query('ROLLBACK');
+      }finally{await c.query('ROLLBACK');c.release();}
     });
     const baseline=await f.snapshot();
     const hashes=(await f.run('00-preflight.sql')).flatMap(r=>r.rows).find(r=>r.ledger_md5);

@@ -6,9 +6,15 @@ const root = new URL('../', import.meta.url);
 const read = async name => (await readFile(new URL(name, root), 'utf8')).replace(/\r\n/g, '\n');
 const save = (name, content) => writeFile(new URL('db/manual/release10/' + name, root), content);
 const literal = value => "'" + String(value).replaceAll("'", "''") + "'";
-const prod = JSON.parse(await read('test/fixtures/masterpuntos-release10/prod-catalog.json'));
-const qa = JSON.parse(await read('test/fixtures/masterpuntos-release10/qa-catalog.json'));
-const extra = JSON.parse(await read('test/fixtures/masterpuntos-release10/prod-extra.json'));
+const prod = JSON.parse(await read('test/fixtures/masterpuntos-release10/current/prod-catalog.json'));
+const qaObserved = JSON.parse(await read('test/fixtures/masterpuntos-release10/current/qa-catalog.json'));
+const extra = JSON.parse(await read('test/fixtures/masterpuntos-release10/current/prod-extra.json'));
+// AM: Mismos cuerpos efectivos QA; conservar el path endurecido productivo en las nueve rutinas publicas.
+const qa = {...qaObserved,functions:qaObserved.functions.map(f=>{
+  if(f.signature.startsWith('app_private.'))return f;
+  const definition=f.definition.replace(" SET search_path TO 'pg_catalog', 'public'\n", " SET search_path TO 'pg_catalog', 'public', 'pg_temp'\n");
+  return {...f,definition,config:['search_path=pg_catalog, public, pg_temp'],hash:createHash('md5').update(definition).digest('hex')};
+})};
 const data = (await read('db/manual/release10/data-checks.sql')).replace(/;\s*$/, '');
 const values = list => list.map(row => '(' + row.map(literal).join(',') + ')').join(',\n');
 const publicSignature = f => f.signature.startsWith('app_private.') ? f.signature : 'public.' + f.signature;
@@ -19,9 +25,9 @@ const functionCheck = (list, exact = true) => `NOT EXISTS (SELECT 1 FROM (VALUES
  ${exact ? `AND (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname IN('public','app_private') AND (p.proname ILIKE '%point%' OR p.proname ILIKE '%punto%'))=${list.length}` : ''}`;
 const triggers = list => values(list.map(t => [t.table,t.name,t.definition]));
-const triggerCheck = list => `NOT EXISTS (SELECT 1 FROM (VALUES\n${triggers(list)}\n) e(tablename,name,definition)
+const triggerCheck = (list, containment=false) => `NOT EXISTS (SELECT 1 FROM (VALUES\n${triggers(list)}\n) e(tablename,name,definition)
  LEFT JOIN pg_trigger t ON t.tgrelid=to_regclass('public.'||e.tablename) AND t.tgname=e.name
- WHERE t.oid IS NULL OR t.tgenabled<>'O' OR pg_get_triggerdef(t.oid)<>e.definition)`;
+ WHERE t.oid IS NULL OR NOT (t.tgenabled='O' ${containment ? "OR (e.name LIKE 'tr_points_paid_%' AND t.tgenabled='D')" : ''}) OR pg_get_triggerdef(t.oid)<>e.definition)`;
 const scopedTriggers = s => s.triggers.filter(t => t.name.startsWith('tr_points_'));
 const original = `${functionCheck(prod.functions)} AND ${triggerCheck(scopedTriggers(prod))}
  AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname LIKE 'tr_points_paid_%' AND NOT tgisinternal)`;
@@ -38,14 +44,19 @@ const catalogChecks = `SELECT 'CATALOG_DRIFT' code, CASE WHEN (${original}) OR (
  WHERE i.schemaname='public' AND i.indexname=e.name AND i.indexdef=e.definition AND ix.indisvalid AND ix.indisunique)
  UNION ALL SELECT 'PRIVATE_HELPER_GRANTS',count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname='app_private' AND p.proname LIKE 'points_%_v1' AND (p.proacl IS DISTINCT FROM ARRAY['postgres=X/postgres']::aclitem[] OR p.prosecdef)`;
-const checks = `SELECT * FROM (${catalogChecks}) catalog UNION ALL SELECT * FROM (${data}) data_checks`;
+// AM: El respaldo efectivo de SEGURIDAD-02 es dependencia inmutable, no un sello a actualizar.
+const backupRows=values(prod.security_backup.map(b=>[b.signature,JSON.stringify(Object.fromEntries(Object.entries(b).filter(([key])=>key!=='routine_oid')))]));
+const backupGuard=`SELECT 'SECURITY02_BACKUP_DRIFT' code,count(*)::bigint affected FROM (VALUES\n${backupRows}\n) e(signature,metadata)
+ LEFT JOIN app_private.security02_routine_backup b USING(signature)
+ WHERE b.signature IS NULL OR b.routine_oid<>to_regprocedure(e.signature)::oid OR to_jsonb(b)-'routine_oid'<>e.metadata::jsonb`;
+const checks = `SELECT * FROM (${catalogChecks}) catalog UNION ALL SELECT * FROM (${data}) data_checks UNION ALL ${backupGuard}`;
 const requireZero = query => `DO $release10$ DECLARE r record; BEGIN
  FOR r IN ${query} LOOP
  IF r.affected<>0 THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_BLOCKED: % (%)',r.code,r.affected; END IF;
  END LOOP; END $release10$;\n`;
 const digest = `(SELECT md5(COALESCE(string_agg(to_jsonb(t)::text,E'\\n' ORDER BY id_points_tx),'')) FROM public.points_transactions t)`;
 const cyclesDigest = `(SELECT md5(COALESCE(string_agg(to_jsonb(t)::text,E'\\n' ORDER BY id_cycle),'')) FROM public.points_cycles t)`;
-const begin = `BEGIN;\nSET LOCAL lock_timeout='5s';\nSET LOCAL statement_timeout='60s';\nSET LOCAL search_path=pg_catalog,public;\n`;
+const begin = `BEGIN;\nSET LOCAL lock_timeout='5s';\nSET LOCAL statement_timeout='60s';\nSET LOCAL TimeZone='UTC';\nSET LOCAL search_path=pg_catalog,public;\n`;
 const lockTables = ['citas','citas_grupos','citas_detalles','clientes','payments','payment_intents','subscriptions',
   'subscription_consumptions','subscription_payments','membership_purchase_orders','payment_events','payment_providers',
   'points_cycles','points_transactions','points_rules','points_rule_services','tipos_puntos'].sort();
@@ -54,7 +65,7 @@ const beforeDigest = `SELECT set_config('masterfade.release10_ledger',${digest},
 const assertDigest = `DO $unchanged$ BEGIN IF ${digest}<>current_setting('masterfade.release10_ledger')
  OR ${cyclesDigest}<>current_setting('masterfade.release10_cycles') THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_LEDGER_CHANGED'; END IF; END $unchanged$;\n`;
 await mkdir(new URL('db/manual/release10/', root), { recursive: true });
-await save('00-preflight.sql', `-- AM: SOLO LECTURA; cualquier affected>0 es NO-GO. No llamar helpers mutables.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL statement_timeout='60s';\nSET LOCAL search_path=pg_catalog,public;\n${checks};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nCOMMIT;\n`);
+await save('00-preflight.sql', `-- AM: SOLO LECTURA; cualquier affected>0 es NO-GO. No llamar helpers mutables.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL TimeZone='UTC';\nSET LOCAL statement_timeout='60s';\nSET LOCAL search_path=pg_catalog,public;\n${checks};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nCOMMIT;\n`);
 const sources = ['db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql','db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql'];
 let merged = '';
 const hashes = {};
@@ -63,23 +74,22 @@ for (const file of sources) {
   hashes[file] = createHash('sha256').update(sql).digest('hex');
   merged += `\n-- AM: Fuente exacta ${file}; SHA256 ${hashes[file]}\n` + sql.replace(/^BEGIN;\s*$/mg,'').replace(/^COMMIT;\s*$/mg,'');
 }
-const harden = prod.functions.filter(f => ['fn_points_estado_final_cita()','fn_points_get_effective_rule(uuid)',
-  'fn_points_materialize_expired_cycles(uuid)','fn_points_tx_apply_tipo_sign()'].includes(f.signature))
+const harden = prod.functions
   .map(f => `ALTER FUNCTION ${publicSignature(f)} SET search_path TO pg_catalog,public,pg_temp;`).join('\n');
-const targetGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${target} THEN 0 ELSE 1 END::bigint affected`;
+const targetGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${target} THEN 0 ELSE 1 END::bigint affected UNION ALL ${backupGuard}`;
 await save('10-apply.sql', `-- AM: MANUAL, requiere autorizacion y ventana sin escritores. DDL atomico, sin backfill.\n${begin}${locks}${requireZero(checks)}${beforeDigest}${merged}\n-- AM: Solo cuatro dependencias MasterPuntos de SEGURIDAD-02; no importar su hardening global.\n${harden}\n${requireZero(targetGuard)}${assertDigest}COMMIT;\n`);
-await save('20-postflight.sql', `-- AM: SOLO LECTURA; ejecutar antes de reabrir trafico y comparar hashes con 00.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL search_path=pg_catalog,public;\n${targetGuard};\n${data};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nSELECT p.oid::regprocedure signature,md5(pg_get_functiondef(p.oid)) hash,p.prosecdef,p.proacl FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN('public','app_private') AND (p.proname ILIKE '%point%' OR p.proname ILIKE '%punto%') ORDER BY 1::text;\nCOMMIT;\n`);
+await save('20-postflight.sql', `-- AM: SOLO LECTURA; ejecutar antes de reabrir trafico y comparar hashes con 00.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL TimeZone='UTC';\nSET LOCAL search_path=pg_catalog,public;\n${targetGuard};\n${data};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nSELECT p.oid::regprocedure signature,md5(pg_get_functiondef(p.oid)) hash,p.prosecdef,p.proacl FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN('public','app_private') AND (p.proname ILIKE '%point%' OR p.proname ILIKE '%punto%') ORDER BY 1::text;\nCOMMIT;\n`);
 // AM: Reversion de contencion: detiene nuevos creditos, conserva guardas, expiracion y cada movimiento.
 const disable = scopedTriggers(qa).filter(t=>t.name.startsWith('tr_points_paid_')).map(t=>`ALTER TABLE public.${t.table} DISABLE TRIGGER ${t.name};`).join('\n');
-const containmentGuard = targetGuard.replace("t.tgenabled<>'O'","t.tgenabled NOT IN('O','D')");
+const containmentGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${functionCheck(qa.functions)} AND ${triggerCheck(scopedTriggers(qa),true)} THEN 0 ELSE 1 END::bigint affected UNION ALL ${backupGuard}`;
 await save('30-rollback-containment.sql', `-- AM: MANUAL; mantener trafico detenido. No restaurar backend antiguo ni reabrir con creditos suspendidos.\n${begin}${locks}${requireZero(containmentGuard)}${beforeDigest}${disable}\n${assertDigest}COMMIT;\n`);
 // AM: Restauracion exacta solamente para abortar antes de reabrir, con ledger/ciclos aun iguales al preflight.
-const restore = prod.functions.map(f=>f.definition+';\nALTER FUNCTION '+publicSignature(f)+' RESET ALL;').join('\n');
+const restore = prod.functions.map(f=>f.definition+';').join('\n');
 const removePaid = scopedTriggers(qa).filter(t=>t.name.startsWith('tr_points_paid_')).map(t=>`DROP TRIGGER ${t.name} ON public.${t.table};`).join('\n');
 const restoreTriggers = scopedTriggers(prod).map(t=>t.definition.replace('CREATE TRIGGER','CREATE OR REPLACE TRIGGER')+';').join('\n');
 const removeHelpers = qa.functions.filter(f=>f.signature.startsWith('app_private.')).map(f=>`DROP FUNCTION ${f.signature};`).reverse().join('\n');
-await save('31-restore-before-traffic.sql', `-- AM: SOLO antes de reabrir. Introducir hashes 00; valores vacios bloquean. Mantener trafico detenido.\n${begin}${locks}DO $gate$ BEGIN
+await save('31-restore-before-traffic.sql', `-- AM: SOLO antes de reabrir. Introducir hashes 00; valores vacios bloquean. Mantener trafico detenido.\n${begin}${locks}${requireZero(targetGuard)}DO $gate$ BEGIN
  IF COALESCE(current_setting('masterfade.release10_expected_ledger',true),'')<>${digest}
  OR COALESCE(current_setting('masterfade.release10_expected_cycles',true),'')<>${cyclesDigest}
  THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_RESTORE_REQUIRES_UNCHANGED_BASELINE'; END IF; END $gate$;\n${beforeDigest}${removePaid}\n${restore}\n${restoreTriggers}\n${removeHelpers}\n${requireZero(`SELECT 'RESTORE_CATALOG' code,CASE WHEN ${original} THEN 0 ELSE 1 END::bigint affected`)}${assertDigest}COMMIT;\n`);
-await save('manifest.json', JSON.stringify({base:'3a77863',qa_project:'jgipiyhjtpgyaujfhghf',prod_project:'pdzsmkjnyazpkoocjbpw',sources:hashes,qa_functions:qa.functions.map(f=>({signature:publicSignature(f),hash:f.hash})),prod_functions:prod.functions.map(f=>({signature:publicSignature(f),hash:f.hash})),note:'Catalogos sin datos personales. Aplicacion manual; no registra migraciones ajenas como aplicadas.'},null,2)+'\n');
+await save('manifest.json', JSON.stringify({base:'32e05f8e0e04e53279099a52d5d9f4eaaa84c9ad',captured_at:{prod:prod.captured_at,qa:qaObserved.captured_at},qa_project:'jgipiyhjtpgyaujfhghf',prod_project:'pdzsmkjnyazpkoocjbpw',sources:hashes,qa_functions:qa.functions.map(f=>({signature:publicSignature(f),hash:f.hash,body_hash:f.body_hash})),prod_functions:prod.functions.map(f=>({signature:publicSignature(f),hash:f.hash,body_hash:f.body_hash})),note:'Cuerpos QA sin cambios; path endurecido de PROD preservado. Historico legitimo sin ciclo bloquea aplicacion. Respaldo SEGURIDAD-02 no se rebaselina.'},null,2)+'\n');

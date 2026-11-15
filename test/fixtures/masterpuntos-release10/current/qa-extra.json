@@ -1,0 +1,623 @@
+{
+  "rules": [
+    {
+      "activo": true,
+      "branch_specific": false,
+      "puntos_por_cita": 1,
+      "expiracion_meses": null,
+      "puntos_para_premio": 10
+    }
+  ],
+  "types": [
+    {
+      "signo": 1,
+      "descripcion": "Acumulacion de puntos",
+      "tipo_puntos_codigo": "acumular"
+    },
+    {
+      "signo": 1,
+      "descripcion": "Ajuste manual",
+      "tipo_puntos_codigo": "ajustar"
+    },
+    {
+      "signo": -1,
+      "descripcion": "Ajuste administrativo negativo",
+      "tipo_puntos_codigo": "ajuste_resta"
+    },
+    {
+      "signo": -1,
+      "descripcion": "Puntos canjeados por beneficio",
+      "tipo_puntos_codigo": "canje"
+    },
+    {
+      "signo": -1,
+      "descripcion": "Canje de premio",
+      "tipo_puntos_codigo": "canjear"
+    },
+    {
+      "signo": -1,
+      "descripcion": "Expirar puntos",
+      "tipo_puntos_codigo": "expirar"
+    },
+    {
+      "signo": 1,
+      "descripcion": "Puntos ganados por consumo o promocion",
+      "tipo_puntos_codigo": "ganancia"
+    },
+    {
+      "signo": -1,
+      "descripcion": "Redimir puntos",
+      "tipo_puntos_codigo": "redimir"
+    },
+    {
+      "signo": 1,
+      "descripcion": "Movimiento de sistema",
+      "tipo_puntos_codigo": "sistema"
+    },
+    {
+      "signo": -1,
+      "descripcion": "Vencimiento de puntos",
+      "tipo_puntos_codigo": "vencimiento"
+    }
+  ],
+  "views": [
+    {
+      "name": "vw_points_redemption_services",
+      "definition": " SELECT prs.id_rule_service,\n    pr.id_rule,\n    pr.id_sucursal,\n    prs.cliente_condicion_codigo,\n    prs.id_servicio,\n    s.nombre_servicio,\n    s.descripcion AS descripcion_servicio,\n    s.grupo_catalogo,\n    COALESCE(prs.puntos_canje, pr.puntos_para_premio) AS puntos_requeridos,\n    prs.puntos_canje AS puntos_canje_override,\n    pr.puntos_para_premio AS puntos_para_premio_regla,\n    prs.habilitado AS regla_servicio_activa,\n    prs.visible_cliente,\n    prs.orden_visual,\n    pr.activo AS regla_puntos_activa,\n    s.activo AS servicio_activo,\n    s.visible_publico AS servicio_visible_publico,\n    s.agendable AS servicio_agendable,\n    prs.created_at,\n    prs.updated_at\n   FROM points_rule_services prs\n     JOIN points_rules pr ON pr.id_rule = prs.id_rule\n     JOIN servicios s ON s.id_servicio = prs.id_servicio\n  WHERE s.deleted_at IS NULL;"
+    },
+    {
+      "name": "vw_points_balance",
+      "definition": " WITH ledger_balance AS (\n         SELECT pt.id_cliente,\n            COALESCE(sum(pt.puntos), 0::bigint) AS ledger_points\n           FROM points_transactions pt\n          GROUP BY pt.id_cliente\n        ), pending_expired_cycles AS (\n         SELECT pc.id_cliente,\n            pc.id_cycle,\n            COALESCE(sum(pt.puntos), 0::bigint) AS remaining_points\n           FROM points_cycles pc\n             JOIN points_transactions pt ON pt.id_cycle = pc.id_cycle\n          WHERE pc.estado_ciclo_codigo = 'activo'::text AND pc.vence_at IS NOT NULL AND pc.vence_at <= now()\n          GROUP BY pc.id_cliente, pc.id_cycle\n        ), pending_expiration_by_client AS (\n         SELECT pec.id_cliente,\n            COALESCE(sum(\n                CASE\n                    WHEN pec.remaining_points > 0 THEN pec.remaining_points\n                    ELSE 0::bigint\n                END), 0::bigint::numeric) AS pending_expired_points\n           FROM pending_expired_cycles pec\n          GROUP BY pec.id_cliente\n        )\n SELECT lb.id_cliente,\n    (lb.ledger_points::numeric - COALESCE(pe.pending_expired_points, 0::bigint::numeric))::integer AS balance_puntos\n   FROM ledger_balance lb\n     LEFT JOIN pending_expiration_by_client pe ON pe.id_cliente = lb.id_cliente;"
+    }
+  ],
+  "cycles": [
+    {
+      "rows": 5,
+      "estado_ciclo_codigo": "activo"
+    },
+    {
+      "rows": 2,
+      "estado_ciclo_codigo": "cerrado"
+    }
+  ],
+  "columns": [
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "membership_plans",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_plan",
+      "type": "text",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_hnl",
+      "type": "numeric",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "periodo_membresia_codigo",
+      "type": "text",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "beneficios",
+      "type": "jsonb",
+      "table": "membership_plans",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "membership_plans",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "membership_plans",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "membership_plans",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "membership_plans",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "categoria_nivel",
+      "type": "int2",
+      "table": "membership_plans",
+      "default": "1",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_order",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_usuario",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan_sucursal",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_orden_codigo",
+      "type": "text",
+      "table": "membership_purchase_orders",
+      "default": "'pendiente_pago'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "moneda_codigo",
+      "type": "text",
+      "table": "membership_purchase_orders",
+      "default": "'HNL'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "subtotal_hnl",
+      "type": "numeric",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_hnl",
+      "type": "numeric",
+      "table": "membership_purchase_orders",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_hnl",
+      "type": "numeric",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "plan_snapshot",
+      "type": "jsonb",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "cliente_snapshot",
+      "type": "jsonb",
+      "table": "membership_purchase_orders",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "factura_snapshot",
+      "type": "jsonb",
+      "table": "membership_purchase_orders",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "email_factura",
+      "type": "text",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "notas",
+      "type": "text",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "expires_at",
+      "type": "timestamptz",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "paid_at",
+      "type": "timestamptz",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "cancelled_at",
+      "type": "timestamptz",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_by_usuario_id",
+      "type": "uuid",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "membership_purchase_orders",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "membership_purchase_orders",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "idempotency_key",
+      "type": "text",
+      "table": "membership_purchase_orders",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_event",
+      "type": "uuid",
+      "table": "payment_events",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_provider",
+      "type": "uuid",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "provider_event_id",
+      "type": "text",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "evento_tipo",
+      "type": "text",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "firma_valida",
+      "type": "bool",
+      "table": "payment_events",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_intent",
+      "type": "uuid",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_payment",
+      "type": "uuid",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "payload_esencial",
+      "type": "jsonb",
+      "table": "payment_events",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "recibido_at",
+      "type": "timestamptz",
+      "table": "payment_events",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "procesado_at",
+      "type": "timestamptz",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "resultado_procesamiento",
+      "type": "text",
+      "table": "payment_events",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_provider",
+      "type": "uuid",
+      "table": "payment_providers",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "codigo",
+      "type": "text",
+      "table": "payment_providers",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre",
+      "type": "text",
+      "table": "payment_providers",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "payment_providers",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "configuracion_publica",
+      "type": "jsonb",
+      "table": "payment_providers",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "payment_providers",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "payment_providers",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_rule_service",
+      "type": "uuid",
+      "table": "points_rule_services",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_rule",
+      "type": "uuid",
+      "table": "points_rule_services",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "points_rule_services",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "points_rule_services",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "cliente_condicion_codigo",
+      "type": "text",
+      "table": "points_rule_services",
+      "default": "'sin_membresia'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "puntos_canje",
+      "type": "int4",
+      "table": "points_rule_services",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "habilitado",
+      "type": "bool",
+      "table": "points_rule_services",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "visible_cliente",
+      "type": "bool",
+      "table": "points_rule_services",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_visual",
+      "type": "int4",
+      "table": "points_rule_services",
+      "default": "100",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "points_rule_services",
+      "default": "statement_timestamp()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sub_payment",
+      "type": "uuid",
+      "table": "subscription_payments",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "monto_hnl",
+      "type": "numeric",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "moneda_codigo",
+      "type": "text",
+      "table": "subscription_payments",
+      "default": "'HNL'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "metodo",
+      "type": "text",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "estado",
+      "type": "text",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "paid_at",
+      "type": "timestamptz",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_payment",
+      "type": "uuid",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "registrado_por_usuario_id",
+      "type": "uuid",
+      "table": "subscription_payments",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "subscription_payments",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "subscription_payments",
+      "default": "now()",
+      "nullable": "NO"
+    }
+  ],
+  "uncycled": {
+    "net": 7,
+    "rows": 9,
+    "by_type": [
+      {
+        "net": 33,
+        "rows": 6,
+        "tipo_puntos_codigo": "ajustar"
+      },
+      {
+        "net": -16,
+        "rows": 2,
+        "tipo_puntos_codigo": "ajuste_resta"
+      },
+      {
+        "net": -10,
+        "rows": 1,
+        "tipo_puntos_codigo": "canjear"
+      }
+    ],
+    "clients": 3
+  },
+  "cycles_md5": "f42a7aa040faca4e8a18621ff4969fcc",
+  "ledger_md5": "478019006d26ed69e8e6f55d014846ec",
+  "ledger_sum": 2,
+  "captured_at": "2026-11-15T21:55:24.324205+00:00",
+  "ledger_rows": 23
+}

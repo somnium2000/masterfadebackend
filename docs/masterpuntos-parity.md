@@ -1,6 +1,6 @@
 # Matriz MasterPuntos QA / Produccion
 
-Actualizada 15/11/2026. Corte backend `origin/main=3a77863`; candidato `release/prod-masterpuntos-functional`. Inspeccion remota limitada a catalogos y SELECT agregados. No confundir codigo integrado, SQL efectivo y certificacion funcional.
+Actualizada 15/11/2026 15:55 America/Tegucigalpa. Corte backend `origin/main=32e05f8`; candidato `release/prod-masterpuntos-functional`. Catalogo/ACL/respaldo consultados nuevamente despues de SEGURIDAD-02. No confundir codigo integrado, SQL efectivo y certificacion funcional.
 
 | Capacidad | Codigo en main | Codigo candidato | SQL QA efectivo | SQL PROD efectivo | Certificacion |
 |---|---|---|---|---|---|
@@ -12,11 +12,11 @@ Actualizada 15/11/2026. Corte backend `origin/main=3a77863`; candidato `release/
 | Canje con 1–4 acompanantes | Restriccion antigua en hold | Permite grupo ordenado; conserva restricciones restantes | Credita al titular en grupo autenticado | Semantica antigua | SQL/HTTP sinteticos; pendiente extremo a extremo remoto |
 | Confirmacion total cero concurrente | Lectura previa al lock | Lock de grupo antes de leer efectos | Sin cambio SQL de reservas | Sin cambio SQL de reservas | HTTP local, sin proveedor externo |
 | Protecciones VIP/pago real vs mock/simulacion | Motor main conservado | Sin importar cambios generales de membresias | Helpers de evidencia financiera presentes | Helpers ausentes | PG17 sintetico; no validacion de cuentas reales |
-| SEGURIDAD-02 para dependencias de puntos | No trasladada como migracion global | Solo search_path de cuatro rutinas requeridas | Hardening presente | Estas funciones sin hardening | Hashes completos comparados localmente |
-| Historial compatible con vencimiento anual | No resuelto por codigo | Preflight bloquea y no modifica datos | 1 cliente abierto sin ciclo y 1 ciclo negativo | 10 clientes, 56 puntos netos sin ciclo | **NO-GO de datos en ambos entornos** |
+| SEGURIDAD-02 para dependencias de puntos | Integrado y aplicado | Preserva path/ACL de las nueve publicas y respaldo intacto | Hardening presente | Hardening aplicado | CATALOG_DRIFT=0 y SECURITY02_BACKUP_DRIFT=0 en PROD; transicion/reversion PG17 |
+| Historial legitimo sin ciclo | Registros administrativos existentes | Bloquea imputacion no aprobada; cero DML historico | Referencia funcional, sin limpiar datos | 14 movimientos, 69 puntos netos, 12 clientes, cero ciclos | **NO-GO financiero de aplicacion** |
 
-QA registra 50 migraciones; PROD 38. Las tres entradas de ciclos, pago confirmado y SEGURIDAD-02 faltan en PROD. El paquete manual no marca las tres como aplicadas ni ejecuta el hardening general. La prueba local compara cuerpos efectivos, ACL, propietario, triggers e indices; una coincidencia de nombres no es certificacion.
+SEGURIDAD-02 esta aplicada en PROD; ciclos/pago confirmado siguen pendientes. El paquete no modifica historial de migraciones ni rebaselina el respaldo de seguridad. Los cuerpos comerciales objetivo son los efectivos de QA, conservando el path endurecido de PROD. Una coincidencia de nombres no es certificacion.
 
 Estado de entrega: candidato revisable, SQL manual preparado, **SQL remoto NO aplicado**, merge/despliegue NO realizados, certificacion de PROD NO concedida. El frontend no cambia en este trabajo; su paridad visual y certificacion remota no se afirman. PixelPay Hosted y cambios generales de agendamiento quedan fuera.
 
-Procedimiento exacto y bloqueos: [release10/PROCEDIMIENTO.md](release10/PROCEDIMIENTO.md). Evidencia de lectura actual: [PROD](release10/prod-preflight.json), [QA](release10/qa-preflight.json). Tras una futura ejecucion autorizada se debe actualizar esta matriz con SHA desplegado, hash del paquete, acta SQL y certificacion remota por separado.
+Procedimiento vigente: [release10/CIERRE-CODEXA.md](release10/CIERRE-CODEXA.md). Lecturas actuales: [PROD](release10/prod-preflight-current.json), [QA](release10/qa-preflight-current.json). Las lecturas previas quedan como evidencia historica, fuera del generador operativo. Tras una futura ventana autorizada registrar SHA desplegado, acta SQL y certificacion remota por separado.

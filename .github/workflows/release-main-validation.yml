@@ -75,6 +75,14 @@ jobs:
         run: |
           node scripts/release-security02-package.mjs
           git diff --exit-code -- db/manual/security02-release
+      - name: Reproduce financial manual packages
+        if: matrix.target == 'D1'
+        run: |
+          for package in masterpuntos:release10 vip-consumptions:vip-release; do
+            script="scripts/release-${package%%:*}-package.mjs"
+            directory="db/manual/${package#*:}"
+            if [[ -f "$script" ]]; then node "$script"; git diff --exit-code -- "$directory"; fi
+          done
       - run: git diff --check
       - name: Identity in an ephemeral local database
         if: matrix.target == 'D1'
