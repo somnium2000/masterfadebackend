@@ -415,6 +415,12 @@ async function getAppointmentContactColumnsSupport(client) {
   return appointmentContactColumnsSupportCache;
 }
 
+// AM: El invitado puede no tener persona; priorizar el contacto y conservar el alias como respaldo.
+function buildOperationalClientNameSql(support) {
+  return `COALESCE(${support.has_contacto_nombre ? "NULLIF(BTRIM(c.contacto_nombre), '')," : ''}
+    NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), NULLIF(BTRIM(c.alias_integrante), ''), 'Sin nombre')`;
+}
+
 async function listOperationalAppointments(client, {
   branchIds,
   barberScopeId = null,
@@ -428,11 +434,11 @@ async function listOperationalAppointments(client, {
   limit = 100,
   sortDirection = "asc",
   reservationGroupIds = null,
+  page = null,
+  dateOffset = "",
 } = {}) {
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
-  const clientNameSql = contactColumnsSupport.has_contacto_nombre
-    ? "COALESCE(NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
-    : "COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
+  const clientNameSql = buildOperationalClientNameSql(contactColumnsSupport);
   const clientPhoneSql = contactColumnsSupport.has_contacto_telefono
     ? "COALESCE(c.contacto_telefono, pc.telefono_principal)"
     : "pc.telefono_principal";
@@ -483,13 +489,18 @@ async function listOperationalAppointments(client, {
   }
 
   if (fechaDesde) {
-    params.push(`${fechaDesde}T00:00:00`);
+    params.push(`${fechaDesde}T00:00:00${dateOffset}`);
     where.push(`c.inicio_at >= $${params.length}::timestamptz`);
   }
 
   if (fechaHasta) {
-    params.push(`${fechaHasta}T23:59:59.999`);
-    where.push(`c.inicio_at <= $${params.length}::timestamptz`);
+    if (dateOffset) {
+      params.push(`${fechaHasta}T00:00:00${dateOffset}`);
+      where.push(`c.inicio_at < ($${params.length}::timestamptz + interval '24 hours')`);
+    } else {
+      params.push(`${fechaHasta}T23:59:59.999`);
+      where.push(`c.inicio_at <= $${params.length}::timestamptz`);
+    }
   }
 
   if (q) {
@@ -544,8 +555,7 @@ async function listOperationalAppointments(client, {
   const limitIdx = params.length;
 
   const normalizedSortDirection = String(sortDirection || "asc").toLowerCase() === "desc" ? "DESC" : "ASC";
-  const { rows } = await client.query(
-    `
+  const sql = `
       SELECT
         c.id_cita,
         c.id_grupo_cita,
@@ -591,7 +601,7 @@ async function listOperationalAppointments(client, {
         ON eb.id_empleado = c.id_empleado_barbero
       JOIN public.personas pb
         ON pb.id_persona = eb.id_persona
-      JOIN public.personas pc
+      LEFT JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
       ${preferencesJoin}
       LEFT JOIN LATERAL (
@@ -649,10 +659,27 @@ async function listOperationalAppointments(client, {
       ) delay_reag ON TRUE
       WHERE ${where.join(" AND ")}
       ORDER BY c.inicio_at ${normalizedSortDirection}, c.id_cita ${normalizedSortDirection}
-      LIMIT $${limitIdx}::int
-    `,
-    params
-  );
+    `;
+  if (page !== null) {
+    params.push((page - 1) * limit);
+    const result = await client.query(`
+      WITH filtered_appointments AS (${sql})
+      SELECT (SELECT COUNT(*)::int FROM filtered_appointments) AS total,
+        COALESCE((
+          SELECT jsonb_agg(p ORDER BY p.inicio_at ${normalizedSortDirection}, p.id_cita ${normalizedSortDirection})
+          FROM (SELECT * FROM filtered_appointments
+                ORDER BY inicio_at ${normalizedSortDirection}, id_cita ${normalizedSortDirection}
+                LIMIT $${limitIdx}::int OFFSET $${params.length}::bigint) p
+        ), '[]'::jsonb) AS citas
+    `, params);
+    const total = Number(result.rows[0]?.total || 0);
+    return {
+      citas: (result.rows[0]?.citas || []).map(row => mapOperationalAppointment(row, { preferencesBarberId: safePreferencesBarberId })),
+      pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)),
+        has_next: page * limit < total, has_prev: page > 1 },
+    };
+  }
+  const { rows } = await client.query(sql + ` LIMIT $${limitIdx}::int`, params);
 
   return rows.map((row) => mapOperationalAppointment(row, { preferencesBarberId: safePreferencesBarberId }));
 }
@@ -672,9 +699,7 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
   }
 
   const contactColumnsSupport = await getAppointmentContactColumnsSupport(client);
-  const clientNameSql = contactColumnsSupport.has_contacto_nombre
-    ? "COALESCE(NULLIF(BTRIM(c.contacto_nombre), ''), NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')"
-    : "COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Sin nombre')";
+  const clientNameSql = buildOperationalClientNameSql(contactColumnsSupport);
 
   const { rows } = await client.query(
     `
@@ -713,10 +738,10 @@ async function getScopedAppointment(client, { idCita, branchIds, barberScopeId =
         ON eb.id_empleado = c.id_empleado_barbero
       JOIN public.personas pb
         ON pb.id_persona = eb.id_persona
-      JOIN public.personas pc
+      LEFT JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
       WHERE ${where.join(" AND ")}
-      ${forUpdate ? "FOR UPDATE" : ""}
+      ${forUpdate ? "FOR UPDATE OF c" : ""}
       LIMIT 1
     `,
     params
@@ -972,6 +997,7 @@ async function propagateOperationalDelay(client, {
     };
   }
 
+  const clientNameSql = buildOperationalClientNameSql(await getAppointmentContactColumnsSupport(client));
   const affectedResult = await client.query(
     `
       SELECT
@@ -982,14 +1008,14 @@ async function propagateOperationalDelay(client, {
         c.fin_at,
         c.duracion_total_min,
         c.buffer_total_min,
-        COALESCE(NULLIF(TRIM(CONCAT(pc.nombres, ' ', pc.apellidos)), ''), 'Cliente') AS nombre_cliente,
+        ${clientNameSql} AS nombre_cliente,
         COALESCE(c.contacto_email, cp.email) AS correo_cliente,
         COALESCE(NULLIF(TRIM(CONCAT(pb.nombres, ' ', pb.apellidos)), ''), 'Barbero') AS nombre_barbero,
         s.nombre_sucursal
       FROM public.citas c
       JOIN public.sucursales s
         ON s.id_sucursal = c.id_sucursal
-      JOIN public.personas pc
+      LEFT JOIN public.personas pc
         ON pc.id_persona = c.id_persona_cliente
       JOIN public.empleados eb
         ON eb.id_empleado = c.id_empleado_barbero
@@ -1010,7 +1036,7 @@ async function propagateOperationalDelay(client, {
         AND c.inicio_at > $4::timestamptz
         AND (c.inicio_at AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date = ($4::timestamptz AT TIME ZONE '${OPERATIONAL_TIMEZONE}')::date
       ORDER BY c.inicio_at ASC, c.id_cita ASC
-      FOR UPDATE
+      FOR UPDATE OF c
     `,
     [
       citaCausante.id_empleado_barbero,
@@ -1946,7 +1972,11 @@ export default async function adminCitasRoutes(app) {
       const roleScope = getRoleScope(request.claims);
       const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
       const states = parseStatusFilter(request.query?.estado, OPERATIONAL_APPOINTMENT_STATES);
-      const citas = await listOperationalAppointments(app.db, {
+      const page = request.query?.page === undefined ? null : Number(request.query.page);
+      if (page !== null && (!Number.isSafeInteger(page) || page < 1 || page > 100000000)) {
+        throw new AppError(400, "Página inválida", { code: "ADMIN_CITAS_INVALID_PAGE" });
+      }
+      const result = await listOperationalAppointments(app.db, {
         branchIds,
         barberScopeId: roleScope.barber_empleado_id,
         preferencesBarberId: roleScope.preferences_barber_empleado_id,
@@ -1957,9 +1987,12 @@ export default async function adminCitasRoutes(app) {
         fechaDesde,
         fechaHasta,
         limit: parseLimit(request.query?.limit, 120, 400),
+        page,
+        dateOffset: request.query?.zona_horaria === "America/Tegucigalpa" ? "-06:00" : "",
       });
       return sendOk(reply, {
-        citas,
+        citas: page === null ? result : result.citas,
+        ...(page === null ? {} : { pagination: result.pagination }),
         filtros: {
           id_sucursal: request.query?.id_sucursal ?? null,
           id_empleado_barbero: request.query?.id_empleado_barbero ?? null,
@@ -1997,6 +2030,7 @@ export default async function adminCitasRoutes(app) {
         fechaHasta: operationalDate,
         limit: parseLimit(request.query?.limit, 200, 300),
         sortDirection: "desc",
+        dateOffset: "-06:00",
       });
 
       return sendOk(reply, {
@@ -2029,7 +2063,13 @@ export default async function adminCitasRoutes(app) {
       const roleScope = getRoleScope(request.claims);
       const { fechaDesde, fechaHasta } = resolveDateRange(request.query || {});
       const states = parseStatusFilter(request.query?.estado, []);
-      const citas = await listOperationalAppointments(app.db, {
+      const page = Number(request.query?.page ?? 1);
+      if (!Number.isSafeInteger(page) || page < 1 || page > 100000000) {
+        throw new AppError(400, "Página inválida", { code: "ADMIN_CITAS_INVALID_PAGE" });
+      }
+      const limit = parseLimit(request.query?.limit, 200, 500);
+      if (limit < 1) throw new AppError(400, "Límite inválido", { code: "ADMIN_CITAS_LIMIT_INVALID" });
+      const { citas, pagination } = await listOperationalAppointments(app.db, {
         branchIds,
         barberScopeId: roleScope.barber_empleado_id,
         idSucursal: request.query?.id_sucursal ?? null,
@@ -2038,8 +2078,10 @@ export default async function adminCitasRoutes(app) {
         q: cleanText(request.query?.q),
         fechaDesde,
         fechaHasta,
-        limit: parseLimit(request.query?.limit, 200, 500),
+        limit,
         sortDirection: "desc",
+        page,
+        dateOffset: request.query?.zona_horaria === "America/Tegucigalpa" ? "-06:00" : "",
       });
       return sendOk(reply, {
         citas,
@@ -2052,6 +2094,7 @@ export default async function adminCitasRoutes(app) {
           q: cleanText(request.query?.q),
         },
         estados_historicos_sugeridos: HISTORICAL_DEFAULT_STATES,
+        pagination,
       });
     } catch (error) {
       return sendHandled(reply, request, error, "No se pudo consultar el historial de citas", "ADMIN_CITAS_HISTORY_LIST_ERROR");
