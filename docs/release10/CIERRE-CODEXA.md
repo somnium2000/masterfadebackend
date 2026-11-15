@@ -3,14 +3,16 @@
 ## A. Resumen ejecutivo
 
 PR existente #123 actualizado mediante merge normal de origin/main
-32e05f8e0e04e53279099a52d5d9f4eaaa84c9ad, sin dev, rebase ni force-push.
+55a86efb8b492402f79d7ec2930cdcfbd4fc72fb, sin dev, rebase ni force-push.
+Merge normal 2edd4aa6bf4fd3c8a1bbed88a91e51e0c472b8a1; el HEAD anterior
+b86f40a06c7312dd5887a946c5a0e621cfec4312 se conserva como ancestro.
 Los cuerpos/ACL/paths/triggers/columnas/indices y el respaldo de SEGURIDAD-02 se
 consultaron nuevamente en QA/PROD mediante transacciones de solo lectura.
 Snapshots actuales: test/fixtures/masterpuntos-release10/current/.
 
 **NO-GO financiero para aplicar:** Produccion conserva 14 movimientos administrativos
 legitimos, 69 puntos netos, 12 clientes y ningun ciclo en la lectura del 15/11/2026
-a las 15:55 America/Tegucigalpa. Las cifras son una observacion, no un sello fijo.
+a las 17:22 America/Tegucigalpa (23:22 UTC). Las cifras son una observacion, no un sello fijo.
 No existe una regla aprobada para vincular el saldo sin ciclo con los nuevos debitos
 y vencimientos por ciclo sin decidir como imputarlo. La vista conserva el historico,
 pero un debito futuro en un ciclo sin creditos suficientes puede dejarlo negativo;
@@ -56,6 +58,53 @@ y la suite completa/CI del SHA publicado se enlazan en #123; SKIP ajenos se sepa
 Las fuentes antiguas bajo fixtures siguen solo para las regresiones historicas de
 SEGURIDAD-02 ya integradas; el generador operativo utiliza exclusivamente current/.
 
+### Prueba contable del bloqueo restante
+
+`test/masterpuntos-legacy-ledger-proof.postgres.test.mjs` ejecuta PostgreSQL 17 real,
+los cuerpos SQL objetivo, la vista, triggers y los servicios reales de ajuste y canje.
+Instala el paquete solamente sobre un fixture vacio que supera el preflight; despues
+construye estados mixtos adversarios en loopback. No omite el guard para instalarlo
+sobre datos historicos, ni presenta esos estados como una aplicacion autorizable.
+
+| Caso aislado | Resultado reproducido del candidato, no correccion |
+|---|---|
+| Credito legitimo sin ciclo | `HISTORICAL_UNCYCLED_REVIEW=1`, fila intacta |
+| 9 existentes + 5 acreditaciones validas - ajuste de 10 | Saldo global 4, ciclo -5; replay no duplica |
+| Dos restas concurrentes de 10 | Solo una aplica, otra `POINTS_INSUFFICIENT_BALANCE`; ciclo -5 |
+| Canje real con esos mismos saldos | Una fila de -10 y replay idempotente; ciclo -5 |
+| Imputar todo el debito a NULL | Saldo previo 4; vista/materializacion del vencimiento deja -1 |
+| Consumir primero puntos del ciclo o existentes | Saldo inmediato 4 en ambos; tras vencimiento queda 4 o 0 |
+| Ciclo agotado por canje y siguiente acreditacion | Reutiliza id/fecha antiguos; no renueva 12 meses desde el nuevo punto |
+| Rollback local del experimento | Ledger y ciclos intactos |
+
+El propietario confirmo durante este cierre que, tras un canje el 15, el primer
+punto del nuevo ciclo acreditado el 16 debe tener 12 meses desde el 16. No autoriza
+asignar a los puntos fisicos un vencimiento desde su fecha de captura. La duracion
+de 12 meses y ese ejemplo de reinicio estan confirmados; no deben confundirse con
+la imputacion de un debito que atraviesa saldo sin ciclo y saldo de un ciclo.
+
+**Decision estrictamente pendiente para esa convivencia:** con 9 puntos existentes
+sin vencimiento asignado y 4 puntos de un ciclo con fecha de vencimiento conocida,
+un canje de 10 deja 3. Debe determinarse si esos 3 son remanente existente o remanente
+del ciclo. Ambas imputaciones conservan el saldo inmediato y las filas originales,
+pero producen saldos futuros diferentes. Ni el neto 13-10=3 ni la duracion de 12 meses
+identifican por si solos que puntos fueron consumidos. No se elige una prioridad,
+se mueven filas, se divide el canje, ni se transfieren saldos para ocultar el problema.
+
+No se modifican funciones/guardas SQL ni codigo funcional en este cierre. El segundo
+hallazgo impide tambien afirmar que los cuerpos QA actuales ya cumplen el ejemplo
+de reinicio confirmado por el propietario. Las nueve comprobaciones nuevas son
+pruebas de diagnostico PASS; **la correccion financiera sigue pendiente**.
+
+### Evidencia productiva de solo lectura
+
+Lectura `2026-11-15T23:22:00.878308+00:00`, transaccion `REPEATABLE READ READ ONLY`,
+`transaction_read_only=on`. 14 filas, neto 69, 12 clientes, cero ciclos y cero fechas
+de vencimiento asignadas al historico. `ledger_md5=7d9c4759b1d2e7f35c98a4c983f68cb6`;
+`cycles_md5=d41d8cd98f00b204e9800998ecf8427e`. Coinciden con la lectura inicial.
+Los 16 controles restantes siguen en cero; `CATALOG_DRIFT=0` y
+`SECURITY02_BACKUP_DRIFT=0`. No se leyeron ni publicaron identidades personales.
+
 ## E. SQL coordinado (preparado, NO autorizado para aplicar)
 
 1. Ventana sin escritores/DDL concurrente. Verificar proyecto PROD y rol postgres.
@@ -90,6 +139,7 @@ de checkout/Hosted/reservas generales. No hubo escritura remota, merge a main o 
 
 ## G. Decision
 
-GO para revisar la reconciliacion tecnica y sus pruebas. NO-GO de aplicacion/despliegue
-de MasterPuntos hasta resolver por separado el bloqueo financiero conservando saldos,
-beneficiarios y trazabilidad. Se continua con Consumos VIP en otro worktree desde main.
+GO para revisar la reconciliacion tecnica y sus pruebas. NO-GO para integrar el codigo
+financiero actual, aplicar SQL o desplegar MasterPuntos hasta resolver el bloqueo
+financiero y el reinicio del ciclo conservando saldos, beneficiarios y trazabilidad.
+PR #132 no se modifica en este cierre.

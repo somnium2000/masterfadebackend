@@ -1,6 +1,6 @@
 # Matriz MasterPuntos QA / Produccion
 
-Actualizada 15/11/2026 15:55 America/Tegucigalpa. Corte backend `origin/main=32e05f8`; candidato `release/prod-masterpuntos-functional`. Catalogo/ACL/respaldo consultados nuevamente despues de SEGURIDAD-02. No confundir codigo integrado, SQL efectivo y certificacion funcional.
+Actualizada 15/11/2026 17:22 America/Tegucigalpa. Corte backend `origin/main=55a86ef`; candidato `release/prod-masterpuntos-functional`. Catalogo/ACL/respaldo consultados nuevamente despues de SEGURIDAD-02. No confundir codigo integrado, SQL efectivo y certificacion funcional.
 
 | Capacidad | Codigo en main | Codigo candidato | SQL QA efectivo | SQL PROD efectivo | Certificacion |
 |---|---|---|---|---|---|
@@ -14,6 +14,7 @@ Actualizada 15/11/2026 15:55 America/Tegucigalpa. Corte backend `origin/main=32e
 | Protecciones VIP/pago real vs mock/simulacion | Motor main conservado | Sin importar cambios generales de membresias | Helpers de evidencia financiera presentes | Helpers ausentes | PG17 sintetico; no validacion de cuentas reales |
 | SEGURIDAD-02 para dependencias de puntos | Integrado y aplicado | Preserva path/ACL de las nueve publicas y respaldo intacto | Hardening presente | Hardening aplicado | CATALOG_DRIFT=0 y SECURITY02_BACKUP_DRIFT=0 en PROD; transicion/reversion PG17 |
 | Historial legitimo sin ciclo | Registros administrativos existentes | Bloquea imputacion no aprobada; cero DML historico | Referencia funcional, sin limpiar datos | 14 movimientos, 69 puntos netos, 12 clientes, cero ciclos | **NO-GO financiero de aplicacion** |
+| Debito mixto y reinicio tras canje | Sin convivencia certificada | Prueba real reproduce ciclo -5 y reutilizacion del vencimiento anterior | Cuerpos objetivo sin corregir | Sin aplicar | **9 comprobaciones de diagnostico, no certificacion funcional** |
 
 SEGURIDAD-02 esta aplicada en PROD; ciclos/pago confirmado siguen pendientes. El paquete no modifica historial de migraciones ni rebaselina el respaldo de seguridad. Los cuerpos comerciales objetivo son los efectivos de QA, conservando el path endurecido de PROD. Una coincidencia de nombres no es certificacion.
 
