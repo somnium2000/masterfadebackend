@@ -70,6 +70,11 @@ jobs:
       - run: git rev-parse HEAD
       - run: node --test --test-concurrency=2
       - run: npm run lint
+      - name: Reproduce SEGURIDAD-02 manual package
+        if: matrix.target == 'D1' && hashFiles('scripts/release-security02-package.mjs') != ''
+        run: |
+          node scripts/release-security02-package.mjs
+          git diff --exit-code -- db/manual/security02-release
       - run: git diff --check
       - name: Identity in an ephemeral local database
         if: matrix.target == 'D1'
