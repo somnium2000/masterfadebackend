@@ -107,12 +107,18 @@ reemplazar la tarjeta. No se incluyen PAN ni CVV en este informe.
 | 3DS 2.9-2.12 | Step-up exitoso, fallido, no disponible y error de autenticacion | Tarjetas adicionales rechazadas por allowlist |
 
 La tabla basica publica expiracion 2512 (diciembre 2025), vencida en la fecha de
-esta revision. El ejemplo generico SDK utiliza otra fecha futura y un CVV diferente
-del asignado a esa marca en la tabla Sandbox. Un ejemplo generico no demuestra que
-Sandbox acepte esa fecha/CVV. La tabla 3DS no especifica su propio vencimiento/CVV.
-**Datos vigentes aceptados por el proveedor: BLOQUEADO hasta confirmacion oficial.**
-No se inventa una fecha, no se relaja el rechazo de tarjetas vencidas y no se prueba
-variantes mediante cobros.
+esta revision. Una revision posterior encontro un ejemplo ESPECIFICO de Sandbox:
+MCP oficial `get_use_case`, page_id `es/sandbox/use-cases-sdk/payments/sale-card/javascript`,
+domain/sdk_variant `sandbox`, integration_path `sdk`. Usa setupSandbox(), importe
+1 HNL y doSale sin withAuthenticationRequest; declara vencimiento 12/28. Su tarjeta
+coincide con una de las dos basicas admitidas; su CVV no coincide con la fila de esa
+marca en la tabla general. Se corrige la conclusion anterior: SI existe un conjunto
+completo de datos futuros publicado para Sandbox; su aceptacion real no se probo.
+No mezclar PAN, vencimiento y CVV de fuentes distintas. Para una futura operacion
+autorizada, tomar un unico ejemplo Sandbox completo y declarar la contradiccion al
+proveedor. La tabla 3DS no especifica su propio vencimiento/CVV. Ningun ejemplo
+garantiza aprobacion ni ausencia de HTTP 202. No se inventan datos, no se relaja la
+validacion de vencimiento y no se prueban variantes mediante cobros.
 
 Frontend valida CVV de tres o cuatro digitos y vencimiento MM/AA vigente; backend
 exige CVV numerico de tres o cuatro digitos y vencimiento YYMM vigente. Son controles
@@ -181,17 +187,18 @@ en esta revision. No se cambiaron package.json ni lockfiles de MasterFade.
    verifica un resultado Status completo o un callback firmado sin asumir aprobacion?
 7. 2.5.10 es compatible con esta arquitectura? El hook nuevo exige un servicio o token
    no documentado en las paginas publicas? Que contrato reemplaza el router eliminado?
-8. Cuales son los vencimientos y CVV vigentes para las dos tarjetas basicas y los
-   12 escenarios 3DS? La tabla 2512 esta desactualizada y aplica otra regla oficial?
+8. Confirman vigente como conjunto completo el ejemplo Sandbox SDK sale-card con
+   12/28, incluido su CVV, para importe 1 sin autenticacion solicitada? Como se resuelve
+   su contradiccion con la tabla 2512/CVV y que datos aplican a los 12 escenarios 3DS?
 9. Si no existe handoff soportado, recomiendan Hosted Sandbox para esta arquitectura
    y cual es el contrato financiero/callback autenticado que debemos verificar?
 
 ## Puerta para la primera Sale Sandbox, sin autorizacion implicita
 
-Los PR actuales no habilitan Sale. El modo de reserva por identidad exige
-QA_PRIVATE_COMMERCE_SALE_ENABLED=false y rechaza arrancar si se combina con true.
-Una futura prueba necesita tambien un permiso de Sale acotado, revisado y probado
-por separado una vez acreditado el contrato; no basta cambiar esa variable.
+El permiso nuevo de Sale basica se describe en `qa-first-sandbox-sale.md`; esta
+apagado por defecto y no se configuro. QA_PRIVATE_COMMERCE_SALE_ENABLED es el flag
+LEGADO: debe seguir false. Ningun permiso nuevo implementa continuacion 3DS ni
+autoriza ejecutar una transaccion; requiere revision y autorizaciones separadas.
 
 1. Revisar y validar por separado los PR UX/recuperacion; confirmar que la reserva QA
    por identidad sigue funcionando y Sale/VIP permanecen bloqueados.

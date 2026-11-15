@@ -51,6 +51,8 @@ const QA_PILOT_SALE_ROUTES = new Set([
 // AM: Account-scoped QA booking never grants VIP, simulated payment or provider Sale.
 const QA_SANDBOX_BOOKING_ROUTES = new Set([...QA_PILOT_BOOKING_ROUTES]
   .filter(route => !route.startsWith('POST /v1/cliente/planes/')));
+// AM: Identity-scoped Sale requires the handler that verifies internal reservation ownership.
+const QA_SANDBOX_SALE_ROUTES = new Set(['POST /v1/pagos/reservas/pixelpay/sale']);
 const normalizeIp = value => {
   const text = String(value || "").trim();
   const ip = text.startsWith("::ffff:") ? text.slice(7) : text;
@@ -103,6 +105,15 @@ export function resolveQaSandboxBookingConfig(env) {
   return Object.freeze({ enabled: true, userIds: [userId.toLowerCase()] });
 }
 
+export function resolveQaSandboxSaleConfig(env) {
+  const flag = String(env.QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED || 'false').trim();
+  if (!['true', 'false'].includes(flag)) throw new Error('QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED invalido.');
+  if (flag === 'true' && !resolveQaSandboxBookingConfig(env).enabled) {
+    throw new Error('QA Sandbox Sale requiere reservas QA por identidad habilitadas.');
+  }
+  return Object.freeze({ enabled: flag === 'true' });
+}
+
 export function isPrivateCommerceRoute(method, route) {
   if (["OPTIONS", "HEAD"].includes(method)) return false;
   const path = String(route || "").replace(/\/$/, "");
@@ -137,7 +148,8 @@ export function privateCommerceIpAllowed(request, config) {
 export default fp(async function privateCommerce(app) {
   const config = app.config.privateCommercePilot || resolvePrivateCommerceConfig(process.env);
   const qaBooking = resolveQaSandboxBookingConfig(process.env);
-  if (qaBooking.enabled && (config.enabled || config.saleEnabled)) throw new Error('QA booking no permite piloto ni Sale activos.');
+  const qaSale = resolveQaSandboxSaleConfig(process.env);
+  if (qaBooking.enabled && (config.enabled || config.saleEnabled)) throw new Error('QA booking no permite piloto ni Sale legado activos.');
   const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const qaVipPurchaseSimulationEnabled = app.config.qaVipPurchaseSimulation?.enabled === true;
   if (qaBooking.enabled && (qaPaymentSimulationEnabled || qaVipPurchaseSimulationEnabled)) {
@@ -175,7 +187,7 @@ export default fp(async function privateCommerce(app) {
     if (await eligible(request, reply)) {
       if (qaBooking.enabled || config.qaCapabilities) {
         const route = `${request.method} ${String(request.routeOptions.url || '').replace(/\/$/, '')}`;
-        const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route)
+        const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route) || (qaSale.enabled && QA_SANDBOX_SALE_ROUTES.has(route))
           : QA_PILOT_BOOKING_ROUTES.has(route) || (config.saleEnabled && QA_PILOT_SALE_ROUTES.has(route));
         if (!routeAllowed) {
           return sendError(reply, 403, 'Operacion comercial no disponible.', { code: 'PRIVATE_COMMERCE_RESTRICTED' });
@@ -201,6 +213,6 @@ export default fp(async function privateCommerce(app) {
     await diagnose(request, reason);
     if (reply.sent) return;
     return { ok: true, data: { booking: allowed, vipPurchase: qaBooking.enabled || config.qaCapabilities ? false : allowed,
-      ...(qaBooking.enabled ? { pixelpaySale: false } : {}) } };
+      ...(qaBooking.enabled ? { pixelpaySale: allowed && qaSale.enabled } : {}) } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });

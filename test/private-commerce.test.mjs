@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import jwt from "jsonwebtoken";
 import auth from "../src/plugins/auth.js";
 import adminDataEntry from "../src/plugins/adminDataEntry.js";
-import gate, { resolvePrivateCommerceConfig, resolveQaSandboxBookingConfig } from "../src/plugins/privateCommerce.js";
+import gate, { resolvePrivateCommerceConfig, resolveQaSandboxBookingConfig, resolveQaSandboxSaleConfig } from "../src/plugins/privateCommerce.js";
 import { buildTrustProxy } from "../src/utils/trustProxy.js";
 import publicCitas from "../src/routes/v1/public/citas.js";
 import publicPagos from "../src/routes/v1/public/pagos.js";
@@ -558,4 +558,80 @@ test('QA identity rollback returns to closed legacy mode and preserves default r
   const f=await fixture(t,{env:{...QA_BOOKING_IDENTITY,QA_PRIVATE_COMMERCE_BOOKING_ENABLED:'false'}});
   const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
   assert.deepEqual(r.json().data,{booking:false,vipPurchase:false});
+});
+
+const QA_SANDBOX_SALE_IDENTITY = { ...QA_BOOKING_IDENTITY, QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED: 'true' };
+
+test('QA Sandbox Sale permission defaults closed and requires the isolated identity booking configuration', () => {
+  assert.equal(resolveQaSandboxSaleConfig({}).enabled, false);
+  assert.equal(resolveQaSandboxSaleConfig(QA_BOOKING_IDENTITY).enabled, false);
+  assert.equal(resolveQaSandboxSaleConfig(QA_SANDBOX_SALE_IDENTITY).enabled, true);
+  for (const patch of [
+    { QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED: 'yes' },
+    { QA_PRIVATE_COMMERCE_BOOKING_ENABLED: 'false' }, { QA_PRIVATE_COMMERCE_BOOKING_ENABLED: undefined },
+    { QA_PRIVATE_COMMERCE_USER_ID: '' }, { QA_PRIVATE_COMMERCE_USER_ID: USER + ',' + OTHER },
+    { NODE_ENV: 'production' }, { NODE_ENV: 'staging' }, { ENTORNO: 'production' },
+    { PIXELPAY_ENV: 'live' }, { PIXELPAY_IMPLEMENTATION: 'direct' }, { PAYMENT_PROVIDER: 'todopago' },
+    { PIXELPAY_ENDPOINT: 'https://pixelpay.app' }, { PIXELPAY_APP_URL: 'https://pixelpay.app' },
+    { PRIVATE_COMMERCE_PILOT_ENABLED: 'true' }, { QA_PRIVATE_COMMERCE_SALE_ENABLED: 'true' },
+    { ENABLE_QA_PAYMENT_SIMULATION: 'true' }, { ENABLE_QA_VIP_PURCHASE_SIMULATION: 'true' },
+  ]) assert.throws(() => resolveQaSandboxSaleConfig({ ...QA_SANDBOX_SALE_IDENTITY, ...patch }));
+});
+
+test('QA Sandbox Sale grants only the authenticated reservation Sale route and preserves original validation', async t => {
+  const f = await fixture(t, { env: QA_SANDBOX_SALE_IDENTITY, roles: ['cliente'] });
+  let providerCalls = 0;
+  const originalCreate = PaymentProviderFactory.create;
+  PaymentProviderFactory.create = () => { providerCalls++; throw Error('Provider prohibited during gate test'); };
+  t.after(() => { PaymentProviderFactory.create = originalCreate; });
+  const headers = { ...f.headers(), 'x-forwarded-for': 'invalid', 'x-real-ip': IP };
+  const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.99', headers });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: true });
+  for (const url of ['/v1/pagos/reservas/pixelpay/sale', '/v1/public/citas/hold', '/v1/public/pagos/crear-intent']) {
+    const response = await f.app.inject({ method: 'POST', url, remoteAddress: '10.0.0.99', headers, payload: {} });
+    assert.equal(response.statusCode, 400, url + ': original payload validation must remain');
+  }
+  for (const url of ['/v1/public/pagos/pixelpay/sale', '/v1/cliente/planes/orden', '/v1/cliente/planes/pago-intent', '/v1/cliente/planes/adquirir',
+    '/v1/cliente/planes/pago-intent/' + OTHER + '/estado', '/v1/public/pagos/simulator/event',
+    '/v1/public/pagos/mock-completar', '/v1/admin/citas/hold', '/v1/pagos/crear-intent', '/v1/citas/probe']) {
+    const response = await f.app.inject({ method: 'POST', url, remoteAddress: '10.0.0.99', headers, payload: {} });
+    assert.equal(response.statusCode, 403, url + ': unrelated commercial routes must remain blocked');
+  }
+  assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+  assert.equal(providerCalls, 0);
+});
+
+for (const scenario of ['guest','other','tampered','revoked','no-client','invalid-client','no-role','identity-mismatch','inactive-user','csrf-missing','csrf-wrong','admin-mode']) {
+  test('QA Sandbox Sale permission does not bypass ' + scenario, async t => {
+    const f = await fixture(t, { env: QA_SANDBOX_SALE_IDENTITY, revoked: scenario === 'revoked',
+      clientId: scenario === 'no-client' ? null : scenario === 'invalid-client' ? 'invalid' : OTHER,
+      roles: scenario === 'no-role' ? ['super_admin'] : ['cliente'], claimsMismatch: scenario === 'identity-mismatch',
+      noClaims: scenario === 'inactive-user', config: scenario === 'admin-mode' ? { adminDataEntryMode: true } : {} });
+    const headers = scenario === 'guest' ? {} : f.headers(scenario === 'other' ? OTHER : USER);
+    if (scenario === 'tampered') headers.cookie += 'tampered';
+    if (scenario === 'csrf-missing') delete headers['x-csrf-token'];
+    if (scenario === 'csrf-wrong') headers['x-csrf-token'] = 'wrong';
+    Object.assign(headers, { 'x-forwarded-for': IP, 'x-real-ip': IP, 'x-user-id': USER });
+    for (const url of ['/v1/public/pagos/pixelpay/sale', '/v1/pagos/reservas/pixelpay/sale']) {
+      const denied = await f.app.inject({ method: 'POST', url, remoteAddress: '10.0.0.99', headers, payload: {} });
+      assert.ok([401, 403].includes(denied.statusCode), denied.body);
+    }
+    if (!scenario.startsWith('csrf-')) {
+      const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.99', headers });
+      if (eligibility.statusCode === 200) assert.deepEqual(eligibility.json().data, { booking: false, vipPurchase: false, pixelpaySale: false });
+      else assert.equal(eligibility.statusCode, 401);
+    }
+    assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
+  });
+}
+
+test('QA Sandbox Sale rollback leaves booking available while blocking charges again', async t => {
+  const f = await fixture(t, { env: { ...QA_SANDBOX_SALE_IDENTITY, QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED: 'false' } });
+  const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', headers: f.headers() });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: false });
+  for (const url of ['/v1/public/pagos/pixelpay/sale', '/v1/pagos/reservas/pixelpay/sale']) {
+    const denied = await f.app.inject({ method: 'POST', url, headers: f.headers(), payload: {} });
+    assert.equal(denied.statusCode, 403);
+  }
+  assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
 });
