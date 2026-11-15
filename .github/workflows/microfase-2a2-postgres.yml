@@ -124,6 +124,7 @@ jobs:
       - name: Run late payment triggers and durable recovery in isolated PostgreSQL
         env:
           RUN_PAYMENT_LATE_PG_INTEGRATION: "true"
+          RUN_FINANCIAL_CONTRACT_PG: "true"
         run: |
           "$MASTERFADE_TEST_PG_BIN/initdb" --version | grep -E '^initdb \(PostgreSQL\) 17\.'
           "$MASTERFADE_TEST_PG_BIN/postgres" --version | grep -E '^postgres \(PostgreSQL\) 17\.'
