@@ -776,6 +776,7 @@ async function createPagosApp(client, {
   privatePilot = null,
   config = {},
   qa3dsDiagnostic = null,
+  songbirdBridge = null,
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -789,6 +790,7 @@ async function createPagosApp(client, {
       : false,
   });
   if (qa3dsDiagnostic) app.decorate('qaPixelPay3dsDiagnostic', qa3dsDiagnostic);
+  if (songbirdBridge) app.decorate('songbirdBridge', songbirdBridge);
   app.decorate("config", {
     paymentProvider: providerCode,
     pixelPayEnv: "sandbox",
@@ -4231,6 +4233,64 @@ function diagnosticRouteClient({intentPatch={},...options}={}) {
 const diagnosticOwnerClaims={cliente_id:CLIENT_A,user:{id_usuario:USER_A,id_persona:USER_A}};
 const diagnosticCard={card_number:QA_PIXELPAY_CASE29_VISA};
 const diagnosticPayload=()=>({...pixelPaySalePayload(),...diagnosticCard,card_expire:'2812'});
+
+test('Songbird state reserve commits with START before one initial dispatch and never releases the financial claim',async t=>{
+  const client=diagnosticRouteClient();let reserved=false;let dispatches=0;let delivered=0;
+  const bridge={config:{enabled:true,qa:true},async reserve(c,context){
+    assert.equal(c,client);assert.equal(client.getSaleAttempts().length,1);
+    assert.notEqual(client.calls.at(-1).sql,'COMMIT');assert.equal(context.amount,1);assert.equal(context.currency,'HNL');
+    assert.equal(context.ownerId,USER_A);assert.equal(context.idIntent,INTENT_A);reserved=true;
+  },async capture(id,owner,payload){
+    assert.equal(id,INTENT_A);assert.equal(owner,USER_A);assert.equal(payload,'synthetic.payload.signature');delivered++;
+  }};
+  const provider={async sale(_input,context){
+    assert.equal(reserved,true);assert.equal(client.calls.at(-1).sql,'COMMIT');dispatches++;
+    await context.onSongbirdRequired('synthetic.payload.signature');
+    throw Object.assign(new Error('Synthetic202'),{code:'PIXELPAY_NETWORK_ERROR',uncertain:true,statusCode:202});
+  }};
+  const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:provider,authenticated:true,
+    claims:diagnosticOwnerClaims,qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge});
+  t.after(()=>app.close());
+  const send=()=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:diagnosticPayload()});
+  assert.equal((await send()).statusCode,202);assert.equal((await send()).statusCode,409);
+  assert.equal(dispatches,1);assert.equal(delivered,1);assert.equal(client.getPayments().length,0);
+  assert.equal(client.getPaymentEvents().length,0);
+});
+
+test('authenticated bridge enforces ownership/action fields and recovers local metadata without a provider operation',async t=>{
+  const client=diagnosticRouteClient();let reads=0;let financial=0;
+  const bridge={config:{enabled:true,qa:true},async status(id,owner){
+    assert.equal(id,INTENT_A);assert.equal(owner,USER_A);reads++;
+    return {state:'contract_blocked',can_start:false,financial_finalization_enabled:false};
+  }};
+  const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:{async sale(){financial++;}},
+    authenticated:true,claims:diagnosticOwnerClaims,qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge});
+  t.after(()=>app.close());
+  const payload={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com',action:'status'};
+  const send=fields=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',payload:{...payload,...fields}});
+  const response=await send({});assert.equal(response.statusCode,200,response.body);
+  assert.match(response.headers['cache-control'],/no-store/);assert.equal(response.json().data.state,'contract_blocked');
+  for(const fields of [{action:'finalize'},{action:'sale'},{identifier:'foreign'},{acsUrl:'https://foreign.invalid'},
+    {amount:1},{jwt:'synthetic.payload.signature'},{headers:{'x-auth-key':'foreign'}}])assert.equal((await send(fields)).statusCode,400);
+  assert.equal(reads,1);assert.equal(financial,0);assert.equal(client.getPayments().length,0);
+  app.qaPixelPay3dsDiagnostic=resolveQaPixelPay3dsDiagnostic({QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:INTENT_A});
+  bridge.config.enabled=false;
+  assert.equal((await send({})).statusCode,200);assert.equal(reads,2);
+  assert.equal((await send({action:'claim'})).statusCode,403);
+});
+
+test('bridge owner mismatch and anonymous route never disclose handoff state',async t=>{
+  for(const authenticated of [true,false]){
+    const client=diagnosticRouteClient();let called=0;
+    const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated,
+      claims:{...diagnosticOwnerClaims,cliente_id:CLIENT_B},qa3dsDiagnostic:diagnosticPolicy(),
+      songbirdBridge:{config:{enabled:true,qa:true},async status(){called++;}}});
+    t.after(()=>app.close());
+    const response=await app.inject({method:'POST',url:(authenticated?'/v1/pagos/reservas':'/v1/public/pagos')+'/pixelpay/3ds/bridge',
+      payload:{id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com',action:'status'}});
+    assert.ok([403,404].includes(response.statusCode),response.body);assert.equal(called,0);
+  }
+});
 
 test('QA diagnostic authenticated handler: canonical one-HNL claim COMMIT then single202, reload local and no second Sale',async t=>{
   const client=diagnosticRouteClient();

@@ -26,6 +26,7 @@ const USER = crypto.randomUUID(), OTHER = crypto.randomUUID();
 const SECRET = crypto.randomBytes(40).toString("hex");
 const IP = "203.0.113.10";
 const protectedPaths = ["/v1/public/citas/hold", "/v1/public/citas/validar-contactos",
+  "/v1/pagos/reservas/pixelpay/3ds/bridge",
   "/v1/public/pagos/crear-intent", "/v1/public/pagos/pixelpay/sale", "/v1/public/pagos/pixelpay/status",
   "/v1/public/pagos/estado", "/v1/public/pagos/mock-completar", "/v1/public/pagos/simulator/event",
   "/v1/cliente/planes/orden", "/v1/cliente/planes/pago-intent", "/v1/cliente/planes/confirmar-pago",
@@ -518,7 +519,7 @@ test('QA identity booking grants only verified owner, independently of TCP and f
   ]) {
     const headers={...f.headers(),...extra};
     const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress,headers});
-    assert.equal(r.statusCode,200); assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:false});
+    assert.equal(r.statusCode,200); assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic: false,pixelpaySongbirdBridge:false});
     for(const url of ['/v1/public/citas/hold','/v1/citas/hold','/v1/public/pagos/crear-intent','/v1/pagos/reservas/crear-intent','/v1/public/pagos/estado','/v1/pagos/reservas/estado']) {
       const invalid=await f.app.inject({method:'POST',url,remoteAddress,headers,payload:{}});
       assert.equal(invalid.statusCode,400,url+': original input validation remains');
@@ -547,7 +548,7 @@ for(const scenario of ['guest','other','tampered','revoked','no-client','invalid
     assert.ok([401,403].includes(denied.statusCode),denied.body);
     if(!scenario.startsWith('csrf-')) {
       const r=await f.app.inject({url:'/v1/commerce/eligibility',remoteAddress:'10.0.0.99',headers});
-      if(r.statusCode===200)assert.deepEqual(r.json().data,{booking:false,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:false});
+      if(r.statusCode===200)assert.deepEqual(r.json().data,{booking:false,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic: false,pixelpaySongbirdBridge:false});
       else assert.equal(r.statusCode,401);
     }
     assert.deepEqual(f.state,{business:0,unexpectedSql:0});
@@ -586,7 +587,7 @@ test('QA Sandbox Sale grants only the authenticated reservation Sale route and p
   t.after(() => { PaymentProviderFactory.create = originalCreate; });
   const headers = { ...f.headers(), 'x-forwarded-for': 'invalid', 'x-real-ip': IP };
   const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.99', headers });
-  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: true, pixelpay3dsDiagnostic: false });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: true, pixelpay3dsDiagnostic: false, pixelpaySongbirdBridge: false });
   for (const url of ['/v1/pagos/reservas/pixelpay/sale', '/v1/public/citas/hold', '/v1/public/pagos/crear-intent']) {
     const response = await f.app.inject({ method: 'POST', url, remoteAddress: '10.0.0.99', headers, payload: {} });
     assert.equal(response.statusCode, 400, url + ': original payload validation must remain');
@@ -618,7 +619,7 @@ for (const scenario of ['guest','other','tampered','revoked','no-client','invali
     }
     if (!scenario.startsWith('csrf-')) {
       const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '10.0.0.99', headers });
-      if (eligibility.statusCode === 200) assert.deepEqual(eligibility.json().data, { booking: false, vipPurchase: false, pixelpaySale: false, pixelpay3dsDiagnostic: false });
+      if (eligibility.statusCode === 200) assert.deepEqual(eligibility.json().data, { booking: false, vipPurchase: false, pixelpaySale: false, pixelpay3dsDiagnostic: false, pixelpaySongbirdBridge: false });
       else assert.equal(eligibility.statusCode, 401);
     }
     assert.deepEqual(f.state, { business: 0, unexpectedSql: 0 });
@@ -628,7 +629,7 @@ for (const scenario of ['guest','other','tampered','revoked','no-client','invali
 test('QA Sandbox Sale rollback leaves booking available while blocking charges again', async t => {
   const f = await fixture(t, { env: { ...QA_SANDBOX_SALE_IDENTITY, QA_PRIVATE_COMMERCE_SANDBOX_SALE_ENABLED: 'false' } });
   const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', headers: f.headers() });
-  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: false, pixelpay3dsDiagnostic: false });
+  assert.deepEqual(eligibility.json().data, { booking: true, vipPurchase: false, pixelpaySale: false, pixelpay3dsDiagnostic: false, pixelpaySongbirdBridge: false });
   for (const url of ['/v1/public/pagos/pixelpay/sale', '/v1/pagos/reservas/pixelpay/sale']) {
     const denied = await f.app.inject({ method: 'POST', url, headers: f.headers(), payload: {} });
     assert.equal(denied.statusCode, 403);
@@ -641,10 +642,21 @@ const diagnosticEnv = () => ({ ...QA_BOOKING_IDENTITY, QA_PRIVATE_COMMERCE_SANDB
   QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true', QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:QA_DIAG_TARGET,
   QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL:new Date(Date.now()+8*60000).toISOString() });
 
+test('Songbird bridge capability is explicit, separate from Sale/VIP, and does not accredit the default contract',async t=>{
+  const f=await fixture(t,{env:{...diagnosticEnv(),QA_PIXELPAY_SONGBIRD_BRIDGE_ENABLED:'true',
+    QA_PIXELPAY_SONGBIRD_BRIDGE_KEY:Buffer.alloc(32,8).toString('base64')},roles:['cliente']});
+  const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
+  assert.equal(r.json().data.pixelpaySongbirdBridge,true);assert.equal(r.json().data.pixelpaySale,false);
+  assert.equal(r.json().data.vipPurchase,false);assert.equal(f.app.songbirdBridge.contract.browserPayloadAccredited,false);
+  const headers=f.headers();delete headers['x-csrf-token'];
+  const blocked=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',headers,payload:{}});
+  assert.equal(blocked.statusCode,403);assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+});
+
 test('QA 3DS capability is separate, exact-account authenticated route only, with no provider operations',async t=>{
   const f=await fixture(t,{env:diagnosticEnv(),roles:['cliente']});
   const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
-  assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:true});
+  assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic: true,pixelpaySongbirdBridge:false});
   const allowed=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET}});
   assert.equal(allowed.statusCode,400,'ordinary required fields remain required');
   for(const url of ['/v1/public/pagos/pixelpay/sale','/v1/cliente/planes/orden','/v1/public/pagos/simulator/event']) {

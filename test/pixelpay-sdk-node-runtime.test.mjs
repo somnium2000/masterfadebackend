@@ -159,6 +159,25 @@ after(() => {
   syncBuiltinESMExports();
 });
 
+test('Songbird transient sink is awaited once, never attached to public errors, and cannot trigger a retry',async()=>{
+  for (const fail of [false,true]) {
+    mockTransport(202,{success:true,data:{transaction_type:'songbird',payload:DATA_SENTINEL}});
+    let delivered=0;
+    const run=await execute(makeProvider(),input(),{qa3dsDiagnostic:true,onSongbirdRequired:async payload=>{
+      delivered++;assert.equal(payload,DATA_SENTINEL);
+      if(fail)throw new Error(DATA_SENTINEL);
+    }});
+    assert.equal(delivered,1);assert.equal(run.saleCalls,1);assert.equal(run.error.uncertain,true);
+    assert.equal(run.error.statusCode,202);assert.equal(run.error.safeMessageCode,'SDK_BROWSER_ACTION_REQUIRED');
+    assert.equal(JSON.stringify(run.error).includes(DATA_SENTINEL),false);
+    assert.equal(run.execution.qa3dsObservation.stopped_before_continuation,true);
+  }
+  mockTransport(202,{success:true,data:{transaction_type:'router',payload:DATA_SENTINEL}});
+  let delivered=0;
+  await execute(makeProvider(),input(),{qa3dsDiagnostic:true,onSongbirdRequired:()=>{delivered++;}});
+  assert.equal(delivered,0);
+});
+
 for (const type of ['songbird','payload','router','untrusted-unknown']) {
   test('QA observation contains native encrypted202 without continuation: '+type,async()=>{
     mockTransport(202,{success:true,data:{transaction_type:type,payload:DATA_SENTINEL}});
