@@ -43,6 +43,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-17
           "$MASTERFADE_TEST_PG_BIN/postgres" --version
+      - name: Isolate Unix sockets for immutable PostgreSQL fixtures
+        run: |
+          test_bin="$RUNNER_TEMP/release-postgres-bin"
+          mkdir -p "$test_bin"
+          for binary in /usr/lib/postgresql/17/bin/*; do ln -s "$binary" "$test_bin/$(basename "$binary")"; done
+          rm "$test_bin/initdb"
+          cat > "$test_bin/initdb" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          args=("$@")
+          data_path=''
+          while (($#)); do
+            if [[ "$1" == '-D' ]]; then data_path="$2"; break; fi
+            shift
+          done
+          /usr/lib/postgresql/17/bin/initdb "${args[@]}"
+          if [[ -n "$data_path" ]]; then
+            [[ "$data_path" == /tmp/* || "$data_path" == "$RUNNER_TEMP"/* ]]
+            printf "\nunix_socket_directories = ''\n" >> "$data_path/postgresql.conf"
+          fi
+          SH
+          chmod +x "$test_bin/initdb"
+          echo "MASTERFADE_TEST_PG_BIN=$test_bin" >> "$GITHUB_ENV"
+          echo "MASTERFADE_PHASE02_PG_BIN=$test_bin" >> "$GITHUB_ENV"
       - run: git rev-parse HEAD
       - run: node --test --test-concurrency=2
       - run: npm run lint
