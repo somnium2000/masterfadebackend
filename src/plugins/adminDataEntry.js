@@ -29,6 +29,7 @@ export const ADMIN_DATA_ENTRY_ROUTES = Object.freeze([
   "GET /v1/cliente/me",
   "PATCH /v1/cliente/me",
   "GET /v1/cliente/planes/estado",
+  "GET /v1/cliente/planes/consumos",
   "POST /v1/cliente/planes/cancelar",
   "PATCH /v1/cliente/planes/:id_suscripcion/cancelar",
   "GET /v1/cliente/puntos/resumen",

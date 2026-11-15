@@ -16,6 +16,8 @@ import {
   cancelMembership,
   cancelMembershipBySubscription,
   getClienteMembershipState,
+  listClienteMembershipConsumptions,
+  listClienteMembershipConsumptionAppointments,
 } from "../../services/membershipService.js";
 import {
   confirmClientAccountDeletionRequest,
@@ -914,6 +916,29 @@ export default async function clienteRoutes(app) {
       }
     }
   );
+
+  app.get("/planes/consumos", {
+    preHandler: app.requireRoles(CLIENT_ROLES),
+    schema: { querystring: { type: "object", additionalProperties: false, properties: {
+      page: { type: "integer", minimum: 1, maximum: 1000000, default: 1 },
+      limit: { type: "integer", enum: [5], default: 5 },
+      id_suscripcion: { type: "string", format: "uuid" },
+      agrupar_por: { type: "string", enum: ["cita"] },
+    } } },
+  }, async (request, reply) => {
+    const context = ensureClienteContext(request);
+    let client;
+    try {
+      client = await app.db.connect();
+      const list = request.query.agrupar_por === "cita"
+        ? listClienteMembershipConsumptionAppointments : listClienteMembershipConsumptions;
+      return sendOk(reply, await list(client, context.clienteId, {
+        page: request.query.page, idSuscripcion: request.query.id_suscripcion || null,
+      }), { requestId: request.id });
+    } catch (error) {
+      return sendHandled(reply, request, error, "No se pudieron consultar los consumos del plan", "CLIENTE_MEMBERSHIP_CONSUMPTIONS_ERROR");
+    } finally { client?.release(); }
+  });
 
   app.get(
     "/planes/estado",
