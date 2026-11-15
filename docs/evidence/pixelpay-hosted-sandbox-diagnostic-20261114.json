@@ -1,0 +1,292 @@
+{
+  "mode": "sandbox_only_no_card_no_callback",
+  "results": [
+    {
+      "startedAt": "2026-11-14T12:11:29.656Z",
+      "completedAt": "2026-11-14T12:11:30.113Z",
+      "request": {
+        "case": "app_post_signed",
+        "origin": "https://pixelpay.app",
+        "path": "/api/v2/transaction/hosted/sandbox",
+        "method": "POST",
+        "variant": "signed",
+        "fieldNames": [
+          "_key",
+          "_order_id",
+          "_amount",
+          "_currency",
+          "_first_name",
+          "_last_name",
+          "_email",
+          "_complete",
+          "_cancel",
+          "json",
+          "_client_signature"
+        ],
+        "cardFields": false,
+        "callbackConfigured": false
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "server": "cloudflare",
+          "content-type": "text/html; charset=UTF-8",
+          "cf-mitigated": "challenge",
+          "cf-ray": "a5a5eb489f90ebce-ATL",
+          "date": "Sat, 14 Nov 2026 12:11:30 GMT"
+        },
+        "bodyBytes": 6053,
+        "bodySha256": "41fbbc8767281f4a7734500f3b966b972ca998974c41f220d4be9d08961be07b",
+        "signals": {
+          "edgeChallenge": true,
+          "cloudflareChallengeMarkup": true,
+          "sandboxModuleUnavailable": false,
+          "jsonResponse": false,
+          "success": null,
+          "validationErrorFields": []
+        },
+        "checkout": null,
+        "location": null
+      }
+    },
+    {
+      "startedAt": "2026-11-14T12:11:30.120Z",
+      "completedAt": "2026-11-14T12:11:30.472Z",
+      "request": {
+        "case": "app_get_signed",
+        "origin": "https://pixelpay.app",
+        "path": "/api/v2/transaction/hosted/sandbox",
+        "method": "GET",
+        "variant": "signed",
+        "fieldNames": [
+          "_key",
+          "_order_id",
+          "_amount",
+          "_currency",
+          "_first_name",
+          "_last_name",
+          "_email",
+          "_complete",
+          "_cancel",
+          "json",
+          "_client_signature"
+        ],
+        "cardFields": false,
+        "callbackConfigured": false
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "server": "cloudflare",
+          "content-type": "text/html; charset=UTF-8",
+          "cf-mitigated": "challenge",
+          "cf-ray": "a5a5eb4acd0a2181-ATL",
+          "date": "Sat, 14 Nov 2026 12:11:30 GMT"
+        },
+        "bodyBytes": 7672,
+        "bodySha256": "836d62ff44d9c0fafc509ee884d3af9e89f8f3291d7c5c78bc8e558acad66771",
+        "signals": {
+          "edgeChallenge": true,
+          "cloudflareChallengeMarkup": true,
+          "sandboxModuleUnavailable": false,
+          "jsonResponse": false,
+          "success": null,
+          "validationErrorFields": []
+        },
+        "checkout": null,
+        "location": null
+      }
+    },
+    {
+      "startedAt": "2026-11-14T12:11:30.474Z",
+      "completedAt": "2026-11-14T12:11:30.819Z",
+      "request": {
+        "case": "app_post_bad_signature",
+        "origin": "https://pixelpay.app",
+        "path": "/api/v2/transaction/hosted/sandbox",
+        "method": "POST",
+        "variant": "bad_signature",
+        "fieldNames": [
+          "_key",
+          "_order_id",
+          "_amount",
+          "_currency",
+          "_first_name",
+          "_last_name",
+          "_email",
+          "_complete",
+          "_cancel",
+          "json",
+          "_client_signature"
+        ],
+        "cardFields": false,
+        "callbackConfigured": false
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "server": "cloudflare",
+          "content-type": "text/html; charset=UTF-8",
+          "cf-mitigated": "challenge",
+          "cf-ray": "a5a5eb4cffd60193-ATL",
+          "date": "Sat, 14 Nov 2026 12:11:30 GMT"
+        },
+        "bodyBytes": 5946,
+        "bodySha256": "cffaa09145be4da54a2d7613d6b141cc64e36d2b66ffe5ae93a4d98580a63ee4",
+        "signals": {
+          "edgeChallenge": true,
+          "cloudflareChallengeMarkup": true,
+          "sandboxModuleUnavailable": false,
+          "jsonResponse": false,
+          "success": null,
+          "validationErrorFields": []
+        },
+        "checkout": null,
+        "location": null
+      }
+    },
+    {
+      "startedAt": "2026-11-14T12:11:30.820Z",
+      "completedAt": "2026-11-14T12:11:31.169Z",
+      "request": {
+        "case": "app_post_missing_name",
+        "origin": "https://pixelpay.app",
+        "path": "/api/v2/transaction/hosted/sandbox",
+        "method": "POST",
+        "variant": "missing_name",
+        "fieldNames": [
+          "_key",
+          "_order_id",
+          "_amount",
+          "_currency",
+          "_last_name",
+          "_email",
+          "_complete",
+          "_cancel",
+          "json",
+          "_client_signature"
+        ],
+        "cardFields": false,
+        "callbackConfigured": false
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "server": "cloudflare",
+          "content-type": "text/html; charset=UTF-8",
+          "cf-mitigated": "challenge",
+          "cf-ray": "a5a5eb4f2ec712f1-ATL",
+          "date": "Sat, 14 Nov 2026 12:11:31 GMT"
+        },
+        "bodyBytes": 6053,
+        "bodySha256": "0999ff4eadc9ecc4472715ebfd81fc406614b829e7ac6658090cc7b6903be49a",
+        "signals": {
+          "edgeChallenge": true,
+          "cloudflareChallengeMarkup": true,
+          "sandboxModuleUnavailable": false,
+          "jsonResponse": false,
+          "success": null,
+          "validationErrorFields": []
+        },
+        "checkout": null,
+        "location": null
+      }
+    },
+    {
+      "startedAt": "2026-11-14T12:11:31.171Z",
+      "completedAt": "2026-11-14T12:11:31.649Z",
+      "request": {
+        "case": "dev_post_signed",
+        "origin": "https://pixelpay.dev",
+        "path": "/api/v2/transaction/hosted/sandbox",
+        "method": "POST",
+        "variant": "signed",
+        "fieldNames": [
+          "_key",
+          "_order_id",
+          "_amount",
+          "_currency",
+          "_first_name",
+          "_last_name",
+          "_email",
+          "_complete",
+          "_cancel",
+          "json",
+          "_client_signature"
+        ],
+        "cardFields": false,
+        "callbackConfigured": false
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "server": "cloudflare",
+          "content-type": "text/html; charset=UTF-8",
+          "cf-mitigated": "challenge",
+          "cf-ray": "a5a5eb5229b89871-ATL",
+          "date": "Sat, 14 Nov 2026 12:11:31 GMT"
+        },
+        "bodyBytes": 6053,
+        "bodySha256": "cfb9e250c9a9a322c4b48cbffbdc659232a4df0d5fc4b5cb1558c9e0c8c7d142",
+        "signals": {
+          "edgeChallenge": true,
+          "cloudflareChallengeMarkup": true,
+          "sandboxModuleUnavailable": false,
+          "jsonResponse": false,
+          "success": null,
+          "validationErrorFields": []
+        },
+        "checkout": null,
+        "location": null
+      }
+    },
+    {
+      "startedAt": "2026-11-14T12:11:31.651Z",
+      "completedAt": "2026-11-14T12:11:31.995Z",
+      "request": {
+        "case": "dev_get_signed",
+        "origin": "https://pixelpay.dev",
+        "path": "/api/v2/transaction/hosted/sandbox",
+        "method": "GET",
+        "variant": "signed",
+        "fieldNames": [
+          "_key",
+          "_order_id",
+          "_amount",
+          "_currency",
+          "_first_name",
+          "_last_name",
+          "_email",
+          "_complete",
+          "_cancel",
+          "json",
+          "_client_signature"
+        ],
+        "cardFields": false,
+        "callbackConfigured": false
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "server": "cloudflare",
+          "content-type": "text/html; charset=UTF-8",
+          "cf-mitigated": "challenge",
+          "cf-ray": "a5a5eb545e7064f4-ATL",
+          "date": "Sat, 14 Nov 2026 12:11:31 GMT"
+        },
+        "bodyBytes": 7672,
+        "bodySha256": "43b4ef74b5001225334bfda1d3501922aa44ce051a552d7a25acdd621e48ab37",
+        "signals": {
+          "edgeChallenge": true,
+          "cloudflareChallengeMarkup": true,
+          "sandboxModuleUnavailable": false,
+          "jsonResponse": false,
+          "success": null,
+          "validationErrorFields": []
+        },
+        "checkout": null,
+        "location": null
+      }
+    }
+  ]
+}

@@ -20,6 +20,7 @@ const CSRF_EXEMPT_PATHS = [
   "/v1/auth/reset-password",
   "/v1/pagos/webhook/mock",
   "/v1/pagos/webhook/banpais",
+  "/v1/pagos/pixelpay/hosted/callback",
 ];
 
 function parseBoolean(value, fallback = false) {

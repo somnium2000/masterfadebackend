@@ -307,6 +307,7 @@ export async function processPixelPayOrderCallback({
     ]);
     const lookup = await client.query(
       `SELECT pi.id_intent, pi.id_provider, pi.orden_compra, pi.provider_session_id,
+              COALESCE(to_jsonb(pi)->>'payment_channel', 'sdk') AS payment_channel,
               pi.referencia_externa,
               pi.monto_hnl, pi.moneda_codigo, pi.estado_intent_codigo
          FROM public.payment_intents pi
@@ -333,6 +334,9 @@ export async function processPixelPayOrderCallback({
       });
     }
     intent = lookup.rows[0];
+    if (intent.payment_channel === "hosted") {
+      throw new AppError(409, "La orden requiere el callback del canal de pago seguro", { code: "PIXELPAY_PAYMENT_CHANNEL_MISMATCH" });
+    }
     // One notification slot per financial intent/order, including pending Sale recovery.
     // Callback identifiers and the order hash cannot create additional event identities.
     providerEventId = pixelPayCallbackEventId({ orderId, idIntent: intent.id_intent });
