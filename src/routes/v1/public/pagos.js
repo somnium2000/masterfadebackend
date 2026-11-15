@@ -942,6 +942,7 @@ async function loadPublicIntentForGroup(client, {
         pi.provider_session_id,
         pi.idempotency_key,
         pi.created_by_usuario_id,
+        pi.created_at,
         pp.codigo AS provider_code,
         c.id_grupo_cita AS intent_group_id,
         c.estado_cita_codigo AS anchor_estado_cita_codigo,
@@ -2405,6 +2406,7 @@ export default async function publicPagosRoutes(app, options = {}) {
     let claim = null;
     const qa3dsTarget = isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent);
     const diagnosticFields = observation => qa3dsTarget ? { qa_3ds_diagnostic: true,
+      ...(app.qaPixelPay3dsDiagnostic?.sessionMode ? { qa_sandbox_session: true } : {}),
       ...(observation ? { qa_3ds_observation: sanitizeQa3dsObservation(observation) } : {}) } : {};
     try {
       const idGrupoCita = assertUuid(request.body?.id_grupo_cita, "id_grupo_cita");
@@ -2456,7 +2458,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       if (qa3dsTarget) {
         const history = await dbClient.query('SELECT EXISTS(SELECT 1 FROM app_private.pixelpay_sale_attempts WHERE id_intent=$1::uuid) AS attempted', [idIntent]);
         assertQa3dsFreshIntent(app.qaPixelPay3dsDiagnostic, intent, totalHnl, history.rows[0]?.attempted !== false);
-        assertQa3dsCardAllowed(request.body.card_number);
+        assertQa3dsCardAllowed(request.body.card_number, app.qaPixelPay3dsDiagnostic);
       }
       if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
         throw new AppError(409, "El intent no pertenece a PixelPay", {
@@ -2923,7 +2925,8 @@ export default async function publicPagosRoutes(app, options = {}) {
         monto_hnl: Number(intent.monto_hnl || 0),
         moneda_codigo: intent.moneda_codigo || "HNL",
         id_grupo_cita: idGrupoCita,
-        ...(isQa3dsIntent(app.qaPixelPay3dsDiagnostic, idIntent) ? { qa_3ds_diagnostic: true } : {}),
+        ...(isQa3dsIntent(app.qaPixelPay3dsDiagnostic, idIntent) ? { qa_3ds_diagnostic: true,
+          ...(app.qaPixelPay3dsDiagnostic.sessionMode ? { qa_sandbox_session: true } : {}) } : {}),
       });
     } catch (error) {
       if (error instanceof AppError) {

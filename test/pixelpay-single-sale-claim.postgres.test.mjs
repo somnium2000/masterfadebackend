@@ -211,6 +211,12 @@ test('PostgreSQL17: RPC y START durable permiten un solo claim Sale por intent',
       assert.equal((await state()).attempts, 0);
       assert.equal(simulatedPosts, 0);
     });
+    await t.test('QA thirty-minute holds are preserved by the existing claim RPC',async()=>{
+      await reset();await client.query("UPDATE public.citas_holds SET expires_at=date_trunc('second',clock_timestamp())+interval '30 minutes'");
+      const before=(await client.query('SELECT expires_at FROM public.citas_holds')).rows[0].expires_at;
+      await claim();const after=(await client.query('SELECT expires_at FROM public.citas_holds')).rows[0].expires_at;
+      assert.equal(after.getTime(),before.getTime());
+    });
     assert.equal(externalConnections, 0);
   } finally {
     try { if (isolated) await isolated.stop(); }
