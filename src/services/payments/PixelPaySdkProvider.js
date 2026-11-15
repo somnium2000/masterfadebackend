@@ -372,7 +372,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     this.sdk.Services.Transaction.withConcurrency();
   }
 
-  createTransaction(signature, { sale = false } = {}) {
+  createTransaction(signature, { sale = false, qa3dsDiagnostic = false } = {}) {
     const settings = new this.sdk.Models.Settings();
     if (this.env === "sandbox") {
       settings.setupSandbox();
@@ -385,7 +385,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       settings.setupEnvironment("live");
     }
     settings.setupHeaders({ "x-client-signature": signature });
-    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings)
+    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings, { qa3dsDiagnostic })
       : new this.sdk.Services.Transaction(settings);
   }
 
@@ -548,7 +548,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
         orderId: input.orderId,
         appUrl: this.appUrl,
       });
-      transaction = this.createTransaction(signature, { sale: true });
+      transaction = this.createTransaction(signature, { sale: true, qa3dsDiagnostic: telemetryContext.qa3dsDiagnostic === true });
       const saleRequest = this.buildSaleRequest(input, referenceDate);
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
         durationMs: Date.now() - startedAt,
@@ -741,6 +741,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       response: normalizedResponse,
       diagnostics,
       paymentAttemptId: attempt.paymentAttemptId,
+      ...(execution?.qa3dsObservation ? { qa3dsObservation: execution.qa3dsObservation } : {}),
     };
   }
 

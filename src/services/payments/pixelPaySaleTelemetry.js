@@ -151,6 +151,7 @@ export function buildPixelPaySaleEvent(event, attempt, details = {}) {
     httpResponseReceived: runtime.httpResponseReceived,
     requestMayHaveBeenSent: runtime.requestMayHaveBeenSent,
     sdkTransactionType: runtime.sdkTransactionType,
+    ...(runtime.qa3dsObservation ? { qa3dsObservation: runtime.qa3dsObservation } : {}),
     transportErrorCode: runtime.transportErrorCode,
     wafChallenge: runtime.wafChallenge,
     sdkStackFile: runtime.sdkStackFile,
