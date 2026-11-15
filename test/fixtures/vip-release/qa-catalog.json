@@ -1,0 +1,1909 @@
+{
+  "tables": [
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres"
+      ],
+      "rls": false,
+      "name": "reserva_idempotencia",
+      "owner": "postgres",
+      "schema": "app_private"
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": true,
+      "name": "citas_admin_beneficios_resumen",
+      "owner": "postgres",
+      "schema": "public"
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": false,
+      "name": "subscription_consumptions",
+      "owner": "postgres",
+      "schema": "public"
+    },
+    {
+      "acl": [
+        "postgres=arwdDxtm/postgres",
+        "mf_audit_readonly=r/postgres"
+      ],
+      "rls": true,
+      "name": "subscriptions",
+      "owner": "postgres",
+      "schema": "public"
+    }
+  ],
+  "columns": [
+    {
+      "name": "request_id",
+      "type": "uuid",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "payload_hash",
+      "type": "text",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "resultado",
+      "type": "jsonb",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "completed_at",
+      "type": "timestamptz",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "scope",
+      "type": "text",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "request_fingerprint",
+      "type": "text",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "response_payload",
+      "type": "jsonb",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "response_completed_at",
+      "type": "timestamptz",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_empleado_barbero",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona_cliente",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "creada_por_usuario_id",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "asignada_automaticamente",
+      "type": "bool",
+      "table": "citas",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "estado_cita_codigo",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "inicio_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "fin_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "duracion_total_min",
+      "type": "int4",
+      "table": "citas",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "buffer_total_min",
+      "type": "int4",
+      "table": "citas",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "subtotal_servicios_hnl",
+      "type": "numeric",
+      "table": "citas",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_hnl",
+      "type": "numeric",
+      "table": "citas",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_pagar_hnl",
+      "type": "numeric",
+      "table": "citas",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "moneda_codigo",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": "'HNL'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "notas",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "llegada_real_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "no_show_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "deleted_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "orden_integrante",
+      "type": "int4",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "alias_integrante",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "contacto_nombre",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "contacto_email",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "contacto_telefono",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "selection_type",
+      "type": "text",
+      "table": "citas",
+      "schema": "public",
+      "default": "'services'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_paquete",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "atencion_iniciada_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "atencion_finalizada_at",
+      "type": "timestamptz",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "retraso_inicio_min",
+      "type": "int4",
+      "table": "citas",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "es_canje_recompensa",
+      "type": "bool",
+      "table": "citas",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita_integrante",
+      "type": "uuid",
+      "table": "citas",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "resumen_beneficios",
+      "type": "jsonb",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_membresia_hnl",
+      "type": "numeric",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_recompensa_hnl",
+      "type": "numeric",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_promocion_hnl",
+      "type": "numeric",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_cortesia_hnl",
+      "type": "numeric",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_pagar_hnl",
+      "type": "numeric",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "recompensa_context_token",
+      "type": "text",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "cortesia_aplicada",
+      "type": "bool",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "membresia_aplicada",
+      "type": "bool",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "recompensa_aplicada",
+      "type": "bool",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "promocion_aplicada",
+      "type": "bool",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita_detalle",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "cantidad",
+      "type": "int4",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "1",
+      "nullable": "NO"
+    },
+    {
+      "name": "duracion_min",
+      "type": "int4",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "buffer_min",
+      "type": "int4",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "5",
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_unitario_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "subtotal_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita_paquete",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "origen_item_codigo",
+      "type": "text",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "'servicio_manual'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_servicio_snapshot",
+      "type": "text",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_referencia_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "descuento_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "isv_porcentaje",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "isv_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_linea_hnl",
+      "type": "numeric",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_tarifa",
+      "type": "uuid",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "incluye_isv_snapshot",
+      "type": "bool",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "line_key",
+      "type": "text",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_linea",
+      "type": "int4",
+      "table": "citas_detalles",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_grupo_cita",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_persona_titular",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_cliente_titular",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "estado_grupo_codigo",
+      "type": "text",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": "'activo'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "notas",
+      "type": "text",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "codigo_reserva",
+      "type": "text",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_usuario_titular",
+      "type": "uuid",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "origen_codigo",
+      "type": "text",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": "'publico'::text",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_hnl",
+      "type": "numeric",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "release_token",
+      "type": "text",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "release_token_hash",
+      "type": "text",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "release_token_created_at",
+      "type": "timestamptz",
+      "table": "citas_grupos",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id",
+      "type": "uuid",
+      "table": "cortesias",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre",
+      "type": "text",
+      "table": "cortesias",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "cortesias",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "cortesias",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "cortesias",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "nombre_plan",
+      "type": "text",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_hnl",
+      "type": "numeric",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "periodo_membresia_codigo",
+      "type": "text",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "beneficios",
+      "type": "jsonb",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "descripcion",
+      "type": "text",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "categoria_nivel",
+      "type": "int2",
+      "table": "membership_plans",
+      "schema": "public",
+      "default": "1",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan_sucursal",
+      "type": "uuid",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal",
+      "type": "uuid",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_hnl",
+      "type": "numeric",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "activo",
+      "type": "bool",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "visible_publico",
+      "type": "bool",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": "true",
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_visual",
+      "type": "int4",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": "100",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "membership_plans_sucursal",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_alert_event",
+      "type": "uuid",
+      "table": "subscription_alert_events",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "subscription_alert_events",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "alert_type",
+      "type": "text",
+      "table": "subscription_alert_events",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "sent_at",
+      "type": "timestamptz",
+      "table": "subscription_alert_events",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "payload",
+      "type": "jsonb",
+      "table": "subscription_alert_events",
+      "schema": "public",
+      "default": "'{}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "subscription_alert_events",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_consumo",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cita",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "orden_integrante",
+      "type": "int4",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "item_tipo",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_servicio",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "item_codigo",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "item_nombre",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "cantidad",
+      "type": "int4",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "precio_unitario_hnl",
+      "type": "numeric",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "total_hnl",
+      "type": "numeric",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": "0",
+      "nullable": "NO"
+    },
+    {
+      "name": "coverage_status",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "source_key",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cortesia",
+      "type": "uuid",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "source_kind",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "invalidado",
+      "type": "bool",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "invalidado_motivo",
+      "type": "text",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "id_suscripcion",
+      "type": "uuid",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "gen_random_uuid()",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_cliente",
+      "type": "uuid",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "id_plan",
+      "type": "uuid",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "estado_suscripcion_codigo",
+      "type": "text",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "inicio_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "fin_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "NO"
+    },
+    {
+      "name": "renovacion_auto",
+      "type": "bool",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "cancelada_al_fin",
+      "type": "bool",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "false",
+      "nullable": "NO"
+    },
+    {
+      "name": "created_by_usuario_id",
+      "type": "uuid",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "created_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "updated_at",
+      "type": "timestamptz",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "now()",
+      "nullable": "NO"
+    },
+    {
+      "name": "beneficios_snapshot",
+      "type": "jsonb",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": "'{\"items\": [], \"version\": 1}'::jsonb",
+      "nullable": "NO"
+    },
+    {
+      "name": "id_sucursal_contratada",
+      "type": "uuid",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    },
+    {
+      "name": "motivo_fin_codigo",
+      "type": "text",
+      "table": "subscriptions",
+      "schema": "public",
+      "default": null,
+      "nullable": "YES"
+    }
+  ],
+  "indexes": [
+    {
+      "name": "idx_reserva_idempotencia_created_at",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "definition": "CREATE INDEX idx_reserva_idempotencia_created_at ON app_private.reserva_idempotencia USING btree (created_at)"
+    },
+    {
+      "name": "idx_reserva_idempotencia_scope_fingerprint",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "definition": "CREATE INDEX idx_reserva_idempotencia_scope_fingerprint ON app_private.reserva_idempotencia USING btree (scope, request_fingerprint) WHERE ((scope IS NOT NULL) AND (request_fingerprint IS NOT NULL))"
+    },
+    {
+      "name": "reserva_idempotencia_pkey",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "definition": "CREATE UNIQUE INDEX reserva_idempotencia_pkey ON app_private.reserva_idempotencia USING btree (request_id)"
+    },
+    {
+      "name": "citas_admin_beneficios_resumen_pkey",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX citas_admin_beneficios_resumen_pkey ON public.citas_admin_beneficios_resumen USING btree (id_grupo_cita)"
+    },
+    {
+      "name": "idx_citas_admin_beneficios_resumen_recompensa",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_citas_admin_beneficios_resumen_recompensa ON public.citas_admin_beneficios_resumen USING btree (recompensa_aplicada, id_grupo_cita) WHERE (recompensa_aplicada IS TRUE)"
+    },
+    {
+      "name": "citas_detalles_pkey",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX citas_detalles_pkey ON public.citas_detalles USING btree (id_cita_detalle)"
+    },
+    {
+      "name": "idx_citas_detalles_cita_orden_linea",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_citas_detalles_cita_orden_linea ON public.citas_detalles USING btree (id_cita, orden_linea)"
+    },
+    {
+      "name": "idx_citas_detalles_cita_paquete",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_citas_detalles_cita_paquete ON public.citas_detalles USING btree (id_cita_paquete) WHERE (id_cita_paquete IS NOT NULL)"
+    },
+    {
+      "name": "idx_citas_detalles_id_tarifa",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_citas_detalles_id_tarifa ON public.citas_detalles USING btree (id_tarifa) WHERE (id_tarifa IS NOT NULL)"
+    },
+    {
+      "name": "idx_citas_detalles_origen_item",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_citas_detalles_origen_item ON public.citas_detalles USING btree (origen_item_codigo)"
+    },
+    {
+      "name": "idx_det_servicio",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_det_servicio ON public.citas_detalles USING btree (id_servicio)"
+    },
+    {
+      "name": "uq_citas_detalles_cita_line_key",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX uq_citas_detalles_cita_line_key ON public.citas_detalles USING btree (id_cita, line_key)"
+    },
+    {
+      "name": "uq_citas_detalles_linea_canonica",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX uq_citas_detalles_linea_canonica ON public.citas_detalles USING btree (id_cita, id_servicio, COALESCE(id_tarifa, '00000000-0000-0000-0000-000000000000'::uuid), origen_item_codigo, COALESCE(id_cita_paquete, '00000000-0000-0000-0000-000000000000'::uuid))"
+    },
+    {
+      "name": "idx_subc_cita",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_cita ON public.subscription_consumptions USING btree (id_cita)"
+    },
+    {
+      "name": "idx_subc_cliente",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_cliente ON public.subscription_consumptions USING btree (id_cliente, created_at DESC)"
+    },
+    {
+      "name": "idx_subc_coverage",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_coverage ON public.subscription_consumptions USING btree (coverage_status, created_at DESC)"
+    },
+    {
+      "name": "idx_subc_id_cortesia",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_id_cortesia ON public.subscription_consumptions USING btree (id_cortesia)"
+    },
+    {
+      "name": "idx_subc_invalidado_created",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_invalidado_created ON public.subscription_consumptions USING btree (invalidado, created_at DESC)"
+    },
+    {
+      "name": "idx_subc_source_kind",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_source_kind ON public.subscription_consumptions USING btree (source_kind)"
+    },
+    {
+      "name": "idx_subc_suscripcion",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subc_suscripcion ON public.subscription_consumptions USING btree (id_suscripcion, created_at DESC)"
+    },
+    {
+      "name": "idx_subscription_consumptions_cliente_created",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subscription_consumptions_cliente_created ON public.subscription_consumptions USING btree (id_cliente, created_at DESC)"
+    },
+    {
+      "name": "idx_subscription_consumptions_suscripcion_created",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subscription_consumptions_suscripcion_created ON public.subscription_consumptions USING btree (id_suscripcion, created_at DESC)"
+    },
+    {
+      "name": "subscription_consumptions_pkey",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX subscription_consumptions_pkey ON public.subscription_consumptions USING btree (id_consumo)"
+    },
+    {
+      "name": "uq_subc_source_key",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX uq_subc_source_key ON public.subscription_consumptions USING btree (source_key)"
+    },
+    {
+      "name": "idx_subs_cliente_estado",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subs_cliente_estado ON public.subscriptions USING btree (id_cliente, estado_suscripcion_codigo)"
+    },
+    {
+      "name": "idx_subscriptions_cliente_estado_fin",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subscriptions_cliente_estado_fin ON public.subscriptions USING btree (id_cliente, estado_suscripcion_codigo, fin_at DESC)"
+    },
+    {
+      "name": "idx_subscriptions_cliente_fin",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subscriptions_cliente_fin ON public.subscriptions USING btree (id_cliente, fin_at DESC)"
+    },
+    {
+      "name": "idx_subscriptions_cliente_sucursal_estado",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CREATE INDEX idx_subscriptions_cliente_sucursal_estado ON public.subscriptions USING btree (id_cliente, id_sucursal_contratada, estado_suscripcion_codigo, fin_at DESC)"
+    },
+    {
+      "name": "subscriptions_pkey",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX subscriptions_pkey ON public.subscriptions USING btree (id_suscripcion)"
+    },
+    {
+      "name": "ux_subscriptions_active_client_branch",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CREATE UNIQUE INDEX ux_subscriptions_active_client_branch ON public.subscriptions USING btree (id_cliente, id_sucursal_contratada) WHERE ((estado_suscripcion_codigo = 'activa'::text) AND (id_sucursal_contratada IS NOT NULL))"
+    }
+  ],
+  "triggers": [
+    {
+      "name": "tr_points_paid_subscription_consumptions",
+      "table": "subscription_consumptions",
+      "enabled": "O",
+      "definition": "CREATE CONSTRAINT TRIGGER tr_points_paid_subscription_consumptions AFTER INSERT OR UPDATE ON public.subscription_consumptions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app_private.points_award_paid_event_v1()"
+    },
+    {
+      "name": "tr_audit_subscriptions",
+      "table": "subscriptions",
+      "enabled": "O",
+      "definition": "CREATE TRIGGER tr_audit_subscriptions AFTER INSERT OR DELETE OR UPDATE ON public.subscriptions FOR EACH ROW EXECUTE FUNCTION fn_auditar_bitacora('id_suscripcion')"
+    },
+    {
+      "name": "tr_set_updated_at_subscriptions",
+      "table": "subscriptions",
+      "enabled": "O",
+      "definition": "CREATE TRIGGER tr_set_updated_at_subscriptions BEFORE UPDATE ON public.subscriptions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+    }
+  ],
+  "captured_at": "2026-11-15T22:04:55.527405+00:00",
+  "constraints": [
+    {
+      "name": "fk_reserva_idempotencia_grupo",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "definition": "FOREIGN KEY (id_grupo_cita) REFERENCES citas_grupos(id_grupo_cita) ON UPDATE CASCADE ON DELETE CASCADE"
+    },
+    {
+      "name": "reserva_idempotencia_pkey",
+      "table": "reserva_idempotencia",
+      "schema": "app_private",
+      "definition": "PRIMARY KEY (request_id)"
+    },
+    {
+      "name": "citas_pkey",
+      "table": "citas",
+      "schema": "public",
+      "definition": "PRIMARY KEY (id_cita)"
+    },
+    {
+      "name": "ck_cita_montos",
+      "table": "citas",
+      "schema": "public",
+      "definition": "CHECK (((subtotal_servicios_hnl >= (0)::numeric) AND (descuento_hnl >= (0)::numeric) AND (total_pagar_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "ck_cita_rango",
+      "table": "citas",
+      "schema": "public",
+      "definition": "CHECK ((fin_at > inicio_at))"
+    },
+    {
+      "name": "ck_citas_orden_integrante_pos",
+      "table": "citas",
+      "schema": "public",
+      "definition": "CHECK (((orden_integrante IS NULL) OR (orden_integrante > 0)))"
+    },
+    {
+      "name": "ck_citas_persona_cliente_requerida",
+      "table": "citas",
+      "schema": "public",
+      "definition": "CHECK (((id_persona_cliente IS NOT NULL) OR ((id_grupo_cita IS NOT NULL) AND (orden_integrante IS NOT NULL) AND (orden_integrante > 1))))"
+    },
+    {
+      "name": "ck_citas_retraso_inicio_min_non_negative",
+      "table": "citas",
+      "schema": "public",
+      "definition": "CHECK ((retraso_inicio_min >= 0))"
+    },
+    {
+      "name": "ck_citas_selection_type",
+      "table": "citas",
+      "schema": "public",
+      "definition": "CHECK ((selection_type = ANY (ARRAY['services'::text, 'package'::text, 'mixed'::text])))"
+    },
+    {
+      "name": "ex_citas_solape_barbero",
+      "table": "citas",
+      "schema": "public",
+      "definition": "EXCLUDE USING gist (id_empleado_barbero WITH =, tstzrange(inicio_at, fin_at, '[)'::text) WITH &&) WHERE (((deleted_at IS NULL) AND (estado_cita_codigo = ANY (ARRAY['en_espera'::text, 'pendiente_pago'::text, 'confirmada'::text, 'en_salon'::text, 'en_atencion'::text]))))"
+    },
+    {
+      "name": "fk_cita_barbero",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_empleado_barbero) REFERENCES empleados(id_empleado) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_cliente",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_cita_creador",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (creada_por_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_estado",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (estado_cita_codigo) REFERENCES estados_cita(estado_cita_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_moneda",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (moneda_codigo) REFERENCES monedas(moneda_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_persona_cliente",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_persona_cliente) REFERENCES personas(id_persona) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_cita_sucursal",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_sucursal) REFERENCES sucursales(id_sucursal) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_citas_grupo",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_grupo_cita) REFERENCES citas_grupos(id_grupo_cita) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_citas_integrante",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cita_integrante) REFERENCES citas_integrantes(id_cita_integrante) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_citas_paquete",
+      "table": "citas",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_paquete) REFERENCES paquetes(id_paquete) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "tr_points_paid_citas",
+      "table": "citas",
+      "schema": "public",
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      "name": "uq_citas_grupo_orden",
+      "table": "citas",
+      "schema": "public",
+      "definition": "UNIQUE (id_grupo_cita, orden_integrante)"
+    },
+    {
+      "name": "citas_admin_beneficios_resumen_pkey",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "PRIMARY KEY (id_grupo_cita)"
+    },
+    {
+      "name": "ck_citas_admin_beneficios_resumen_json",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "CHECK ((jsonb_typeof(resumen_beneficios) = 'object'::text))"
+    },
+    {
+      "name": "ck_citas_admin_beneficios_resumen_montos_non_negative",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "CHECK (((descuento_membresia_hnl >= (0)::numeric) AND (descuento_recompensa_hnl >= (0)::numeric) AND (descuento_promocion_hnl >= (0)::numeric) AND (descuento_cortesia_hnl >= (0)::numeric) AND (total_pagar_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "ck_citas_admin_beneficios_resumen_token",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "CHECK (((recompensa_context_token IS NULL) OR (btrim(recompensa_context_token) <> ''::text)))"
+    },
+    {
+      "name": "fk_citas_admin_beneficios_resumen_grupo",
+      "table": "citas_admin_beneficios_resumen",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_grupo_cita) REFERENCES citas_grupos(id_grupo_cita) ON UPDATE CASCADE ON DELETE CASCADE"
+    },
+    {
+      "name": "citas_detalles_pkey",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "PRIMARY KEY (id_cita_detalle)"
+    },
+    {
+      "name": "ck_citas_detalles_isv_formula",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((isv_hnl =\nCASE\n    WHEN (isv_porcentaje <= (0)::numeric) THEN (0)::numeric\n    WHEN (incluye_isv_snapshot IS TRUE) THEN round((GREATEST((0)::numeric, (subtotal_hnl - descuento_hnl)) - (GREATEST((0)::numeric, (subtotal_hnl - descuento_hnl)) / ((1)::numeric + (isv_porcentaje / (100)::numeric)))), 2)\n    ELSE round(((GREATEST((0)::numeric, (subtotal_hnl - descuento_hnl)) * isv_porcentaje) / (100)::numeric), 2)\nEND))"
+    },
+    {
+      "name": "ck_citas_detalles_montos_normalizados_non_negative",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK (((precio_referencia_hnl >= (0)::numeric) AND (descuento_hnl >= (0)::numeric) AND (descuento_hnl <= subtotal_hnl) AND (isv_porcentaje >= (0)::numeric) AND (isv_porcentaje <= (100)::numeric) AND (isv_hnl >= (0)::numeric) AND (total_linea_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "ck_citas_detalles_orden_linea_pos",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((orden_linea > 0))"
+    },
+    {
+      "name": "ck_citas_detalles_origen_item",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((origen_item_codigo = ANY (ARRAY['servicio_manual'::text, 'servicio_extra'::text, 'paquete_incluido'::text, 'plan_incluido'::text, 'recompensa_masterpuntos'::text])))"
+    },
+    {
+      "name": "ck_citas_detalles_paquete_incluido_requiere_paquete",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK (((origen_item_codigo <> 'paquete_incluido'::text) OR (id_cita_paquete IS NOT NULL)))"
+    },
+    {
+      "name": "ck_citas_detalles_total_linea_formula",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((total_linea_hnl = GREATEST((0)::numeric, round(((subtotal_hnl - descuento_hnl) +\nCASE\n    WHEN (incluye_isv_snapshot IS TRUE) THEN (0)::numeric\n    ELSE isv_hnl\nEND), 2))))"
+    },
+    {
+      "name": "ck_detalle_buffer",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((buffer_min >= 0))"
+    },
+    {
+      "name": "ck_detalle_cantidad",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((cantidad > 0))"
+    },
+    {
+      "name": "ck_detalle_duracion",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK ((duracion_min > 0))"
+    },
+    {
+      "name": "ck_detalle_precios",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "CHECK (((precio_unitario_hnl >= (0)::numeric) AND (subtotal_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "fk_citas_detalles_cita_paquete",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cita_paquete) REFERENCES citas_paquetes(id_cita_paquete) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_citas_detalles_tarifa",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_tarifa) REFERENCES servicios_tarifas(id_tarifa) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_det_cita",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cita) REFERENCES citas(id_cita) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_det_servicio",
+      "table": "citas_detalles",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_servicio) REFERENCES servicios(id_servicio) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "ck_subc_cantidad",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CHECK ((cantidad > 0))"
+    },
+    {
+      "name": "ck_subc_coverage_status",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CHECK ((coverage_status = ANY (ARRAY['cubierto_plan'::text, 'extra_pendiente'::text, 'extra_pagado'::text])))"
+    },
+    {
+      "name": "ck_subc_item_tipo",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CHECK ((item_tipo = ANY (ARRAY['servicio'::text, 'cortesia'::text])))"
+    },
+    {
+      "name": "ck_subc_precios",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "CHECK (((precio_unitario_hnl >= (0)::numeric) AND (total_hnl >= (0)::numeric)))"
+    },
+    {
+      "name": "fk_subc_cita",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cita) REFERENCES citas(id_cita) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_subc_cliente",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_subc_servicio",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_servicio) REFERENCES servicios(id_servicio) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_subc_sub",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_suscripcion) REFERENCES subscriptions(id_suscripcion) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "subscription_consumptions_id_cortesia_fkey",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cortesia) REFERENCES cortesias(id)"
+    },
+    {
+      "name": "subscription_consumptions_pkey",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "PRIMARY KEY (id_consumo)"
+    },
+    {
+      "name": "tr_points_paid_subscription_consumptions",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      "name": "uq_subc_source_key",
+      "table": "subscription_consumptions",
+      "schema": "public",
+      "definition": "UNIQUE (source_key)"
+    },
+    {
+      "name": "ck_sub_motivo_fin",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "CHECK (((motivo_fin_codigo IS NULL) OR (motivo_fin_codigo = ANY (ARRAY['tiempo'::text, 'agotamiento'::text, 'reemplazo'::text, 'cancelacion'::text, 'eliminacion_cuenta'::text]))))"
+    },
+    {
+      "name": "fk_sub_cliente",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_sub_creador",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (created_by_usuario_id) REFERENCES usuarios(id_usuario) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "fk_sub_estado",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (estado_suscripcion_codigo) REFERENCES estados_suscripcion(estado_suscripcion_codigo) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_sub_plan",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_plan) REFERENCES membership_plans(id_plan) ON UPDATE CASCADE ON DELETE RESTRICT"
+    },
+    {
+      "name": "fk_sub_sucursal_contratada",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "FOREIGN KEY (id_sucursal_contratada) REFERENCES sucursales(id_sucursal) ON UPDATE CASCADE ON DELETE SET NULL"
+    },
+    {
+      "name": "subscriptions_pkey",
+      "table": "subscriptions",
+      "schema": "public",
+      "definition": "PRIMARY KEY (id_suscripcion)"
+    }
+  ],
+  "consumptions": {
+    "rows": 17,
+    "units": 17,
+    "digest": "dfc8b69b1213e950b9d5f8dff30e0875"
+  },
+  "evidence_admin": {
+    "rows": 0,
+    "version1": 0
+  },
+  "evidence_reservation": {
+    "rows": 206,
+    "version1": 11
+  }
+}

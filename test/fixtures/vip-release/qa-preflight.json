@@ -1,0 +1,26 @@
+[
+  {
+    "code": "REQUIRED_COLUMNS",
+    "affected": 0
+  },
+  {
+    "code": "REQUIRED_UNIQUE_INDEXES",
+    "affected": 0
+  },
+  {
+    "code": "CONSUMPTION_CLIENT_OR_BRANCH_MISMATCH",
+    "affected": 0
+  },
+  {
+    "code": "DUPLICATE_SOURCE_KEY",
+    "affected": 0
+  },
+  {
+    "code": "INVALID_QUANTITY",
+    "affected": 0
+  },
+  {
+    "code": "ACTIVE_CLIENT_BRANCH_DUPLICATED",
+    "affected": 0
+  }
+]

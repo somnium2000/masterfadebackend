@@ -1239,6 +1239,8 @@ async function consumeMembershipForConfirmedRows(client, request, {
         },
         "No se pudo registrar consumo de membresia para cita confirmada"
       );
+      // AM: Confirmacion y consumo VIP conservan una unica transaccion.
+      throw membershipError;
     }
   }
 }
