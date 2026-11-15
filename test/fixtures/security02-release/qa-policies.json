@@ -1,0 +1,255 @@
+[
+  {
+    "name": "p_agenda_bloqueos_empleados_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "agenda_bloqueos_empleados",
+    "using": "(fn_is_super_admin(auth.uid()) OR (id_empleado = fn_empleado_id_por_uid(auth.uid())) OR (EXISTS ( SELECT 1\n   FROM empleados e\n  WHERE ((e.id_empleado = agenda_bloqueos_empleados.id_empleado) AND fn_es_admin_de_sucursal(auth.uid(), e.id_sucursal)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_agenda_excepciones_sucursal_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "agenda_excepciones_sucursal",
+    "using": "(fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_agenda_excepciones_sucursal_bloques_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "agenda_excepciones_sucursal_bloques",
+    "using": "(EXISTS ( SELECT 1\n   FROM agenda_excepciones_sucursal e\n  WHERE ((e.id_excepcion_sucursal = agenda_excepciones_sucursal_bloques.id_excepcion_sucursal) AND (fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), e.id_sucursal)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_bitacoras_admin_only",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "bitacoras",
+    "using": "(fn_is_super_admin(auth.uid()) OR (EXISTS ( SELECT 1\n   FROM (roles_usuarios ru\n     JOIN roles r ON ((r.id_rol = ru.id_rol)))\n  WHERE ((ru.id_usuario = auth.uid()) AND (ru.activo = true) AND (r.nombre = 'admin'::text)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_bloqueos_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "bloqueos_agenda",
+    "using": "(fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal) OR (id_empleado = fn_empleado_id_por_uid(auth.uid())))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_citas_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "citas",
+    "using": "(fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal) OR (id_empleado_barbero = fn_empleado_id_por_uid(auth.uid())) OR (creada_por_usuario_id = auth.uid()) OR ((id_cliente IS NOT NULL) AND (id_cliente = fn_cliente_id_por_uid(auth.uid()))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_citas_update_staff",
+    "check": "(fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal) OR (id_empleado_barbero = fn_empleado_id_por_uid(auth.uid())))",
+    "roles": [
+      "authenticated"
+    ],
+    "table": "citas",
+    "using": "(fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal) OR (id_empleado_barbero = fn_empleado_id_por_uid(auth.uid())))",
+    "command": "w",
+    "permissive": true
+  },
+  {
+    "name": "p_citas_detalles_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "citas_detalles",
+    "using": "(EXISTS ( SELECT 1\n   FROM citas c\n  WHERE ((c.id_cita = citas_detalles.id_cita) AND (fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), c.id_sucursal) OR (c.id_empleado_barbero = fn_empleado_id_por_uid(auth.uid())) OR (c.creada_por_usuario_id = auth.uid()) OR ((c.id_cliente IS NOT NULL) AND (c.id_cliente = fn_cliente_id_por_uid(auth.uid())))))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_holds_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "citas_holds",
+    "using": "((id_usuario = auth.uid()) OR fn_is_super_admin(auth.uid()) OR (EXISTS ( SELECT 1\n   FROM citas c\n  WHERE ((c.id_cita = citas_holds.id_cita) AND fn_es_admin_de_sucursal(auth.uid(), c.id_sucursal)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_clientes_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "clientes",
+    "using": "((deleted_at IS NULL) AND (fn_is_super_admin(auth.uid()) OR (id_usuario = auth.uid()) OR (EXISTS ( SELECT 1\n   FROM citas c\n  WHERE ((c.id_cliente = clientes.id_cliente) AND (c.deleted_at IS NULL) AND fn_es_admin_de_sucursal(auth.uid(), c.id_sucursal))))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_empleados_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "empleados",
+    "using": "(fn_is_super_admin(auth.uid()) OR (id_empleado = fn_empleado_id_por_uid(auth.uid())) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_horarios_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "horarios_semanales_empleados",
+    "using": "(fn_is_super_admin(auth.uid()) OR (id_empleado = fn_empleado_id_por_uid(auth.uid())) OR (EXISTS ( SELECT 1\n   FROM empleados e\n  WHERE ((e.id_empleado = horarios_semanales_empleados.id_empleado) AND fn_es_admin_de_sucursal(auth.uid(), e.id_sucursal)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_horarios_sucursales_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "horarios_semanales_sucursales",
+    "using": "(fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), id_sucursal))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_horarios_sucursales_bloques_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "horarios_semanales_sucursales_bloques",
+    "using": "(EXISTS ( SELECT 1\n   FROM horarios_semanales_sucursales hss\n  WHERE ((hss.id_horario_sucursal = horarios_semanales_sucursales_bloques.id_horario_sucursal) AND (fn_is_super_admin(auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), hss.id_sucursal)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_notif_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "notificaciones_email",
+    "using": "(fn_is_super_admin(auth.uid()) OR (id_usuario_destino = auth.uid()) OR (EXISTS ( SELECT 1\n   FROM (roles_usuarios ru\n     JOIN roles r ON ((r.id_rol = ru.id_rol)))\n  WHERE ((ru.id_usuario = auth.uid()) AND (ru.activo = true) AND (r.nombre = 'admin'::text)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_payment_events_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "payment_events",
+    "using": "(fn_is_super_admin(auth.uid()) OR (EXISTS ( SELECT 1\n   FROM (payment_intents pi\n     JOIN citas c ON ((c.id_cita = pi.id_cita)))\n  WHERE ((pi.id_intent = payment_events.id_intent) AND ((pi.created_by_usuario_id = auth.uid()) OR fn_es_admin_de_sucursal(auth.uid(), c.id_sucursal))))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_intents_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "payment_intents",
+    "using": "(fn_is_super_admin(auth.uid()) OR (created_by_usuario_id = auth.uid()) OR (EXISTS ( SELECT 1\n   FROM citas c\n  WHERE ((c.id_cita = payment_intents.id_cita) AND fn_es_admin_de_sucursal(auth.uid(), c.id_sucursal)))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_payments_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "payments",
+    "using": "(fn_is_super_admin(auth.uid()) OR (EXISTS ( SELECT 1\n   FROM payment_intents pi\n  WHERE ((pi.id_intent = payments.id_intent) AND ((pi.created_by_usuario_id = auth.uid()) OR (EXISTS ( SELECT 1\n           FROM citas c\n          WHERE ((c.id_cita = pi.id_cita) AND fn_es_admin_de_sucursal(auth.uid(), c.id_sucursal)))))))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_points_select_self",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "points_transactions",
+    "using": "(fn_is_super_admin(auth.uid()) OR (id_cliente = fn_cliente_id_por_uid(auth.uid())))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_roles_usuarios_select_scope",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "roles_usuarios",
+    "using": "((id_usuario = auth.uid()) OR fn_is_super_admin(auth.uid()) OR (EXISTS ( SELECT 1\n   FROM (roles_usuarios ru2\n     JOIN roles r2 ON ((r2.id_rol = ru2.id_rol)))\n  WHERE ((ru2.id_usuario = auth.uid()) AND (ru2.activo = true) AND (r2.nombre = 'admin'::text) AND (NOT (ru2.id_sucursal IS DISTINCT FROM roles_usuarios.id_sucursal))))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_subpay_select_self",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "subscription_payments",
+    "using": "(fn_is_super_admin(auth.uid()) OR (EXISTS ( SELECT 1\n   FROM subscriptions s\n  WHERE ((s.id_suscripcion = subscription_payments.id_suscripcion) AND (s.id_cliente = fn_cliente_id_por_uid(auth.uid()))))))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_subs_select_self",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "subscriptions",
+    "using": "(fn_is_super_admin(auth.uid()) OR (id_cliente = fn_cliente_id_por_uid(auth.uid())))",
+    "command": "r",
+    "permissive": true
+  },
+  {
+    "name": "p_usuarios_select_self",
+    "check": null,
+    "roles": [
+      "authenticated"
+    ],
+    "table": "usuarios",
+    "using": "((id_usuario = auth.uid()) OR fn_is_super_admin(auth.uid()))",
+    "command": "r",
+    "permissive": true
+  }
+]

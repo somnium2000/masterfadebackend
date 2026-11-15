@@ -1,0 +1,550 @@
+{
+  "source": "Supabase get_advisors (read-only; no execute_sql)",
+  "project": "qa",
+  "lints": [
+    {
+      "name": "rls_enabled_no_policy",
+      "title": "RLS Enabled No Policy",
+      "level": "INFO",
+      "facing": "EXTERNAL",
+      "categories": [
+        "SECURITY"
+      ],
+      "description": "Detects cases where row level security (RLS) has been enabled on a table but no RLS policies have been created.",
+      "remediation": "https://supabase.com/docs/guides/database/database-linter?lint=0008_rls_enabled_no_policy",
+      "count": 9,
+      "findings": [
+        {
+          "detail": "Table \\`app_private.guest_registration_requests\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "guest_registration_requests",
+            "type": "table",
+            "schema": "app_private"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.am_backup_roles_cliente_globales_20260702\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "am_backup_roles_cliente_globales_20260702",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.app_protected_users\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "app_protected_users",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.citas_admin_beneficios_resumen\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "citas_admin_beneficios_resumen",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.membership_purchase_orders\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "membership_purchase_orders",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.promociones_codigos\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "promociones_codigos",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.promociones_reglas_compatibilidad\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "promociones_reglas_compatibilidad",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.promociones_reglas_cupos\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "promociones_reglas_cupos",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Table \\`public.promociones_usos\\` has RLS enabled, but no policies exist",
+          "metadata": {
+            "name": "promociones_usos",
+            "type": "table",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        }
+      ]
+    },
+    {
+      "name": "function_search_path_mutable",
+      "title": "Function Search Path Mutable",
+      "level": "WARN",
+      "facing": "EXTERNAL",
+      "categories": [
+        "SECURITY"
+      ],
+      "description": "Detects functions where the search_path parameter is not set.",
+      "remediation": "https://supabase.com/docs/guides/database/database-linter?lint=0011_function_search_path_mutable",
+      "count": 31,
+      "findings": [
+        {
+          "detail": "Function \\`public.set_current_timestamp_updated_at\\` has a role mutable search_path",
+          "metadata": {
+            "name": "set_current_timestamp_updated_at",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_points_get_effective_rule\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_points_get_effective_rule",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_bloquear_delete_fisico\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_bloquear_delete_fisico",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_validar_persona_empleado_campos_obligatorios\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_validar_persona_empleado_campos_obligatorios",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_points_estado_final_cita\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_points_estado_final_cita",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_bloquear_persona_cliente_empleado\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_bloquear_persona_cliente_empleado",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_validar_servicio_activo_con_tarifa_base\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_validar_servicio_activo_con_tarifa_base",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_guardar_desactivacion_servicio\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_guardar_desactivacion_servicio",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_desactivar_tarifas_base_de_servicio\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_desactivar_tarifas_base_de_servicio",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_points_tx_apply_tipo_sign\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_points_tx_apply_tipo_sign",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_validar_paquete_activo_minimo_servicios\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_validar_paquete_activo_minimo_servicios",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_validar_paquete_activo_sin_servicios_inactivos\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_validar_paquete_activo_sin_servicios_inactivos",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_citas_integrantes_set_updated_at\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_citas_integrantes_set_updated_at",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.validate_membership_plan_beneficios\\` has a role mutable search_path",
+          "metadata": {
+            "name": "validate_membership_plan_beneficios",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_set_updated_at\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_set_updated_at",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_trg_validar_cliente_persona_en_cita\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_trg_validar_cliente_persona_en_cita",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_trg_roles_usuarios_unicidad_scope\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_trg_roles_usuarios_unicidad_scope",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_marcar_no_show\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_marcar_no_show",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_comprobantes_agendamiento_set_defaults\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_comprobantes_agendamiento_set_defaults",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_comprobantes_destinatarios_set_updated_at\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_comprobantes_destinatarios_set_updated_at",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_facturas_set_updated_at\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_facturas_set_updated_at",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_citas_grupos_set_defaults\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_citas_grupos_set_defaults",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_citas_integrantes_validate_limits\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_citas_integrantes_validate_limits",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_citas_set_integrante_from_legacy\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_citas_set_integrante_from_legacy",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_prevent_block_protected_usuario\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_prevent_block_protected_usuario",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_prevent_block_protected_role\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_prevent_block_protected_role",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_prevent_block_protected_persona\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_prevent_block_protected_persona",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_prevent_block_protected_correo\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_prevent_block_protected_correo",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_agenda_excepciones_sucursal_validar_compatibilidad\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_agenda_excepciones_sucursal_validar_compatibilidad",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_agenda_excepciones_sucursal_bloques_validar_modo\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_agenda_excepciones_sucursal_bloques_validar_modo",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function \\`public.fn_points_materialize_expired_cycles\\` has a role mutable search_path",
+          "metadata": {
+            "name": "fn_points_materialize_expired_cycles",
+            "type": "function",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        }
+      ]
+    },
+    {
+      "name": "extension_in_public",
+      "title": "Extension in Public",
+      "level": "WARN",
+      "facing": "EXTERNAL",
+      "categories": [
+        "SECURITY"
+      ],
+      "description": "Detects extensions installed in the \\`public\\` schema.",
+      "remediation": "https://supabase.com/docs/guides/database/database-linter?lint=0014_extension_in_public",
+      "count": 3,
+      "findings": [
+        {
+          "detail": "Extension \\`citext\\` is installed in the public schema. Move it to another schema.",
+          "metadata": {
+            "name": "citext",
+            "type": "extension",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Extension \\`btree_gist\\` is installed in the public schema. Move it to another schema.",
+          "metadata": {
+            "name": "btree_gist",
+            "type": "extension",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Extension \\`pg_trgm\\` is installed in the public schema. Move it to another schema.",
+          "metadata": {
+            "name": "pg_trgm",
+            "type": "extension",
+            "schema": "public"
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        }
+      ]
+    },
+    {
+      "name": "anon_security_definer_function_executable",
+      "title": "Public Can Execute SECURITY DEFINER Function",
+      "level": "WARN",
+      "facing": "EXTERNAL",
+      "categories": [
+        "SECURITY"
+      ],
+      "description": "Detects `SECURITY DEFINER` functions that are callable without signing in. Revoke `EXECUTE`, switch the function to `SECURITY INVOKER`, or move it out of your exposed API schema if it is not meant to be public.",
+      "remediation": "https://supabase.com/docs/guides/database/database-linter?lint=0028_anon_security_definer_function_executable",
+      "count": 2,
+      "findings": [
+        {
+          "detail": "Function `public.fn_citas_detalles_line_identity_v2()` can be executed by the `anon` role as a `SECURITY DEFINER` function via `/rest/v1/rpc/fn_citas_detalles_line_identity_v2`. Revoke `EXECUTE` or switch it to `SECURITY INVOKER` if that is not intentional.",
+          "metadata": {
+            "name": "fn_citas_detalles_line_identity_v2",
+            "schema": "public",
+            "language": "plpgsql",
+            "arguments": "",
+            "security_definer": true
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function `public.fn_hold_defaults_y_unico()` can be executed by the `anon` role as a `SECURITY DEFINER` function via `/rest/v1/rpc/fn_hold_defaults_y_unico`. Revoke `EXECUTE` or switch it to `SECURITY INVOKER` if that is not intentional.",
+          "metadata": {
+            "name": "fn_hold_defaults_y_unico",
+            "schema": "public",
+            "language": "plpgsql",
+            "arguments": "",
+            "security_definer": true
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        }
+      ]
+    },
+    {
+      "name": "authenticated_security_definer_function_executable",
+      "title": "Signed-In Users Can Execute SECURITY DEFINER Function",
+      "level": "WARN",
+      "facing": "EXTERNAL",
+      "categories": [
+        "SECURITY"
+      ],
+      "description": "Detects `SECURITY DEFINER` functions that are callable by signed-in users. Revoke `EXECUTE`, switch the function to `SECURITY INVOKER`, or move it out of your exposed API schema if signed-in users should not call it.",
+      "remediation": "https://supabase.com/docs/guides/database/database-linter?lint=0029_authenticated_security_definer_function_executable",
+      "count": 4,
+      "findings": [
+        {
+          "detail": "Function `public.fn_citas_detalles_line_identity_v2()` can be executed by the `authenticated` role as a `SECURITY DEFINER` function via `/rest/v1/rpc/fn_citas_detalles_line_identity_v2`. Revoke `EXECUTE` or switch it to `SECURITY INVOKER` if that is not intentional.",
+          "metadata": {
+            "name": "fn_citas_detalles_line_identity_v2",
+            "schema": "public",
+            "language": "plpgsql",
+            "arguments": "",
+            "security_definer": true
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function `public.fn_es_admin_de_sucursal(p_uid uuid, p_sucursal uuid)` can be executed by the `authenticated` role as a `SECURITY DEFINER` function via `/rest/v1/rpc/fn_es_admin_de_sucursal`. Revoke `EXECUTE` or switch it to `SECURITY INVOKER` if that is not intentional.",
+          "metadata": {
+            "name": "fn_es_admin_de_sucursal",
+            "schema": "public",
+            "language": "sql",
+            "arguments": "p_uid uuid, p_sucursal uuid",
+            "security_definer": true
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function `public.fn_hold_defaults_y_unico()` can be executed by the `authenticated` role as a `SECURITY DEFINER` function via `/rest/v1/rpc/fn_hold_defaults_y_unico`. Revoke `EXECUTE` or switch it to `SECURITY INVOKER` if that is not intentional.",
+          "metadata": {
+            "name": "fn_hold_defaults_y_unico",
+            "schema": "public",
+            "language": "plpgsql",
+            "arguments": "",
+            "security_definer": true
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        },
+        {
+          "detail": "Function `public.fn_is_super_admin(p_uid uuid)` can be executed by the `authenticated` role as a `SECURITY DEFINER` function via `/rest/v1/rpc/fn_is_super_admin`. Revoke `EXECUTE` or switch it to `SECURITY INVOKER` if that is not intentional.",
+          "metadata": {
+            "name": "fn_is_super_admin",
+            "schema": "public",
+            "language": "sql",
+            "arguments": "p_uid uuid",
+            "security_definer": true
+          },
+          "observed_at": "2026-11-13T23:49:50.675Z"
+        }
+      ]
+    },
+    {
+      "name": "auth_leaked_password_protection",
+      "title": "Leaked Password Protection Disabled",
+      "level": "WARN",
+      "facing": "EXTERNAL",
+      "categories": [
+        "SECURITY"
+      ],
+      "description": "Leaked password protection is currently disabled.",
+      "remediation": "https://supabase.com/docs/guides/auth/password-security#password-strength-and-leaked-password-protection",
+      "count": 1,
+      "findings": [
+        {
+          "detail": "Supabase Auth prevents the use of compromised passwords by checking against HaveIBeenPwned.org. Enable this feature to enhance security.",
+          "metadata": {
+            "type": "auth",
+            "entity": "Auth"
+          }
+        }
+      ]
+    }
+  ]
+}

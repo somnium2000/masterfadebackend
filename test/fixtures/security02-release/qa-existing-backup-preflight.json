@@ -1,0 +1,166 @@
+[
+  {
+    "signature": "public.fn_agenda_excepciones_sucursal_bloques_validar_modo()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_agenda_excepciones_sucursal_validar_compatibilidad()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_bloquear_delete_fisico()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_bloquear_persona_cliente_empleado()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_citas_detalles_line_identity_v2()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_citas_grupos_set_defaults()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_citas_integrantes_set_updated_at()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_citas_integrantes_validate_limits()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_citas_set_integrante_from_legacy()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_comprobantes_agendamiento_set_defaults()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_comprobantes_destinatarios_set_updated_at()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_desactivar_tarifas_base_de_servicio()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_es_admin_de_sucursal(uuid, uuid)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_facturas_set_updated_at()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_guardar_desactivacion_servicio()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_has_role(uuid, text)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_hold_defaults_y_unico()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_is_super_admin(uuid)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_marcar_no_show(integer, integer)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_estado_final_cita()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_get_effective_rule(uuid)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_get_or_create_active_cycle(uuid, integer, timestamp with time zone)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_get_or_create_active_cycle(uuid, timestamp with time zone)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_materialize_expired_cycles(uuid)",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_tx_apply_tipo_sign()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_points_tx_guard_acumular_final()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_correo()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_persona()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_role()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_usuario()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_set_updated_at()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_trg_otorgar_puntos_plan_confirmada()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_trg_otorgar_puntos_por_cita()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_trg_roles_usuarios_unicidad_scope()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_trg_validar_cliente_persona_en_cita()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_validar_paquete_activo_minimo_servicios()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_validar_paquete_activo_sin_servicios_inactivos()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_validar_persona_empleado_campos_obligatorios()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.fn_validar_servicio_activo_con_tarifa_base()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.set_current_timestamp_updated_at()",
+    "status": "READY"
+  },
+  {
+    "signature": "public.validate_membership_plan_beneficios()",
+    "status": "READY"
+  }
+]

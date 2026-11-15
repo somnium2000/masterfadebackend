@@ -1,0 +1,3598 @@
+[
+  {
+    "signature": "public.fn_agenda_excepciones_sucursal_bloques_validar_modo()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "d22b4024d252b463eb1f35d01167830c",
+    "canonical_body_hash": "b7f1fd429da5b143d2e6f634a6687b77",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_validar_agenda_excepciones_sucursal_bloques_modo on table agenda_excepciones_sucursal_bloques"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_validar_agenda_excepciones_sucursal_bloques_modo BEFORE INSERT OR UPDATE ON public.agenda_excepciones_sucursal_bloques FOR EACH ROW EXECUTE FUNCTION fn_agenda_excepciones_sucursal_bloques_validar_modo()"
+    ]
+  },
+  {
+    "signature": "public.fn_agenda_excepciones_sucursal_validar_compatibilidad()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "040ab427b3dffd7f271fd977a586ee17",
+    "canonical_body_hash": "fce621274910e0365e87f6ee4b9c7669",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_validar_agenda_excepciones_sucursal on table agenda_excepciones_sucursal"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_validar_agenda_excepciones_sucursal BEFORE INSERT OR UPDATE ON public.agenda_excepciones_sucursal FOR EACH ROW EXECUTE FUNCTION fn_agenda_excepciones_sucursal_validar_compatibilidad()"
+    ]
+  },
+  {
+    "signature": "public.fn_bloquear_delete_fisico()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "47f244622d8cbee96ea778ae4421453b",
+    "canonical_body_hash": "4dc9aadcf54d803079c7a6d07f44c8e2",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_bloquear_delete_personas on table personas",
+      "trigger trg_bloquear_delete_empleados on table empleados",
+      "trigger trg_bloquear_delete_usuarios on table usuarios",
+      "trigger trg_bloquear_delete_roles_usuarios on table roles_usuarios",
+      "trigger trg_bloquear_delete_correos on table correos"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_bloquear_delete_personas BEFORE DELETE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()",
+      "CREATE TRIGGER trg_bloquear_delete_empleados BEFORE DELETE ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()",
+      "CREATE TRIGGER trg_bloquear_delete_usuarios BEFORE DELETE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()",
+      "CREATE TRIGGER trg_bloquear_delete_roles_usuarios BEFORE DELETE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()",
+      "CREATE TRIGGER trg_bloquear_delete_correos BEFORE DELETE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_bloquear_delete_fisico()"
+    ]
+  },
+  {
+    "signature": "public.fn_bloquear_persona_cliente_empleado()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "56b7d42510a2fae394a7f810566f7428",
+    "canonical_body_hash": "56b7d42510a2fae394a7f810566f7428",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_bloquear_persona_cliente_en_empleados on table empleados",
+      "trigger trg_bloquear_persona_empleado_en_clientes on table clientes"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_bloquear_persona_cliente_en_empleados BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.empleados FOR EACH ROW WHEN ((new.deleted_at IS NULL)) EXECUTE FUNCTION fn_bloquear_persona_cliente_empleado()",
+      "CREATE TRIGGER trg_bloquear_persona_empleado_en_clientes BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.clientes FOR EACH ROW WHEN ((new.deleted_at IS NULL)) EXECUTE FUNCTION fn_bloquear_persona_cliente_empleado()"
+    ]
+  },
+  {
+    "signature": "public.fn_citas_detalles_line_identity_v2()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": true,
+    "current_config": [
+      "search_path=pg_catalog, public, app_private"
+    ],
+    "proposed_path_if_changed": "pg_catalog, public, app_private, pg_temp",
+    "literal_body_hash": "e0529d5052325541fa66519eae480ec9",
+    "canonical_body_hash": "e0529d5052325541fa66519eae480ec9",
+    "execution_scope": "trigger",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_zz_citas_detalles_line_identity on table citas_detalles"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_zz_citas_detalles_line_identity BEFORE INSERT OR UPDATE ON public.citas_detalles FOR EACH ROW EXECUTE FUNCTION fn_citas_detalles_line_identity_v2()"
+    ]
+  },
+  {
+    "signature": "public.fn_citas_grupos_set_defaults()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "30442740a082a123e54e69c3784d24db",
+    "canonical_body_hash": "30442740a082a123e54e69c3784d24db",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_citas_grupos_set_defaults on table citas_grupos"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_citas_grupos_set_defaults BEFORE INSERT ON public.citas_grupos FOR EACH ROW EXECUTE FUNCTION fn_citas_grupos_set_defaults()"
+    ]
+  },
+  {
+    "signature": "public.fn_citas_integrantes_set_updated_at()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "canonical_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_citas_integrantes_set_updated_at on table citas_integrantes"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_citas_integrantes_set_updated_at BEFORE UPDATE ON public.citas_integrantes FOR EACH ROW EXECUTE FUNCTION fn_citas_integrantes_set_updated_at()"
+    ]
+  },
+  {
+    "signature": "public.fn_citas_integrantes_validate_limits()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "72a2a7e18406fe35f707809efc9d6445",
+    "canonical_body_hash": "72a2a7e18406fe35f707809efc9d6445",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_citas_integrantes_validate_limits on table citas_integrantes"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_citas_integrantes_validate_limits BEFORE INSERT OR UPDATE ON public.citas_integrantes FOR EACH ROW EXECUTE FUNCTION fn_citas_integrantes_validate_limits()"
+    ]
+  },
+  {
+    "signature": "public.fn_citas_set_integrante_from_legacy()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "41fefd2ea50288d4874e8947cf75f1c5",
+    "canonical_body_hash": "41fefd2ea50288d4874e8947cf75f1c5",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_citas_set_integrante_from_legacy on table citas"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_citas_set_integrante_from_legacy BEFORE INSERT OR UPDATE OF id_cita_integrante, id_grupo_cita, orden_integrante, id_cliente, id_persona_cliente, contacto_nombre, contacto_email, contacto_telefono, alias_integrante ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_citas_set_integrante_from_legacy()"
+    ]
+  },
+  {
+    "signature": "public.fn_comprobantes_agendamiento_set_defaults()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "5823059c60bd5159e094bbda1fa2cafa",
+    "canonical_body_hash": "5823059c60bd5159e094bbda1fa2cafa",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_comprobantes_agendamiento_set_defaults on table comprobantes_agendamiento"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_comprobantes_agendamiento_set_defaults BEFORE INSERT OR UPDATE ON public.comprobantes_agendamiento FOR EACH ROW EXECUTE FUNCTION fn_comprobantes_agendamiento_set_defaults()"
+    ]
+  },
+  {
+    "signature": "public.fn_comprobantes_destinatarios_set_updated_at()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "canonical_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_comprobantes_destinatarios_set_updated_at on table comprobantes_agendamiento_destinatarios"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_comprobantes_destinatarios_set_updated_at BEFORE UPDATE ON public.comprobantes_agendamiento_destinatarios FOR EACH ROW EXECUTE FUNCTION fn_comprobantes_destinatarios_set_updated_at()"
+    ]
+  },
+  {
+    "signature": "public.fn_desactivar_tarifas_base_de_servicio()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "fc102cad03011adda030e0631f482264",
+    "canonical_body_hash": "fc102cad03011adda030e0631f482264",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_desactivar_tarifas_base_de_servicio on table servicios"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_desactivar_tarifas_base_de_servicio AFTER UPDATE OF activo ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_desactivar_tarifas_base_de_servicio()"
+    ]
+  },
+  {
+    "signature": "public.fn_es_admin_de_sucursal(uuid, uuid)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": true,
+    "current_config": [
+      "search_path=public, auth"
+    ],
+    "proposed_path_if_changed": "pg_catalog, public, auth, pg_temp",
+    "literal_body_hash": "9bad3022eac86ec52bd7902a0fe515f6",
+    "canonical_body_hash": "9bad3022eac86ec52bd7902a0fe515f6",
+    "execution_scope": "rls",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "authenticated",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": false
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": false
+      },
+      {
+        "role": "dashboard_user",
+        "execute": false
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": false
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": false
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": false
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": false
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": false
+      }
+    ],
+    "references": [
+      "schema public"
+    ],
+    "dependents": [
+      "policy p_empleados_select_scope on table empleados",
+      "policy p_citas_select_scope on table citas",
+      "policy p_citas_update_staff on table citas",
+      "policy p_citas_update_staff on table citas",
+      "policy p_citas_detalles_select_scope on table citas_detalles",
+      "policy p_holds_select_scope on table citas_holds",
+      "policy p_intents_select_scope on table payment_intents",
+      "policy p_payments_select_scope on table payments",
+      "policy p_horarios_select_scope on table horarios_semanales_empleados",
+      "policy p_bloqueos_select_scope on table bloqueos_agenda",
+      "policy p_payment_events_select_scope on table payment_events",
+      "policy p_horarios_sucursales_select_scope on table horarios_semanales_sucursales",
+      "policy p_horarios_sucursales_bloques_select_scope on table horarios_semanales_sucursales_bloques",
+      "policy p_clientes_select_scope on table clientes",
+      "policy p_agenda_excepciones_sucursal_select_scope on table agenda_excepciones_sucursal",
+      "policy p_agenda_excepciones_sucursal_bloques_select_scope on table agenda_excepciones_sucursal_bloques",
+      "policy p_agenda_bloqueos_empleados_select_scope on table agenda_bloqueos_empleados"
+    ],
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_facturas_set_updated_at()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "canonical_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_facturas_set_updated_at on table facturas"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_facturas_set_updated_at BEFORE UPDATE ON public.facturas FOR EACH ROW EXECUTE FUNCTION fn_facturas_set_updated_at()"
+    ]
+  },
+  {
+    "signature": "public.fn_guardar_desactivacion_servicio()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "31abab3e1bdace55a2eaf282ec503d04",
+    "canonical_body_hash": "31abab3e1bdace55a2eaf282ec503d04",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_guardar_desactivacion_servicio on table servicios"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_guardar_desactivacion_servicio BEFORE UPDATE OF activo ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_guardar_desactivacion_servicio()"
+    ]
+  },
+  {
+    "signature": "public.fn_has_role(uuid, text)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": true,
+    "current_config": [
+      "search_path=public, auth"
+    ],
+    "proposed_path_if_changed": "pg_catalog, public, auth, pg_temp",
+    "literal_body_hash": "1d9b2c65d020c49ec142a62ed70ee868",
+    "canonical_body_hash": "1d9b2c65d020c49ec142a62ed70ee868",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": false
+      },
+      {
+        "role": "authenticated",
+        "execute": false
+      },
+      {
+        "role": "authenticator",
+        "execute": false
+      },
+      {
+        "role": "dashboard_user",
+        "execute": false
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": false
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": false
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": false
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": false
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": false
+      }
+    ],
+    "references": [
+      "schema public"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_hold_defaults_y_unico()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": true,
+    "current_config": [
+      "search_path=pg_catalog, public, app_private"
+    ],
+    "proposed_path_if_changed": "pg_catalog, public, app_private, pg_temp",
+    "literal_body_hash": "cdb2df6f06d291d52b40ae7ebd2a92a7",
+    "canonical_body_hash": "cdb2df6f06d291d52b40ae7ebd2a92a7",
+    "execution_scope": "trigger",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_hold_unico on table citas_holds"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_hold_unico BEFORE INSERT ON public.citas_holds FOR EACH ROW EXECUTE FUNCTION fn_hold_defaults_y_unico()"
+    ]
+  },
+  {
+    "signature": "public.fn_is_super_admin(uuid)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": true,
+    "current_config": [
+      "search_path=public, auth"
+    ],
+    "proposed_path_if_changed": "pg_catalog, public, auth, pg_temp",
+    "literal_body_hash": "478c6d1cd1c85e02fcc87a4a14c93be5",
+    "canonical_body_hash": "478c6d1cd1c85e02fcc87a4a14c93be5",
+    "execution_scope": "rls",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "authenticated",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": false
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": false
+      },
+      {
+        "role": "dashboard_user",
+        "execute": false
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": false
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": false
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": false
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": false
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": false
+      }
+    ],
+    "references": [
+      "schema public"
+    ],
+    "dependents": [
+      "policy p_usuarios_select_self on table usuarios",
+      "policy p_roles_usuarios_select_scope on table roles_usuarios",
+      "policy p_empleados_select_scope on table empleados",
+      "policy p_citas_select_scope on table citas",
+      "policy p_citas_update_staff on table citas",
+      "policy p_citas_update_staff on table citas",
+      "policy p_citas_detalles_select_scope on table citas_detalles",
+      "policy p_holds_select_scope on table citas_holds",
+      "policy p_intents_select_scope on table payment_intents",
+      "policy p_payments_select_scope on table payments",
+      "policy p_points_select_self on table points_transactions",
+      "policy p_subs_select_self on table subscriptions",
+      "policy p_subpay_select_self on table subscription_payments",
+      "policy p_bitacoras_admin_only on table bitacoras",
+      "policy p_notif_select_scope on table notificaciones_email",
+      "policy p_horarios_select_scope on table horarios_semanales_empleados",
+      "policy p_bloqueos_select_scope on table bloqueos_agenda",
+      "policy p_payment_events_select_scope on table payment_events",
+      "policy p_horarios_sucursales_select_scope on table horarios_semanales_sucursales",
+      "policy p_horarios_sucursales_bloques_select_scope on table horarios_semanales_sucursales_bloques",
+      "policy p_clientes_select_scope on table clientes",
+      "policy p_agenda_excepciones_sucursal_select_scope on table agenda_excepciones_sucursal",
+      "policy p_agenda_excepciones_sucursal_bloques_select_scope on table agenda_excepciones_sucursal_bloques",
+      "policy p_agenda_bloqueos_empleados_select_scope on table agenda_bloqueos_empleados"
+    ],
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_marcar_no_show(integer, integer)",
+    "expected_kind": "procedure",
+    "actual_kind": "p",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "078aba2a9a1da944b163b1ab1c1b605b",
+    "canonical_body_hash": "078aba2a9a1da944b163b1ab1c1b605b",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_points_estado_final_cita()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "38b27cac561d41e078a3f53775e4a429",
+    "canonical_body_hash": "38b27cac561d41e078a3f53775e4a429",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_points_get_effective_rule(uuid)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "27b895e6f146655df078882c50a9911b",
+    "canonical_body_hash": "27b895e6f146655df078882c50a9911b",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_points_get_or_create_active_cycle(uuid, integer, timestamp with time zone)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "a38d0b9a382ab61dc7468198b6d45229",
+    "canonical_body_hash": "a38d0b9a382ab61dc7468198b6d45229",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_points_get_or_create_active_cycle(uuid, timestamp with time zone)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "6be79dd3b72e1d7a05016a613bf4a53d",
+    "canonical_body_hash": "6be79dd3b72e1d7a05016a613bf4a53d",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_points_materialize_expired_cycles(uuid)",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "1fc9e808d8d6d56570897b5c84480144",
+    "canonical_body_hash": "1fc9e808d8d6d56570897b5c84480144",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": true,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_points_tx_apply_tipo_sign()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "d9e9c315c1cfb417de0945ccc1b91e07",
+    "canonical_body_hash": "d9e9c315c1cfb417de0945ccc1b91e07",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_points_tx_apply_tipo_sign on table points_transactions"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_points_tx_apply_tipo_sign BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, puntos ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_apply_tipo_sign()"
+    ]
+  },
+  {
+    "signature": "public.fn_points_tx_guard_acumular_final()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "25e47807f162b12b9de8c87e15a8248c",
+    "canonical_body_hash": "25e47807f162b12b9de8c87e15a8248c",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_points_tx_guard_acumular_final on table points_transactions"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_points_tx_guard_acumular_final BEFORE INSERT OR UPDATE OF tipo_puntos_codigo, id_cita, origen_punto_codigo ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_points_tx_guard_acumular_final()"
+    ]
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_correo()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "2dc14d8febcbc50350f637def7b83e0f",
+    "canonical_body_hash": "08f9e5c93d55cf921e7d32eb3bc5ed15",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_prevent_block_protected_correo on table correos"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_prevent_block_protected_correo BEFORE UPDATE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_correo()"
+    ]
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_persona()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "2b06cba7b21221d6789ab333dfbe234e",
+    "canonical_body_hash": "cae50000e7933616b7d51470839c056a",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_prevent_block_protected_persona on table personas"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_prevent_block_protected_persona BEFORE UPDATE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_persona()"
+    ]
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_role()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "afad426a76d8503ae8753944aaa978ad",
+    "canonical_body_hash": "e2f0a78d7a2c712bb6afeb339c9d7c6c",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_prevent_block_protected_role on table roles_usuarios"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_prevent_block_protected_role BEFORE UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_role()"
+    ]
+  },
+  {
+    "signature": "public.fn_prevent_block_protected_usuario()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "5a84454db69c740b361b8dc33db427e3",
+    "canonical_body_hash": "85b8212c6b1966571f2cb756b1b98ec6",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_prevent_block_protected_usuario on table usuarios"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_prevent_block_protected_usuario BEFORE UPDATE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_prevent_block_protected_usuario()"
+    ]
+  },
+  {
+    "signature": "public.fn_set_updated_at()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "canonical_body_hash": "5bdc21b8fa8fb1231bdb021e09a5bc8e",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_set_updated_at_empresas on table empresas",
+      "trigger tr_set_updated_at_sucursales on table sucursales",
+      "trigger tr_set_updated_at_personas on table personas",
+      "trigger tr_set_updated_at_usuarios on table usuarios",
+      "trigger tr_set_updated_at_correos on table correos",
+      "trigger tr_set_updated_at_empleados on table empleados",
+      "trigger tr_set_updated_at_clientes on table clientes",
+      "trigger tr_set_updated_at_archivos on table archivos",
+      "trigger tr_set_updated_at_roles on table roles",
+      "trigger tr_set_updated_at_roles_usuarios on table roles_usuarios",
+      "trigger tr_set_updated_at_permisos on table permisos",
+      "trigger tr_set_updated_at_pantallas on table pantallas",
+      "trigger tr_set_updated_at_roles_pantallas_permisos on table roles_pantallas_permisos",
+      "trigger tr_set_updated_at_parametros_sistema on table parametros_sistema",
+      "trigger tr_set_updated_at_parametros_sucursal on table parametros_sucursal",
+      "trigger tr_set_updated_at_servicios on table servicios",
+      "trigger tr_set_updated_at_servicios_tarifas on table servicios_tarifas",
+      "trigger tr_set_updated_at_paquetes on table paquetes",
+      "trigger tr_set_updated_at_paquetes_detalles on table paquetes_detalles",
+      "trigger tr_set_updated_at_horarios_semanales_empleados on table horarios_semanales_empleados",
+      "trigger tr_set_updated_at_bloqueos_agenda on table bloqueos_agenda",
+      "trigger tr_set_updated_at_citas on table citas",
+      "trigger tr_set_updated_at_citas_detalles on table citas_detalles",
+      "trigger tr_set_updated_at_citas_holds on table citas_holds",
+      "trigger tr_set_updated_at_payment_providers on table payment_providers",
+      "trigger tr_set_updated_at_payment_intents on table payment_intents",
+      "trigger tr_set_updated_at_payments on table payments",
+      "trigger tr_set_updated_at_points_rules on table points_rules",
+      "trigger tr_set_updated_at_points_transactions on table points_transactions",
+      "trigger tr_set_updated_at_membership_plans on table membership_plans",
+      "trigger tr_set_updated_at_subscriptions on table subscriptions",
+      "trigger tr_set_updated_at_subscription_payments on table subscription_payments",
+      "trigger tr_set_updated_at_notificaciones_email on table notificaciones_email",
+      "trigger tr_set_updated_at_points_cycles on table points_cycles",
+      "trigger tr_set_updated_at_citas_grupos on table citas_grupos",
+      "trigger tr_set_updated_at_citas_reagendaciones on table citas_reagendaciones",
+      "trigger tr_set_updated_at_storage_assets on table storage_assets",
+      "trigger tr_set_updated_at_points_legacy_migrations on table points_legacy_migrations",
+      "trigger tr_set_updated_at_cortesias on table cortesias",
+      "trigger tr_set_updated_at_cortesias_sucursales on table cortesias_sucursales",
+      "trigger tr_set_updated_at_horarios_semanales_sucursales on table horarios_semanales_sucursales",
+      "trigger tr_set_updated_at_horarios_semanales_sucursales_bloques on table horarios_semanales_sucursales_bloques",
+      "trigger tr_set_updated_at_membership_purchase_orders on table membership_purchase_orders",
+      "trigger tr_set_updated_at_agenda_excepciones_sucursal on table agenda_excepciones_sucursal",
+      "trigger tr_set_updated_at_agenda_excepciones_sucursal_bloques on table agenda_excepciones_sucursal_bloques",
+      "trigger tr_set_updated_at_agenda_bloqueos_empleados on table agenda_bloqueos_empleados"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_set_updated_at_empresas BEFORE UPDATE ON public.empresas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_sucursales BEFORE UPDATE ON public.sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_personas BEFORE UPDATE ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_usuarios BEFORE UPDATE ON public.usuarios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_correos BEFORE UPDATE ON public.correos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_empleados BEFORE UPDATE ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_clientes BEFORE UPDATE ON public.clientes FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_archivos BEFORE UPDATE ON public.archivos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_roles BEFORE UPDATE ON public.roles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_roles_usuarios BEFORE UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_permisos BEFORE UPDATE ON public.permisos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_pantallas BEFORE UPDATE ON public.pantallas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_roles_pantallas_permisos BEFORE UPDATE ON public.roles_pantallas_permisos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_parametros_sistema BEFORE UPDATE ON public.parametros_sistema FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_parametros_sucursal BEFORE UPDATE ON public.parametros_sucursal FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_servicios BEFORE UPDATE ON public.servicios FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_servicios_tarifas BEFORE UPDATE ON public.servicios_tarifas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_paquetes BEFORE UPDATE ON public.paquetes FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_paquetes_detalles BEFORE UPDATE ON public.paquetes_detalles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_horarios_semanales_empleados BEFORE UPDATE ON public.horarios_semanales_empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_bloqueos_agenda BEFORE UPDATE ON public.bloqueos_agenda FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_citas BEFORE UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_citas_detalles BEFORE UPDATE ON public.citas_detalles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_citas_holds BEFORE UPDATE ON public.citas_holds FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_payment_providers BEFORE UPDATE ON public.payment_providers FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_payment_intents BEFORE UPDATE ON public.payment_intents FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_payments BEFORE UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_points_rules BEFORE UPDATE ON public.points_rules FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_points_transactions BEFORE UPDATE ON public.points_transactions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_membership_plans BEFORE UPDATE ON public.membership_plans FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_subscriptions BEFORE UPDATE ON public.subscriptions FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_subscription_payments BEFORE UPDATE ON public.subscription_payments FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_notificaciones_email BEFORE UPDATE ON public.notificaciones_email FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_points_cycles BEFORE UPDATE ON public.points_cycles FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_citas_grupos BEFORE UPDATE ON public.citas_grupos FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_citas_reagendaciones BEFORE UPDATE ON public.citas_reagendaciones FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_storage_assets BEFORE UPDATE ON public.storage_assets FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_points_legacy_migrations BEFORE UPDATE ON public.points_legacy_migrations FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_cortesias BEFORE UPDATE ON public.cortesias FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_cortesias_sucursales BEFORE UPDATE ON public.cortesias_sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_membership_purchase_orders BEFORE UPDATE ON public.membership_purchase_orders FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_horarios_semanales_sucursales BEFORE UPDATE ON public.horarios_semanales_sucursales FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_horarios_semanales_sucursales_bloques BEFORE UPDATE ON public.horarios_semanales_sucursales_bloques FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_agenda_excepciones_sucursal BEFORE UPDATE ON public.agenda_excepciones_sucursal FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_agenda_excepciones_sucursal_bloques BEFORE UPDATE ON public.agenda_excepciones_sucursal_bloques FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()",
+      "CREATE TRIGGER tr_set_updated_at_agenda_bloqueos_empleados BEFORE UPDATE ON public.agenda_bloqueos_empleados FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()"
+    ]
+  },
+  {
+    "signature": "public.fn_trg_otorgar_puntos_plan_confirmada()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "d28d6871c43022fd0950f4ec9f973972",
+    "canonical_body_hash": "d28d6871c43022fd0950f4ec9f973972",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": null,
+    "triggers": null
+  },
+  {
+    "signature": "public.fn_trg_otorgar_puntos_por_cita()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "b271a74a0fd9440113f62c331e8a7ea8",
+    "canonical_body_hash": "b271a74a0fd9440113f62c331e8a7ea8",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_points_cita_confirmada on table citas"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_points_cita_confirmada AFTER UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_otorgar_puntos_por_cita()"
+    ]
+  },
+  {
+    "signature": "public.fn_trg_roles_usuarios_unicidad_scope()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "896fbcfb6beffcd7c9e9d139358c72ca",
+    "canonical_body_hash": "b35bcc38f4d9a303d946a57f45dc0306",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_ru_unicidad_scope on table roles_usuarios"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_ru_unicidad_scope BEFORE INSERT OR UPDATE ON public.roles_usuarios FOR EACH ROW EXECUTE FUNCTION fn_trg_roles_usuarios_unicidad_scope()"
+    ]
+  },
+  {
+    "signature": "public.fn_trg_validar_cliente_persona_en_cita()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "804968e5011334975898f0f92c3d2a22",
+    "canonical_body_hash": "804968e5011334975898f0f92c3d2a22",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger tr_citas_validar_cliente_persona on table citas"
+    ],
+    "triggers": [
+      "CREATE TRIGGER tr_citas_validar_cliente_persona BEFORE INSERT OR UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION fn_trg_validar_cliente_persona_en_cita()"
+    ]
+  },
+  {
+    "signature": "public.fn_validar_paquete_activo_minimo_servicios()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "66bd226e1771837b8532cad439e5ddb3",
+    "canonical_body_hash": "66bd226e1771837b8532cad439e5ddb3",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_validar_paquete_activo_minimo_servicios_en_detalles on table paquetes_detalles",
+      "trigger trg_validar_paquete_activo_minimo_servicios_en_paquetes on table paquetes"
+    ],
+    "triggers": [
+      "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_minimo_servicios_en_paquetes AFTER INSERT OR UPDATE OF activo, deleted_at ON public.paquetes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_minimo_servicios()",
+      "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_minimo_servicios_en_detalles AFTER INSERT OR DELETE OR UPDATE ON public.paquetes_detalles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_minimo_servicios()"
+    ]
+  },
+  {
+    "signature": "public.fn_validar_paquete_activo_sin_servicios_inactivos()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "9f36d7892d1ce610990354708cc635f1",
+    "canonical_body_hash": "9f36d7892d1ce610990354708cc635f1",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes on table paquetes",
+      "trigger trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles on table paquetes_detalles"
+    ],
+    "triggers": [
+      "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_sin_servicios_inactivos_en_paquetes AFTER INSERT OR UPDATE OF activo, deleted_at ON public.paquetes DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_sin_servicios_inactivos()",
+      "CREATE CONSTRAINT TRIGGER trg_validar_paquete_activo_sin_servicios_inactivos_en_detalles AFTER INSERT OR DELETE OR UPDATE ON public.paquetes_detalles DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_paquete_activo_sin_servicios_inactivos()"
+    ]
+  },
+  {
+    "signature": "public.fn_validar_persona_empleado_campos_obligatorios()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "2b2b513e8938f017bc635d58c2e6ed5c",
+    "canonical_body_hash": "2b2b513e8938f017bc635d58c2e6ed5c",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_validar_empleado_campos_obligatorios_empleados on table empleados",
+      "trigger trg_validar_empleado_campos_obligatorios_personas on table personas"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_validar_empleado_campos_obligatorios_empleados BEFORE INSERT OR UPDATE OF id_persona, deleted_at ON public.empleados FOR EACH ROW EXECUTE FUNCTION fn_validar_persona_empleado_campos_obligatorios()",
+      "CREATE TRIGGER trg_validar_empleado_campos_obligatorios_personas BEFORE UPDATE OF dni, telefono_principal, deleted_at ON public.personas FOR EACH ROW EXECUTE FUNCTION fn_validar_persona_empleado_campos_obligatorios()"
+    ]
+  },
+  {
+    "signature": "public.fn_validar_servicio_activo_con_tarifa_base()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "016ee021bb845a57158a5ffefe1c1630",
+    "canonical_body_hash": "016ee021bb845a57158a5ffefe1c1630",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_validar_servicio_activo_con_tarifa_en_servicios on table servicios",
+      "trigger trg_validar_servicio_activo_con_tarifa_en_tarifas on table servicios_tarifas"
+    ],
+    "triggers": [
+      "CREATE CONSTRAINT TRIGGER trg_validar_servicio_activo_con_tarifa_en_servicios AFTER INSERT OR UPDATE OF activo, deleted_at ON public.servicios DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_servicio_activo_con_tarifa_base()",
+      "CREATE CONSTRAINT TRIGGER trg_validar_servicio_activo_con_tarifa_en_tarifas AFTER INSERT OR DELETE OR UPDATE ON public.servicios_tarifas DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fn_validar_servicio_activo_con_tarifa_base()"
+    ]
+  },
+  {
+    "signature": "public.set_current_timestamp_updated_at()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "9b1889f56258bf9d6554213c05019c76",
+    "canonical_body_hash": "9b1889f56258bf9d6554213c05019c76",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_barberos_perfiles_publicos_updated_at on table barberos_perfiles_publicos"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_barberos_perfiles_publicos_updated_at BEFORE UPDATE ON public.barberos_perfiles_publicos FOR EACH ROW EXECUTE FUNCTION set_current_timestamp_updated_at()"
+    ]
+  },
+  {
+    "signature": "public.validate_membership_plan_beneficios()",
+    "expected_kind": "function",
+    "actual_kind": "f",
+    "current_owner": "postgres",
+    "definition_status": "KNOWN_DEFINITION",
+    "security_definer": false,
+    "current_config": null,
+    "proposed_path_if_changed": "pg_catalog, public, pg_temp",
+    "literal_body_hash": "30211caf31b6be34f745c27ade950b42",
+    "canonical_body_hash": "30211caf31b6be34f745c27ade950b42",
+    "execution_scope": "unchanged",
+    "rpc_return_kind_candidate": false,
+    "reported_pgrst_schemas": null,
+    "current_acl": [
+      {
+        "grantee": "PUBLIC",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      },
+      {
+        "grantee": "postgres",
+        "grantor": "postgres",
+        "grantable": false,
+        "privilege": "EXECUTE"
+      }
+    ],
+    "effective_access": [
+      {
+        "role": "anon",
+        "execute": true
+      },
+      {
+        "role": "authenticated",
+        "execute": true
+      },
+      {
+        "role": "authenticator",
+        "execute": true
+      },
+      {
+        "role": "dashboard_user",
+        "execute": true
+      },
+      {
+        "role": "postgres",
+        "execute": true
+      },
+      {
+        "role": "service_role",
+        "execute": true
+      },
+      {
+        "role": "supabase_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_auth_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_etl_admin",
+        "execute": true
+      },
+      {
+        "role": "supabase_read_only_user",
+        "execute": true
+      },
+      {
+        "role": "supabase_storage_admin",
+        "execute": true
+      }
+    ],
+    "references": [
+      "schema public",
+      "language plpgsql"
+    ],
+    "dependents": [
+      "trigger trg_validate_plan_beneficios on table membership_plans"
+    ],
+    "triggers": [
+      "CREATE TRIGGER trg_validate_plan_beneficios BEFORE INSERT OR UPDATE ON public.membership_plans FOR EACH ROW EXECUTE FUNCTION validate_membership_plan_beneficios()"
+    ]
+  }
+]
