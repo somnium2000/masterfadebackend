@@ -1,23 +1,28 @@
 # Matriz MasterPuntos QA / Produccion
 
-Actualizada 15/11/2026 17:22 America/Tegucigalpa. Corte backend `origin/main=55a86ef`; candidato `release/prod-masterpuntos-functional`. Catalogo/ACL/respaldo consultados nuevamente despues de SEGURIDAD-02. No confundir codigo integrado, SQL efectivo y certificacion funcional.
+Corte 15/11/2026 18:27 Honduras. main=55a86ef; candidato #123 sobre la misma rama.
+La aclaracion final del propietario define vigencia por ciclo: primer punto +12 meses,
+no doce meses independientes por cada credito. Las fechas de las cargas manuales
+productivas quedan expresamente autorizadas como inicio del ciclo.
 
-| Capacidad | Codigo en main | Codigo candidato | SQL QA efectivo | SQL PROD efectivo | Certificacion |
-|---|---|---|---|---|---|
-| Lecturas sin materializar expiracion | Integrado | Conservado | Vista/rutina presentes | Vista/rutina presentes | Regresiones locales; no escrituras remotas |
-| Ajustes admin, permisos y limites de #121 | Integrado | Conserva alcance de resta de main; vincula movimientos nuevos al ciclo | Idempotencia presente | Idempotencia presente | HTTP + PG17 sintetico |
-| Ciclos anuales en ambos overloads | Pendiente funcional | Preparado en SQL manual | Cuerpos anuales presentes | Overload de dos argumentos deja NULL | Transicion local a hashes QA; pendiente PROD |
-| Acreditacion por pago confirmado valido | Escritor anticipado presente | Retirado de tres llamadas; SQL diferido | Cuatro triggers diferidos presentes | Cuatro triggers ausentes; hook por completada | PG17 con pagos sinteticos; pendiente PROD |
-| Canje titular sin acreditacion propia | Codigo parcial | Sin DELETE historicos; debito con ciclo | Guard de pago/beneficiario presente | Guard antiguo por completada | Canje e idempotencia locales |
-| Canje con 1–4 acompanantes | Restriccion antigua en hold | Permite grupo ordenado; conserva restricciones restantes | Credita al titular en grupo autenticado | Semantica antigua | SQL/HTTP sinteticos; pendiente extremo a extremo remoto |
-| Confirmacion total cero concurrente | Lectura previa al lock | Lock de grupo antes de leer efectos | Sin cambio SQL de reservas | Sin cambio SQL de reservas | HTTP local, sin proveedor externo |
-| Protecciones VIP/pago real vs mock/simulacion | Motor main conservado | Sin importar cambios generales de membresias | Helpers de evidencia financiera presentes | Helpers ausentes | PG17 sintetico; no validacion de cuentas reales |
-| SEGURIDAD-02 para dependencias de puntos | Integrado y aplicado | Preserva path/ACL de las nueve publicas y respaldo intacto | Hardening presente | Hardening aplicado | CATALOG_DRIFT=0 y SECURITY02_BACKUP_DRIFT=0 en PROD; transicion/reversion PG17 |
-| Historial legitimo sin ciclo | Registros administrativos existentes | Bloquea imputacion no aprobada; cero DML historico | Referencia funcional, sin limpiar datos | 14 movimientos, 69 puntos netos, 12 clientes, cero ciclos | **NO-GO financiero de aplicacion** |
-| Debito mixto y reinicio tras canje | Sin convivencia certificada | Prueba real reproduce ciclo -5 y reutilizacion del vencimiento anterior | Cuerpos objetivo sin corregir | Sin aplicar | **9 comprobaciones de diagnostico, no certificacion funcional** |
+| Capacidad | Codigo candidato | SQL preparado | Produccion efectiva | Evidencia |
+|---|---|---|---|---|
+| Ajustes, permisos, limites y auditoria | Preservados; error de ciclo controlado | Guarda valida saldo/pertenencia | Version previa conservada | HTTP y PostgreSQL17 |
+| Primer punto y siguientes | Mismo contrato | Aniversario comun; sexto punto no reinicia | SQL nuevo no aplicado | Casos con fechas diferentes |
+| Reinicio tras agotamiento | Sin cambios de API | Cierra ciclo a cero; siguiente credito abre 12 meses | Pendiente aplicacion | Canje/resta y nuevos creditos reales aislados |
+| Historico legitimo 14/69/12 | No reescribe movimientos | Crea solo ciclos desde primera carga autorizada | Ledger/hash intactos, cero ciclos | Preflight remoto solo lectura: 19 controles=0 |
+| Saldo mixto y canje de diez | Conserva unica fila de canje | Resuelve cargas originales por cliente/periodo | Sin operaciones reales nuevas | 9+5-10=4; concurrencia/replay |
+| Vencimiento del remanente | Lecturas sin escribir | Vista y materializacion usan el mismo ciclo | Motor anterior, sin activar este release | Ocho puntos, aniversario y una sola expiracion |
+| Conservacion de ledger | Sin compensaciones/borrados | Hash antes/despues identico | 7d9c4759b1d2e7f35c98a4c983f68cb6 | Comparacion byte a byte en PG17 |
+| Acreditacion y acompanantes | Candidato previo preservado | Reglas de elegibilidad/pago intactas | Pendiente release coordinado | Suites pagada/grupal sinteticas |
+| SEGURIDAD-02 | Sin cambios a su fuente/respaldo | Paths/ACL preservados; tres cuerpos nuevos con hashes certificados | Aplicada; drift=0 | Tests originales y guardas actuales |
+| Rollback | Sin restaurar escritores que borran puntos | Antes de trafico: restaura ciclos/vista/rutinas; despues: contencion | No ejecutado remotamente | Backups privados, baseline y bloqueo tras trafico |
 
-SEGURIDAD-02 esta aplicada en PROD; ciclos/pago confirmado siguen pendientes. El paquete no modifica historial de migraciones ni rebaselina el respaldo de seguridad. Los cuerpos comerciales objetivo son los efectivos de QA, conservando el path endurecido de PROD. Una coincidencia de nombres no es certificacion.
+No se consideran permanentes los movimientos antiguos con id_cycle/vence_at NULL:
+el ciclo efectivo validado determina su vigencia. No hay categorias comerciales,
+puntos sustitutivos, cambios de PixelPay/checkout ni cambios de PR #132/#111/#93/#125.
 
-Estado de entrega: candidato revisable, SQL manual preparado, **SQL remoto NO aplicado**, merge/despliegue NO realizados, certificacion de PROD NO concedida. El frontend no cambia en este trabajo; su paridad visual y certificacion remota no se afirman. PixelPay Hosted y cambios generales de agendamiento quedan fuera.
-
-Procedimiento vigente: [release10/CIERRE-CODEXA.md](release10/CIERRE-CODEXA.md). Lecturas actuales: [PROD](release10/prod-preflight-current.json), [QA](release10/qa-preflight-current.json). Las lecturas previas quedan como evidencia historica, fuera del generador operativo. Tras una futura ventana autorizada registrar SHA desplegado, acta SQL y certificacion remota por separado.
+Procedimiento y criterios: [CIERRE-CODEXA.md](release10/CIERRE-CODEXA.md).
+Los documentos/lecturas anteriores quedan como evidencia historica, no como politica
+vigente. Codigo/SQL revisables tras CI verde; no hay autorizacion de merge, SQL remoto
+o despliegue. La certificacion de la integracion productiva desplegada sigue pendiente.

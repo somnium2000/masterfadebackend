@@ -31,7 +31,7 @@ test('Release10: cuerpos PROD efectivos, transicion atomica a QA y reversion con
         await assert.rejects(c.query(await f.sql('10-apply.sql')),new RegExp(reason));await c.query('ROLLBACK');
       }finally{c.release();}assert.deepEqual(await f.snapshot(),before);allZero(await f.run('00-preflight.sql'));
     });
-    await t.test('sin ciclos con saldo historico abierto: bloquea sin DDL ni correccion',async()=>{
+    await t.test('saldo historico sin evidencia de autor: bloquea sin DDL ni correccion',async()=>{
       const actor=await f.owner();await f.pool.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos) VALUES($1,'ajustar',5)",[actor.id]);
       const before=await f.snapshot();
       const c=await f.pool.connect();try{await assert.rejects(c.query(await f.sql('10-apply.sql')),/HISTORICAL_UNCYCLED_REVIEW/);await c.query('ROLLBACK');}finally{c.release();}
@@ -40,7 +40,7 @@ test('Release10: cuerpos PROD efectivos, transicion atomica a QA y reversion con
       await f.pool.query("INSERT INTO points_transactions(id_cliente,tipo_puntos_codigo,puntos) VALUES($1,'ajuste_resta',5)",[actor.id]);
       allZero(await f.run('00-preflight.sql'));
     });
-    await t.test('14 movimientos administrativos legitimos y 69 puntos: bloqueo explicito sin regularizacion',async()=>{
+    await t.test('14 movimientos sin autor comprobable: bloqueo explicito sin regularizacion',async()=>{
       const owners=await Promise.all(Array.from({length:12},()=>f.owner()));const c=await f.pool.connect();
       try{
         await c.query('BEGIN');

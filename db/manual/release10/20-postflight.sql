@@ -2,18 +2,31 @@
 BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL TimeZone='UTC';
 SET LOCAL search_path=pg_catalog,public;
-SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN NOT EXISTS (SELECT 1 FROM (VALUES
+DO $backup$ DECLARE n bigint:=0; BEGIN
+ IF to_regclass('app_private.release10_cycle_bootstrap_backup') IS NOT NULL THEN
+ EXECUTE 'SELECT CASE WHEN count(*)=1 AND bool_and(seal=md5(ledger_md5||cycles_before_md5||cycles_before::text||cycles_after::text)) THEN 0 ELSE 1 END FROM app_private.release10_cycle_bootstrap_backup' INTO n;
+ IF EXISTS(SELECT 1 FROM pg_class WHERE oid='app_private.release10_cycle_bootstrap_backup'::regclass
+   AND (pg_get_userbyid(relowner)<>'postgres' OR NOT relrowsecurity))
+   OR has_table_privilege('anon','app_private.release10_cycle_bootstrap_backup','SELECT,INSERT,UPDATE,DELETE')
+   OR has_table_privilege('authenticated','app_private.release10_cycle_bootstrap_backup','SELECT,INSERT,UPDATE,DELETE')
+   OR has_table_privilege('service_role','app_private.release10_cycle_bootstrap_backup','SELECT,INSERT,UPDATE,DELETE') THEN n:=n+1; END IF;
+ END IF;
+ PERFORM set_config('masterfade.release10_bootstrap_drift',n::text,true);
+ END $backup$;
+SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN md5(pg_get_viewdef('public.vw_points_balance'::regclass,true))='4a9b6f5a236c559aced71862d60aa811'
+ AND (SELECT pg_get_userbyid(relowner)='postgres' AND relacl::text='{postgres=arwdDxtm/postgres,mf_audit_readonly=r/postgres}'
+ FROM pg_class WHERE oid='public.vw_points_balance'::regclass) AND to_regclass('app_private.release10_cycle_bootstrap_backup') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM (VALUES
 ('app_private.points_appointment_paid_v1(uuid)','663537c379708916af32a983c04bd4cd','{postgres=X/postgres}'),
 ('app_private.points_award_paid_appointment_v1(uuid)','e8912101bcf8da89a498de48b530928e','{postgres=X/postgres}'),
 ('app_private.points_award_paid_event_v1()','6234460cf41408ba70f151d2613246af','{postgres=X/postgres}'),
 ('app_private.points_payment_valid_v1(uuid)','fd02d98719e13fef3b90356343f318c4','{postgres=X/postgres}'),
 ('public.fn_points_estado_final_cita()','7fb6bdfda4c090baa1cc35217fb793b7',''),
 ('public.fn_points_get_effective_rule(uuid)','66f5ab15eeca8e37248f9dcfcb47ad4f',''),
-('public.fn_points_get_or_create_active_cycle(uuid,integer,timestamp with time zone)','50a10a365d5da4d86fdf44a34698c704',''),
+('public.fn_points_get_or_create_active_cycle(uuid,integer,timestamp with time zone)','8dc2c1af4e08b0a79fd1f60922219bba',''),
 ('public.fn_points_get_or_create_active_cycle(uuid,timestamp with time zone)','8591cd5d75c788dad26d3f01da39916e',''),
-('public.fn_points_materialize_expired_cycles(uuid)','64f4a8091790eeeaf5887fb505edaf61',''),
+('public.fn_points_materialize_expired_cycles(uuid)','baf12a0bd62353ae20131a7ff4a0e59f',''),
 ('public.fn_points_tx_apply_tipo_sign()','880bc208992a8e325add77fe7edf467f',''),
-('public.fn_points_tx_guard_acumular_final()','1bddbe08306f6ebdde21b92b065b2a8b',''),
+('public.fn_points_tx_guard_acumular_final()','c5b2927b50497f5047466f3829ffd4c3',''),
 ('public.fn_trg_otorgar_puntos_plan_confirmada()','30d6d740dc19182fa2ffb702257c3f50',''),
 ('public.fn_trg_otorgar_puntos_por_cita()','5505b1ae05412a8e42de790c5790282c','')
 ) e(signature,hash,acl)
@@ -42,7 +55,7 @@ SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN NOT EXISTS (SELECT 1 FROM (
 ('public.fn_trg_otorgar_puntos_por_cita()','{"kind":"function","signature":"public.fn_trg_otorgar_puntos_por_cita()","applied_at":"2026-11-15T14:55:32.165695+00:00","captured_at":"2026-11-15T14:55:32.165353+00:00","dependencies":{"triggers":["CREATE TRIGGER tr_points_cita_confirmada AFTER UPDATE ON public.citas FOR EACH ROW EXECUTE FUNCTION public.fn_trg_otorgar_puntos_por_cita()"],"dependents":["trigger tr_points_cita_confirmada on table public.citas"],"references":["schema public","language plpgsql"]},"original_acl":null,"path_changed":true,"applied_config":["search_path=pg_catalog, public, pg_temp"],"original_owner":"postgres","rolled_back_at":null,"original_config":null,"original_body_hash":"b271a74a0fd9440113f62c331e8a7ea8","applied_execute_acl":[{"grantee":"PUBLIC","grantor":"postgres","grantable":false},{"grantee":"postgres","grantor":"postgres","grantable":false}],"original_definition":"CREATE OR REPLACE FUNCTION public.fn_trg_otorgar_puntos_por_cita()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nDECLARE\n  v_estado_final text;\n  v_origen text;\n  v_puntos_por_cita integer := 1;\n  v_cycle record;\n  v_cliente_usuario uuid;\nBEGIN\n  SELECT public.fn_points_estado_final_cita() INTO v_estado_final;\n\n  IF TG_OP = ''INSERT'' THEN\n    IF NEW.estado_cita_codigo IS DISTINCT FROM v_estado_final THEN\n      RETURN NEW;\n    END IF;\n  ELSIF TG_OP = ''UPDATE'' THEN\n    IF NOT (\n      OLD.estado_cita_codigo IS DISTINCT FROM NEW.estado_cita_codigo\n      AND NEW.estado_cita_codigo = v_estado_final\n    ) THEN\n      RETURN NEW;\n    END IF;\n  ELSE\n    RETURN NEW;\n  END IF;\n\n  IF NEW.id_cliente IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  v_origen := CASE\n    WHEN COALESCE(NEW.orden_integrante, 1) > 1 THEN ''integrante''\n    ELSE ''titular''\n  END;\n\n  IF COALESCE(NEW.es_canje_recompensa, false) IS TRUE AND v_origen = ''titular'' THEN\n    RETURN NEW;\n  END IF;\n\n  SELECT COALESCE(pr.puntos_por_cita, 1)\n  INTO v_puntos_por_cita\n  FROM public.points_rules pr\n  WHERE pr.activo IS TRUE\n    AND (pr.id_sucursal = NEW.id_sucursal OR pr.id_sucursal IS NULL)\n  ORDER BY\n    CASE WHEN pr.id_sucursal = NEW.id_sucursal THEN 0 ELSE 1 END,\n    pr.updated_at DESC NULLS LAST,\n    pr.created_at DESC NULLS LAST\n  LIMIT 1;\n\n  SELECT *\n  INTO v_cycle\n  FROM public.fn_points_get_or_create_active_cycle(\n    NEW.id_cliente,\n    COALESCE(NEW.inicio_at, now())\n  )\n  LIMIT 1;\n\n  SELECT c.id_usuario\n  INTO v_cliente_usuario\n  FROM public.clientes c\n  WHERE c.id_cliente = NEW.id_cliente\n    AND c.deleted_at IS NULL\n  LIMIT 1;\n\n  INSERT INTO public.points_transactions (\n    id_cliente,\n    id_cita,\n    id_cycle,\n    id_sucursal_origen,\n    tipo_puntos_codigo,\n    origen_punto_codigo,\n    puntos,\n    vence_at,\n    motivo,\n    creado_por_usuario_id,\n    created_at,\n    updated_at\n  )\n  VALUES (\n    NEW.id_cliente,\n    NEW.id_cita,\n    v_cycle.id_cycle,\n    NEW.id_sucursal,\n    ''acumular'',\n    v_origen,\n    GREATEST(1, COALESCE(v_puntos_por_cita, 1)),\n    v_cycle.vence_at,\n    CASE WHEN v_origen = ''integrante''\n      THEN ''Punto por acompañante en visita completada''\n      ELSE ''Punto por visita completada del titular''\n    END,\n    COALESCE(NEW.creada_por_usuario_id, v_cliente_usuario),\n    now(),\n    now()\n  )\n  ON CONFLICT DO NOTHING;\n\n  RETURN NEW;\nEND;\n$function$\n","original_execute_acl":[{"grantee":"PUBLIC","grantor":"postgres","grantable":false},{"grantee":"postgres","grantor":"postgres","grantable":false}],"original_security_definer":false}')
 ) e(signature,metadata)
  LEFT JOIN app_private.security02_routine_backup b USING(signature)
- WHERE b.signature IS NULL OR b.routine_oid<>to_regprocedure(e.signature)::oid OR to_jsonb(b)-'routine_oid'<>e.metadata::jsonb;
+ WHERE b.signature IS NULL OR b.routine_oid<>to_regprocedure(e.signature)::oid OR to_jsonb(b)-'routine_oid'<>e.metadata::jsonb UNION ALL SELECT 'CYCLE_BOOTSTRAP_BACKUP_DRIFT' code,current_setting('masterfade.release10_bootstrap_drift')::bigint affected;
 -- AM: SELECT compartido por preflight y aplicacion; sin escrituras ni reparacion implicita.
 WITH historical AS (
   SELECT pt.*, tp.signo,
@@ -51,17 +64,41 @@ WITH historical AS (
   WHERE pt.id_cycle IS NULL
 ), history_review AS (
   SELECT h.id_cliente FROM historical h GROUP BY h.id_cliente
-  HAVING sum(h.puntos::bigint) <> 0
-    OR min(h.running) < 0 OR count(DISTINCT h.created_at) <> count(*)
-    OR NOT bool_and(COALESCE(
-      h.created_at IS NOT NULL AND isfinite(h.created_at)
-      AND h.updated_at IS NOT NULL AND isfinite(h.updated_at)
-      AND h.updated_at >= h.created_at AND h.updated_at <= now() AND h.vence_at IS NULL
-      AND ((h.puntos > 0 AND h.tipo_puntos_codigo IN ('acumular','ajustar') AND h.signo=1)
-        OR (h.puntos < 0 AND h.tipo_puntos_codigo='ajuste_resta' AND h.signo=-1)
+  HAVING NOT (
+    min(h.running)>=0 AND count(DISTINCT h.created_at)=count(*)
+    AND bool_and(COALESCE(isfinite(h.created_at) AND isfinite(h.updated_at)
+      AND h.created_at<=h.updated_at AND h.updated_at<=now() AND h.vence_at IS NULL
+      AND ((h.puntos>0 AND h.tipo_puntos_codigo IN ('acumular','ajustar') AND h.signo=1)
+        OR (h.puntos<0 AND h.tipo_puntos_codigo='ajuste_resta' AND h.signo=-1)
         OR (h.puntos=-10 AND h.tipo_puntos_codigo='canjear' AND h.signo=-1)),false))
-    OR EXISTS (SELECT 1 FROM public.points_cycles pc WHERE pc.id_cliente=h.id_cliente
-      AND (pc.primer_acumulado_at <= max(h.created_at) OR pc.primer_acumulado_at <= max(h.updated_at)))
+    AND (
+      (sum(h.puntos::bigint)=0 AND NOT EXISTS(SELECT 1 FROM public.points_cycles pc
+        WHERE pc.id_cliente=h.id_cliente AND (pc.primer_acumulado_at<=max(h.created_at)
+          OR pc.primer_acumulado_at<=max(h.updated_at))))
+      OR (
+        -- AM: Carga manual aprobada por el propietario: el primer registro positivo inicia el ciclo.
+        sum(h.puntos::bigint)>0 AND bool_and(h.tipo_puntos_codigo IN ('ajustar','ajuste_resta')
+          AND h.creado_por_usuario_id IS NOT NULL)
+        AND max(h.created_at)<((min(h.created_at) FILTER(WHERE h.puntos>0) AT TIME ZONE 'America/Tegucigalpa')
+          +interval '12 months') AT TIME ZONE 'America/Tegucigalpa'
+        AND (
+          (NOT EXISTS(SELECT 1 FROM public.points_cycles pc WHERE pc.id_cliente=h.id_cliente)
+            AND ((min(h.created_at) FILTER(WHERE h.puntos>0) AT TIME ZONE 'America/Tegucigalpa')
+              +interval '12 months') AT TIME ZONE 'America/Tegucigalpa'>now())
+          OR (EXISTS(SELECT 1 FROM public.points_cycles pc WHERE pc.id_cliente=h.id_cliente
+                AND pc.primer_acumulado_at=min(h.created_at) FILTER(WHERE h.puntos>0))
+            AND bool_and((SELECT count(*) FROM public.points_cycles pc
+              WHERE pc.id_cliente=h.id_cliente AND h.created_at>=pc.primer_acumulado_at
+                AND h.created_at<pc.vence_at)=1))
+        )
+      )
+    )
+  )
+), effective AS (
+  SELECT pt.*,COALESCE(pt.id_cycle,(SELECT pc.id_cycle FROM public.points_cycles pc
+    WHERE pc.id_cliente=pt.id_cliente AND pt.created_at>=pc.primer_acumulado_at AND pt.created_at<pc.vence_at
+    ORDER BY pc.primer_acumulado_at DESC,pc.id_cycle DESC LIMIT 1)) effective_cycle
+  FROM public.points_transactions pt
 ), issues AS (
  SELECT 'HISTORICAL_UNCYCLED_REVIEW' code, count(*)::bigint affected FROM history_review
  UNION ALL SELECT 'RULE_REVIEW', count(*) FROM public.points_rules WHERE activo IS TRUE
@@ -77,7 +114,11 @@ WITH historical AS (
    LEFT JOIN public.points_cycles pc ON pc.id_cycle=pt.id_cycle
    WHERE pt.id_cycle IS NOT NULL AND pt.id_cliente IS DISTINCT FROM pc.id_cliente
  UNION ALL SELECT 'CYCLE_NEGATIVE_BALANCE', count(*) FROM (
-   SELECT id_cycle FROM public.points_transactions WHERE id_cycle IS NOT NULL GROUP BY id_cycle HAVING sum(puntos::bigint)<0) d
+   SELECT effective_cycle FROM effective WHERE effective_cycle IS NOT NULL GROUP BY effective_cycle HAVING sum(puntos::bigint)<0) d
+ UNION ALL SELECT 'INACTIVE_CYCLE_BALANCE_REVIEW',count(*) FROM (
+   SELECT pc.id_cycle FROM public.points_cycles pc JOIN effective e ON e.effective_cycle=pc.id_cycle
+   JOIN public.clientes c ON c.id_cliente=pc.id_cliente AND c.deleted_at IS NULL AND c.estado IS NOT FALSE
+   WHERE pc.estado_ciclo_codigo IN ('cerrado','expirado') GROUP BY pc.id_cycle HAVING sum(e.puntos::bigint)<>0) d
  UNION ALL SELECT 'CLIENT_NEGATIVE_OR_OVERFLOW_BALANCE', count(*) FROM (
    SELECT id_cliente FROM public.points_transactions GROUP BY id_cliente
    HAVING sum(puntos::bigint)<0 OR sum(puntos::bigint)>2147483647) d

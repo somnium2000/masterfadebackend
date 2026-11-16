@@ -8,7 +8,9 @@
   "prod_project": "pdzsmkjnyazpkoocjbpw",
   "sources": {
     "db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql": "211a3dfb034f9dd83df0021ad8e89c6ad58ca2d1315cb54814bb03c87f0ba5ad",
-    "db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql": "bcfbaf4ff3c74b1b298fc2f378c2990c4a18fcc234e1657924ca9604071194bc"
+    "db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql": "bcfbaf4ff3c74b1b298fc2f378c2990c4a18fcc234e1657924ca9604071194bc",
+    "db/manual/release10/cycle-accounting.sql": "12b76b03aad5a8ee37dbbad9efe377b6edef06910b07ccf49d0f5b6c6bb72db5",
+    "db/manual/release10/cycle-bootstrap.sql": "ca5c332671ef260c9d04e720788d93be5e43df2ca234ef054817e664d3c0235f"
   },
   "qa_functions": [
     {
@@ -43,8 +45,8 @@
     },
     {
       "signature": "public.fn_points_get_or_create_active_cycle(uuid,integer,timestamp with time zone)",
-      "hash": "50a10a365d5da4d86fdf44a34698c704",
-      "body_hash": "00ae108a843def22ce1b8e732e9a75ba"
+      "hash": "8dc2c1af4e08b0a79fd1f60922219bba",
+      "body_hash": "67bd8cbffe595873ac496c1debc302af"
     },
     {
       "signature": "public.fn_points_get_or_create_active_cycle(uuid,timestamp with time zone)",
@@ -53,8 +55,8 @@
     },
     {
       "signature": "public.fn_points_materialize_expired_cycles(uuid)",
-      "hash": "64f4a8091790eeeaf5887fb505edaf61",
-      "body_hash": "1fc9e808d8d6d56570897b5c84480144"
+      "hash": "baf12a0bd62353ae20131a7ff4a0e59f",
+      "body_hash": "17daa417ec86c7bd7eb137f4b1fd9db8"
     },
     {
       "signature": "public.fn_points_tx_apply_tipo_sign()",
@@ -63,8 +65,8 @@
     },
     {
       "signature": "public.fn_points_tx_guard_acumular_final()",
-      "hash": "1bddbe08306f6ebdde21b92b065b2a8b",
-      "body_hash": "6ff488db9f5a4e7843b32dd978ae529a"
+      "hash": "c5b2927b50497f5047466f3829ffd4c3",
+      "body_hash": "0e923d620034fee20531e44a45f5af59"
     },
     {
       "signature": "public.fn_trg_otorgar_puntos_plan_confirmada()",
@@ -124,5 +126,5 @@
       "body_hash": "b271a74a0fd9440113f62c331e8a7ea8"
     }
   ],
-  "note": "Cuerpos QA sin cambios; path endurecido de PROD preservado. Historico legitimo sin ciclo bloquea aplicacion. Respaldo SEGURIDAD-02 no se rebaselina."
+  "note": "Ciclos de doce meses desde primer punto, segun aclaracion del propietario; carga manual historica inicia en su primer registro positivo. Ledger intacto. Respaldo SEGURIDAD-02 no se rebaselina."
 }

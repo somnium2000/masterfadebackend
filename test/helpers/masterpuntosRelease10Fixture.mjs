@@ -13,7 +13,7 @@ export async function createMasterpuntosRelease10Fixture() {
   const keys = prod.constraints.filter(c=>c.definition.startsWith('PRIMARY KEY'));
   const close = async () => { await pool.end(); await isolated.stop(); };
   try {
-    await pool.query('CREATE SCHEMA app_private; CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;');
+    await pool.query('CREATE SCHEMA app_private; CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role; CREATE ROLE mf_audit_readonly;');
     await pool.query(await source('db/migrations/20261031143653_masterpuntos_manual_adjustment_idempotency_v1.sql'));
     const tables = new Map();
     for (const c of [...prod.columns,...extra.columns]) {
@@ -38,7 +38,11 @@ export async function createMasterpuntosRelease10Fixture() {
       const local=(await pool.query('SELECT to_regprocedure($1)::oid oid',[saved.signature])).rows[0].oid;
       await pool.query('INSERT INTO app_private.security02_routine_backup SELECT * FROM jsonb_populate_record(NULL::app_private.security02_routine_backup,$1::jsonb)',[JSON.stringify({...saved,routine_oid:local})]);
     }
-    for (const v of prod.views) await pool.query(`CREATE VIEW public.${v.name} AS ${v.definition}`);
+    for (const v of prod.views) {
+      await pool.query(`CREATE VIEW public.${v.name} AS ${v.definition}`);
+      // AM: ACL reales de las vistas, incluido el lector de auditoria de produccion.
+      await pool.query(`GRANT ALL ON public.${v.name} TO postgres; GRANT SELECT ON public.${v.name} TO mf_audit_readonly;`);
+    }
     for (const t of prod.triggers.filter(t=>t.name.startsWith('tr_points_'))) await pool.query(t.definition);
     for (const t of extra.types) await pool.query('INSERT INTO tipos_puntos(tipo_puntos_codigo,descripcion,signo) VALUES($1,$2,$3)',[t.tipo_puntos_codigo,t.descripcion,t.signo]);
     await pool.query("INSERT INTO points_rules(expiracion_meses) VALUES(NULL); INSERT INTO estados_cita VALUES('completada','Completada');");

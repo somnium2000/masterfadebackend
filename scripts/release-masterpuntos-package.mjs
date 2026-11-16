@@ -9,10 +9,15 @@ const literal = value => "'" + String(value).replaceAll("'", "''") + "'";
 const prod = JSON.parse(await read('test/fixtures/masterpuntos-release10/current/prod-catalog.json'));
 const qaObserved = JSON.parse(await read('test/fixtures/masterpuntos-release10/current/qa-catalog.json'));
 const extra = JSON.parse(await read('test/fixtures/masterpuntos-release10/current/prod-extra.json'));
-// AM: Mismos cuerpos efectivos QA; conservar el path endurecido productivo en las nueve rutinas publicas.
+// AM: Correccion local certificada sobre cuerpos QA, sin rebaselinar SEGURIDAD-02.
+const cycleSource=await read('db/manual/release10/cycle-accounting.sql');
+const cycleTarget=JSON.parse(await read('test/fixtures/masterpuntos-release10/current/cycle-target.json'));
+if(createHash('sha256').update(cycleSource).digest('hex')!==cycleTarget.source_sha256)throw new Error('CYCLE_TARGET_SOURCE_NOT_CERTIFIED');
+const overrides=new Map(cycleTarget.functions.map(f=>[f.signature,f]));
 const qa = {...qaObserved,functions:qaObserved.functions.map(f=>{
   if(f.signature.startsWith('app_private.'))return f;
   const definition=f.definition.replace(" SET search_path TO 'pg_catalog', 'public'\n", " SET search_path TO 'pg_catalog', 'public', 'pg_temp'\n");
+  if(overrides.has(f.signature))return {...f,...overrides.get(f.signature)};
   return {...f,definition,config:['search_path=pg_catalog, public, pg_temp'],hash:createHash('md5').update(definition).digest('hex')};
 })};
 const data = (await read('db/manual/release10/data-checks.sql')).replace(/;\s*$/, '');
@@ -29,9 +34,15 @@ const triggerCheck = (list, containment=false) => `NOT EXISTS (SELECT 1 FROM (VA
  LEFT JOIN pg_trigger t ON t.tgrelid=to_regclass('public.'||e.tablename) AND t.tgname=e.name
  WHERE t.oid IS NULL OR NOT (t.tgenabled='O' ${containment ? "OR (e.name LIKE 'tr_points_paid_%' AND t.tgenabled='D')" : ''}) OR pg_get_triggerdef(t.oid)<>e.definition)`;
 const scopedTriggers = s => s.triggers.filter(t => t.name.startsWith('tr_points_'));
-const original = `${functionCheck(prod.functions)} AND ${triggerCheck(scopedTriggers(prod))}
+const originalView=prod.views.find(v=>v.name==='vw_points_balance');
+const viewCheck=hash=>`md5(pg_get_viewdef('public.vw_points_balance'::regclass,true))='${hash}'
+ AND (SELECT pg_get_userbyid(relowner)='postgres' AND relacl::text='${'{'+originalView.acl.join(',')+'}'}'
+ FROM pg_class WHERE oid='public.vw_points_balance'::regclass)`;
+const originalViewCheck=viewCheck(createHash('md5').update(originalView.definition).digest('hex'));
+const targetViewCheck=viewCheck(cycleTarget.view.hash);
+const original = `${originalViewCheck} AND ${functionCheck(prod.functions)} AND ${triggerCheck(scopedTriggers(prod))}
  AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname LIKE 'tr_points_paid_%' AND NOT tgisinternal)`;
-const target = `${functionCheck(qa.functions)} AND ${triggerCheck(scopedTriggers(qa))}`;
+const target = `${targetViewCheck} AND to_regclass('app_private.release10_cycle_bootstrap_backup') IS NOT NULL AND ${functionCheck(qa.functions)} AND ${triggerCheck(scopedTriggers(qa))}`;
 const columns = [...prod.columns,...extra.columns].filter(c =>
   c.table.startsWith('points_') || ['citas','citas_grupos','citas_detalles','clientes','payments','payment_intents',
     'subscriptions','subscription_consumptions','subscription_payments','membership_purchase_orders','payment_events','payment_providers','tipos_puntos'].includes(c.table));
@@ -49,7 +60,19 @@ const backupRows=values(prod.security_backup.map(b=>[b.signature,JSON.stringify(
 const backupGuard=`SELECT 'SECURITY02_BACKUP_DRIFT' code,count(*)::bigint affected FROM (VALUES\n${backupRows}\n) e(signature,metadata)
  LEFT JOIN app_private.security02_routine_backup b USING(signature)
  WHERE b.signature IS NULL OR b.routine_oid<>to_regprocedure(e.signature)::oid OR to_jsonb(b)-'routine_oid'<>e.metadata::jsonb`;
-const checks = `SELECT * FROM (${catalogChecks}) catalog UNION ALL SELECT * FROM (${data}) data_checks UNION ALL ${backupGuard}`;
+const readBootstrapGuard=`DO $backup$ DECLARE n bigint:=0; BEGIN
+ IF to_regclass('app_private.release10_cycle_bootstrap_backup') IS NOT NULL THEN
+ EXECUTE 'SELECT CASE WHEN count(*)=1 AND bool_and(seal=md5(ledger_md5||cycles_before_md5||cycles_before::text||cycles_after::text)) THEN 0 ELSE 1 END FROM app_private.release10_cycle_bootstrap_backup' INTO n;
+ IF EXISTS(SELECT 1 FROM pg_class WHERE oid='app_private.release10_cycle_bootstrap_backup'::regclass
+   AND (pg_get_userbyid(relowner)<>'postgres' OR NOT relrowsecurity))
+   OR has_table_privilege('anon','app_private.release10_cycle_bootstrap_backup','SELECT,INSERT,UPDATE,DELETE')
+   OR has_table_privilege('authenticated','app_private.release10_cycle_bootstrap_backup','SELECT,INSERT,UPDATE,DELETE')
+   OR has_table_privilege('service_role','app_private.release10_cycle_bootstrap_backup','SELECT,INSERT,UPDATE,DELETE') THEN n:=n+1; END IF;
+ END IF;
+ PERFORM set_config('masterfade.release10_bootstrap_drift',n::text,true);
+ END $backup$;\n`;
+const bootstrapGuard=`SELECT 'CYCLE_BOOTSTRAP_BACKUP_DRIFT' code,current_setting('masterfade.release10_bootstrap_drift')::bigint affected`;
+const checks = `SELECT * FROM (${catalogChecks}) catalog UNION ALL SELECT * FROM (${data}) data_checks UNION ALL ${backupGuard} UNION ALL ${bootstrapGuard}`;
 const requireZero = query => `DO $release10$ DECLARE r record; BEGIN
  FOR r IN ${query} LOOP
  IF r.affected<>0 THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_BLOCKED: % (%)',r.code,r.affected; END IF;
@@ -65,7 +88,7 @@ const beforeDigest = `SELECT set_config('masterfade.release10_ledger',${digest},
 const assertDigest = `DO $unchanged$ BEGIN IF ${digest}<>current_setting('masterfade.release10_ledger')
  OR ${cyclesDigest}<>current_setting('masterfade.release10_cycles') THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_LEDGER_CHANGED'; END IF; END $unchanged$;\n`;
 await mkdir(new URL('db/manual/release10/', root), { recursive: true });
-await save('00-preflight.sql', `-- AM: SOLO LECTURA; cualquier affected>0 es NO-GO. No llamar helpers mutables.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL TimeZone='UTC';\nSET LOCAL statement_timeout='60s';\nSET LOCAL search_path=pg_catalog,public;\n${checks};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nCOMMIT;\n`);
+await save('00-preflight.sql', `-- AM: SOLO LECTURA; cualquier affected>0 es NO-GO. No llamar helpers mutables.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL TimeZone='UTC';\nSET LOCAL statement_timeout='60s';\nSET LOCAL search_path=pg_catalog,public;\n${readBootstrapGuard}${checks};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nCOMMIT;\n`);
 const sources = ['db/manual/20261113024454_masterpuntos_completion_cycles_v1.sql','db/manual/20261113161929_masterpuntos_paid_confirmation_v1.sql'];
 let merged = '';
 const hashes = {};
@@ -76,20 +99,34 @@ for (const file of sources) {
 }
 const harden = prod.functions
   .map(f => `ALTER FUNCTION ${publicSignature(f)} SET search_path TO pg_catalog,public,pg_temp;`).join('\n');
-const targetGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${target} THEN 0 ELSE 1 END::bigint affected UNION ALL ${backupGuard}`;
-await save('10-apply.sql', `-- AM: MANUAL, requiere autorizacion y ventana sin escritores. DDL atomico, sin backfill.\n${begin}${locks}${requireZero(checks)}${beforeDigest}${merged}\n-- AM: Solo cuatro dependencias MasterPuntos de SEGURIDAD-02; no importar su hardening global.\n${harden}\n${requireZero(targetGuard)}${assertDigest}COMMIT;\n`);
-await save('20-postflight.sql', `-- AM: SOLO LECTURA; ejecutar antes de reabrir trafico y comparar hashes con 00.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL TimeZone='UTC';\nSET LOCAL search_path=pg_catalog,public;\n${targetGuard};\n${data};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nSELECT p.oid::regprocedure signature,md5(pg_get_functiondef(p.oid)) hash,p.prosecdef,p.proacl FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN('public','app_private') AND (p.proname ILIKE '%point%' OR p.proname ILIKE '%punto%') ORDER BY 1::text;\nCOMMIT;\n`);
+const targetGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${target} THEN 0 ELSE 1 END::bigint affected UNION ALL ${backupGuard} UNION ALL ${bootstrapGuard}`;
+await save('10-apply.sql', `-- AM: MANUAL, requiere autorizacion y ventana sin escritores. DDL atomico, sin backfill de puntos; metadatos de ciclos autorizados.\n${begin}${locks}${readBootstrapGuard}${requireZero(checks)}${beforeDigest}${merged}\n${cycleSource}\n${await read('db/manual/release10/cycle-bootstrap.sql')}\n-- AM: Solo cuatro dependencias MasterPuntos de SEGURIDAD-02; no importar su hardening global.\n${harden}\n${readBootstrapGuard}${requireZero(targetGuard)}${requireZero(data)}DO $preserve$ BEGIN IF ${digest}<>current_setting('masterfade.release10_ledger') THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_LEDGER_CHANGED'; END IF; END $preserve$;\nCOMMIT;\n`);
+await save('20-postflight.sql', `-- AM: SOLO LECTURA; ejecutar antes de reabrir trafico y comparar hashes con 00.\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL TimeZone='UTC';\nSET LOCAL search_path=pg_catalog,public;\n${readBootstrapGuard}${targetGuard};\n${data};\nSELECT count(*) ledger_rows,COALESCE(sum(puntos::bigint),0) ledger_sum,${digest} ledger_md5,${cyclesDigest} cycles_md5 FROM public.points_transactions;\nSELECT p.oid::regprocedure signature,md5(pg_get_functiondef(p.oid)) hash,p.prosecdef,p.proacl FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN('public','app_private') AND (p.proname ILIKE '%point%' OR p.proname ILIKE '%punto%') ORDER BY 1::text;\nCOMMIT;\n`);
 // AM: Reversion de contencion: detiene nuevos creditos, conserva guardas, expiracion y cada movimiento.
 const disable = scopedTriggers(qa).filter(t=>t.name.startsWith('tr_points_paid_')).map(t=>`ALTER TABLE public.${t.table} DISABLE TRIGGER ${t.name};`).join('\n');
-const containmentGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${functionCheck(qa.functions)} AND ${triggerCheck(scopedTriggers(qa),true)} THEN 0 ELSE 1 END::bigint affected UNION ALL ${backupGuard}`;
-await save('30-rollback-containment.sql', `-- AM: MANUAL; mantener trafico detenido. No restaurar backend antiguo ni reabrir con creditos suspendidos.\n${begin}${locks}${requireZero(containmentGuard)}${beforeDigest}${disable}\n${assertDigest}COMMIT;\n`);
+const containmentGuard = `SELECT 'TARGET_FUNCTIONS_OR_TRIGGERS' code,CASE WHEN ${functionCheck(qa.functions)} AND ${triggerCheck(scopedTriggers(qa),true)} THEN 0 ELSE 1 END::bigint affected UNION ALL ${backupGuard} UNION ALL ${bootstrapGuard}`;
+await save('30-rollback-containment.sql', `-- AM: MANUAL; mantener trafico detenido. No restaurar backend antiguo ni reabrir con creditos suspendidos.\n${begin}${locks}${readBootstrapGuard}${requireZero(containmentGuard)}${beforeDigest}${disable}\n${assertDigest}COMMIT;\n`);
 // AM: Restauracion exacta solamente para abortar antes de reabrir, con ledger/ciclos aun iguales al preflight.
 const restore = prod.functions.map(f=>f.definition+';').join('\n');
 const removePaid = scopedTriggers(qa).filter(t=>t.name.startsWith('tr_points_paid_')).map(t=>`DROP TRIGGER ${t.name} ON public.${t.table};`).join('\n');
 const restoreTriggers = scopedTriggers(prod).map(t=>t.definition.replace('CREATE TRIGGER','CREATE OR REPLACE TRIGGER')+';').join('\n');
 const removeHelpers = qa.functions.filter(f=>f.signature.startsWith('app_private.')).map(f=>`DROP FUNCTION ${f.signature};`).reverse().join('\n');
-await save('31-restore-before-traffic.sql', `-- AM: SOLO antes de reabrir. Introducir hashes 00; valores vacios bloquean. Mantener trafico detenido.\n${begin}${locks}${requireZero(targetGuard)}DO $gate$ BEGIN
+const restoreView=`CREATE OR REPLACE VIEW public.vw_points_balance AS ${originalView.definition};`;
+await save('31-restore-before-traffic.sql', `-- AM: Solo antes de trafico; conserva respaldo de SEGURIDAD-02 y metadatos del bootstrap.\n${begin}${locks}${readBootstrapGuard}${requireZero(targetGuard)}
+DO $gate$ DECLARE b app_private.release10_cycle_bootstrap_backup%ROWTYPE; current_cycles jsonb; BEGIN
+ SELECT * INTO STRICT b FROM app_private.release10_cycle_bootstrap_backup WHERE singleton;
+ SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY id_cycle),'[]') INTO current_cycles FROM public.points_cycles t;
  IF COALESCE(current_setting('masterfade.release10_expected_ledger',true),'')<>${digest}
- OR COALESCE(current_setting('masterfade.release10_expected_cycles',true),'')<>${cyclesDigest}
- THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_RESTORE_REQUIRES_UNCHANGED_BASELINE'; END IF; END $gate$;\n${beforeDigest}${removePaid}\n${restore}\n${restoreTriggers}\n${removeHelpers}\n${requireZero(`SELECT 'RESTORE_CATALOG' code,CASE WHEN ${original} THEN 0 ELSE 1 END::bigint affected`)}${assertDigest}COMMIT;\n`);
-await save('manifest.json', JSON.stringify({base:'55a86efb8b492402f79d7ec2930cdcfbd4fc72fb',captured_at:{prod:prod.captured_at,qa:qaObserved.captured_at},qa_project:'jgipiyhjtpgyaujfhghf',prod_project:'pdzsmkjnyazpkoocjbpw',sources:hashes,qa_functions:qa.functions.map(f=>({signature:publicSignature(f),hash:f.hash,body_hash:f.body_hash})),prod_functions:prod.functions.map(f=>({signature:publicSignature(f),hash:f.hash,body_hash:f.body_hash})),note:'Cuerpos QA sin cambios; path endurecido de PROD preservado. Historico legitimo sin ciclo bloquea aplicacion. Respaldo SEGURIDAD-02 no se rebaselina.'},null,2)+'\n');
+ OR b.ledger_md5<>${digest} OR b.cycles_after<>current_cycles
+ OR COALESCE(current_setting('masterfade.release10_expected_cycles',true),'')<>b.cycles_before_md5
+ THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_RESTORE_REQUIRES_UNCHANGED_BASELINE'; END IF;
+END $gate$;
+${beforeDigest}${removePaid}\n${restore}\n${restoreView}\n${restoreTriggers}\n${removeHelpers}
+DELETE FROM public.points_cycles pc USING app_private.release10_cycle_bootstrap_backup b
+ WHERE b.singleton AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(b.cycles_before) r(id_cycle uuid) WHERE r.id_cycle=pc.id_cycle);
+${requireZero(`SELECT 'RESTORE_CATALOG' code,CASE WHEN ${original} THEN 0 ELSE 1 END::bigint affected`)}
+DO $preserve$ BEGIN IF ${digest}<>current_setting('masterfade.release10_ledger')
+ OR ${cyclesDigest}<>current_setting('masterfade.release10_expected_cycles') THEN RAISE EXCEPTION 'MASTERPUNTOS_RELEASE10_LEDGER_CHANGED'; END IF; END $preserve$;
+COMMIT;\n`);
+for(const file of ['db/manual/release10/cycle-accounting.sql','db/manual/release10/cycle-bootstrap.sql'])hashes[file]=createHash('sha256').update(await read(file)).digest('hex');
+await save('manifest.json', JSON.stringify({base:'55a86efb8b492402f79d7ec2930cdcfbd4fc72fb',captured_at:{prod:prod.captured_at,qa:qaObserved.captured_at},qa_project:'jgipiyhjtpgyaujfhghf',prod_project:'pdzsmkjnyazpkoocjbpw',sources:hashes,qa_functions:qa.functions.map(f=>({signature:publicSignature(f),hash:f.hash,body_hash:f.body_hash})),prod_functions:prod.functions.map(f=>({signature:publicSignature(f),hash:f.hash,body_hash:f.body_hash})),note:'Ciclos de doce meses desde primer punto, segun aclaracion del propietario; carga manual historica inicia en su primer registro positivo. Ledger intacto. Respaldo SEGURIDAD-02 no se rebaselina.'},null,2)+'\n');

@@ -1,145 +1,158 @@
-# Cierre MasterPuntos sobre SEGURIDAD-02 aplicada
+# Release10: cierre focalizado de ciclos y saldo historico
 
-## A. Resumen ejecutivo
+## A. Regla definitiva del propietario
 
-PR existente #123 actualizado mediante merge normal de origin/main
-55a86efb8b492402f79d7ec2930cdcfbd4fc72fb, sin dev, rebase ni force-push.
-Merge normal 2edd4aa6bf4fd3c8a1bbed88a91e51e0c472b8a1; el HEAD anterior
-b86f40a06c7312dd5887a946c5a0e621cfec4312 se conserva como ancestro.
-Los cuerpos/ACL/paths/triggers/columnas/indices y el respaldo de SEGURIDAD-02 se
-consultaron nuevamente en QA/PROD mediante transacciones de solo lectura.
-Snapshots actuales: test/fixtures/masterpuntos-release10/current/.
+Aclaracion del 15/11/2026 (America/Tegucigalpa), posterior al texto inicial del ticket:
+**la vigencia es por ciclo, no por acreditacion individual**. El primer punto abre
+12 meses calendario. Los puntos siguientes comparten ese aniversario. Si al llegar
+el aniversario quedan ocho, vencen los ocho. Un sexto punto manual no reinicia el
+plazo. Al agotarse el saldo, el siguiente credito abre otro ciclo; un canje que deja
+remanente conserva el vencimiento vigente y no extiende puntos anteriores.
 
-**NO-GO financiero para aplicar:** Produccion conserva 14 movimientos administrativos
-legitimos, 69 puntos netos, 12 clientes y ningun ciclo en la lectura del 15/11/2026
-a las 17:22 America/Tegucigalpa (23:22 UTC). Las cifras son una observacion, no un sello fijo.
-No existe una regla aprobada para vincular el saldo sin ciclo con los nuevos debitos
-y vencimientos por ciclo sin decidir como imputarlo. La vista conserva el historico,
-pero un debito futuro en un ciclo sin creditos suficientes puede dejarlo negativo;
-un debito sin ciclo deja el remanente del ciclo nuevo intacto para expiracion.
-No se inventa una imputacion, se asignan fechas ni se regularizan saldos.
-El preflight mantiene HISTORICAL_UNCYCLED_REVIEW=12: significa compatibilidad
-contable pendiente, no saldo ilegitimo ni dato a borrar. Los otros 16 controles PROD
-son cero, incluidos CATALOG_DRIFT y SECURITY02_BACKUP_DRIFT.
+Para las cargas fisicas realizadas al montar Produccion, el propietario autorizo
+expresamente usar la fecha de carga registrada como inicio: primer registro positivo
+por cliente. No se deduce una fecha fisica desconocida ni se cambia created_at.
+Esta decision sustituye el impedimento descrito en el cierre anterior. No se aplican
+vencimientos individuales, puntos permanentes ni categorias comerciales nuevas.
 
-## B. Archivos funcionales
+## B. Base, alcance y compatibilidad
 
-Se conservan los tres archivos funcionales ya presentes en #123:
-src/services/pointsService.js, src/routes/v1/citas.js y src/routes/v1/public/pagos.js.
-Este cierre cambia su paquete manual, generador, fixture, pruebas y documentacion;
-no agrega mas cambios a src/. Las fuentes comerciales versionadas de ciclos y pago
-confirmado siguen intactas. Nada de 10B, checkout, Hosted o agenda del companero.
+Base remota verificada: `55a86efb8b492402f79d7ec2930cdcfbd4fc72fb`.
+HEAD anterior #123: `2d6f2eb1a5701550feffafc2a2ef2d7459be6fc4`.
+Misma rama `release/prod-masterpuntos-functional`, sin dev, rebase ni force-push.
 
-## C. Diferencias tecnicas resueltas
+Solo MasterPuntos: tres funciones SQL existentes, vista de saldo, respaldo privado
+del bootstrap y tratamiento controlado de sus errores en pointsService.js. No hay
+cambios nuevos a citas.js, public/pagos.js, membershipService.js, proveedores,
+checkout, flags, roles, frontend ni PR #132/#111/#93/#125. Las fuentes SQL previas
+versionadas permanecen intactas; el paquete atomico incorpora la correccion despues
+de ellas, sin intervalo operativo con una version intermedia.
 
-- Entrada: nueve definiciones productivas reales ya endurecidas, ACL reales y
-  triggers vigentes; no se reutilizan hashes anteriores a SEGURIDAD-02.
-- Salida: mismos cuerpos comerciales efectivos de QA, con search_path productivo
-  pg_catalog,public,pg_temp conservado en las nueve funciones publicas. La diferencia
-  de hashes de definicion frente a QA corresponde a ese metadato explicito, no a
-  una ampliacion de versiones para hacer pasar una diferencia desconocida.
-- Cuatro helpers privados de pago con ACL postgres y sin SECURITY DEFINER.
-- Respaldo de SEGURIDAD-02: comparacion exacta con la lectura actual, preservando
-  contenido y OID de cada rutina. Nunca se borra, actualiza ni rebaselina.
-- La restauracion ya no hace RESET ALL: reinstala las definiciones productivas
-  endurecidas, conserva configuracion/ACL existentes y valida la salida exacta.
-  Bloquea deriva de funciones/ACL y modificaciones del respaldo antes de restaurar.
-- Contencion solo acepta deshabilitar los cuatro triggers nuevos de pago; no tolera
-  deshabilitar guardas, signo ni triggers antiguos.
+## C. Causas corregidas
 
-## D. Certificacion
+- **Reinicio:** fn_points_get_or_create_active_cycle conserva el aniversario mientras
+  exista saldo. Cuando el saldo efectivo llega a cero, cierra ese ciclo usando el
+  estado existente cerrado. El siguiente credito inicia otros doce meses. Un ciclo
+  vacio previo se ancla en su primer credito, como antes.
+- **Historico legitimo:** el preflight ya distingue cargas manuales verificables de
+  historicos inconsistentes. Exige autor, signos/tipos correctos, fechas finitas y
+  no futuras, orden inequivoco, prefijos no negativos y ciclo inicial no vencido.
+  No acepta acreditaciones automaticas sin ciclo como si fueran cargas manuales.
+  Los historicos completamente compensados siguen sin producir ciclos vacios.
+- **Transicion:** se crean solamente metadatos points_cycles, desde el primer registro
+  positivo autorizado de cada cliente. No se actualiza, borra, duplica ni compensa
+  ningun points_transaction. Su asociacion efectiva se resuelve por cliente y rango
+  temporal unico; los ciclos posteriores no absorben registros anteriores.
+- **Debitos mixtos:** la vista, el calculo del ciclo, la guarda y materializacion
+  incluyen esos movimientos originales sin id_cycle. No se confunde la suma de las
+  filas con id_cycle explicito con el saldo completo del ciclo. Nueve puntos
+  importados mas cinco nuevos menos diez dejan cuatro, sin saldo negativo ni
+  vencimiento excesivo. El debito sigue siendo una unica fila de -10.
+- **Concurrencia:** ajustes, canjes y vencimiento toman primero el mismo advisory lock
+  por cliente. La guarda comprueba pertenencia y saldo antes de insertar; conserva
+  los indices de idempotencia. Un rechazo SQL de ciclo se presenta como 409 seguro,
+  sin exponer SQL ni alterar la respuesta de operaciones correctas.
+- **Vencimiento:** vista de solo lectura y materializacion usan el mismo ciclo
+  efectivo. Se resta solo el remanente, una vez, al alcanzar el limite exclusivo.
+  Los meses calendario se anclan explicitamente en America/Tegucigalpa.
 
-PostgreSQL17 aislado reconstruye el catalogo actual, las restricciones de puntos y
-los nueve respaldos efectivos con OID locales. Se certifican acreditacion por pago,
-beneficiario de acompanantes, canje, idempotencia, concurrencia, vencimiento firmado,
-permisos y reversion sin perdida de filas. El caso sintetico 14 movimientos/69 puntos
-demuestra que la aplicacion bloquea sin modificar el historico. Las pruebas afectadas
-y la suite completa/CI del SHA publicado se enlazan en #123; SKIP ajenos se separan.
-Las fuentes antiguas bajo fixtures siguen solo para las regresiones historicas de
-SEGURIDAD-02 ya integradas; el generador operativo utiliza exclusivamente current/.
+Las cargas anteriores conservan sus id_cycle y vence_at originales NULL en el
+ledger: eso NO las convierte en permanentes. Su vigencia efectiva esta en el ciclo
+creado desde la fecha autorizada; la vista, guarda y vencimiento lo resuelven. Los
+nuevos ajustes guardan id_cycle y vence_at del ciclo vigente desde el INSERT.
 
-### Prueba contable del bloqueo restante
+No hay imputacion arbitraria entre ciclos simultaneos: el modelo conserva un unico
+ciclo activo y exige revision ante periodos historicos ambiguos o ciclos inactivos
+con saldo de un Cliente activo. No divide movimientos ni amplia reglas de canje.
 
-`test/masterpuntos-legacy-ledger-proof.postgres.test.mjs` ejecuta PostgreSQL 17 real,
-los cuerpos SQL objetivo, la vista, triggers y los servicios reales de ajuste y canje.
-Instala el paquete solamente sobre un fixture vacio que supera el preflight; despues
-construye estados mixtos adversarios en loopback. No omite el guard para instalarlo
-sobre datos historicos, ni presenta esos estados como una aplicacion autorizable.
+## D. Evidencia productiva exclusivamente de lectura
 
-| Caso aislado | Resultado reproducido del candidato, no correccion |
-|---|---|
-| Credito legitimo sin ciclo | `HISTORICAL_UNCYCLED_REVIEW=1`, fila intacta |
-| 9 existentes + 5 acreditaciones validas - ajuste de 10 | Saldo global 4, ciclo -5; replay no duplica |
-| Dos restas concurrentes de 10 | Solo una aplica, otra `POINTS_INSUFFICIENT_BALANCE`; ciclo -5 |
-| Canje real con esos mismos saldos | Una fila de -10 y replay idempotente; ciclo -5 |
-| Imputar todo el debito a NULL | Saldo previo 4; vista/materializacion del vencimiento deja -1 |
-| Consumir primero puntos del ciclo o existentes | Saldo inmediato 4 en ambos; tras vencimiento queda 4 o 0 |
-| Ciclo agotado por canje y siguiente acreditacion | Reutiliza id/fecha antiguos; no renueva 12 meses desde el nuevo punto |
-| Rollback local del experimento | Ledger y ciclos intactos |
+`2026-11-16T00:27:50.901719+00:00` = 15/11/2026 18:27 Honduras.
+REPEATABLE READ READ ONLY, transaction_read_only=on.
 
-El propietario confirmo durante este cierre que, tras un canje el 15, el primer
-punto del nuevo ciclo acreditado el 16 debe tener 12 meses desde el 16. No autoriza
-asignar a los puntos fisicos un vencimiento desde su fecha de captura. La duracion
-de 12 meses y ese ejemplo de reinicio estan confirmados; no deben confundirse con
-la imputacion de un debito que atraviesa saldo sin ciclo y saldo de un ciclo.
+- 14 movimientos, 13 positivos, 69 puntos netos y 12 clientes; cero ciclos existentes.
+- Ledger MD5: `7d9c4759b1d2e7f35c98a4c983f68cb6`, igual a las lecturas iniciales.
+- **19 controles en cero**, incluido HISTORICAL_UNCYCLED_REVIEW.
+- CATALOG_DRIFT=0 y SECURITY02_BACKUP_DRIFT=0.
+- La bitacora tiene los 14 INSERT; no contiene otra fecha fisica de acreditacion.
+  El uso de created_at procede de la autorizacion expresa del propietario, no de
+  asumir que una fecha de importacion equivale siempre a una fecha fisica.
 
-**Decision estrictamente pendiente para esa convivencia:** con 9 puntos existentes
-sin vencimiento asignado y 4 puntos de un ciclo con fecha de vencimiento conocida,
-un canje de 10 deja 3. Debe determinarse si esos 3 son remanente existente o remanente
-del ciclo. Ambas imputaciones conservan el saldo inmediato y las filas originales,
-pero producen saldos futuros diferentes. Ni el neto 13-10=3 ni la duracion de 12 meses
-identifican por si solos que puntos fueron consumidos. No se elige una prioridad,
-se mueven filas, se divide el canje, ni se transfieren saldos para ocultar el problema.
+No se modifico ningun dato ni objeto remoto. No se utilizaron identidades reales
+para escribir. La prueba local reconstruye catalogos y datos sinteticos, no declara
+una certificacion funcional ya desplegada en Produccion.
 
-No se modifican funciones/guardas SQL ni codigo funcional en este cierre. El segundo
-hallazgo impide tambien afirmar que los cuerpos QA actuales ya cumplen el ejemplo
-de reinicio confirmado por el propietario. Las nueve comprobaciones nuevas son
-pruebas de diagnostico PASS; **la correccion financiera sigue pendiente**.
+## E. Aplicacion manual coordinada y rollback
 
-### Evidencia productiva de solo lectura
+1. Autorizacion explicita de ventana, respaldo/PITR disponible, escritores detenidos,
+   rol postgres y SHA backend/SQL aprobados juntos. No ejecutar fuentes por separado.
+2. Ejecutar `00-preflight.sql` completo: solo lectura, exigir TODOS affected=0.
+   Archivar ledger_md5, cycles_md5, cantidad y suma actuales; no fijar 14/69 como sello.
+   Cualquier deriva de catalogo, ACL, respaldo, fechas, signos, identidad o saldo bloquea.
+3. Ejecutar `10-apply.sql` completo: una transaccion, locks de escritores en orden
+   estable, lock_timeout=5s y statement_timeout=60s. Repite controles, instala fuentes
+   y correccion, crea metadatos de ciclos y respaldo, valida target y datos otra vez.
+   Antes de COMMIT exige que el hash del ledger siga EXACTAMENTE igual. Sin backfill
+   de puntos, DML sobre el ledger ni registro ficticio de migraciones.
+4. `20-postflight.sql` antes de trafico: target/ACL/backup exactos y todos controles
+   en cero; ledger_md5, cantidad y suma iguales al preflight. **cycles_md5 cambia
+   legitimamente al crear ciclos**: contrastarlo con cycles_after del respaldo y
+   verificar anclas/aniversarios. No exigir igualdad con el hash de ciclos vacios.
+5. Antes de trafico, `31-restore-before-traffic.sql`, en la misma conexion con
+   masterfade.release10_expected_ledger y masterfade.release10_expected_cycles
+   establecidos a los hashes originales del paso 2. Exige ledger original y ciclos
+   exactos del bootstrap. Restaura nueve funciones/vista/triggers/ACL de PROD y elimina
+   solo los ciclos nuevos. Conserva el respaldo privado. Verifica ambos hashes
+   originales antes de COMMIT; no borra movimientos ni toca SEGURIDAD-02.
+6. Tras nuevos movimientos, 31 se bloquea. `30-rollback-containment.sql` detiene solo
+   las cuatro nuevas fuentes de acreditacion, conserva la guarda, saldo y expiracion.
+   Mantener escritores detenidos y revisar; no recuperar el escritor antiguo que
+   borraba puntos ni hacer compensaciones/backfill automaticos.
 
-Lectura `2026-11-15T23:22:00.878308+00:00`, transaccion `REPEATABLE READ READ ONLY`,
-`transaction_read_only=on`. 14 filas, neto 69, 12 clientes, cero ciclos y cero fechas
-de vencimiento asignadas al historico. `ledger_md5=7d9c4759b1d2e7f35c98a4c983f68cb6`;
-`cycles_md5=d41d8cd98f00b204e9800998ecf8427e`. Coinciden con la lectura inicial.
-Los 16 controles restantes siguen en cero; `CATALOG_DRIFT=0` y
-`SECURITY02_BACKUP_DRIFT=0`. No se leyeron ni publicaron identidades personales.
+El unico objeto auxiliar nuevo es app_private.release10_cycle_bootstrap_backup:
+respaldo de metadatos antes/despues y hash del ledger, RLS y privilegios solo postgres.
+No es una clase de puntos ni un segundo ledger. Su contenido no se reemplaza al
+reintentar; una deriva o acceso inesperado bloquea. Permite repetir apply tras un
+aborto/reversion usando los mismos metadatos sin duplicar ciclos.
 
-## E. SQL coordinado (preparado, NO autorizado para aplicar)
+## F. SEGURIDAD-02 y pruebas
 
-1. Ventana sin escritores/DDL concurrente. Verificar proyecto PROD y rol postgres.
-2. db/manual/release10/00-preflight.sql: solo lectura. Exigir todos affected=0.
-   Actualmente HISTORICAL_UNCYCLED_REVIEW=12 obliga a detenerse. No hay bypass.
-   Archivar hashes dinamicos de ledger/ciclos y salida; no fijar 14/69 como condicion.
-3. Solamente cuando exista compatibilidad contable aprobada y recertificada,
-   10-apply.sql completo: transaccion atomica, bloqueo de tablas, checks repetidos,
-   fuentes de ciclos/pago y preservacion de paths. Cero backfill y cero DML de ledger.
-4. 20-postflight.sql: target exacto, respaldo inmutable, datos compatibles y hashes
-   ledger/ciclos iguales al preflight antes de abrir trafico.
-5. Aborto antes de trafico: en la misma sesion del operador definir
-   masterfade.release10_expected_ledger y masterfade.release10_expected_cycles con
-   los hashes archivados; ejecutar 31-restore-before-traffic.sql completo. Exige target
-   conocido y datos intactos; restaura el estado PROD ya endurecido y elimina solo
-   helpers/triggers nuevos. Comparar catalogo y hashes; no ejecutar rollback SEGURIDAD-02.
-6. Tras movimientos nuevos: 31 se bloquea. 30-rollback-containment.sql detiene nuevas
-   acreditaciones sin tocar ledger/ciclos. Mantener trafico detenido y revisar el caso;
-   no reabrir con codigo antiguo ni acreditar/revertir datos automaticamente.
+Se conservan fuentes, respaldos, OID, ACL y search_path endurecido de SEGURIDAD-02.
+Solo cambian los tres cuerpos MasterPuntos enumerados y certificados en
+current/cycle-target.json; el generador exige el SHA256 de su fuente y los tests
+comparan los hashes reales PostgreSQL. No se rebaselina el respaldo de seguridad ni
+se amplian indiscriminadamente las versiones aceptadas. La vista conserva owner,
+ACL y contrato. Un rollback generico de SEGURIDAD-02 debe rechazar estos cuerpos
+nuevos por deriva: es proteccion esperada, no motivo para actualizar su respaldo.
 
-Mientras los cinco cuerpos de puntos esten actualizados, el apply/rollback anterior
-de SEGURIDAD-02 debe negarse por deriva de cuerpos contra su respaldo: es proteccion
-esperada. MasterPuntos 31 devuelve exactamente sus cuerpos y paths previos, permitiendo
-de nuevo la comprobacion de ese respaldo. No actualizar sellos de SEGURIDAD-02.
+Comandos de certificacion, usando PostgreSQL 17 temporal en loopback:
 
-## F. Riesgos y dependencias
+- node --test --test-concurrency=2 (con las banderas financieras existentes de CI).
+- node scripts/release-identity-postgres.mjs.
+- npm run lint; ESLint de archivos JS afectados con max-warnings=0.
+- node scripts/release-masterpuntos-package.mjs y git diff --exit-code del paquete.
+- git diff --check.
 
-Unico bloqueo financiero actual: compatibilidad del historico legitimo sin ciclo.
-No se resuelve con una nueva clasificacion, compensacion ni fecha inventada. Los pagos
-usados en las pruebas son sinteticos. No se modifica #111/#93/#125 ni funcionalidades
-de checkout/Hosted/reservas generales. No hubo escritura remota, merge a main o deploy.
+Nueva suite de correccion: **26 PASS / 0 FAIL / 0 SKIP**. Fuentes de pago, canje
+grupal, transicion/rollback: **182 PASS / 0 FAIL / 0 SKIP** en la ejecucion focalizada
+anterior a los tres ultimos casos adicionales. Se conservan las 25 pruebas originales
+de transicion; los dos nombres de fixtures sin autor se aclaran sin quitar aserciones.
+Suite completa local: **3438 PASS / 0 FAIL / 7 SKIP**; identidad aislada: **12 PASS / 0 FAIL / 0 SKIP**.
+ESLint: cero errores y 25 advertencias preexistentes; JS afectado con max-warnings=0.
+CI del SHA final: enlace y resultado exactos en el PR #123. Los SKIP optativos no se
+presentan como ejecutados; las suites financieras de CI se habilitaron.
 
-## G. Decision
+Cobertura: 14/69/12, ledger byte a byte, fechas de carga distintas, sexto punto manual,
+canje y restas concurrentes, reintentos, limite de ocho puntos, UTC/Honduras/Tokyo,
+aniversarios/bisiesto, sobregiro, ciclo ajeno, roles, respaldo alterado/vacio/expuesto,
+apply repetido, fallo atomico y rollback antes/despues de trafico.
 
-GO para revisar la reconciliacion tecnica y sus pruebas. NO-GO para integrar el codigo
-financiero actual, aplicar SQL o desplegar MasterPuntos hasta resolver el bloqueo
-financiero y el reinicio del ciclo conservando saldos, beneficiarios y trazabilidad.
-PR #132 no se modifica en este cierre.
+## G. Decision y limites
+
+GO tecnico para revision del codigo y SQL si la CI del SHA final pasa. La anterior
+falta de autorizacion de fechas ya esta resuelta por el propietario; los historicos
+ambiguos o inconsistentes siguen bloqueados. No hay permiso para aplicar SQL,
+mergear ni desplegar: Produccion sigue NO-GO de ejecucion hasta autorizacion y ventana
+coordinada. Pendiente validar despues de una aplicacion autorizada el backend servido,
+rol de conexion, catalogo/postflight, interfaces y conciliacion con el ledger real.
+No se afirma esa validacion desplegada. PR #132 permanece intacto.

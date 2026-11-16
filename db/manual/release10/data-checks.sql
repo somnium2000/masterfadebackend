@@ -6,17 +6,41 @@ WITH historical AS (
   WHERE pt.id_cycle IS NULL
 ), history_review AS (
   SELECT h.id_cliente FROM historical h GROUP BY h.id_cliente
-  HAVING sum(h.puntos::bigint) <> 0
-    OR min(h.running) < 0 OR count(DISTINCT h.created_at) <> count(*)
-    OR NOT bool_and(COALESCE(
-      h.created_at IS NOT NULL AND isfinite(h.created_at)
-      AND h.updated_at IS NOT NULL AND isfinite(h.updated_at)
-      AND h.updated_at >= h.created_at AND h.updated_at <= now() AND h.vence_at IS NULL
-      AND ((h.puntos > 0 AND h.tipo_puntos_codigo IN ('acumular','ajustar') AND h.signo=1)
-        OR (h.puntos < 0 AND h.tipo_puntos_codigo='ajuste_resta' AND h.signo=-1)
+  HAVING NOT (
+    min(h.running)>=0 AND count(DISTINCT h.created_at)=count(*)
+    AND bool_and(COALESCE(isfinite(h.created_at) AND isfinite(h.updated_at)
+      AND h.created_at<=h.updated_at AND h.updated_at<=now() AND h.vence_at IS NULL
+      AND ((h.puntos>0 AND h.tipo_puntos_codigo IN ('acumular','ajustar') AND h.signo=1)
+        OR (h.puntos<0 AND h.tipo_puntos_codigo='ajuste_resta' AND h.signo=-1)
         OR (h.puntos=-10 AND h.tipo_puntos_codigo='canjear' AND h.signo=-1)),false))
-    OR EXISTS (SELECT 1 FROM public.points_cycles pc WHERE pc.id_cliente=h.id_cliente
-      AND (pc.primer_acumulado_at <= max(h.created_at) OR pc.primer_acumulado_at <= max(h.updated_at)))
+    AND (
+      (sum(h.puntos::bigint)=0 AND NOT EXISTS(SELECT 1 FROM public.points_cycles pc
+        WHERE pc.id_cliente=h.id_cliente AND (pc.primer_acumulado_at<=max(h.created_at)
+          OR pc.primer_acumulado_at<=max(h.updated_at))))
+      OR (
+        -- AM: Carga manual aprobada por el propietario: el primer registro positivo inicia el ciclo.
+        sum(h.puntos::bigint)>0 AND bool_and(h.tipo_puntos_codigo IN ('ajustar','ajuste_resta')
+          AND h.creado_por_usuario_id IS NOT NULL)
+        AND max(h.created_at)<((min(h.created_at) FILTER(WHERE h.puntos>0) AT TIME ZONE 'America/Tegucigalpa')
+          +interval '12 months') AT TIME ZONE 'America/Tegucigalpa'
+        AND (
+          (NOT EXISTS(SELECT 1 FROM public.points_cycles pc WHERE pc.id_cliente=h.id_cliente)
+            AND ((min(h.created_at) FILTER(WHERE h.puntos>0) AT TIME ZONE 'America/Tegucigalpa')
+              +interval '12 months') AT TIME ZONE 'America/Tegucigalpa'>now())
+          OR (EXISTS(SELECT 1 FROM public.points_cycles pc WHERE pc.id_cliente=h.id_cliente
+                AND pc.primer_acumulado_at=min(h.created_at) FILTER(WHERE h.puntos>0))
+            AND bool_and((SELECT count(*) FROM public.points_cycles pc
+              WHERE pc.id_cliente=h.id_cliente AND h.created_at>=pc.primer_acumulado_at
+                AND h.created_at<pc.vence_at)=1))
+        )
+      )
+    )
+  )
+), effective AS (
+  SELECT pt.*,COALESCE(pt.id_cycle,(SELECT pc.id_cycle FROM public.points_cycles pc
+    WHERE pc.id_cliente=pt.id_cliente AND pt.created_at>=pc.primer_acumulado_at AND pt.created_at<pc.vence_at
+    ORDER BY pc.primer_acumulado_at DESC,pc.id_cycle DESC LIMIT 1)) effective_cycle
+  FROM public.points_transactions pt
 ), issues AS (
  SELECT 'HISTORICAL_UNCYCLED_REVIEW' code, count(*)::bigint affected FROM history_review
  UNION ALL SELECT 'RULE_REVIEW', count(*) FROM public.points_rules WHERE activo IS TRUE
@@ -32,7 +56,11 @@ WITH historical AS (
    LEFT JOIN public.points_cycles pc ON pc.id_cycle=pt.id_cycle
    WHERE pt.id_cycle IS NOT NULL AND pt.id_cliente IS DISTINCT FROM pc.id_cliente
  UNION ALL SELECT 'CYCLE_NEGATIVE_BALANCE', count(*) FROM (
-   SELECT id_cycle FROM public.points_transactions WHERE id_cycle IS NOT NULL GROUP BY id_cycle HAVING sum(puntos::bigint)<0) d
+   SELECT effective_cycle FROM effective WHERE effective_cycle IS NOT NULL GROUP BY effective_cycle HAVING sum(puntos::bigint)<0) d
+ UNION ALL SELECT 'INACTIVE_CYCLE_BALANCE_REVIEW',count(*) FROM (
+   SELECT pc.id_cycle FROM public.points_cycles pc JOIN effective e ON e.effective_cycle=pc.id_cycle
+   JOIN public.clientes c ON c.id_cliente=pc.id_cliente AND c.deleted_at IS NULL AND c.estado IS NOT FALSE
+   WHERE pc.estado_ciclo_codigo IN ('cerrado','expirado') GROUP BY pc.id_cycle HAVING sum(e.puntos::bigint)<>0) d
  UNION ALL SELECT 'CLIENT_NEGATIVE_OR_OVERFLOW_BALANCE', count(*) FROM (
    SELECT id_cliente FROM public.points_transactions GROUP BY id_cliente
    HAVING sum(puntos::bigint)<0 OR sum(puntos::bigint)>2147483647) d

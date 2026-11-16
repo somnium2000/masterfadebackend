@@ -223,6 +223,16 @@ async function lockClientePointsScope(client, idCliente) {
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text))", [idCliente]);
 }
 
+// AM: No exponer SQL ni confirmar un debito cuya asignacion al ciclo fue rechazada.
+function normalizeCycleBalanceError(error) {
+  if (error?.code === '23514' && error?.constraint === 'masterpuntos_cycle_balance') {
+    return new AppError(409, 'No se pudo aplicar el movimiento. Actualiza tus MasterPuntos e intenta nuevamente.', {
+      code: 'POINTS_CYCLE_BALANCE_REVIEW_REQUIRED',
+    });
+  }
+  return error;
+}
+
 async function materializeCyclesIfAvailable(client, idCliente) {
   try {
     await client.query("SELECT public.fn_points_materialize_expired_cycles($1::uuid)", [idCliente]);
@@ -1082,7 +1092,7 @@ export async function applyRewardRedeemForConfirmedGroup(dbClient, {
       normalizeText(motivo) || "Canje de recompensa ruta a tu cortesia",
       createdBy || null,
     ]
-  );
+  ).catch(error => { throw normalizeCycleBalanceError(error); });
   const movement = insertResult.rows[0] || null;
   if (!movement) {
     const conflictedTx = await dbClient.query(
@@ -1426,7 +1436,7 @@ export async function addManualPointsAdjustment(app, {
     return response;
   } catch (error) {
     await dbClient.query("ROLLBACK").catch(() => {});
-    throw error;
+    throw normalizeCycleBalanceError(error);
   } finally {
     dbClient.release();
   }
