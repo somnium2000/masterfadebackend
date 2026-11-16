@@ -7,6 +7,7 @@ import { startPostgres17 } from './helpers/postgres17.mjs';
 import { SongbirdBridge } from '../src/services/payments/songbirdBridge.js';
 import { SongbirdRepository } from '../src/services/payments/songbirdRepository.js';
 import { assertSongbirdFinalizationBlocked } from '../src/services/payments/songbirdContract.js';
+import { createSongbirdSdkContract } from '../src/services/payments/songbirdSdkContract.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const ATTEMPT = '22222222-2222-4222-8222-222222222222';
@@ -128,6 +129,62 @@ test('Songbird operational claims PostgreSQL17: concurrency, failed authenticati
       assert.equal(fixture.counter[method], 1);
       return results.find(result => result.ok).result;
     };
+
+    await t.test('independent initial JWT order diagnostics remain callback-only and both mismatches keep the durable bridge blocked', async () => {
+      let providerCalls = 0;
+      const contract = createSongbirdSdkContract({ providerFactory() {
+        providerCalls++; throw new Error('PROVIDER_FORBIDDEN');
+      } });
+      const bridge = new SongbirdBridge({ repository, config, contract });
+      const key = Buffer.alloc(32, 7).toString('base64');
+      const boxed = `${Buffer.alloc(16, 8).toString('base64')}|${Buffer.alloc(24, 9).toString('base64')}`;
+      const context = { version: 1, collectionUrlPresent: false,
+        order: { id: ORDER, amount: '1.00', currency: 'HNL' },
+        sdkPublicKey: key, merchantPublicKey: key,
+        encrypted: { card_number: boxed, card_expire: boxed }, billing: {} };
+      const privateMarker = 'SYNTHETIC-FOREIGN-ORDER-NEVER-LOG';
+      for (const field of ['top', 'nested']) {
+        await pool.query('DELETE FROM app_private.pixelpay_songbird_handoffs');
+        const c = await pool.connect();
+        try {
+          await c.query('BEGIN');
+          await bridge.reserve(c, { idIntent: ID, paymentAttemptId: ATTEMPT, ownerId: OWNER, groupId: GROUP,
+            orderId: ORDER, amount: 1, currency: 'HNL', expiresAt: new Date(Date.now() + 600000).toISOString() });
+          await c.query('COMMIT');
+        } catch (error) { await c.query('ROLLBACK'); throw error; } finally { c.release(); }
+        const claims = { iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 600,
+          order_id: field === 'top' ? privateMarker : ORDER,
+          Payload: { OrderDetails: { OrderNumber: field === 'nested' ? privateMarker : ORDER } } };
+        const payload = [{ alg: 'HS256' }, claims].map(value => Buffer.from(JSON.stringify(value)).toString('base64url'))
+          .concat('c3ludGhldGlj').join('.');
+        const result = await bridge.capture(ID, OWNER, payload, context);
+        assert.equal(result.state, 'contract_blocked');
+        assert.equal(result.financial_finalization_enabled, false);
+        assert.equal(result.capture_diagnostic.rule, 'JWT_ORDER_MISMATCH');
+        const flags = result.capture_diagnostic.flags;
+        assert.equal(flags.jwt_order_id_present, true);
+        assert.equal(flags.jwt_order_number_present, true);
+        assert.equal(flags.jwt_order_id_matches, field !== 'top');
+        assert.equal(flags.jwt_order_number_matches, field !== 'nested');
+        assert.equal(Object.values(flags).every(value => typeof value === 'boolean'), true);
+        const saved = await snapshot();
+        assert.equal(saved.block_code, 'PIXELPAY_SONGBIRD_CONTEXT_UNAVAILABLE');
+        assert.equal(saved.payload_box, null); assert.equal(saved.context_box, null);
+        assert.equal(Object.hasOwn(saved, 'capture_diagnostic'), false);
+        const restarted = new SongbirdBridge({ repository: new SongbirdRepository(pool), config, contract });
+        const status = await restarted.status(ID, OWNER);
+        assert.equal(status.state, 'contract_blocked');
+        assert.equal(Object.hasOwn(status, 'capture_diagnostic'), false);
+        await assert.rejects(restarted.claim(ID, OWNER), error => error.code === 'PIXELPAY_SONGBIRD_CONTRACT_BLOCKED');
+        for (const object of [result, saved, status]) {
+          assert.equal(JSON.stringify(object).includes(payload), false);
+          assert.equal(JSON.stringify(object).includes(privateMarker), false);
+          assert.equal(JSON.stringify(object).includes(boxed), false);
+        }
+        await noFinancialEffects({ finalize: 0 });
+      }
+      assert.equal(providerCalls, 0);
+    });
 
     await t.test('legacy rollback writer closes a lease without knowing context_box; cleanup remains private and invoker', async () => {
       const fixture = await rig();

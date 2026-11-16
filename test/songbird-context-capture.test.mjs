@@ -18,7 +18,10 @@ const flags = ['jwt_present','jwt_shape_valid','jwt_json_valid','jwt_algorithm_v
   'card_number_present','card_number_encrypted','card_expire_present','card_expire_encrypted','optional_encrypted_valid',
   'billing_valid','order_matches','amount_matches','currency_matches','collection_url_present','context_present','context_version_valid'];
 const allowedFlags = [...flags, 'jwt_exp_present','jwt_iat_present','sale_request_present',
-  'sdk_key_pair_accessor_present','sdk_key_pair_present'];
+  'sdk_key_pair_accessor_present','sdk_key_pair_present',
+  'jwt_order_id_present','jwt_order_id_is_string','jwt_order_id_matches',
+  'jwt_order_number_present','jwt_order_number_is_string','jwt_order_number_matches',
+  'jwt_payload_is_object','jwt_payload_is_string'];
 const contextRules = {
   'context absent': 'CONTEXT_MISSING', 'context version': 'CONTEXT_VERSION_INVALID',
   'SDK public key missing': 'SDK_PUBLIC_KEY_MISSING', 'SDK public key malformed': 'SDK_PUBLIC_KEY_INVALID',
@@ -150,6 +153,89 @@ test('unsupported collection_url remains an explicit blocked variant with no bro
   assert.equal(result.flags.collection_url_present, true);
   assert.equal(JSON.stringify(context).includes('unsupported.invalid'), false);
   for (const diagnostic of [...observations, result]) assertSafeDiagnostic(diagnostic, [token(), 'unsupported.invalid']);
+});
+
+test('independent claim indicators distinguish absent, matching, contradictory and non-string values without changing acceptance', () => {
+  const { context } = nativeFixture();
+  const contract = createSongbirdSdkContract({ clock: () => now,
+    providerFactory() { throw new Error('PROVIDER_MUST_NOT_BE_CREATED'); } });
+  const cases = [
+    { value: undefined, present: false, string: false, matches: false, allowed: true },
+    { value: row.order_id, present: true, string: true, matches: true, allowed: true },
+    { value: secretSentinel, present: true, string: true, matches: false, allowed: false },
+    { value: null, present: true, string: false, matches: false, allowed: false },
+    { value: '', present: true, string: true, matches: false, allowed: false },
+    { value: 17, present: true, string: false, matches: false, allowed: false },
+  ];
+  const connect = net.Socket.prototype.connect;
+  let sockets = 0;
+  net.Socket.prototype.connect = function () { sockets++; throw new Error('EXTERNAL_IO_FORBIDDEN'); };
+  try {
+    for (const top of cases) for (const nested of cases) {
+      const jwt = token({ order_id: top.value, Payload: { OrderDetails: { OrderNumber: nested.value } } });
+      const result = inspectSongbirdContextCapture(jwt, row, context, { now });
+      const expected = {
+        jwt_order_id_present: top.present, jwt_order_id_is_string: top.string, jwt_order_id_matches: top.matches,
+        jwt_order_number_present: nested.present, jwt_order_number_is_string: nested.string, jwt_order_number_matches: nested.matches,
+        jwt_payload_is_object: true, jwt_payload_is_string: false,
+      };
+      for (const [key, value] of Object.entries(expected)) assert.equal(result.flags[key], value);
+      assert.equal(result.accepted, top.allowed && nested.allowed);
+      assert.equal(result.flags.jwt_order_matches, top.allowed && nested.allowed);
+      assert.equal(result.rule, result.accepted ? 'VALID' : 'JWT_ORDER_MISMATCH');
+      assert.equal(contract.inspect(jwt, row, context), result.accepted);
+      assertSafeDiagnostic(sanitizeSongbirdCaptureDiagnostic(result), [jwt, row.order_id]);
+    }
+    assert.equal(sockets, 0);
+  } finally { net.Socket.prototype.connect = connect; }
+});
+
+test('stringified Cardinal Payload is reported as such without normalizing it or replacing the existing nested claim path', () => {
+  const { context } = nativeFixture();
+  const jwt = token({ order_id: undefined, ObjectifyPayload: false,
+    Payload: JSON.stringify({ OrderDetails: { OrderNumber: secretSentinel } }) });
+  const result = inspectSongbirdContextCapture(jwt, row, context, { now });
+  assert.equal(result.flags.jwt_payload_is_string, true);
+  assert.equal(result.flags.jwt_payload_is_object, false);
+  assert.equal(result.flags.jwt_order_id_present, false);
+  assert.equal(result.flags.jwt_order_number_present, false);
+  assert.equal(result.flags.jwt_order_number_matches, false);
+  // AM: Characterize the existing gate; do not introduce an undocumented normalization policy.
+  assert.equal(result.flags.jwt_order_matches, true);
+  assert.equal(result.accepted, true);
+  assertSafeDiagnostic(result, [jwt, secretSentinel]);
+});
+
+test('numerically equivalent order identifiers still fail strict comparison; no coercion is introduced', () => {
+  const { context } = nativeFixture();
+  const numericRow = { ...row, order_id: '17' };
+  const numericContext = { ...context, order: { ...context.order, id: '17' } };
+  const result = inspectSongbirdContextCapture(token({ order_id: 17 }), numericRow, numericContext, { now });
+  assert.equal(result.flags.order_matches, true);
+  assert.equal(result.flags.jwt_order_id_present, true);
+  assert.equal(result.flags.jwt_order_id_is_string, false);
+  assert.equal(result.flags.jwt_order_id_matches, false);
+  assert.equal(result.rule, 'JWT_ORDER_MISMATCH');
+  assert.equal(result.accepted, false);
+});
+
+test('malformed JWT JSON cannot supply positive claim indicators and diagnostics do not attest signature verification', () => {
+  const { context } = nativeFixture();
+  const invalid = inspectSongbirdContextCapture('synthetic.invalid.signature', row, context, { now });
+  for (const name of allowedFlags.filter(name => /^jwt_order_(id|number)_|^jwt_payload_is_/.test(name))) {
+    assert.equal(invalid.flags[name], false);
+  }
+  // AM: The synthetic suffix is not a valid HMAC; existing acceptance is structural, not cryptographic proof.
+  const structural = inspectSongbirdContextCapture(token(), row, context, { now });
+  assert.equal(structural.accepted, true);
+  assert.equal(Object.hasOwn(structural.flags, 'jwt_signature_verified'), false);
+  const sanitized = sanitizeSongbirdCaptureDiagnostic({ ...structural,
+    flags: { ...structural.flags, jwt_order_id_present: secretSentinel,
+      jwt_order_number_matches: secretSentinel, jwt_signature_verified: true } });
+  assert.equal(Object.hasOwn(sanitized.flags, 'jwt_order_id_present'), false);
+  assert.equal(Object.hasOwn(sanitized.flags, 'jwt_order_number_matches'), false);
+  assert.equal(Object.hasOwn(sanitized.flags, 'jwt_signature_verified'), false);
+  assertSafeDiagnostic(sanitized);
 });
 
 test('a malformed capture-input accessor exception is diagnosed without logging its error or request values', () => {

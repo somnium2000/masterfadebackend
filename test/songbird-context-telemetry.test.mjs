@@ -37,8 +37,13 @@ async function observe({ tokenKind = 'valid', emptyName = false, sink = 'normal'
     paymentAttemptId: '22222222-2222-4222-8222-222222222222', ownerId: '33333333-3333-4333-8333-333333333333',
     groupId: '44444444-4444-4444-8444-444444444444', orderId: 'SYNTHETIC-TELEMETRY-ORDER', amount: 1,
     currency: 'HNL', expiresAt: new Date(now + 600000).toISOString() };
-  let token = [{ alg: 'HS256' }, { iat: Math.floor(now / 1000),
-    exp: Math.floor(now / 1000) + (tokenKind === 'expired' ? -1 : 600), order_id: context.orderId }]
+  const claims = { iat: Math.floor(now / 1000),
+    exp: Math.floor(now / 1000) + (tokenKind === 'expired' ? -1 : 600), order_id: context.orderId };
+  if (['order-id', 'order-number'].includes(tokenKind)) {
+    claims.order_id = tokenKind === 'order-id' ? SECRET : context.orderId;
+    claims.Payload = { OrderDetails: { OrderNumber: tokenKind === 'order-number' ? SECRET : context.orderId } };
+  }
+  let token = [{ alg: 'HS256' }, claims]
     .map(value => Buffer.from(JSON.stringify(value)).toString('base64url')).concat('c3ludGhldGlj').join('.');
   if (tokenKind === 'json') token = 'synthetic.invalid.signature';
   if (tokenKind === 'shape') token = 'synthetic-not-a-jwt';
@@ -150,6 +155,22 @@ test('capture exception identifies optional ciphertext rule, not provider omissi
   assert.equal(result.event.validation.rule, 'CONTEXT_MISSING');
   assert.equal(result.event.bridge_capture_completed, true);
 });
+
+for (const tokenKind of ['order-id', 'order-number']) {
+  test(`native 202 diagnostic distinguishes ${tokenKind} mismatch without exposing the claim or allowing another Sale`, async () => {
+    const result = await observe({ tokenKind });
+    assert.equal(result.status.state, 'contract_blocked');
+    assert.equal(result.event.capture.rule, 'VALID');
+    assert.equal(result.event.validation.rule, 'JWT_ORDER_MISMATCH');
+    assert.equal(result.event.validation.flags.jwt_order_id_present, true);
+    assert.equal(result.event.validation.flags.jwt_order_number_present, true);
+    assert.equal(result.event.validation.flags.jwt_order_id_matches, tokenKind !== 'order-id');
+    assert.equal(result.event.validation.flags.jwt_order_number_matches, tokenKind !== 'order-number');
+    assert.equal(result.counts.sale, 1);
+    assert.equal(result.counts.secondSale, 0);
+    assert.equal(result.counts.sockets, 0);
+  });
+}
 
 for (const [tokenKind, rule] of [['expired', 'JWT_EXPIRED'], ['json', 'JWT_JSON_INVALID'], ['shape', 'JWT_SHAPE_INVALID']]) {
   test(`valid encrypted context distinguishes JWT validation failure (${rule}) without publishing input`, async () => {
