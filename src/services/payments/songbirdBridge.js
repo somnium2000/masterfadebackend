@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { AppError } from '../../utils/errors.js';
 import { songbirdContract } from './songbirdContract.js';
+import { sanitizeSongbirdCaptureDiagnostic } from './songbirdSdkContract.js';
 
 const fail = (code, status = 409) => new AppError(status, 'La autenticacion no puede continuar. Conserva la reserva y no repitas el pago.', { code });
 const TERMINAL = new Set(['contract_blocked', 'interrupted', 'expired', 'authentication_complete', 'authentication_failed']);
@@ -70,8 +71,10 @@ export class SongbirdBridge {
     return this.repository.mutate(id, owner, row => {
       if (!this.check(row)) return songbirdView(row);
       if (row.state !== 'awaiting_response') return songbirdView(row);
+      const diagnostic = typeof this.contract.inspectCapture === 'function'
+        ? sanitizeSongbirdCaptureDiagnostic(this.contract.inspectCapture(payload, { ...row }, context)) : null;
       const accepted = jwt(payload) && this.contract.browserPayloadAccredited === true
-        && this.contract.inspect(payload, { ...row }, context) === true;
+        && (diagnostic ? diagnostic.accepted === true : this.contract.inspect(payload, { ...row }, context) === true);
       row.state = accepted ? 'handoff_ready' : 'contract_blocked';
       if (accepted) {
         row.payload_box = sealSongbird(payload, this.config.key, binding(row));
@@ -86,7 +89,8 @@ export class SongbirdBridge {
         row.context_box = null;
         row.block_code = context?.collectionUrlPresent ? 'PIXELPAY_SONGBIRD_DIRECT_API_UNSUPPORTED' : 'PIXELPAY_SONGBIRD_CONTEXT_UNAVAILABLE';
       }
-      return songbirdView(row);
+      // AM: Internal callback-only diagnostics; never put them in the row, status or public Sale response.
+      return { ...songbirdView(row), ...(diagnostic ? { capture_diagnostic: diagnostic } : {}) };
     });
   }
   async status(id, owner) {
