@@ -5,6 +5,8 @@ import { createQaCommerceDiagnostic } from "../utils/qaCommerceDiagnostic.js";
 import { isQa3dsIntent, qa3dsWindowOpen, resolveQaPixelPay3dsDiagnostic } from '../services/payments/qaPixelPay3dsDiagnostic.js';
 import { resolveSongbirdBridgeConfig, SongbirdBridge } from '../services/payments/songbirdBridge.js';
 import { SongbirdRepository } from '../services/payments/songbirdRepository.js';
+import { createSongbirdSdkContract } from '../services/payments/songbirdSdkContract.js';
+import { PaymentProviderFactory } from '../services/payments/PaymentProviderFactory.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -155,7 +157,8 @@ export default fp(async function privateCommerce(app) {
   const qa3ds = resolveQaPixelPay3dsDiagnostic(process.env, { bookingEnabled: qaBooking.enabled });
   app.decorate('qaPixelPay3dsDiagnostic', qa3ds);
   const bridgeConfig = resolveSongbirdBridgeConfig(process.env, qa3ds);
-  app.decorate('songbirdBridge', new SongbirdBridge({ repository: new SongbirdRepository(app.db), config: bridgeConfig }));
+  app.decorate('songbirdBridge', new SongbirdBridge({ repository: new SongbirdRepository(app.db), config: bridgeConfig,
+    ...(bridgeConfig.enabled ? { contract: createSongbirdSdkContract({ providerFactory: () => PaymentProviderFactory.create() }) } : {}) }));
   if (qaBooking.enabled && (config.enabled || config.saleEnabled)) throw new Error('QA booking no permite piloto ni Sale legado activos.');
   const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const qaVipPurchaseSimulationEnabled = app.config.qaVipPurchaseSimulation?.enabled === true;

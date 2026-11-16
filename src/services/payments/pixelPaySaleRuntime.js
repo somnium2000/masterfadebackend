@@ -250,7 +250,7 @@ export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnost
         this.saleExecution.sdkTransactionType = safeContinuationType(response?.data?.transaction_type);
         // AM: Transient server-only handoff sink; never attach opaque data to errors or diagnostics.
         if (qa3dsDiagnostic && response?.data?.transaction_type === 'songbird' && typeof onSongbirdPayload === 'function') {
-          onSongbirdPayload(response?.data?.payload);
+          onSongbirdPayload(response?.data?.payload, { collectionUrl: response?.data?.collection_url ?? null });
         }
         throw new PixelPayContinuationRequiredError(this.saleExecution.sdkTransactionType);
       }

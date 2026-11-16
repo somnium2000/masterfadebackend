@@ -3,11 +3,14 @@ import { AppError } from '../../utils/errors.js';
 import { songbirdContract } from './songbirdContract.js';
 
 const fail = (code, status = 409) => new AppError(status, 'La autenticacion no puede continuar. Conserva la reserva y no repitas el pago.', { code });
-const TERMINAL = new Set(['contract_blocked', 'interrupted', 'expired', 'authentication_complete']);
+const TERMINAL = new Set(['contract_blocked', 'interrupted', 'expired', 'authentication_complete', 'authentication_failed']);
 const STATES = new Set(['awaiting_response', 'handoff_ready', 'browser_leased', 'setup_in_flight', 'challenge_ready', 'validation_in_flight', ...TERMINAL]);
 const text = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(value);
 const jwt = value => typeof value === 'string' && value.length <= 16000 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 const digest = value => createHash('sha256').update(value).digest('hex');
+const SAFE_ADAPTER_CODES = new Set(['PIXELPAY_SONGBIRD_CONTEXT_INVALID','PIXELPAY_SONGBIRD_BROWSER_CONTEXT_INVALID',
+  'PIXELPAY_SONGBIRD_DIRECT_API_VARIANT_UNSUPPORTED','PIXELPAY_SONGBIRD_SANDBOX_REQUIRED',
+  'PIXELPAY_SONGBIRD_PROVIDER_REQUIRED','PIXELPAY_SONGBIRD_VALIDATION_INPUT_INVALID']);
 
 export function resolveSongbirdBridgeConfig(env, diagnostic) {
   const qa = env.NODE_ENV === 'development' && env.ENTORNO === 'qa' && env.PIXELPAY_ENV === 'sandbox'
@@ -19,7 +22,7 @@ export function resolveSongbirdBridgeConfig(env, diagnostic) {
   const encoded = env.QA_PIXELPAY_SONGBIRD_BRIDGE_KEY || '';
   const key = Buffer.from(encoded, 'base64');
   if (!qa || diagnostic?.enabled !== true || key.length !== 32 || key.toString('base64') !== encoded) throw fail('SONGBIRD_CONFIG_INVALID', 500);
-  return Object.freeze({ enabled: true, key, qa });
+  return Object.freeze({ enabled: true, key, qa, ttlMs: 600000 });
 }
 
 export function sealSongbird(value, key, binding) {
@@ -40,7 +43,9 @@ export function songbirdView(row) {
   if (!row) return { state: 'unavailable', can_start: false, can_resume: false, financial_finalization_enabled: false };
   return { state: STATES.has(row.state) ? row.state : 'contract_blocked', version: row.version,
     expires_at: new Date(row.expires_at).toISOString(), can_start: row.state === 'handoff_ready', can_resume: false,
-    financial_finalization_enabled: false, block_code: row.state === 'contract_blocked' ? 'PIXELPAY_SONGBIRD_CONTRACT_BLOCKED' : null };
+    financial_finalization_enabled: false,
+    provider_http_status: Number.isInteger(row.provider_http_status) ? row.provider_http_status : null,
+    block_code: row.block_code || (row.state === 'contract_blocked' ? 'PIXELPAY_SONGBIRD_CONTRACT_BLOCKED' : null) };
 }
 
 export class SongbirdBridge {
@@ -50,24 +55,37 @@ export class SongbirdBridge {
   }
   async reserve(client, context) {
     if (!this.config.enabled) return null;
-    const expires = Math.min(Date.parse(context.expiresAt), this.clock() + 120000);
+    const expires = Math.min(Date.parse(context.expiresAt), this.clock() + (this.config.ttlMs || 120000));
     if (!Number.isFinite(expires) || expires <= this.clock()) throw fail('SONGBIRD_EXPIRED');
     const row = { id_intent: context.idIntent, payment_attempt_id: context.paymentAttemptId, owner_id: context.ownerId,
       group_id: context.groupId, order_id: context.orderId, amount_hnl: context.amount, currency: context.currency,
-      expires_at: new Date(expires).toISOString(), version: 0, lease_id: null, payload_box: null, challenge_box: null };
+      expires_at: new Date(expires).toISOString(), version: 0, lease_id: null, payload_box: null, challenge_box: null,
+      context_box: null, block_code: null, provider_http_status: null };
     row.state = 'awaiting_response';
     try { return songbirdView(await this.repository.reserve(client, row)); }
-    catch (error) { if (error.code === '42P01') throw fail('SONGBIRD_SCHEMA_REQUIRED', 503); throw error; }
+    catch (error) { if (['42P01','42703'].includes(error.code)) throw fail('SONGBIRD_SCHEMA_REQUIRED', 503); throw error; }
   }
-  async capture(id, owner, payload) {
+  async capture(id, owner, payload, context = null) {
     if (!this.config.enabled) return null;
     return this.repository.mutate(id, owner, row => {
       if (!this.check(row)) return songbirdView(row);
       if (row.state !== 'awaiting_response') return songbirdView(row);
       const accepted = jwt(payload) && this.contract.browserPayloadAccredited === true
-        && this.contract.inspect(payload, { ...row }) === true;
+        && this.contract.inspect(payload, { ...row }, context) === true;
       row.state = accepted ? 'handoff_ready' : 'contract_blocked';
-      if (accepted) row.payload_box = sealSongbird(payload, this.config.key, binding(row));
+      if (accepted) {
+        row.payload_box = sealSongbird(payload, this.config.key, binding(row));
+        if (context) row.context_box = sealSongbird(JSON.stringify(context), this.config.key, binding(row));
+        if (this.contract.contextRequired) {
+          let claims = {};
+          try { claims = JSON.parse(Buffer.from(payload.split('.')[1], 'base64url').toString('utf8')); }
+          catch { /* AM: The adapter owns token-shape validation; injected test protocols can be opaque. */ }
+          if (Number.isFinite(claims.exp)) row.expires_at = new Date(Math.min(Date.parse(row.expires_at), claims.exp * 1000)).toISOString();
+        }
+      } else {
+        row.context_box = null;
+        row.block_code = context?.collectionUrlPresent ? 'PIXELPAY_SONGBIRD_DIRECT_API_UNSUPPORTED' : 'PIXELPAY_SONGBIRD_CONTEXT_UNAVAILABLE';
+      }
       return songbirdView(row);
     });
   }
@@ -77,7 +95,7 @@ export class SongbirdBridge {
       return songbirdView(row);
     });
   }
-  expire(row) { row.state = 'expired'; row.payload_box = null; row.challenge_box = null; }
+  expire(row) { row.state = 'expired'; row.payload_box = null; row.challenge_box = null; row.context_box = null; }
   check(row) {
     if (!row) throw fail('SONGBIRD_NOT_FOUND', 404);
     if (row.state === 'expired') return false;
@@ -91,23 +109,39 @@ export class SongbirdBridge {
       if (row.state !== 'handoff_ready') throw fail('SONGBIRD_ALREADY_LEASED');
       let payload;
       try { payload = openSongbird(row.payload_box, this.config.key, binding(row)); }
-      catch { row.state = 'contract_blocked'; row.payload_box = null; return songbirdView(row); }
+      catch { row.state = 'contract_blocked'; row.payload_box = null; row.context_box = null; return songbirdView(row); }
       row.lease_id = randomUUID(); row.state = 'browser_leased'; row.payload_box = null;
       // AM: The payload is delivered once, never reissued on reload or response loss.
       return { ...songbirdView(row), handoff: { protocol: 'songbird-sandbox-v1', lease_id: row.lease_id,
-        expires_at: row.expires_at, order_id: row.order_id, jwt: payload, ephemeral_contract_verified: true } };
+        expires_at: row.expires_at, order_id: row.order_id, jwt: payload, ephemeral_contract_verified: true,
+        payload_source_verified: true, authentication_verified: false } };
     });
   }
-  async interrupt(id, owner, lease) {
+  async interrupt(id, owner, lease, blockCode = null) {
     return this.repository.mutate(id, owner, row => {
       if (!this.check(row)) return songbirdView(row);
       if (row.lease_id && row.lease_id !== lease) throw fail('SONGBIRD_LEASE_MISMATCH', 403);
-      if (!TERMINAL.has(row.state)) { row.state = 'interrupted'; row.payload_box = null; row.challenge_box = null; }
+      if (!TERMINAL.has(row.state)) {
+        row.state = 'interrupted'; row.payload_box = null; row.challenge_box = null; row.context_box = null;
+        if (blockCode) row.block_code = blockCode;
+      }
       return songbirdView(row);
     });
   }
-  async step(id, owner, op, lease, value) {
+  async step(id, owner, op, lease, value, options = {}) {
     if (!['setup', 'validated'].includes(op)) throw fail('SONGBIRD_OPERATION_INVALID', 400);
+    if (op === 'validated' && options.actionCode && options.actionCode !== 'SUCCESS') {
+      if (!['ERROR','FAILURE','NOACTION','CANCEL','TIMEOUT'].includes(options.actionCode)) throw fail('SONGBIRD_INPUT_INVALID', 400);
+      return this.repository.mutate(id, owner, row => {
+        if (!this.check(row)) return songbirdView(row);
+        if (!lease || row.lease_id !== lease) throw fail('SONGBIRD_LEASE_MISMATCH', 403);
+        if (!TERMINAL.has(row.state)) {
+          row.state = 'authentication_failed'; row.block_code = 'PIXELPAY_SONGBIRD_AUTHENTICATION_FAILED';
+          row.payload_box = null; row.context_box = null; row.challenge_box = null;
+        }
+        return songbirdView(row);
+      });
+    }
     if ((op === 'setup' && !text(value)) || (op === 'validated' && !jwt(value))) throw fail('SONGBIRD_INPUT_INVALID', 400);
     const claim = await this.repository.mutate(id, owner, row => {
       if (!this.check(row)) return { stopped: songbirdView(row) };
@@ -116,30 +150,43 @@ export class SongbirdBridge {
       if (row.state !== (op === 'setup' ? 'browser_leased' : 'challenge_ready')) throw fail('SONGBIRD_PHASE_ALREADY_CLAIMED');
       row.state = op === 'setup' ? 'setup_in_flight' : 'validation_in_flight';
       row.input_hash = digest(value);
-      return structuredClone(row);
+      const claimed = structuredClone(row);
+      if (op === 'setup') row.context_box = null;
+      return claimed;
     });
     if (claim.stopped) return claim.stopped;
     // AM: A durable phase claim commits before any future authentication adapter is called.
     let result;
     try {
-      result = op === 'setup' ? await this.contract.lookup({ reference: value, attempt: claim })
+      let context = null;
+      if (op === 'setup' && this.contract.contextRequired) {
+        context = JSON.parse(openSongbird(claim.context_box, this.config.key, binding(claim)));
+      }
+      result = op === 'setup' ? await this.contract.lookup({ reference: value, attempt: claim, context,
+        browser: { ...options.emv, ip_address: options.ipAddress, browser_header: options.httpAccept } })
         : await this.contract.validate({ jwt: value, attempt: claim });
-    } catch { return this.interrupt(id, owner, lease); }
+    } catch (error) {
+      return this.interrupt(id, owner, lease, SAFE_ADAPTER_CODES.has(error?.code) ? error.code : 'PIXELPAY_SONGBIRD_TRANSPORT_UNCERTAIN');
+    }
     return this.repository.mutate(id, owner, row => {
       if (!this.check(row)) return songbirdView(row);
       if (row.lease_id !== lease || row.state !== claim.state) return songbirdView(row);
+      row.provider_http_status = Number.isInteger(result?.httpStatus) ? result.httpStatus : null;
+      row.context_box = null;
       if (op === 'setup') {
         // AM: Only a provider adapter may validate ACS destinations; arbitrary browser URLs are never relayed.
         if (result?.verified !== true || this.contract.challengeAllowed?.(result.challenge, claim) !== true || typeof result.challenge?.payload !== 'string'
           || !text(result.challenge?.transactionId) || !text(result.challenge?.authenticationId) || typeof result.challenge?.acsUrl !== 'string'
           || !/^https:\/\//.test(result.challenge.acsUrl) || result.challenge.payload.length > 16000) {
-          row.state = 'contract_blocked'; return songbirdView(row);
+          row.state = result?.rejected ? 'authentication_failed' : 'contract_blocked';
+          row.block_code = result?.blockCode || 'PIXELPAY_SONGBIRD_LOOKUP_UNVERIFIED'; return songbirdView(row);
         }
         row.state = 'challenge_ready'; row.authentication_id = result.challenge.authenticationId;
         return { ...songbirdView(row), challenge: { acsUrl: result.challenge.acsUrl, payload: result.challenge.payload,
           transactionId: result.challenge.transactionId, authenticationId: result.challenge.authenticationId } };
       }
-      row.state = result?.verified === true ? 'authentication_complete' : 'contract_blocked';
+      row.state = result?.verified === true ? 'authentication_complete' : result?.rejected ? 'authentication_failed' : 'contract_blocked';
+      row.block_code = result?.blockCode || (row.state === 'contract_blocked' ? 'PIXELPAY_SONGBIRD_AUTH_RESULT_UNACCREDITED' : null);
       // AM: Authentication is never payment evidence; there is deliberately no Sale/finalize adapter here.
       return songbirdView(row);
     });

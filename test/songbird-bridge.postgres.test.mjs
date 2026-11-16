@@ -30,6 +30,7 @@ test('Songbird durable bridge PostgreSQL17: real locks/rollback, no provider or 
       CREATE TABLE public.citas_holds(id_hold uuid PRIMARY KEY,id_cita uuid,estado_hold_codigo text,expires_at timestamptz);
       CREATE TABLE public.payments(id int);CREATE TABLE public.payment_events(id int);`);
     await pool.query(await readFile(new URL('../db/migrations/pixel/20261115190000_pixelpay_songbird_handoff.sql',import.meta.url),'utf8'));
+    await pool.query(await readFile(new URL('../db/migrations/pixel/20261116003000_pixelpay_songbird_operational_context.sql',import.meta.url),'utf8'));
     const order='MF-PIXELPAY-'+ID.replaceAll('-','').toUpperCase();
     await pool.query(`INSERT INTO payment_intents VALUES($1,$2,$3,$4,1,'HNL','pendiente_confirmacion')`,[ID,OWNER,GROUP,order]);
     await pool.query('INSERT INTO app_private.pixelpay_sale_attempts VALUES($1,$2)',[ATTEMPT,ID]);
