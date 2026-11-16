@@ -36,7 +36,10 @@ const DIAGNOSTIC_FLAGS = new Set(['context_present','context_version_valid','col
   'merchant_public_key_present','merchant_public_key_valid','card_number_present','card_number_encrypted',
   'card_expire_present','card_expire_encrypted','optional_encrypted_valid','billing_valid',
   'jwt_present','jwt_shape_valid','jwt_json_valid','jwt_algorithm_valid','jwt_exp_present','jwt_iat_present',
-  'jwt_time_valid','jwt_order_matches','sale_request_present','sdk_key_pair_accessor_present','sdk_key_pair_present']);
+  'jwt_time_valid','jwt_order_matches','jwt_order_id_present','jwt_order_id_is_string','jwt_order_id_matches',
+  'jwt_order_number_present','jwt_order_number_is_string','jwt_order_number_matches',
+  'jwt_payload_is_object','jwt_payload_is_string',
+  'sale_request_present','sdk_key_pair_accessor_present','sdk_key_pair_present']);
 
 // AM: Diagnostic values are a separate allowlist, never an exception/body/context serialization.
 export function sanitizeSongbirdCaptureDiagnostic(value) {
@@ -153,6 +156,9 @@ export function inspectSongbirdContextCapture(payload, row, context, { now = Dat
     jwt_shape_valid: typeof payload === 'string' && payload.length <= 16000 && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(payload),
     jwt_json_valid: false, jwt_algorithm_valid: false, jwt_exp_present: false, jwt_iat_present: false,
     jwt_time_valid: false, jwt_order_matches: false,
+    jwt_order_id_present: false, jwt_order_id_is_string: false, jwt_order_id_matches: false,
+    jwt_order_number_present: false, jwt_order_number_is_string: false, jwt_order_number_matches: false,
+    jwt_payload_is_object: false, jwt_payload_is_string: false,
   };
   let jwtRule = !flags.jwt_present ? 'JWT_MISSING' : 'JWT_SHAPE_INVALID';
   if (flags.jwt_shape_valid) {
@@ -166,6 +172,16 @@ export function inspectSongbirdContextCapture(payload, row, context, { now = Dat
         const expValid = !flags.jwt_exp_present || Number.isFinite(claims.exp) && claims.exp * 1000 > now;
         const iatValid = !flags.jwt_iat_present || Number.isFinite(claims.iat) && claims.iat * 1000 <= now + 60000 && claims.iat * 1000 >= now - 300000;
         flags.jwt_time_valid = expValid && iatValid;
+        // AM: Observe the existing paths without coercion, reparsing Payload or changing the acceptance gate.
+        const orderNumber = claims.Payload?.OrderDetails?.OrderNumber;
+        flags.jwt_order_id_present = claims.order_id !== undefined;
+        flags.jwt_order_id_is_string = typeof claims.order_id === 'string';
+        flags.jwt_order_id_matches = flags.jwt_order_id_present && claims.order_id === row?.order_id;
+        flags.jwt_order_number_present = orderNumber !== undefined;
+        flags.jwt_order_number_is_string = typeof orderNumber === 'string';
+        flags.jwt_order_number_matches = flags.jwt_order_number_present && orderNumber === row?.order_id;
+        flags.jwt_payload_is_object = claims.Payload !== null && typeof claims.Payload === 'object' && !Array.isArray(claims.Payload);
+        flags.jwt_payload_is_string = typeof claims.Payload === 'string';
         flags.jwt_order_matches = [claims.order_id, claims.Payload?.OrderDetails?.OrderNumber].every(value => value === undefined || value === row?.order_id);
         jwtRule = !flags.jwt_algorithm_valid ? 'JWT_ALGORITHM_UNSUPPORTED'
           : flags.jwt_exp_present && !Number.isFinite(claims.exp) ? 'JWT_EXP_INVALID' : !expValid ? 'JWT_EXPIRED'
