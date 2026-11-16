@@ -5,7 +5,7 @@ import { createSecurity02CurrentFixture,decorateSecurity02,securitySource as rea
 import { createMasterpuntosRelease10Fixture } from './helpers/security02Release10Fixture.mjs';
 
 const dir='db/manual/security02-release/';
-const apply=await read(dir+'10-apply.sql'), rollback=await read(dir+'30-rollback.sql');
+const apply=(await read(dir+'10-apply.sql')).replaceAll('\r\n','\n'), rollback=await read(dir+'30-rollback.sql');
 const preflight=await read(dir+'00-preflight.sql'),postflight=await read(dir+'20-postflight.sql');
 const source=(await read('db/manual/20261113235412_seguridad_supabase_02_routine_hardening.sql')).replaceAll('\r\n','\n');
 const run=Boolean(process.env.MASTERFADE_TEST_PG_BIN);

@@ -1,0 +1,487 @@
+[
+  {
+    "name": "agenda_bloqueos_empleados_pkey",
+    "table": "agenda_bloqueos_empleados",
+    "definition": "PRIMARY KEY (id_bloqueo_empleado)"
+  },
+  {
+    "name": "agenda_excepciones_sucursal_pkey",
+    "table": "agenda_excepciones_sucursal",
+    "definition": "PRIMARY KEY (id_excepcion_sucursal)"
+  },
+  {
+    "name": "agenda_excepciones_sucursal_bloques_pkey",
+    "table": "agenda_excepciones_sucursal_bloques",
+    "definition": "PRIMARY KEY (id_bloque_excepcion)"
+  },
+  {
+    "name": "app_protected_users_pkey",
+    "table": "app_protected_users",
+    "definition": "PRIMARY KEY (id_usuario)"
+  },
+  {
+    "name": "archivos_pkey",
+    "table": "archivos",
+    "definition": "PRIMARY KEY (id_archivo)"
+  },
+  {
+    "name": "barberos_perfiles_publicos_pkey",
+    "table": "barberos_perfiles_publicos",
+    "definition": "PRIMARY KEY (id_perfil_publico)"
+  },
+  {
+    "name": "bitacoras_pkey",
+    "table": "bitacoras",
+    "definition": "PRIMARY KEY (id_bitacora)"
+  },
+  {
+    "name": "bloqueos_agenda_pkey",
+    "table": "bloqueos_agenda",
+    "definition": "PRIMARY KEY (id_bloqueo)"
+  },
+  {
+    "name": "citas_pkey",
+    "table": "citas",
+    "definition": "PRIMARY KEY (id_cita)"
+  },
+  {
+    "name": "citas_admin_beneficios_resumen_pkey",
+    "table": "citas_admin_beneficios_resumen",
+    "definition": "PRIMARY KEY (id_grupo_cita)"
+  },
+  {
+    "name": "citas_detalles_pkey",
+    "table": "citas_detalles",
+    "definition": "PRIMARY KEY (id_cita_detalle)"
+  },
+  {
+    "name": "citas_grupos_pkey",
+    "table": "citas_grupos",
+    "definition": "PRIMARY KEY (id_grupo_cita)"
+  },
+  {
+    "name": "citas_holds_pkey",
+    "table": "citas_holds",
+    "definition": "PRIMARY KEY (id_hold)"
+  },
+  {
+    "name": "citas_integrantes_pkey",
+    "table": "citas_integrantes",
+    "definition": "PRIMARY KEY (id_cita_integrante)"
+  },
+  {
+    "name": "citas_paquetes_pkey",
+    "table": "citas_paquetes",
+    "definition": "PRIMARY KEY (id_cita_paquete)"
+  },
+  {
+    "name": "citas_promociones_pkey",
+    "table": "citas_promociones",
+    "definition": "PRIMARY KEY (id_cita_promocion)"
+  },
+  {
+    "name": "citas_reagendaciones_pkey",
+    "table": "citas_reagendaciones",
+    "definition": "PRIMARY KEY (id_reagendacion)"
+  },
+  {
+    "name": "clientes_pkey",
+    "table": "clientes",
+    "definition": "PRIMARY KEY (id_cliente)"
+  },
+  {
+    "name": "comprobantes_agendamiento_pkey",
+    "table": "comprobantes_agendamiento",
+    "definition": "PRIMARY KEY (id_comprobante_agendamiento)"
+  },
+  {
+    "name": "comprobantes_agendamiento_destinatarios_pkey",
+    "table": "comprobantes_agendamiento_destinatarios",
+    "definition": "PRIMARY KEY (id_comprobante_destinatario)"
+  },
+  {
+    "name": "comunicaciones_campanias_pkey",
+    "table": "comunicaciones_campanias",
+    "definition": "PRIMARY KEY (id_campania)"
+  },
+  {
+    "name": "comunicaciones_envios_pkey",
+    "table": "comunicaciones_envios",
+    "definition": "PRIMARY KEY (id_envio)"
+  },
+  {
+    "name": "correos_pkey",
+    "table": "correos",
+    "definition": "PRIMARY KEY (id_correo)"
+  },
+  {
+    "name": "cortesias_pkey",
+    "table": "cortesias",
+    "definition": "PRIMARY KEY (id)"
+  },
+  {
+    "name": "cortesias_sucursales_pkey",
+    "table": "cortesias_sucursales",
+    "definition": "PRIMARY KEY (id)"
+  },
+  {
+    "name": "empleados_pkey",
+    "table": "empleados",
+    "definition": "PRIMARY KEY (id_empleado)"
+  },
+  {
+    "name": "empresas_pkey",
+    "table": "empresas",
+    "definition": "PRIMARY KEY (id_empresa)"
+  },
+  {
+    "name": "estados_cita_pkey",
+    "table": "estados_cita",
+    "definition": "PRIMARY KEY (estado_cita_codigo)"
+  },
+  {
+    "name": "estados_hold_pkey",
+    "table": "estados_hold",
+    "definition": "PRIMARY KEY (estado_hold_codigo)"
+  },
+  {
+    "name": "estados_horario_sucursal_pkey",
+    "table": "estados_horario_sucursal",
+    "definition": "PRIMARY KEY (estado_horario_codigo)"
+  },
+  {
+    "name": "estados_intent_pago_pkey",
+    "table": "estados_intent_pago",
+    "definition": "PRIMARY KEY (estado_intent_codigo)"
+  },
+  {
+    "name": "estados_notificacion_pkey",
+    "table": "estados_notificacion",
+    "definition": "PRIMARY KEY (estado_notificacion_codigo)"
+  },
+  {
+    "name": "estados_pago_pkey",
+    "table": "estados_pago",
+    "definition": "PRIMARY KEY (estado_pago_codigo)"
+  },
+  {
+    "name": "estados_pago_suscripcion_pkey",
+    "table": "estados_pago_suscripcion",
+    "definition": "PRIMARY KEY (estado_pago_sub_codigo)"
+  },
+  {
+    "name": "estados_suscripcion_pkey",
+    "table": "estados_suscripcion",
+    "definition": "PRIMARY KEY (estado_suscripcion_codigo)"
+  },
+  {
+    "name": "facturas_pkey",
+    "table": "facturas",
+    "definition": "PRIMARY KEY (id_factura)"
+  },
+  {
+    "name": "facturas_detalles_pkey",
+    "table": "facturas_detalles",
+    "definition": "PRIMARY KEY (id_factura_detalle)"
+  },
+  {
+    "name": "generos_pkey",
+    "table": "generos",
+    "definition": "PRIMARY KEY (genero_codigo)"
+  },
+  {
+    "name": "horarios_semanales_empleados_pkey",
+    "table": "horarios_semanales_empleados",
+    "definition": "PRIMARY KEY (id_horario)"
+  },
+  {
+    "name": "horarios_semanales_sucursales_pkey",
+    "table": "horarios_semanales_sucursales",
+    "definition": "PRIMARY KEY (id_horario_sucursal)"
+  },
+  {
+    "name": "horarios_semanales_sucursales_bloques_pkey",
+    "table": "horarios_semanales_sucursales_bloques",
+    "definition": "PRIMARY KEY (id_bloque_horario)"
+  },
+  {
+    "name": "membership_plans_pkey",
+    "table": "membership_plans",
+    "definition": "PRIMARY KEY (id_plan)"
+  },
+  {
+    "name": "membership_plans_sucursal_pkey",
+    "table": "membership_plans_sucursal",
+    "definition": "PRIMARY KEY (id_plan_sucursal)"
+  },
+  {
+    "name": "membership_purchase_orders_pkey",
+    "table": "membership_purchase_orders",
+    "definition": "PRIMARY KEY (id_order)"
+  },
+  {
+    "name": "metodos_pago_pkey",
+    "table": "metodos_pago",
+    "definition": "PRIMARY KEY (metodo_pago_codigo)"
+  },
+  {
+    "name": "modos_excepcion_sucursal_pkey",
+    "table": "modos_excepcion_sucursal",
+    "definition": "PRIMARY KEY (modo_excepcion_codigo)"
+  },
+  {
+    "name": "monedas_pkey",
+    "table": "monedas",
+    "definition": "PRIMARY KEY (moneda_codigo)"
+  },
+  {
+    "name": "notificaciones_email_pkey",
+    "table": "notificaciones_email",
+    "definition": "PRIMARY KEY (id_notificacion)"
+  },
+  {
+    "name": "pantallas_pkey",
+    "table": "pantallas",
+    "definition": "PRIMARY KEY (id_pantalla)"
+  },
+  {
+    "name": "paquetes_pkey",
+    "table": "paquetes",
+    "definition": "PRIMARY KEY (id_paquete)"
+  },
+  {
+    "name": "paquetes_detalles_pkey",
+    "table": "paquetes_detalles",
+    "definition": "PRIMARY KEY (id_paquete_detalle)"
+  },
+  {
+    "name": "paquetes_sucursal_pkey",
+    "table": "paquetes_sucursal",
+    "definition": "PRIMARY KEY (id_paquete_sucursal)"
+  },
+  {
+    "name": "parametros_sistema_pkey",
+    "table": "parametros_sistema",
+    "definition": "PRIMARY KEY (clave)"
+  },
+  {
+    "name": "parametros_sucursal_pkey",
+    "table": "parametros_sucursal",
+    "definition": "PRIMARY KEY (id_sucursal, clave)"
+  },
+  {
+    "name": "payment_events_pkey",
+    "table": "payment_events",
+    "definition": "PRIMARY KEY (id_event)"
+  },
+  {
+    "name": "payment_intents_pkey",
+    "table": "payment_intents",
+    "definition": "PRIMARY KEY (id_intent)"
+  },
+  {
+    "name": "payment_providers_pkey",
+    "table": "payment_providers",
+    "definition": "PRIMARY KEY (id_provider)"
+  },
+  {
+    "name": "payments_pkey",
+    "table": "payments",
+    "definition": "PRIMARY KEY (id_payment)"
+  },
+  {
+    "name": "periodos_membresia_pkey",
+    "table": "periodos_membresia",
+    "definition": "PRIMARY KEY (periodo_membresia_codigo)"
+  },
+  {
+    "name": "permisos_pkey",
+    "table": "permisos",
+    "definition": "PRIMARY KEY (id_permiso)"
+  },
+  {
+    "name": "personas_pkey",
+    "table": "personas",
+    "definition": "PRIMARY KEY (id_persona)"
+  },
+  {
+    "name": "plan_categoria_niveles_pkey",
+    "table": "plan_categoria_niveles",
+    "definition": "PRIMARY KEY (nivel)"
+  },
+  {
+    "name": "points_cycles_pkey",
+    "table": "points_cycles",
+    "definition": "PRIMARY KEY (id_cycle)"
+  },
+  {
+    "name": "points_legacy_migrations_pkey",
+    "table": "points_legacy_migrations",
+    "definition": "PRIMARY KEY (id_migracion)"
+  },
+  {
+    "name": "points_rule_services_pkey",
+    "table": "points_rule_services",
+    "definition": "PRIMARY KEY (id_rule_service)"
+  },
+  {
+    "name": "points_rules_pkey",
+    "table": "points_rules",
+    "definition": "PRIMARY KEY (id_rule)"
+  },
+  {
+    "name": "points_transactions_pkey",
+    "table": "points_transactions",
+    "definition": "PRIMARY KEY (id_points_tx)"
+  },
+  {
+    "name": "promociones_pkey",
+    "table": "promociones",
+    "definition": "PRIMARY KEY (id_promocion)"
+  },
+  {
+    "name": "promociones_codigos_pkey",
+    "table": "promociones_codigos",
+    "definition": "PRIMARY KEY (id_promocion_codigo)"
+  },
+  {
+    "name": "promociones_items_agendamiento_pkey",
+    "table": "promociones_items_agendamiento",
+    "definition": "PRIMARY KEY (id_promocion_item)"
+  },
+  {
+    "name": "promociones_reglas_agendamiento_pkey",
+    "table": "promociones_reglas_agendamiento",
+    "definition": "PRIMARY KEY (id_promocion_regla)"
+  },
+  {
+    "name": "promociones_reglas_compatibilidad_pkey",
+    "table": "promociones_reglas_compatibilidad",
+    "definition": "PRIMARY KEY (id_compatibilidad)"
+  },
+  {
+    "name": "promociones_reglas_cupos_pkey",
+    "table": "promociones_reglas_cupos",
+    "definition": "PRIMARY KEY (id_promocion_regla_cupo)"
+  },
+  {
+    "name": "promociones_restricciones_agendamiento_pkey",
+    "table": "promociones_restricciones_agendamiento",
+    "definition": "PRIMARY KEY (id_promocion_restriccion)"
+  },
+  {
+    "name": "promociones_sucursal_pkey",
+    "table": "promociones_sucursal",
+    "definition": "PRIMARY KEY (id_promocion_sucursal)"
+  },
+  {
+    "name": "promociones_usos_pkey",
+    "table": "promociones_usos",
+    "definition": "PRIMARY KEY (id_promocion_uso)"
+  },
+  {
+    "name": "roles_pkey",
+    "table": "roles",
+    "definition": "PRIMARY KEY (id_rol)"
+  },
+  {
+    "name": "roles_pantallas_permisos_pkey",
+    "table": "roles_pantallas_permisos",
+    "definition": "PRIMARY KEY (id_rpp)"
+  },
+  {
+    "name": "roles_usuarios_pkey",
+    "table": "roles_usuarios",
+    "definition": "PRIMARY KEY (id_rol_usuario)"
+  },
+  {
+    "name": "seguridad_alertas_pkey",
+    "table": "seguridad_alertas",
+    "definition": "PRIMARY KEY (id_alerta)"
+  },
+  {
+    "name": "seguridad_audit_logs_pkey",
+    "table": "seguridad_audit_logs",
+    "definition": "PRIMARY KEY (id_audit_log)"
+  },
+  {
+    "name": "seguridad_login_logs_pkey",
+    "table": "seguridad_login_logs",
+    "definition": "PRIMARY KEY (id_login_log)"
+  },
+  {
+    "name": "seguridad_password_policy_pkey",
+    "table": "seguridad_password_policy",
+    "definition": "PRIMARY KEY (id_policy)"
+  },
+  {
+    "name": "seguridad_sesiones_pkey",
+    "table": "seguridad_sesiones",
+    "definition": "PRIMARY KEY (id_sesion)"
+  },
+  {
+    "name": "seguridad_session_policy_pkey",
+    "table": "seguridad_session_policy",
+    "definition": "PRIMARY KEY (id_policy)"
+  },
+  {
+    "name": "seguridad_usuarios_acceso_pkey",
+    "table": "seguridad_usuarios_acceso",
+    "definition": "PRIMARY KEY (id_usuario)"
+  },
+  {
+    "name": "servicios_pkey",
+    "table": "servicios",
+    "definition": "PRIMARY KEY (id_servicio)"
+  },
+  {
+    "name": "servicios_tarifas_pkey",
+    "table": "servicios_tarifas",
+    "definition": "PRIMARY KEY (id_tarifa)"
+  },
+  {
+    "name": "storage_assets_pkey",
+    "table": "storage_assets",
+    "definition": "PRIMARY KEY (id_asset)"
+  },
+  {
+    "name": "subscription_alert_events_pkey",
+    "table": "subscription_alert_events",
+    "definition": "PRIMARY KEY (id_alert_event)"
+  },
+  {
+    "name": "subscription_consumptions_pkey",
+    "table": "subscription_consumptions",
+    "definition": "PRIMARY KEY (id_consumo)"
+  },
+  {
+    "name": "subscription_payments_pkey",
+    "table": "subscription_payments",
+    "definition": "PRIMARY KEY (id_sub_payment)"
+  },
+  {
+    "name": "subscriptions_pkey",
+    "table": "subscriptions",
+    "definition": "PRIMARY KEY (id_suscripcion)"
+  },
+  {
+    "name": "sucursales_pkey",
+    "table": "sucursales",
+    "definition": "PRIMARY KEY (id_sucursal)"
+  },
+  {
+    "name": "tipos_bloqueo_agenda_pkey",
+    "table": "tipos_bloqueo_agenda",
+    "definition": "PRIMARY KEY (tipo_bloqueo_codigo)"
+  },
+  {
+    "name": "tipos_puntos_pkey",
+    "table": "tipos_puntos",
+    "definition": "PRIMARY KEY (tipo_puntos_codigo)"
+  },
+  {
+    "name": "usuarios_pkey",
+    "table": "usuarios",
+    "definition": "PRIMARY KEY (id_usuario)"
+  }
+]

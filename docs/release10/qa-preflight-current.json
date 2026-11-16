@@ -1,0 +1,70 @@
+[
+  {
+    "code": "CATALOG_DRIFT",
+    "affected": 1
+  },
+  {
+    "code": "REQUIRED_COLUMNS",
+    "affected": 0
+  },
+  {
+    "code": "REQUIRED_UNIQUE_INDEXES",
+    "affected": 0
+  },
+  {
+    "code": "PRIVATE_HELPER_GRANTS",
+    "affected": 0
+  },
+  {
+    "code": "ACTIVE_CYCLES_DUPLICATED",
+    "affected": 0
+  },
+  {
+    "code": "CLIENT_NEGATIVE_OR_OVERFLOW_BALANCE",
+    "affected": 0
+  },
+  {
+    "code": "CREDIT_BENEFICIARY_REVIEW",
+    "affected": 0
+  },
+  {
+    "code": "CYCLE_CLIENT_MISMATCH",
+    "affected": 0
+  },
+  {
+    "code": "CYCLE_DATES_REVIEW",
+    "affected": 0
+  },
+  {
+    "code": "CYCLE_NEGATIVE_BALANCE",
+    "affected": 1
+  },
+  {
+    "code": "DUPLICATE_CREDIT",
+    "affected": 0
+  },
+  {
+    "code": "HISTORICAL_UNCYCLED_REVIEW",
+    "affected": 1
+  },
+  {
+    "code": "REDEMPTION_AMOUNT_REVIEW",
+    "affected": 0
+  },
+  {
+    "code": "REQUIRED_POINT_TYPES",
+    "affected": 0
+  },
+  {
+    "code": "RULE_REVIEW",
+    "affected": 0
+  },
+  {
+    "code": "TRANSACTION_SIGN_OR_DATE_REVIEW",
+    "affected": 0
+  },
+  {
+    "code": "SECURITY02_BACKUP_DRIFT",
+    "affected": 9
+  }
+]

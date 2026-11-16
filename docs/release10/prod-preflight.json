@@ -1,0 +1,79 @@
+{
+  "project": "pdzsmkjnyazpkoocjbpw",
+  "captured_date": "2026-11-15",
+  "mode": "REPEATABLE READ READ ONLY",
+  "checks": [
+    {
+      "code": "CATALOG_DRIFT",
+      "affected": 0
+    },
+    {
+      "code": "REQUIRED_COLUMNS",
+      "affected": 0
+    },
+    {
+      "code": "REQUIRED_UNIQUE_INDEXES",
+      "affected": 0
+    },
+    {
+      "code": "PRIVATE_HELPER_GRANTS",
+      "affected": 0
+    },
+    {
+      "code": "ACTIVE_CYCLES_DUPLICATED",
+      "affected": 0
+    },
+    {
+      "code": "CLIENT_NEGATIVE_OR_OVERFLOW_BALANCE",
+      "affected": 0
+    },
+    {
+      "code": "CREDIT_BENEFICIARY_REVIEW",
+      "affected": 0
+    },
+    {
+      "code": "CYCLE_CLIENT_MISMATCH",
+      "affected": 0
+    },
+    {
+      "code": "CYCLE_DATES_REVIEW",
+      "affected": 0
+    },
+    {
+      "code": "CYCLE_NEGATIVE_BALANCE",
+      "affected": 0
+    },
+    {
+      "code": "DUPLICATE_CREDIT",
+      "affected": 0
+    },
+    {
+      "code": "HISTORICAL_UNCYCLED_REVIEW",
+      "affected": 10
+    },
+    {
+      "code": "REDEMPTION_AMOUNT_REVIEW",
+      "affected": 0
+    },
+    {
+      "code": "REQUIRED_POINT_TYPES",
+      "affected": 0
+    },
+    {
+      "code": "RULE_REVIEW",
+      "affected": 0
+    },
+    {
+      "code": "TRANSACTION_SIGN_OR_DATE_REVIEW",
+      "affected": 0
+    }
+  ],
+  "summary": [
+    {
+      "ledger_rows": 12,
+      "ledger_sum": "56",
+      "ledger_md5": "fe4c3aabf8ee0902b427bb43d41ec1ec",
+      "cycles_md5": "d41d8cd98f00b204e9800998ecf8427e"
+    }
+  ]
+}
