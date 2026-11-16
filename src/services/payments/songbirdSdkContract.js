@@ -23,6 +23,30 @@ const boxed = value => {
     && parts.every(part => Buffer.from(part, 'base64').toString('base64') === part);
 };
 const amount = value => Number.isFinite(Number(value)) ? Number(value).toFixed(2) : null;
+const DIAGNOSTIC_STAGES = new Set(['context_capture','context_validation','jwt_validation']);
+const DIAGNOSTIC_RULES = new Set(['VALID','CAPTURE_EXCEPTION','CONTEXT_MISSING','CONTEXT_VERSION_INVALID',
+  'COLLECTION_URL_UNSUPPORTED','COLLECTION_FLAG_INVALID','ORDER_MISMATCH','CURRENCY_MISMATCH','AMOUNT_MISMATCH',
+  'SDK_PUBLIC_KEY_MISSING','SDK_PUBLIC_KEY_INVALID','MERCHANT_PUBLIC_KEY_MISSING','MERCHANT_PUBLIC_KEY_INVALID',
+  'ENCRYPTED_FIELDS_UNEXPECTED','BILLING_FIELDS_INVALID','CARD_NUMBER_MISSING','CARD_NUMBER_CIPHERTEXT_INVALID',
+  'CARD_EXPIRE_MISSING','CARD_EXPIRE_CIPHERTEXT_INVALID','OPTIONAL_CIPHERTEXT_INVALID','JWT_MISSING','JWT_SHAPE_INVALID',
+  'JWT_JSON_INVALID','JWT_ALGORITHM_UNSUPPORTED','JWT_EXP_INVALID','JWT_EXPIRED','JWT_IAT_INVALID','JWT_IAT_FUTURE',
+  'JWT_IAT_STALE','JWT_ORDER_MISMATCH']);
+const DIAGNOSTIC_FLAGS = new Set(['context_present','context_version_valid','collection_url_present',
+  'order_matches','currency_matches','amount_matches','sdk_public_key_present','sdk_public_key_valid',
+  'merchant_public_key_present','merchant_public_key_valid','card_number_present','card_number_encrypted',
+  'card_expire_present','card_expire_encrypted','optional_encrypted_valid','billing_valid',
+  'jwt_present','jwt_shape_valid','jwt_json_valid','jwt_algorithm_valid','jwt_exp_present','jwt_iat_present',
+  'jwt_time_valid','jwt_order_matches','sale_request_present','sdk_key_pair_accessor_present','sdk_key_pair_present']);
+
+// AM: Diagnostic values are a separate allowlist, never an exception/body/context serialization.
+export function sanitizeSongbirdCaptureDiagnostic(value) {
+  if (!value || !DIAGNOSTIC_STAGES.has(value.stage) || !DIAGNOSTIC_RULES.has(value.rule)
+    || typeof value.accepted !== 'boolean') return null;
+  return { accepted: value.accepted, stage: value.stage, rule: value.rule,
+    flags: Object.fromEntries([...DIAGNOSTIC_FLAGS].filter(name => typeof value.flags?.[name] === 'boolean')
+      .map(name => [name, value.flags[name]])) };
+}
+
 const matches = (context, row) => context?.version === 1 && context.collectionUrlPresent === false
   && ID.test(context.order?.id || '') && context.order.id === row?.order_id
   && context.order.currency === 'HNL' && row.currency === 'HNL'
@@ -36,22 +60,39 @@ const matches = (context, row) => context?.version === 1 && context.collectionUr
     || typeof context.billing[name] === 'string' && context.billing[name].length <= 500);
 
 // AM: Capture only already-encrypted fields plus public keys. Never retain CVV or a NaCl secret key.
-export function captureSongbirdSdkContext(saleRequest, settings, { collectionUrl = null } = {}) {
-  const pair = saleRequest?.getSDKKeyPair?.();
-  const context = { version: 1,
-    order: { id: saleRequest?.order_id, amount: amount(saleRequest?.order_amount), currency: saleRequest?.order_currency },
-    encrypted: {}, billing: {},
-    sdkPublicKey: pair?.publicKey ? Buffer.from(pair.publicKey).toString('base64') : null,
-    merchantPublicKey: settings?.public_key || null,
-    collectionUrlPresent: collectionUrl !== null && collectionUrl !== undefined && collectionUrl !== '',
+export function captureSongbirdSdkContext(saleRequest, settings, { collectionUrl = null, onDiagnostic } = {}) {
+  const emit = value => {
+    try { if (typeof onDiagnostic === 'function') onDiagnostic(sanitizeSongbirdCaptureDiagnostic(value)); }
+    catch { /* AM: Observability cannot change the acceptance gate or the durable Sale claim. */ }
   };
-  for (const name of ENCRYPTED) if (saleRequest?.[name] !== undefined) context.encrypted[name] = saleRequest[name];
-  for (const name of BILLING) if (saleRequest?.[name] !== undefined) context.billing[name] = saleRequest[name];
-  if (context.collectionUrlPresent) return { ...context, encrypted: {}, billing: {}, sdkPublicKey: null, merchantPublicKey: null };
-  if (!matches(context, { order_id: context.order.id, amount_hnl: context.order.amount, currency: context.order.currency })) {
-    throw fail('PIXELPAY_SONGBIRD_CONTEXT_INVALID');
+  let diagnostic;
+  try {
+    const pair = saleRequest?.getSDKKeyPair?.();
+    const context = { version: 1,
+      order: { id: saleRequest?.order_id, amount: amount(saleRequest?.order_amount), currency: saleRequest?.order_currency },
+      encrypted: {}, billing: {},
+      sdkPublicKey: pair?.publicKey ? Buffer.from(pair.publicKey).toString('base64') : null,
+      merchantPublicKey: settings?.public_key || null,
+      collectionUrlPresent: collectionUrl !== null && collectionUrl !== undefined && collectionUrl !== '',
+    };
+    for (const name of ENCRYPTED) if (saleRequest?.[name] !== undefined) context.encrypted[name] = saleRequest[name];
+    for (const name of BILLING) if (saleRequest?.[name] !== undefined) context.billing[name] = saleRequest[name];
+    const row = { order_id: context.order.id, amount_hnl: context.order.amount, currency: context.order.currency };
+    diagnostic = inspectSongbirdContextCapture(null, row, context);
+    diagnostic = { ...diagnostic, accepted: matches(context, row), stage: 'context_capture',
+      rule: context.collectionUrlPresent ? 'COLLECTION_URL_UNSUPPORTED' : contextRule(context, row),
+      flags: Object.fromEntries(Object.entries(diagnostic.flags).filter(([name]) => !name.startsWith('jwt_'))) };
+    Object.assign(diagnostic.flags, { sale_request_present: Boolean(saleRequest),
+      sdk_key_pair_accessor_present: typeof saleRequest?.getSDKKeyPair === 'function', sdk_key_pair_present: Boolean(pair) });
+    emit(diagnostic);
+    if (context.collectionUrlPresent) return { ...context, encrypted: {}, billing: {}, sdkPublicKey: null, merchantPublicKey: null };
+    if (!diagnostic.accepted) throw fail('PIXELPAY_SONGBIRD_CONTEXT_INVALID');
+    return context;
+  } catch (error) {
+    if (!diagnostic) emit({ accepted: false, stage: 'context_capture', rule: 'CAPTURE_EXCEPTION',
+      flags: { sale_request_present: Boolean(saleRequest), collection_url_present: collectionUrl !== null && collectionUrl !== undefined && collectionUrl !== '' } });
+    throw error;
   }
-  return context;
 }
 
 function inspectJwt(value, now, orderId) {
@@ -67,6 +108,76 @@ function inspectJwt(value, now, orderId) {
     }
     return true;
   } catch { return false; }
+}
+
+function contextRule(context, row) {
+  if (!context) return 'CONTEXT_MISSING';
+  if (context.version !== 1) return 'CONTEXT_VERSION_INVALID';
+  if (context.collectionUrlPresent === true) return 'COLLECTION_URL_UNSUPPORTED';
+  if (context.collectionUrlPresent !== false) return 'COLLECTION_FLAG_INVALID';
+  if (!ID.test(context.order?.id || '') || context.order.id !== row?.order_id) return 'ORDER_MISMATCH';
+  if (context.order.currency !== 'HNL' || row?.currency !== 'HNL') return 'CURRENCY_MISMATCH';
+  if (amount(context.order.amount) !== '1.00' || amount(row?.amount_hnl) !== '1.00') return 'AMOUNT_MISMATCH';
+  if (!context.sdkPublicKey) return 'SDK_PUBLIC_KEY_MISSING';
+  if (!keyValid(context.sdkPublicKey)) return 'SDK_PUBLIC_KEY_INVALID';
+  if (!context.merchantPublicKey) return 'MERCHANT_PUBLIC_KEY_MISSING';
+  if (!keyValid(context.merchantPublicKey)) return 'MERCHANT_PUBLIC_KEY_INVALID';
+  if (!Object.keys(context.encrypted || {}).every(name => ENCRYPTED.includes(name))) return 'ENCRYPTED_FIELDS_UNEXPECTED';
+  if (!Object.keys(context.billing || {}).every(name => BILLING.includes(name))) return 'BILLING_FIELDS_INVALID';
+  if (!context.encrypted?.card_number) return 'CARD_NUMBER_MISSING';
+  if (!boxed(context.encrypted.card_number)) return 'CARD_NUMBER_CIPHERTEXT_INVALID';
+  if (!context.encrypted?.card_expire) return 'CARD_EXPIRE_MISSING';
+  if (!boxed(context.encrypted.card_expire)) return 'CARD_EXPIRE_CIPHERTEXT_INVALID';
+  if (!ENCRYPTED.every(name => context.encrypted[name] === undefined || boxed(context.encrypted[name]))) return 'OPTIONAL_CIPHERTEXT_INVALID';
+  if (!BILLING.every(name => context.billing?.[name] === undefined || typeof context.billing[name] === 'string' && context.billing[name].length <= 500)) return 'BILLING_FIELDS_INVALID';
+  return 'VALID';
+}
+
+export function inspectSongbirdContextCapture(payload, row, context, { now = Date.now() } = {}) {
+  const present = value => value !== undefined && value !== null && value !== '';
+  const flags = {
+    context_present: Boolean(context), context_version_valid: context?.version === 1,
+    collection_url_present: context?.collectionUrlPresent === true,
+    order_matches: Boolean(ID.test(context?.order?.id || '') && context.order.id === row?.order_id),
+    currency_matches: context?.order?.currency === 'HNL' && row?.currency === 'HNL',
+    amount_matches: amount(context?.order?.amount) === '1.00' && amount(row?.amount_hnl) === '1.00',
+    sdk_public_key_present: present(context?.sdkPublicKey), sdk_public_key_valid: keyValid(context?.sdkPublicKey),
+    merchant_public_key_present: present(context?.merchantPublicKey), merchant_public_key_valid: keyValid(context?.merchantPublicKey),
+    card_number_present: present(context?.encrypted?.card_number), card_number_encrypted: boxed(context?.encrypted?.card_number),
+    card_expire_present: present(context?.encrypted?.card_expire), card_expire_encrypted: boxed(context?.encrypted?.card_expire),
+    optional_encrypted_valid: Object.keys(context?.encrypted || {}).every(name => ENCRYPTED.includes(name))
+      && ENCRYPTED.every(name => context?.encrypted?.[name] === undefined || boxed(context.encrypted[name])),
+    billing_valid: Object.keys(context?.billing || {}).every(name => BILLING.includes(name))
+      && BILLING.every(name => context?.billing?.[name] === undefined || typeof context.billing[name] === 'string' && context.billing[name].length <= 500),
+    jwt_present: typeof payload === 'string' && payload.length > 0,
+    jwt_shape_valid: typeof payload === 'string' && payload.length <= 16000 && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(payload),
+    jwt_json_valid: false, jwt_algorithm_valid: false, jwt_exp_present: false, jwt_iat_present: false,
+    jwt_time_valid: false, jwt_order_matches: false,
+  };
+  let jwtRule = !flags.jwt_present ? 'JWT_MISSING' : 'JWT_SHAPE_INVALID';
+  if (flags.jwt_shape_valid) {
+    jwtRule = 'JWT_JSON_INVALID';
+    try {
+      const [header, claims] = payload.split('.').slice(0, 2).map(part => JSON.parse(Buffer.from(part, 'base64url').toString('utf8')));
+      flags.jwt_json_valid = Boolean(header && claims && !Array.isArray(header) && !Array.isArray(claims));
+      if (flags.jwt_json_valid) {
+        flags.jwt_algorithm_valid = ['HS256','HS384','HS512','RS256','RS384','RS512','ES256','ES384','ES512'].includes(header.alg);
+        flags.jwt_exp_present = claims.exp !== undefined; flags.jwt_iat_present = claims.iat !== undefined;
+        const expValid = !flags.jwt_exp_present || Number.isFinite(claims.exp) && claims.exp * 1000 > now;
+        const iatValid = !flags.jwt_iat_present || Number.isFinite(claims.iat) && claims.iat * 1000 <= now + 60000 && claims.iat * 1000 >= now - 300000;
+        flags.jwt_time_valid = expValid && iatValid;
+        flags.jwt_order_matches = [claims.order_id, claims.Payload?.OrderDetails?.OrderNumber].every(value => value === undefined || value === row?.order_id);
+        jwtRule = !flags.jwt_algorithm_valid ? 'JWT_ALGORITHM_UNSUPPORTED'
+          : flags.jwt_exp_present && !Number.isFinite(claims.exp) ? 'JWT_EXP_INVALID' : !expValid ? 'JWT_EXPIRED'
+          : flags.jwt_iat_present && !Number.isFinite(claims.iat) ? 'JWT_IAT_INVALID'
+          : flags.jwt_iat_present && claims.iat * 1000 > now + 60000 ? 'JWT_IAT_FUTURE'
+          : !iatValid ? 'JWT_IAT_STALE' : !flags.jwt_order_matches ? 'JWT_ORDER_MISMATCH' : 'VALID';
+      }
+    } catch { /* AM: Only a fixed rule is retained; parse errors can contain opaque token material. */ }
+  }
+  const rule = contextRule(context, row);
+  return { accepted: matches(context, row) && inspectJwt(payload, now, row?.order_id),
+    stage: rule === 'VALID' ? 'jwt_validation' : 'context_validation', rule: rule === 'VALID' ? jwtRule : rule, flags };
 }
 // AM: SDK parseResponse collapses missing success to false; HTTP 200 false cannot prove rejection.
 const rejected = status => status >= 400 && status < 500 && ![408, 429].includes(status);
@@ -115,6 +226,7 @@ export function createSongbirdSdkContract({ providerFactory, clock = Date.now })
   return Object.freeze({
     id: 'pixelpay-sdk-2.5.8-songbird-authentication-only', browserPayloadAccredited: true, contextRequired: true,
     inspect: (payload, row, context) => matches(context, row) && inspectJwt(payload, clock(), row.order_id),
+    inspectCapture: (payload, row, context) => inspectSongbirdContextCapture(payload, row, context, { now: clock() }),
     challengeAllowed,
     async lookup({ reference, attempt, context, browser }) {
       if (context?.collectionUrlPresent) throw fail('PIXELPAY_SONGBIRD_DIRECT_API_VARIANT_UNSUPPORTED');
