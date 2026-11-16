@@ -4356,6 +4356,38 @@ test('bridge owner mismatch and anonymous route never disclose handoff state',as
   }
 });
 
+test('operational bridge accepts only native browser EMV and action codes, without financial routing',async t=>{
+  const client=diagnosticRouteClient();const steps=[];
+  const bridge={config:{enabled:true,qa:true},async step(...args){steps.push(args);return{state:'contract_blocked',
+    block_code:'PIXELPAY_SONGBIRD_AUTH_RESULT_UNACCREDITED',financial_finalization_enabled:false};}};
+  let financial=0;
+  const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
+    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,providerAdapter:{async sale(){financial++;}}});
+  t.after(()=>app.close());
+  const emv={browser_java_enabled:'false',browser_javascript_enabled:'true',browser_language:'es-HN',
+    browser_color_depth:'24',browser_screen_height:'900',browser_screen_width:'1400',browser_time_zone:'360',user_agent:'Synthetic browser'};
+  const payload={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com',lease_id:USER_B};
+  const send=body=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',headers:{accept:'application/json'},payload:{...payload,...body}});
+  const setup=await send({action:'setup',reference:'synthetic-reference',emv});
+  assert.equal(setup.statusCode,200,setup.body);assert.equal(steps.length,1);
+  assert.equal(steps[0][0],INTENT_A);assert.equal(steps[0][1],USER_A);assert.equal(steps[0][2],'setup');
+  assert.deepEqual(steps[0][5].emv,emv);assert.equal(steps[0][5].ipAddress,'127.0.0.1');
+  assert.equal(steps[0][5].httpAccept,'application/json');
+  const valid=await send({action:'validated',action_code:'SUCCESS',jwt:'synthetic.validated.signature'});
+  assert.equal(valid.statusCode,200,valid.body);assert.equal(steps[1][5].actionCode,'SUCCESS');
+  const failed=await send({action:'validated',action_code:'ERROR'});
+  assert.equal(failed.statusCode,200,failed.body);assert.equal(steps[2][4],undefined);assert.equal(steps[2][5].actionCode,'ERROR');
+  for(const body of [{action:'setup',reference:'r',emv:{...emv,ip_address:'untrusted'}},
+    {action:'setup',reference:'r',emv:{...emv,acsUrl:'https://untrusted.invalid'}},
+    {action:'setup',reference:'r',emv:{}},{action:'validated',action_code:'SUCCESS'},
+    {action:'validated',action_code:'ERROR',jwt:'synthetic.signature.token'},
+    {action:'validated',jwt:'synthetic.signature.token'},{action:'finalize'}]) {
+    assert.equal((await send(body)).statusCode,400);
+  }
+  assert.equal(steps.length,3);assert.equal(financial,0);assert.equal(client.getPayments().length,0);
+  assert.equal(client.getPaymentEvents().length,0);
+});
+
 test('QA diagnostic authenticated handler: canonical one-HNL claim COMMIT then single202, reload local and no second Sale',async t=>{
   const client=diagnosticRouteClient();
   let dispatches=0;

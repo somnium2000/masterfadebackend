@@ -4,10 +4,14 @@ const denied = () => new AppError(403, 'Autenticacion no disponible.', { code: '
 export class SongbirdRepository {
   constructor(pool) { this.pool = pool; }
   async preflight() {
-    const r = await this.pool.query("SELECT to_regclass('app_private.pixelpay_songbird_handoffs') IS NOT NULL AS ready");
+    const r = await this.pool.query(`SELECT to_regclass('app_private.pixelpay_songbird_handoffs') IS NOT NULL
+      AND (SELECT count(*)=3 FROM information_schema.columns WHERE table_schema='app_private'
+        AND table_name='pixelpay_songbird_handoffs' AND column_name IN ('context_box','block_code','provider_http_status')) AS ready`);
     if (r.rows[0]?.ready !== true) throw new AppError(503, 'Autenticacion no disponible.', { code: 'SONGBIRD_SCHEMA_REQUIRED' });
   }
   async reserve(client, row) {
+    // AM: Missing local migration rolls START back before any provider dispatch.
+    await client.query('SELECT context_box,block_code,provider_http_status FROM app_private.pixelpay_songbird_handoffs LIMIT 0');
     const result = await client.query(`INSERT INTO app_private.pixelpay_songbird_handoffs
       (id_intent,payment_attempt_id,owner_id,group_id,order_id,amount_hnl,currency,state,expires_at,payload_box)
       SELECT pi.id_intent,a.payment_attempt_id,$3::uuid,$4::uuid,$5::text,$6::numeric,$7::text,$8::text,$9::timestamptz,$10::text
@@ -42,13 +46,15 @@ export class SongbirdRepository {
       if (row.intent_state !== 'pendiente_confirmacion' || !citas.rows.length || holds.rows.length !== citas.rows.length
         || citas.rows.some(ci=>ci.estado_cita_codigo!=='pendiente_pago')
         || holds.rows.some(h=>h.estado_hold_codigo!=='activo'||!Number.isFinite(Date.parse(h.expires_at))||Date.parse(h.expires_at)<=Date.now())) {
-        row.state='expired'; row.payload_box=null; row.challenge_box=null;
+        row.state='expired'; row.payload_box=null; row.challenge_box=null; row.context_box=null;
       }
       row.version++;
       const result = await work(row);
       await c.query(`UPDATE app_private.pixelpay_songbird_handoffs SET state=$2,version=$7,lease_id=$3::uuid,
-        payload_box=$4,challenge_box=$5,input_hash=$6,authentication_id=$8,updated_at=clock_timestamp() WHERE id_intent=$1::uuid`,
-      [id,row.state,row.lease_id,row.payload_box,row.challenge_box,row.input_hash||null,row.version,row.authentication_id||null]);
+        payload_box=$4,challenge_box=$5,input_hash=$6,authentication_id=$8,expires_at=$9::timestamptz,
+        context_box=$10,block_code=$11,provider_http_status=$12,updated_at=clock_timestamp() WHERE id_intent=$1::uuid`,
+      [id,row.state,row.lease_id,row.payload_box,row.challenge_box,row.input_hash||null,row.version,row.authentication_id||null,
+        row.expires_at,row.context_box||null,row.block_code||null,row.provider_http_status||null]);
       await c.query('COMMIT'); return result;
     } catch (error) { await c.query('ROLLBACK'); throw error; }
     finally { c.release(); }

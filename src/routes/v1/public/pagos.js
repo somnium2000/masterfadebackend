@@ -1974,16 +1974,37 @@ export default async function publicPagosRoutes(app, options = {}) {
     preValidation: async request => {
       const fields = ['id_grupo_cita','id_intent','titular_email','action'];
       if (['setup','validated','interrupt'].includes(request.body?.action)) fields.push('lease_id');
-      if (request.body?.action === 'setup') fields.push('reference');
-      if (request.body?.action === 'validated') fields.push('jwt');
+      if (request.body?.action === 'setup') fields.push('reference','emv');
+      if (request.body?.action === 'validated') fields.push('jwt','action_code');
       if (!request.body || Object.keys(request.body).some(key=>!fields.includes(key))) {
+        throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
+      }
+      if (request.body.action==='setup' && request.body.emv && typeof request.body.emv==='object'
+        && Object.keys(request.body.emv).some(key=>!['browser_java_enabled','browser_javascript_enabled','browser_language',
+          'browser_color_depth','browser_screen_height','browser_screen_width','browser_time_zone','user_agent'].includes(key))) {
+        throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
+      }
+      if (request.body.action==='validated' && (request.body.action_code==='SUCCESS' ? !request.body.jwt : request.body.jwt!==undefined)) {
+        throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
+      }
+      if (['setup','validated'].includes(request.body.action) && !request.body.lease_id
+        || request.body.action==='setup' && (!request.body.reference || !request.body.emv)) {
         throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
       }
     },
     schema: { body: { type:'object',additionalProperties:false, required:['id_grupo_cita','id_intent','titular_email','action'],
       properties: { id_grupo_cita:{type:'string',format:'uuid'}, id_intent:{type:'string',format:'uuid'},
         titular_email:{type:'string',format:'email',maxLength:160}, action:{enum:['status','claim','setup','validated','interrupt']},
-        lease_id:{type:'string',format:'uuid'}, reference:{type:'string',maxLength:160}, jwt:{type:'string',maxLength:16000} } } },
+        lease_id:{type:'string',format:'uuid'}, reference:{type:'string',maxLength:160}, jwt:{type:'string',maxLength:16000},
+        action_code:{enum:['SUCCESS','ERROR','FAILURE','NOACTION','CANCEL','TIMEOUT']},
+        emv:{type:'object',additionalProperties:false,
+          required:['browser_java_enabled','browser_javascript_enabled','browser_language','browser_color_depth',
+            'browser_screen_height','browser_screen_width','browser_time_zone','user_agent'],properties:{
+          browser_java_enabled:{enum:['true','false']}, browser_javascript_enabled:{enum:['true','false']},
+          browser_language:{type:'string',minLength:1,maxLength:32}, browser_color_depth:{type:'string',pattern:'^[0-9]{1,2}$'},
+          browser_screen_height:{type:'string',pattern:'^[0-9]{1,5}$'}, browser_screen_width:{type:'string',pattern:'^[0-9]{1,5}$'},
+          browser_time_zone:{type:'string',pattern:'^-?[0-9]{1,4}$'}, user_agent:{type:'string',minLength:1,maxLength:1024}
+        }} } } },
   }, async (request,reply)=>{
     reply.header('Cache-Control','private, no-store');
     const body=request.body;
@@ -2006,9 +2027,13 @@ export default async function publicPagosRoutes(app, options = {}) {
       if (body.action==='status') result=await bridge.status(body.id_intent,owner);
       else if (body.action==='claim') result=await bridge.claim(body.id_intent,owner);
       else if (body.action==='interrupt') result=await bridge.interrupt(body.id_intent,owner,body.lease_id);
-      else result=await bridge.step(body.id_intent,owner,body.action,body.lease_id,body.action==='setup'?body.reference:body.jwt);
+      else {
+        if (body.action==='validated' && !body.action_code) throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
+        result=await bridge.step(body.id_intent,owner,body.action,body.lease_id,body.action==='setup'?body.reference:body.jwt,
+          {emv:body.emv,actionCode:body.action_code,ipAddress:request.ip,httpAccept:request.headers.accept});
+      }
     } catch(error) {
-      if (body.action==='status' && error.code==='42P01') result={state:'unavailable',can_start:false,can_resume:false,financial_finalization_enabled:false};
+      if (body.action==='status' && ['42P01','42703'].includes(error.code)) result={state:'unavailable',can_start:false,can_resume:false,financial_finalization_enabled:false};
       else if(error instanceof AppError) throw error;
       else throw new AppError(503,'Autenticacion no disponible.',{code:'SONGBIRD_STATE_UNAVAILABLE'});
     }
@@ -2567,7 +2592,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           logger: request.log,
           qa3dsDiagnostic: qa3dsTarget,
           ...(qa3dsTarget && app.songbirdBridge?.config.enabled ? {
-            onSongbirdRequired: payload => app.songbirdBridge.capture(idIntent, access.owner.usuarioId, payload),
+            onSongbirdRequired: (payload, context) => app.songbirdBridge.capture(idIntent, access.owner.usuarioId, payload, context),
           } : {}),
         });
       } catch (providerError) {

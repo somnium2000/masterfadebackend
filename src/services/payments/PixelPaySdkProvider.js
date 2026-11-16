@@ -2,6 +2,7 @@ import PixelPaySdk from "@pixelpay/sdk-core";
 import { createPixelPayNodeSaleTransaction, classifyPixelPaySaleRuntimeError, sanitizePixelPaySaleRuntimeDiagnostics } from "./pixelPaySaleRuntime.js";
 import { capturePixelPayStatusShape, emitPixelPayStatusShape } from "./pixelPayStatusShapeProbe.js";
 import { createHash } from "node:crypto";
+import { captureSongbirdSdkContext } from './songbirdSdkContract.js';
 import { PaymentProvider } from "./PaymentProvider.js";
 import {
   createPixelPaySaleAttempt,
@@ -542,6 +543,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     let transaction;
     let sdkInvoked = false;
     let pendingSongbird = null;
+    let saleRequest;
     try {
       const signature = createPixelPaySaleSignature({
         secretKey: this.secretKey,
@@ -550,8 +552,12 @@ export class PixelPaySdkProvider extends PaymentProvider {
         appUrl: this.appUrl,
       });
       transaction = this.createTransaction(signature, { sale: true, qa3dsDiagnostic: telemetryContext.qa3dsDiagnostic === true,
-        onSongbirdPayload: typeof telemetryContext.onSongbirdRequired === 'function' ? payload => { pendingSongbird = { payload }; } : undefined });
-      const saleRequest = this.buildSaleRequest(input, referenceDate);
+        onSongbirdPayload: typeof telemetryContext.onSongbirdRequired === 'function' ? (payload, metadata) => {
+          pendingSongbird = { payload, context: null };
+          try { pendingSongbird.context = captureSongbirdSdkContext(saleRequest, transaction.settings, metadata); }
+          catch { /* AM: Missing encrypted context stops the bridge; it never causes another Sale. */ }
+        } : undefined });
+      saleRequest = this.buildSaleRequest(input, referenceDate);
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
         durationMs: Date.now() - startedAt,
         ...inputDiagnostics,
@@ -561,12 +567,12 @@ export class PixelPaySdkProvider extends PaymentProvider {
       return this.completeSaleResponse(input, attempt, logger, startedAt, inputDiagnostics, transaction, response);
     } catch (error) {
       if (pendingSongbird) {
-        try { await telemetryContext.onSongbirdRequired(pendingSongbird.payload); }
+        try { await telemetryContext.onSongbirdRequired(pendingSongbird.payload, pendingSongbird.context); }
         catch {
           // AM: A handoff write failure cannot release the financial claim or cause another Sale.
           try { logger?.error?.({ event: 'PIXELPAY_SONGBIRD_HANDOFF_PERSISTENCE_FAILED', paymentAttemptId: attempt.paymentAttemptId }, 'No se pudo guardar la autenticacion'); }
           catch { /* AM: Logger failures never release an uncertain financial claim. */ }
-        } finally { delete pendingSongbird.payload; }
+        } finally { delete pendingSongbird.payload; delete pendingSongbird.context; }
       }
       const execution = sdkInvoked ? transaction?.getSaleExecutionDiagnostics?.() : {
           executionPhase: "request_construction", httpResponseReceived: false, requestMayHaveBeenSent: false,
