@@ -217,10 +217,12 @@ const challengeAllowed = challenge => {
 function lookupDiagnostic(response, httpStatus, challenge, attempt) {
   const present = value => value !== undefined && value !== null && value !== '';
   const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
-  let urlValid = false; let originAllowed = false;
+  let urlValid = false; let originAllowed = false; let acsOrigin = null;
   if (typeof challenge.acsUrl === 'string' && challenge.acsUrl.length <= 2048) {
     try {
       const url = new URL(challenge.acsUrl);
+      // AM: Only normalized HTTPS origin is diagnostic; never retain path, query, fragment or userinfo.
+      if (url.protocol === 'https:') acsOrigin = url.origin;
       urlValid = url.protocol === 'https:' && !url.username && !url.password && !url.hash;
       originAllowed = ACS_ORIGINS.has(url.origin);
     } catch { /* AM: Parsing failures may include URLs; retain booleans only. */ }
@@ -228,7 +230,7 @@ function lookupDiagnostic(response, httpStatus, challenge, attempt) {
   return {
     event: 'PIXELPAY_SONGBIRD_LOOKUP_DIAGNOSTIC',
     id_intent: uuid(attempt.id_intent), paymentAttemptId: uuid(attempt.payment_attempt_id),
-    provider_http_status: httpStatus,
+    provider_http_status: httpStatus, acs_origin: acsOrigin,
     response_class: response instanceof PayloadResponse ? 'PayloadResponse'
       : response instanceof SuccessResponse ? 'SuccessResponse' : response == null ? 'absent' : 'other',
     // AM: These describe the parsed SDK response; missing upstream success is normalized to false by SDK.
