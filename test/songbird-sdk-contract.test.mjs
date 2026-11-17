@@ -291,3 +291,19 @@ for (const [url, origin] of [
   assert.equal(telemetry[0].fields.acs_origin_allowed,false);
   for(const secret of ['password','private','SENSITIVE','fragment'])assert.equal(JSON.stringify(telemetry).includes(secret),false);
 });
+
+for (const [origin, allowed] of [
+  ['https://cas.client.cardinaltrusted.com', true],
+  ['https://client.cardinaltrusted.com', false],
+  ['https://evil.cas.client.cardinaltrusted.com', false],
+  ['https://cas.client.cardinaltrusted.com.evil.invalid', false],
+  ['http://cas.client.cardinaltrusted.com', false],
+  ['https://cas.client.cardinaltrusted.com:8443', false],
+]) test('CAS origin policy: '+origin, async()=>{
+  const {context,contract}=rig();
+  await transport(async requests=>{
+    const result=await contract.lookup({reference:'ref',attempt:row,context,browser});
+    assert.equal(result.verified,allowed);
+    assert.deepEqual(requests.map(r=>r.route),['api/v2/cardinal/authentication/lookup']);
+  },lookupReply(202,{data:{...challenge,continue_url:origin+'/merchantacs/threeds/v2/creq'}}));
+});
