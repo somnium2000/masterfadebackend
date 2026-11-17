@@ -4,20 +4,28 @@ import { createRequire } from 'node:module';
 import net from 'node:net';
 import { captureSongbirdSdkContext, createSongbirdSdkContract } from '../src/services/payments/songbirdSdkContract.js';
 import { PixelPaySdkProvider } from '../src/services/payments/PixelPaySdkProvider.js';
+import { SongbirdBridge } from '../src/services/payments/songbirdBridge.js';
+import { assertSongbirdFinalizationBlocked } from '../src/services/payments/songbirdContract.js';
 
 const require = createRequire(import.meta.url);
 const sdk = require('@pixelpay/sdk-core');
 const nacl = require('tweetnacl');
 const axios = require('axios');
+const CardinalAuthentication = require('@pixelpay/sdk-core/lib/services/CardinalAuthentication.js').default;
 const now = Date.now();
 const jwt = (payload = {}, header = { alg: 'HS256' }) => [header, { iat: Math.floor(now / 1000), ...payload }]
   .map(value => Buffer.from(JSON.stringify(value)).toString('base64url')).concat('c3ludGhldGlj').join('.');
-const row = { order_id: 'SYNTHETIC-SONGBIRD-ORDER', amount_hnl: '1.00', currency: 'HNL', authentication_id: 'synthetic-auth' };
+const row = { id_intent: '11111111-1111-4111-8111-111111111111', payment_attempt_id: '22222222-2222-4222-8222-222222222222',
+  order_id: 'SYNTHETIC-SONGBIRD-ORDER', amount_hnl: '1.00', currency: 'HNL', authentication_id: 'synthetic-auth' };
 const browser = { browser_java_enabled: 'false', browser_javascript_enabled: 'true', browser_language: 'es-HN',
   browser_color_depth: '24', browser_screen_height: '900', browser_screen_width: '1400', browser_time_zone: '360',
   user_agent: 'Synthetic-browser', browser_header: '*/*', ip_address: '127.0.0.1' };
 
-function rig() {
+const challenge = { identifier: row.authentication_id, transaction_id: 'synthetic-transaction',
+  continue_url: 'https://centinelapistag.cardinalcommerce.com/challenge', continue_payload: 'synthetic-challenge' };
+const lookupReply = (status, data = {}) => ({ status, data: { action: 'continue', data: challenge, ...data } });
+
+function rig(options = {}) {
   const merchant = nacl.box.keyPair();
   const publicKey = Buffer.from(merchant.publicKey).toString('base64');
   const sale = new sdk.Requests.SaleTransaction();
@@ -28,7 +36,7 @@ function rig() {
   const context = captureSongbirdSdkContext(sale, { public_key: publicKey });
   const provider = new PixelPaySdkProvider({ endpoint: 'https://pixelpay.dev', env: 'sandbox',
     keyId: 'synthetic-key', authHash: 'c'.repeat(32), secretKey: 'synthetic-secret', appUrl: 'https://pixelpay.dev' });
-  const contract = createSongbirdSdkContract({ providerFactory: () => provider, clock: () => now });
+  const contract = createSongbirdSdkContract({ providerFactory: () => provider, clock: () => now, ...options });
   return { context, contract, sale, provider };
 }
 
@@ -109,6 +117,124 @@ test('lookup rejects unknown ACS and missing browser context without any financi
     assert.equal(r.verified, false);
     assert.equal(r.blockCode, 'PIXELPAY_SONGBIRD_CHALLENGE_UNACCREDITED');
   }, { data: { action: 'continue', data: { identifier: row.authentication_id, continue_url: 'https://evil.invalid', continue_payload: 'synthetic', transaction_id: 'synthetic' } } });
+});
+
+for (const scenario of [
+  { name: 'false success', data: { success: false } },
+  { name: 'missing success', data: { success: undefined } },
+  { name: 'string success', data: { success: 'true' } },
+  { name: 'missing action', data: { action: undefined } },
+  { name: 'terminal action', data: { action: 'token_auth_success' } },
+  ...Object.keys(challenge).map(field => ({ name: `missing ${field}`, data: { data: { ...challenge, [field]: undefined } } })),
+  { name: 'invalid identifier', data: { data: { ...challenge, identifier: 'invalid identifier' } } },
+  { name: 'oversized payload', data: { data: { ...challenge, continue_payload: 'x'.repeat(16001) } } },
+  ...['https://evil.invalid/challenge', 'https://songbird.cardinalcommerce.com/challenge',
+    'https://user@centinelapistag.cardinalcommerce.com/challenge',
+    'https://centinelapistag.cardinalcommerce.com/challenge#fragment'].map(continue_url => ({
+    name: `forbidden ACS ${continue_url}`, data: { data: { ...challenge, continue_url } },
+  })),
+]) {
+  test(`HTTP 202 lookup blocks ${scenario.name} without financial requests`, async () => {
+    const { context, contract } = rig();
+    await transport(async requests => {
+      const result = await contract.lookup({ reference: 'ref', attempt: row, context, browser });
+      assert.equal(result.verified, false);
+      assert.equal(result.httpStatus, 202);
+      assert.equal(Object.hasOwn(result, 'challenge'), false);
+      assert.deepEqual(requests.map(request => request.route), ['api/v2/cardinal/authentication/lookup']);
+    }, lookupReply(202, scenario.data));
+  });
+}
+
+test('HTTP 202 requires the SDK PayloadResponse class rather than a matching shape or class name', async () => {
+  const { context, contract } = rig();
+  const original = CardinalAuthentication.prototype.authenticationLookup;
+  CardinalAuthentication.prototype.authenticationLookup = async () => ({ status: 202, success: true, action: 'continue',
+    data: challenge, constructor: { name: 'PayloadResponse' } });
+  try {
+    await transport(async requests => {
+      const result = await contract.lookup({ reference: 'ref', attempt: row, context, browser });
+      assert.equal(result.verified, false);
+      assert.equal(result.blockCode, 'PIXELPAY_SONGBIRD_LOOKUP_UNCERTAIN');
+      assert.equal(requests.length, 0);
+    });
+  } finally { CardinalAuthentication.prototype.authenticationLookup = original; }
+});
+
+class LookupRepository {
+  async reserve(_client, value) { this.row = structuredClone(value); return this.row; }
+  async mutate(id, owner, work) {
+    assert.equal(id, this.row.id_intent); assert.equal(owner, this.row.owner_id);
+    const next = structuredClone(this.row); next.version++;
+    const result = await work(next); this.row = next; return result;
+  }
+}
+
+for (const scenario of [{ status: 200, valid: true }, { status: 202, valid: true }, { status: 202, valid: false }]) {
+  test(`native lookup HTTP ${scenario.status} ${scenario.valid ? 'valid' : 'invalid'} follows the bridge claim/setup state without Sale or financial confirmation`, async () => {
+    const { context, contract } = rig(); const repository = new LookupRepository();
+    const owner = '33333333-3333-4333-8333-333333333333';
+    const bridge = new SongbirdBridge({ repository, config: { enabled: true, key: Buffer.alloc(32, 8), ttlMs: 600000 }, contract, clock: () => now });
+    await bridge.reserve(null, { idIntent: row.id_intent, paymentAttemptId: row.payment_attempt_id, ownerId: owner,
+      groupId: '44444444-4444-4444-8444-444444444444', orderId: row.order_id,
+      amount: row.amount_hnl, currency: row.currency, expiresAt: new Date(now + 600000).toISOString() });
+    assert.equal((await bridge.capture(row.id_intent, owner, jwt(), context)).state, 'handoff_ready');
+    const lease = await bridge.claim(row.id_intent, owner);
+    assert.equal(lease.state, 'browser_leased');
+    await transport(async requests => {
+      const setup = await bridge.step(row.id_intent, owner, 'setup', lease.handoff.lease_id, 'synthetic-reference', {
+        emv: browser, ipAddress: browser.ip_address, httpAccept: browser.browser_header,
+      });
+      assert.equal(setup.state, scenario.valid ? 'challenge_ready' : 'contract_blocked');
+      assert.equal(setup.provider_http_status, scenario.status);
+      assert.equal(setup.financial_finalization_enabled, false);
+      assert.equal(repository.row.context_box, null);
+      await assert.rejects(bridge.step(row.id_intent, owner, 'setup', lease.handoff.lease_id, 'synthetic-reference'),
+        error => error.code === 'SONGBIRD_PHASE_ALREADY_CLAIMED');
+      assert.deepEqual(requests.map(request => request.route), ['api/v2/cardinal/authentication/lookup']);
+      assert.throws(assertSongbirdFinalizationBlocked, error => error.code === 'PIXELPAY_3DS_FINALIZATION_BLOCKED');
+    }, lookupReply(scenario.status, scenario.valid ? {} : { data: { ...challenge, continue_payload: undefined } }));
+  });
+}
+
+test('lookup diagnostics correlate native response class and booleans without sensitive data', async () => {
+  const telemetry = [];
+  const { context, contract } = rig({ logger: { info: fields => telemetry.push(fields) } });
+  await transport(async () => {
+    assert.equal((await contract.lookup({ reference: 'ref', attempt: row, context, browser })).verified, true);
+  }, lookupReply(202, { message: 'SENSITIVE-PROVIDER-MESSAGE', data: { ...challenge, jwt: jwt(), secretKey: 'SENSITIVE-PROVIDER-SECRET' } }));
+  assert.equal(telemetry.length, 1);
+  assert.deepEqual(telemetry[0], {
+    event: 'PIXELPAY_SONGBIRD_LOOKUP_DIAGNOSTIC', id_intent: row.id_intent, paymentAttemptId: row.payment_attempt_id,
+    provider_http_status: 202, response_class: 'PayloadResponse', success: true, success_is_boolean: true, action: 'continue',
+    fields: { identifier_present: true, identifier_valid: true, transaction_id_present: true, transaction_id_valid: true,
+      continue_payload_present: true, continue_payload_valid: true, continue_url_present: true, continue_url_valid: true,
+      acs_origin_allowed: true, challenge_valid: true }, financial_finalization_enabled: false,
+  });
+  const serialized = JSON.stringify(telemetry);
+  for (const forbidden of [jwt(), challenge.continue_payload, challenge.continue_url, challenge.identifier,
+    challenge.transaction_id, context.encrypted.card_number, context.sdkPublicKey, 'synthetic-secret',
+    'SENSITIVE-PROVIDER-MESSAGE', 'SENSITIVE-PROVIDER-SECRET', 'card_cvv', 'secretKey']) assert.equal(serialized.includes(forbidden), false);
+});
+
+test('lookup diagnostics normalize unknown action and nonboolean success without leaking their values', async () => {
+  const telemetry = [];
+  const { context, contract } = rig({ logger: { info: fields => telemetry.push(fields) } });
+  await transport(async () => {
+    assert.equal((await contract.lookup({ reference: 'ref', attempt: row, context, browser })).verified, false);
+  }, lookupReply(202, { success: 'SENSITIVE-SUCCESS', action: 'SENSITIVE-ACTION' }));
+  assert.equal(telemetry[0].success, false);
+  assert.equal(telemetry[0].success_is_boolean, false);
+  assert.equal(telemetry[0].action, 'other');
+  assert.equal(JSON.stringify(telemetry).includes('SENSITIVE-'), false);
+});
+
+test('a throwing diagnostic logger cannot change acceptance of a valid HTTP 202 lookup', async () => {
+  const { context, contract } = rig({ logger: { info() { throw new Error('LOGGER_FAILURE'); } } });
+  await transport(async requests => {
+    assert.equal((await contract.lookup({ reference: 'ref', attempt: row, context, browser })).verified, true);
+    assert.equal(requests.length, 1);
+  }, lookupReply(202));
 });
 
 test('native continue is bound to stored authentication identifier; success never authorizes financial finalization', async () => {

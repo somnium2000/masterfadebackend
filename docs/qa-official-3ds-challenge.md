@@ -1,5 +1,36 @@
 # QA: desbloquear el desafío Songbird con SDK 2.5.8
 
+## Corrección de authenticationLookup HTTP 202
+
+El lookup del SDK convierte HTTP 202 en `PayloadResponse`. Se admite únicamente
+esa clase real, con `success === true`, `action === 'continue'` y desafío válido
+bajo los controles de contexto y los dos orígenes ACS Sandbox existentes.
+HTTP 200 válido conserva su comportamiento. Ninguna respuesta de lookup acredita
+un pago ni habilita `retryTransaction` o una segunda Sale.
+
+Para este parche, fusionar su PR a `dev` después de CI y desplegar **solo backend
+QA** en EasyPanel desde ese SHA. Conservar la configuración QA actual; no requiere
+reconstruir React, modificar el SDK, aplicar migraciones ni cambiar producción.
+La siguiente prueba real la realiza el operador, con una única Sale nueva y clic
+inmediato en el botón 3DS. No reutilizar el intento bloqueado ni reejecutar lookup.
+
+Antes de esa prueba, la salida SSH filtrada debe conservar el evento
+`PIXELPAY_SONGBIRD_LOOKUP_DIAGNOSTIC`: `id_intent`, `paymentAttemptId`,
+`provider_http_status`, `response_class`, `success`, `success_is_boolean`, `action`,
+`fields` (solo booleanos de presencia/validez) y
+`financial_finalization_enabled`. El evento describe la respuesta **parseada** por
+el SDK; no distingue un `success` ausente en el cuerpo original de `false`.
+Nunca imprimir cuerpos, JWT, payloads, tarjetas, credenciales ni URLs completas.
+El wrapper SSH general anterior elimina estos campos; su salida no permite
+acreditar el contrato. Usar una salida filtrada que ya los permita, sin ampliar
+permisos del usuario SSH.
+
+Secuencia esperada: `claim → browser_leased`, diagnóstico de lookup
+`202 / PayloadResponse / true / continue` con todos los indicadores válidos,
+`setup → challenge_ready`, y desafío visible en React. Un lookup 200 válido
+produce `SuccessResponse` y conserva la misma continuación. El cierre financiero
+sigue bloqueado aun si Cardinal completa la autenticación.
+
 ## Cambio y límite
 
 Base backend `289b69e`, frontend `2332202`, ambas desde `dev`. El puente HTTP 202,
@@ -103,7 +134,7 @@ Secuencia esperada de esta única operación:
   `jwt_order_number_matches=false` es compatible con aceptación.
 - Pulsar una vez **Iniciar autenticación 3DS**: fase `claim`, estado
   `browser_leased`. React carga Songbird Sandbox y llama setup con el JWT efímero.
-- Fase `setup`: lookup HTTP 200 válido, estado `challenge_ready`. En React debe
+- Fase `setup`: lookup HTTP 200 o 202 válido, estado `challenge_ready`. En React debe
   verse el desafío bancario en el iframe del modal nativo; SSH solo acredita
   el avance backend, no que el navegador lo haya mostrado.
 - Si se completa, fase `validated` y respuesta HTTP real de continue. Incluso
