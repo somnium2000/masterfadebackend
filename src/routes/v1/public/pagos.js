@@ -2037,6 +2037,12 @@ export default async function publicPagosRoutes(app, options = {}) {
       else if(error instanceof AppError) throw error;
       else throw new AppError(503,'Autenticacion no disponible.',{code:'SONGBIRD_STATE_UNAVAILABLE'});
     }
+    // AM: Log only phase indicators; never serialize the handoff, challenge or request body.
+    if (body.action !== 'status') request.log.info({
+      event: 'pixelpay_songbird_phase', id_intent: body.id_intent, action: body.action, state: result.state,
+      provider_http_status: result.provider_http_status ?? null,
+      financial_finalization_enabled: false,
+    }, 'PixelPay QA 3DS phase');
     return sendOk(reply,result);
   });
   app.post("/crear-intent", {

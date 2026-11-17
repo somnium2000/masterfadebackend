@@ -130,7 +130,7 @@ test('Songbird operational claims PostgreSQL17: concurrency, failed authenticati
       return results.find(result => result.ok).result;
     };
 
-    await t.test('independent initial JWT order diagnostics remain callback-only and both mismatches keep the durable bridge blocked', async () => {
+    await t.test('durable binding blocks merchant order mismatch but leases provider OrderNumber once after restart', async () => {
       let providerCalls = 0;
       const contract = createSongbirdSdkContract({ providerFactory() {
         providerCalls++; throw new Error('PROVIDER_FORBIDDEN');
@@ -157,10 +157,12 @@ test('Songbird operational claims PostgreSQL17: concurrency, failed authenticati
           Payload: { OrderDetails: { OrderNumber: field === 'nested' ? privateMarker : ORDER } } };
         const payload = [{ alg: 'HS256' }, claims].map(value => Buffer.from(JSON.stringify(value)).toString('base64url'))
           .concat('c3ludGhldGlj').join('.');
+        const accepted = field === 'nested';
+        const state = accepted ? 'handoff_ready' : 'contract_blocked';
         const result = await bridge.capture(ID, OWNER, payload, context);
-        assert.equal(result.state, 'contract_blocked');
+        assert.equal(result.state, state);
         assert.equal(result.financial_finalization_enabled, false);
-        assert.equal(result.capture_diagnostic.rule, 'JWT_ORDER_MISMATCH');
+        assert.equal(result.capture_diagnostic.rule, accepted ? 'VALID' : 'JWT_ORDER_MISMATCH');
         const flags = result.capture_diagnostic.flags;
         assert.equal(flags.jwt_order_id_present, true);
         assert.equal(flags.jwt_order_number_present, true);
@@ -168,14 +170,24 @@ test('Songbird operational claims PostgreSQL17: concurrency, failed authenticati
         assert.equal(flags.jwt_order_number_matches, field !== 'nested');
         assert.equal(Object.values(flags).every(value => typeof value === 'boolean'), true);
         const saved = await snapshot();
-        assert.equal(saved.block_code, 'PIXELPAY_SONGBIRD_CONTEXT_UNAVAILABLE');
-        assert.equal(saved.payload_box, null); assert.equal(saved.context_box, null);
+        assert.equal(saved.block_code, accepted ? null : 'PIXELPAY_SONGBIRD_CONTEXT_UNAVAILABLE');
+        assert.equal(typeof saved.payload_box, accepted ? 'string' : 'object');
+        assert.equal(typeof saved.context_box, accepted ? 'string' : 'object');
+        if (!accepted) { assert.equal(saved.payload_box, null); assert.equal(saved.context_box, null); }
         assert.equal(Object.hasOwn(saved, 'capture_diagnostic'), false);
         const restarted = new SongbirdBridge({ repository: new SongbirdRepository(pool), config, contract });
         const status = await restarted.status(ID, OWNER);
-        assert.equal(status.state, 'contract_blocked');
+        assert.equal(status.state, state);
         assert.equal(Object.hasOwn(status, 'capture_diagnostic'), false);
-        await assert.rejects(restarted.claim(ID, OWNER), error => error.code === 'PIXELPAY_SONGBIRD_CONTRACT_BLOCKED');
+        if (accepted) {
+          const claimed = await restarted.claim(ID, OWNER);
+          assert.equal(claimed.handoff.jwt, payload);
+          assert.equal(claimed.handoff.order_id, ORDER);
+          assert.equal((await snapshot()).payload_box, null);
+          await assert.rejects(restarted.claim(ID, OWNER), error => error.code === 'SONGBIRD_ALREADY_LEASED');
+        } else {
+          await assert.rejects(restarted.claim(ID, OWNER), error => error.code === 'PIXELPAY_SONGBIRD_CONTRACT_BLOCKED');
+        }
         for (const object of [result, saved, status]) {
           assert.equal(JSON.stringify(object).includes(payload), false);
           assert.equal(JSON.stringify(object).includes(privateMarker), false);

@@ -39,7 +39,7 @@ const jwtRules = {
   'JWT absent': 'JWT_MISSING', 'JWT malformed': 'JWT_SHAPE_INVALID', 'JWT JSON malformed': 'JWT_JSON_INVALID',
   'JWT unsigned algorithm': 'JWT_ALGORITHM_UNSUPPORTED', 'JWT expired': 'JWT_EXPIRED',
   'JWT future timestamp': 'JWT_IAT_FUTURE', 'JWT stale timestamp': 'JWT_IAT_STALE',
-  'JWT contradictory order': 'JWT_ORDER_MISMATCH', 'JWT contradictory nested order': 'JWT_ORDER_MISMATCH',
+  'JWT contradictory order': 'JWT_ORDER_MISMATCH',
 };
 
 function nativeFixture() {
@@ -133,7 +133,6 @@ for (const scenario of [
   { name: 'JWT future timestamp', value: token({ iat: Math.floor(now / 1000) + 120 }), flag: 'jwt_time_valid' },
   { name: 'JWT stale timestamp', value: token({ iat: Math.floor(now / 1000) - 600 }), flag: 'jwt_time_valid' },
   { name: 'JWT contradictory order', value: token({ order_id: 'OTHER-ORDER' }), flag: 'jwt_order_matches' },
-  { name: 'JWT contradictory nested order', value: token({ Payload: { OrderDetails: { OrderNumber: 'OTHER-ORDER' } } }), flag: 'jwt_order_matches' },
 ]) test(`JWT rejection identifies ${scenario.name} without returning its value`, () => {
   const { context } = nativeFixture();
   const result = inspectSongbirdContextCapture(scenario.value, row, context, { now });
@@ -155,7 +154,7 @@ test('unsupported collection_url remains an explicit blocked variant with no bro
   for (const diagnostic of [...observations, result]) assertSafeDiagnostic(diagnostic, [token(), 'unsupported.invalid']);
 });
 
-test('independent claim indicators distinguish absent, matching, contradictory and non-string values without changing acceptance', () => {
+test('Cardinal OrderNumber is observational; explicit merchant order_id and captured context remain binding', () => {
   const { context } = nativeFixture();
   const contract = createSongbirdSdkContract({ clock: () => now,
     providerFactory() { throw new Error('PROVIDER_MUST_NOT_BE_CREATED'); } });
@@ -180,8 +179,8 @@ test('independent claim indicators distinguish absent, matching, contradictory a
         jwt_payload_is_object: true, jwt_payload_is_string: false,
       };
       for (const [key, value] of Object.entries(expected)) assert.equal(result.flags[key], value);
-      assert.equal(result.accepted, top.allowed && nested.allowed);
-      assert.equal(result.flags.jwt_order_matches, top.allowed && nested.allowed);
+      assert.equal(result.accepted, top.allowed);
+      assert.equal(result.flags.jwt_order_matches, top.allowed);
       assert.equal(result.rule, result.accepted ? 'VALID' : 'JWT_ORDER_MISMATCH');
       assert.equal(contract.inspect(jwt, row, context), result.accepted);
       assertSafeDiagnostic(sanitizeSongbirdCaptureDiagnostic(result), [jwt, row.order_id]);

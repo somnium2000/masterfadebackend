@@ -159,9 +159,9 @@ test('capture exception identifies optional ciphertext rule, not provider omissi
 for (const tokenKind of ['order-id', 'order-number']) {
   test(`native 202 diagnostic distinguishes ${tokenKind} mismatch without exposing the claim or allowing another Sale`, async () => {
     const result = await observe({ tokenKind });
-    assert.equal(result.status.state, 'contract_blocked');
+    assert.equal(result.status.state, tokenKind === 'order-number' ? 'handoff_ready' : 'contract_blocked');
     assert.equal(result.event.capture.rule, 'VALID');
-    assert.equal(result.event.validation.rule, 'JWT_ORDER_MISMATCH');
+    assert.equal(result.event.validation.rule, tokenKind === 'order-number' ? 'VALID' : 'JWT_ORDER_MISMATCH');
     assert.equal(result.event.validation.flags.jwt_order_id_present, true);
     assert.equal(result.event.validation.flags.jwt_order_number_present, true);
     assert.equal(result.event.validation.flags.jwt_order_id_matches, tokenKind !== 'order-id');
