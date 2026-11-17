@@ -1975,6 +1975,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       const fields = ['id_grupo_cita','id_intent','titular_email','action'];
       if (['setup','validated','interrupt'].includes(request.body?.action)) fields.push('lease_id');
       if (request.body?.action === 'setup') fields.push('reference','emv');
+      if (request.body?.action === 'interrupt') fields.push('interrupt_reason');
       if (request.body?.action === 'validated') fields.push('jwt','action_code');
       if (!request.body || Object.keys(request.body).some(key=>!fields.includes(key))) {
         throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
@@ -1997,6 +1998,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         titular_email:{type:'string',format:'email',maxLength:160}, action:{enum:['status','claim','setup','validated','interrupt']},
         lease_id:{type:'string',format:'uuid'}, reference:{type:'string',maxLength:160}, jwt:{type:'string',maxLength:16000},
         action_code:{enum:['SUCCESS','ERROR','FAILURE','NOACTION','CANCEL','TIMEOUT']},
+        interrupt_reason:{enum:['PANEL_CLEANUP','CONTEXT_CHANGED','SIGNAL_ABORT','HANDOFF_EXPIRED','UI_CLOSED','SDK_HANDLER_ERROR','SDK_RUN_ERROR','SESSION_INIT_ERROR','CHALLENGE_INVALID','USER_CANCEL']},
         emv:{type:'object',additionalProperties:false,
           required:['browser_java_enabled','browser_javascript_enabled','browser_language','browser_color_depth',
             'browser_screen_height','browser_screen_width','browser_time_zone','user_agent'],properties:{
@@ -2041,6 +2043,7 @@ export default async function publicPagosRoutes(app, options = {}) {
     if (body.action !== 'status') request.log.info({
       event: 'pixelpay_songbird_phase', id_intent: body.id_intent, action: body.action, state: result.state,
       provider_http_status: result.provider_http_status ?? null,
+      ...(body.action === 'interrupt' ? { interrupt_reason: body.interrupt_reason ?? 'UNSPECIFIED' } : {}),
       financial_finalization_enabled: false,
     }, 'PixelPay QA 3DS phase');
     return sendOk(reply,result);

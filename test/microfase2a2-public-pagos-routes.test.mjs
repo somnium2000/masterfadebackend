@@ -4455,3 +4455,22 @@ for(const [scenario,options,claims,payloadPatch] of [
     assert.equal(client.getPayments().length,0); assert.equal(client.getPaymentEvents().length,0);
   });
 }
+
+test('Songbird interrupt telemetry accepts fixed reasons only and preserves legacy callers',async t=>{
+  const logs=[];let interrupted=0;
+  const bridge={config:{enabled:true,qa:true},async interrupt(){interrupted++;return{state:'interrupted',financial_finalization_enabled:false};}};
+  const app=await createPagosApp(diagnosticRouteClient(),{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
+    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,logs});t.after(()=>app.close());
+  const base={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com',lease_id:USER_B,action:'interrupt'};
+  const send=extra=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',payload:{...base,...extra}});
+  for(const interrupt_reason of ['PANEL_CLEANUP','UI_CLOSED','SDK_HANDLER_ERROR']){
+    assert.equal((await send({interrupt_reason})).statusCode,200);
+  }
+  assert.equal((await send({})).statusCode,200);
+  assert.equal((await send({interrupt_reason:'SENSITIVE_ERROR'})).statusCode,400);
+  assert.equal((await send({action:'setup',interrupt_reason:'UI_CLOSED'})).statusCode,400);
+  assert.equal(interrupted,4);
+  const phases=logs.map(line=>JSON.parse(line)).filter(entry=>entry.event==='pixelpay_songbird_phase');
+  assert.deepEqual(phases.map(row=>row.interrupt_reason),['PANEL_CLEANUP','UI_CLOSED','SDK_HANDLER_ERROR','UNSPECIFIED']);
+  assert.ok(phases.every(row=>row.id_intent===INTENT_A&&row.financial_finalization_enabled===false));
+});

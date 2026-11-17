@@ -206,7 +206,7 @@ test('lookup diagnostics correlate native response class and booleans without se
   assert.equal(telemetry.length, 1);
   assert.deepEqual(telemetry[0], {
     event: 'PIXELPAY_SONGBIRD_LOOKUP_DIAGNOSTIC', id_intent: row.id_intent, paymentAttemptId: row.payment_attempt_id,
-    provider_http_status: 202, response_class: 'PayloadResponse', success: true, success_is_boolean: true, action: 'continue',
+    provider_http_status: 202, acs_origin: 'https://centinelapistag.cardinalcommerce.com', response_class: 'PayloadResponse', success: true, success_is_boolean: true, action: 'continue',
     fields: { identifier_present: true, identifier_valid: true, transaction_id_present: true, transaction_id_valid: true,
       continue_payload_present: true, continue_payload_valid: true, continue_url_present: true, continue_url_valid: true,
       acs_origin_allowed: true, challenge_valid: true }, financial_finalization_enabled: false,
@@ -275,4 +275,19 @@ test('Live/provider mismatch never dispatches an authentication operation', asyn
     await assert.rejects(contract.lookup({ reference: 'ref', attempt: row, context, browser }), error => error.code === 'PIXELPAY_SONGBIRD_SANDBOX_REQUIRED');
     assert.equal(requests.length, 0);
   });
+});
+
+for (const [url, origin] of [
+  ['https://user:password@ACS.Example.invalid:8443/private?jwt=SENSITIVE#fragment','https://acs.example.invalid:8443'],
+  ['https://ACS.Example.invalid:443/private?payload=SENSITIVE','https://acs.example.invalid'],
+  ['http://acs.example.invalid/private',null], ['not-a-url-SENSITIVE',null],
+]) test('ACS diagnostic retains only normalized HTTPS origin',async()=>{
+  const telemetry=[];const {context,contract}=rig({logger:{info:fields=>telemetry.push(fields)}});
+  await transport(async()=>{
+    const result=await contract.lookup({reference:'ref',attempt:row,context,browser});
+    assert.equal(result.verified,false);
+  },lookupReply(202,{data:{...challenge,continue_url:url}}));
+  assert.equal(telemetry[0].acs_origin,origin);
+  assert.equal(telemetry[0].fields.acs_origin_allowed,false);
+  for(const secret of ['password','private','SENSITIVE','fragment'])assert.equal(JSON.stringify(telemetry).includes(secret),false);
 });
