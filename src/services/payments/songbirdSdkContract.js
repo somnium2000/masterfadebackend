@@ -106,7 +106,8 @@ function inspectJwt(value, now, orderId) {
       || !['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512', 'ES256', 'ES384', 'ES512'].includes(header.alg)) return false;
     if (payload.exp !== undefined && (!Number.isFinite(payload.exp) || payload.exp * 1000 <= now)) return false;
     if (payload.iat !== undefined && (!Number.isFinite(payload.iat) || payload.iat * 1000 > now + 60000 || payload.iat * 1000 < now - 300000)) return false;
-    for (const declared of [payload.order_id, payload.Payload?.OrderDetails?.OrderNumber]) {
+    // AM: Cardinal's OrderNumber belongs to the provider; binding uses the captured backend context.
+    for (const declared of [payload.order_id]) {
       if (declared !== undefined && declared !== orderId) return false;
     }
     return true;
@@ -172,7 +173,7 @@ export function inspectSongbirdContextCapture(payload, row, context, { now = Dat
         const expValid = !flags.jwt_exp_present || Number.isFinite(claims.exp) && claims.exp * 1000 > now;
         const iatValid = !flags.jwt_iat_present || Number.isFinite(claims.iat) && claims.iat * 1000 <= now + 60000 && claims.iat * 1000 >= now - 300000;
         flags.jwt_time_valid = expValid && iatValid;
-        // AM: Observe the existing paths without coercion, reparsing Payload or changing the acceptance gate.
+        // AM: Observe Cardinal OrderNumber without using it as the merchant order identity.
         const orderNumber = claims.Payload?.OrderDetails?.OrderNumber;
         flags.jwt_order_id_present = claims.order_id !== undefined;
         flags.jwt_order_id_is_string = typeof claims.order_id === 'string';
@@ -182,7 +183,7 @@ export function inspectSongbirdContextCapture(payload, row, context, { now = Dat
         flags.jwt_order_number_matches = flags.jwt_order_number_present && orderNumber === row?.order_id;
         flags.jwt_payload_is_object = claims.Payload !== null && typeof claims.Payload === 'object' && !Array.isArray(claims.Payload);
         flags.jwt_payload_is_string = typeof claims.Payload === 'string';
-        flags.jwt_order_matches = [claims.order_id, claims.Payload?.OrderDetails?.OrderNumber].every(value => value === undefined || value === row?.order_id);
+        flags.jwt_order_matches = claims.order_id === undefined || claims.order_id === row?.order_id;
         jwtRule = !flags.jwt_algorithm_valid ? 'JWT_ALGORITHM_UNSUPPORTED'
           : flags.jwt_exp_present && !Number.isFinite(claims.exp) ? 'JWT_EXP_INVALID' : !expValid ? 'JWT_EXPIRED'
           : flags.jwt_iat_present && !Number.isFinite(claims.iat) ? 'JWT_IAT_INVALID'

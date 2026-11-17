@@ -63,7 +63,7 @@ test('inspect binds order, amount, currency and optional token time without asse
   assert.equal(contract.inspect(jwt({ order_id: row.order_id }), row, context), true);
   assert.equal(contract.inspect(jwt({ Payload: { OrderDetails: { OrderNumber: row.order_id } } }), row, context), true);
   assert.equal(contract.inspect(jwt({ order_id: 'foreign' }), row, context), false);
-  assert.equal(contract.inspect(jwt({ Payload: { OrderDetails: { OrderNumber: 'foreign' } } }), row, context), false);
+  assert.equal(contract.inspect(jwt({ Payload: { OrderDetails: { OrderNumber: 'provider-order' } } }), row, context), true);
   for (const token of [jwt({}, { alg: 'none' }), jwt({ exp: now / 1000 - 1 }), jwt({ iat: now / 1000 + 120 }), 'opaque.not.json']) assert.equal(contract.inspect(token, row, context), false);
   for (const change of [{ order_id: 'foreign' }, { amount_hnl: 2 }, { currency: 'USD' }]) assert.equal(contract.inspect(jwt(), { ...row, ...change }, context), false);
   assert.equal(contract.inspect(jwt(), row, { ...context, encrypted: { ...context.encrypted, card_cvv: 'injected' } }), false);

@@ -44,7 +44,8 @@ test('backend operational chain: native SDK Sale 202 → encrypted handoff → n
     ownerId: '33333333-3333-4333-8333-333333333333', groupId: '44444444-4444-4444-8444-444444444444',
     orderId: 'SYNTHETIC-OPERATIONAL-E2E', amount: 1, currency: 'HNL', expiresAt: new Date(now + 600000).toISOString() };
   const token = phase => [
-    { alg: 'HS256' }, { iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 600, order_id: context.orderId, phase },
+    { alg: 'HS256' }, { iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 600, order_id: context.orderId,
+      Payload: { OrderDetails: { OrderNumber: 'PROVIDER-OWNED-ORDER' } }, phase },
   ].map(value => Buffer.from(JSON.stringify(value)).toString('base64url')).concat('c3ludGhldGlj').join('.');
   const initialJwt = token('initial'); const validatedJwt = token('validated');
   const syntheticSecret = 'SYNTHETIC-SERVER-SECRET-NEVER-RETURN';

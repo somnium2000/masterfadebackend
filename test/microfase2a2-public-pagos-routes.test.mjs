@@ -4357,12 +4357,12 @@ test('bridge owner mismatch and anonymous route never disclose handoff state',as
 });
 
 test('operational bridge accepts only native browser EMV and action codes, without financial routing',async t=>{
-  const client=diagnosticRouteClient();const steps=[];
+  const client=diagnosticRouteClient();const steps=[];const logs=[];
   const bridge={config:{enabled:true,qa:true},async step(...args){steps.push(args);return{state:'contract_blocked',
     block_code:'PIXELPAY_SONGBIRD_AUTH_RESULT_UNACCREDITED',financial_finalization_enabled:false};}};
   let financial=0;
   const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
-    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,providerAdapter:{async sale(){financial++;}}});
+    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,logs,providerAdapter:{async sale(){financial++;}}});
   t.after(()=>app.close());
   const emv={browser_java_enabled:'false',browser_javascript_enabled:'true',browser_language:'es-HN',
     browser_color_depth:'24',browser_screen_height:'900',browser_screen_width:'1400',browser_time_zone:'360',user_agent:'Synthetic browser'};
@@ -4377,6 +4377,11 @@ test('operational bridge accepts only native browser EMV and action codes, witho
   assert.equal(valid.statusCode,200,valid.body);assert.equal(steps[1][5].actionCode,'SUCCESS');
   const failed=await send({action:'validated',action_code:'ERROR'});
   assert.equal(failed.statusCode,200,failed.body);assert.equal(steps[2][4],undefined);assert.equal(steps[2][5].actionCode,'ERROR');
+  const phases=logs.map(line=>JSON.parse(line)).filter(entry=>entry.event==='pixelpay_songbird_phase');
+  assert.deepEqual(phases.map(entry=>entry.action),['setup','validated','validated']);
+  assert.ok(phases.every(entry=>entry.id_intent===INTENT_A&&entry.financial_finalization_enabled===false));
+  assert.equal(JSON.stringify(phases).includes('synthetic.validated.signature'),false);
+  assert.equal(JSON.stringify(phases).includes('synthetic-reference'),false);
   for(const body of [{action:'setup',reference:'r',emv:{...emv,ip_address:'untrusted'}},
     {action:'setup',reference:'r',emv:{...emv,acsUrl:'https://untrusted.invalid'}},
     {action:'setup',reference:'r',emv:{}},{action:'validated',action_code:'SUCCESS'},
