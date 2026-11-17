@@ -1,12 +1,16 @@
 import CardinalAuthenticationModule from '@pixelpay/sdk-core/lib/services/CardinalAuthentication.js';
 import LookupTransactionModule from '@pixelpay/sdk-core/lib/requests/LookupTransaction.js';
 import LookupContinueTransactionModule from '@pixelpay/sdk-core/lib/requests/LookupContinueTransaction.js';
+import PayloadResponseModule from '@pixelpay/sdk-core/lib/responses/PayloadResponse.js';
+import SuccessResponseModule from '@pixelpay/sdk-core/lib/responses/SuccessResponse.js';
 import { AppError } from '../../utils/errors.js';
 import { createPixelPaySaleSignature } from './PixelPayDirectProvider.js';
 
 const CardinalAuthentication = CardinalAuthenticationModule.default || CardinalAuthenticationModule;
 const LookupTransaction = LookupTransactionModule.default || LookupTransactionModule;
 const LookupContinueTransaction = LookupContinueTransactionModule.default || LookupContinueTransactionModule;
+const PayloadResponse = PayloadResponseModule.default || PayloadResponseModule;
+const SuccessResponse = SuccessResponseModule.default || SuccessResponseModule;
 const SANDBOX = 'https://pixelpay.dev';
 const ACS_ORIGINS = new Set(['https://songbirdstag.cardinalcommerce.com', 'https://centinelapistag.cardinalcommerce.com']);
 const ENCRYPTED = ['card_number', 'card_expire', 'customer_name', 'customer_email', 'customer_identification'];
@@ -209,6 +213,40 @@ const challengeAllowed = challenge => {
   catch { return false; }
 };
 
+// AM: Inspect only shape/validity; never serialize provider values, URLs, errors or encrypted context.
+function lookupDiagnostic(response, httpStatus, challenge, attempt) {
+  const present = value => value !== undefined && value !== null && value !== '';
+  const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
+  let urlValid = false; let originAllowed = false;
+  if (typeof challenge.acsUrl === 'string' && challenge.acsUrl.length <= 2048) {
+    try {
+      const url = new URL(challenge.acsUrl);
+      urlValid = url.protocol === 'https:' && !url.username && !url.password && !url.hash;
+      originAllowed = ACS_ORIGINS.has(url.origin);
+    } catch { /* AM: Parsing failures may include URLs; retain booleans only. */ }
+  }
+  return {
+    event: 'PIXELPAY_SONGBIRD_LOOKUP_DIAGNOSTIC',
+    id_intent: uuid(attempt.id_intent), paymentAttemptId: uuid(attempt.payment_attempt_id),
+    provider_http_status: httpStatus,
+    response_class: response instanceof PayloadResponse ? 'PayloadResponse'
+      : response instanceof SuccessResponse ? 'SuccessResponse' : response == null ? 'absent' : 'other',
+    // AM: These describe the parsed SDK response; missing upstream success is normalized to false by SDK.
+    success: response?.success === true, success_is_boolean: typeof response?.success === 'boolean',
+    action: ['continue', 'token_auth_success', 'token_auth_failed'].includes(response?.action) ? response.action
+      : response?.action == null ? 'absent' : 'other',
+    fields: {
+      identifier_present: present(challenge.authenticationId), identifier_valid: ID.test(challenge.authenticationId || ''),
+      transaction_id_present: present(challenge.transactionId), transaction_id_valid: ID.test(challenge.transactionId || ''),
+      continue_payload_present: present(challenge.payload),
+      continue_payload_valid: typeof challenge.payload === 'string' && challenge.payload.length > 0 && challenge.payload.length <= 16000,
+      continue_url_present: present(challenge.acsUrl), continue_url_valid: urlValid,
+      acs_origin_allowed: originAllowed, challenge_valid: challengeAllowed(challenge),
+    },
+    financial_finalization_enabled: false,
+  };
+}
+
 function emvFields(browser) {
   const out = {};
   for (const name of ['browser_java_enabled', 'browser_javascript_enabled']) {
@@ -229,7 +267,7 @@ function emvFields(browser) {
   return out;
 }
 
-export function createSongbirdSdkContract({ providerFactory, clock = Date.now }) {
+export function createSongbirdSdkContract({ providerFactory, clock = Date.now, logger }) {
   if (typeof providerFactory !== 'function') throw fail('PIXELPAY_SONGBIRD_PROVIDER_REQUIRED');
   const service = attempt => {
     if (!ID.test(attempt?.order_id || '') || amount(attempt.amount_hnl) !== '1.00' || attempt.currency !== 'HNL') throw fail('PIXELPAY_SONGBIRD_CONTEXT_INVALID');
@@ -259,13 +297,17 @@ export function createSongbirdSdkContract({ providerFactory, clock = Date.now })
       // AM: Native SDK reuses box|nonce ciphertexts and the original public key; no secret key is needed.
       const response = await native.authenticationLookup(request);
       const httpStatus = providerHttpStatus(response);
-      if (httpStatus !== 200 || response?.success !== true) {
+      const challenge = { acsUrl: response?.data?.continue_url, payload: response?.data?.continue_payload,
+        transactionId: response?.data?.transaction_id, authenticationId: response?.data?.identifier };
+      try { logger?.info?.(lookupDiagnostic(response, httpStatus, challenge, attempt), 'PixelPay QA lookup diagnostic'); }
+      catch { /* AM: Telemetry cannot change authentication acceptance or trigger a retry. */ }
+      // AM: SDK 2.5.8 maps HTTP 202 to PayloadResponse; it is only a candidate for a validated challenge.
+      const expectedResponse = httpStatus === 200 || (httpStatus === 202 && response instanceof PayloadResponse);
+      if (!expectedResponse || response?.success !== true) {
         const definitive = rejected(httpStatus);
         return { verified: false, rejected: definitive, httpStatus,
           blockCode: definitive ? 'PIXELPAY_SONGBIRD_LOOKUP_REJECTED' : 'PIXELPAY_SONGBIRD_LOOKUP_UNCERTAIN' };
       }
-      const challenge = { acsUrl: response.data?.continue_url, payload: response.data?.continue_payload,
-        transactionId: response.data?.transaction_id, authenticationId: response.data?.identifier };
       if (response.action !== 'continue' || !challengeAllowed(challenge)) return { verified: false, httpStatus, blockCode: 'PIXELPAY_SONGBIRD_CHALLENGE_UNACCREDITED' };
       return { verified: true, httpStatus, challenge };
     },

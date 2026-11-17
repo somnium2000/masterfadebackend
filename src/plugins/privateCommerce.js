@@ -158,7 +158,7 @@ export default fp(async function privateCommerce(app) {
   app.decorate('qaPixelPay3dsDiagnostic', qa3ds);
   const bridgeConfig = resolveSongbirdBridgeConfig(process.env, qa3ds);
   app.decorate('songbirdBridge', new SongbirdBridge({ repository: new SongbirdRepository(app.db), config: bridgeConfig,
-    ...(bridgeConfig.enabled ? { contract: createSongbirdSdkContract({ providerFactory: () => PaymentProviderFactory.create() }) } : {}) }));
+    ...(bridgeConfig.enabled ? { contract: createSongbirdSdkContract({ providerFactory: () => PaymentProviderFactory.create(), logger: app.log }) } : {}) }));
   if (qaBooking.enabled && (config.enabled || config.saleEnabled)) throw new Error('QA booking no permite piloto ni Sale legado activos.');
   const qaPaymentSimulationEnabled = app.config.qaPaymentSimulation?.enabled === true;
   const qaVipPurchaseSimulationEnabled = app.config.qaVipPurchaseSimulation?.enabled === true;
