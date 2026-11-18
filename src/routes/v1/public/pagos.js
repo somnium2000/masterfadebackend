@@ -35,6 +35,24 @@ import {
   assertPixelPayCardAllowedForEnvironment,
   assertPixelPaySandboxCardAllowed,
 } from "../../../services/payments/pixelPayCardEnvironment.js";
+export function validateSaleCardBeforeClaim(cardNumber, environment, logger, requestId, idIntent) {
+  try {
+    assertPixelPayCardAllowedForEnvironment(cardNumber, environment);
+  } catch (error) {
+    if (error instanceof AppError && error.statusCode === 422 && error.code === "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED") {
+      logger.warn({
+        event: "PIXELPAY_SALE_PREFLIGHT_REJECTED",
+        requestId,
+        id_intent: idIntent,
+        statusCode: 422,
+        code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
+        phase: "before_provider_send",
+      });
+    }
+    throw error;
+  }
+}
+
 export { assertPixelPayCardAllowedForEnvironment, assertPixelPaySandboxCardAllowed };
 export { buildSafeProviderErrorDiagnostic, buildSafePixelPaySdkDiagnostics };
 import { applyRewardRedeemForConfirmedGroup } from "../../../services/pointsService.js";
@@ -2519,23 +2537,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           code: "PIXELPAY_ORDER_ID_MISSING",
         });
       }
-      if (!qa3dsTarget) {
-        try {
-          assertPixelPayCardAllowedForEnvironment(request.body.card_number, app.config?.pixelPayEnv);
-        } catch (error) {
-          if (error instanceof AppError && error.statusCode === 422 && error.code === "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED") {
-            request.log.warn({
-              event: "PIXELPAY_SALE_PREFLIGHT_REJECTED",
-              requestId: request.id,
-              id_intent: idIntent,
-              statusCode: 422,
-              code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
-              phase: "before_provider_send",
-            });
-          }
-          throw error;
-        }
-      }
+      if (!qa3dsTarget) validateSaleCardBeforeClaim(request.body.card_number, app.config?.pixelPayEnv, request.log, request.id, idIntent);
       const claimed = await dbClient.query(
         `SELECT app_private.proteger_reserva_pago_v1(
            $1::uuid, $2::uuid

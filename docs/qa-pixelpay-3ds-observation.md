@@ -211,3 +211,10 @@ incluida en esta preparación.
 - **3DS completo:** NO-GO mientras falten handoff soportado, autenticidad de
   tokens, vínculo de continuación, recuperación y garantía del segundo POST.
 - **Producción:** NO-GO; esta excepción QA no cambia ese dictamen.
+
+Para observar un rechazo local de tarjeta Sandbox, filtrar el JSON estructurado de Fastify
+antes de la lista de campos del wrapper. Con jq, esta proyección conserva solo los seis campos:
+
+~~~sh
+jq -c 'select(.event == "PIXELPAY_SALE_PREFLIGHT_REJECTED") | {event,requestId,id_intent,statusCode,code,phase}'
+~~~
