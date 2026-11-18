@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { QA_PIXELPAY_CASE29_VISA, QA_PIXELPAY_CASE29_MASTERCARD } from "./fixtures/qa-pixelpay-case29.mjs";
 import { resolvePixelPayCustomerErrorCode } from "../src/services/payments/PixelPayDirectProvider.js";
 import {
   assertPixelPayCardAllowedForEnvironment,
@@ -34,6 +35,17 @@ test("solo permite tarjetas documentadas para PixelPay Sandbox", () => {
   );
 });
 
+test("caso oficial 2.9 llega a la validación previa ordinaria sin activar el puente ni emitir rechazo", () => {
+  let warnings = 0;
+  const logger = { warn: () => { warnings++; } };
+  for (const card of [QA_PIXELPAY_CASE29_VISA, QA_PIXELPAY_CASE29_MASTERCARD]) {
+    assert.equal(assertPixelPaySandboxCardAllowed(card), card);
+    assert.equal(assertPixelPayCardAllowedForEnvironment(card, "sandbox"), card);
+    assert.doesNotThrow(() => validateSaleCardBeforeClaim(card, "sandbox", logger, "req-fixture", "intent-fixture"));
+  }
+  assert.equal(warnings, 0);
+});
+
 test("live acepta tarjetas reales y bloquea las tarjetas oficiales de Sandbox", () => {
   assert.equal(
     assertPixelPayCardAllowedForEnvironment("4000 0000 0000 0002", "live"),
@@ -55,6 +67,10 @@ test("live acepta tarjetas reales y bloquea las tarjetas oficiales de Sandbox", 
     () => assertPixelPayCardAllowedForEnvironment("4000000000000002", "production"),
     (error) => error.code === "PIXELPAY_ENV_INVALID"
   );
+  // AM: The expanded Sandbox catalog must not extend the pre-existing Live denylist.
+  for (const card of [QA_PIXELPAY_CASE29_VISA, QA_PIXELPAY_CASE29_MASTERCARD]) {
+    assert.equal(assertPixelPayCardAllowedForEnvironment(card, "live"), card);
+  }
 });
 
 test("decline y error contractual definitivos pasan a fallido; incierto conserva pendiente", () => {
