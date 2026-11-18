@@ -4,6 +4,7 @@ import { resolvePixelPayCustomerErrorCode } from "../src/services/payments/Pixel
 import {
   assertPixelPayCardAllowedForEnvironment,
   assertPixelPaySandboxCardAllowed,
+  validateSaleCardBeforeClaim,
   buildPixelPaySaleRateLimitConfig,
   canStartPixelPaySale,
   resolvePixelPaySaleFailureState,
@@ -76,4 +77,14 @@ test("clasifica mensajes seguros para rechazo, datos, precondicion e incertidumb
   assert.equal(resolvePixelPayCustomerErrorCode({ outcome: "request_error_definitive", statusCode: 422 }), "PIXELPAY_PAYMENT_DATA_INVALID");
   assert.equal(resolvePixelPayCustomerErrorCode({ outcome: "request_error_definitive", statusCode: 412 }), "PIXELPAY_PRECONDITION_FAILED");
   assert.equal(resolvePixelPayCustomerErrorCode({ outcome: "uncertain", statusCode: 408 }), "PIXELPAY_PAYMENT_PENDING");
+});
+
+test("rechazo local Sandbox solo emite los seis campos de diagnóstico", () => {
+  const records = [];
+  const logger = { warn: (...args) => records.push(args) };
+  assert.throws(() => validateSaleCardBeforeClaim("fixture", "sandbox", logger, "req-test", "intent-test"),
+    { statusCode: 422, code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED" });
+  assert.deepEqual(records, [[{ event: "PIXELPAY_SALE_PREFLIGHT_REJECTED", requestId: "req-test",
+    id_intent: "intent-test", statusCode: 422, code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
+    phase: "before_provider_send" }]]);
 });
