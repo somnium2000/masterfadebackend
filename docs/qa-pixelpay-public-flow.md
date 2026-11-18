@@ -1,5 +1,58 @@
 # PixelPay 3DS: contrato público y retiro del puente QA
 
+## Corrección de tarjetas QA y revisión del 18 de noviembre de 2026
+
+La política Sandbox ordinaria reutiliza ahora `OFFICIAL_QA_CARD_HASHES`. Se contrastó
+el catálogo con [Instalación Sandbox](https://docs.pixelpay.com/page/sandbox/installation?locale=es)
+mediante el MCP de documentación. Coinciden las 26 huellas, dos casos básicos y
+Visa/Mastercard de cada escenario 2.1–2.12, incluido 2.9. Se admiten únicamente esas
+tarjetas de prueba. El catálogo controla qué datos pueden usarse en los ensayos.
+PixelPay decide la autenticación, autorización y resultado de cada operación.
+La política Live conserva su conjunto original independiente.
+
+El evento `PIXELPAY_SALE_PREFLIGHT_REJECTED` del intent
+`6d66fc84-8ea3-481d-b6e3-45167829497b` acredita, según la evidencia aportada para esta
+corrección, un rechazo local anterior al envío. Ese intento se excluye de la futura
+prueba. La nueva prueba todavía requiere completar el contrato SDK descrito abajo.
+
+`pixelPaySaleRuntime.js` intercepta el HTTP 202 después de `super.parseResponse()`
+y lanza `PixelPayContinuationRequiredError`. Se revisó si se podía retirar esa
+intervención. En SDK 2.5.8, `Transaction.doSale()` conserva el mismo contexto y
+ejecuta los gestores de navegador ante `PayloadResponse`. Además, rechaza
+`authentication_request` en Node antes del envío. Quitar el interceptor en este
+backend conduce a ese código de navegador y no establece el recorrido React/Node.
+La excepción y el tratamiento incierto se conservan mientras se obtiene el método
+público que los sustituya.
+
+**Único bloqueo técnico pendiente:** acreditar el ejemplo soportado que indique
+dónde ejecutar `Transaction.doSale(sale)` con `withAuthenticationRequest()`, qué
+configuración segura recibe React y, si el flujo está dividido, el método público
+y parámetros que conectan las dos partes y devuelven el resultado de la misma
+orden. Secret Key y el `auth_hash` reutilizable deben permanecer en backend.
+Se revisaron de nuevo [instalación JavaScript](https://docs.pixelpay.com/page/sdk/installation/javascript?locale=es),
+[peticiones](https://docs.pixelpay.com/page/sdk/requests?locale=es) y
+[modelos](https://docs.pixelpay.com/page/sdk/models?locale=es).
+El ticket #9834 encarga la orquestación al SDK. Los materiales revisados todavía
+no precisan ese contrato entre contextos. No se implementa una continuación
+manual de Cardinal, JWT, CAS, `authenticationLookup()` o `authenticationContinue()`.
+
+### Prueba preparada para cuando el contrato esté implementado
+
+1. Verificar SHA servido, configuración de cuenta QA, endpoint Sandbox y recorrido
+   público SDK implementado y aprobado por CI.
+2. Obtener autorización operativa para una única Sale Sandbox sobre una cuenta QA
+   y un grupo, intento y orden nuevos, de su titular, con importe canónico HNL 1.00.
+   Comprobar ausencia de intentos previos y vigencia de la reserva.
+3. Usar el escenario 2.9 desde el checkout con los datos de prueba oficiales. El
+   SDK debe presentar y completar el desafío dentro del recorrido público.
+4. Verificar en backend orden, importe, aprobación, hash y unicidad de evento/pago
+   antes de confirmar la reserva. Un 200 aislado no acredita desafío ni pago.
+5. Ante resultado incierto, conservar claim y recuperación. Detener nuevos envíos
+   y observar únicamente los identificadores y campos diagnósticos permitidos.
+
+Esta corrección se valida localmente y en CI con fixtures. La ejecución de esta
+prueba remota queda pendiente de completar el contrato y de su autorización.
+
 ## Decisión
 
 Se aplica el caso C de la revisión solicitada: falta un contrato público que permita completar 3DS con la cuenta configurada manteniendo sus credenciales privadas en backend. Este cambio retira la iniciación del puente experimental; no implementa todavía una ruta de pago 3DS completa ni acredita una solución del desafío remoto.
