@@ -2015,25 +2015,16 @@ export default async function publicPagosRoutes(app, options = {}) {
       throw new AppError(403,'Autenticacion no disponible.',{code:'SONGBIRD_QA_ONLY'});
     }
     const access=paymentAccess(request);
-    const {groupRows}=await loadPublicIntentForGroup(app.db,{groupId:body.id_grupo_cita,idIntent:body.id_intent,
+    await loadPublicIntentForGroup(app.db,{groupId:body.id_grupo_cita,idIntent:body.id_intent,
       titularEmail:normalizeEmail(body.titular_email),access});
     if (!['status','interrupt'].includes(body.action)) {
-      if (!bridge.config.enabled || !qa3dsWindowOpen(app.qaPixelPay3dsDiagnostic)) {
-        throw new AppError(403,'Autenticacion no disponible.',{code:'SONGBIRD_DISABLED'});
-      }
-      assertPublicGroupPayable(groupRows); resolveGroupExpiresAt(groupRows);
+      throw new AppError(503,'El pago con autenticacion no esta disponible.',{code:'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE'});
     }
     const owner=access.owner.usuarioId;
     let result;
     try {
       if (body.action==='status') result=await bridge.status(body.id_intent,owner);
-      else if (body.action==='claim') result=await bridge.claim(body.id_intent,owner);
       else if (body.action==='interrupt') result=await bridge.interrupt(body.id_intent,owner,body.lease_id);
-      else {
-        if (body.action==='validated' && !body.action_code) throw new AppError(400,'Solicitud invalida.',{code:'SONGBIRD_INPUT_INVALID'});
-        result=await bridge.step(body.id_intent,owner,body.action,body.lease_id,body.action==='setup'?body.reference:body.jwt,
-          {emv:body.emv,actionCode:body.action_code,ipAddress:request.ip,httpAccept:request.headers.accept});
-      }
     } catch(error) {
       if (body.action==='status' && ['42P01','42703'].includes(error.code)) result={state:'unavailable',can_start:false,can_resume:false,financial_finalization_enabled:false};
       else if(error instanceof AppError) throw error;
@@ -2046,7 +2037,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       ...(body.action === 'interrupt' ? { interrupt_reason: body.interrupt_reason ?? 'UNSPECIFIED' } : {}),
       financial_finalization_enabled: false,
     }, 'PixelPay QA 3DS phase');
-    return sendOk(reply,result);
+    return sendOk(reply,{ ...result, can_start: false, can_resume: false });
   });
   app.post("/crear-intent", {
     ...routeGuard,
@@ -2436,10 +2427,14 @@ export default async function publicPagosRoutes(app, options = {}) {
       },
     },
   }, async (request, reply) => {
+    const qa3dsTarget = isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent);
+    // AM: Stop the retired Node/React protocol before reserving or dispatching a new operation.
+    if (qa3dsTarget || app.qaPixelPay3dsDiagnostic?.enabled === true) {
+      throw new AppError(503, 'El pago con autenticacion no esta disponible.', { code: 'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE' });
+    }
     let dbClient = await app.db.connect();
     let inTransaction = false;
     let claim = null;
-    const qa3dsTarget = isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent);
     const diagnosticFields = observation => qa3dsTarget ? { qa_3ds_diagnostic: true,
       ...(app.qaPixelPay3dsDiagnostic?.sessionMode ? { qa_sandbox_session: true } : {}),
       ...(observation ? { qa_3ds_observation: sanitizeQa3dsObservation(observation) } : {}) } : {};
@@ -2560,12 +2555,6 @@ export default async function publicPagosRoutes(app, options = {}) {
         cardExpireFuture: expiry.future,
         billingAddressLength: String(request.body.billing_address).trim().length,
       });
-      if (qa3dsTarget && app.songbirdBridge?.config.enabled) {
-        // AM: Reserve durable bridge state with START, before the only initial financial dispatch.
-        await app.songbirdBridge.reserve(dbClient, { idIntent, paymentAttemptId: claim.paymentAttemptId,
-          ownerId: access.owner.usuarioId, groupId: idGrupoCita, orderId: claim.orderId,
-          amount: claim.amount, currency: claim.currency, expiresAt: claim.protectionExpiresAt });
-      }
       await dbClient.query("COMMIT");
       inTransaction = false;
       dbClient.release();
@@ -2600,9 +2589,6 @@ export default async function publicPagosRoutes(app, options = {}) {
           paymentAttemptId: claim.paymentAttemptId,
           logger: request.log,
           qa3dsDiagnostic: qa3dsTarget,
-          ...(qa3dsTarget && app.songbirdBridge?.config.enabled ? {
-            onSongbirdRequired: (payload, context) => app.songbirdBridge.capture(idIntent, access.owner.usuarioId, payload, context),
-          } : {}),
         });
       } catch (providerError) {
         const diagnostic = buildSafeProviderErrorDiagnostic(providerError, request.id);

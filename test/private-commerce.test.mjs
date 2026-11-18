@@ -656,13 +656,14 @@ for(const scenario of ['owner','guest','other','revoked','csrf-missing','no-role
   assert.deepEqual(f.state,{business:0,unexpectedSql:0});
 });
 
-test('Songbird capability selects only the Sandbox authentication adapter, separate from Sale/VIP',async t=>{
+test('legacy Songbird flags cannot activate the retired authentication adapter or Sale/VIP',async t=>{
   const f=await fixture(t,{env:{...diagnosticEnv(),QA_PIXELPAY_SONGBIRD_BRIDGE_ENABLED:'true',
     QA_PIXELPAY_SONGBIRD_BRIDGE_KEY:Buffer.alloc(32,8).toString('base64')},roles:['cliente']});
   const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
-  assert.equal(r.json().data.pixelpaySongbirdBridge,true);assert.equal(r.json().data.pixelpaySale,false);
-  assert.equal(r.json().data.vipPurchase,false);assert.equal(f.app.songbirdBridge.contract.browserPayloadAccredited,true);
-  assert.equal(f.app.songbirdBridge.contract.id,'pixelpay-sdk-2.5.8-songbird-authentication-only');
+  assert.equal(r.json().data.pixelpaySongbirdBridge,false);assert.equal(r.json().data.pixelpaySale,false);
+  assert.equal(r.json().data.vipPurchase,false);assert.equal(f.app.songbirdBridge.contract.browserPayloadAccredited,false);
+  assert.equal(f.app.songbirdBridge.config.enabled,false);assert.equal(f.app.songbirdBridge.config.key,null);
+  assert.equal(f.app.songbirdBridge.contract.id,'pixelpay-songbird-unaccredited');
   const headers=f.headers();delete headers['x-csrf-token'];
   const blocked=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',headers,payload:{}});
   assert.equal(blocked.statusCode,403);assert.deepEqual(f.state,{business:0,unexpectedSql:0});
@@ -671,7 +672,7 @@ test('Songbird capability selects only the Sandbox authentication adapter, separ
 test('QA 3DS capability is separate, exact-account authenticated route only, with no provider operations',async t=>{
   const f=await fixture(t,{env:diagnosticEnv(),roles:['cliente']});
   const r=await f.app.inject({url:'/v1/commerce/eligibility',headers:f.headers()});
-  assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic: true,pixelpaySongbirdBridge:false});
+  assert.deepEqual(r.json().data,{booking:true,vipPurchase:false,pixelpaySale:false,pixelpay3dsDiagnostic:false,pixelpaySongbirdBridge:false});
   const allowed=await f.app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',headers:f.headers(),payload:{id_intent:QA_DIAG_TARGET}});
   assert.equal(allowed.statusCode,400,'ordinary required fields remain required');
   for(const url of ['/v1/public/pagos/pixelpay/sale','/v1/cliente/planes/orden','/v1/public/pagos/simulator/event']) {
