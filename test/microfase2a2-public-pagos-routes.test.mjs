@@ -4255,77 +4255,67 @@ const diagnosticOwnerClaims={cliente_id:CLIENT_A,user:{id_usuario:USER_A,id_pers
 const diagnosticCard={card_number:QA_PIXELPAY_CASE29_VISA};
 const diagnosticPayload=()=>({...pixelPaySalePayload(),...diagnosticCard,card_expire:'2812'});
 
-test('QA session: two new intents each allow one initial Sale; reload/replay never dispatches again or captures',async t=>{
+test('retired QA session never starts a new operation or changes a fresh intent',async t=>{
   const now=Date.now();
   const policy=resolveQaPixelPay3dsDiagnostic({NODE_ENV:'development',ENTORNO:'qa',PAYMENT_PROVIDER:'pixelpay',PIXELPAY_IMPLEMENTATION:'sdk',
     PIXELPAY_ENV:'sandbox',PIXELPAY_ENDPOINT:'https://pixelpay.dev',PIXELPAY_APP_URL:'https://pixelpay.dev',
     QA_PIXELPAY_SANDBOX_SESSION_ENABLED:'true',QA_PIXELPAY_SANDBOX_SESSION_UNTIL:new Date(now+3600000).toISOString()},{bookingEnabled:true,now});
-  let dispatches=0;
+  let dispatches=0,connections=0;
   for(const id of [INTENT_A,USER_B]){
     const client=diagnosticRouteClient({intentPatch:{id_intent:id,created_at:new Date(now).toISOString(),
       orden_compra:buildProviderOrderReference({providerCode:'pixelpay',idIntent:id})}});
     const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,qa3dsDiagnostic:policy,
-      providerAdapter:{async sale(){dispatches++;throw Object.assign(new Error('synthetic202'),{uncertain:true,code:'PIXELPAY_NETWORK_ERROR',statusCode:202});}}});
+      connectFactory:()=>{connections++;throw new Error('Unexpected claim');},providerAdapter:{async sale(){dispatches++;}}});
     t.after(()=>app.close());
-    const send=()=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),id_intent:id}});
-    const first=await send();assert.equal(first.statusCode,202,first.body);assert.equal(first.json().data.qa_sandbox_session,true);
-    assert.equal((await send()).statusCode,409);assert.equal(client.getSaleAttempts().length,1);
-    assert.equal(client.getSaleAttempts()[0].qa_test_origin,'sandbox_session');
-    assert.ok(client.calls.findIndex(c=>c.sql.includes('INSERT INTO app_private.pixelpay_sale_attempts'))
-      < client.calls.findIndex(c=>c.sql==='COMMIT'));
+    for(let retry=0;retry<2;retry++){
+      const response=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),id_intent:id}});
+      assert.equal(response.statusCode,503,response.body);
+      assert.equal(response.json().code,'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE');
+    }
+    assert.equal(client.getActiveIntent().estado_intent_codigo,'link_generado');
+    assert.equal(client.getSaleAttempts().length,0);assert.equal(client.calls.length,0);
     assert.equal(client.getPayments().length,0);assert.equal(client.getPaymentEvents().length,0);
-    await app.close();
-    // AM: New Fastify instance and disabled policy model a restart without any target UUID.
-    let externalStatuses=0;
-    const restarted=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
-      qa3dsDiagnostic:resolveQaPixelPay3dsDiagnostic({}),providerAdapter:{async queryPaymentStatus(){externalStatuses++;},
-        async sale(){dispatches++;throw new Error('Unexpected replay');}}});
-    t.after(()=>restarted.close());
-    const stateBody={id_grupo_cita:GROUP_A,id_intent:id,titular_email:'cliente@example.com'};
-    const status=await restarted.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/status',payload:stateBody});
-    assert.equal(status.statusCode,403,status.body);
-    const local=await restarted.inject({method:'POST',url:'/v1/pagos/reservas/estado',payload:stateBody});
-    assert.equal(local.statusCode,200);assert.equal(local.json().data.qa_sandbox_session,true);
-    assert.equal(local.json().data.pending_confirmation,true);
-    const replay=await restarted.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),id_intent:id}});
-    assert.equal(replay.statusCode,409);assert.equal(externalStatuses,0);
-    await restarted.close();
-    const publicAlias=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:{async queryPaymentStatus(){externalStatuses++;}}});
-    t.after(()=>publicAlias.close());
-    const bypass=await publicAlias.inject({method:'POST',url:'/v1/public/pagos/pixelpay/status',payload:stateBody});
-    assert.equal(bypass.statusCode,403);assert.equal(externalStatuses,0);await publicAlias.close();
   }
-  assert.equal(dispatches,2);
+  assert.equal(dispatches,0);assert.equal(connections,0);
 });
 
-test('Songbird state reserve commits with START before one initial dispatch and never releases the financial claim',async t=>{
-  const client=diagnosticRouteClient();let reserved=false;let dispatches=0;let delivered=0;
-  const bridge={config:{enabled:true,qa:true},async reserve(c,context){
-    assert.equal(c,client);assert.equal(client.getSaleAttempts().length,1);
-    assert.notEqual(client.calls.at(-1).sql,'COMMIT');assert.equal(context.amount,1);assert.equal(context.currency,'HNL');
-    assert.equal(context.ownerId,USER_A);assert.equal(context.idIntent,INTENT_A);reserved=true;
-  },async capture(id,owner,payload){
-    assert.equal(id,INTENT_A);assert.equal(owner,USER_A);assert.equal(payload,'synthetic.payload.signature');delivered++;
-  }};
-  const provider={async sale(_input,context){
-    assert.equal(reserved,true);assert.equal(client.calls.at(-1).sql,'COMMIT');dispatches++;
-    await context.onSongbirdRequired('synthetic.payload.signature');
-    throw Object.assign(new Error('Synthetic202'),{code:'PIXELPAY_NETWORK_ERROR',uncertain:true,statusCode:202});
-  }};
-  const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:provider,authenticated:true,
-    claims:diagnosticOwnerClaims,qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge});
+test('retired QA session preserves historical uncertainty and local recovery after restart',async t=>{
+  const client=diagnosticRouteClient({intentPatch:{estado_intent_codigo:'pendiente_confirmacion'},
+    initialSaleAttempts:[{id_intent:INTENT_A,payment_attempt_id:USER_B,qa_test_origin:'sandbox_session',outcome:'uncertain'}]});
+  let dispatches=0,externalStatuses=0;
+  const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
+    qa3dsDiagnostic:resolveQaPixelPay3dsDiagnostic({}),providerAdapter:{async queryPaymentStatus(){externalStatuses++;},async sale(){dispatches++;}}});
   t.after(()=>app.close());
-  const send=()=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:diagnosticPayload()});
-  assert.equal((await send()).statusCode,202);assert.equal((await send()).statusCode,409);
-  assert.equal(dispatches,1);assert.equal(delivered,1);assert.equal(client.getPayments().length,0);
-  assert.equal(client.getPaymentEvents().length,0);
+  const stateBody={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com'};
+  const status=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/status',payload:stateBody});
+  assert.equal(status.statusCode,403,status.body);
+  const local=await app.inject({method:'POST',url:'/v1/pagos/reservas/estado',payload:stateBody});
+  assert.equal(local.statusCode,200,local.body);assert.equal(local.json().data.qa_sandbox_session,true);
+  assert.equal(local.json().data.pending_confirmation,true);
+  assert.equal(local.json().data.estado_intent_codigo,'pendiente_confirmacion');
+  const replay=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:diagnosticPayload()});
+  assert.equal(replay.statusCode,409,replay.body);assert.equal(dispatches,0);assert.equal(externalStatuses,0);
+  assert.equal(client.getSaleAttempts().length,1);assert.equal(client.getSaleAttempts()[0].outcome,'uncertain');
+  assert.equal(client.getPayments().length,0);assert.equal(client.getPaymentEvents().length,0);
+});
+
+test('retired QA protocol cannot reserve a bridge or dispatch Sale even with the legacy bridge enabled',async t=>{
+  const client=diagnosticRouteClient();let reserved=0,dispatches=0,captured=0;
+  const bridge={config:{enabled:true,qa:true},async reserve(){reserved++;},async capture(){captured++;}};
+  const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
+    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,providerAdapter:{async sale(){dispatches++;}}});
+  t.after(()=>app.close());
+  const response=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:diagnosticPayload()});
+  assert.equal(response.statusCode,503,response.body);assert.equal(reserved,0);assert.equal(dispatches,0);assert.equal(captured,0);
+  assert.equal(client.calls.length,0);assert.equal(client.getSaleAttempts().length,0);
+  assert.equal(client.getActiveIntent().estado_intent_codigo,'link_generado');
 });
 
 test('authenticated bridge enforces ownership/action fields and recovers local metadata without a provider operation',async t=>{
   const client=diagnosticRouteClient();let reads=0;let financial=0;
   const bridge={config:{enabled:true,qa:true},async status(id,owner){
     assert.equal(id,INTENT_A);assert.equal(owner,USER_A);reads++;
-    return {state:'contract_blocked',can_start:false,financial_finalization_enabled:false};
+    return {state:'handoff_ready',can_start:true,can_resume:true,financial_finalization_enabled:false};
   }};
   const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:{async sale(){financial++;}},
     authenticated:true,claims:diagnosticOwnerClaims,qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge});
@@ -4333,14 +4323,15 @@ test('authenticated bridge enforces ownership/action fields and recovers local m
   const payload={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com',action:'status'};
   const send=fields=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',payload:{...payload,...fields}});
   const response=await send({});assert.equal(response.statusCode,200,response.body);
-  assert.match(response.headers['cache-control'],/no-store/);assert.equal(response.json().data.state,'contract_blocked');
+  assert.match(response.headers['cache-control'],/no-store/);assert.equal(response.json().data.state,'handoff_ready');
+  assert.equal(response.json().data.can_start,false);assert.equal(response.json().data.can_resume,false);
   for(const fields of [{action:'finalize'},{action:'sale'},{identifier:'foreign'},{acsUrl:'https://foreign.invalid'},
     {amount:1},{jwt:'synthetic.payload.signature'},{headers:{'x-auth-key':'foreign'}}])assert.equal((await send(fields)).statusCode,400);
   assert.equal(reads,1);assert.equal(financial,0);assert.equal(client.getPayments().length,0);
   app.qaPixelPay3dsDiagnostic=resolveQaPixelPay3dsDiagnostic({QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:INTENT_A});
   bridge.config.enabled=false;
   assert.equal((await send({})).statusCode,200);assert.equal(reads,2);
-  assert.equal((await send({action:'claim'})).statusCode,403);
+  assert.equal((await send({action:'claim'})).statusCode,503);
 });
 
 test('bridge owner mismatch and anonymous route never disclose handoff state',async t=>{
@@ -4356,82 +4347,42 @@ test('bridge owner mismatch and anonymous route never disclose handoff state',as
   }
 });
 
-test('operational bridge accepts only native browser EMV and action codes, without financial routing',async t=>{
-  const client=diagnosticRouteClient();const steps=[];const logs=[];
-  const bridge={config:{enabled:true,qa:true},async step(...args){steps.push(args);return{state:'contract_blocked',
-    block_code:'PIXELPAY_SONGBIRD_AUTH_RESULT_UNACCREDITED',financial_finalization_enabled:false};}};
-  let financial=0;
+test('retired bridge rejects every orchestration action without invoking native authentication or finance',async t=>{
+  const client=diagnosticRouteClient();let steps=0,claims=0,financial=0;
+  const bridge={config:{enabled:true,qa:true},async step(){steps++;},async claim(){claims++;}};
   const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
-    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,logs,providerAdapter:{async sale(){financial++;}}});
+    qa3dsDiagnostic:diagnosticPolicy(),songbirdBridge:bridge,providerAdapter:{async sale(){financial++;}}});
   t.after(()=>app.close());
   const emv={browser_java_enabled:'false',browser_javascript_enabled:'true',browser_language:'es-HN',
     browser_color_depth:'24',browser_screen_height:'900',browser_screen_width:'1400',browser_time_zone:'360',user_agent:'Synthetic browser'};
-  const payload={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com',lease_id:USER_B};
-  const send=body=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',headers:{accept:'application/json'},payload:{...payload,...body}});
-  const setup=await send({action:'setup',reference:'synthetic-reference',emv});
-  assert.equal(setup.statusCode,200,setup.body);assert.equal(steps.length,1);
-  assert.equal(steps[0][0],INTENT_A);assert.equal(steps[0][1],USER_A);assert.equal(steps[0][2],'setup');
-  assert.deepEqual(steps[0][5].emv,emv);assert.equal(steps[0][5].ipAddress,'127.0.0.1');
-  assert.equal(steps[0][5].httpAccept,'application/json');
-  const valid=await send({action:'validated',action_code:'SUCCESS',jwt:'synthetic.validated.signature'});
-  assert.equal(valid.statusCode,200,valid.body);assert.equal(steps[1][5].actionCode,'SUCCESS');
-  const failed=await send({action:'validated',action_code:'ERROR'});
-  assert.equal(failed.statusCode,200,failed.body);assert.equal(steps[2][4],undefined);assert.equal(steps[2][5].actionCode,'ERROR');
-  const phases=logs.map(line=>JSON.parse(line)).filter(entry=>entry.event==='pixelpay_songbird_phase');
-  assert.deepEqual(phases.map(entry=>entry.action),['setup','validated','validated']);
-  assert.ok(phases.every(entry=>entry.id_intent===INTENT_A&&entry.financial_finalization_enabled===false));
-  assert.equal(JSON.stringify(phases).includes('synthetic.validated.signature'),false);
-  assert.equal(JSON.stringify(phases).includes('synthetic-reference'),false);
-  for(const body of [{action:'setup',reference:'r',emv:{...emv,ip_address:'untrusted'}},
-    {action:'setup',reference:'r',emv:{...emv,acsUrl:'https://untrusted.invalid'}},
-    {action:'setup',reference:'r',emv:{}},{action:'validated',action_code:'SUCCESS'},
-    {action:'validated',action_code:'ERROR',jwt:'synthetic.signature.token'},
-    {action:'validated',jwt:'synthetic.signature.token'},{action:'finalize'}]) {
-    assert.equal((await send(body)).statusCode,400);
+  const payload={id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com'};
+  for(const action of [{action:'claim'}, {action:'setup',lease_id:USER_B,reference:'synthetic-reference',emv},
+    {action:'validated',lease_id:USER_B,action_code:'SUCCESS',jwt:'synthetic.validated.signature'},
+    {action:'validated',lease_id:USER_B,action_code:'ERROR'}]){
+    const response=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/3ds/bridge',payload:{...payload,...action}});
+    assert.equal(response.statusCode,503,response.body);
+    assert.equal(response.json().code,'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE');
   }
-  assert.equal(steps.length,3);assert.equal(financial,0);assert.equal(client.getPayments().length,0);
-  assert.equal(client.getPaymentEvents().length,0);
+  assert.equal(steps,0);assert.equal(claims,0);assert.equal(financial,0);
+  assert.equal(client.getPayments().length,0);assert.equal(client.getPaymentEvents().length,0);
 });
 
-test('QA diagnostic authenticated handler: canonical one-HNL claim COMMIT then single202, reload local and no second Sale',async t=>{
-  const client=diagnosticRouteClient();
+test('retired targeted QA diagnostic leaves pending results unchanged and never retries Sale',async t=>{
+  const client=diagnosticRouteClient({intentPatch:{estado_intent_codigo:'pendiente_confirmacion'},
+    initialSaleAttempts:[{id_intent:INTENT_A,payment_attempt_id:USER_B,qa_test_origin:'3ds_diagnostic',outcome:'uncertain'}]});
   let dispatches=0;
-  const provider={async sale(input,context){
-    dispatches++;
-    assert.equal(input.amount,1); assert.equal(input.currency,'HNL');
-    assert.equal(context.qa3dsDiagnostic,true); assert.equal(client.getSaleAttempts().length,1);
-    assert.equal(client.getActiveIntent().estado_intent_codigo,'pendiente_confirmacion');
-    assert.equal(client.calls.at(-1).sql,'COMMIT');
-    throw Object.assign(new Error('Synthetic202'),{code:'PIXELPAY_NETWORK_ERROR',uncertain:true,statusCode:202,
-      runtimeDiagnostics:{qa3dsObservation:{upstream_http_status:202,response_class:'PayloadResponse',transaction_type:'songbird',
-        continuation_required:true,opaque_payload_present:true,public_key_request_attempted:true,public_key_response_received:true,
-        public_key_http_status:200,public_key_obtained:true,encryption_completed:true,stopped_before_continuation:true}}});
-  }};
-  const app=await createPagosApp(client,{providerCode:'pixelpay',providerAdapter:provider,authenticated:true,claims:diagnosticOwnerClaims,qa3dsDiagnostic:diagnosticPolicy()});
+  const app=await createPagosApp(client,{providerCode:'pixelpay',authenticated:true,claims:diagnosticOwnerClaims,
+    qa3dsDiagnostic:diagnosticPolicy(),providerAdapter:{async sale(){dispatches++;}}});
   t.after(()=>app.close());
-  const send=payload=>app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload});
-  const first=await send(diagnosticPayload());
-  assert.equal(first.statusCode,202); assert.equal(first.json().data.qa_3ds_diagnostic,true);
-  assert.equal(first.json().data.pending_confirmation,true); assert.equal(first.json().data.qa_3ds_observation.stopped_before_continuation,true);
-  assert.equal(dispatches,1); assert.equal(client.getSaleAttempts()[0].outcome,'uncertain');
-  assert.equal(client.getPayments().length,0); assert.equal(client.getPaymentEvents().length,0);
-  assert.equal((await send(diagnosticPayload())).statusCode,409); assert.equal(dispatches,1);
-  for(const fields of [{authentication_identifier:'foreign'}, {authentication_request:true}, {continue_success:false},
-    {payload:'opaque',identifier:'foreign'}, {amount:2,currency:'USD'}]) {
-    assert.equal((await send({...diagnosticPayload(),...fields})).statusCode,400); assert.equal(dispatches,1);
-  }
-  for(const phase of ['lookup','continue','finalize']) {
-    const continuation=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/'+phase,payload:{id_intent:INTENT_A}});
-    assert.equal(continuation.statusCode,404); assert.equal(dispatches,1);
-  }
-  app.qaPixelPay3dsDiagnostic=resolveQaPixelPay3dsDiagnostic({QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:INTENT_A});
-  const local=await app.inject({method:'POST',url:'/v1/pagos/reservas/estado',payload:{id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com'}});
-  assert.equal(local.statusCode,200); assert.equal(local.json().data.qa_3ds_diagnostic,true);
-  assert.equal(local.json().data.estado_intent_codigo,'pendiente_confirmacion'); assert.equal(dispatches,1);
-  assert.equal((await send(diagnosticPayload())).statusCode,403); assert.equal(dispatches,1);
-  const serialized=JSON.stringify({first:first.json(),local:local.json(),attempts:client.getSaleAttempts(),calls:client.calls});
-  assert.equal(serialized.includes(diagnosticCard.card_number),false);
-  assert.equal(serialized.includes('"card_cvv"'),false); assert.equal(serialized.includes('"payload":"opaque"'),false);
+  const response=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:diagnosticPayload()});
+  assert.equal(response.statusCode,503,response.body);assert.equal(client.calls.length,0);
+  const local=await app.inject({method:'POST',url:'/v1/pagos/reservas/estado',
+    payload:{id_grupo_cita:GROUP_A,id_intent:INTENT_A,titular_email:'cliente@example.com'}});
+  assert.equal(local.statusCode,200,local.body);assert.equal(local.json().data.qa_3ds_diagnostic,true);
+  assert.equal(local.json().data.estado_intent_codigo,'pendiente_confirmacion');assert.equal(local.json().data.pending_confirmation,true);
+  assert.equal(dispatches,0);assert.equal(client.getSaleAttempts().length,1);
+  assert.equal(client.getSaleAttempts()[0].outcome,'uncertain');
+  assert.equal(client.getPayments().length,0);assert.equal(client.getPaymentEvents().length,0);
 });
 
 for(const [scenario,options,claims,payloadPatch] of [
@@ -4451,7 +4402,7 @@ for(const [scenario,options,claims,payloadPatch] of [
       authenticated:true,claims,qa3dsDiagnostic:diagnosticPolicy()});
     t.after(()=>app.close());
     const response=await app.inject({method:'POST',url:'/v1/pagos/reservas/pixelpay/sale',payload:{...diagnosticPayload(),...payloadPatch}});
-    assert.ok([403,409].includes(response.statusCode)); assert.equal(dispatches,0);
+    assert.ok([403,503].includes(response.statusCode),response.body); assert.equal(dispatches,0);
     assert.equal(client.getPayments().length,0); assert.equal(client.getPaymentEvents().length,0);
   });
 }
