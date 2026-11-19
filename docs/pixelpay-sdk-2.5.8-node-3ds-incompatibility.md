@@ -91,7 +91,17 @@ Resultado observado en Node **v22.22.2**:
 - Sale sin bandera con 202 sintético: segundo envío al adaptador, seguido del error DOM esperado.
 - Conexiones de socket externas: **0**; llamadas reales Sale/Status: **0**.
 - No se reemplazan `doSale()` ni `withAuthenticationRequest()`. Se sustituye únicamente el transporte Axios por respuestas sintéticas y se bloquean sockets. Esto no acredita un challenge real ni aprobación financiera.
-- Lint backend: **0 errores, 25 advertencias preexistentes**. No se ejecutó una batería adicional de pagos ni build frontend porque el cambio es exclusivamente documental.
+- Lint backend: **0 errores, 25 advertencias preexistentes**. No se ejecutó una batería general de pagos ni build frontend porque el cambio es exclusivamente documental.
+
+Tras solicitar el usuario ver qué devuelven los métodos, se ejecutó además la prueba existente de navegador simulado del SHA frontend revisado:
+
+```sh
+npm run test:vitest -- src/features/payments/__tests__/officialPixelPaySdk.test.jsx
+```
+
+Resultado: **4 PASS, 0 FAIL**. Se reutilizaron por junction las dependencias frontend 2.5.8 indicadas arriba. La prueba usa jsdom y Cardinal/HTTP sintéticos, no un challenge remoto. Comprueba que `doSale()` en entorno navegador administra setup/challenge/continue y alcanza su POST interno final con la misma orden e identificador de autenticación; ese envío final se bloquea en el adaptador. También comprueba que sin credenciales no inicia HTTP y que `setupSandbox()` proporciona credenciales públicas del entorno de prueba. Esto último no representa la configuración privada del comercio ni cumple por sí solo el requisito de mantener `doSale()` en Node. No se simularon `window`/`document` en el proceso backend para eludir su rechazo.
+
+La inspección de salidas del método real confirmó: `withAuthenticationRequest()` devuelve `undefined` y cambia `authentication_request` de `false` a `true`; `doSale()` con esa bandera produce `InvalidTransactionTypeException` con **0 intentos HTTP**. Sin la bandera, el 202 `songbird` sintético produce `ReferenceError: document is not defined`. En ambas comprobaciones se bloquearon sockets y no hubo ventas reales.
 
 El primer intento en el worktree falló por `MODULE_NOT_FOUND` al no tener dependencias. Se resolvió usando las dependencias locales ya instaladas. El intento de crear una junction sin elevación devolvió `Acceso denegado`; la creación con el mecanismo de autorización del entorno fue permitida. Ninguno de esos errores fue un fallo de Git o evidencia del SDK. La prueba pasó una vez resuelta la dependencia.
 
