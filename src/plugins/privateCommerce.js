@@ -5,6 +5,7 @@ import { createQaCommerceDiagnostic } from "../utils/qaCommerceDiagnostic.js";
 import { isQa3dsIntent, qa3dsWindowOpen, resolveQaPixelPay3dsDiagnostic } from '../services/payments/qaPixelPay3dsDiagnostic.js';
 import { resolveSongbirdBridgeConfig, SongbirdBridge } from '../services/payments/songbirdBridge.js';
 import { SongbirdRepository } from '../services/payments/songbirdRepository.js';
+import { resolveQaDelegatedConfig } from '../experimental/pixelpayDelegated/qaAttempts.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -154,6 +155,8 @@ export default fp(async function privateCommerce(app) {
   const qaSale = resolveQaSandboxSaleConfig(process.env);
   const qa3ds = resolveQaPixelPay3dsDiagnostic(process.env, { bookingEnabled: qaBooking.enabled });
   app.decorate('qaPixelPay3dsDiagnostic', qa3ds);
+  const delegated = resolveQaDelegatedConfig(process.env, qa3ds);
+  app.decorate('qaPixelPayDelegated', delegated);
   // AM: Retire the custom protocol while tolerating legacy flags during the QA rollout.
   const bridgeConfig = resolveSongbirdBridgeConfig({ ...process.env, QA_PIXELPAY_SONGBIRD_BRIDGE_ENABLED: 'false' }, qa3ds);
   app.decorate('songbirdBridge', new SongbirdBridge({ repository: new SongbirdRepository(app.db), config: bridgeConfig }));
@@ -197,6 +200,8 @@ export default fp(async function privateCommerce(app) {
         const route = `${request.method} ${String(request.routeOptions.url || '').replace(/\/$/, '')}`;
         const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route)
           || route === 'POST /v1/pagos/reservas/pixelpay/3ds/bridge'
+          || (delegated && ['POST /v1/pagos/reservas/pixelpay/3ds/delegated',
+            'POST /v1/pagos/reservas/pixelpay/status'].includes(route))
           || ((qaSale.enabled || qa3dsWindowOpen(qa3ds)) && QA_SANDBOX_SALE_ROUTES.has(route))
           : QA_PILOT_BOOKING_ROUTES.has(route) || (config.saleEnabled && QA_PILOT_SALE_ROUTES.has(route));
         if (!routeAllowed) {
@@ -216,7 +221,8 @@ export default fp(async function privateCommerce(app) {
     // AM: Retain the target after disabling/expiry so reload cannot call external Status.
     const route = `${request.method} ${String(request.routeOptions.url || '').replace(/\/$/, '')}`;
     if (['POST /v1/public/pagos/pixelpay/status', 'POST /v1/pagos/reservas/pixelpay/status'].includes(route)
-      && isQa3dsIntent(qa3ds, request.body?.id_intent)) {
+      && isQa3dsIntent(qa3ds, request.body?.id_intent)
+      && !(delegated && route === 'POST /v1/pagos/reservas/pixelpay/status')) {
       return sendError(reply, 403, 'La observacion requiere revision operativa.', { code: 'QA_3DS_EXTERNAL_STATUS_DISABLED' });
     }
   });

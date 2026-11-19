@@ -193,6 +193,82 @@ function makeProvider(fake, overrides = {}) {
   });
 }
 
+function nestedStatusEnvelope(result = {}) {
+  return {
+    status: 'PAID', order_id: ORDER_ID, order_currency: 'HNL', payment_uuid: PAYMENT_UUID,
+    last_response: { data: approvedData(result) },
+  };
+}
+
+function queryStatusWithExpectedIdentity(data) {
+  return makeProvider(makeFakeSdk({ statusResponse: sdkResponse(200, { data }) }))
+    .queryPaymentStatus(PAYMENT_UUID, { orderId: ORDER_ID, amount: 1, currency: 'HNL' });
+}
+
+test('nested Status keeps outer identity separate from historical Sale and rejects conflicts', async () => {
+  const envelope = nestedStatusEnvelope({ response_approved: '1' });
+  const status = await queryStatusWithExpectedIdentity(envelope);
+  assert.equal(status.approved, true);
+  assert.equal(status.resultOrderId, ORDER_ID);
+  assert.equal(status.resultCurrency, 'HNL');
+  assert.equal(status.resultPaymentUuid, PAYMENT_UUID);
+  for (const patch of [{ order_id: 'other' }, { payment_uuid: 'other' }, { transaction_currency: 'USD' },
+    { transaction_approved_amount: 2 }, { transaction_amount: 2 }, { transaction_id: undefined }, { payment_hash: 'invalid' }]) {
+    assert.equal((await queryStatusWithExpectedIdentity(nestedStatusEnvelope({
+      response_approved: '1', ...patch,
+    }))).approved, false, JSON.stringify(patch));
+  }
+  assert.equal((await queryStatusWithExpectedIdentity({ ...envelope, status: 'PENDING' })).approved, false);
+  assert.equal((await queryStatusWithExpectedIdentity({ ...envelope, order_currency: undefined })).approved, false);
+  assert.equal((await queryStatusWithExpectedIdentity({ ...envelope, last_response: { data: null } })).approved, false);
+});
+
+test('nested Status accepts boolean approval and the accredited "1" with code "00"', async () => {
+  for (const [response_approved, response_code] of [[true, '00'], [true, undefined], ['1', '00']]) {
+    const status = await queryStatusWithExpectedIdentity(nestedStatusEnvelope({ response_approved, response_code }));
+    assert.equal(status.approved, true);
+    assert.equal(status.incomplete, false);
+    assert.equal(status.uncertain, false);
+    assert.equal(status.terminal, true);
+    assert.equal(classifyPixelPayStatusEvidence(status).autoApprovalEligible, false);
+  }
+});
+
+test('nested Status keeps unsupported or contradictory approval representations uncertain', async () => {
+  for (const [response_approved, response_code] of [
+    ['1', undefined], ['1', '05'], ['1', 0], ['1', ' 00 '],
+    [true, '05'], [true, null], [false, '00'], [1, '00'], ['true', '00'], ['0', '00'], [undefined, '00'],
+  ]) {
+    const envelope = nestedStatusEnvelope({ response_approved, response_code });
+    // AM: Un código exterior no reemplaza el código del resultado anidado.
+    const status = await queryStatusWithExpectedIdentity({ ...envelope, response_code: '00' });
+    assert.equal(status.status, 'COMPLETED');
+    assert.equal(status.approved, false, JSON.stringify([response_approved, response_code]));
+    assert.equal(status.uncertain, true);
+    assert.equal(status.terminal, false);
+  }
+});
+
+test('nested Status with approved flag still requires explicit boolean false for incomplete', async () => {
+  for (const response_approved of [true, '1']) {
+    for (const incompleteFlag of [undefined, null, '0', true]) {
+      const envelope = nestedStatusEnvelope({ response_approved });
+      if (incompleteFlag === undefined) delete envelope.last_response.data.response_incomplete;
+      else envelope.last_response.data.response_incomplete = incompleteFlag;
+      const status = await queryStatusWithExpectedIdentity(envelope);
+      assert.equal(status.incomplete, incompleteFlag === true ? true : null);
+      assert.equal(status.approved, false);
+      assert.equal(status.uncertain, true);
+    }
+  }
+});
+
+test('flat Status retains its boolean approval contract', async () => {
+  const data = { status: 'PAID', ...approvedData() };
+  assert.equal((await queryStatusWithExpectedIdentity(data)).approved, true);
+  assert.equal((await queryStatusWithExpectedIdentity({ ...data, response_approved: '1' })).approved, false);
+});
+
 function makeLiveProvider(fake, overrides = {}) {
   return makeProvider(fake, {
     endpoint: "https://merchant.pixelpay.app",

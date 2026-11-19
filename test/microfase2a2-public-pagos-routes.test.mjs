@@ -21,6 +21,8 @@ import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDu
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { resolveQaPixelPay3dsDiagnostic } from '../src/services/payments/qaPixelPay3dsDiagnostic.js';
 import { QA_PIXELPAY_CASE29_VISA } from './fixtures/qa-pixelpay-case29.mjs';
+import { DelegatedAttempt } from '../src/experimental/pixelpayDelegated/attempt.js';
+import { desktopContext } from './fixtures/delegatedPixelPayProvider.mjs';
 
 const GROUP_A = "11111111-2222-4333-8444-555555555555";
 const CITA_A = "66666666-6666-4666-8666-666666666666";
@@ -351,7 +353,14 @@ function createPagosClient({
         return { rows: [{ attempted: saleAttempts.some(row=>row.id_intent===params[0]) }] };
       }
       if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) {
-        assert.equal(transactionSnapshot, null, "FINAL debe usar autocommit fuera del claim");
+        if (!text.includes("SET finalized_at")) {
+          const row = saleAttempts.find(entry => entry.id_intent === params[0] && entry.payment_attempt_id === params[1]);
+          if (row) row.observed_payment_uuid_untrusted = params[2];
+          return { rows: [] };
+        }
+        if (saleAttempts.find(entry => entry.payment_attempt_id === params[0])?.qa_test_origin !== '3ds_diagnostic') {
+          assert.equal(transactionSnapshot, null, "FINAL ordinario debe usar autocommit fuera del claim");
+        }
         if (failAttemptFinal) throw new Error("fixture privada 4111111111111111 secretKey-final");
         const row = saleAttempts.find((entry) => entry.payment_attempt_id === params[0] && !entry.finalized_at);
         if (!row) return { rows: [] };
@@ -362,6 +371,11 @@ function createPagosClient({
           observed_payment_uuid_untrusted: params[31],
           observed_transaction_id_untrusted: params[32],
           observed_transaction_reference_untrusted: params[33],
+          response_success: params[13], transaction_result_valid: params[14],
+          transaction_result_parsed: params[15], response_approved: params[16], response_incomplete: params[17],
+          payment_uuid_present: params[19], transaction_id_present: params[20], payment_hash_present: params[21],
+          payment_hash_valid: params[22], transaction_amount_matches: params[23], approved_amount_matches: params[24],
+          amount_matches: params[25],
           final_parameters: structuredClone(params),
         });
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
@@ -414,6 +428,8 @@ function createPagosClient({
           && (!params[2] || new Date(params[2]).getTime() === new Date(event.recibido_at).getTime())
           ? [{ finalized_at: rows[0].finalized_at, paid_at: event.recibido_at }] : [] };
       }
+      if (text.includes('AS deletion_identity_lock')) return { rows: [{ deletion_identity_lock: true }] };
+      if (text.includes('FOR SHARE OF c,u,p')) return { rows: [{ id_cliente: CLIENT_A }] };
       if (failPaymentInsert && text.includes("INSERT INTO public.payments")) {
         throw new Error("fixture fallo financiero posterior a FINAL");
       }
@@ -593,6 +609,12 @@ function createPagosClient({
         return { rows: [{ ...activeIntent }] };
       }
       if (text.includes("UPDATE public.payment_intents")
+        && text.includes("SET referencia_externa = $3, provider_session_id = $4")) {
+        if (activeIntent?.estado_intent_codigo !== 'pendiente_confirmacion') return { rows: [] };
+        activeIntent = { ...activeIntent, referencia_externa: params[2], provider_session_id: params[3] };
+        return { rows: [{ id_intent: activeIntent.id_intent }] };
+      }
+      if (text.includes("UPDATE public.payment_intents")
         && text.includes("estado_intent_codigo = 'pendiente_confirmacion'")
         && text.includes("RETURNING id_intent")) {
         if (!activeIntent || activeIntent.estado_intent_codigo !== "link_generado") return { rows: [] };
@@ -682,6 +704,8 @@ function createPagosClient({
         if (!paymentEvents.some((row) => row.provider_event_id === params[1])) {
           paymentEvents.push({
             id_intent: params[0],
+            id_provider: activeIntent.id_provider,
+            firma_valida: true,
             provider_event_id: params[1],
             evento_tipo: params[2],
             payload_esencial: params[3],
@@ -782,6 +806,7 @@ async function createPagosApp(client, {
   config = {},
   qa3dsDiagnostic = null,
   songbirdBridge = null,
+  delegatedAttemptFactory = null,
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -795,6 +820,7 @@ async function createPagosApp(client, {
       : false,
   });
   if (qa3dsDiagnostic) app.decorate('qaPixelPay3dsDiagnostic', qa3dsDiagnostic);
+  if (delegatedAttemptFactory) app.decorate('qaPixelPayDelegated', qa3dsDiagnostic);
   if (songbirdBridge) app.decorate('songbirdBridge', songbirdBridge);
   app.decorate("config", {
     paymentProvider: providerCode,
@@ -820,6 +846,7 @@ async function createPagosApp(client, {
   await app.register(publicPagosRoutes, {
     prefix: authenticated ? "/v1/pagos/reservas" : "/v1/public/pagos",
     authenticated,
+    ...(delegatedAttemptFactory ? { delegatedAttemptFactory } : {}),
   });
   return app;
 }
@@ -4254,6 +4281,89 @@ function diagnosticRouteClient({intentPatch={},...options}={}) {
 const diagnosticOwnerClaims={cliente_id:CLIENT_A,user:{id_usuario:USER_A,id_persona:USER_A}};
 const diagnosticCard={card_number:QA_PIXELPAY_CASE29_VISA};
 const diagnosticPayload=()=>({...pixelPaySalePayload(),...diagnosticCard,card_expire:'2812'});
+
+test('QA delegate records a single durable claim and never restarts after loss of its worker', async t => {
+  const client = diagnosticRouteClient();
+  const policy = diagnosticPolicy();
+  const calls = [];
+  let closeWorker;
+  const makeAttempt = ({ context, onClose }) => {
+    assert.equal(context.input.orderId, buildProviderOrderReference({ providerCode: 'pixelpay', idIntent: INTENT_A }));
+    assert.equal(client.getActiveIntent().estado_intent_codigo, 'pendiente_confirmacion');
+    assert.equal(client.getSaleAttempts().length, 1);
+    closeWorker = onClose;
+    return {
+      close: onClose,
+      async call(operation) {
+        calls.push(operation);
+        if (operation === 'start') return { state: 'challenge', observedPaymentUuid: 'P-QA-OBSERVED',
+          continuation: { status: 202, transaction_type: 'songbird', payload: 'opaque' } };
+        return { status: 200, success: true, data: {} };
+      },
+    };
+  };
+  const app = await createPagosApp(client, {
+    providerCode: 'pixelpay', authenticated: true, claims: diagnosticOwnerClaims, qa3dsDiagnostic: policy,
+    delegatedAttemptFactory: makeAttempt, providerAdapter: { env: 'sandbox' },
+  });
+  t.after(() => app.close());
+  const base = '/v1/pagos/reservas/pixelpay';
+  const post = (route, payload) => app.inject({ method: 'POST', url: base + route, payload });
+  const reopened = await app.inject({ method: 'POST', url: '/v1/pagos/reservas/crear-intent', payload: publicIntentPayload() });
+  assert.equal(reopened.statusCode, 200, reopened.body);
+  assert.equal(reopened.json().data.qa_3ds_delegated, true);
+  const initial = await post('/sale', diagnosticPayload());
+  assert.equal(initial.statusCode, 202, initial.body);
+  const handoff = initial.json().data.qa_3ds_handoff;
+  assert.equal(handoff.continuation.payload, 'opaque');
+  assert.equal(handoff.observedPaymentUuid, undefined);
+  assert.equal(client.getSaleAttempts()[0].observed_payment_uuid_untrusted, 'P-QA-OBSERVED');
+  const lookup = { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: 'cliente@example.com',
+    token: handoff.token, operation: 'lookup', data: { reference: 'opaque-reference' } };
+  assert.equal((await post('/3ds/delegated', { ...lookup, token: USER_B })).statusCode, 409);
+  assert.equal((await post('/3ds/delegated', lookup)).statusCode, 200);
+  closeWorker();
+  assert.equal((await post('/3ds/delegated', lookup)).statusCode, 409);
+  assert.equal((await post('/sale', diagnosticPayload())).statusCode, 409);
+  const restarted = await createPagosApp(client, { providerCode: 'pixelpay', authenticated: true,
+    claims: diagnosticOwnerClaims, qa3dsDiagnostic: policy, delegatedAttemptFactory: makeAttempt, providerAdapter: { env: 'sandbox' } });
+  t.after(() => restarted.close());
+  assert.equal((await restarted.inject({ method: 'POST', url: base + '/sale', payload: diagnosticPayload() })).statusCode, 409);
+  assert.deepEqual(calls, ['start', 'lookup']);
+  assert.equal(client.getPayments().length, 0);
+});
+
+test('QA route uses native worker provider evidence and the durable reconciler exactly once', async t => {
+  const client = diagnosticRouteClient();
+  const makeAttempt = options => {
+    const fixture = desktopContext(options.context.input.orderId, 'nested-status');
+    return new DelegatedAttempt({ ...options, workerUrl: new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url),
+      context: { ...options.context, config: fixture.config, scenario: fixture.scenario, application: true } });
+  };
+  const app = await createPagosApp(client, { providerCode: 'pixelpay', authenticated: true, claims: diagnosticOwnerClaims,
+    qa3dsDiagnostic: diagnosticPolicy(), delegatedAttemptFactory: makeAttempt, providerAdapter: { env: 'sandbox' } });
+  t.after(() => app.close());
+  const base = '/v1/pagos/reservas/pixelpay';
+  const post = (url, payload) => app.inject({ method: 'POST', url: base + url, payload });
+  const initial = await post('/sale', diagnosticPayload());
+  assert.equal(initial.statusCode, 202, initial.body);
+  const handoff = initial.json().data.qa_3ds_handoff;
+  assert.ok(handoff);
+  const scope = { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: 'cliente@example.com', token: handoff.token };
+  const send = (operation, data) => post('/3ds/delegated', { ...scope, operation, data });
+  assert.equal((await send('lookup', { reference: 'opaque' })).statusCode, 200);
+  assert.equal((await send('retry', { response_approved: 'true' })).statusCode, 400);
+  assert.equal(client.getPayments().length, 0);
+  assert.equal((await send('continue', { payload: 'opaque' })).statusCode, 200);
+  const result = await send('retry', {});
+  assert.equal(result.statusCode, 200, result.body);
+  assert.equal(client.getSaleAttempts()[0].outcome, 'approved');
+  assert.equal(client.getPaymentEvents().length, 1);
+  assert.equal(client.getPayments().length, 1);
+  assert.equal(client.getActiveIntent().estado_intent_codigo, 'confirmado');
+  assert.equal((await send('retry', {})).statusCode, 409);
+  assert.equal(client.getPayments().length, 1);
+});
 
 test('retired QA session never starts a new operation or changes a fresh intent',async t=>{
   const now=Date.now();

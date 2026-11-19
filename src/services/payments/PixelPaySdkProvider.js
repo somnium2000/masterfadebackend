@@ -833,14 +833,29 @@ export class PixelPaySdkProvider extends PaymentProvider {
       );
     }
     const beforeShape = capturePixelPayStatusShape(this, shapeProbe, response?.data);
-    const transactionResult = this.readTransactionResult(response);
+    const envelope = objectOrNull(response?.data);
+    const hasNested = Boolean(expected?.currency) && Object.hasOwn(envelope || {}, 'last_response');
+    const nested = objectOrNull(envelope?.last_response?.data);
+    const nestedValid = nested && this.sdk.Entities.TransactionResult.validateResponse(response) === true;
+    // AM: Parse the transaction fields from the recorded response, retaining outer Status separately.
+    const transactionResult = !hasNested ? this.readTransactionResult(response) : {
+      valid: nestedValid === true, parsed: nestedValid === true, result: nestedValid ? nested : null,
+    };
     const result = transactionResult.result;
     emitPixelPayStatusShape(shapeProbe, beforeShape,
       beforeShape ? capturePixelPayStatusShape(this, shapeProbe, result) : null);
-    const resultPaymentUuid = text(result?.payment_uuid) || null;
+    const consistent = (...values) => {
+      const fields = values.map(text).filter(Boolean);
+      return fields.length && fields.every(value => value === fields[0]) ? fields[0] : null;
+    };
+    const resultPaymentUuid = hasNested ? consistent(result?.payment_uuid, envelope?.payment_uuid)
+      : text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
-    const resultOrderId = text(result?.order_id) || text(response?.data?.order_id) || null;
-    const resultCurrency = text(result?.transaction_currency)
+    const resultOrderId = hasNested ? consistent(result?.order_id, envelope?.order_id)
+      : text(result?.order_id) || text(response?.data?.order_id) || null;
+    const resultCurrency = hasNested ? consistent(result?.transaction_currency, result?.order_currency,
+      envelope?.transaction_currency, envelope?.order_currency)
+      : text(result?.transaction_currency)
       || text(response?.data?.transaction_currency)
       || text(response?.data?.order_currency)
       || null;
@@ -870,6 +885,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const normalizedStatus = rawStatus === "PAID" ? "COMPLETED" : rawStatus;
     const providerContractValid = transactionResult.valid === true
       && transactionResult.parsed === true
+      && (!hasNested || (resultPaymentUuid === normalizedUuid && resultOrderId === expectedOrderId
+        && resultCurrency === expected?.currency && responseSuccess(response) === true))
       && PIXELPAY_STATUS_VALUES.has(normalizedStatus);
     const payload = normalizePixelPayStatusResponse({
       success: responseSuccess(response),
@@ -878,20 +895,31 @@ export class PixelPaySdkProvider extends PaymentProvider {
         : {},
     });
     const status = providerContractValid ? normalizedStatus : "UNKNOWN";
+    const approvalFlag = result?.response_approved;
+    const responseCode = result?.response_code;
+    // AM: Ticket #9787 acredita "1" con "00". Se conserva el booleano sin código del SDK.
+    const declaresApproval = hasNested
+      ? (approvalFlag === true && responseCode === undefined)
+        || ((approvalFlag === true || approvalFlag === "1") && responseCode === "00")
+      : approvalFlag === true;
+    const incompleteFlag = result?.response_incomplete;
+    const incomplete = hasNested && typeof incompleteFlag !== "boolean" ? null : incompleteFlag === true;
+    const approved = status === "COMPLETED"
+      && declaresApproval
+      && (hasNested ? incomplete === false && amountMatches && paymentHashValid && Boolean(transactionId) : !incomplete);
+    const unverifiedCompletion = hasNested && status === "COMPLETED" && !approved;
     return {
       ok: statusCode != null && statusCode >= 200 && statusCode < 300,
       statusCode,
       success: payload.success,
       paymentUuid: normalizedUuid,
       status,
-      terminal: ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
-      uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
-      approved: status === "COMPLETED"
-        && result?.response_approved === true
-        && result?.response_incomplete !== true,
+      terminal: !unverifiedCompletion && ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
+      uncertain: unverifiedCompletion || ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
+      approved,
       rejected: status === "DECLINED",
       voided: status === "VOIDED",
-      incomplete: result?.response_incomplete === true,
+      incomplete,
       definitiveRejected: transactionResult.valid === true
         && transactionResult.parsed === true
         && status === "DECLINED"
