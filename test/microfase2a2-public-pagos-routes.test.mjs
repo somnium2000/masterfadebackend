@@ -4297,7 +4297,8 @@ test('QA delegate records a single durable claim and never restarts after loss o
       async call(operation) {
         calls.push(operation);
         if (operation === 'start') return { state: 'challenge', observedPaymentUuid: 'P-QA-OBSERVED',
-          continuation: { status: 202, transaction_type: 'songbird', payload: 'opaque' } };
+          continuation_mode: 'direct_api', continuation: { status: 202, transaction_type: 'songbird',
+            payload: 'opaque', collection_url: 'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect' } };
         return { status: 200, success: true, data: {} };
       },
     };
@@ -4316,6 +4317,8 @@ test('QA delegate records a single durable claim and never restarts after loss o
   assert.equal(initial.statusCode, 202, initial.body);
   const handoff = initial.json().data.qa_3ds_handoff;
   assert.equal(handoff.continuation.payload, 'opaque');
+  assert.equal(handoff.continuation_mode, 'direct_api');
+  assert.equal(handoff.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect');
   assert.equal(handoff.observedPaymentUuid, undefined);
   assert.equal(client.getSaleAttempts()[0].observed_payment_uuid_untrusted, 'P-QA-OBSERVED');
   const lookup = { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: 'cliente@example.com',
@@ -4335,13 +4338,14 @@ test('QA delegate records a single durable claim and never restarts after loss o
 
 test('QA route uses native worker provider evidence and the durable reconciler exactly once', async t => {
   const client = diagnosticRouteClient();
+  const logs = [];
   const makeAttempt = options => {
     const fixture = desktopContext(options.context.input.orderId, 'nested-status');
     return new DelegatedAttempt({ ...options, workerUrl: new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url),
       context: { ...options.context, config: fixture.config, scenario: fixture.scenario, application: true } });
   };
   const app = await createPagosApp(client, { providerCode: 'pixelpay', authenticated: true, claims: diagnosticOwnerClaims,
-    qa3dsDiagnostic: diagnosticPolicy(), delegatedAttemptFactory: makeAttempt, providerAdapter: { env: 'sandbox' } });
+    qa3dsDiagnostic: diagnosticPolicy(), delegatedAttemptFactory: makeAttempt, providerAdapter: { env: 'sandbox' }, logs });
   t.after(() => app.close());
   const base = '/v1/pagos/reservas/pixelpay';
   const post = (url, payload) => app.inject({ method: 'POST', url: base + url, payload });
@@ -4349,12 +4353,14 @@ test('QA route uses native worker provider evidence and the durable reconciler e
   assert.equal(initial.statusCode, 202, initial.body);
   const handoff = initial.json().data.qa_3ds_handoff;
   assert.ok(handoff);
+  assert.equal(handoff.continuation_mode, 'direct_api');
+  assert.equal(initial.json().data.continuation_diagnostic, undefined);
   const scope = { id_grupo_cita: GROUP_A, id_intent: INTENT_A, titular_email: 'cliente@example.com', token: handoff.token };
   const send = (operation, data) => post('/3ds/delegated', { ...scope, operation, data });
   assert.equal((await send('lookup', { reference: 'opaque' })).statusCode, 200);
   assert.equal((await send('retry', { response_approved: 'true' })).statusCode, 400);
+  assert.equal((await send('retry', { completed: 'true' })).statusCode, 400);
   assert.equal(client.getPayments().length, 0);
-  assert.equal((await send('continue', { payload: 'opaque' })).statusCode, 200);
   const result = await send('retry', {});
   assert.equal(result.statusCode, 200, result.body);
   assert.equal(client.getSaleAttempts()[0].outcome, 'approved');
@@ -4363,6 +4369,16 @@ test('QA route uses native worker provider evidence and the durable reconciler e
   assert.equal(client.getActiveIntent().estado_intent_codigo, 'confirmado');
   assert.equal((await send('retry', {})).statusCode, 409);
   assert.equal(client.getPayments().length, 1);
+  const phases = logs.map(line => JSON.parse(line)).filter(event => event.event === 'pixelpay_qa_delegated_phase');
+  assert.deepEqual(phases.map(event => event.operation), ['start', 'lookup', 'retry']);
+  assert.equal(phases[0].continuation_diagnostic?.code, 'PIXELPAY_3DS_COLLECTION_READY');
+  assert.equal(phases[0].id_intent, INTENT_A);
+  assert.ok(phases[0].paymentAttemptId);
+  assert.ok(phases.every(event => event.continuation_mode === 'direct_api'));
+  const diagnostic = JSON.stringify(phases[0]);
+  assert.ok(!diagnostic.includes(handoff.continuation.payload));
+  assert.ok(!diagnostic.includes(handoff.continuation.collection_url));
+  assert.ok(!diagnostic.includes(handoff.token));
 });
 
 test('retired QA session never starts a new operation or changes a fresh intent',async t=>{

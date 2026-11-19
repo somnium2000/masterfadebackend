@@ -49,6 +49,43 @@ const safeContentType = value => {
 };
 const safeCfRay = value => typeof value === "string" && /^[a-fA-F0-9]{16,32}-[A-Z]{3}$/.test(value) ? value : null;
 
+function safeHttpsOrigin(value) {
+  if (typeof value !== 'string' || value.length > 2048) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' && !url.username && !url.password && /^[a-z0-9.-]{1,253}$/.test(url.hostname)) {
+      return url.origin;
+    }
+  } catch { /* AM: URL parse exceptions may contain the original value. */ }
+  return null;
+}
+
+const CONTINUATION_FIELDS = ['collection_url', 'payload', 'transaction_type'];
+// AM: Keep field presence distinct from null and empty string at each boundary.
+function describeContinuationField(container, field) {
+  const present = container != null && Object.hasOwn(container, field);
+  const value = present ? container[field] : undefined;
+  const type = !present ? 'absent' : value === null ? 'null' : value === '' ? 'empty_string'
+    : Array.isArray(value) ? 'array' : typeof value;
+  return { present, type, length: typeof value === 'string' ? value.length : null,
+    ...(field === 'collection_url' ? { origin: safeHttpsOrigin(value) } : {}) };
+}
+
+function inspectContinuationData(data) {
+  return {
+    ...Object.fromEntries(CONTINUATION_FIELDS.map(field => [field, describeContinuationField(data, field)])),
+    transaction_type_kind: safeContinuationType(data?.transaction_type),
+  };
+}
+
+export function comparePixelPayContinuationFields(left, right) {
+  return Object.fromEntries(CONTINUATION_FIELDS.map(field => {
+    const leftPresent = left != null && Object.hasOwn(left, field);
+    const rightPresent = right != null && Object.hasOwn(right, field);
+    return [field, leftPresent === rightPresent && (!leftPresent || Object.is(left[field], right[field]))];
+  }));
+}
+
 export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
   const input = source && typeof source === "object" ? source : {};
   const sdkStackFile = SDK_FILES.has(input.sdkStackFile) ? input.sdkStackFile : null;
@@ -206,6 +243,7 @@ export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnost
         transport.interceptors.request.use(config => {
           this.saleExecution.executionPhase = "sale_transport";
           this.saleExecution.requestMayHaveBeenSent = true;
+          if (typeof onContinuation === 'function') this.saleExecution.saleOrigin = safeHttpsOrigin(config.baseURL);
           return config;
         });
         const received = response => {
@@ -249,7 +287,16 @@ export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnost
       if (saleResponse && status === 202) {
         this.saleExecution.sdkTransactionType = safeContinuationType(response?.data?.transaction_type);
         // AM: Opt-in application transport captures the native response; default containment remains intact.
-        if (typeof onContinuation === 'function') onContinuation(response);
+        if (typeof onContinuation === 'function') onContinuation(response, {
+          upstream_http_status: safeStatus(this.saleExecution.statusCode),
+          upstream_cf_ray: this.saleExecution.cfRay ?? null,
+          sale_origin: this.saleExecution.saleOrigin ?? null,
+          sale_environment: ['sandbox', 'staging', 'live'].includes(this.settings.environment) ? this.settings.environment : null,
+          raw_top_level_collection_url: describeContinuationField(data, 'collection_url'),
+          raw_data: inspectContinuationData(data?.data),
+          sdk_data: inspectContinuationData(response?.data),
+          raw_to_sdk_equal: comparePixelPayContinuationFields(data?.data, response?.data),
+        });
         // AM: Transient server-only handoff sink; never attach opaque data to errors or diagnostics.
         if (qa3dsDiagnostic && response?.data?.transaction_type === 'songbird' && typeof onSongbirdPayload === 'function') {
           onSongbirdPayload(response?.data?.payload, { collectionUrl: response?.data?.collection_url ?? null });

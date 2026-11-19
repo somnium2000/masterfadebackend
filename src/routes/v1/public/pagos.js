@@ -2074,6 +2074,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         if (body.operation !== 'retry') {
           const response = await context.worker.call(body.operation, body.data);
           request.log.info({ event: 'pixelpay_qa_delegated_phase', id_intent: body.id_intent,
+            paymentAttemptId: context.claim.paymentAttemptId, continuation_mode: context.continuationMode,
             operation: body.operation, upstream_status: response.status });
           return sendOk(reply, response);
         }
@@ -2081,6 +2082,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           const response = await context.worker.call('retry');
           const booking = await persistDelegatedResult(context.claim, response.final, request, owner);
           request.log.info({ event: 'pixelpay_qa_delegated_phase', id_intent: body.id_intent, operation: 'retry',
+            paymentAttemptId: context.claim.paymentAttemptId, continuation_mode: context.continuationMode,
             upstream_status: response.sdkResponse.status, booking_confirmed: booking.booking_confirmed === true });
           context.worker.close();
           return response.sdkResponse;
@@ -2721,13 +2723,20 @@ export default async function publicPagosRoutes(app, options = {}) {
               return sendOk(reply, settled, { statusCode: settled.booking_confirmed ? 200 : 202 });
             }
             await recordDelegatedStatusCandidate(app.db, { ...claim, paymentUuid: result.observedPaymentUuid });
+            const handoff = result.state === 'challenge' && result.continuation_mode === 'direct_api' ? {
+              state: result.state, order: result.order, sdk: result.sdk, continuation: result.continuation,
+              continuation_mode: result.continuation_mode, token, expiresAt: deadline,
+            } : null;
+            const diagnostic = result.continuation_diagnostic;
             request.log.info({ event: 'pixelpay_qa_delegated_phase', id_intent: idIntent,
-              operation: 'start', state: result.state, upstream_status: 202 });
+              paymentAttemptId: claim.paymentAttemptId, operation: 'start', state: result.state, upstream_status: 202,
+              continuation_mode: handoff?.continuation_mode ?? null,
+              // AM: The worker produces this closed diagnostic from response shapes only.
+              continuation_diagnostic: diagnostic, handoff_sent: Boolean(handoff) });
             return sendOk(reply, { ...pendingDelegated,
-              ...(result.state === 'challenge' ? { qa_3ds_handoff: {
-                state: result.state, order: result.order, sdk: result.sdk, continuation: result.continuation,
-                token, expiresAt: deadline,
-              } } : {}) },
+              ...(handoff ? { qa_3ds_handoff: handoff } : {
+                qa_3ds_continuation_code: diagnostic?.code ?? 'PIXELPAY_3DS_CONTINUATION_INVALID',
+              }) },
             { statusCode: 202 });
           } catch {
             delegated.close();

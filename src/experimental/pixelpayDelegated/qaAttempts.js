@@ -31,10 +31,12 @@ export function createQaDelegatedAttempts({ config, makeAttempt = options => new
         lifetimeMs, timeoutMs: null,
         onClose: () => { if (live?.token === token) live = null; },
       });
-      live = { claim, owner, deadline, worker, token };
+      const context = { claim, owner, deadline, worker, token, continuationMode: null };
+      live = context;
       try {
         const result = await worker.call('start');
-        if (result.state !== 'challenge') worker.close();
+        if (result.state === 'challenge') context.continuationMode = result.continuation_mode;
+        else worker.close();
         return { result, deadline, token };
       } catch (error) {
         worker.close();

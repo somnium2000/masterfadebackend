@@ -22,6 +22,7 @@ export function installSyntheticProvider(context) {
   const merchant = nacl.box.keyPair();
   const stats = { externalSockets: 0, initialSales: 0, retries: 0, lookups: 0, continues: 0,
     cryptoContextMatches: true, credentialsInNode: true, orders: [] };
+  if (context.application) stats.directLookupCvvMatches = null;
   let initialPublicKey, initialCiphertext;
   net.Socket.prototype.connect = function () { stats.externalSockets++; throw new Error('EXTERNAL_BLOCKED'); };
   globalThis.fetch = async () => { stats.externalSockets++; throw new Error('EXTERNAL_BLOCKED'); };
@@ -66,16 +67,39 @@ export function installSyntheticProvider(context) {
     stats.orders.push(body.order_id);
     if (config.url.endsWith('lookup')) {
       stats.lookups++;
-      return reply(200, { identifier: `auth-${body.order_id}`, continue_url: 'https://acs.offline.invalid',
-        continue_payload: 'opaque-challenge', transaction_id: `tx-${body.order_id}` },
-      context.scenario === 'frictionless' ? null : 'continue');
+      if (context.application) {
+        const [box, nonce] = String(body.card_cvv).split('|');
+        const cvv = nonce && nacl.box.open(decode(box), decode(nonce), decode(config.headers['x-auth-secure']), merchant.secretKey);
+        stats.directLookupCvvMatches = Boolean(cvv && Buffer.from(cvv).toString() === context.input.card.cvv);
+      }
+      const challengeUrl = context.application ? 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F'
+        : 'https://acs.offline.invalid';
+      return reply(context.application && !['frictionless', 'challenge-http-200'].includes(context.scenario) ? 202 : 200, {
+        identifier: context.scenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
+        continue_url: context.scenario === 'invalid-step-up' ? 'https://acs.offline.invalid' : challengeUrl,
+        continue_payload: 'opaque.+/=%ñ', transaction_id: `tx-${body.order_id}`, window_size: '03',
+      }, context.scenario === 'frictionless' ? null : 'continue', context.scenario !== 'lookup-not-successful');
     }
     if (!config.url.endsWith('transaction/sale')) throw new Error('UNEXPECTED_ROUTE');
     if (!body.authentication_identifier) {
       stats.initialSales++;
-      if (context.scenario !== 'no-3ds') return reply(202, { transaction_type: 'songbird', payload: `opaque-setup-${body.order_id}`,
-        payment_uuid: context.scenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}`,
-        ...(context.scenario === 'collection-url' ? { collection_url: 'https://collection.offline.invalid' } : {}) });
+      if (context.scenario !== 'no-3ds') {
+        const collectionPathVersion = context.scenario === 'challenge-http-200' ? 'V2' : 'V1';
+        const collectionUrl = `https://cas.client.cardinaltrusted.com/centinelapi/${collectionPathVersion}/Cruise/Collect?n=%2B%2F`;
+        const collection = {
+          'collection-absent': undefined, 'collection-top-level': undefined, 'collection-null': null,
+          'collection-empty': '', 'collection-object': { url: collectionUrl },
+          'collection-untrusted': 'https://example.invalid/collection',
+          'collection-invalid-path': 'https://cas.client.cardinaltrusted.com/other',
+        };
+        const collectionValue = Object.hasOwn(collection, context.scenario) ? collection[context.scenario] : collectionUrl;
+        const response = reply(202, { transaction_type: 'songbird', payload: `opaque-setup-${body.order_id}`,
+          payment_uuid: context.scenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}`,
+          ...(context.application && collectionValue !== undefined ? { collection_url: collectionValue } : {}) });
+        response.headers['cf-ray'] = '0123456789abcdef-TPA';
+        if (context.scenario === 'collection-top-level') response.data.collection_url = collectionUrl;
+        return response;
+      }
     } else {
       stats.retries++;
       if (body.authentication_identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
