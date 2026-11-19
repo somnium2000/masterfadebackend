@@ -895,21 +895,31 @@ export class PixelPaySdkProvider extends PaymentProvider {
         : {},
     });
     const status = providerContractValid ? normalizedStatus : "UNKNOWN";
+    const approvalFlag = result?.response_approved;
+    const responseCode = result?.response_code;
+    // AM: Ticket #9787 acredita "1" con "00". Se conserva el booleano sin código del SDK.
+    const declaresApproval = hasNested
+      ? (approvalFlag === true && responseCode === undefined)
+        || ((approvalFlag === true || approvalFlag === "1") && responseCode === "00")
+      : approvalFlag === true;
+    const incompleteFlag = result?.response_incomplete;
+    const incomplete = hasNested && typeof incompleteFlag !== "boolean" ? null : incompleteFlag === true;
+    const approved = status === "COMPLETED"
+      && declaresApproval
+      && (hasNested ? incomplete === false && amountMatches && paymentHashValid && Boolean(transactionId) : !incomplete);
+    const unverifiedCompletion = hasNested && status === "COMPLETED" && !approved;
     return {
       ok: statusCode != null && statusCode >= 200 && statusCode < 300,
       statusCode,
       success: payload.success,
       paymentUuid: normalizedUuid,
       status,
-      terminal: ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
-      uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
-      approved: status === "COMPLETED"
-        && result?.response_approved === true
-        && (hasNested ? result?.response_incomplete === false && amountMatches && paymentHashValid && Boolean(transactionId)
-          : result?.response_incomplete !== true),
+      terminal: !unverifiedCompletion && ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
+      uncertain: unverifiedCompletion || ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
+      approved,
       rejected: status === "DECLINED",
       voided: status === "VOIDED",
-      incomplete: result?.response_incomplete === true,
+      incomplete,
       definitiveRejected: transactionResult.valid === true
         && transactionResult.parsed === true
         && status === "DECLINED"
