@@ -43,3 +43,30 @@ export async function resolvePixelPayStatusCandidate(db, intent = {}, { delegate
   }
   return { paymentUuid: candidates[0], source: "observed_untrusted" };
 }
+
+
+// PixelPay #9834 (19 nov 2026): Status no es consultable mientras el 3DS
+// de una respuesta HTTP 202 no ha terminado. Solo se usa evidencia durable local.
+// El registro de un 202 nunca prueba aprobacion ni autoriza reintentar Sale.
+export async function hasUnfinishedPixelPay3dsResponse(db, intent = {}) {
+  if (safeText(intent.estado_intent_codigo)?.toLowerCase() !== "pendiente_confirmacion") {
+    return false;
+  }
+  const idIntent = safeText(intent.id_intent);
+  if (!idIntent) {
+    throw new AppError(503, "No se pudo verificar el estado local de la operacion.", {
+      code: "PIXELPAY_3DS_STATUS_GATE_UNAVAILABLE",
+    });
+  }
+  // Safe read-only query. Query failures must propagate: never fall through
+  // to the provider when the 3DS state cannot be checked.
+  const result = await db.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM app_private.pixelpay_sale_attempts
+       WHERE id_intent = $1::uuid
+         AND (upstream_http_status = 202 OR sdk_response_class = 'PayloadResponse')
+     ) AS awaiting_authentication`,
+    [idIntent],
+  );
+  return result.rows[0]?.awaiting_authentication === true;
+}
