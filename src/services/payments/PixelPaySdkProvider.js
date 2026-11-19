@@ -2,6 +2,7 @@ import PixelPaySdk from "@pixelpay/sdk-core";
 import { createPixelPayNodeSaleTransaction, classifyPixelPaySaleRuntimeError, sanitizePixelPaySaleRuntimeDiagnostics } from "./pixelPaySaleRuntime.js";
 import { capturePixelPayStatusShape, emitPixelPayStatusShape } from "./pixelPayStatusShapeProbe.js";
 import { createHash } from "node:crypto";
+import { captureSongbirdSdkContext, sanitizeSongbirdCaptureDiagnostic } from './songbirdSdkContract.js';
 import { PaymentProvider } from "./PaymentProvider.js";
 import {
   createPixelPaySaleAttempt,
@@ -491,7 +492,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
     this.sdk.Services.Transaction.withConcurrency();
   }
 
-  createTransaction(signature, { sale = false } = {}) {
+  createTransaction(signature, { sale = false, qa3dsDiagnostic = false, onSongbirdPayload } = {}) {
     const settings = new this.sdk.Models.Settings();
     if (this.env === "sandbox") {
       settings.setupSandbox();
@@ -504,7 +505,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       settings.setupEnvironment("live");
     }
     settings.setupHeaders({ "x-client-signature": signature });
-    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings)
+    return sale ? createPixelPayNodeSaleTransaction(this.sdk, settings, { qa3dsDiagnostic, onSongbirdPayload })
       : new this.sdk.Services.Transaction(settings);
   }
 
@@ -660,6 +661,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
     let response;
     let transaction;
     let sdkInvoked = false;
+    let pendingSongbird = null;
+    let saleRequest;
     try {
       const signature = createPixelPaySaleSignature({
         secretKey: this.secretKey,
@@ -667,8 +670,20 @@ export class PixelPaySdkProvider extends PaymentProvider {
         orderId: input.orderId,
         appUrl: this.appUrl,
       });
-      transaction = this.createTransaction(signature, { sale: true });
-      const saleRequest = this.buildSaleRequest(input, referenceDate);
+      transaction = this.createTransaction(signature, { sale: true, qa3dsDiagnostic: telemetryContext.qa3dsDiagnostic === true,
+        onSongbirdPayload: typeof telemetryContext.onSongbirdRequired === 'function' ? (payload, metadata) => {
+          pendingSongbird = { payload, context: null, captureDiagnostic: null };
+          try {
+            pendingSongbird.context = captureSongbirdSdkContext(saleRequest, transaction.settings, {
+              collectionUrl: metadata?.collectionUrl ?? null,
+              onDiagnostic: value => { pendingSongbird.captureDiagnostic = sanitizeSongbirdCaptureDiagnostic(value); },
+            });
+          } catch {
+            // AM: Preserve a fixed capture-stage reason; never serialize the original exception.
+            pendingSongbird.captureDiagnostic ||= { accepted: false, stage: 'context_capture', rule: 'CAPTURE_EXCEPTION', flags: {} };
+          }
+        } : undefined });
+      saleRequest = this.buildSaleRequest(input, referenceDate);
       emitPixelPaySaleEvent(logger, PIXELPAY_SALE_EVENT.HTTP_STARTED, attempt, {
         durationMs: Date.now() - startedAt,
         ...inputDiagnostics,
@@ -677,6 +692,27 @@ export class PixelPaySdkProvider extends PaymentProvider {
       response = await transaction.doSale(saleRequest);
       return this.completeSaleResponse(input, attempt, logger, startedAt, inputDiagnostics, transaction, response);
     } catch (error) {
+      if (pendingSongbird) {
+        let captured;
+        let sinkCompleted = false;
+        try {
+          captured = await telemetryContext.onSongbirdRequired(pendingSongbird.payload, pendingSongbird.context);
+          sinkCompleted = true;
+        }
+        catch {
+          // AM: A handoff write failure cannot release the financial claim or cause another Sale.
+          try { logger?.error?.({ event: 'PIXELPAY_SONGBIRD_HANDOFF_PERSISTENCE_FAILED', paymentAttemptId: attempt.paymentAttemptId }, 'No se pudo guardar la autenticacion'); }
+          catch { /* AM: Logger failures never release an uncertain financial claim. */ }
+        } finally {
+          try {
+            const validation = sanitizeSongbirdCaptureDiagnostic(captured?.capture_diagnostic);
+            logger?.info?.({ event: 'PIXELPAY_SONGBIRD_CAPTURE_DIAGNOSTIC', songbird_response: true,
+              bridge_capture_completed: sinkCompleted, validation_available: Boolean(validation),
+              capture: sanitizeSongbirdCaptureDiagnostic(pendingSongbird.captureDiagnostic), validation });
+          } catch { /* AM: Logger failures cannot alter the uncertain outcome, release a claim or repeat Sale. */ }
+          delete pendingSongbird.payload; delete pendingSongbird.context; delete pendingSongbird.captureDiagnostic;
+        }
+      }
       const execution = sdkInvoked ? transaction?.getSaleExecutionDiagnostics?.() : {
           executionPhase: "request_construction", httpResponseReceived: false, requestMayHaveBeenSent: false,
         };
@@ -860,6 +896,7 @@ export class PixelPaySdkProvider extends PaymentProvider {
       response: normalizedResponse,
       diagnostics,
       paymentAttemptId: attempt.paymentAttemptId,
+      ...(execution?.qa3dsObservation ? { qa3dsObservation: execution.qa3dsObservation } : {}),
     };
   }
 
@@ -915,6 +952,117 @@ export class PixelPaySdkProvider extends PaymentProvider {
       );
     }
     const beforeShape = capturePixelPayStatusShape(this, shapeProbe, response?.data);
+    if (this.env !== "sandbox" || !expected.currency) {
+      return this.readProductionStatus(response, normalizedUuid, expected, shapeProbe, beforeShape, statusCode);
+    }
+
+    const envelope = objectOrNull(response?.data);
+    const hasNested = Boolean(expected?.currency) && Object.hasOwn(envelope || {}, 'last_response');
+    const nested = objectOrNull(envelope?.last_response?.data);
+    const nestedValid = nested && this.sdk.Entities.TransactionResult.validateResponse(response) === true;
+    // AM: Parse the transaction fields from the recorded response, retaining outer Status separately.
+    const transactionResult = !hasNested ? this.readTransactionResult(response) : {
+      valid: nestedValid === true, parsed: nestedValid === true, result: nestedValid ? nested : null,
+    };
+    const result = transactionResult.result;
+    emitPixelPayStatusShape(shapeProbe, beforeShape,
+      beforeShape ? capturePixelPayStatusShape(this, shapeProbe, result) : null);
+    const consistent = (...values) => {
+      const fields = values.map(text).filter(Boolean);
+      return fields.length && fields.every(value => value === fields[0]) ? fields[0] : null;
+    };
+    const resultPaymentUuid = hasNested ? consistent(result?.payment_uuid, envelope?.payment_uuid)
+      : text(result?.payment_uuid) || null;
+    const transactionId = text(result?.transaction_id) || null;
+    const resultOrderId = hasNested ? consistent(result?.order_id, envelope?.order_id)
+      : text(result?.order_id) || text(response?.data?.order_id) || null;
+    const resultCurrency = hasNested ? consistent(result?.transaction_currency, result?.order_currency,
+      envelope?.transaction_currency, envelope?.order_currency)
+      : text(result?.transaction_currency)
+      || text(response?.data?.transaction_currency)
+      || text(response?.data?.order_currency)
+      || null;
+    const expectedOrderId = text(expected?.orderId);
+    const expectedAmount = expected?.amount;
+    const hasPaymentHash = Boolean(text(result?.payment_hash));
+    let paymentHashValid = false;
+    if (hasPaymentHash && expectedOrderId) {
+      try {
+        paymentHashValid = transaction.verifyPaymentHash(
+          result.payment_hash,
+          expectedOrderId,
+          this.secretKey
+        ) === true;
+      } catch {
+        paymentHashValid = false;
+      }
+    }
+    const transactionAmountMatches = valuePresent(result?.transaction_amount)
+      && money(result.transaction_amount) === money(expectedAmount);
+    const approvedAmountMatches = valuePresent(result?.transaction_approved_amount)
+      && money(result.transaction_approved_amount) === money(expectedAmount);
+    const amountMatches = transactionAmountMatches && approvedAmountMatches;
+    // AM: sdk-core@2.5.8 no declara `status` en TransactionResult; el contrato
+    // oficial de Status lo entrega en el envelope como `data.status`.
+    const rawStatus = text(response?.data?.status).toUpperCase();
+    const normalizedStatus = rawStatus === "PAID" ? "COMPLETED" : rawStatus;
+    const providerContractValid = transactionResult.valid === true
+      && transactionResult.parsed === true
+      && (!hasNested || (resultPaymentUuid === normalizedUuid && resultOrderId === expectedOrderId
+        && resultCurrency === expected?.currency && responseSuccess(response) === true))
+      && PIXELPAY_STATUS_VALUES.has(normalizedStatus);
+    const payload = normalizePixelPayStatusResponse({
+      success: responseSuccess(response),
+      data: providerContractValid
+        ? { status: normalizedStatus }
+        : {},
+    });
+    const status = providerContractValid ? normalizedStatus : "UNKNOWN";
+    const approvalFlag = result?.response_approved;
+    const responseCode = result?.response_code;
+    // AM: Ticket #9787 acredita "1" con "00". Se conserva el booleano sin código del SDK.
+    const declaresApproval = hasNested
+      ? (approvalFlag === true && responseCode === undefined)
+        || ((approvalFlag === true || approvalFlag === "1") && responseCode === "00")
+      : approvalFlag === true;
+    const incompleteFlag = result?.response_incomplete;
+    const incomplete = hasNested && typeof incompleteFlag !== "boolean" ? null : incompleteFlag === true;
+    const approved = status === "COMPLETED"
+      && declaresApproval
+      && transactionResult.valid === true && responseSuccess(response) === true
+      && incomplete === false && amountMatches && paymentHashValid && Boolean(transactionId)
+      && (!expected?.transactionId || transactionId === expected.transactionId);
+    const unverifiedCompletion = status === "COMPLETED" && !approved;
+    return {
+      ok: statusCode != null && statusCode >= 200 && statusCode < 300,
+      statusCode,
+      success: payload.success,
+      paymentUuid: normalizedUuid,
+      status,
+      terminal: !unverifiedCompletion && ["COMPLETED", "DECLINED", "VOIDED"].includes(status),
+      uncertain: unverifiedCompletion || ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
+      approved,
+      rejected: status === "DECLINED",
+      voided: status === "VOIDED",
+      incomplete,
+      definitiveRejected: transactionResult.valid === true
+        && transactionResult.parsed === true
+        && status === "DECLINED"
+        && result?.response_approved === false
+        && result?.response_incomplete === false
+        && resultPaymentUuid === normalizedUuid,
+      transactionId,
+      resultPaymentUuid,
+      resultOrderId,
+      resultCurrency,
+      paymentHashValid,
+      amountMatches,
+      providerContractValid,
+      response: payload,
+    };
+  }
+
+  readProductionStatus(response, normalizedUuid, expected, shapeProbe, beforeShape, statusCode) {
     let sdkEnvelopeValid;
     try {
       sdkEnvelopeValid = this.sdk.Entities.TransactionResult.validateResponse(response) === true;

@@ -17,7 +17,7 @@ export default fp(async function authPlugin(app) {
   app.decorateRequest("auth", null);
   app.decorateRequest("claims", null);
 
-  app.decorate("authenticate", async function authenticate(request, reply) {
+  app.decorate("authenticate", async function authenticate(request, reply, { readOnly = false } = {}) {
     const token = getSessionTokenFromRequest(request);
 
     if (!token) {
@@ -61,7 +61,7 @@ export default fp(async function authPlugin(app) {
         id_usuario: String(payload.sub || ""),
         sid: String(payload.sid || ""),
         jti: String(payload.jti || ""),
-      });
+      }, { readOnly });
 
       if (!sessionValidation.ok) {
         if (sessionValidation.statusCode === 500) {

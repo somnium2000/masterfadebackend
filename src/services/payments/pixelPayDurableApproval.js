@@ -29,6 +29,9 @@ export async function loadDurablePixelPayApproval(client, { idIntent, groupRows,
        JOIN public.payment_intents pi ON pi.id_intent = pe.id_intent AND pi.id_provider = pe.id_provider
        JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider
        WHERE pe.id_intent = $1::uuid AND pp.codigo = 'pixelpay'
+         AND pi.orden_compra = 'MF-PIXELPAY-' || upper(replace(pi.id_intent::text, '-', ''))
+         AND EXISTS (SELECT 1 FROM public.citas c WHERE c.id_cita = pi.id_cita
+           AND c.id_grupo_cita = pi.id_grupo_cita AND c.deleted_at IS NULL)
          AND pe.evento_tipo = 'pixelpay.sale.approved_verified' AND pe.firma_valida IS TRUE
          AND pe.provider_event_id = 'pixelpay_sale_' || (pe.payload_esencial->>'payment_attempt_id')
          AND pe.payload_esencial->>'payment_uuid' = pi.provider_session_id
@@ -42,6 +45,7 @@ export async function loadDurablePixelPayApproval(client, { idIntent, groupRows,
      SELECT a.finalized_at::text AS finalized_at, e.recibido_at::text AS paid_at
      FROM approved_attempts a JOIN sale_events e USING (payment_attempt_id)
      WHERE (SELECT count(*) FROM approved_attempts) = 1 AND (SELECT count(*) FROM sale_events) = 1
+       AND a.finalized_at <= e.expires_at
        AND e.recibido_at <= $2::timestamptz AND e.recibido_at <= e.expires_at
        AND e.recibido_at <= (
          SELECT min(h.expires_at) FROM public.citas_holds h

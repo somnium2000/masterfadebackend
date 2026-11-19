@@ -10,28 +10,31 @@ import pg from "pg";
 import Fastify from "fastify";
 import paymentRecoveryRoutes from "../src/routes/v1/paymentRecovery.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
-import { reconcilePixelPayFromDurableApproval, reconcilePixelPayPaid } from "../src/routes/v1/public/pagos.js";
+import { buildProviderOrderReference, reconcilePixelPayFromDurableApproval, reconcilePixelPayPaid } from "../src/routes/v1/public/pagos.js";
 import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDurableApproval.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
+import { processPixelPayOrderCallback } from "../src/routes/v1/pagos.js";
+import { closeCompletedPixelPayCallback, PIXELPAY_CALLBACK_CLOSED_RESULT } from "../src/services/payments/pixelPayCallbackReceipt.js";
+import { loadPixelPayQaOrigin } from '../src/services/payments/pixelPayQaOrigin.js';
 
 const migrationUrl = new URL("../db/migrations/pixel/20261011213325_payment_late_uses_paid_at_v1.sql", import.meta.url);
 const baselineUrl = new URL("./sql/payments/qa_payment_triggers_20261011.sql", import.meta.url);
 const RUN = process.env.RUN_PAYMENT_LATE_PG_INTEGRATION === "true";
 const RUN_FINANCIAL_CONTRACT = process.env.RUN_FINANCIAL_CONTRACT_PG === "true";
 const financialContractUrl = new URL("../db/migrations/pixel/20261101025900_financial_paid_at_contract_v2.sql", import.meta.url);
-const INTENT = "9b1626eb-0c04-4ce3-ae93-5296ddcb02fe";
-const GROUP = "1cc40753-b888-4452-82b5-8e384d590fbc";
-const CITA = "05f53173-ab1a-4b35-8a70-88f2f40d22f2";
-const HOLD = "1dcc3717-bec0-4b31-be58-20f0821c947a";
+const INTENT = "f1000000-0000-4000-8000-000000000001";
+const GROUP = "f1000000-0000-4000-8000-000000000002";
+const CITA = "f1000000-0000-4000-8000-000000000003";
+const HOLD = "f1000000-0000-4000-8000-000000000004";
 const PERSON = "11111111-1111-4111-8111-111111111111";
-const BARBER = "9f7192ec-f8ee-41be-91c4-b0f4024e63a2";
+const BARBER = "f1000000-0000-4000-8000-000000000005";
 const PROVIDER = "22222222-2222-4222-8222-222222222222";
 const OTHER_PROVIDER = "33333333-3333-4333-8333-333333333333";
 const OTHER_INTENT = "44444444-4444-4444-8444-444444444444";
 const MEMBERSHIP_INTENT = "55555555-5555-4555-8555-555555555555";
 const MEMBERSHIP_ORDER = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-const UUID = "S-a2f5612c-5084-4134-ad5f-feeb0ae6d8c8";
-const TX = "1f694eee-4715-45b8-a545-000000000000";
+const UUID = "PAY-QA-DURABLE-SYNTHETIC";
+const TX = "TX-QA-DURABLE-SYNTHETIC";
 const PAID_AT = "2026-10-11T19:43:29.880935Z";
 const FINALIZED_AT = "2026-10-11T19:43:28.123456Z";
 const EXPIRY = "2026-10-11T19:48:29.071048Z";
@@ -175,8 +178,9 @@ async function seed(client, { paidAt = PAID_AT, intentExpiry = EXPIRY, holdExpir
   await client.query("INSERT INTO public.citas_holds(id_hold,id_cita,expires_at,estado_hold_codigo) VALUES ($1,$2,$3,$4)", [HOLD, CITA, holdExpiry, holdState]);
   await client.query("INSERT INTO public.payment_providers(id_provider,codigo) VALUES ($1,'pixelpay')", [PROVIDER]);
   await client.query(`INSERT INTO public.payment_intents(id_intent,id_cita,id_hold,id_grupo_cita,id_provider,monto_hnl,
-    moneda_codigo,expires_at,estado_intent_codigo,provider_session_id,referencia_externa)
-    VALUES ($1,$2,$3,$4,$5,1,'HNL',$6,$7,$8,$9)`, [INTENT, CITA, HOLD, GROUP, PROVIDER, intentExpiry, intentState, UUID, TX]);
+    moneda_codigo,expires_at,estado_intent_codigo,provider_session_id,referencia_externa,orden_compra)
+    VALUES ($1,$2,$3,$4,$5,1,'HNL',$6,$7,$8,$9,$10)`, [INTENT, CITA, HOLD, GROUP, PROVIDER, intentExpiry, intentState, UUID, TX,
+    buildProviderOrderReference({ providerCode: "pixelpay", idIntent: INTENT })]);
   return paidAt;
 }
 
@@ -185,14 +189,14 @@ async function insertPayment(client, paidAt, amount = 1, currency = "HNL") {
     VALUES ($1,'capturado',$2,$3,$4,$5) RETURNING pago_tardio,paid_at::text`, [INTENT, UUID, amount, currency, paidAt]);
 }
 
-async function seedDurableSale(client) {
+async function seedDurableSale(client, qaTestOrigin = null) {
   const attemptId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   await client.query(`INSERT INTO app_private.pixelpay_sale_attempts(id_intent,payment_attempt_id,finalized_at,outcome,
     sdk_response_class,upstream_http_status,uncertain,response_success,response_approved,response_incomplete,
     transaction_result_valid,transaction_result_parsed,payment_uuid_present,transaction_id_present,payment_hash_present,
-    payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches)
-    VALUES ($1,$2,$3,'approved','SuccessResponse',200,false,true,true,false,true,true,true,true,true,true,true,true,true)`,
-  [INTENT, attemptId, FINALIZED_AT]);
+    payment_hash_valid,transaction_amount_matches,approved_amount_matches,amount_matches${qaTestOrigin?',qa_test_origin':''})
+    VALUES ($1,$2,$3,'approved','SuccessResponse',200,false,true,true,false,true,true,true,true,true,true,true,true,true${qaTestOrigin?',$4::text':''})`,
+  [INTENT, attemptId, FINALIZED_AT,...(qaTestOrigin?[qaTestOrigin]:[])]);
   await client.query(`INSERT INTO public.payment_events
     (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
     VALUES ($1,$2,'pixelpay.sale.approved_verified',TRUE,$3,$4,$5)`, [PROVIDER, `pixelpay_sale_${attemptId}`, {
@@ -327,19 +331,37 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
     await client.query(functionSql(historical, "app_private.confirmar_reserva_pagada_v1"));
     await client.query(await readFile(new URL("../db/migrations/pixel/20261011043911_pixelpay_sale_attempts.sql", import.meta.url), "utf8"));
     await client.query(await readFile(financialContractUrl, "utf8"));
+    // AM: La funcion sintetica de auditoria usa una tabla sin esquema; conservarla con RPC SECURITY DEFINER real.
+    await client.query("ALTER FUNCTION public.fn_auditar_bitacora() SET search_path = pg_catalog, public");
+    await client.query(`ALTER TABLE public.payment_intents
+      ADD COLUMN last_verified_at timestamptz, ADD COLUMN verification_attempts integer NOT NULL DEFAULT 0`);
+    await client.query(await readFile(new URL("../db/migrations/pixel/20260923020000_payment_status_checks_v1.sql", import.meta.url), "utf8"));
+    await client.query(await readFile(new URL("../db/migrations/pixel/20261104013000_payment_status_checks_precondition_failed.sql", import.meta.url), "utf8"));
+    await client.query(`ALTER TABLE public.clientes ADD COLUMN anonimizado boolean NOT NULL DEFAULT false;
+      ALTER TABLE public.usuarios ADD COLUMN estado_acceso text NOT NULL DEFAULT 'activo';
+      CREATE TABLE app_private.solicitudes_eliminacion_cuenta (
+        id_cliente uuid, id_usuario uuid, id_persona uuid, estado_codigo text NOT NULL
+      );
+      CREATE TABLE public.points_cycles (
+        id_cycle uuid PRIMARY KEY, id_cliente uuid, vence_at timestamptz,
+        estado_ciclo_codigo text, updated_at timestamptz
+      )`);
+    await client.query(functionSql(await readFile(new URL("../db/migrations/20261030010000_masterpuntos_readonly_expiration_v1.sql", import.meta.url), "utf8"),
+      "public.fn_points_materialize_expired_cycles"));
+    await client.query(await readFile(new URL('../db/migrations/pixel/20261115233000_pixelpay_qa_test_origin.sql',import.meta.url),'utf8'));
     const reset = async (options = {}) => {
       // AM: Solo fixtures del cluster temporal; ninguna conexion externa ni dato historico.
       await client.query(`TRUNCATE public.payment_events,app_private.pixelpay_sale_attempts,public.payments,
         public.payment_intents,public.citas_holds,public.citas,public.citas_grupos,public.correos,
-        public.personas,public.payment_providers CASCADE`);
+        public.personas,public.payment_providers,app_private.solicitudes_eliminacion_cuenta CASCADE`);
       await seed(client, options);
       if (options.holdState === "activo") await client.query("UPDATE public.citas_grupos SET estado_grupo_codigo='activo'");
-      await seedDurableSale(client);
+      await seedDurableSale(client, options.qaTestOrigin);
     };
-    const recover = (connection = client) => reconcilePixelPayFromDurableApproval(connection, {
-      idGrupoCita: GROUP, idIntent: INTENT, titularEmail: EMAIL,
+    const recover = (connection = client, options = {}) => reconcilePixelPayFromDurableApproval(connection, {
+      idGrupoCita: GROUP, idIntent: INTENT, titularEmail: EMAIL, ...options,
     });
-    const assertConfirmedOnce = async () => {
+    const assertConfirmedOnce = async (options) => {
       const state = (await client.query(`SELECT p.paid_at=$2::timestamptz exact_payment_time,
         i.paid_at=$2::timestamptz exact_intent_time, p.paid_at<>a.finalized_at distinct_from_final,
         p.paid_at::text paid_at, p.pago_tardio, i.estado_intent_codigo,h.estado_hold_codigo,c.estado_cita_codigo
@@ -351,9 +373,185 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       assert.deepEqual(state[0], { exact_payment_time: true, exact_intent_time: true, distinct_from_final: true,
         paid_at: "2026-10-11 19:43:29.880935+00", pago_tardio: false,
         estado_intent_codigo: "confirmado", estado_hold_codigo: "consumido", estado_cita_codigo: "confirmada" });
-      assert.equal((await recover()).duplicate, true);
+      assert.equal((await recover(client, options)).duplicate, true);
       assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 1);
     };
+    await t.test("callback: cierre operativo con contabilidad v2 y carreras reales", async (ct) => {
+      const pool = new pg.Pool({ host: "127.0.0.1", port: client.connectionParameters.port,
+        user: "postgres", password: "", database: "postgres", ssl: false, max: 3, query_timeout: 10000 });
+      const body = { order: buildProviderOrderReference({ providerCode: "pixelpay", idIntent: INTENT }),
+        uuid: UUID, transaction_id: TX, payment_hash: "fixture-hash",
+        amount: 1, currency: "HNL", status: "PAID" };
+      const callbackProvider = { statusCalls: 0,
+        verifyPaymentHash(hash, order) { return hash === body.payment_hash && order === body.order; },
+        async queryPaymentStatus() { this.statusCalls++; throw new Error("Status inesperado"); },
+      };
+      const callback = (db = pool, currentProvider = callbackProvider) => processPixelPayOrderCallback({
+        db, provider: currentProvider, body, requestId: "synthetic-callback-v2", retryCooldownSeconds: 0,
+      });
+      const rawReceipt = async () => (await client.query(`SELECT firma_valida,resultado_procesamiento,
+        payload_esencial,id_payment,procesado_at::text FROM public.payment_events
+        WHERE evento_tipo='pixelpay.order_callback.received'`)).rows[0];
+      const assertClosed = async () => {
+        const receipt = await rawReceipt();
+        assert.equal(receipt.resultado_procesamiento, PIXELPAY_CALLBACK_CLOSED_RESULT);
+        assert.equal(receipt.firma_valida, false);
+        assert.equal(receipt.payload_esencial.callback_uuid_matches, true);
+        assert.equal(receipt.payload_esencial.callback_transaction_id_matches, true);
+        const payment = (await client.query("SELECT id_payment,paid_at::text FROM public.payments WHERE id_intent=$1", [INTENT])).rows;
+        assert.equal(payment.length, 1);
+        assert.equal(receipt.id_payment, payment[0].id_payment);
+        assert.equal(payment[0].paid_at, "2026-10-11 19:43:29.880935+00");
+        assert.equal((await client.query("SELECT count(*)::int n FROM public.payment_events WHERE evento_tipo='pixelpay.order_callback.status_verified'")).rows[0].n, 0);
+        return receipt;
+      };
+      try {
+        await ct.test("confirmado: callback y duplicado no consultan Status ni cambian evidencia", async () => {
+          await reset({qaTestOrigin:'sandbox_session'});
+          await recover();
+          const first = await callback();
+          assert.equal(first.extension_pending, false);
+          assert.equal(first.duplicate, false);
+          const receipt = await assertClosed();
+          const second = await callback();
+          assert.equal(second.extension_pending, false);
+          assert.equal(second.duplicate, true);
+          assert.deepEqual(await assertClosed(), receipt);
+          assert.equal(callbackProvider.statusCalls, 0);
+          assert.equal(await loadPixelPayQaOrigin(client,INTENT),'sandbox_session');
+          await assertConfirmedOnce();
+        });
+        await ct.test("callback temprano sin Sale queda pendiente y COMMIT financiero posterior lo cierra", async () => {
+          await reset();
+          const sale = (await client.query("DELETE FROM public.payment_events RETURNING provider_event_id,payload_esencial,recibido_at::text")).rows[0];
+          assert.equal((await callback()).extension_pending, true);
+          assert.equal((await rawReceipt()).resultado_procesamiento, "sale_evidence_missing_pending");
+          await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,firma_valida,
+            payload_esencial,id_intent,recibido_at) VALUES ($1,$2,'pixelpay.sale.approved_verified',true,$3,$4,$5)`,
+          [PROVIDER, sale.provider_event_id, sale.payload_esencial, INTENT, sale.recibido_at]);
+          await recover();
+          await assertClosed();
+          assert.equal(callbackProvider.statusCalls, 0);
+        });
+        for (const outcome of ["incomplete", "412"]) {
+          await ct.test(`Status ${outcome} en vuelo no reabre cierre confirmado desde otra conexion`, async () => {
+            await reset();
+            let signalStarted;
+            let settleStatus;
+            const started = new Promise(resolve => { signalStarted = resolve; });
+            const deferred = new Promise(resolve => { settleStatus = resolve; });
+            let calls = 0;
+            const controlledProvider = { ...callbackProvider, async queryPaymentStatus() {
+              calls++; signalStarted(); await deferred;
+              if (outcome === "412") throw Object.assign(new Error("synthetic precondition"), {
+                code: "PIXELPAY_STATUS_PRECONDITION_FAILED", statusCode: 412 });
+              return { ok: true, success: true, statusCode: 200, status: "COMPLETED", incomplete: true };
+            } };
+            const pending = callback(pool, controlledProvider);
+            try {
+              await Promise.race([started, pending.then(() => { throw new Error("callback termino antes de Status"); })]);
+              assert.equal((await rawReceipt()).resultado_procesamiento, "status_consulta_en_curso");
+              assert.equal((await recover()).booking_confirmed, true);
+              await assertClosed();
+            } finally { settleStatus(); }
+            assert.equal((await pending).extension_pending, false);
+            await assertClosed();
+            assert.equal(calls, 1);
+            const checks = (await client.query("SELECT resultado_consulta_codigo,http_status FROM app_private.payment_status_checks WHERE id_intent=$1", [INTENT])).rows;
+            assert.deepEqual(checks, [{ resultado_consulta_codigo: outcome === "412" ? "precondicion_fallida" : "respuesta_invalida",
+              http_status: outcome === "412" ? 412 : 200 }]);
+          });
+        }
+        await ct.test("escritura pendiente posterior a prueba local respeta cierre concurrente", async () => {
+          await reset();
+          let signalWriter;
+          let releaseWriter;
+          const writerReached = new Promise(resolve => { signalWriter = resolve; });
+          const writerGate = new Promise(resolve => { releaseWriter = resolve; });
+          const gatedDb = { connect: () => pool.connect(), async query(sql, params) {
+            if (sql.includes("IS DISTINCT FROM $4::text")) { signalWriter(); await writerGate; }
+            return pool.query(sql, params);
+          } };
+          const controlledProvider = { ...callbackProvider, async queryPaymentStatus() {
+            return { ok: true, success: true, statusCode: 200, status: "COMPLETED", incomplete: true };
+          } };
+          const pending = callback(gatedDb, controlledProvider);
+          try {
+            await Promise.race([writerReached, pending.then(() => { throw new Error("callback termino antes de escritura"); })]);
+            await recover(); await assertClosed();
+          }
+          finally { releaseWriter(); }
+          assert.equal((await pending).extension_pending, false);
+          await assertClosed();
+        });
+        for (const [label, sql, params = []] of [
+          ["firma Sale falsa", "UPDATE public.payment_events SET firma_valida=false WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["sin Sale", "DELETE FROM public.payment_events WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["UUID distinto", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"payment_uuid\":\"OTHER\"}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["transaccion distinta", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"transaction_id\":\"OTHER\"}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["monto distinto", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"amount\":2}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["hash no valido", "UPDATE public.payment_events SET payload_esencial=payload_esencial || '{\"payment_hash_valid\":false}' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["paid_at distinto por microsegundo", "UPDATE public.payment_events SET recibido_at=recibido_at+interval '1 microsecond' WHERE evento_tipo='pixelpay.sale.approved_verified'"],
+          ["FINAL incierto", "UPDATE app_private.pixelpay_sale_attempts SET uncertain=true"],
+          ["FINAL tardio", "UPDATE app_private.pixelpay_sale_attempts SET finalized_at=$1::timestamptz+interval '1 microsecond'", [EXPIRY]],
+          ["hold no consumido", "UPDATE public.citas_holds SET estado_hold_codigo='expirado'"],
+          ["hold vencio antes del evento", "UPDATE public.citas_holds SET expires_at=$1::timestamptz-interval '1 microsecond'", [PAID_AT]],
+          ["cita no confirmada", "UPDATE public.citas SET estado_cita_codigo='expirada'"],
+          ["orden no canonica", "UPDATE public.payment_intents SET orden_compra='OTHER'"],
+          ["moneda correlacionada distinta de HNL", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"currency":"USD"}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET moneda_codigo='USD'; UPDATE public.payments SET moneda_codigo='USD'`],
+          ["monto correlacionado cero", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"amount":0}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET monto_hnl=0; UPDATE public.payments SET monto_hnl=0`],
+          ["UUID correlacionado vacio", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"payment_uuid":" "}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET provider_session_id=' '; UPDATE public.payments SET provider_tx_id=' '`],
+          ["transaccion correlacionada vacia", `UPDATE public.payment_events SET payload_esencial=payload_esencial || '{"transaction_id":" "}' WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET referencia_externa=' '`],
+        ]) {
+          await ct.test(`cierre falla cerrado: ${label}`, async () => {
+            await reset(); await recover();
+            await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,id_intent,
+              resultado_procesamiento) VALUES ($1,'synthetic-receipt','pixelpay.order_callback.received',$2,'status_incierto_pendiente')`, [PROVIDER, INTENT]);
+            await client.query("BEGIN");
+            try {
+              await client.query(sql, params);
+              assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), false);
+              assert.equal((await rawReceipt()).resultado_procesamiento, "status_incierto_pendiente");
+            } finally { await client.query("ROLLBACK"); }
+          });
+        }
+        await ct.test("identificadores opacos iguales con roles correlacionados permiten cierre", async () => {
+          await reset(); await recover();
+          await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,id_intent,
+            resultado_procesamiento) VALUES ($1,'synthetic-receipt','pixelpay.order_callback.received',$2,'status_incierto_pendiente')`, [PROVIDER, INTENT]);
+          // AM: Cada identificador conserva su correlacion; el contrato no exige que sus valores difieran.
+          await client.query(`UPDATE public.payment_events SET payload_esencial=jsonb_set(payload_esencial,'{transaction_id}',payload_esencial->'payment_uuid')
+            WHERE evento_tipo='pixelpay.sale.approved_verified';
+            UPDATE public.payment_intents SET referencia_externa=provider_session_id`);
+          const paymentsBefore = (await client.query("SELECT * FROM public.payments WHERE id_intent=$1", [INTENT])).rows;
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          const receipt = await rawReceipt();
+          assert.equal(receipt.resultado_procesamiento, PIXELPAY_CALLBACK_CLOSED_RESULT);
+          assert.equal(receipt.firma_valida, false);
+          assert.equal(receipt.id_payment, paymentsBefore[0].id_payment);
+          assert.deepEqual((await client.query("SELECT * FROM public.payments WHERE id_intent=$1", [INTENT])).rows, paymentsBefore);
+        });
+        await ct.test("rollback del cierre no modifica recibo ni contabilidad; reintento local idempotente", async () => {
+          await reset(); await recover();
+          await client.query(`INSERT INTO public.payment_events(id_provider,provider_event_id,evento_tipo,id_intent,
+            resultado_procesamiento) VALUES ($1,'synthetic-receipt','pixelpay.order_callback.received',$2,'status_incierto_pendiente')`, [PROVIDER, INTENT]);
+          const before = await rawReceipt();
+          await client.query("BEGIN");
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          await client.query("ROLLBACK");
+          assert.deepEqual(await rawReceipt(), before);
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          const once = await rawReceipt();
+          assert.equal(await closeCompletedPixelPayCallback(client, { idIntent: INTENT }), true);
+          assert.deepEqual(await rawReceipt(), once);
+          await assertConfirmedOnce();
+        });
+      } finally { await pool.end(); }
+    });
     await t.test("aprobacion con hold vigente y duplicado preservan seis decimales", async () => {
       await reset({ intentExpiry: "2099-01-01", holdExpiry: "2099-01-01", holdState: "activo", citaState: "pendiente_pago" });
       assert.equal((await recover()).booking_confirmed, true);
@@ -443,7 +641,18 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       ["firma no verificada", "UPDATE public.payment_events SET firma_valida=FALSE"],
       ["tipo incorrecto", "UPDATE public.payment_events SET evento_tipo='pixelpay.callback'"],
       ["identificador de evento incorrecto", "UPDATE public.payment_events SET provider_event_id='other'"],
+      ["orden no canonica", "UPDATE public.payment_intents SET orden_compra='MF-PIXELPAY-OTHER'"],
+      ["grupo distinto del intent", "UPDATE public.payment_intents SET id_grupo_cita=NULL"],
+      ["grupo de cita distinto del intent", "UPDATE public.citas SET id_grupo_cita=NULL"],
+      ["proveedor distinto", "UPDATE public.payment_providers SET codigo='otro'"],
+      ["error de transporte sin aprobacion", "UPDATE app_private.pixelpay_sale_attempts SET outcome='uncertain',uncertain=TRUE,sdk_response_class=NULL,upstream_http_status=NULL"],
+      ["HTTP 202 incierto", "UPDATE app_private.pixelpay_sale_attempts SET outcome='uncertain',uncertain=TRUE,upstream_http_status=202"],
+      ["sin UUID financiero", "UPDATE public.payment_intents SET provider_session_id=NULL"],
       ["FINAL tardio por un microsegundo", "UPDATE app_private.pixelpay_sale_attempts SET finalized_at=$1::timestamptz+interval '1 microsecond'", [EXPIRY]],
+      ["FINAL posterior al intent aunque el evento sea previo y los holds venzan despues", `WITH changed AS (
+        UPDATE public.payment_intents SET expires_at=$1::timestamptz+interval '1 microsecond' RETURNING id_intent
+      ) UPDATE app_private.pixelpay_sale_attempts a SET finalized_at=$1::timestamptz+interval '2 microseconds'
+        FROM changed WHERE a.id_intent=changed.id_intent`, [PAID_AT]],
       ["evento tardio por un microsegundo", "UPDATE public.payment_events SET recibido_at=$1::timestamptz+interval '1 microsecond'", [EXPIRY]],
       ["intent vencido antes del evento", "UPDATE public.payment_intents SET expires_at=$1::timestamptz-interval '1 microsecond'", [PAID_AT]],
       ...Object.entries({ payment_uuid: "other", transaction_id: "other", payment_attempt_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -460,7 +669,125 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
       await t.test(`rechaza ${name} sin escribir pagos`, async () => {
         await reset();
         await client.query(sql, params);
-        assert.equal((await recover()).manual_reconciliation_required, true);
+        try {
+          assert.equal((await recover()).manual_reconciliation_required, true);
+        } catch (error) {
+          assert.ok(["PUBLIC_PAGOS_INTENT_GROUP_MISMATCH", "PUBLIC_PAGOS_GROUP_NOT_FOUND", "PUBLIC_PAGOS_INTENT_PROVIDER_MISMATCH"].includes(error.code), error.code);
+        }
+        assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
+      });
+    }
+    await t.test("intento duplicado y proveedor ajeno no son evidencia para este intent", async () => {
+      await reset();
+      await client.query("INSERT INTO public.payment_providers(id_provider,codigo) VALUES ($1,'otro')", [OTHER_PROVIDER]);
+      await client.query("UPDATE public.payment_events SET id_provider=$1", [OTHER_PROVIDER]);
+      assert.equal((await recover()).manual_reconciliation_required, true);
+      await client.query("UPDATE public.payment_events SET id_provider=$1", [PROVIDER]);
+      await client.query(`INSERT INTO public.payment_intents(id_intent,id_cita,id_hold,id_grupo_cita,id_provider,monto_hnl,
+        moneda_codigo,expires_at,estado_intent_codigo,provider_session_id,referencia_externa,orden_compra)
+        SELECT $1,id_cita,id_hold,id_grupo_cita,id_provider,monto_hnl,moneda_codigo,expires_at,
+          estado_intent_codigo,provider_session_id,referencia_externa,orden_compra
+        FROM public.payment_intents WHERE id_intent=$2`, [OTHER_INTENT, INTENT]);
+      await client.query("UPDATE public.payment_events SET id_intent=$1", [OTHER_INTENT]);
+      assert.equal((await recover()).manual_reconciliation_required, true);
+      assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
+    });
+    const owner = { usuarioId: "f1111111-1111-4111-8111-111111111111", clienteId: "f2222222-2222-4222-8222-222222222222", personaId: PERSON };
+    const seedOwner = async () => {
+      await reset();
+      await client.query("INSERT INTO public.usuarios(id_usuario,id_persona) VALUES ($1,$2)", [owner.usuarioId, PERSON]);
+      await client.query("INSERT INTO public.clientes(id_cliente,id_persona,id_usuario) VALUES ($1,$2,$3)", [owner.clienteId, PERSON, owner.usuarioId]);
+      await client.query(`UPDATE public.citas_grupos SET id_usuario_titular=$1,id_cliente_titular=$2,origen_codigo='cliente_autenticado'`, [owner.usuarioId, owner.clienteId]);
+      await client.query("UPDATE public.citas SET id_cliente=$1", [owner.clienteId]);
+      await client.query("UPDATE public.payment_intents SET created_by_usuario_id=$1", [owner.usuarioId]);
+    };
+    await t.test("cuenta activa y propietario exacto recuperan sin usar solo el correo", async () => {
+      await seedOwner();
+      await assert.rejects(recover(), error => error.code === "PAYMENT_RECOVERY_FORBIDDEN");
+      assert.equal((await recover(client, { owner })).booking_confirmed, true);
+      assert.equal((await recover(client, { owner })).duplicate, true);
+    });
+    await t.test("recuperacion autenticada concurrente rechaza colision de identidad y reintento local es duplicado", async () => {
+      await seedOwner();
+      const peers = [0, 1].map(() => new pg.Client({ host: "127.0.0.1", port: client.connectionParameters.port,
+        user: "postgres", password: "", database: "postgres", ssl: false, query_timeout: 10000 }));
+      let pending;
+      let lockHeld = false;
+      try {
+        await Promise.all(peers.map(peer => peer.connect()));
+        const pid = (await peers[0].query("SELECT pg_backend_pid() pid")).rows[0].pid;
+        await client.query("BEGIN");
+        lockHeld = true;
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))", [`pixelpay-sale:${INTENT}`]);
+        pending = recover(peers[0], { owner });
+        const deadline = Date.now() + 5000;
+        let waiting = false;
+        do {
+          waiting = (await client.query(`SELECT EXISTS(SELECT 1 FROM pg_locks
+            WHERE pid=$1 AND locktype='advisory' AND NOT granted) waiting`, [pid])).rows[0].waiting;
+          if (!waiting) await new Promise(resolve => setTimeout(resolve, 20));
+        } while (!waiting && Date.now() < deadline);
+        // AM: Primera recuperacion posee identidad y espera finanzas al iniciar la segunda.
+        assert.equal(waiting, true);
+        await assert.rejects(recover(peers[1], { owner }), error => error.code === "PAYMENT_RECOVERY_ACCOUNT_UNAVAILABLE");
+        assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
+        await client.query("COMMIT");
+        lockHeld = false;
+        assert.equal((await pending).booking_confirmed, true);
+        assert.equal((await recover(peers[1], { owner })).duplicate, true);
+        const counts = (await client.query(`SELECT (SELECT count(*)::int FROM public.payments) payments,
+          (SELECT count(*)::int FROM public.payment_events) events,
+          (SELECT count(*)::int FROM public.citas WHERE estado_cita_codigo='confirmada') citas,
+          (SELECT count(*)::int FROM public.citas_holds WHERE estado_hold_codigo='consumido') holds`)).rows[0];
+        assert.deepEqual(counts, { payments: 1, events: 1, citas: 1, holds: 1 });
+      } finally {
+        if (lockHeld) await client.query("ROLLBACK");
+        if (pending) await pending;
+        await Promise.all(peers.map(peer => peer.end()));
+      }
+    });
+    await t.test("eliminacion concurrente bloquea la recuperacion antes del lock financiero", async () => {
+      await seedOwner();
+      const peer = new pg.Client({ host: "127.0.0.1", port: client.connectionParameters.port,
+        user: "postgres", password: "", database: "postgres", ssl: false, query_timeout: 10000 });
+      try {
+        await peer.connect();
+        await peer.query("BEGIN");
+        await peer.query("SELECT pg_advisory_xact_lock(hashtext('masterfade.account_deletion'),hashtext($1::text))", [owner.usuarioId]);
+        await assert.rejects(recover(client, { owner }), error => error.code === "PAYMENT_RECOVERY_ACCOUNT_UNAVAILABLE");
+        assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
+      } finally {
+        await peer.query("ROLLBACK");
+        await peer.end();
+      }
+      assert.equal((await recover(client, { owner })).booking_confirmed, true);
+    });
+    await t.test("evento identico duplicado respeta unicidad durable y una sola captura", async () => {
+      await reset();
+      await assert.rejects(client.query(`INSERT INTO public.payment_events
+        (id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at)
+        SELECT id_provider,provider_event_id,evento_tipo,firma_valida,payload_esencial,id_intent,recibido_at
+        FROM public.payment_events`), error => error.code === "23505");
+      assert.equal((await recover()).booking_confirmed, true);
+      await assertConfirmedOnce();
+    });
+    for (const [name, sql] of [
+      ["cliente inactivo", "UPDATE public.clientes SET estado=FALSE"],
+      ["cliente eliminado", "UPDATE public.clientes SET deleted_at=now()"],
+      ["cliente anonimizado", "UPDATE public.clientes SET anonimizado=TRUE"],
+      ["usuario inactivo", "UPDATE public.usuarios SET estado=FALSE"],
+      ["usuario eliminado", "UPDATE public.usuarios SET deleted_at=now()"],
+      ["usuario bloqueado", "UPDATE public.usuarios SET estado_acceso='bloqueado'"],
+      ["persona eliminada", "UPDATE public.personas SET deleted_at=now()"],
+      ["eliminacion pendiente", `INSERT INTO app_private.solicitudes_eliminacion_cuenta(id_cliente,estado_codigo)
+        SELECT id_cliente,'procesando' FROM public.clientes`],
+      ["eliminacion completada", `INSERT INTO app_private.solicitudes_eliminacion_cuenta(id_usuario,estado_codigo)
+        SELECT id_usuario,'completada' FROM public.usuarios`],
+    ]) {
+      await t.test(`cuenta no disponible: ${name} rechazada antes de escribir`, async () => {
+        await seedOwner();
+        await client.query(sql);
+        await assert.rejects(recover(client, { owner }), error => error.code === "PAYMENT_RECOVERY_ACCOUNT_UNAVAILABLE");
         assert.equal((await client.query("SELECT count(*)::int count FROM public.payments")).rows[0].count, 0);
       });
     }
@@ -484,14 +811,8 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
     await t.test("HTTP con compras suspendidas recupera solo la reserva propia sin proveedor", async (sub) => {
       await reset();
       // AM: Ampliar solo el esquema sintetico local para el contexto de identidad autenticada.
-      await client.query(`ALTER TABLE public.clientes ADD COLUMN anonimizado boolean NOT NULL DEFAULT false;
-        ALTER TABLE public.usuarios ADD COLUMN estado_acceso text NOT NULL DEFAULT 'activo';
-        CREATE TABLE app_private.solicitudes_eliminacion_cuenta
-          (id_cliente uuid,id_usuario uuid,id_persona uuid,estado_codigo text);
-        CREATE TABLE public.membership_purchase_orders (id_order uuid PRIMARY KEY,id_cliente uuid,id_usuario uuid);
+      await client.query(`CREATE TABLE public.membership_purchase_orders (id_order uuid PRIMARY KEY,id_cliente uuid,id_usuario uuid);
         CREATE TABLE public.points_transactions (id_cliente uuid,puntos integer);
-        CREATE FUNCTION public.fn_points_materialize_expired_cycles(uuid) RETURNS integer
-          LANGUAGE sql AS 'SELECT 0';
         CREATE FUNCTION public.fn_points_get_effective_rule(uuid) RETURNS TABLE(puntos_para_premio integer)
           LANGUAGE sql AS 'SELECT 10'`);
       // AM: Puntos fuera de alcance: fixture al tope, sin canje ni ciclos; triggers financieros reales intactos.
@@ -519,7 +840,8 @@ test("PostgreSQL 17: recovery usa recibido_at exacto con contrato financiero vig
         assert.equal((await app.inject(request())).json().data.duplicate, true);
         const read = await app.inject(request("GET"));
         assert.equal(read.json().data.paid_at, "2026-10-11 19:43:29.880935+00");
-        await assertConfirmedOnce();
+        await assert.rejects(recover(), { code: "PAYMENT_RECOVERY_FORBIDDEN" });
+        await assertConfirmedOnce({ owner: { clienteId: PERSON, personaId: PERSON, usuarioId: PERSON } });
         await client.query("BEGIN");
         try {
           await client.query("SELECT pg_advisory_xact_lock(hashtext('masterfade.account_deletion'),hashtext($1::text))", [PERSON]);

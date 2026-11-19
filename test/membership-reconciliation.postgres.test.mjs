@@ -50,7 +50,6 @@ test("PostgreSQL 17 v2: recuperacion real de membresia exige evento canonico cor
   // AM: Solo esquema sintetico local para ejecutar el servicio real y los triggers v2 intactos.
   await client.query(`ALTER TABLE public.clientes ADD COLUMN anonimizado boolean NOT NULL DEFAULT false;
     ALTER TABLE public.usuarios ADD COLUMN estado_acceso text NOT NULL DEFAULT 'activo';
-    ALTER TABLE public.payment_intents ADD COLUMN orden_compra text;
     ALTER TABLE public.payments ADD COLUMN registrado_por_usuario_id uuid;
     CREATE TABLE app_private.solicitudes_eliminacion_cuenta(id_cliente uuid,id_usuario uuid,id_persona uuid,estado_codigo text);
     CREATE TABLE public.membership_plans(id_plan uuid PRIMARY KEY,periodo_membresia_codigo text,beneficios jsonb,nombre_plan text);

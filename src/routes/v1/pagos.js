@@ -6,6 +6,7 @@ import { PaymentProviderFactory } from "../../services/payments/PaymentProviderF
 import { MockPaymentProvider } from "../../services/payments/MockPaymentProvider.js";
 import { buildPixelPayCallbackProbeTelemetry } from "../../services/payments/pixelPayCallbackProbeTelemetry.js";
 import { inspectPixelPayWebhookSignature } from "../../services/payments/pixelPayWebhookSignature.js";
+import { closeCompletedPixelPayCallback, PIXELPAY_CALLBACK_CLOSED_RESULT } from "../../services/payments/pixelPayCallbackReceipt.js";
 
 const CLIENT_ALLOWED_ROLES = ["cliente", "admin", "super_admin"];
 const ACTIVE_INTENT_STATES = ["creado", "link_generado", "pendiente_confirmacion"];
@@ -259,6 +260,31 @@ async function recordCallbackStatusCheck(db, {
   );
 }
 
+async function recordCallbackResultUnlessClosed(db, idProvider, providerEventId, result) {
+  const updated = await db.query(
+    `UPDATE public.payment_events
+        SET procesado_at = now(), resultado_procesamiento = $3::text
+      WHERE id_provider = $1::uuid AND provider_event_id = $2::text
+        AND resultado_procesamiento IS DISTINCT FROM $4::text
+      RETURNING resultado_procesamiento`,
+    [idProvider, providerEventId, result, PIXELPAY_CALLBACK_CLOSED_RESULT]
+  );
+  if (updated.rows.length) return false;
+  // AM: Leer despues de un UPDATE que espero otro commit evita reabrir un cierre concurrente.
+  const current = await db.query(
+    `SELECT resultado_procesamiento FROM public.payment_events
+      WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
+    [idProvider, providerEventId]
+  );
+  return current.rows[0]?.resultado_procesamiento === PIXELPAY_CALLBACK_CLOSED_RESULT;
+}
+
+function closedPixelPayCallbackResult(providerEventId, duplicate) {
+  return { provider: "pixelpay", provider_event_id: providerEventId, status: "paid",
+    processed: false, duplicate, extension_pending: false };
+}
+
+
 export async function processPixelPayOrderCallback({
   db,
   provider,
@@ -448,6 +474,10 @@ export async function processPixelPayOrderCallback({
         extension_pending: true,
       };
     }
+    if (await closeCompletedPixelPayCallback(client, { idIntent: intent.id_intent })) {
+      await client.query("COMMIT");
+      return closedPixelPayCallbackResult(providerEventId, duplicate);
+    }
     const claimed = await client.query(
       `UPDATE public.payment_events
           SET procesado_at = now(),
@@ -479,6 +509,14 @@ export async function processPixelPayOrderCallback({
     );
     await client.query("COMMIT");
     if (!claimed.rows[0]) {
+      const current = await client.query(
+        `SELECT resultado_procesamiento FROM public.payment_events
+          WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
+        [intent.id_provider, providerEventId]
+      );
+      if (current.rows[0]?.resultado_procesamiento === PIXELPAY_CALLBACK_CLOSED_RESULT) {
+        return closedPixelPayCallbackResult(providerEventId, duplicate);
+      }
       return {
         provider: "pixelpay",
         provider_event_id: providerEventId,
@@ -569,11 +607,16 @@ export async function processPixelPayOrderCallback({
       durationMs: Date.now() - startedAt,
       requestId,
     });
+    if (await closeCompletedPixelPayCallback(db, { idIntent: intent.id_intent })) {
+      return closedPixelPayCallbackResult(providerEventId, duplicate);
+    }
     if (financiallyVerified) {
       await db.query(
         `INSERT INTO public.payment_events (
            id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
-         ) VALUES ($1::uuid, $2::text, 'pixelpay.order_callback.status_verified', TRUE, $3::jsonb, $4::uuid)
+         ) SELECT $1::uuid, $2::text, 'pixelpay.order_callback.status_verified', TRUE, $3::jsonb, $4::uuid
+           WHERE NOT EXISTS (SELECT 1 FROM public.payment_events WHERE id_provider = $1::uuid
+             AND provider_event_id = $5::text AND resultado_procesamiento = 'sale_durable_ya_conciliada')
          ON CONFLICT (id_provider, provider_event_id) DO NOTHING`,
         [
           intent.id_provider,
@@ -590,22 +633,13 @@ export async function processPixelPayOrderCallback({
             provider_status: safeText(status.status)?.toUpperCase(),
           },
           intent.id_intent,
+          providerEventId,
         ]
       );
     }
-    await db.query(
-      `UPDATE public.payment_events
-          SET procesado_at = now(),
-              resultado_procesamiento = $3::text
-        WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
-      [
-        intent.id_provider,
-        providerEventId,
-        financiallyVerified
-          ? "status_verificado_pendiente_conciliacion"
-          : "status_incierto_pendiente",
-      ]
-    );
+    const closed = await recordCallbackResultUnlessClosed(db, intent.id_provider, providerEventId,
+      financiallyVerified ? "status_verificado_pendiente_conciliacion" : "status_incierto_pendiente");
+    if (closed) return closedPixelPayCallbackResult(providerEventId, duplicate);
     return {
       provider: "pixelpay",
       provider_event_id: providerEventId,
@@ -629,12 +663,11 @@ export async function processPixelPayOrderCallback({
       durationMs: Date.now() - startedAt,
       requestId,
     });
-    await db.query(
-      `UPDATE public.payment_events
-          SET procesado_at = now(), resultado_procesamiento = $3::text
-        WHERE id_provider = $1::uuid AND provider_event_id = $2::text`,
-      [intent.id_provider, providerEventId, callbackResult]
-    );
+    if (await closeCompletedPixelPayCallback(db, { idIntent: intent.id_intent })) {
+      return closedPixelPayCallbackResult(providerEventId, duplicate);
+    }
+    const closed = await recordCallbackResultUnlessClosed(db, intent.id_provider, providerEventId, callbackResult);
+    if (closed) return closedPixelPayCallbackResult(providerEventId, duplicate);
     return {
       provider: "pixelpay",
       provider_event_id: providerEventId,

@@ -110,6 +110,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f db/migrations/pixel/20260924011000_assert_pixelpay_reconciliation_window.sql
       - name: Run tests
         run: npm test
+      - name: Validate zero-total reward confirmation in isolated PostgreSQL
+        env:
+          MASTERFADE_PHASE02_PG_BIN: ${{ env.MASTERFADE_TEST_PG_BIN }}
+        run: node --test test/masterpuntos-group-redeem.postgres.test.mjs
       - name: Run database preflight
         env:
           DATABASE_URL: postgresql://supabase_admin:postgres@localhost:5432/postgres
@@ -120,10 +124,16 @@ jobs:
       - name: Run late payment triggers and durable recovery in isolated PostgreSQL
         env:
           RUN_PAYMENT_LATE_PG_INTEGRATION: "true"
+          RUN_FINANCIAL_CONTRACT_PG: "true"
+          RUN_PIXELPAY_SINGLE_SALE_CLAIM_PG: "true"
+          RUN_PIXELPAY_SONGBIRD_PG: "true"
         run: |
           "$MASTERFADE_TEST_PG_BIN/initdb" --version | grep -E '^initdb \(PostgreSQL\) 17\.'
           "$MASTERFADE_TEST_PG_BIN/postgres" --version | grep -E '^postgres \(PostgreSQL\) 17\.'
           node --test test/payment-late-paid-at.postgres.test.mjs
+          node --test test/pixelpay-single-sale-claim.postgres.test.mjs
+          node --test test/songbird-bridge.postgres.test.mjs
+          node --test test/songbird-operational.postgres.test.mjs
       - name: Run lint
         run: npm run lint
       - name: Check whitespace

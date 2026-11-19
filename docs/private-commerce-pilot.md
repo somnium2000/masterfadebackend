@@ -93,3 +93,6 @@ comprueba sintaxis de los plugins modificados. Todo usa fixtures locales y prove
 Las excepciones CI heredadas estan documentadas en #91; no son regresiones nuevas.
 Resultado de esta rama: 91/91 pruebas de acceso/registro/webhook y 4/4 positivos HTTP
 de reserva/VIP. Lint sin errores (25 advertencias previas), sintaxis y diff-check correctos.
+
+La operación de diagnóstico Sandbox y sus flags temporales están documentados en
+[PixelPay QA delegado](qa-pixelpay-delegated-pilot.md).

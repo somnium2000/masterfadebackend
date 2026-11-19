@@ -10,6 +10,7 @@ import {
   createMembershipOrderPaymentIntent,
   processMembershipPixelPaySale,
   processMembershipSimulatorEvent,
+  readMembershipSimulatedPaymentStatus,
   recoverMembershipPixelPayApproval,
   reconcileMembershipPixelPayStatus,
 } from "../src/services/membershipService.js";
@@ -25,6 +26,7 @@ const ORDER = "71111111-1111-4111-8111-111111111111";
 const PLAN = "81111111-1111-4111-8111-111111111111";
 const OFFER = "91111111-1111-4111-8111-111111111111";
 const BRANCH = "a1111111-1111-4111-8111-111111111111";
+const SUBSCRIPTION = "c1111111-1111-4111-8111-111111111111";
 
 function intentRow(state = "pendiente_confirmacion", owner = CLIENT) {
   return {
@@ -132,6 +134,87 @@ test("HTTP estado VIP rechaza usuario no autenticado antes de consultar BD", asy
   assert.equal(connects, 0);
 });
 
+test("HTTP confirmar-pago bajo TodoPago QA no abre BD ni ejecuta PixelPay", async (t) => {
+  let connects = 0;
+  const app = Fastify();
+  app.decorate("requireRoles", () => async (request) => {
+    request.claims = { roles: ["cliente"], cliente_id: CLIENT, user: { id_usuario: USER } };
+  });
+  app.decorate("db", { connect: async () => { connects += 1; throw new Error("DB must not be reached"); } });
+  app.decorate("config", {
+    nodeEnv: "development",
+    paymentProvider: "todopago",
+    qaVipPurchaseSimulation: { enabled: true },
+    todoPago: { mode: "preprod_simulated", simulatedEnabled: true },
+  });
+  await app.register(clienteRoutes, { prefix: "/v1/cliente" });
+  await app.ready();
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/cliente/planes/confirmar-pago",
+    payload: {
+      id_payment_intent: INTENT,
+      card: { number: "4111111111111111", holder: "Cliente QA", expire: "3012", cvv: "123" },
+      billing: { address: "Blvd Suyapa", country: "HN", state: "HN-FM", city: "Tegucigalpa", phone: "99999999" },
+    },
+  });
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json().error.code, "MEMBERSHIP_PIXELPAY_DISABLED");
+  assert.equal(connects, 0);
+});
+
+test("HTTP estado TodoPago QA solo lee el intent propio", async (t) => {
+  let releases = 0;
+  let queries = 0;
+  const client = {
+    async query(sql) {
+      queries += 1;
+      assert.match(sql, /FROM public\.payment_intents/);
+      assert.doesNotMatch(sql, /UPDATE|INSERT|DELETE/i);
+      return { rows: [{
+        id_intent: INTENT,
+        origen_pago_codigo: "membership",
+        estado_intent_codigo: "confirmado",
+        provider_code: "todopago",
+        id_cliente: CLIENT,
+        estado_orden_codigo: "pagada",
+        id_suscripcion: SUBSCRIPTION,
+      }] };
+    },
+    release() { releases += 1; },
+  };
+  const app = Fastify();
+  app.decorate("requireRoles", () => async (request) => {
+    request.claims = { roles: ["cliente"], cliente_id: CLIENT, user: { id_usuario: USER } };
+  });
+  app.decorate("db", { connect: async () => client });
+  app.decorate("config", {
+    nodeEnv: "development",
+    paymentProvider: "todopago",
+    qaVipPurchaseSimulation: { enabled: true },
+    todoPago: { mode: "preprod_simulated", simulatedEnabled: true },
+  });
+  await app.register(clienteRoutes, { prefix: "/v1/cliente" });
+  await app.ready();
+  t.after(() => app.close());
+  const response = await app.inject({
+    method: "POST",
+    url: `/v1/cliente/planes/pago-intent/${INTENT}/estado`,
+    payload: {},
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json().data, {
+    normalized_status: "PAGADO",
+    estado_intent_codigo: "confirmado",
+    id_suscripcion: SUBSCRIPTION,
+    provider: "todopago",
+    simulated: true,
+  });
+  assert.equal(queries, 1);
+  assert.equal(releases, 1);
+});
+
 test("servicio de adquisicion directa falla cerrado sin consultar ni escribir", async () => {
   const client = { query() { throw new Error("DB must not be reached"); } };
   await assert.rejects(acquireMembershipPlan(client, {
@@ -175,10 +258,22 @@ test("un cliente no puede confirmar la orden de otro cliente", async () => {
 
 test("simulador rechaza PixelPay y entornos no locales antes de consultar BD", async () => {
   const client = { query() { throw new Error("DB must not be reached"); } };
+  const allowed = {
+    paymentProvider: "todopago",
+    mode: "preprod_simulated",
+    simulatedEnabled: true,
+    qaPaymentSimulationEnabled: true,
+    membershipSimulatorEnabled: true,
+    vipPurchaseSimulationEnabled: true,
+    nodeEnv: "development",
+  };
   for (const serverContext of [
-    { paymentProvider: "pixelpay", mode: "preprod_simulated", simulatedEnabled: true, explicitlyEnabled: true, nodeEnv: "test" },
-    { paymentProvider: "todopago", mode: "preprod_simulated", simulatedEnabled: true, explicitlyEnabled: true, nodeEnv: "staging" },
-    { paymentProvider: "todopago", mode: "preprod_simulated", simulatedEnabled: true, explicitlyEnabled: false, nodeEnv: "development" },
+    { ...allowed, paymentProvider: "pixelpay" },
+    { ...allowed, nodeEnv: "test" },
+    { ...allowed, nodeEnv: "staging" },
+    { ...allowed, qaPaymentSimulationEnabled: false },
+    { ...allowed, membershipSimulatorEnabled: false },
+    { ...allowed, vipPurchaseSimulationEnabled: false },
   ]) {
     await assert.rejects(processMembershipSimulatorEvent(client, {
       idPaymentIntent: INTENT,
@@ -186,6 +281,111 @@ test("simulador rechaza PixelPay y entornos no locales antes de consultar BD", a
       serverContext,
     }), { statusCode: 409, code: "MEMBERSHIP_PAYMENT_SIMULATOR_DISABLED" });
   }
+});
+
+const authorizedSimulatorContext = Object.freeze({
+  paymentProvider: "todopago",
+  mode: "preprod_simulated",
+  simulatedEnabled: true,
+  qaPaymentSimulationEnabled: true,
+  membershipSimulatorEnabled: true,
+  vipPurchaseSimulationEnabled: true,
+  nodeEnv: "development",
+});
+
+for (const [amount, normalizedStatus, nextState] of [
+  [1.05, "FAILED", "fallido"],
+  [1.57, "PENDING", "pendiente_confirmacion"],
+]) {
+  test(`simulador VIP ${amount} persiste ${normalizedStatus} sin activar beneficios`, async () => {
+    const calls = [];
+    let eventPayload;
+    const client = {
+      async query(sql, params = []) {
+        const text = String(sql).replace(/\s+/g, " ").trim();
+        calls.push(text);
+        if (text.includes("FROM public.payment_intents pi")) {
+          return { rows: [intentRow("creado")], rowCount: 1 };
+        }
+        if (text.includes("INSERT INTO public.payment_events")) {
+          eventPayload = params[2];
+          return { rows: [], rowCount: 1 };
+        }
+        if (text.includes("UPDATE public.payment_intents")) {
+          assert.deepEqual(params, [INTENT, nextState]);
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`Unexpected simulator query: ${text.slice(0, 120)}`);
+      },
+    };
+    const result = await processMembershipSimulatorEvent(client, {
+      idPaymentIntent: INTENT,
+      clienteId: CLIENT,
+      montoPruebaHnl: amount,
+      serverContext: authorizedSimulatorContext,
+    });
+    assert.equal(result.normalized_status, normalizedStatus);
+    assert.equal(result.estado_intent_codigo, nextState);
+    assert.equal(eventPayload.monto_resuelto_hnl, amount);
+    assert.equal(eventPayload.monto_intent_hnl, 800);
+    assert.equal(calls.some((sql) => /INSERT INTO public\.(payments|subscriptions|subscription_payments)/.test(sql)), false);
+  });
+}
+
+test("estado simulado es una lectura local con validacion de propietario y proveedor", async () => {
+  let calls = 0;
+  const client = {
+    async query(sql, params) {
+      calls += 1;
+      assert.match(sql, /FROM public\.payment_intents/);
+      assert.deepEqual(params, [INTENT]);
+      return { rows: [{
+        id_intent: INTENT,
+        origen_pago_codigo: "membership",
+        estado_intent_codigo: "confirmado",
+        provider_code: "todopago",
+        id_cliente: CLIENT,
+        estado_orden_codigo: "pagada",
+        id_suscripcion: SUBSCRIPTION,
+      }] };
+    },
+  };
+  const result = await readMembershipSimulatedPaymentStatus(client, {
+    idPaymentIntent: INTENT,
+    clienteId: CLIENT,
+  });
+  assert.deepEqual(result, {
+    normalized_status: "PAGADO",
+    estado_intent_codigo: "confirmado",
+    id_suscripcion: SUBSCRIPTION,
+    provider: "todopago",
+    simulated: true,
+  });
+  assert.equal(calls, 1);
+});
+
+test("estado simulado bloquea intents de otra cuenta sin mutaciones", async () => {
+  const client = {
+    async query(sql) {
+      assert.doesNotMatch(sql, /UPDATE|INSERT|DELETE/i);
+      return { rows: [{
+        id_intent: INTENT,
+        origen_pago_codigo: "membership",
+        estado_intent_codigo: "creado",
+        provider_code: "todopago",
+        id_cliente: OTHER_CLIENT,
+        estado_orden_codigo: "pendiente_pago",
+        id_suscripcion: null,
+      }] };
+    },
+  };
+  await assert.rejects(
+    readMembershipSimulatedPaymentStatus(client, {
+      idPaymentIntent: INTENT,
+      clienteId: CLIENT,
+    }),
+    { statusCode: 403, code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN" }
+  );
 });
 
 test("PixelPay reutiliza el mismo intent de la orden sin invocar createIntent", async () => {

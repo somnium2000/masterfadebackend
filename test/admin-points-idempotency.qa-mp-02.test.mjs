@@ -62,6 +62,16 @@ test('misma clave con payload diferente produce conflicto sin segundo movimiento
   assert.equal(f.movements.length, 1);
 });
 
+for (const accion of ['sumar', 'restar']) {
+  test(`servicio ${accion} rechaza cantidades invalidas sin iniciar transaccion`, async () => {
+    for (const puntos of [-1, 0, 1.5, 2147483648, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, '2', true, null, [], {}]) {
+      const f = fixture();
+      await assert.rejects(addManualPointsAdjustment(f.app, input({ accion, puntos })), { statusCode: 400, code: 'POINTS_ADJUSTMENT_INVALID' });
+      assert.equal(f.calls.length, 0); assert.equal(f.movements.length, 0);
+    }
+  });
+}
+
 test('la ruta exige y propaga x-idempotency-key', async (t) => {
   const f = fixture(); const app = Fastify({ logger: false }); app.decorate('db', f.app.db);
   app.decorate('requireRoles', () => async (request) => { request.claims = actorClaims; });

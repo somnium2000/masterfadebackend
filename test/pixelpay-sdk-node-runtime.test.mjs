@@ -126,12 +126,12 @@ axios.defaults.adapter = async (config) => {
   return { ...response, statusText: String(response.status), headers: response.headers || { "content-type": "application/json" }, config };
 };
 
-async function execute(provider = makeProvider(), saleInput = input()) {
+async function execute(provider = makeProvider(), saleInput = input(), telemetry = {}) {
   const events = [];
   const logger = { info: (event) => events.push(event), warn: (event) => events.push(event) };
   let result;
   let error;
-  try { result = await provider.sale(saleInput, { paymentAttemptId: randomUUID(), idIntent: randomUUID(), requestId: "local-node", logger }); }
+  try { result = await provider.sale(saleInput, { paymentAttemptId: randomUUID(), idIntent: randomUUID(), requestId: "local-node", logger, ...telemetry }); }
   catch (caught) { error = caught; }
   const execution = error?.runtimeDiagnostics || provider.lastTransaction?.getSaleExecutionDiagnostics?.();
   const serialized = JSON.stringify({ events, diagnostics: result?.diagnostics, runtime: error?.runtimeDiagnostics });
@@ -157,6 +157,64 @@ after(() => {
   axios.defaults.adapter = originalAdapter;
   for (const restore of restorations.reverse()) restore();
   syncBuiltinESMExports();
+});
+
+test('Songbird transient sink is awaited once, never attached to public errors, and cannot trigger a retry',async()=>{
+  for (const fail of [false,true]) {
+    mockTransport(202,{success:true,data:{transaction_type:'songbird',payload:DATA_SENTINEL}});
+    let delivered=0;
+    const run=await execute(makeProvider(),input(),{qa3dsDiagnostic:true,onSongbirdRequired:async payload=>{
+      delivered++;assert.equal(payload,DATA_SENTINEL);
+      if(fail)throw new Error(DATA_SENTINEL);
+    }});
+    assert.equal(delivered,1);assert.equal(run.saleCalls,1);assert.equal(run.error.uncertain,true);
+    assert.equal(run.error.statusCode,202);assert.equal(run.error.safeMessageCode,'SDK_BROWSER_ACTION_REQUIRED');
+    assert.equal(JSON.stringify(run.error).includes(DATA_SENTINEL),false);
+    assert.equal(run.execution.qa3dsObservation.stopped_before_continuation,true);
+  }
+  mockTransport(202,{success:true,data:{transaction_type:'router',payload:DATA_SENTINEL}});
+  let delivered=0;
+  await execute(makeProvider(),input(),{qa3dsDiagnostic:true,onSongbirdRequired:()=>{delivered++;}});
+  assert.equal(delivered,0);
+});
+
+for (const type of ['songbird','payload','router','untrusted-unknown']) {
+  test('QA observation contains native encrypted202 without continuation: '+type,async()=>{
+    mockTransport(202,{success:true,data:{transaction_type:type,payload:DATA_SENTINEL}});
+    const run=await execute(makeProvider(),input(),{qa3dsDiagnostic:true});
+    const observation=run.error.runtimeDiagnostics.qa3dsObservation;
+    assert.equal(run.error.uncertain,true); assert.equal(run.error.statusCode,202); assert.equal(run.saleCalls,1);
+    assert.equal(observation.public_key_request_attempted,true); assert.equal(observation.public_key_response_received,true);
+    assert.equal(observation.public_key_http_status,200); assert.equal(observation.public_key_obtained,true);
+    assert.equal(observation.encryption_completed,true); assert.equal(observation.upstream_http_status,202);
+    assert.equal(observation.response_class,'PayloadResponse');
+    assert.equal(observation.transaction_type,type==='untrusted-unknown'?'other':type);
+    assert.equal(observation.opaque_payload_present,true); assert.equal(observation.continuation_required,type==='untrusted-unknown'?null:true);
+    assert.equal(observation.stopped_before_continuation,true); assert.equal(observation.browser_authentication_data_exposed,false);
+    assert.equal(observation.continuation_accredited,false);
+    assert.deepEqual(calls.map(c=>c.route),['public_key','sale']);
+    assert.deepEqual(run.events.at(-1).qa3dsObservation,observation);
+    assert.equal(JSON.stringify(observation).includes(DATA_SENTINEL),false);
+  });
+}
+test('QA observation is absent unless trusted server context explicitly enables it',async()=>{
+  mockTransport(200,{success:true,data:approved()});
+  const ordinary=await execute();
+  assert.equal(ordinary.result.qa3dsObservation,undefined);
+  assert.equal(ordinary.events.some(event=>'qa3dsObservation' in event),false);
+  mockTransport(200,{success:true,data:approved()});
+  const diagnostic=await execute(makeProvider(),input(),{qa3dsDiagnostic:true});
+  assert.equal(diagnostic.result.approved,true); assert.equal(diagnostic.result.qa3dsObservation.encryption_completed,true);
+  assert.equal(diagnostic.result.qa3dsObservation.stopped_before_continuation,false);
+});
+test('QA observation separates public-key success from encryption failure and never dispatches Sale',async()=>{
+  mockTransport(200,{success:true,data:approved()});
+  transport=async()=>({status:200,data:{success:true,data:{public_key:'synthetic-invalid-public-key'}}});
+  const run=await execute(makeProvider(),input(),{qa3dsDiagnostic:true});
+  assert.equal(run.saleCalls,0); assert.equal(run.error.uncertain,true);
+  const observation=run.error.runtimeDiagnostics.qa3dsObservation;
+  assert.equal(observation.public_key_response_received,true); assert.equal(observation.public_key_obtained,true);
+  assert.equal(observation.encryption_completed,false); assert.equal(observation.upstream_http_status,null);
 });
 
 test("guardas impiden HTTP HTTPS DNS TCP TLS y fetch externos", () => {
