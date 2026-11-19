@@ -5,7 +5,11 @@ import { desktopContext } from './fixtures/delegatedPixelPayProvider.mjs';
 import { createQaDelegatedAttempts, resolveQaDelegatedConfig } from '../src/experimental/pixelpayDelegated/qaAttempts.js';
 const workerUrl = new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url);
 function attempt(t, order = 'A', scenario, extra = {}) {
-  const value = new DelegatedAttempt({ workerUrl, context: { ...desktopContext(order, scenario), ...extra } });
+  const context = { ...desktopContext(order, scenario), ...extra };
+  if (context.application) Object.assign(context.config, {
+    env: 'sandbox', endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev',
+  });
+  const value = new DelegatedAttempt({ workerUrl, context });
   t.after(() => value.close());
   return value;
 }
@@ -130,23 +134,100 @@ test('200 without authentication is never reported as a proven 3DS handoff', asy
   await assert.rejects(value.call('lookup', lookup));
 });
 
-test('QA retry requires an actual continue call when lookup requests challenge; PAID corroborates an approved Sale only', async t => {
+test('QA native Direct API retries only after trusted lookup; PAID corroborates an approved Sale only', async t => {
   for (const [scenario, approved] of [['nested-status', true], ['missing-status-currency', false]]) {
     const value = attempt(t, 'A', scenario, { application: true });
-    await prepare(value);
+    const handoff = await value.call('start');
+    assert.equal(handoff.continuation_mode, 'direct_api');
+    assert.equal(handoff.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect?n=%2B%2F');
+    assert.equal(handoff.continuation.payload, 'opaque-setup-A');
+    assert.deepEqual(handoff.continuation_diagnostic.sdk_to_handoff_equal, {
+      collection_url: true, payload: true, transaction_type: true,
+    });
+    assert.deepEqual(handoff.continuation_diagnostic.raw_to_sdk_equal, {
+      collection_url: true, payload: true, transaction_type: true,
+    });
+    assert.equal(handoff.continuation_diagnostic.sale_origin, 'https://pixelpay.dev');
+    assert.equal(handoff.continuation_diagnostic.sale_environment, 'sandbox');
+    assert.equal(handoff.continuation_diagnostic.upstream_cf_ray, '0123456789abcdef-TPA');
+    assert.doesNotMatch(JSON.stringify(handoff.continuation_diagnostic), /opaque-setup-A|n=%2B|synthetic-secret/);
     await assert.rejects(value.call('retry'));
-    await value.call('continue', { payload: 'opaque' });
-    const result = await value.call('retry');
+    const response = await value.call('lookup', lookup);
+    assert.deepEqual(response.data, {
+      identifier: 'auth-A', continue_url: 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F',
+      continue_payload: 'opaque.+/=%ñ', transaction_id: 'tx-A', window_size: '03',
+    });
+    assert.deepEqual(await value.call('lookup', lookup), response);
+    await assert.rejects(value.call('lookup', { ...lookup, reference: 'different-attempt' }));
+    await assert.rejects(value.call('continue', { payload: 'client-assertion' }));
+    await assert.rejects(value.call('retry', { completed: true }));
+    await assert.rejects(value.call('retry', { identifier: 'auth-A' }));
+    const [result, repeated] = await Promise.all([value.call('retry'), value.call('retry')]);
+    assert.deepEqual(repeated, result);
     assert.equal(result.final.approved, approved);
     assert.deepEqual(result.sdkResponse.data, {});
-    assert.equal((await value.call('inspect')).retries, 1);
+    const stats = await value.call('inspect');
+    assert.equal(stats.initialSales, 1);
+    assert.equal(stats.retries, 1);
+    assert.equal(stats.lookups, 1);
+    assert.equal(stats.continues, 0);
+    assert.equal(stats.directLookupCvvMatches, true);
+    assert.equal(stats.externalSockets, 0);
     value.close();
   }
 });
 
-test('QA collection_url remains uncertain with provider candidate and no second Sale', async t => {
-  const value = attempt(t, 'A', 'collection-url', { application: true });
-  assert.deepEqual(await value.call('start'), { state: 'unsupported', observedPaymentUuid: 'uuid-A' });
+for (const [suffix, reason, type] of [
+  ['absent', 'ABSENT', 'absent'], ['top-level', 'ABSENT', 'absent'], ['null', 'NULL', 'null'],
+  ['empty', 'EMPTY', 'empty_string'], ['object', 'INVALID', 'object'],
+  ['untrusted', 'INVALID', 'string'], ['invalid-path', 'INVALID', 'string'],
+]) test(`QA collection_url ${suffix} leaves the submitted Sale pending without a handoff or another Sale`, async t => {
+  const value = attempt(t, 'A', `collection-${suffix}`, { application: true });
+  const result = await value.call('start');
+  assert.equal(result.state, 'unsupported');
+  assert.equal(result.observedPaymentUuid, 'uuid-A');
+  assert.equal(result.continuation, undefined);
+  assert.equal(result.continuation_diagnostic.code, `PIXELPAY_3DS_COLLECTION_URL_${reason}`);
+  assert.equal(result.continuation_diagnostic.raw_data.collection_url.type, type);
+  assert.equal(result.continuation_diagnostic.raw_top_level_collection_url.present, suffix === 'top-level');
+  assert.equal(result.continuation_diagnostic.sdk_data.collection_url.type, type);
   await assert.rejects(value.call('retry'));
   assert.equal((await value.call('inspect')).initialSales, 1);
+});
+
+for (const scenario of ['invalid-step-up', 'invalid-lookup-identifier', 'lookup-not-successful']) {
+  test(`QA Direct API ${scenario} cannot dispatch the native retry`, async t => {
+    const value = attempt(t, 'A', scenario, { application: true });
+    assert.equal((await value.call('start')).continuation_mode, 'direct_api');
+    const response = await value.call('lookup', lookup);
+    assert.equal(response.success, false);
+    assert.deepEqual(response.data, {});
+    await assert.rejects(value.call('retry'));
+    assert.equal((await value.call('inspect')).retries, 0);
+  });
+}
+
+test('QA Direct API frictionless lookup can retry without requesting an ACS challenge', async t => {
+  const value = attempt(t, 'A', 'frictionless', { application: true });
+  assert.equal((await value.call('start')).continuation_mode, 'direct_api');
+  const response = await value.call('lookup', lookup);
+  assert.equal(response.action, null);
+  assert.equal(response.success, true);
+  const result = await value.call('retry');
+  assert.equal(result.final.approved, true);
+  assert.equal((await value.call('inspect')).retries, 1);
+});
+
+test('QA Direct API accepts a 200 challenge lookup and cannot retry after worker close', async t => {
+  const value = attempt(t, 'A', 'challenge-http-200', { application: true });
+  const start = await value.call('start');
+  assert.equal(start.continuation_mode, 'direct_api');
+  assert.equal(start.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/Collect?n=%2B%2F');
+  const response = await value.call('lookup', lookup);
+  assert.equal(response.status, 200);
+  assert.equal(response.success, true);
+  assert.equal(response.action, 'continue');
+  assert.equal((await value.call('inspect')).retries, 0);
+  value.close();
+  await assert.rejects(value.call('retry'), /CONTEXT_LOST/);
 });

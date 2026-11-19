@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { PixelPaySdkProvider } from '../../services/payments/PixelPaySdkProvider.js';
 import { createPixelPaySaleSignature } from '../../services/payments/PixelPayDirectProvider.js';
-import { createPixelPayNodeSaleTransaction, PixelPayContinuationRequiredError } from '../../services/payments/pixelPaySaleRuntime.js';
+import { comparePixelPayContinuationFields, createPixelPayNodeSaleTransaction, PixelPayContinuationRequiredError } from '../../services/payments/pixelPaySaleRuntime.js';
 const require = createRequire(import.meta.url);
 const sdk = require('@pixelpay/sdk-core');
 // AM: Explicit internal SDK extensions, not documented public transport APIs.
@@ -17,6 +17,32 @@ const RESPONSE_FIELDS = ['identifier', 'continue_url', 'continue_payload', 'wind
 const fail = () => { throw new Error('PROTOTYPE_REQUEST_REJECTED'); };
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const opaque = (value, max = 32768) => typeof value === 'string' && value.length > 0 && value.length <= max;
+const CAS_COLLECTION = new Set([
+  'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect',
+  'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/Collect',
+]);
+const CAS_STEP_UP = new Set(['https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp']);
+
+function allowedCasUrl(value, targets) {
+  return opaque(value, 2048) && !/[\s\\#]/.test(value) && targets.has(value.split('?', 1)[0]);
+}
+
+function collectionError(data) {
+  if (data == null || !Object.hasOwn(data, 'collection_url')) return 'PIXELPAY_3DS_COLLECTION_URL_ABSENT';
+  if (data.collection_url === null) return 'PIXELPAY_3DS_COLLECTION_URL_NULL';
+  if (data.collection_url === '') return 'PIXELPAY_3DS_COLLECTION_URL_EMPTY';
+  if (!allowedCasUrl(data.collection_url, CAS_COLLECTION)) return 'PIXELPAY_3DS_COLLECTION_URL_INVALID';
+  return null;
+}
+
+function directLookupAccepted(response) {
+  const data = response.data;
+  if (response.success !== true || !opaque(data?.identifier, 160)) return false;
+  if (response.action === 'continue') {
+    return [200, 202].includes(response.status) && allowedCasUrl(data.continue_url, CAS_STEP_UP) && opaque(data.continue_payload);
+  }
+  return response.status === 200 && response.action === null;
+}
 
 function wire(response) {
   return { status: response.status, success: response.success, action: response.action,
@@ -32,8 +58,12 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
   const settings = provider.createTransaction(signature).settings;
   const request = provider.buildSaleRequest(input);
   if (explicitAuthentication) request.withAuthenticationRequest();
-  let captured, state = 'new', identifier, finalResponse, evidence, lookupRequiresChallenge;
-  const initial = createPixelPayNodeSaleTransaction(sdk, settings, { onContinuation: response => { captured = response; } });
+  let captured, captureDiagnostic, state = 'new', identifier, finalResponse, evidence;
+  let continuationMode, directLookupVerified = false;
+  const initial = createPixelPayNodeSaleTransaction(sdk, settings, { onContinuation: (response, diagnostic) => {
+    captured = response;
+    captureDiagnostic = diagnostic;
+  } });
   const service = new CardinalAuthentication(settings);
   const memo = new Map();
 
@@ -101,7 +131,12 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
     if (operation === 'lookup' && (!opaque(data.reference, 1024) || EMV.some(key => data[key] !== undefined && !opaque(data[key], 2048)))) fail();
     if (operation === 'continue' && (!identifier || !opaque(data.payload))) fail();
     if (operation === 'retry' && !identifier) fail();
-    if (application && operation === 'retry' && lookupRequiresChallenge && state !== 'continued') fail();
+    if (application && operation !== 'start' && continuationMode !== 'direct_api') fail();
+    if (continuationMode === 'direct_api') {
+      if (operation === 'continue') fail();
+      // AM: Direct API does not use authenticationContinue. Only the worker's lookup can admit a native retry.
+      if (operation === 'retry' && (state !== 'lookup' || !directLookupVerified)) fail();
+    }
     const promise = (async () => {
       try {
         if (operation === 'start') {
@@ -118,31 +153,39 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
             state = 'completed_without_3ds';
             return { state, evidence, threeDsGuaranteed: false };
           }
-          if (application && (captured.data?.transaction_type !== 'songbird'
-            || captured.data.collection_url || !opaque(captured.data.payload))) {
-            return { state: 'unsupported', observedPaymentUuid: captured.data?.payment_uuid ?? null };
+          if (application) {
+            const code = captured.data?.transaction_type !== 'songbird' || !opaque(captured.data?.payload)
+              ? 'PIXELPAY_3DS_CONTINUATION_INVALID' : collectionError(captured.data);
+            if (code) {
+              state = 'unsupported';
+              return { state, observedPaymentUuid: captured.data?.payment_uuid ?? null,
+                continuation_diagnostic: { ...captureDiagnostic, code, sdk_to_handoff_equal: null } };
+            }
+            continuationMode = 'direct_api';
           }
+          const continuation = { status: captured.status, transaction_type: captured.data.transaction_type,
+            payload: captured.data.payload, collection_url: application ? captured.data.collection_url : captured.data.collection_url ?? null };
           state = 'challenge';
           return { state, attemptId, order: { id: input.orderId, amount: input.amount, currency: input.currency },
-            sdk: { endpoint: settings.endpoint, environment: settings.environment },
-            continuation: { status: captured.status, transaction_type: captured.data.transaction_type,
-              payload: captured.data.payload, collection_url: captured.data.collection_url ?? null },
+            sdk: { endpoint: settings.endpoint, environment: settings.environment }, continuation,
             nodeAuthenticationRequested: request.authentication_request === true, threeDsGuaranteed: false,
-            ...(application ? { observedPaymentUuid: captured.data.payment_uuid ?? null } : {}) };
+            ...(application ? { continuation_mode: continuationMode, observedPaymentUuid: captured.data.payment_uuid ?? null,
+              continuation_diagnostic: { ...captureDiagnostic, code: 'PIXELPAY_3DS_COLLECTION_READY',
+                sdk_to_handoff_equal: comparePixelPayContinuationFields(captured.data, continuation) } } : {}) };
         }
         if (operation === 'lookup') {
           const lookup = new LookupTransaction();
           lookup.fromPaymentTransaction(request);
           // AM: Match the native manager: CVV is added only on its collection_url path.
-          if (captured?.data?.collection_url) lookup.card_cvv = request.card_cvv;
+          if (continuationMode === 'direct_api' || (!application && captured?.data?.collection_url)) lookup.card_cvv = request.card_cvv;
           for (const key of ['reference', ...EMV]) if (data[key] !== undefined) lookup[key] = data[key];
           const response = await service.authenticationLookup(lookup);
-          identifier = application && (response.success !== true || !opaque(response.data?.identifier, 160))
-            ? null : response.data?.identifier;
-          lookupRequiresChallenge = response.action === 'continue';
+          directLookupVerified = continuationMode === 'direct_api' && directLookupAccepted(response);
+          identifier = application && !directLookupVerified ? null : response.data?.identifier;
           request.authentication_identifier = identifier;
           state = response.status >= 500 ? 'uncertain' : 'lookup';
           if (!application) return wire(response);
+          if (!directLookupVerified) return { status: response.status, success: false, action: null, data: {} };
           const result = wire(response);
           result.data = Object.fromEntries(Object.entries(result.data)
             .filter(([key]) => ['identifier', 'continue_url', 'continue_payload', 'window_size', 'transaction_id'].includes(key)));
