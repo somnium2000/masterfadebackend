@@ -41,7 +41,20 @@ export function installSyntheticProvider(context) {
       && config.headers['x-auth-hash'] === context.config.authHash;
     const body = config.data ? JSON.parse(config.data) : {};
     const reply = (status, data, action = null, success = true) => ({ config, status, headers: {}, data: { success, action, data } });
+    const approvedData = {
+      response_approved: context.scenario !== 'declined', response_incomplete: false, response_code: '00',
+      transaction_amount: context.input.amount,
+      transaction_approved_amount: context.scenario === 'bad-amount' ? context.input.amount + 1 : context.input.amount,
+      transaction_id: `tx-${context.input.orderId}`, payment_uuid: `uuid-${context.input.orderId}`,
+      payment_hash: createHash('md5').update([context.input.orderId, context.config.keyId, context.config.secretKey].join('|')).digest('hex'),
+    };
     if (config.url.endsWith('public_key')) return reply(200, { public_key: Buffer.from(merchant.publicKey).toString('base64') });
+    if (config.url.endsWith('transaction/status')) {
+      if (body.payment_uuid !== approvedData.payment_uuid) throw new Error('STATUS_UUID_MISMATCH');
+      return reply(200, { status: 'PAID', payment_uuid: approvedData.payment_uuid, order_id: context.input.orderId,
+        ...(context.scenario === 'missing-status-currency' ? {} : { order_currency: context.input.currency }),
+        last_response: { data: approvedData } });
+    }
     if (config.url.endsWith('authentication/continue')) {
       stats.continues++;
       if (body.identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
@@ -61,19 +74,17 @@ export function installSyntheticProvider(context) {
     if (!body.authentication_identifier) {
       stats.initialSales++;
       if (context.scenario !== 'no-3ds') return reply(202, { transaction_type: 'songbird', payload: `opaque-setup-${body.order_id}`,
-        payment_uuid: context.scenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}` });
+        payment_uuid: context.scenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}`,
+        ...(context.scenario === 'collection-url' ? { collection_url: 'https://collection.offline.invalid' } : {}) });
     } else {
       stats.retries++;
       if (body.authentication_identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
       await new Promise(resolve => setTimeout(resolve, 30));
       if (context.scenario === 'retry-timeout') throw new Error('SYNTHETIC_TIMEOUT');
     }
-    const paymentHash = createHash('md5').update([body.order_id, context.config.keyId, context.config.secretKey].join('|')).digest('hex');
-    return reply(200, { response_approved: context.scenario !== 'declined', response_incomplete: false,
-      response_code: '00', transaction_amount: context.input.amount,
-      transaction_approved_amount: context.scenario === 'bad-amount' ? context.input.amount + 1 : context.input.amount,
-      transaction_id: `tx-${body.order_id}`, payment_uuid: `uuid-${body.order_id}`, payment_hash: paymentHash,
-      order_id: body.order_id, transaction_currency: context.scenario === 'bad-currency' ? 'USD' : body.order_currency });
+    return reply(200, ['nested-status', 'missing-status-currency'].includes(context.scenario) ? approvedData
+      : { ...approvedData, order_id: body.order_id,
+        transaction_currency: context.scenario === 'bad-currency' ? 'USD' : body.order_currency });
   };
   return { stats, restore() { net.Socket.prototype.connect = nativeConnect; globalThis.fetch = nativeFetch; axios.defaults.adapter = adapter; } };
 }

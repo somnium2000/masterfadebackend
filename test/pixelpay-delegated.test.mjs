@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DelegatedAttempt } from '../src/experimental/pixelpayDelegated/attempt.js';
 import { desktopContext } from './fixtures/delegatedPixelPayProvider.mjs';
+import { createQaDelegatedAttempts, resolveQaDelegatedConfig } from '../src/experimental/pixelpayDelegated/qaAttempts.js';
 const workerUrl = new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url);
 function attempt(t, order = 'A', scenario, extra = {}) {
   const value = new DelegatedAttempt({ workerUrl, context: { ...desktopContext(order, scenario), ...extra } });
@@ -9,6 +10,29 @@ function attempt(t, order = 'A', scenario, extra = {}) {
   return value;
 }
 const lookup = { reference: 'opaque-reference', browser_language: 'es-HN', user_agent: 'Fixture' };
+
+test('QA context follows hold/QA expiry instead of prototype timers and stays bound to owner and claim', async () => {
+  let now = 1000, workerOptions;
+  const qa = { enabled: true, intentId: 'A', until: now + 300000 };
+  const registry = createQaDelegatedAttempts({ config: qa, now: () => now, makeAttempt: options => {
+    workerOptions = options;
+    return { call: async () => ({ state: 'challenge' }), close: options.onClose };
+  } });
+  const claim = { idIntent: 'A', idGrupoCita: 'group', paymentAttemptId: 'attempt-A', protectionExpiresAt: new Date(now + 290000) };
+  const { deadline, token } = await registry.start({ claim, owner: 'owner', input: {}, provider: { env: 'sandbox' } });
+  const key = { idIntent: 'A', idGrupoCita: 'group', owner: 'owner', token };
+  assert.equal(workerOptions.lifetimeMs, 290000);
+  assert.equal(workerOptions.timeoutMs, null);
+  now += 180000;
+  assert.ok(registry.get(key));
+  assert.equal(registry.get({ ...key, owner: 'other' }), null);
+  assert.equal(registry.get({ ...key, idGrupoCita: 'other' }), null);
+  now = deadline - 1;
+  assert.ok(registry.get(key));
+  now = deadline;
+  assert.equal(registry.get(key), null);
+  assert.throws(() => resolveQaDelegatedConfig({ QA_PIXELPAY_DELEGATED_ENABLED: 'true', ENTORNO: 'prod' }, qa));
+});
 async function prepare(value) {
   const start = await value.call('start');
   assert.equal(start.continuation.status, 202);
@@ -104,4 +128,25 @@ test('200 without authentication is never reported as a proven 3DS handoff', asy
   assert.equal(start.threeDsGuaranteed, false);
   assert.equal(start.evidence.bookingConfirmed, false);
   await assert.rejects(value.call('lookup', lookup));
+});
+
+test('QA retry requires an actual continue call when lookup requests challenge; PAID corroborates an approved Sale only', async t => {
+  for (const [scenario, approved] of [['nested-status', true], ['missing-status-currency', false]]) {
+    const value = attempt(t, 'A', scenario, { application: true });
+    await prepare(value);
+    await assert.rejects(value.call('retry'));
+    await value.call('continue', { payload: 'opaque' });
+    const result = await value.call('retry');
+    assert.equal(result.final.approved, approved);
+    assert.deepEqual(result.sdkResponse.data, {});
+    assert.equal((await value.call('inspect')).retries, 1);
+    value.close();
+  }
+});
+
+test('QA collection_url remains uncertain with provider candidate and no second Sale', async t => {
+  const value = attempt(t, 'A', 'collection-url', { application: true });
+  assert.deepEqual(await value.call('start'), { state: 'unsupported', observedPaymentUuid: 'uuid-A' });
+  await assert.rejects(value.call('retry'));
+  assert.equal((await value.call('inspect')).initialSales, 1);
 });

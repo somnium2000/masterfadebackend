@@ -10,7 +10,7 @@ function missingCandidateError() {
   });
 }
 
-export async function resolvePixelPayStatusCandidate(db, intent = {}) {
+export async function resolvePixelPayStatusCandidate(db, intent = {}, { delegated = false } = {}) {
   const trustedPaymentUuid = safeText(intent.provider_session_id);
   if (trustedPaymentUuid) {
     return { paymentUuid: trustedPaymentUuid, source: "trusted" };
@@ -24,8 +24,8 @@ export async function resolvePixelPayStatusCandidate(db, intent = {}) {
     `SELECT DISTINCT observed_payment_uuid_untrusted
        FROM app_private.pixelpay_sale_attempts
       WHERE id_intent = $1::uuid
-        AND outcome = 'uncertain'
-        AND finalized_at IS NOT NULL
+        AND ((outcome = 'uncertain' AND finalized_at IS NOT NULL)
+          ${delegated ? "OR (qa_test_origin = '3ds_diagnostic' AND finalized_at IS NULL)" : ""})
         AND observed_payment_uuid_untrusted IS NOT NULL
         AND btrim(observed_payment_uuid_untrusted) <> ''
       LIMIT 2`,

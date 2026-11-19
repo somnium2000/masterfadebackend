@@ -642,6 +642,18 @@ const diagnosticEnv = () => ({ ...QA_BOOKING_IDENTITY, QA_PRIVATE_COMMERCE_SANDB
   QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'true', QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:QA_DIAG_TARGET,
   QA_PIXELPAY_3DS_DIAGNOSTIC_UNTIL:new Date(Date.now()+8*60000).toISOString() });
 
+test('delegated QA checkout grants capability only in window and requires session and CSRF for continuation', async t => {
+  const f = await fixture(t, { env: { ...diagnosticEnv(), QA_PIXELPAY_DELEGATED_ENABLED: 'true' }, roles: ['cliente'] });
+  const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', headers: f.headers() });
+  assert.equal(eligibility.json().data.pixelpaySale, true);
+  const csrfMissing = f.headers();
+  delete csrfMissing['x-csrf-token'];
+  for (const headers of [{}, csrfMissing, f.headers(OTHER)]) {
+    const result = await f.app.inject({ method: 'POST', url: '/v1/pagos/reservas/pixelpay/3ds/delegated', headers, payload: {} });
+    assert.equal(result.statusCode, 403);
+  }
+});
+
 for(const scenario of ['owner','guest','other','revoked','csrf-missing','no-role'])test('multi-intent QA session keeps backend identity/CSRF and no VIP: '+scenario,async t=>{
   const f=await fixture(t,{env:{...diagnosticEnv(),QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED:'false',QA_PIXELPAY_3DS_DIAGNOSTIC_INTENT_ID:'',
     QA_PIXELPAY_SANDBOX_SESSION_ENABLED:'true',QA_PIXELPAY_SANDBOX_SESSION_UNTIL:new Date(Date.now()+3600000).toISOString()},

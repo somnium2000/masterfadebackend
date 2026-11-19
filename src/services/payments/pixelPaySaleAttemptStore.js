@@ -147,3 +147,14 @@ export async function finalizePixelPaySaleAttemptBestEffort(pool, dto, logger) {
     return false;
   }
 }
+
+export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAttemptId, paymentUuid }) {
+  const observed = safeObservedPaymentUuid(paymentUuid);
+  if (!observed) return;
+  await pool.query(
+    `UPDATE app_private.pixelpay_sale_attempts SET observed_payment_uuid_untrusted = $3::varchar(80)
+     WHERE id_intent = $1::uuid AND payment_attempt_id = $2::uuid AND qa_test_origin = '3ds_diagnostic'
+       AND finalized_at IS NULL AND observed_payment_uuid_untrusted IS NULL`,
+    [requireUuid(idIntent), requireUuid(paymentAttemptId), observed],
+  );
+}

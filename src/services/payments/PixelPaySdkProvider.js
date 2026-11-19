@@ -833,14 +833,29 @@ export class PixelPaySdkProvider extends PaymentProvider {
       );
     }
     const beforeShape = capturePixelPayStatusShape(this, shapeProbe, response?.data);
-    const transactionResult = this.readTransactionResult(response);
+    const envelope = objectOrNull(response?.data);
+    const hasNested = Boolean(expected?.currency) && Object.hasOwn(envelope || {}, 'last_response');
+    const nested = objectOrNull(envelope?.last_response?.data);
+    const nestedValid = nested && this.sdk.Entities.TransactionResult.validateResponse(response) === true;
+    // AM: Parse the transaction fields from the recorded response, retaining outer Status separately.
+    const transactionResult = !hasNested ? this.readTransactionResult(response) : {
+      valid: nestedValid === true, parsed: nestedValid === true, result: nestedValid ? nested : null,
+    };
     const result = transactionResult.result;
     emitPixelPayStatusShape(shapeProbe, beforeShape,
       beforeShape ? capturePixelPayStatusShape(this, shapeProbe, result) : null);
-    const resultPaymentUuid = text(result?.payment_uuid) || null;
+    const consistent = (...values) => {
+      const fields = values.map(text).filter(Boolean);
+      return fields.length && fields.every(value => value === fields[0]) ? fields[0] : null;
+    };
+    const resultPaymentUuid = hasNested ? consistent(result?.payment_uuid, envelope?.payment_uuid)
+      : text(result?.payment_uuid) || null;
     const transactionId = text(result?.transaction_id) || null;
-    const resultOrderId = text(result?.order_id) || text(response?.data?.order_id) || null;
-    const resultCurrency = text(result?.transaction_currency)
+    const resultOrderId = hasNested ? consistent(result?.order_id, envelope?.order_id)
+      : text(result?.order_id) || text(response?.data?.order_id) || null;
+    const resultCurrency = hasNested ? consistent(result?.transaction_currency, result?.order_currency,
+      envelope?.transaction_currency, envelope?.order_currency)
+      : text(result?.transaction_currency)
       || text(response?.data?.transaction_currency)
       || text(response?.data?.order_currency)
       || null;
@@ -870,6 +885,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
     const normalizedStatus = rawStatus === "PAID" ? "COMPLETED" : rawStatus;
     const providerContractValid = transactionResult.valid === true
       && transactionResult.parsed === true
+      && (!hasNested || (resultPaymentUuid === normalizedUuid && resultOrderId === expectedOrderId
+        && resultCurrency === expected?.currency && responseSuccess(response) === true))
       && PIXELPAY_STATUS_VALUES.has(normalizedStatus);
     const payload = normalizePixelPayStatusResponse({
       success: responseSuccess(response),
@@ -888,7 +905,8 @@ export class PixelPaySdkProvider extends PaymentProvider {
       uncertain: ["PENDING", "UNKNOWN", "TIMEOUT"].includes(status),
       approved: status === "COMPLETED"
         && result?.response_approved === true
-        && result?.response_incomplete !== true,
+        && (hasNested ? result?.response_incomplete === false && amountMatches && paymentHashValid && Boolean(transactionId)
+          : result?.response_incomplete !== true),
       rejected: status === "DECLINED",
       voided: status === "VOIDED",
       incomplete: result?.response_incomplete === true,

@@ -193,6 +193,25 @@ function makeProvider(fake, overrides = {}) {
   });
 }
 
+test('nested Status keeps outer identity separate from historical Sale and rejects conflicts', async () => {
+  const expected = { orderId: ORDER_ID, amount: 1, currency: 'HNL' };
+  const envelope = { status: 'PAID', order_id: ORDER_ID, order_currency: 'HNL', payment_uuid: PAYMENT_UUID,
+    last_response: { data: approvedData({ payment_uuid: PAYMENT_UUID }) } };
+  const get = data => makeProvider(makeFakeSdk({ statusResponse: sdkResponse(200, { data }) }))
+    .queryPaymentStatus(PAYMENT_UUID, expected);
+  const status = await get(envelope);
+  assert.equal(status.approved, true);
+  assert.equal(status.resultOrderId, ORDER_ID);
+  assert.equal(status.resultCurrency, 'HNL');
+  assert.equal(status.resultPaymentUuid, PAYMENT_UUID);
+  for (const patch of [{ order_id: 'other' }, { payment_uuid: 'other' }, { transaction_currency: 'USD' },
+    { transaction_approved_amount: 2 }, { response_incomplete: undefined }]) {
+    assert.equal((await get({ ...envelope, last_response: { data: { ...envelope.last_response.data, ...patch } } })).approved, false);
+  }
+  assert.equal((await get({ ...envelope, order_currency: undefined })).approved, false);
+  assert.equal((await get({ ...envelope, last_response: { data: null } })).approved, false);
+});
+
 function makeLiveProvider(fake, overrides = {}) {
   return makeProvider(fake, {
     endpoint: "https://merchant.pixelpay.app",
