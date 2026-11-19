@@ -1,4 +1,6 @@
+import { sanitizeQa3dsObservation } from './qaPixelPay3dsDiagnostic.js';
 const SALE_ROUTE = "api/v2/transaction/sale";
+const PUBLIC_KEY_ROUTE = 'api/v2/merchant/public_key';
 const EXECUTION_PHASES = new Set(["request_construction", "sdk_preparation", "sale_transport", "response_processing"]);
 const RUNTIME_CODES = new Set([
   "SDK_REFERENCE_ERROR", "SDK_RUNTIME_ERROR", "SDK_NETWORK_ERROR", "SDK_HTTP_TIMEOUT",
@@ -47,6 +49,43 @@ const safeContentType = value => {
 };
 const safeCfRay = value => typeof value === "string" && /^[a-fA-F0-9]{16,32}-[A-Z]{3}$/.test(value) ? value : null;
 
+function safeHttpsOrigin(value) {
+  if (typeof value !== 'string' || value.length > 2048) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' && !url.username && !url.password && /^[a-z0-9.-]{1,253}$/.test(url.hostname)) {
+      return url.origin;
+    }
+  } catch { /* AM: URL parse exceptions may contain the original value. */ }
+  return null;
+}
+
+const CONTINUATION_FIELDS = ['collection_url', 'payload', 'transaction_type'];
+// AM: Keep field presence distinct from null and empty string at each boundary.
+function describeContinuationField(container, field) {
+  const present = container != null && Object.hasOwn(container, field);
+  const value = present ? container[field] : undefined;
+  const type = !present ? 'absent' : value === null ? 'null' : value === '' ? 'empty_string'
+    : Array.isArray(value) ? 'array' : typeof value;
+  return { present, type, length: typeof value === 'string' ? value.length : null,
+    ...(field === 'collection_url' ? { origin: safeHttpsOrigin(value) } : {}) };
+}
+
+function inspectContinuationData(data) {
+  return {
+    ...Object.fromEntries(CONTINUATION_FIELDS.map(field => [field, describeContinuationField(data, field)])),
+    transaction_type_kind: safeContinuationType(data?.transaction_type),
+  };
+}
+
+export function comparePixelPayContinuationFields(left, right) {
+  return Object.fromEntries(CONTINUATION_FIELDS.map(field => {
+    const leftPresent = left != null && Object.hasOwn(left, field);
+    const rightPresent = right != null && Object.hasOwn(right, field);
+    return [field, leftPresent === rightPresent && (!leftPresent || Object.is(left[field], right[field]))];
+  }));
+}
+
 export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
   const input = source && typeof source === "object" ? source : {};
   const sdkStackFile = SDK_FILES.has(input.sdkStackFile) ? input.sdkStackFile : null;
@@ -68,6 +107,7 @@ export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
     errorName: safeName(input.errorName),
     errorConstructorName: safeName(input.errorConstructorName),
     sdkErrorName: safeName(input.sdkErrorName),
+    ...(input.qa3dsObservation ? { qa3dsObservation: sanitizeQa3dsObservation(input.qa3dsObservation) } : {}),
   };
 }
 
@@ -132,12 +172,17 @@ export function classifyPixelPaySaleRuntimeError(error, execution = {}) {
   });
 }
 
-export function createPixelPayNodeSaleTransaction(sdk, settings) {
+export function createPixelPayNodeSaleTransaction(sdk, settings, { qa3dsDiagnostic = false, onSongbirdPayload, onContinuation } = {}) {
   class NodeSaleTransaction extends sdk.Services.Transaction {
     constructor(configuration) {
       super(configuration);
       this.saleActive = false;
       this.saleResponsePending = false;
+      this.qa3dsObservation = qa3dsDiagnostic === true ? {
+        public_key_request_attempted: false, public_key_response_received: false, public_key_http_status: null,
+        public_key_obtained: false, encryption_completed: false, stopped_before_continuation: false,
+        transaction_type: 'absent', continuation_required: false, opaque_payload_present: false,
+      } : null;
       this.saleExecution = {
         executionPhase: "sdk_preparation", httpResponseReceived: false,
         requestMayHaveBeenSent: false, statusCode: null,
@@ -145,6 +190,10 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
     }
 
     getSaleExecutionDiagnostics() {
+      if (this.qa3dsObservation) {
+        this.qa3dsObservation.public_key_obtained = Boolean(this.settings.public_key);
+        this.qa3dsObservation.encryption_completed = Boolean(this.sdk_public_key);
+      }
       const safe = sanitizePixelPaySaleRuntimeDiagnostics(this.saleExecution);
       return {
         executionPhase: safe.executionPhase, httpResponseReceived: safe.httpResponseReceived,
@@ -152,6 +201,7 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
         sdkTransactionType: safe.sdkTransactionType,
         transportErrorCode: safe.transportErrorCode, wafChallenge: safe.wafChallenge,
         upstreamContentType: safe.upstreamContentType, cfRay: safe.cfRay,
+        ...(this.qa3dsObservation ? { qa3dsObservation: sanitizeQa3dsObservation(this.qa3dsObservation) } : {}),
       };
     }
 
@@ -172,17 +222,35 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
 
     buildRequest(url, transaction) {
       const transport = super.buildRequest(url, transaction);
+      if (this.saleActive && this.qa3dsObservation && url === PUBLIC_KEY_ROUTE) {
+        transport.interceptors.request.use(config => { this.qa3dsObservation.public_key_request_attempted = true; return config; });
+        const received = response => {
+          this.qa3dsObservation.public_key_response_received = true;
+          this.qa3dsObservation.public_key_http_status = safeStatus(response?.status);
+        };
+        transport.interceptors.response.use(response => { received(response); return response; }, error => {
+          if (error?.response) received(error.response);
+          throw error;
+        });
+      }
       if (this.saleActive && url === SALE_ROUTE) {
+        if (this.qa3dsObservation) {
+          // AM: Observe presence only after the SDK completes its native encryption path.
+          this.qa3dsObservation.public_key_obtained = Boolean(this.settings.public_key);
+          this.qa3dsObservation.encryption_completed = Boolean(this.sdk_public_key);
+        }
         // AM: El public_key del SDK no prueba que se envio Sale ni que se recibio su respuesta.
         transport.interceptors.request.use(config => {
           this.saleExecution.executionPhase = "sale_transport";
           this.saleExecution.requestMayHaveBeenSent = true;
+          if (typeof onContinuation === 'function') this.saleExecution.saleOrigin = safeHttpsOrigin(config.baseURL);
           return config;
         });
         const received = response => {
           this.saleExecution.executionPhase = "response_processing";
           this.saleExecution.httpResponseReceived = true;
           this.saleExecution.statusCode = safeStatus(response?.status);
+          if (this.qa3dsObservation) this.qa3dsObservation.upstream_http_status = safeStatus(response?.status);
           // AM: Conservar solo evidencia de cabeceras permitidas antes de que el SDK las descarte.
           const headers = response?.headers;
           const header = name => typeof headers?.get === "function" ? headers.get(name) : headers?.[name];
@@ -207,9 +275,32 @@ export function createPixelPayNodeSaleTransaction(sdk, settings) {
       const saleResponse = this.saleActive && this.saleResponsePending;
       this.saleResponsePending = false;
       const response = super.parseResponse(data, status);
+      if (saleResponse && this.qa3dsObservation) {
+        const type = response?.data?.transaction_type;
+        this.qa3dsObservation.response_class = response?.constructor?.name;
+        this.qa3dsObservation.transaction_type = CONTINUATION_TYPES.has(type) ? type : type == null ? 'absent' : 'other';
+        this.qa3dsObservation.opaque_payload_present = typeof response?.data?.payload === 'string' && response.data.payload.length > 0;
+        this.qa3dsObservation.continuation_required = status === 202 ? (CONTINUATION_TYPES.has(type) ? true : null) : false;
+        this.qa3dsObservation.stopped_before_continuation = status === 202;
+      }
       // AM: Contener el 202 antes de DOM/3DS/router; nunca ejecutar otra Sale ni convertirlo en aprobacion.
       if (saleResponse && status === 202) {
         this.saleExecution.sdkTransactionType = safeContinuationType(response?.data?.transaction_type);
+        // AM: Opt-in application transport captures the native response; default containment remains intact.
+        if (typeof onContinuation === 'function') onContinuation(response, {
+          upstream_http_status: safeStatus(this.saleExecution.statusCode),
+          upstream_cf_ray: this.saleExecution.cfRay ?? null,
+          sale_origin: this.saleExecution.saleOrigin ?? null,
+          sale_environment: ['sandbox', 'staging', 'live'].includes(this.settings.environment) ? this.settings.environment : null,
+          raw_top_level_collection_url: describeContinuationField(data, 'collection_url'),
+          raw_data: inspectContinuationData(data?.data),
+          sdk_data: inspectContinuationData(response?.data),
+          raw_to_sdk_equal: comparePixelPayContinuationFields(data?.data, response?.data),
+        });
+        // AM: Transient server-only handoff sink; never attach opaque data to errors or diagnostics.
+        if (qa3dsDiagnostic && response?.data?.transaction_type === 'songbird' && typeof onSongbirdPayload === 'function') {
+          onSongbirdPayload(response?.data?.payload, { collectionUrl: response?.data?.collection_url ?? null });
+        }
         throw new PixelPayContinuationRequiredError(this.saleExecution.sdkTransactionType);
       }
       return response;

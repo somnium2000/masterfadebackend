@@ -5,6 +5,7 @@ import {
 } from "./pixelPaySaleDiagnostics.js";
 import { safePixelPayUuid } from "./pixelPaySaleTelemetry.js";
 import { PIXELPAY_SALE_OUTCOME } from "./PixelPayDirectProvider.js";
+import { PIXELPAY_QA_ORIGINS } from './pixelPayQaOrigin.js';
 
 export const PIXELPAY_SALE_FINAL_QUERY_TIMEOUT_MS = 1000;
 
@@ -40,15 +41,18 @@ function safeObservedProviderIdentifier(value) {
 
 export async function createPixelPaySaleAttemptRecord(transactionClient, dto) {
   const safe = buildSafePixelPaySdkDiagnostics(dto);
+  const origin = dto.qaTestOrigin;
+  if (origin != null && !PIXELPAY_QA_ORIGINS.has(origin)) throw new TypeError('Origen QA invalido.');
   const result = await transactionClient.query(
     `INSERT INTO app_private.pixelpay_sale_attempts (
        id_intent, payment_attempt_id, request_id,
-       card_expire_format_valid, card_expire_future, billing_address_length
-     ) VALUES ($1::uuid, $2::uuid, $3::varchar(120), $4::boolean, $5::boolean, $6::integer)
+       card_expire_format_valid, card_expire_future, billing_address_length${origin ? ', qa_test_origin' : ''}
+     ) VALUES ($1::uuid, $2::uuid, $3::varchar(120), $4::boolean, $5::boolean, $6::integer${origin ? ', $7::text' : ''})
      RETURNING id_sale_attempt`,
     [
       requireUuid(dto.idIntent), requireUuid(dto.paymentAttemptId), safePixelPayRequestId(dto.requestId),
       safe?.cardExpireFormatValid ?? null, safe?.cardExpireFuture ?? null, safe?.billingAddressLength ?? null,
+      ...(origin ? [origin] : []),
     ]
   );
   if (!result.rows[0]) throw new Error("No se pudo registrar el diagnostico inicial PixelPay.");
@@ -142,4 +146,15 @@ export async function finalizePixelPaySaleAttemptBestEffort(pool, dto, logger) {
     } catch { /* AM: Incluso un fallo del logger debe permitir continuar la reconciliacion. */ }
     return false;
   }
+}
+
+export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAttemptId, paymentUuid }) {
+  const observed = safeObservedPaymentUuid(paymentUuid);
+  if (!observed) return;
+  await pool.query(
+    `UPDATE app_private.pixelpay_sale_attempts SET observed_payment_uuid_untrusted = $3::varchar(80)
+     WHERE id_intent = $1::uuid AND payment_attempt_id = $2::uuid AND qa_test_origin = '3ds_diagnostic'
+       AND finalized_at IS NULL AND observed_payment_uuid_untrusted IS NULL`,
+    [requireUuid(idIntent), requireUuid(paymentAttemptId), observed],
+  );
 }

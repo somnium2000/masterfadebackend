@@ -1,10 +1,14 @@
+import { createHash } from "node:crypto";
 import { AppError } from "../../utils/errors.js";
+import { OFFICIAL_QA_CARD_HASHES } from "./qaPixelPayOfficialCases.js";
 
-const PIXELPAY_SANDBOX_CARD_NUMBERS = new Set(["4111111111111111", "5555555555554444"]);
+// AM: Preserve the existing Live policy independently of the official Sandbox test catalog.
+const PIXELPAY_LIVE_FORBIDDEN_TEST_CARDS = new Set(["4111111111111111", "5555555555554444"]);
 
 export function assertPixelPaySandboxCardAllowed(cardNumber) {
   const normalized = String(cardNumber || "").replace(/\D+/g, "");
-  if (!PIXELPAY_SANDBOX_CARD_NUMBERS.has(normalized)) {
+  const fingerprint = createHash("sha256").update(normalized).digest("hex");
+  if (!OFFICIAL_QA_CARD_HASHES.has(fingerprint)) {
     throw new AppError(422, "La tarjeta no pertenece al set permitido de PixelPay Sandbox", {
       code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
     });
@@ -21,7 +25,7 @@ export function assertPixelPayCardAllowedForEnvironment(cardNumber, environment)
       code: "PIXELPAY_ENV_INVALID",
     });
   }
-  if (PIXELPAY_SANDBOX_CARD_NUMBERS.has(normalized)) {
+  if (PIXELPAY_LIVE_FORBIDDEN_TEST_CARDS.has(normalized)) {
     throw new AppError(422, "Las tarjetas de prueba no estan disponibles en este entorno", {
       code: "PIXELPAY_TEST_CARD_FORBIDDEN_IN_LIVE",
     });

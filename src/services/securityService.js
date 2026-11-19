@@ -573,7 +573,7 @@ export async function createActiveSession(app, request, payload) {
   }
 }
 
-export async function validateActiveSession(app, request, payload) {
+export async function validateActiveSession(app, request, payload, { readOnly = false } = {}) {
   if (!app?.db) return { ok: false, statusCode: 500, code: "DB_NOT_CONFIGURED" };
 
   const userId = String(payload?.id_usuario || "").trim();
@@ -620,7 +620,7 @@ export async function validateActiveSession(app, request, payload) {
     const revoked = Boolean(row.revocada_at);
 
     if (estado !== SESSION_STATUS_ACTIVE || expired || closed || revoked) {
-      if (expired && estado === SESSION_STATUS_ACTIVE) {
+      if (!readOnly && expired && estado === SESSION_STATUS_ACTIVE) {
         await app.db
           .query(
             `
@@ -644,6 +644,8 @@ export async function validateActiveSession(app, request, payload) {
       : true;
 
     if (idleExpired) {
+      // AM: Diagnostic authentication must not expire or touch session records.
+      if (readOnly) return { ok: false, statusCode: 401, code: "AUTH_SESSION_IDLE_EXPIRED" };
       await app.db
         .query(
           `
@@ -666,7 +668,7 @@ export async function validateActiveSession(app, request, payload) {
       return { ok: false, statusCode: 401, code: "AUTH_SESSION_IDLE_EXPIRED" };
     }
 
-    await app.db
+    if (!readOnly) await app.db
       .query(
         `
           UPDATE public.seguridad_sesiones

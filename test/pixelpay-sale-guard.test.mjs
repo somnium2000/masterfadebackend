@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { QA_PIXELPAY_CASE29_VISA, QA_PIXELPAY_CASE29_MASTERCARD } from "./fixtures/qa-pixelpay-case29.mjs";
 import { resolvePixelPayCustomerErrorCode } from "../src/services/payments/PixelPayDirectProvider.js";
 import {
   assertPixelPayCardAllowedForEnvironment,
   assertPixelPaySandboxCardAllowed,
+  validateSaleCardBeforeClaim,
   buildPixelPaySaleRateLimitConfig,
   canStartPixelPaySale,
   resolvePixelPaySaleFailureState,
@@ -33,6 +35,17 @@ test("solo permite tarjetas documentadas para PixelPay Sandbox", () => {
   );
 });
 
+test("caso oficial 2.9 llega a la validación previa ordinaria sin activar el puente ni emitir rechazo", () => {
+  let warnings = 0;
+  const logger = { warn: () => { warnings++; } };
+  for (const card of [QA_PIXELPAY_CASE29_VISA, QA_PIXELPAY_CASE29_MASTERCARD]) {
+    assert.equal(assertPixelPaySandboxCardAllowed(card), card);
+    assert.equal(assertPixelPayCardAllowedForEnvironment(card, "sandbox"), card);
+    assert.doesNotThrow(() => validateSaleCardBeforeClaim(card, "sandbox", logger, "req-fixture", "intent-fixture"));
+  }
+  assert.equal(warnings, 0);
+});
+
 test("live acepta tarjetas reales y bloquea las tarjetas oficiales de Sandbox", () => {
   assert.equal(
     assertPixelPayCardAllowedForEnvironment("4000 0000 0000 0002", "live"),
@@ -54,6 +67,10 @@ test("live acepta tarjetas reales y bloquea las tarjetas oficiales de Sandbox", 
     () => assertPixelPayCardAllowedForEnvironment("4000000000000002", "production"),
     (error) => error.code === "PIXELPAY_ENV_INVALID"
   );
+  // AM: The expanded Sandbox catalog must not extend the pre-existing Live denylist.
+  for (const card of [QA_PIXELPAY_CASE29_VISA, QA_PIXELPAY_CASE29_MASTERCARD]) {
+    assert.equal(assertPixelPayCardAllowedForEnvironment(card, "live"), card);
+  }
 });
 
 test("decline y error contractual definitivos pasan a fallido; incierto conserva pendiente", () => {
@@ -76,4 +93,14 @@ test("clasifica mensajes seguros para rechazo, datos, precondicion e incertidumb
   assert.equal(resolvePixelPayCustomerErrorCode({ outcome: "request_error_definitive", statusCode: 422 }), "PIXELPAY_PAYMENT_DATA_INVALID");
   assert.equal(resolvePixelPayCustomerErrorCode({ outcome: "request_error_definitive", statusCode: 412 }), "PIXELPAY_PRECONDITION_FAILED");
   assert.equal(resolvePixelPayCustomerErrorCode({ outcome: "uncertain", statusCode: 408 }), "PIXELPAY_PAYMENT_PENDING");
+});
+
+test("rechazo local Sandbox solo emite los seis campos de diagnóstico", () => {
+  const records = [];
+  const logger = { warn: (...args) => records.push(args) };
+  assert.throws(() => validateSaleCardBeforeClaim("fixture", "sandbox", logger, "req-test", "intent-test"),
+    { statusCode: 422, code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED" });
+  assert.deepEqual(records, [[{ event: "PIXELPAY_SALE_PREFLIGHT_REJECTED", requestId: "req-test",
+    id_intent: "intent-test", statusCode: 422, code: "PIXELPAY_SANDBOX_CARD_NOT_ALLOWED",
+    phase: "before_provider_send" }]]);
 });

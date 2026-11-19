@@ -155,7 +155,7 @@ test('cliente elegible sin sucursal es visible y admite suma, pero no resta para
   await assert.rejects(addManualPointsAdjustment(app, {
     idCliente: CLIENT, accion: 'restar', puntos: 5, motivo: 'Ajuste sintético',
     usuarioAdmin: actorClaims.user, claims: actorClaims,
-    idempotencyKey: '77777777-7777-4777-8777-777777777777',
+    idempotencyKey: '77777777-7777-4777-8777-777777777777', allowGlobalAssignment: true,
   }), { statusCode: 403, code: 'POINTS_CLIENT_BRANCH_FORBIDDEN' });
   assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.points_transactions')).length, 1);
 });
@@ -167,11 +167,11 @@ test('super_admin conserva búsqueda y resumen globales', async () => {
   assert.equal((await getClientePointsSummary(app, CLIENT, { claims: actorClaims })).id_cliente, CLIENT);
 });
 
-test('super_admin conserva ajuste global para cliente B', async () => {
+for (const accion of ['sumar', 'restar']) test(`super_admin conserva ajuste global ${accion} para cliente B`, async () => {
   const actorClaims = claims(['super_admin'], []);
-  const { app, calls } = fixture({ actorClaims, clientBranch: BRANCH_B });
+  const { app, calls } = fixture({ actorClaims, clientBranch: BRANCH_B, balance: 5 });
   const result = await addManualPointsAdjustment(app, {
-    idCliente: CLIENT, accion: 'sumar', puntos: 5, motivo: 'Ajuste sintético',
+    idCliente: CLIENT, accion, puntos: 5, motivo: 'Ajuste sintético',
     usuarioAdmin: actorClaims.user, claims: actorClaims, idempotencyKey: IDEMPOTENCY_KEY,
   });
   assert.equal(result.id_cliente, CLIENT);
