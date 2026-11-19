@@ -237,7 +237,7 @@ export default fp(async function privateCommerce(app) {
     await diagnose(request, reason);
     if (reply.sent) return;
     return { ok: true, data: { booking: allowed, vipPurchase: qaBooking.enabled || config.qaCapabilities ? false : allowed,
-      ...(qaBooking.enabled ? { pixelpaySale: allowed && (qaSale.enabled || qa3dsWindowOpen(delegated)),
+      ...(qaBooking.enabled ? { pixelpaySale: allowed && qaSale.enabled,
         pixelpay3dsDiagnostic: false,
         pixelpaySongbirdBridge: false } : {}) } };
   });

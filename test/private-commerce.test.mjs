@@ -645,7 +645,7 @@ const diagnosticEnv = () => ({ ...QA_BOOKING_IDENTITY, QA_PRIVATE_COMMERCE_SANDB
 test('delegated QA checkout grants capability only in window and requires session and CSRF for continuation', async t => {
   const f = await fixture(t, { env: { ...diagnosticEnv(), QA_PIXELPAY_DELEGATED_ENABLED: 'true' }, roles: ['cliente'] });
   const eligibility = await f.app.inject({ url: '/v1/commerce/eligibility', headers: f.headers() });
-  assert.equal(eligibility.json().data.pixelpaySale, true);
+  assert.equal(eligibility.json().data.pixelpaySale, false, 'pilot permission belongs to the exact intent, not the account');
   const csrfMissing = f.headers();
   delete csrfMissing['x-csrf-token'];
   for (const headers of [{}, csrfMissing, f.headers(OTHER)]) {
