@@ -1636,7 +1636,7 @@ export async function reconcilePixelPayPaid(client, {
   try {
     const access = recoveryOwner ? { mode: "recovery", owner: recoveryOwner } : null;
     if (recoveryOwner) {
-      // AM: Mismo orden de locks que la eliminacion; revalidar identidad antes de recuperar.
+      // AM: Serializar con eliminacion antes de locks financieros; la nueva ruta nunca autoriza por correo.
       const identityLock = await client.query(`SELECT pg_try_advisory_xact_lock(
         hashtext('masterfade.account_deletion'), hashtext($1::text)) AS deletion_identity_lock`,
       [recoveryOwner.usuarioId]);
@@ -2993,6 +2993,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         expected: {
           orderId: intent.orden_compra,
           amount: Number(intent.monto_hnl),
+          transactionId: intent.referencia_externa,
           ...(qaOrigin ? { currency: intent.moneda_codigo } : {}),
         },
         origin: "manual",
