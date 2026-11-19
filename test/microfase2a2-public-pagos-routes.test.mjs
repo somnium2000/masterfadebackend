@@ -4309,6 +4309,9 @@ test('QA delegate records a single durable claim and never restarts after loss o
   t.after(() => app.close());
   const base = '/v1/pagos/reservas/pixelpay';
   const post = (route, payload) => app.inject({ method: 'POST', url: base + route, payload });
+  const reopened = await app.inject({ method: 'POST', url: '/v1/pagos/reservas/crear-intent', payload: publicIntentPayload() });
+  assert.equal(reopened.statusCode, 200, reopened.body);
+  assert.equal(reopened.json().data.qa_3ds_delegated, true);
   const initial = await post('/sale', diagnosticPayload());
   assert.equal(initial.statusCode, 202, initial.body);
   const handoff = initial.json().data.qa_3ds_handoff;

@@ -1994,6 +1994,8 @@ export default async function publicPagosRoutes(app, options = {}) {
     config: delegatedConfig, makeAttempt: options.delegatedAttemptFactory,
   }) : null;
   const isDelegatedIntent = id => Boolean(delegated && isQa3dsIntent(delegatedConfig, id));
+  const delegatedFlags = id => isDelegatedIntent(id) && qa3dsWindowOpen(delegatedConfig)
+    ? { qa_3ds_delegated: true, qa_3ds_diagnostic: true } : {};
   const pendingDelegated = { processed: false, pending_confirmation: true, booking_confirmed: false,
     estado_intent_codigo: 'pendiente_confirmacion' };
 
@@ -2237,7 +2239,8 @@ export default async function publicPagosRoutes(app, options = {}) {
           inTransaction = false;
           return sendOk(
             reply,
-            buildPublicPaymentIntentPayload(existingIntent.rows[0], pricing, null)
+            { ...buildPublicPaymentIntentPayload(existingIntent.rows[0], pricing, null),
+              ...delegatedFlags(existingIntent.rows[0].id_intent) }
           );
         } else {
           const expiredMismatchedIntent = await dbClient.query(
@@ -2327,7 +2330,8 @@ export default async function publicPagosRoutes(app, options = {}) {
         });
         return sendOk(
           reply,
-          buildPublicPaymentIntentPayload(directIntent, phaseAPricing, null),
+          { ...buildPublicPaymentIntentPayload(directIntent, phaseAPricing, null),
+            ...delegatedFlags(directIntent.id_intent) },
           { statusCode: 201 }
         );
       }
@@ -2474,12 +2478,11 @@ export default async function publicPagosRoutes(app, options = {}) {
       inTransaction = false;
       return sendOk(
         reply,
-        { ...buildPublicPaymentIntentPayload(
+        buildPublicPaymentIntentPayload(
           updated.rows[0],
           phaseAPricing,
           providerIntent.launch ?? null
-        ), ...(isDelegatedIntent(updated.rows[0].id_intent) && qa3dsWindowOpen(delegatedConfig)
-          ? { qa_3ds_delegated: true, qa_3ds_diagnostic: true } : {}) },
+        ),
         { statusCode: 201 }
       );
     } catch (error) {
