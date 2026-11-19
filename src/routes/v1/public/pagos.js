@@ -28,7 +28,7 @@ import {
 } from "../../../services/payments/PixelPaySdkProvider.js";
 import { loadDurablePixelPayApproval } from "../../../services/payments/pixelPayDurableApproval.js";
 import { closeCompletedPixelPayCallback } from "../../../services/payments/pixelPayCallbackReceipt.js";
-import { resolvePixelPayStatusCandidate } from "../../../services/payments/pixelPayStatusCandidate.js";
+import { resolvePixelPayStatusCandidate, hasUnfinishedPixelPay3dsResponse } from "../../../services/payments/pixelPayStatusCandidate.js";
 import {
   pixelPayStatusTransportOnRequest,
   pixelPayStatusTransportOnResponse,
@@ -1636,7 +1636,7 @@ export async function reconcilePixelPayPaid(client, {
   try {
     const access = recoveryOwner ? { mode: "recovery", owner: recoveryOwner } : null;
     if (recoveryOwner) {
-      // AM: Serializar con eliminacion antes de locks financieros; la nueva ruta nunca autoriza por correo.
+      // AM: Mismo orden de locks que la eliminacion; revalidar identidad antes de recuperar.
       const identityLock = await client.query(`SELECT pg_try_advisory_xact_lock(
         hashtext('masterfade.account_deletion'), hashtext($1::text)) AS deletion_identity_lock`,
       [recoveryOwner.usuarioId]);
@@ -2963,6 +2963,23 @@ export default async function publicPagosRoutes(app, options = {}) {
         if (!isDelegatedIntent(idIntent) || !qa3dsWindowOpen(delegatedConfig)) {
           throw new AppError(403, 'Este intento QA solo permite consultar su estado local.', { code: 'QA_3DS_EXTERNAL_STATUS_DISABLED' });
         }
+        // PixelPay #9834: a pending delegated 3DS never allows getStatus().
+        // Return only local state; an authenticated/paid result must come from
+        // durable verified Sale evidence, never from an unfinished HTTP 202.
+        return sendOk(reply, {
+          ...pendingDelegated, id_intent: idIntent, id_grupo_cita: idGrupoCita,
+          code: 'PIXELPAY_3DS_AUTH_PENDING', ...pixelPayQaFlags(qaOrigin),
+        }, { statusCode: 202 });
+      }
+      if (await hasUnfinishedPixelPay3dsResponse(app.db, intent)) {
+        // Ordinary (unmarked) 202 attempts are subject to the same provider contract.
+        // Inability to verify locally fails closed; do not query or retry PixelPay.
+        return sendOk(reply, {
+          id_intent: idIntent, id_grupo_cita: idGrupoCita,
+          estado_intent_codigo: 'pendiente_confirmacion',
+          pending_confirmation: true, processed: false, booking_confirmed: false,
+          code: 'PIXELPAY_3DS_AUTH_PENDING',
+        }, { statusCode: 202 });
       }
       const statusCandidate = await resolvePixelPayStatusCandidate(app.db, intent, { delegated: Boolean(qaOrigin) });
       const paymentUuid = statusCandidate.paymentUuid;
@@ -2976,7 +2993,6 @@ export default async function publicPagosRoutes(app, options = {}) {
         expected: {
           orderId: intent.orden_compra,
           amount: Number(intent.monto_hnl),
-          transactionId: intent.referencia_externa,
           ...(qaOrigin ? { currency: intent.moneda_codigo } : {}),
         },
         origin: "manual",
