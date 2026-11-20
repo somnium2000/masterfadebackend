@@ -5,7 +5,8 @@ import { claimPixelPay3dsDispatch, recordPixelPay3dsContinuation } from './pixel
 import { sanitizePixelPayContinuationDiagnostic } from './pixelPaySaleRuntime.js';
 
 const MAX_ACTIVE_ATTEMPTS = 8;
-const MAX_CONTEXT_MS = 120_000;
+// AM: El desafío bancario puede requerir interacción; el deadline efectivo nunca supera el hold protegido.
+const MAX_CONTEXT_MS = 240_000;
 const LOOKUP_PHASE_EVENTS = { challenge: 'challenge_ready', frictionless: 'frictionless_ready' };
 
 export function publicPixelPay3dsUnavailable() {
