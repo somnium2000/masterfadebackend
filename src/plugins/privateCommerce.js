@@ -256,7 +256,7 @@ export default fp(async function privateCommerce(app) {
 
   const diagnose = createQaCommerceDiagnostic(app, config);
   async function eligibleProduction(request, reply) {
-    if (!config.enabled && !live3ds) return eligibilityResult(request, false, "PRIVATE_COMMERCE_DISABLED");
+    if (!config.enabled && !live3ds) return eligibilityResult(request, false, "PILOT_DISABLED");
     if (app.config.adminDataEntryMode) return eligibilityResult(request, false, "ADMIN_DATA_ENTRY_MODE");
     if (app.config.paymentProvider !== "pixelpay") return eligibilityResult(request, false, "PAYMENT_PROVIDER_NOT_PIXELPAY");
     if (!privateCommerceIpAllowed(request, config)) return eligibilityResult(request, false, "IP_NOT_ALLOWED");
