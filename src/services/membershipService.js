@@ -2436,6 +2436,12 @@ async function persistVerifiedMembershipPixelPayEvidence(app, {
   }
 }
 
+function membershipPublic3ds(app, publicAdmission) {
+  if (app.config?.publicCommerce?.vipPurchaseEnabled !== true
+    || (app.config?.pixelPayEnv === "live" && !publicAdmission)) return null;
+  return app.publicPixelPay3ds;
+}
+
 export async function processMembershipPixelPaySale(app, {
   idPaymentIntent,
   clienteId,
@@ -2445,10 +2451,12 @@ export async function processMembershipPixelPaySale(app, {
   logger,
   userId,
   supportsPublic3ds = false,
+  publicAdmission = false,
 } = {}) {
   const safeIntentId = normalizeText(idPaymentIntent);
   const safeClienteId = normalizeText(clienteId);
-  const public3ds = app.config?.publicCommerce?.vipPurchaseEnabled === true ? app.publicPixelPay3ds : null;
+  const public3ds = membershipPublic3ds(app, publicAdmission);
+  if (publicAdmission && app.config?.pixelPayEnv === "live" && !public3ds) throw publicPixelPay3dsUnavailable();
   assertPixelPayCardAllowedForEnvironment(card?.number, app.config?.pixelPayEnv);
   const paymentAttemptId = crypto.randomUUID();
   const claimClient = await app.db.connect();
@@ -2675,10 +2683,10 @@ export async function processMembershipPixelPaySale(app, {
 }
 
 export async function continueMembershipPixelPay3ds(app, {
-  idPaymentIntent, clienteId, userId, token, operation, data, requestId, logger,
+  idPaymentIntent, clienteId, userId, token, operation, data, requestId, logger, publicAdmission = false,
 } = {}) {
-  const manager = app.publicPixelPay3ds;
-  if (!manager || app.config?.publicCommerce?.vipPurchaseEnabled !== true) throw publicPixelPay3dsUnavailable();
+  const manager = membershipPublic3ds(app, publicAdmission);
+  if (!manager) throw publicPixelPay3dsUnavailable();
   const lost = () => new AppError(409, "El pago sigue pendiente de verificacion", {
     code: "PIXELPAY_PUBLIC_3DS_CONTEXT_LOST",
   });
@@ -2697,10 +2705,15 @@ export async function continueMembershipPixelPay3ds(app, {
     || !(Math.min(new Date(intent.intent_expires_at).getTime(), new Date(intent.order_expires_at).getTime()) > Date.now())
     || safeText(intent.provider_session_id) || safeText(intent.referencia_externa)) throw lost();
 
-  return manager.advance(context, operation, data, result => finalizeMembershipPixelPaySale(app, {
-    intent, saleResult: result, safeIntentId: idPaymentIntent, safeClienteId: clienteId,
-    paymentAttemptId: context.claim.paymentAttemptId, requestId, logger, saleStartedAt: context.claim.saleStartedAt,
-  }));
+  return manager.advance(context, operation, data, result => {
+    if (!result.approved && !result.definitive) {
+      return { ...MEMBERSHIP_PIXELPAY_3DS_PENDING, reconciliation_required: true };
+    }
+    return finalizeMembershipPixelPaySale(app, {
+      intent, saleResult: result, safeIntentId: idPaymentIntent, safeClienteId: clienteId,
+      paymentAttemptId: context.claim.paymentAttemptId, requestId, logger, saleStartedAt: context.claim.saleStartedAt,
+    });
+  });
 }
 
 async function finalizeMembershipPixelPaySale(app, {

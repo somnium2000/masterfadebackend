@@ -198,8 +198,11 @@ export default fp(async function privateCommerce(app) {
   const diagnosticsEnabled = process.env.PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED === "true";
   const verifyClient = app.requireRoles(["cliente"]);
   const publicConfig = app.config.publicCommerce || resolvePublicCommerceConfig(process.env);
-  const public3dsEnabled = resolvePublicPixelPay3dsConfig(process.env, { qaBooking, qaSale, delegated: delegated || qa3ds?.enabled });
-  const public3ds = public3dsEnabled ? createPublicPixelPay3dsAttempts({ db: app.db }) : null;
+  const public3dsEnvironment = resolvePublicPixelPay3dsConfig(process.env, {
+    qaBooking, qaSale, delegated: delegated || qa3ds?.enabled, publicCommerce: publicConfig,
+  });
+  const public3ds = public3dsEnvironment
+    ? createPublicPixelPay3dsAttempts({ db: app.db, environment: public3dsEnvironment, logger: app.log }) : null;
   const public3dsVipEnabled = Boolean(public3ds && publicConfig.vipPurchaseEnabled);
   app.decorate('publicPixelPay3ds', public3ds);
   app.decorateRequest('publicCommerceAdmission', null);
@@ -382,7 +385,7 @@ export default fp(async function privateCommerce(app) {
       && (available.publicBooking || available.publicVipPurchase);
     return { ok: true, data: {
       ...((public3ds || public3dsRequired) ? {
-        pixelpayPublic3ds: Boolean(public3ds && allowed),
+        pixelpayPublic3ds: Boolean(public3ds && (public3dsEnvironment === 'live' ? publiclyEligible : allowed)),
         pixelpayPublic3dsRequired: true,
       } : {}),
       booking: allowed || (available.publicBooking && publiclyEligible),

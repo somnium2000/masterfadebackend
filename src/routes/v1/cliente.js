@@ -1,6 +1,5 @@
 import { AppError, sendError } from "../../utils/errors.js";
 import { sendOk } from "../../utils/response.js";
-import { publicPixelPay3dsUnavailable } from "../../services/payments/publicPixelPay3ds.js";
 import {
   activateAssetForEntity,
   buildAssetReadUrl,
@@ -1269,14 +1268,12 @@ export default async function clienteRoutes(app) {
         });
       }
       try {
-        if (request.publicCommerceAdmission === "vip" && app.config?.pixelPayEnv === "live") {
-          throw publicPixelPay3dsUnavailable();
-        }
         reply.header("Cache-Control", "private, no-store");
         const result = await processMembershipPixelPaySale(app, {
           idPaymentIntent: request.body.id_payment_intent,
           clienteId: context.clienteId,
           userId: context.userId,
+          publicAdmission: request.publicCommerceAdmission === "vip",
           supportsPublic3ds: request.body.supports_public_3ds === true,
           card: request.body.card,
           billing: request.body.billing,
@@ -1319,6 +1316,7 @@ export default async function clienteRoutes(app) {
         const response = await continueMembershipPixelPay3ds(app, {
           idPaymentIntent: id_payment_intent, clienteId: context.clienteId, userId: context.userId,
           token, operation, data, requestId: request.id, logger: request.log,
+          publicAdmission: request.publicCommerceAdmission === "vip",
         });
         return sendOk(reply, response, { requestId: request.id });
       } catch (error) {

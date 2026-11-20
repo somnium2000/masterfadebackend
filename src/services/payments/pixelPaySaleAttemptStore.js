@@ -161,6 +161,34 @@ export async function recordPixelPay3dsContinuation(pool, { idIntent, paymentAtt
   return result.rows.length === 1;
 }
 
+export async function claimPixelPay3dsDispatch(pool, { idIntent, paymentAttemptId, deadline, orderId, amount, currency }) {
+  // AM: Consume continuation for this intent before contacting PixelPay, even if the response is lost.
+  const result = await pool.query(
+    `WITH payable AS (
+       SELECT pi.id_intent, pi.id_provider, a.payment_attempt_id
+       FROM public.payment_intents pi
+       JOIN public.payment_providers pp ON pp.id_provider = pi.id_provider AND pp.codigo = 'pixelpay'
+       JOIN app_private.pixelpay_sale_attempts a ON a.id_intent = pi.id_intent
+       WHERE pi.id_intent = $1::uuid AND a.payment_attempt_id = $2::uuid
+         AND pi.estado_intent_codigo = 'pendiente_confirmacion'
+         AND pi.orden_compra = $4::text AND pi.monto_hnl = $5::numeric AND pi.moneda_codigo = $6::text
+         AND pi.expires_at > clock_timestamp() AND $3::timestamptz > clock_timestamp()
+         AND pi.provider_session_id IS NULL AND pi.referencia_externa IS NULL
+         AND a.upstream_http_status = 202 AND a.finalized_at IS NULL
+       FOR UPDATE OF pi, a
+     )
+     INSERT INTO public.payment_events (id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent)
+     SELECT id_provider, 'pixelpay_public_3ds_continue_' || id_intent::text,
+            'pixelpay.sale.3ds_continuation_dispatched', FALSE,
+            jsonb_build_object('payment_attempt_id', payment_attempt_id), id_intent
+     FROM payable
+     ON CONFLICT (id_provider, provider_event_id) DO NOTHING
+     RETURNING id_event`,
+    [requireUuid(idIntent), requireUuid(paymentAttemptId), new Date(deadline).toISOString(), orderId, amount, currency],
+  );
+  return result.rows.length === 1;
+}
+
 export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAttemptId, paymentUuid, liveTest = false }) {
   if (liveTest) {
     await recordPixelPay3dsContinuation(pool, { idIntent, paymentAttemptId, paymentUuid });

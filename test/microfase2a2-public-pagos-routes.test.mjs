@@ -335,6 +335,20 @@ function createPagosClient({
         }
         return { rows: [] };
       }
+      if (text.includes("'pixelpay.sale.3ds_continuation_dispatched'")) {
+        const [idIntent, idAttempt, deadline, order, amount, currency] = params;
+        const providerEventId = `pixelpay_public_3ds_continue_${idIntent}`;
+        const attempt = saleAttempts.find(row => row.id_intent === idIntent && row.payment_attempt_id === idAttempt);
+        if (!attempt || attempt.upstream_http_status !== 202 || attempt.finalized_at
+          || activeIntent?.estado_intent_codigo !== 'pendiente_confirmacion'
+          || activeIntent.orden_compra !== order || Number(activeIntent.monto_hnl) !== amount
+          || activeIntent.moneda_codigo !== currency || activeIntent.provider_session_id || activeIntent.referencia_externa
+          || Date.parse(activeIntent.expires_at) <= Date.now() || Date.parse(deadline) <= Date.now()
+          || paymentEvents.some(row => row.provider_event_id === providerEventId)) return { rows: [] };
+        paymentEvents.push({ id_intent: idIntent, id_provider: activeIntent.id_provider, provider_event_id: providerEventId,
+          evento_tipo: 'pixelpay.sale.3ds_continuation_dispatched', firma_valida: false });
+        return { rows: [{ id_event: providerEventId }] };
+      }
       if (text.includes("INSERT INTO app_private.pixelpay_sale_attempts")) {
         if (failAttemptStart) throw new Error("fixture de fallo en INSERT START");
         assert.ok(transactionSnapshot, "START debe compartir la transaccion del claim");
@@ -867,15 +881,18 @@ async function createPagosApp(client, {
       return client.query(sql, params);
     },
   });
-  if (public3dsAttemptFactory) {
-    const manager = createPublicPixelPay3dsAttempts({ db: app.db, makeAttempt: public3dsAttemptFactory });
-    app.decorate('publicPixelPay3ds', manager);
-    app.addHook('onClose', async () => manager.close());
-  }
   if (privatePilot?.publicCommerce) app.config.publicCommerce = privatePilot.publicCommerce;
   if (privatePilot) app.pilotRequest = await installPrivatePilot(app, privatePilot.t, {
     userId: USER_A, clientId: CLIENT_A, enabled: privatePilot.enabled ?? true,
   });
+  if (public3dsAttemptFactory) {
+    const manager = createPublicPixelPay3dsAttempts({
+      db: app.db, environment: app.config.pixelPayEnv, makeAttempt: public3dsAttemptFactory,
+    });
+    if (privatePilot) app.publicPixelPay3ds = manager;
+    else app.decorate('publicPixelPay3ds', manager);
+    app.addHook('onClose', async () => manager.close());
+  }
   await app.register(publicPagosRoutes, {
     prefix: authenticated ? "/v1/pagos/reservas" : "/v1/public/pagos",
     authenticated,
@@ -4623,29 +4640,53 @@ test('Songbird interrupt telemetry accepts fixed reasons only and preserves lega
   assert.ok(phases.every(row=>row.id_intent===INTENT_A&&row.financial_finalization_enabled===false));
 });
 
-for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'frictionless-declined', 'frictionless-timeout', 'frictionless-second202']) {
+for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'bad-hash', 'frictionless-declined', 'frictionless-timeout', 'frictionless-second202']) {
   test('public SDK booking securely handles ' + scenario, async t => {
     const client = diagnosticRouteClient({ optionsPublic3ds: true });
     const calls = [];
+    const pending = ['bad-hash', 'frictionless-timeout', 'frictionless-second202'].includes(scenario);
+    const live = ['challenge', 'bad-hash'].includes(scenario);
+    const env = live ? 'live' : 'sandbox';
     const makeAttempt = options => {
       const fixture = desktopContext(options.context.input.orderId, scenario);
       const worker = new DelegatedAttempt({ ...options,
         workerUrl: new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url),
         context: { ...options.context, scenario, application: true,
-          config: { ...fixture.config, env: 'sandbox', endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev' } } });
-      return { close: () => worker.close(), call(operation, data) { calls.push(operation); return worker.call(operation, data); } };
+          config: live ? fixture.config : { ...fixture.config, env, endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev' } } });
+      return {
+        close: () => worker.close(),
+        async call(operation, data) {
+          calls.push(operation);
+          const dispatches = client.getPaymentEvents().filter(row => row.evento_tipo === 'pixelpay.sale.3ds_continuation_dispatched');
+          assert.equal(dispatches.length, Number(operation === 'retry'));
+          const response = await worker.call(operation, data);
+          const stats = await worker.call('inspect');
+          assert.equal(stats.externalSockets, 0);
+          assert.equal(stats.initialSales, 1);
+          assert.equal(stats.retries, Number(operation === 'retry'));
+          assert.equal(stats.continues, 0);
+          assert.equal(stats.statusQueries, 0);
+          assert.equal(stats.cryptoContextMatches, true);
+          assert.ok(stats.orders.every(order => order === options.context.input.orderId));
+          return response;
+        },
+      };
     };
     let statusCalls = 0;
     const app = await createPagosApp(client, { providerCode: 'pixelpay', authenticated: true,
-      claims: diagnosticOwnerClaims, public3dsAttemptFactory: makeAttempt,
-      providerAdapter: { env: 'sandbox', queryPaymentStatus() { statusCalls++; throw new Error('unexpected'); } } });
+      claims: diagnosticOwnerClaims, public3dsAttemptFactory: makeAttempt, config: { pixelPayEnv: env },
+      ...(live ? { privatePilot: { t, enabled: false, publicCommerce: { bookingEnabled: true } } } : {}),
+      providerAdapter: { env, queryPaymentStatus() { statusCalls++; assert.fail('unexpected Status'); },
+        sale() { assert.fail('unexpected legacy Sale'); } } });
     t.after(() => app.close());
     const base = '/v1/pagos/reservas/pixelpay';
-    const post = (url, payload) => app.inject({ method: 'POST', url: base + url, payload });
-    const legacy = await post('/sale', diagnosticPayload());
-    assert.equal(legacy.statusCode, 503);
+    const post = (url, payload) => app.inject({ ...app.pilotRequest, remoteAddress: '198.51.100.2',
+      method: 'POST', url: base + url, payload });
+    const cardPayload = { ...diagnosticPayload(), ...(live ? { card_number: '4000000000000002' } : {}) };
+    const legacy = await post('/sale', cardPayload);
+    assert.equal(legacy.statusCode, 503, legacy.body);
     assert.equal(client.getSaleAttempts().length, 0);
-    const payload = { ...diagnosticPayload(), supports_public_3ds: true };
+    const payload = { ...cardPayload, supports_public_3ds: true };
     const start = await post('/sale', payload);
     assert.equal(start.statusCode, scenario === 'no-3ds' ? 200 : 202, start.body);
     if (scenario !== 'no-3ds') {
@@ -4656,30 +4697,33 @@ for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'frictionless-dec
       const advance = (operation, data, override = {}) => post('/3ds/continuar', { ...scope, operation, data, ...override });
       assert.equal((await advance('retry', {})).statusCode, 409);
       assert.equal((await advance('lookup', { reference: 'opaque' }, { token: USER_B })).statusCode, 409);
+      assert.equal((await advance('lookup', { reference: 'opaque' }, { id_grupo_cita: USER_B })).statusCode, 409);
       const lookup = await advance('lookup', { reference: 'opaque' });
       assert.equal(lookup.statusCode, 200, lookup.body);
-      const terminal = await advance('retry', {});
-      assert.equal(terminal.statusCode, scenario === 'challenge' ? 409 : 200, terminal.body);
-      if (scenario === 'challenge') {
-        assert.equal(terminal.json().code, 'PIXELPAY_PUBLIC_3DS_PROOF_UNAVAILABLE');
-        const status = await post('/status', { id_intent: INTENT_A, id_grupo_cita: GROUP_A, titular_email: payload.titular_email });
-        assert.equal(status.statusCode, 202, status.body);
-      } else if (['frictionless-timeout', 'frictionless-second202'].includes(scenario)) {
-        assert.equal(terminal.json().data.payment.pending_confirmation, true);
+      assert.equal(lookup.json().data.action, live ? 'continue' : null);
+      assert.equal((await advance('retry', { approved: 'true' })).statusCode, 409);
+      assert.equal(client.getPayments().length, 0);
+      const responses = await Promise.all([advance('retry', {}), advance('retry', {})]);
+      const accepted = responses.find(response => response.statusCode === 200);
+      assert.ok(accepted && responses.every(response => [200, 409].includes(response.statusCode)));
+      const terminal = accepted.json().data.payment;
+      if (pending) {
+        assert.equal(terminal.pending_confirmation, true);
         assert.equal(client.getSaleAttempts()[0].upstream_http_status, 202);
+        app.publicPixelPay3ds.close();
         const status = await post('/status', { id_intent: INTENT_A, id_grupo_cita: GROUP_A, titular_email: payload.titular_email });
         assert.equal(status.statusCode, 202, status.body);
       } else if (scenario === 'frictionless-declined') {
-        assert.equal(terminal.json().data.payment.estado_intent_codigo, 'fallido');
+        assert.equal(terminal.estado_intent_codigo, 'fallido');
         assert.equal(client.getActiveIntent().estado_intent_codigo, 'fallido');
-      } else assert.equal(terminal.json().data.payment.booking_confirmed, true);
+      } else assert.equal(terminal.booking_confirmed, true);
       assert.equal((await advance('retry', {})).statusCode, 409);
     }
     assert.equal((await post('/sale', payload)).statusCode, 409);
     assert.equal(client.getSaleAttempts().length, 1);
-    assert.equal(client.getPayments().length, ['no-3ds', 'frictionless'].includes(scenario) ? 1 : 0);
+    assert.equal(client.getPayments().length, ['no-3ds', 'frictionless', 'challenge'].includes(scenario) ? 1 : 0);
     assert.equal(statusCalls, 0);
-    assert.deepEqual(calls, scenario === 'no-3ds' ? ['start'] : scenario === 'challenge' ? ['start', 'lookup'] : ['start', 'lookup', 'retry']);
+    assert.deepEqual(calls, scenario === 'no-3ds' ? ['start'] : ['start', 'lookup', 'retry']);
   });
 }
 

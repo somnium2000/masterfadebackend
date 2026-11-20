@@ -471,7 +471,7 @@ function pixelPayProcessHarness({
     subscriptions: 0, payments: 0, subscriptionPayments: 0,
     verifiedEvidenceEvents: 0, verifiedReferenceWrites: 0, subscriptionInsertParams: null,
     statusClaimed: false, dynamicDurableEvidence: null, dynamicVerifiedAt: null,
-    public3dsClaims: 0, orderReference: null, providerSessionId,
+    public3dsClaims: 0, public3dsDispatches: 0, saleAttempt: null, orderReference: null, providerSessionId,
     paymentProviderTxIds: [], paymentAmounts: [], paymentPaidAts: [],
     orderPaidAts: [], intentPaidAts: [], subscriptionPaymentPaidAts: [], verifiedEventQueries: [],
   };
@@ -541,6 +541,7 @@ function pixelPayProcessHarness({
         return { rows: [{ verified_at: state.dynamicVerifiedAt }] };
       }
       if (text.startsWith("INSERT INTO app_private.pixelpay_sale_attempts")) {
+        state.saleAttempt = { intentId: values[0], attemptId: values[1], status: null, finalized: false };
         return { rows: [{ id_sale_attempt: crypto.randomUUID() }] };
       }
       if (text.includes("SET estado_intent_codigo = 'pendiente_confirmacion'")) {
@@ -635,8 +636,26 @@ function pixelPayProcessHarness({
     connect: async () => client,
     async query(query, values) {
       const text = String(query?.text || query);
+      if (text.includes("'pixelpay.sale.3ds_continuation_dispatched'")) {
+        const [idIntent, idAttempt, deadline, order, amountHnl, currency] = values;
+        if (idIntent !== INTENT || state.saleAttempt?.attemptId !== idAttempt || state.saleAttempt.status !== 202
+          || state.saleAttempt.finalized || state.providerSessionId || state.verifiedReferenceWrites
+          || state.intentState !== "pendiente_confirmacion" || state.orderReference !== order
+          || Number(row.monto_hnl) !== amountHnl || row.moneda_codigo !== currency
+          || Date.parse(deadline) <= Date.now() || Date.parse(row.intent_expires_at) <= Date.now()
+          || state.public3dsDispatches) return { rows: [] };
+        state.public3dsDispatches += 1;
+        return { rows: [{ id_event: crypto.randomUUID() }] };
+      }
       if (text.includes("FROM public.payment_intents pi")) return client.query(query, values);
-      if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) return { rows: [{ id_sale_attempt: crypto.randomUUID() }] };
+      if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) {
+        if (text.includes('SET upstream_http_status = 202')) {
+          if (state.saleAttempt?.intentId !== values[0] || state.saleAttempt?.attemptId !== values[1]) return { rows: [] };
+          state.saleAttempt.status = 202;
+        }
+        if (text.includes('SET finalized_at') && state.saleAttempt) state.saleAttempt.finalized = true;
+        return { rows: [{ id_sale_attempt: crypto.randomUUID() }] };
+      }
       if (text.includes("SET estado_intent_codigo='fallido'")) {
         state.intentState = "fallido";
         return { rows: [{ id_intent: INTENT }] };
@@ -681,7 +700,7 @@ test("membresia live rechaza tarjetas oficiales Sandbox antes de abrir una trans
 async function buildPixelPayRouteApp(t, harnessOptions) {
   const harness = pixelPayProcessHarness(harnessOptions);
   const server = Fastify();
-  if (!harnessOptions.privatePilot) server.decorate("requireRoles", () => async (request) => {
+  if (!harnessOptions.privatePilot && !harnessOptions.publicVipAdmission) server.decorate("requireRoles", () => async (request) => {
     request.claims = { roles: ["cliente"], cliente_id: CLIENT, user: { id_usuario: USER } };
   });
   server.decorate("db", harness.app.db);
@@ -689,22 +708,31 @@ async function buildPixelPayRouteApp(t, harnessOptions) {
     nodeEnv: "test",
     paymentProvider: "pixelpay",
     pixelPayEnv: harnessOptions.pixelPayEnv || "sandbox",
-    publicCommerce: { vipPurchaseEnabled: harnessOptions.public3ds === true },
+    publicCommerce: { vipPurchaseEnabled: harnessOptions.public3ds === true || harnessOptions.publicVipAdmission === true },
     todoPago: { mode: "disabled", simulatedEnabled: false },
   });
-  if (harnessOptions.publicVipAdmission) server.addHook("onRequest", async request => {
-    request.publicCommerceAdmission = "vip";
-  });
+  if (harnessOptions.publicVipAdmission) {
+    const query = server.db.query.bind(server.db);
+    server.db.query = (sql, params) => String(sql).includes("FROM public.clientes c") && String(sql).includes("c.anonimizado")
+      ? { rows: params[0] === CLIENT && params[1] === USER && params[2] === USER ? [{ id_cliente: CLIENT }] : [] }
+      : query(sql, params);
+  }
+  if (harnessOptions.privatePilot || harnessOptions.publicVipAdmission) {
+    server.pilotRequest = await installPrivatePilot(server, t, { userId: USER, clientId: CLIENT,
+      enabled: !harnessOptions.publicVipAdmission });
+  }
   if (harnessOptions.makeAttempt) {
+    const env = server.config.pixelPayEnv;
+    const endpoint = env === "live" ? "https://offline-pixelpay.invalid" : "https://pixelpay.dev";
     Object.assign(PaymentProviderFactory._instance, {
-      env: "sandbox", endpoint: "https://pixelpay.dev", appUrl: "https://pixelpay.dev",
+      env, endpoint, appUrl: env === "live" ? "https://offline-shop.invalid" : endpoint,
       keyId: "synthetic-key", authHash: "synthetic-hash", secretKey: "synthetic-secret",
     });
-    const manager = createPublicPixelPay3dsAttempts({ db: harness.app.db, makeAttempt: harnessOptions.makeAttempt });
-    server.decorate("publicPixelPay3ds", manager);
+    const manager = createPublicPixelPay3dsAttempts({ db: harness.app.db, environment: env, makeAttempt: harnessOptions.makeAttempt });
+    if (harnessOptions.privatePilot || harnessOptions.publicVipAdmission) server.publicPixelPay3ds = manager;
+    else server.decorate("publicPixelPay3ds", manager);
     server.addHook("onClose", async () => manager.close());
   }
-  if (harnessOptions.privatePilot) server.pilotRequest = await installPrivatePilot(server, t, { userId: USER, clientId: CLIENT });
   await server.register(clienteRoutes, { prefix: "/v1/cliente" });
   await server.ready();
   t.after(async () => {
@@ -836,29 +864,34 @@ for (const missingField of ["card", "billing"]) {
 }
 
 
-for (const withChallenge of [false, true]) {
-  test(`HTTP VIP 3DS público usa el intento reclamado y prueba financiera durable (challenge=${withChallenge})`, async t => {
+for (const scenario of ["frictionless", "challenge", "bad-currency", "retry-timeout"]) {
+  test(`HTTP VIP 3DS público reclama y verifica el pago (${scenario})`, async t => {
     const phases = [];
+    const live = scenario !== "frictionless";
+    const shouldApprove = ["frictionless", "challenge"].includes(scenario);
     const { server, state } = await buildPixelPayRouteApp(t, {
-      public3ds: true,
+      public3ds: true, publicVipAdmission: live, pixelPayEnv: live ? "live" : "sandbox",
       provider: { sale: async () => { throw new Error("Legacy Sale must not execute"); } },
       makeAttempt: options => {
         const worker = new DelegatedAttempt({
           ...options,
           workerUrl: new URL("./fixtures/delegatedPixelPayWorker.mjs", import.meta.url),
-          context: { ...options.context, application: true, scenario: withChallenge ? "challenge" : "frictionless" },
+          context: { ...options.context, application: true, scenario },
         });
         return {
           close: () => worker.close(),
           async call(operation, data) {
             phases.push(operation);
             assert.equal(state.public3dsClaims, 1);
+            assert.equal(state.public3dsDispatches, Number(operation === "retry"));
             assert.equal(state.intentState, "pendiente_confirmacion");
             const response = await worker.call(operation, data);
             const stats = await worker.call("inspect");
             assert.equal(stats.externalSockets, 0);
             assert.equal(stats.initialSales, 1);
             assert.equal(stats.retries, Number(operation === "retry"));
+            assert.equal(stats.continues, 0);
+            assert.equal(stats.statusQueries, 0);
             assert.equal(stats.cryptoContextMatches, true);
             assert.ok(stats.orders.every(order => order === `VIP-${ORDER}`));
             return response;
@@ -866,18 +899,22 @@ for (const withChallenge of [false, true]) {
         };
       },
     });
-    const post = (url, payload) => server.inject({ url, method: "POST", payload });
+    const post = (url, payload) => server.inject({ ...server.pilotRequest, remoteAddress: "198.51.100.2",
+      url, method: "POST", payload });
     const confirm = "/v1/cliente/planes/confirmar-pago";
-    const initial = { id_payment_intent: INTENT, card: validCard, billing: validBilling };
+    const card = live ? { ...validCard, number: "4000000000000002" } : validCard;
+    const initial = { id_payment_intent: INTENT, card, billing: validBilling };
     assert.equal((await post(confirm, initial)).statusCode, 503);
     assert.equal(state.public3dsClaims, 0);
-    const started = await post(confirm, { ...initial, supports_public_3ds: true });
+    const supported = { ...initial, supports_public_3ds: true };
+    const started = await post(confirm, supported);
     assert.equal(started.statusCode, 202, started.body);
     const handoff = started.json().data.public_3ds_handoff;
     assert.ok(handoff.token);
     assert.equal(started.headers["cache-control"], "private, no-store");
-    assert.doesNotMatch(started.body, /4111111111111111|"cvv"|"authHash"|"secretKey"/);
-    assert.equal((await post(confirm, { ...initial, supports_public_3ds: true })).statusCode, 409);
+    assert.equal(started.body.includes(card.number), false);
+    assert.doesNotMatch(started.body, /"cvv"|"authHash"|"secretKey"/);
+    assert.equal((await post(confirm, supported)).statusCode, 409);
 
     const path = "/v1/cliente/planes/pixelpay/3ds/continuar";
     const advance = (operation, data = {}, overrides = {}) => post(path, {
@@ -886,26 +923,33 @@ for (const withChallenge of [false, true]) {
     assert.equal((await advance("retry")).statusCode, 409);
     assert.equal((await advance("lookup", { reference: "synthetic" }, { token: OTHER_CLIENT })).statusCode, 409);
     assert.equal((await advance("lookup", { reference: "synthetic" })).statusCode, 200);
-    const final = await advance("retry");
-    assert.equal(final.statusCode, withChallenge ? 409 : 200, final.body);
-    if (withChallenge) {
-      assert.deepEqual(phases, ["start", "lookup"]);
+    assert.equal((await advance("retry", { approved: "true" })).statusCode, 409);
+    assert.equal(state.payments, 0);
+    const responses = await Promise.all([advance("retry"), advance("retry")]);
+    const final = responses.find(response => response.statusCode === 200);
+    assert.ok(final && responses.every(response => [200, 409].includes(response.statusCode)));
+    const payment = final.json().data.payment;
+    if (shouldApprove) {
+      assert.equal(payment.processed, true);
+      assert.equal(state.intentState, "confirmado");
+      assert.equal(state.orderState, "pagada");
+    } else {
+      assert.equal(payment.pending_confirmation, true);
       assert.equal(state.intentState, "pendiente_confirmacion");
+      assert.equal(state.saleAttempt.finalized, false);
       server.publicPixelPay3ds.close();
       state.providerSessionId = "restored-untrusted-id";
       const status = await post(`/v1/cliente/planes/pago-intent/${INTENT}/estado`);
       assert.equal(status.statusCode, 200, status.body);
       assert.equal(status.json().data.reconciliation_required, true);
-    } else {
-      assert.equal(final.json().data.payment.processed, true);
-      assert.deepEqual(phases, ["start", "lookup", "retry"]);
-      assert.equal(state.intentState, "confirmado");
-      assert.equal(state.orderState, "pagada");
+      assert.equal((await post(confirm, supported)).statusCode, 409);
     }
+    assert.deepEqual(phases, ["start", "lookup", "retry"]);
     assert.equal((await advance("retry")).statusCode, 409);
-    assert.equal(state.payments, Number(!withChallenge));
-    assert.equal(state.subscriptions, Number(!withChallenge));
-    assert.equal(state.subscriptionPayments, Number(!withChallenge));
+    assert.equal(state.public3dsDispatches, 1);
+    assert.equal(state.payments, Number(shouldApprove));
+    assert.equal(state.subscriptions, Number(shouldApprove));
+    assert.equal(state.subscriptionPayments, Number(shouldApprove));
     assert.equal(state.saleCalls, 0);
     assert.equal(state.statusCalls ?? 0, 0);
   });
@@ -916,6 +960,7 @@ test("HTTP VIP público Live devuelve indisponibilidad antes de reclamar la vent
     publicVipAdmission: true, pixelPayEnv: "live", provider: { sale: async () => assert.fail() },
   });
   const response = await server.inject({
+    ...server.pilotRequest, remoteAddress: "198.51.100.2",
     method: "POST", url: "/v1/cliente/planes/confirmar-pago",
     payload: { id_payment_intent: INTENT, card: validCard, billing: validBilling, supports_public_3ds: true },
   });

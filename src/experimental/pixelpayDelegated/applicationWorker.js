@@ -3,8 +3,7 @@ import { createDelegatedSession } from './session.js';
 
 if (parentPort) {
   const { config, input, attemptId, publicContinuation = false } = workerData;
-  // Only the private commerce admission may instantiate the Live worker.
-  // SDK provider still enforces the configured keys and app_url server-side.
+  // AM: The admitted environment determines the worker configuration. Keys and app_url stay in Node.
   const endpoint = String(config.endpoint || '').replace(/\/$/, '');
   const appUrl = String(config.appUrl || '').replace(/\/$/, '');
   const sandbox = config.env === 'sandbox'

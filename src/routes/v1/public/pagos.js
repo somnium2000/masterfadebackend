@@ -1991,7 +1991,8 @@ export default async function publicPagosRoutes(app, options = {}) {
   const paymentAccess = (request) => authenticated
     ? { mode: "authenticated", owner: resolveAuthenticatedPaymentOwner(request) }
     : { mode: "public" };
-  const public3ds = authenticated ? app.publicPixelPay3ds : null;
+  const public3dsManager = authenticated ? app.publicPixelPay3ds : null;
+  const livePayments = app.config?.pixelPayEnv === 'live';
   const delegatedConfig = authenticated ? app.qaPixelPayDelegated : null;
   const delegated = delegatedConfig ? createQaDelegatedAttempts({
     config: delegatedConfig, makeAttempt: options.delegatedAttemptFactory,
@@ -2065,7 +2066,7 @@ export default async function publicPagosRoutes(app, options = {}) {
     } finally { client.release(); }
   }
 
-  if (public3ds) {
+  if (public3dsManager) {
     app.post('/pixelpay/3ds/continuar', {
       ...routeGuard,
       bodyLimit: 40000,
@@ -2081,7 +2082,8 @@ export default async function publicPagosRoutes(app, options = {}) {
       reply.header('Cache-Control', 'private, no-store');
       const body = request.body;
       const access = paymentAccess(request);
-      const context = public3ds.get({ kind: 'booking', idIntent: body.id_intent, idGrupoCita: body.id_grupo_cita,
+      if (livePayments && request.publicCommerceAdmission !== 'booking') throw publicPixelPay3dsUnavailable();
+      const context = public3dsManager.get({ kind: 'booking', idIntent: body.id_intent, idGrupoCita: body.id_grupo_cita,
         owner: access.owner.usuarioId, token: body.token });
       const contextLost = () => new AppError(409, 'El pago sigue pendiente de verificación.', {
         code: 'PIXELPAY_PUBLIC_3DS_CONTEXT_LOST',
@@ -2092,7 +2094,7 @@ export default async function publicPagosRoutes(app, options = {}) {
       if (intent.estado_intent_codigo !== 'pendiente_confirmacion' || intent.orden_compra !== context.claim.orderId
         || intent.moneda_codigo !== context.claim.currency || intent.provider_code !== 'pixelpay'
         || !(Date.parse(intent.expires_at) > Date.now())) throw contextLost();
-      const response = await public3ds.advance(context, body.operation, body.data, result =>
+      const response = await public3dsManager.advance(context, body.operation, body.data, result =>
         persistDelegatedResult(context.claim, result, request, access.owner));
       return sendOk(reply, response);
     });
@@ -2620,8 +2622,11 @@ export default async function publicPagosRoutes(app, options = {}) {
     // AM: Stop the retired Node/React protocol before reserving or dispatching a new operation.
     const useDelegated = isDelegatedIntent(request.body?.id_intent);
     const useLiveDelegated = useDelegated && delegatedConfig?.liveTest === true;
-    if ((request.publicCommerceAdmission === 'booking' && app.config?.pixelPayEnv === 'live')
-      || (public3ds && request.body.supports_public_3ds !== true)) throw publicPixelPay3dsUnavailable();
+    const publicLiveBooking = livePayments && request.publicCommerceAdmission === 'booking';
+    const public3ds = !livePayments || publicLiveBooking ? public3dsManager : null;
+    if ((publicLiveBooking && !public3ds) || (public3ds && request.body.supports_public_3ds !== true)) {
+      throw publicPixelPay3dsUnavailable();
+    }
     if (!useDelegated && (qa3dsTarget || app.qaPixelPay3dsDiagnostic?.enabled === true)) {
       throw new AppError(503, 'El pago con autenticacion no esta disponible.', { code: 'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE' });
     }
