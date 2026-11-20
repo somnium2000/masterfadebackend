@@ -710,11 +710,14 @@ test("SDK rechaza solo placeholders exactos de billing address antes de doSale",
   }
 });
 
-test("telemetria local conserva solo metadata de validacion segura", async () => {
+test("telemetria local conserva solo metadata de validacion segura", async t => {
+  const now = new Date("2026-10-10T16:51:50.000Z");
+  // AM: Keep UUID and timestamp digits from colliding with the forbidden card fixture values.
+  t.mock.timers.enable({ apis: ["Date"], now });
   const logger = makeTelemetryLogger();
   const fake = makeFakeSdk({ saleResponse: sdkResponse(200, { data: approvedData() }) });
-  const result = await makeProvider(fake, { now: () => new Date("2026-10-10T16:51:50.000Z") })
-    .sale(saleInput, { logger });
+  const result = await makeProvider(fake, { now: () => now })
+    .sale(saleInput, { logger, paymentAttemptId: "11111111-2222-4333-8444-555555555555" });
   const serialized = JSON.stringify({ diagnostics: result.diagnostics, events: logger.events });
 
   assert.equal(result.diagnostics.cardExpireFormatValid, true);
