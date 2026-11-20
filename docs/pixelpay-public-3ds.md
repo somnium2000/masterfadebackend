@@ -155,11 +155,14 @@ phases = {
     'start_result', 'start_failed',
     'handoff_ready', 'challenge_ready', 'frictionless_ready',
     'lookup_incomplete', 'continuation_dispatched', 'continuation_result',
+    'lookup_failed', 'authentication_continue_ready', 'authentication_continue_incomplete',
+    'authentication_continue_failed', 'continuation_failed',
 }
 diagnostic_codes = {
     'PIXELPAY_3DS_COLLECTION_URL_ABSENT', 'PIXELPAY_3DS_COLLECTION_URL_NULL',
     'PIXELPAY_3DS_COLLECTION_URL_EMPTY', 'PIXELPAY_3DS_COLLECTION_URL_INVALID',
     'PIXELPAY_3DS_CONTINUATION_INVALID', 'PIXELPAY_3DS_COLLECTION_READY',
+    'PIXELPAY_3DS_SONGBIRD_READY',
 }
 field_types = {'absent', 'null', 'empty_string', 'array', 'string', 'object',
                'number', 'boolean', 'undefined'}

@@ -90,7 +90,7 @@ export function comparePixelPayContinuationFields(left, right) {
 export function sanitizePixelPayContinuationDiagnostic(source = {}) {
   const codes = new Set(['PIXELPAY_3DS_COLLECTION_URL_ABSENT', 'PIXELPAY_3DS_COLLECTION_URL_NULL',
     'PIXELPAY_3DS_COLLECTION_URL_EMPTY', 'PIXELPAY_3DS_COLLECTION_URL_INVALID',
-    'PIXELPAY_3DS_CONTINUATION_INVALID', 'PIXELPAY_3DS_COLLECTION_READY']);
+    'PIXELPAY_3DS_CONTINUATION_INVALID', 'PIXELPAY_3DS_COLLECTION_READY', 'PIXELPAY_3DS_SONGBIRD_READY']);
   const types = new Set(['absent', 'null', 'empty_string', 'array', 'string', 'object', 'number', 'boolean', 'undefined']);
   const field = (value, name) => ({ present: safeBoolean(value?.present),
     type: types.has(value?.type) ? value.type : null,
