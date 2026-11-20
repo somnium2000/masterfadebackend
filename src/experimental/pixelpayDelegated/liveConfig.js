@@ -19,17 +19,20 @@ export function resolveLive3dsDirectConfig(env, privateCommerce, { now = Date.no
   const flag = String(env.PIXELPAY_LIVE_3DS_TEST_ENABLED ?? 'false').trim();
   if (!['true', 'false'].includes(flag)) throw new Error('PIXELPAY_LIVE_3DS_TEST_ENABLED invalido.');
   if (flag === 'false') return null;
-  if (!privateCommerce?.enabled || privateCommerce?.qaCapabilities
+  if (!privateCommerce || privateCommerce.enabled || privateCommerce.qaCapabilities
     || privateCommerce.userIds?.length !== 1 || !privateCommerce.ips?.length
     || env.NODE_ENV !== 'production' || env.ENTORNO !== 'production'
     || env.PAYMENT_PROVIDER !== 'pixelpay' || env.PIXELPAY_IMPLEMENTATION !== 'sdk'
     || env.PIXELPAY_ENV !== 'live'
     || !isLiveUrl(env.PIXELPAY_ENDPOINT) || !isLiveUrl(env.PIXELPAY_APP_URL)
+    || !strictOff(env, 'PRIVATE_COMMERCE_PILOT_ENABLED')
     || !strictOff(env, 'PUBLIC_BOOKING_ENABLED') || !strictOff(env, 'PUBLIC_VIP_PURCHASE_ENABLED')
     || !strictOff(env, 'QA_PIXELPAY_DELEGATED_ENABLED')
     || !strictOff(env, 'QA_PIXELPAY_3DS_DIAGNOSTIC_ENABLED')
     || !strictOff(env, 'ENABLE_QA_PAYMENT_SIMULATION')
-    || !strictOff(env, 'ENABLE_QA_VIP_PURCHASE_SIMULATION')) {
+    || !strictOff(env, 'ENABLE_QA_VIP_PURCHASE_SIMULATION')
+    || (privateCommerce.proxies?.length
+      && !['true', '1', 'yes', 'on'].includes(String(env.TRUST_PROXY || '').trim().toLowerCase()))) {
     throw new Error('Live 3DS requiere SDK Live, reservas publicas cerradas y acceso privado por cuenta/IP.');
   }
   return Object.freeze({ enabled: true, liveTest: true, environment: 'live',
