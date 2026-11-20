@@ -65,6 +65,9 @@ export function installSyntheticProvider(context) {
       stats.continues++;
       if (body.identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
       if (flowScenario === 'continue-timeout') throw new Error('SYNTHETIC_TIMEOUT');
+      // AM: Contract tests retain the raw HTTP envelope so the native SDK performs its real normalization.
+      if (Object.hasOwn(context, 'continueResponse')) return { config, status: context.continueResponse.status,
+        headers: {}, data: structuredClone(context.continueResponse.body) };
       return reply(200, {}, null, flowScenario !== 'continue-false');
     }
     if (body.order_id !== context.input.orderId || Number(body.order_amount) !== context.input.amount
@@ -83,7 +86,8 @@ export function installSyntheticProvider(context) {
         : 'https://acs.offline.invalid';
       return reply(context.application && !flowScenario.startsWith('frictionless') && flowScenario !== 'challenge-http-200' ? 202 : 200, {
         identifier: flowScenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
-        continue_url: flowScenario === 'invalid-step-up' ? songbird ? 'http://acs.offline.invalid' : 'https://acs.offline.invalid'
+        continue_url: songbird && Object.hasOwn(context, 'songbirdChallengeUrl') ? context.songbirdChallengeUrl
+          : flowScenario === 'invalid-step-up' ? songbird ? 'http://acs.offline.invalid' : 'https://acs.offline.invalid'
           : flowScenario === 'invalid-step-up-userinfo' ? 'https://user:password@acs.offline.invalid' : challengeUrl,
         continue_payload: flowScenario === 'invalid-continue-payload' ? {} : 'opaque.+/=%ñ',
         transaction_id: flowScenario === 'invalid-transaction-id' ? null : `tx-${body.order_id}`, window_size: '03',
@@ -108,7 +112,8 @@ export function installSyntheticProvider(context) {
           'collection-v3': collectionUrl.replace('/V1/', '/V3/'),
           'collection-trailing-slash': collectionUrl.replace('/Collect?', '/Collect/?'),
         };
-        const collectionValue = Object.hasOwn(collection, context.scenario) ? collection[context.scenario] : collectionUrl;
+        const collectionValue = Object.hasOwn(context, 'collectionUrl') ? context.collectionUrl
+          : Object.hasOwn(collection, context.scenario) ? collection[context.scenario] : collectionUrl;
         const response = reply(202, { transaction_type: 'songbird', payload: `opaque-setup-${body.order_id}`,
           payment_uuid: flowScenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}`,
           ...(context.application && !songbird && collectionValue !== undefined ? { collection_url: collectionValue } : {}) });
