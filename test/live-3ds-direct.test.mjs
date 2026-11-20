@@ -5,12 +5,12 @@ import { resolveLive3dsDirectConfig, assertLive3dsFreshIntent,
 import { createQaDelegatedAttempts } from '../src/experimental/pixelpayDelegated/qaAttempts.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
-const privateAccess = { enabled: true, qaCapabilities: false, userIds: [ID], ips: ['198.51.100.10'] };
+const privateAccess = { enabled: false, qaCapabilities: false, userIds: [ID], ips: ['198.51.100.10'] };
 const env = { PIXELPAY_LIVE_3DS_TEST_ENABLED: 'true', NODE_ENV: 'production', ENTORNO: 'production',
   PAYMENT_PROVIDER: 'pixelpay', PIXELPAY_IMPLEMENTATION: 'sdk', PIXELPAY_ENV: 'live',
   PIXELPAY_ENDPOINT: 'https://pixelpay.app', PIXELPAY_APP_URL: 'https://pixelpay.app',
   PUBLIC_BOOKING_ENABLED: 'false', PUBLIC_VIP_PURCHASE_ENABLED: 'false',
-  PRIVATE_COMMERCE_PILOT_ENABLED: 'true' };
+  PRIVATE_COMMERCE_PILOT_ENABLED: 'false' };
 const now = Date.parse('2026-11-19T23:10:00Z');
 const freshIntent = { id_intent: ID, estado_intent_codigo: 'link_generado',
   created_at: new Date(now + 1000), monto_hnl: 200, moneda_codigo: 'HNL',
@@ -32,9 +32,10 @@ test('Live requires private IP/account plus Live SDK; public booking and QA stay
     [{ ...env, NODE_ENV: 'development' }, privateAccess],
     [{ ...env, PUBLIC_BOOKING_ENABLED: 'true' }, privateAccess],
     [{ ...env, PUBLIC_VIP_PURCHASE_ENABLED: 'true' }, privateAccess],
+    [{ ...env, PRIVATE_COMMERCE_PILOT_ENABLED: 'true' }, privateAccess],
     [{ ...env, PIXELPAY_ENDPOINT: 'https://pixelpay.dev' }, privateAccess],
     [{ ...env, PIXELPAY_LIVE_3DS_TEST_ENABLED: 'true', QA_PIXELPAY_DELEGATED_ENABLED: 'true' }, privateAccess],
-    [env, { ...privateAccess, enabled: false }],
+    [env, { ...privateAccess, enabled: true }],
     [env, { ...privateAccess, userIds: [ID, ID] }],
     [env, { ...privateAccess, ips: [] }],
   ]) assert.throws(() => resolveLive3dsDirectConfig(badEnv, badPrivate, { now }));
