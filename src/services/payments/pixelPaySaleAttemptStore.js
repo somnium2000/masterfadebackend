@@ -148,8 +148,21 @@ export async function finalizePixelPaySaleAttemptBestEffort(pool, dto, logger) {
   }
 }
 
-export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAttemptId, paymentUuid }) {
+export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAttemptId, paymentUuid, liveTest = false }) {
   const observed = safeObservedPaymentUuid(paymentUuid);
+  if (liveTest) {
+    // Persist the HTTP 202 before handing off the browser challenge.
+    // A crash/restart must not make unfinished Live 3DS eligible for external Status.
+    await pool.query(
+      `UPDATE app_private.pixelpay_sale_attempts
+       SET upstream_http_status = 202,
+           observed_payment_uuid_untrusted = COALESCE(observed_payment_uuid_untrusted, $3::varchar(80))
+       WHERE id_intent = $1::uuid AND payment_attempt_id = $2::uuid
+         AND finalized_at IS NULL`,
+      [requireUuid(idIntent), requireUuid(paymentAttemptId), observed],
+    );
+    return;
+  }
   if (!observed) return;
   await pool.query(
     `UPDATE app_private.pixelpay_sale_attempts SET observed_payment_uuid_untrusted = $3::varchar(80)

@@ -14,13 +14,22 @@ export function resolveQaDelegatedConfig(env, diagnostic) {
 
 export function createQaDelegatedAttempts({ config, makeAttempt = options => new DelegatedAttempt(options), now = Date.now }) {
   let live = null;
+  let consumedLiveTest = false;
   return {
     async start({ claim, owner, input, provider }) {
       const deadline = Math.min(new Date(claim.protectionExpiresAt).getTime(), config.until);
       const lifetimeMs = deadline - now();
-      if (live || !(lifetimeMs > 0) || claim.idIntent !== config.intentId || provider.env !== 'sandbox') {
+      const validIntent = config.liveTest
+        ? /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(claim.idIntent)
+        : claim.idIntent === config.intentId;
+      const validEnvironment = provider.env === (config.liveTest ? 'live' : 'sandbox');
+      if (live || !(lifetimeMs > 0) || !validIntent || !validEnvironment
+        || (config.liveTest && (consumedLiveTest || !Number.isFinite(claim.amount)
+          || claim.amount <= 0 || claim.amount > config.maxAmountHnl))) {
         throw new Error('PIXELPAY_DELEGATED_CONTEXT_UNAVAILABLE');
       }
+      // One real-money attempt per runtime; no automatic retry after close/errors.
+      if (config.liveTest) consumedLiveTest = true;
       const token = randomUUID();
       const worker = makeAttempt({
         workerUrl: new URL('./applicationWorker.js', import.meta.url),

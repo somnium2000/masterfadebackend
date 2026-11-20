@@ -3,6 +3,7 @@ import { AppError, sendError } from "../../../utils/errors.js";
 import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
 import { createQaDelegatedAttempts } from '../../../experimental/pixelpayDelegated/qaAttempts.js';
+import { assertLive3dsFreshIntent } from '../../../experimental/pixelpayDelegated/liveConfig.js';
 import { assertQa3dsCardAllowed, assertQa3dsFreshIntent, assertQa3dsInitialPayload, isQa3dsIntent, qa3dsWindowOpen, sanitizeQa3dsObservation } from '../../../services/payments/qaPixelPay3dsDiagnostic.js';
 import { loadPixelPayQaOrigin, pixelPayQaFlags } from '../../../services/payments/pixelPayQaOrigin.js';
 import {
@@ -1995,7 +1996,8 @@ export default async function publicPagosRoutes(app, options = {}) {
   }) : null;
   const isDelegatedIntent = id => Boolean(delegated && isQa3dsIntent(delegatedConfig, id));
   const delegatedFlags = id => isDelegatedIntent(id) && qa3dsWindowOpen(delegatedConfig)
-    ? { qa_3ds_delegated: true, qa_3ds_diagnostic: true } : {};
+    ? delegatedConfig?.liveTest ? { live_3ds_delegated: true }
+      : { qa_3ds_delegated: true, qa_3ds_diagnostic: true } : {};
   const pendingDelegated = { processed: false, pending_confirmation: true, booking_confirmed: false,
     estado_intent_codigo: 'pendiente_confirmacion' };
 
@@ -2003,7 +2005,13 @@ export default async function publicPagosRoutes(app, options = {}) {
     const diagnostics = { ...result.diagnostics, idIntent: claim.idIntent, paymentAttemptId: claim.paymentAttemptId,
       outcome: result.outcome, observedPaymentUuidUntrusted: result.observedPaymentUuid };
     if (!result.approved) {
-      await finalizePixelPaySaleAttemptBestEffort(app.db, diagnostics, request.log);
+      if (delegatedConfig?.liveTest && claim.liveTestHad202) {
+        // Preserve the durable 202 marker after an uncertain native continuation;
+        // otherwise Status could become externally consultable after restart.
+        request.log.warn({ event: 'pixelpay_live_3ds_manual_reconciliation', id_intent: claim.idIntent });
+      } else {
+        await finalizePixelPaySaleAttemptBestEffort(app.db, diagnostics, request.log);
+      }
       return pendingDelegated;
     }
     const client = await app.db.connect();
@@ -2557,6 +2565,7 @@ export default async function publicPagosRoutes(app, options = {}) {
     const qa3dsTarget = isQa3dsIntent(app.qaPixelPay3dsDiagnostic, request.body?.id_intent);
     // AM: Stop the retired Node/React protocol before reserving or dispatching a new operation.
     const useDelegated = isDelegatedIntent(request.body?.id_intent);
+    const useLiveDelegated = useDelegated && delegatedConfig?.liveTest === true;
     if (!useDelegated && (qa3dsTarget || app.qaPixelPay3dsDiagnostic?.enabled === true)) {
       throw new AppError(503, 'El pago con autenticacion no esta disponible.', { code: 'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE' });
     }
@@ -2621,6 +2630,11 @@ export default async function publicPagosRoutes(app, options = {}) {
         assertQa3dsFreshIntent(app.qaPixelPay3dsDiagnostic, intent, totalHnl, history.rows[0]?.attempted !== false);
         if (useDelegated) assertPixelPaySandboxCardAllowed(request.body.card_number);
         else assertQa3dsCardAllowed(request.body.card_number, app.qaPixelPay3dsDiagnostic);
+      }
+      if (useLiveDelegated) {
+        const history = await dbClient.query(
+          'SELECT EXISTS(SELECT 1 FROM app_private.pixelpay_sale_attempts WHERE id_intent=$1::uuid) AS attempted', [idIntent]);
+        assertLive3dsFreshIntent(delegatedConfig, intent, totalHnl, history.rows[0]?.attempted === true);
       }
       if (safeText(intent.provider_code)?.toLowerCase() !== "pixelpay") {
         throw new AppError(409, "El intent no pertenece a PixelPay", {
@@ -2718,11 +2732,14 @@ export default async function publicPagosRoutes(app, options = {}) {
           reply.header('Cache-Control', 'private, no-store');
           try {
             const { result, deadline, token } = await delegated.start({ claim, input, provider, owner: access.owner.usuarioId });
+            if (useLiveDelegated && result.state === 'challenge') claim.liveTestHad202 = true;
             if (result.final) {
               const settled = await persistDelegatedResult(claim, result.final, request, access.owner);
               return sendOk(reply, settled, { statusCode: settled.booking_confirmed ? 200 : 202 });
             }
-            await recordDelegatedStatusCandidate(app.db, { ...claim, paymentUuid: result.observedPaymentUuid });
+            await recordDelegatedStatusCandidate(app.db, {
+              ...claim, paymentUuid: result.observedPaymentUuid, liveTest: useLiveDelegated,
+            });
             const handoff = result.state === 'challenge' && result.continuation_mode === 'direct_api' ? {
               state: result.state, order: result.order, sdk: result.sdk, continuation: result.continuation,
               continuation_mode: result.continuation_mode, token, expiresAt: deadline,
@@ -3167,7 +3184,9 @@ export default async function publicPagosRoutes(app, options = {}) {
             ...(app.qaPixelPay3dsDiagnostic.sessionMode ? { qa_sandbox_session: true } : {}) } : {}),
         ...(isDelegatedIntent(idIntent) && qa3dsWindowOpen(delegatedConfig)
           && ['link_generado', 'pendiente_confirmacion', 'expirado'].includes(intentState)
-          ? { qa_3ds_delegated: true } : {}),
+          && (!delegatedConfig?.liveTest || Date.parse(intent.created_at) >= delegatedConfig.since)
+          ? delegatedConfig?.liveTest ? { live_3ds_delegated: true }
+            : { qa_3ds_delegated: true } : {}),
       });
     } catch (error) {
       if (error instanceof AppError) {
