@@ -309,12 +309,13 @@ export default fp(async function privateCommerce(app) {
       || (available.publicVipPurchase && PUBLIC_VIP_ROUTES.has(route));
     if (publicAdmission ? await publicClient(request, reply) : await eligible(request, reply)) {
       if (!publicAdmission && live3ds?.enabled && !config.qaCapabilities) {
-        // Live test: permit only booking + one Sale + SDK continuation.
-        // No VIP purchase, simulator, external Status or broad public routes.
-        const allowedLiveRoute = (QA_SANDBOX_BOOKING_ROUTES.has(route)
-          && !route.endsWith('/pixelpay/status'))
-          || QA_SANDBOX_SALE_ROUTES.has(route)
-          || route === 'POST /v1/pagos/reservas/pixelpay/3ds/delegated';
+        // No VIP, simulator, external Status or broad public routes.
+        // After the 30-minute window only local-state recovery remains.
+        const recoveryOnly = route === 'POST /v1/pagos/reservas/estado';
+        const allowedLiveRoute = recoveryOnly || (qa3dsWindowOpen(live3ds)
+          && ((QA_SANDBOX_BOOKING_ROUTES.has(route) && !route.endsWith('/pixelpay/status'))
+            || QA_SANDBOX_SALE_ROUTES.has(route)
+            || route === 'POST /v1/pagos/reservas/pixelpay/3ds/delegated'));
         if (!allowedLiveRoute) {
           return sendError(reply, 403, 'Operacion comercial no disponible.',
             { code: 'PRIVATE_COMMERCE_RESTRICTED' });
@@ -371,7 +372,8 @@ export default fp(async function privateCommerce(app) {
       ...(qaBooking.enabled ? { pixelpaySale: allowed && qaSale.enabled,
         pixelpay3dsDiagnostic: false,
         pixelpaySongbirdBridge: false } : {}),
-      ...(live3ds ? { booking: allowed, vipPurchase: false,
-        pixelpaySale: allowed, pixelpayLive3ds: allowed } : {}) } };
+      ...(live3ds ? { booking: allowed && qa3dsWindowOpen(live3ds), vipPurchase: false,
+        pixelpaySale: allowed && qa3dsWindowOpen(live3ds),
+        pixelpayLive3ds: allowed && qa3dsWindowOpen(live3ds) } : {}) } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });
