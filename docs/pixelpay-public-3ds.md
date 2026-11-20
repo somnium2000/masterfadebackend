@@ -11,6 +11,24 @@ Los accesos del piloto privado se configuran por separado.
 
 ## Contrato Direct API
 
+Los destinos iniciales de los formularios se validan según el entorno de
+PixelPay. Live usa `https://client.cardinaltrusted.com` y Sandbox usa
+`https://cas.client.cardinaltrusted.com`. Collect admite
+`/centinelapi/V1/Cruise/Collect` y `/centinelapi/V2/Cruise/Collect`.
+StepUp solo admite `/centinelapi/V2/Cruise/StepUp`.
+[Visa Acceptance KA-09648](https://support.visaacceptance.com/knowledgebase/Knowledgearticle/?code=KA-09648).
+
+La lista exige ruta literal y bloquea puertos distintos de 443, credenciales,
+fragmentos y parámetros de consulta, incluidas URLs de retorno inyectadas.
+El evento de colección debe llegar desde el origen admitido y el iframe de
+la colección. El callback de StepUp conserva su propio origen PixelPay y
+la comprobación de iframe. Las pruebas sintéticas verifican los destinos
+iniciales y los mensajes, sin navegar a Cardinal o al emisor.
+
+El registro Live del 20/11/2026 contiene el origen y la longitud, pero omite
+la ruta. Las dos URLs documentadas de Collect Live miden 64 caracteres.
+Se prueban las dos en el worker y se reproduce Collect V1 de punta a punta.
+
 1. El navegador anuncia `supports_public_3ds` tras comprobar que carga el SDK.
    Backend toma el claim durable y ejecuta la Sale con la orden, importe y moneda
    canónicos y el SDK 2.5.8. Una Sale con respuesta financiera final verificable

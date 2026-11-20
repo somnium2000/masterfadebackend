@@ -17,18 +17,21 @@ const RESPONSE_FIELDS = ['identifier', 'continue_url', 'continue_payload', 'wind
 const fail = () => { throw new Error('PROTOTYPE_REQUEST_REJECTED'); };
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const opaque = (value, max = 32768) => typeof value === 'string' && value.length > 0 && value.length <= max;
-const CAS_COLLECTION = new Set([
-  'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect',
-  'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/Collect',
+const COLLECTION_PATHS = ['/centinelapi/V1/Cruise/Collect', '/centinelapi/V2/Cruise/Collect'];
+const STEP_UP_PATHS = ['/centinelapi/V2/Cruise/StepUp'];
+const CARDINAL_HOSTS = new Map([
+  ['sandbox', 'cas.client.cardinaltrusted.com'],
+  ['live', 'client.cardinaltrusted.com'],
 ]);
-const CAS_STEP_UP = new Set(['https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp']);
 
-function allowedCasUrl(value, targets) {
-  if (!opaque(value, 2048) || !/^https:\/\/[^/]/i.test(value) || /[\p{Cc}\s\\#]/u.test(value)) return false;
-  try {
-    const url = new URL(value);
-    return !url.username && !url.password && targets.has(`${url.origin}${url.pathname}`);
-  } catch { return false; }
+function allowedCardinalUrl(value, paths, environment) {
+  if (!opaque(value, 2048) || /[\p{Cc}\s\\#]/u.test(value)) return false;
+  // AM: Match the documented POST target before URL normalization can rewrite the path.
+  const parts = /^https:\/\/([^/?#]+)(\/[^?#]*)$/i.exec(value);
+  const host = CARDINAL_HOSTS.get(environment);
+  if (!parts || !host) return false;
+  const authority = parts[1].toLowerCase();
+  return (authority === host || authority === `${host}:443`) && paths.includes(parts[2]);
 }
 
 function allowedSongbirdUrl(value) {
@@ -39,19 +42,19 @@ function allowedSongbirdUrl(value) {
   } catch { return false; }
 }
 
-function collectionError(data) {
+function collectionError(data, environment) {
   if (data == null || !Object.hasOwn(data, 'collection_url')) return 'PIXELPAY_3DS_COLLECTION_URL_ABSENT';
   if (data.collection_url === null) return 'PIXELPAY_3DS_COLLECTION_URL_NULL';
   if (data.collection_url === '') return 'PIXELPAY_3DS_COLLECTION_URL_EMPTY';
-  if (!allowedCasUrl(data.collection_url, CAS_COLLECTION)) return 'PIXELPAY_3DS_COLLECTION_URL_INVALID';
+  if (!allowedCardinalUrl(data.collection_url, COLLECTION_PATHS, environment)) return 'PIXELPAY_3DS_COLLECTION_URL_INVALID';
   return null;
 }
 
-function lookupAccepted(response, mode) {
+function lookupAccepted(response, mode, environment) {
   const data = response.data;
   if (response.success !== true || !opaque(data?.identifier, 160)) return false;
   if (response.action === 'continue') {
-    const validUrl = mode === 'direct_api' ? allowedCasUrl(data.continue_url, CAS_STEP_UP)
+    const validUrl = mode === 'direct_api' ? allowedCardinalUrl(data.continue_url, STEP_UP_PATHS, environment)
       : allowedSongbirdUrl(data.continue_url);
     return [200, 202].includes(response.status) && validUrl && opaque(data.continue_payload)
       && (mode === 'direct_api' || opaque(data.transaction_id, 160));
@@ -189,7 +192,7 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
             const hasCollection = captured.data != null && Object.hasOwn(captured.data, 'collection_url');
             const misplacedCollection = captureDiagnostic?.raw_top_level_collection_url?.present === true;
             const code = captured.data?.transaction_type !== 'songbird' || !opaque(captured.data?.payload)
-              ? 'PIXELPAY_3DS_CONTINUATION_INVALID' : hasCollection ? collectionError(captured.data)
+              ? 'PIXELPAY_3DS_CONTINUATION_INVALID' : hasCollection ? collectionError(captured.data, config.env)
                 : misplacedCollection ? 'PIXELPAY_3DS_COLLECTION_URL_ABSENT' : null;
             if (code) {
               state = 'unsupported';
@@ -219,7 +222,7 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
           if (continuationMode === 'direct_api' || (!application && captured?.data?.collection_url)) lookup.card_cvv = request.card_cvv;
           for (const key of ['reference', ...EMV]) if (data[key] !== undefined) lookup[key] = data[key];
           const response = await service.authenticationLookup(lookup);
-          lookupVerified = application && lookupAccepted(response, continuationMode);
+          lookupVerified = application && lookupAccepted(response, continuationMode, config.env);
           if (publicContinuation && lookupVerified) {
             lookupVerified = response.status === 202 ? response instanceof sdk.Responses.PayloadResponse
               : response instanceof sdk.Responses.SuccessResponse;

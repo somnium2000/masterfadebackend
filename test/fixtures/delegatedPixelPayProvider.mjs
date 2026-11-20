@@ -20,6 +20,7 @@ export function installSyntheticProvider(context) {
   if (typeof globalThis.window !== 'undefined' || typeof globalThis.document !== 'undefined') throw new Error('NODE_DOM_FORBIDDEN');
   const nativeConnect = net.Socket.prototype.connect, nativeFetch = globalThis.fetch, adapter = axios.defaults.adapter;
   const merchant = nacl.box.keyPair();
+  const cardinalHost = context.config.env === 'live' ? 'client.cardinaltrusted.com' : 'cas.client.cardinaltrusted.com';
   const songbird = context.scenario.startsWith('songbird');
   const flowScenario = context.scenario === 'songbird' ? 'challenge' : context.scenario.replace(/^songbird-/, '');
   const stats = { externalSockets: 0, initialSales: 0, retries: 0, lookups: 0, continues: 0,
@@ -82,11 +83,12 @@ export function installSyntheticProvider(context) {
         const cvv = nonce && nacl.box.open(decode(box), decode(nonce), decode(config.headers['x-auth-secure']), merchant.secretKey);
         stats.directLookupCvvMatches = Boolean(cvv && Buffer.from(cvv).toString() === context.input.card.cvv);
       }
-      const challengeUrl = context.application && !songbird ? 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F'
+      const challengeUrl = context.application && !songbird ? `https://${cardinalHost}/centinelapi/V2/Cruise/StepUp`
         : 'https://acs.offline.invalid';
       return reply(context.application && !flowScenario.startsWith('frictionless') && flowScenario !== 'challenge-http-200' ? 202 : 200, {
         identifier: flowScenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
-        continue_url: songbird && Object.hasOwn(context, 'songbirdChallengeUrl') ? context.songbirdChallengeUrl
+        continue_url: !songbird && Object.hasOwn(context, 'stepUpUrl') ? context.stepUpUrl
+          : songbird && Object.hasOwn(context, 'songbirdChallengeUrl') ? context.songbirdChallengeUrl
           : flowScenario === 'invalid-step-up' ? songbird ? 'http://acs.offline.invalid' : 'https://acs.offline.invalid'
           : flowScenario === 'invalid-step-up-userinfo' ? 'https://user:password@acs.offline.invalid' : challengeUrl,
         continue_payload: flowScenario === 'invalid-continue-payload' ? {} : 'opaque.+/=%ñ',
@@ -98,19 +100,19 @@ export function installSyntheticProvider(context) {
       stats.initialSales++;
       if (context.scenario !== 'no-3ds') {
         const collectionPathVersion = context.scenario === 'challenge-http-200' ? 'V2' : 'V1';
-        const collectionUrl = `https://cas.client.cardinaltrusted.com/centinelapi/${collectionPathVersion}/Cruise/Collect?n=%2B%2F`;
+        const collectionUrl = `https://${cardinalHost}/centinelapi/${collectionPathVersion}/Cruise/Collect`;
         const collection = {
           'collection-absent': undefined, 'collection-top-level': undefined, 'collection-null': null,
           'collection-empty': '', 'collection-object': { url: collectionUrl },
           'collection-untrusted': 'https://example.invalid/collection',
           'collection-invalid-path': 'https://cas.client.cardinaltrusted.com/other',
-          'collection-uppercase': collectionUrl.replace('cas.client.cardinaltrusted.com', 'CAS.CLIENT.CARDINALTRUSTED.COM'),
+          'collection-uppercase': collectionUrl.replace(cardinalHost, cardinalHost.toUpperCase()),
           'collection-port443': collectionUrl.replace('.com/', '.com:443/'),
           'collection-wrong-port': collectionUrl.replace('.com/', '.com:444/'),
           'collection-userinfo': collectionUrl.replace('https://', 'https://user:password@'),
           'collection-fragment': `${collectionUrl}#fragment`,
           'collection-v3': collectionUrl.replace('/V1/', '/V3/'),
-          'collection-trailing-slash': collectionUrl.replace('/Collect?', '/Collect/?'),
+          'collection-trailing-slash': collectionUrl + '/',
         };
         const collectionValue = Object.hasOwn(context, 'collectionUrl') ? context.collectionUrl
           : Object.hasOwn(collection, context.scenario) ? collection[context.scenario] : collectionUrl;

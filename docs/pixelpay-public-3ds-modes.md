@@ -4,10 +4,10 @@ La sesión pública distingue dos contratos del SDK 2.5.8 después del HTTP 202 
 
 | Respuesta 202 admitida | Modalidad | Navegador | Continuación Node |
 | --- | --- | --- | --- |
-| `transaction_type=songbird`, payload opaco y `data.collection_url` CAS válida | `direct_api` | `manager.init(payload, collection_url)`, Collect, lookup, StepUp si procede | retry nativo con identificador del lookup |
+| `transaction_type=songbird`, payload opaco y `data.collection_url` Cardinal válida para el entorno | `direct_api` | `manager.init(payload, collection_url)`, Collect, lookup, StepUp si procede | retry nativo con identificador del lookup |
 | `transaction_type=songbird`, payload opaco y propiedad `collection_url` ausente | `songbird` | `manager.init(payload)`, Cardinal.setup init, lookup, Cardinal.continue si procede | authenticationContinue aceptado, luego retry nativo |
 
-Las propiedades presentes con null, cadena vacía, tipo incorrecto o URL rechazada no pasan a Songbird. Una colección mal colocada en el nivel superior también se rechaza. La normalización de URL admite host sin distinción de mayúsculas y puerto HTTPS predeterminado, conservando origen y ruta CAS permitidos y el valor original para el SDK. No admite credenciales, fragmentos, espacios ni barras invertidas.
+Las propiedades presentes con null, cadena vacía, tipo incorrecto o URL rechazada no pasan a Songbird. Una colección mal colocada en el nivel superior también se rechaza. La normalización de URL admite host sin distinción de mayúsculas y puerto HTTPS predeterminado, conservando origen y ruta Cardinal permitidos y el valor original para el SDK. Exige las rutas literales de Collect V1/V2 y StepUp V2, sin consulta, credenciales, fragmentos, espacios ni barras invertidas. Live usa client.cardinaltrusted.com y Sandbox usa cas.client.cardinaltrusted.com.
 
 Songbird acepta lookup nativo 200 o 202 con success y action=continue, identificador, URL HTTPS de desafío, payload y transaction_id válidos. La modalidad frictionless 200 no necesita authenticationContinue. El desafío Songbird sí exige respuesta nativa 200/success/action=null de authenticationContinue antes del retry. Ese resultado no constituye aprobación financiera.
 
