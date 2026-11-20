@@ -119,8 +119,13 @@ permisos Sandbox por identidad y sus credenciales QA separados de Live.
    completas del proveedor.
 4. En SSH consultar los logs del servicio backend por `id_intent`; correlacionar
    `paymentAttemptId` en `pixelpay_public_3ds_phase`. Observar
-   `handoff_ready` → `challenge_ready` o `frictionless_ready` →
+   `start_result` con `continuation_diagnostic`, seguido de `handoff_ready` →
+   `challenge_ready` o `frictionless_ready` →
    `continuation_dispatched` → `continuation_result` con estado HTTP seguro.
+   Un `start_failed` conserva la etapa fija donde no pudo iniciarse el flujo.
+   `unsupported` identifica una admisión rechazada; su submotivo se conoce
+   únicamente si está presente el código de diagnóstico. El tamaño de una
+   respuesta anterior no permite recuperar ese código retroactivamente.
    Si cae la conexión puede quedar únicamente `continuation_dispatched`: el
    estado financiero sigue pendiente. Los estados del navegador y el marcador
    de despacho son indicadores de progreso. La evidencia final es el estado
@@ -134,7 +139,8 @@ permisos Sandbox por identidad y sus credenciales QA separados de Live.
 ### Filtro SSH de la ventana Live
 
 Ejecutar en el VPS con el nombre del servicio Live ya verificado y el UUID
-interno del intento. El filtro imprime únicamente fases y metadatos operativos.
+interno del intento. El filtro imprime únicamente fases y metadatos permitidos,
+incluidos los diagnósticos de inicio. Omite valores opacos, URLs y errores libres.
 
 ```bash
 python3 - 'SERVICIO_BACKEND_LIVE' 'UUID_INTERNO_DEL_INTENTO' <<'PY'
@@ -146,9 +152,53 @@ from uuid import UUID
 service = sys.argv[1]
 intent = str(UUID(sys.argv[2]))
 phases = {
+    'start_result', 'start_failed',
     'handoff_ready', 'challenge_ready', 'frictionless_ready',
     'lookup_incomplete', 'continuation_dispatched', 'continuation_result',
+    'lookup_failed', 'authentication_continue_ready', 'authentication_continue_incomplete',
+    'authentication_continue_failed', 'continuation_failed',
 }
+diagnostic_codes = {
+    'PIXELPAY_3DS_COLLECTION_URL_ABSENT', 'PIXELPAY_3DS_COLLECTION_URL_NULL',
+    'PIXELPAY_3DS_COLLECTION_URL_EMPTY', 'PIXELPAY_3DS_COLLECTION_URL_INVALID',
+    'PIXELPAY_3DS_CONTINUATION_INVALID', 'PIXELPAY_3DS_COLLECTION_READY',
+    'PIXELPAY_3DS_SONGBIRD_READY',
+}
+field_types = {'absent', 'null', 'empty_string', 'array', 'string', 'object',
+               'number', 'boolean', 'undefined'}
+fields = ('collection_url', 'payload', 'transaction_type')
+
+def allowed(value, choices):
+    return value if type(value) is str and value in choices else None
+
+def status(value):
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+def shape(value):
+    value = value if type(value) is dict else {}
+    present, length = value.get('present'), value.get('length')
+    return dict(present=present if type(present) is bool else None,
+                type=allowed(value.get('type'), field_types),
+                length=length if type(length) is int and 0 <= length <= 9007199254740991 else None)
+
+def diagnostic(value):
+    value = value if type(value) is dict else {}
+    result = dict(code=allowed(value.get('code'), diagnostic_codes),
+                  upstream_http_status=status(value.get('upstream_http_status')),
+                  sale_environment=allowed(value.get('sale_environment'), {'sandbox', 'staging', 'live'}),
+                  raw_top_level_collection_url=shape(value.get('raw_top_level_collection_url')))
+    for boundary in ('raw_data', 'sdk_data'):
+        data = value.get(boundary)
+        data = data if type(data) is dict else {}
+        result[boundary] = {field: shape(data.get(field)) for field in fields}
+        result[boundary]['transaction_type_kind'] = allowed(data.get('transaction_type_kind'),
+                                                           {'payload', 'songbird', 'router'})
+    for boundary in ('raw_to_sdk_equal', 'sdk_to_handoff_equal'):
+        data = value.get(boundary)
+        result[boundary] = {field: data.get(field) if type(data.get(field)) is bool else None
+                            for field in fields} if type(data) is dict else None
+    return result
+
 cmd = ['docker', 'service', 'logs', '--raw', '--timestamps', '--since', '15m', service]
 with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as logs:
     for line in logs.stdout:
@@ -163,9 +213,18 @@ with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, tex
             attempt = str(UUID(event.get('paymentAttemptId', '')))
         except (AttributeError, TypeError, ValueError):
             continue
-        status = event.get('upstream_status')
-        print(json.dumps(dict(utc=timestamp, id_intent=intent, paymentAttemptId=attempt,
-                              phase=phase, http=status if type(status) is int else None)))
+        result = dict(utc=timestamp, id_intent=intent, paymentAttemptId=attempt,
+                      phase=phase, http=status(event.get('upstream_status')))
+        if phase == 'start_result':
+            result['state'] = allowed(event.get('state'),
+                                      {'challenge', 'unsupported', 'completed_without_3ds', 'unknown'})
+            if 'continuation_diagnostic' in event:
+                result['continuation_diagnostic'] = diagnostic(event['continuation_diagnostic'])
+        if phase == 'start_failed':
+            result['stage'] = allowed(event.get('stage'),
+                                      {'worker_construction', 'worker_start', 'durable_record', 'context_check'})
+            result['code'] = allowed(event.get('code'), {'PIXELPAY_PUBLIC_3DS_START_UNCERTAIN'})
+        print(json.dumps(result))
     print(json.dumps(dict(docker_exit_code=logs.wait())))
 PY
 ```
