@@ -2,9 +2,12 @@
 
 El flujo está disponible como candidato **Sandbox por identidad**. La ruta con desafío puede
 llegar al iframe. El envío financiero posterior al desafío se mantiene bloqueado hasta
-verificar el contrato de PixelPay para esa transición. Las rutas públicas Live responden
-antes de reclamar la Sale mientras esa integración esté incompleta. El modo privado de
-prueba Live conserva su configuración y sus límites históricos.
+verificar el contrato de PixelPay para esa transición. El backend devuelve **HTTP 503
+`PIXELPAY_PUBLIC_3DS_UNAVAILABLE` antes del claim o de la Sale para reservas y VIP
+admitidos públicamente en Live, incluso con `PIXELPAY_PUBLIC_3DS_ENABLED=false`**.
+Poner esa bandera en `true` en Live tampoco abre el checkout. El candidato solo
+admite su activación en el perfil QA Sandbox. El modo privado de prueba Live
+conserva su configuración y sus límites históricos.
 
 ## Contrato
 
@@ -77,17 +80,121 @@ existentes. No hay DDL nuevo.
    retira este backend, mantener cerradas las admisiones públicas Live durante el
    rollback para evitar volver a ofrecer un checkout que se detiene en 202.
 
-## Evidencia de PixelPay pendiente
+## Evidencia de la continuación en SDK 2.5.8
 
-El SDK 2.5.8 espera pixelpay_continue del iframe antes del retryTransaction() de
-la ruta con desafío. El identificador del lookup ya es visible en el navegador.
-Falta un artefacto de finalización verificable en backend y vinculado al intento,
-o confirmación explícita de que PixelPay verifica el desafío, rechaza un envío
-prematuro y deduplica la continuación en la misma orden y contexto cifrado.
-Tampoco se verificó que todas las respuestas finales para la cuenta incluyan la
-evidencia requerida. Un test sintético no acredita el comportamiento remoto Live.
+1. En Direct API, `CardinalManager.handleDirectApiLookup()` ejecuta el lookup y
+   toma `lookup_response.data.identifier`. `validationLookupResponse()` lo copia
+   a `transaction.authentication_identifier`. Con `action=continue`, el SDK
+   envía `continue_payload` como campo `JWT` de un formulario POST a
+   `continue_url`, con `MD` opcional cuando existe valor. Ese JWT inicia StepUp.
+2. El listener nativo acepta el mensaje `pixelpay_continue` del endpoint de PixelPay.
+   `handleDirectApiContinue()` lee `event.data.error` e `event.data.identifier`,
+   rechaza un error o un identificador ausente, y copia el identificador del mensaje
+   a `manager.identifier`. El adaptador de MasterFade además exige el origen esperado
+   y la ventana del iframe de StepUp. Eso protege la interfaz del navegador.
+3. El handler Direct API llama a `retryTransaction(this.transaction)` y esta
+   instancia conserva `authentication_identifier` del **lookup**. El identificador
+   del mensaje no se copia al modelo de Sale. El SDK realiza `doBeforeExecute()`
+   y repite `POST api/v2/transaction/sale` con el modelo original, la orden,
+   el contexto de cifrado y los encabezados del comercio. El mensaje de StepUp
+   no se envía en el POST. En el adaptador actual, React solicita la operación
+   `retry` con `data: {}` y el worker conserva la instancia original.
+4. En el flujo Songbird sin Direct API, `payments.validated` puede entregar un JWT
+   a `authenticationContinue()` con `identifier` y `payload`. Esa ruta no
+   acredita que Direct API deba llamar al mismo método ni que su respuesta confirme
+   un pago.
 
-Referencias oficiales
+La firma de la solicitud y el token del handoff vinculan la operación local a la
+orden y al titular. El mensaje de StepUp es una señal del navegador y la información
+observada hasta ahora no acredita cómo verificarla desde el servidor. El
+`runningTransaction` del SDK y el claim de MasterFade contienen duplicados locales.
+La idempotencia remota, el cierre de la autenticación y la confirmación financiera
+requieren evidencia independiente. MasterFade solo concilia desde una respuesta
+financiera del proveedor con resultado aprobado, importe, moneda, orden,
+identificadores y hash o firma válidos. El hash del SDK vincula la orden al comercio
+y no autentica por sí solo el resultado del desafío.
 
-- [Peticiones del SDK](https://docs.pixelpay.dev/page/sdk/requests)
+En el ticket de soporte #9834, PixelPay indicó que el backend ejecuta la
+continuación financiera después de completar el desafío y debe conservar
+`order_id` durante todo el ciclo. También confirmó que el `payment_uuid` de
+un 202 pendiente de 3DS aún no es consultable con `getStatus()`. La confirmación
+de que los 202 históricos consultados no generaron cargos corresponde a esos
+intentos concretos. El ticket no define un verificador server-to-server de StepUp,
+el resultado de un retry prematuro ni la deduplicación de esa continuación.
+
+### Preguntas para PixelPay
+
+1. **Autenticación.** Para un `authenticationLookup()` que devuelve
+   `action=continue`, ¿qué evidencia puede verificar un backend antes de invocar
+   `retryTransaction()`? Indicar método y endpoint, campos de entrada, respuesta
+   de autenticación completada y, si existe un comprobante firmado, emisor,
+   audiencia, claves de verificación, vigencia y correlación. ¿Es
+   `pixelpay_continue.identifier` el mismo dato que `data.identifier` del
+   lookup? Si difieren, ¿cuál debe ir en `authentication_identifier`?
+2. **Validación de la continuación.** Si el POST con el identificador del lookup
+   es la interfaz soportada, ¿PixelPay verifica en el servidor que StepUp completó
+   con éxito para el mismo comercio, entorno, `order_id`, importe, moneda y
+   contexto de Sale original antes de cobrar? ¿Qué HTTP, clase de respuesta y campos
+   distinguen pendiente, rechazo, cancelación y expiración, sin cargo? ¿Qué papel
+   cumplen `data.transaction_id` del lookup y `payment_uuid` de la Sale inicial?
+3. **Duplicados y resultado incierto.** ¿Cuál es la clave de idempotencia remota y su
+   vigencia para el POST de continuación? Precisar uso de `order_id`,
+   `authentication_identifier`, `payment_uuid` o un encabezado dedicado. ¿Qué
+   responde si se repite en paralelo o después de un timeout que pudo haber
+   capturado? Indicar a partir de qué evidencia ya es válido consultar Status y con
+   cuál UUID, o qué evento firmado permite recuperar el desenlace.
+4. **Resultado financiero.** Compartir ejemplos sanitizados de aprobación y
+   rechazo con la clase HTTP y los campos finales `response_approved`,
+   `response_incomplete`, `response_code`, `order_id`, monedas, importes,
+   `payment_uuid`, `transaction_id` y `payment_hash`. ¿Qué identificadores
+   deben coincidir con la Sale inicial y cuáles pertenecen solo al lookup 3DS?
+   Si faltan campos de correlación, ¿qué fuente autenticada los acredita una vez
+   cerrada la autenticación?
+
+Estas preguntas se refieren al contrato del comercio y del SDK actual. La
+documentación consultada no permitió acreditar esa transición. La posibilidad de
+que PixelPay ofrezca una garantía o una interfaz adicional sigue abierta.
+
+Fuentes revisadas
+
+- Código instalado de `@pixelpay/sdk-core@2.5.8`. Incluye `CardinalManager.js`,
+  `CardinalAuthentication.js`, `PaymentTransaction.js` y `ServiceBehaviour.js`.
+- [Peticiones del SDK](https://docs.pixelpay.com/page/sdk/requests?locale=en)
 - [Firma de seguridad](https://docs.pixelpay.dev/page/secure-signature)
+- [Guía previa de MasterFade y registro del ticket #9834](qa-pixelpay-public-flow.md)
+
+## Requisitos pendientes para admitir Live
+
+Implementar y probar la admisión Live explícita por flujo para reservas y VIP una
+vez acreditada la transición. Debe conservar login, titularidad, CSRF, claim
+previo, resultado financiero verificable y confirmación única. Probar al menos
+StepUp válido, señal prematura o alterada, callback duplicado y respuesta perdida
+tras el despacho. Validar ambos recorridos con los controles del comercio Live.
+
+El candidato usa el menor plazo entre la protección del intento y 120 segundos.
+Una vez vencido, el token pierde acceso al contexto y la operación queda pendiente
+con el claim durable. Reiniciar el backend, perder el worker o caer en otra réplica
+produce la misma respuesta conservadora. El contexto queda en memoria y una
+repetición desde otra réplica no reconstruye los datos de tarjeta ni abre otra Sale.
+Para desplegar Live se debe acreditar y probar el enrutamiento hacia la réplica
+propietaria, incluidos los casos de despliegue y caída, o una reanudación respaldada
+por PixelPay que no requiera conservar PAN/CVV. Mientras no exista esa solución,
+el flujo de QA se valida con una sola réplica y recuperación local.
+
+## Alcance de las pruebas del navegador
+
+- El workflow de release del frontend para PR hacia `main` ejecuta
+  `node scripts/pixelpay-delegated-browser-bundle.mjs`. El script compila su entrada
+  parcial con Vite y `configFile: false`. Usa handoffs Sandbox sintéticos y JSDOM.
+  Es independiente del build Live de la aplicación, de las credenciales
+  y de un backend. Comprueba el SDK empaquetado, montaje del iframe, origen y
+  ventana, duplicados, cancelación, expiración e identificador serializado.
+- La prueba opt-in `React -> loopback HTTP` de `delegatedPixelPay.test.jsx`
+  requiere `PIXELPAY_PROTOTYPE_BACKEND` apuntando al worktree backend. Se ejecutó
+  **localmente** con Fastify en `127.0.0.1`, workers y SDK Node reales, transporte
+  PixelPay sintético y credenciales ficticias. Comprueba el prototipo Songbird,
+  el rechazo del token de otro intento, un inicio pese a doble clic, las fases
+  `start → lookup → continue → retry → status` y evidencia de aprobación del
+  fixture sin confirmar una reserva. No usa rutas públicas de MasterFade ni
+  acredita Direct API, compra VIP o certificación Live. El workflow de release
+  no define esa variable y omite ese caso.
