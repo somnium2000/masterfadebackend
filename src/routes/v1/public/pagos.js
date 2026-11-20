@@ -2005,7 +2005,13 @@ export default async function publicPagosRoutes(app, options = {}) {
     const diagnostics = { ...result.diagnostics, idIntent: claim.idIntent, paymentAttemptId: claim.paymentAttemptId,
       outcome: result.outcome, observedPaymentUuidUntrusted: result.observedPaymentUuid };
     if (!result.approved) {
-      await finalizePixelPaySaleAttemptBestEffort(app.db, diagnostics, request.log);
+      if (delegatedConfig?.liveTest && claim.liveTestHad202) {
+        // Preserve the durable 202 marker after an uncertain native continuation;
+        // otherwise Status could become externally consultable after restart.
+        request.log.warn({ event: 'pixelpay_live_3ds_manual_reconciliation', id_intent: claim.idIntent });
+      } else {
+        await finalizePixelPaySaleAttemptBestEffort(app.db, diagnostics, request.log);
+      }
       return pendingDelegated;
     }
     const client = await app.db.connect();
@@ -2726,6 +2732,7 @@ export default async function publicPagosRoutes(app, options = {}) {
           reply.header('Cache-Control', 'private, no-store');
           try {
             const { result, deadline, token } = await delegated.start({ claim, input, provider, owner: access.owner.usuarioId });
+            if (useLiveDelegated && result.state === 'challenge') claim.liveTestHad202 = true;
             if (result.final) {
               const settled = await persistDelegatedResult(claim, result.final, request, access.owner);
               return sendOk(reply, settled, { statusCode: settled.booking_confirmed ? 200 : 202 });
