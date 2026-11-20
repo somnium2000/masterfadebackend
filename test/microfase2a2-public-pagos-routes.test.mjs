@@ -4623,7 +4623,7 @@ test('Songbird interrupt telemetry accepts fixed reasons only and preserves lega
   assert.ok(phases.every(row=>row.id_intent===INTENT_A&&row.financial_finalization_enabled===false));
 });
 
-for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'frictionless-declined']) {
+for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'frictionless-declined', 'frictionless-timeout', 'frictionless-second202']) {
   test('public SDK booking securely handles ' + scenario, async t => {
     const client = diagnosticRouteClient({ optionsPublic3ds: true });
     const calls = [];
@@ -4664,6 +4664,11 @@ for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'frictionless-dec
         assert.equal(terminal.json().code, 'PIXELPAY_PUBLIC_3DS_PROOF_UNAVAILABLE');
         const status = await post('/status', { id_intent: INTENT_A, id_grupo_cita: GROUP_A, titular_email: payload.titular_email });
         assert.equal(status.statusCode, 202, status.body);
+      } else if (['frictionless-timeout', 'frictionless-second202'].includes(scenario)) {
+        assert.equal(terminal.json().data.payment.pending_confirmation, true);
+        assert.equal(client.getSaleAttempts()[0].upstream_http_status, 202);
+        const status = await post('/status', { id_intent: INTENT_A, id_grupo_cita: GROUP_A, titular_email: payload.titular_email });
+        assert.equal(status.statusCode, 202, status.body);
       } else if (scenario === 'frictionless-declined') {
         assert.equal(terminal.json().data.payment.estado_intent_codigo, 'fallido');
         assert.equal(client.getActiveIntent().estado_intent_codigo, 'fallido');
@@ -4672,7 +4677,7 @@ for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'frictionless-dec
     }
     assert.equal((await post('/sale', payload)).statusCode, 409);
     assert.equal(client.getSaleAttempts().length, 1);
-    assert.equal(client.getPayments().length, ['challenge', 'frictionless-declined'].includes(scenario) ? 0 : 1);
+    assert.equal(client.getPayments().length, ['no-3ds', 'frictionless'].includes(scenario) ? 1 : 0);
     assert.equal(statusCalls, 0);
     assert.deepEqual(calls, scenario === 'no-3ds' ? ['start'] : scenario === 'challenge' ? ['start', 'lookup'] : ['start', 'lookup', 'retry']);
   });

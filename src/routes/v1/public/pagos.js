@@ -2011,7 +2011,8 @@ export default async function publicPagosRoutes(app, options = {}) {
       if ((delegatedConfig?.liveTest && claim.liveTestHad202) || claim.public3dsHad202) {
         // Preserve the durable 202 marker after an uncertain native continuation;
         // otherwise Status could become externally consultable after restart.
-        request.log.warn({ event: 'pixelpay_live_3ds_manual_reconciliation', id_intent: claim.idIntent });
+        request.log.warn({ event: claim.public3ds ? 'pixelpay_public_3ds_manual_reconciliation'
+          : 'pixelpay_live_3ds_manual_reconciliation', id_intent: claim.idIntent });
       } else {
         await finalizePixelPaySaleAttemptBestEffort(app.db, diagnostics, request.log);
       }
@@ -2058,7 +2059,8 @@ export default async function publicPagosRoutes(app, options = {}) {
       return recovered.booking_confirmed === true ? recovered : pendingDelegated;
     } catch {
       await client.query('ROLLBACK').catch(() => {});
-      request.log.warn({ event: 'pixelpay_qa_delegated_recovery_required', id_intent: claim.idIntent });
+      request.log.warn({ event: claim.public3ds ? 'pixelpay_public_3ds_recovery_required'
+        : 'pixelpay_qa_delegated_recovery_required', id_intent: claim.idIntent });
       return pendingDelegated;
     } finally { client.release(); }
   }
