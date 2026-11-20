@@ -16,9 +16,9 @@ const malformed = [
   ['userinfo', 'https://synthetic:synthetic@acs.offline.invalid/challenge'],
 ];
 
-function attempt(t, scenario, extra = {}) {
+function attempt(t, scenario, extra = {}, environment = 'sandbox') {
   const context = { ...desktopContext('URL-CONTRACT', scenario), application: true, publicContinuation: true, ...extra };
-  Object.assign(context.config, { env: 'sandbox', endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev' });
+  if (environment === 'sandbox') Object.assign(context.config, { env: 'sandbox', endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev' });
   const worker = new DelegatedAttempt({ workerUrl: new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url), context });
   t.after(() => worker.close());
   return worker;
@@ -97,3 +97,57 @@ test('public Live configuration requires an unambiguous HTTPS origin for endpoin
     }
   }
 });
+
+const liveOrigin = 'https://client.cardinaltrusted.com';
+const casOrigin = 'https://cas.client.cardinaltrusted.com';
+const collect = '/centinelapi/V1/Cruise/Collect';
+const stepUp = '/centinelapi/V2/Cruise/StepUp';
+
+for (const version of ['V1', 'V2']) {
+  test(`Live admits official Collect ${version} and StepUp V2 via the native worker`, async t => {
+    const collectionUrl = liveOrigin + collect.replace('V1', version);
+    assert.equal(collectionUrl.length, 64);
+    const worker = attempt(t, 'challenge', { collectionUrl }, 'live');
+    const handoff = await worker.call('start');
+    assert.equal(handoff.continuation_mode, 'direct_api');
+    assert.equal(handoff.continuation.collection_url, collectionUrl);
+    assert.equal(handoff.continuation_diagnostic.raw_to_sdk_equal.collection_url, true);
+    const lookup = await worker.call('lookup', { reference: 'synthetic-reference' });
+    assert.equal(lookup.success, true);
+    assert.equal(lookup.data.continue_url, liveOrigin + stepUp);
+    assert.equal((await worker.call('inspect')).externalSockets, 0);
+  });
+}
+
+for (const [label, environment, collectionUrl] of [
+  ['CAS in Live', 'live', casOrigin + collect],
+  ['Live in CAS', 'sandbox', liveOrigin + collect],
+  ['StepUp as Collect', 'live', liveOrigin + stepUp],
+  ['cross-origin query', 'live', liveOrigin + collect + '?redirect=https://redirect.invalid'],
+  ['normalized path', 'live', liveOrigin + '/other/..' + collect],
+  ['lookalike domain', 'live', liveOrigin + '.invalid' + collect],
+  ['empty credentials', 'live', liveOrigin.replace('://', '://@') + collect],
+]) {
+  test(`Direct API rejects Collect ${label} without falling back`, async t => {
+    const worker = attempt(t, 'challenge', { collectionUrl }, environment);
+    const result = await worker.call('start');
+    assert.equal(result.state, 'unsupported');
+    assert.equal(result.continuation_diagnostic.code, 'PIXELPAY_3DS_COLLECTION_URL_INVALID');
+    assert.equal(result.continuation, undefined);
+    await assert.rejects(worker.call('lookup', { reference: 'synthetic-reference' }));
+    assert.equal((await worker.call('inspect')).externalSockets, 0);
+  });
+}
+
+for (const stepUpUrl of [casOrigin + stepUp, liveOrigin + collect, liveOrigin + stepUp + '?return=https://redirect.invalid']) {
+  test(`Live rejects mismatched StepUp destination ${stepUpUrl}`, async t => {
+    const worker = attempt(t, 'challenge', { stepUpUrl }, 'live');
+    assert.equal((await worker.call('start')).continuation_mode, 'direct_api');
+    assert.deepEqual(await worker.call('lookup', { reference: 'synthetic-reference' }), {
+      status: 202, success: false, action: null, data: {},
+    });
+    await assert.rejects(worker.call('retry'));
+    const stats = await worker.call('inspect');
+    assert.equal(stats.retries + stats.externalSockets, 0);
+  });
+}

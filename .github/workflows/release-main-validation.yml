@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   backend:
-    if: startsWith(github.head_ref, 'release/prod-') || github.head_ref == 'release/reconcile-main-dev-20261119' || github.head_ref == 'codex/pixelpay-public-3ds-integrated-20261120'
+    if: startsWith(github.head_ref, 'release/prod-') || github.head_ref == 'release/reconcile-main-dev-20261119' || github.head_ref == 'codex/pixelpay-public-3ds-integrated-20261120' || github.head_ref == 'codex/pixelpay-cardinal-origins-20261120'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:

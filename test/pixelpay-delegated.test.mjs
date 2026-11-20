@@ -139,7 +139,7 @@ test('QA native Direct API retries only after trusted lookup; PAID corroborates 
     const value = attempt(t, 'A', scenario, { application: true });
     const handoff = await value.call('start');
     assert.equal(handoff.continuation_mode, 'direct_api');
-    assert.equal(handoff.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect?n=%2B%2F');
+    assert.equal(handoff.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect');
     assert.equal(handoff.continuation.payload, 'opaque-setup-A');
     assert.deepEqual(handoff.continuation_diagnostic.sdk_to_handoff_equal, {
       collection_url: true, payload: true, transaction_type: true,
@@ -150,11 +150,11 @@ test('QA native Direct API retries only after trusted lookup; PAID corroborates 
     assert.equal(handoff.continuation_diagnostic.sale_origin, 'https://pixelpay.dev');
     assert.equal(handoff.continuation_diagnostic.sale_environment, 'sandbox');
     assert.equal(handoff.continuation_diagnostic.upstream_cf_ray, '0123456789abcdef-TPA');
-    assert.doesNotMatch(JSON.stringify(handoff.continuation_diagnostic), /opaque-setup-A|n=%2B|synthetic-secret/);
+    assert.doesNotMatch(JSON.stringify(handoff.continuation_diagnostic), /opaque-setup-A|\/Cruise\/Collect|synthetic-secret/);
     await assert.rejects(value.call('retry'));
     const response = await value.call('lookup', lookup);
     assert.deepEqual(response.data, {
-      identifier: 'auth-A', continue_url: 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F',
+      identifier: 'auth-A', continue_url: 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp',
       continue_payload: 'opaque.+/=%ñ', transaction_id: 'tx-A', window_size: '03',
     });
     assert.deepEqual(await value.call('lookup', lookup), response);
@@ -338,7 +338,7 @@ test('QA Direct API accepts a 200 challenge lookup and cannot retry after worker
   const value = attempt(t, 'A', 'challenge-http-200', { application: true });
   const start = await value.call('start');
   assert.equal(start.continuation_mode, 'direct_api');
-  assert.equal(start.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/Collect?n=%2B%2F');
+  assert.equal(start.continuation.collection_url, 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/Collect');
   const response = await value.call('lookup', lookup);
   assert.equal(response.status, 200);
   assert.equal(response.success, true);
