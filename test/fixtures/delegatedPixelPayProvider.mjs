@@ -74,11 +74,11 @@ export function installSyntheticProvider(context) {
       }
       const challengeUrl = context.application ? 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F'
         : 'https://acs.offline.invalid';
-      return reply(context.application && !['frictionless', 'challenge-http-200'].includes(context.scenario) ? 202 : 200, {
+      return reply(context.application && !['frictionless', 'frictionless-declined', 'challenge-http-200'].includes(context.scenario) ? 202 : 200, {
         identifier: context.scenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
         continue_url: context.scenario === 'invalid-step-up' ? 'https://acs.offline.invalid' : challengeUrl,
         continue_payload: 'opaque.+/=%ñ', transaction_id: `tx-${body.order_id}`, window_size: '03',
-      }, context.scenario === 'frictionless' ? null : 'continue', context.scenario !== 'lookup-not-successful');
+      }, ['frictionless', 'frictionless-declined'].includes(context.scenario) ? null : 'continue', context.scenario !== 'lookup-not-successful');
     }
     if (!config.url.endsWith('transaction/sale')) throw new Error('UNEXPECTED_ROUTE');
     if (!body.authentication_identifier) {
@@ -105,6 +105,7 @@ export function installSyntheticProvider(context) {
       if (body.authentication_identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
       await new Promise(resolve => setTimeout(resolve, 30));
       if (context.scenario === 'retry-timeout') throw new Error('SYNTHETIC_TIMEOUT');
+      if (context.scenario === 'frictionless-declined') return reply(402, {}, null, false);
     }
     return reply(200, ['nested-status', 'missing-status-currency'].includes(context.scenario) ? approvedData
       : { ...approvedData, order_id: body.order_id,

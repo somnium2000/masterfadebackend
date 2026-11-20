@@ -16,6 +16,10 @@ import {
   createPixelPaySaleAttemptRecord,
   finalizePixelPaySaleAttemptBestEffort,
 } from "./payments/pixelPaySaleAttemptStore.js";
+import {
+  buildPublicPixelPay3dsHandoff,
+  publicPixelPay3dsUnavailable,
+} from "./payments/publicPixelPay3ds.js";
 import { resolveTodoPagoSimulatedResponse } from "./payments/todopagoSimulatedResponses.js";
 
 const ACTIVE_STATUS = "activa";
@@ -35,6 +39,12 @@ const MEMBERSHIP_CONSUMPTION_TYPES = {
 const MEMBERSHIP_CONFIRMABLE_INTENT_STATES = new Set(["creado", "link_generado", "pendiente_confirmacion"]);
 const MEMBERSHIP_SIMULATOR_EVIDENCE = Symbol("membership-simulator-evidence");
 const MEMBERSHIP_PIXELPAY_EVIDENCE = Symbol("membership-pixelpay-evidence");
+const MEMBERSHIP_PIXELPAY_3DS_STARTED = "membership.pixelpay.3ds_started";
+const MEMBERSHIP_PIXELPAY_3DS_PENDING = Object.freeze({
+  processed: false,
+  pending_confirmation: true,
+  estado_intent_codigo: "pendiente_confirmacion",
+});
 // AM: Lista de errores SQL de compatibilidad de esquema (tabla/columna/tipo ausente).
 const SCHEMA_COMPATIBLE_ERROR_CODES = new Set(["42P01", "42703", "42704"]);
 // AM: Literal SQL seguro para fallback de beneficios cuando no existe la columna snapshot.
@@ -2182,6 +2192,16 @@ export async function reconcileMembershipPixelPayStatus(app, {
       await client.query("COMMIT");
       return { normalized_status: "PENDIENTE", estado_intent_codigo: intentState, reconciliation_required: true };
     }
+    // AM: La marca persiste aunque el worker desaparezca o se deshabilite el flujo.
+    const continuationClaim = await client.query(
+      `SELECT 1 FROM public.payment_events
+        WHERE id_intent = $1::uuid AND id_provider = $2::uuid AND evento_tipo = $3::text LIMIT 1`,
+      [safeIntentId, intent.id_provider, MEMBERSHIP_PIXELPAY_3DS_STARTED]
+    );
+    if (continuationClaim.rows?.[0]) {
+      await client.query("COMMIT");
+      return { normalized_status: "PENDIENTE", estado_intent_codigo: intentState, reconciliation_required: true };
+    }
     const claimed = await client.query(
       `UPDATE public.payment_intents
           SET last_verified_at = now(), verification_attempts = COALESCE(verification_attempts, 0) + 1,
@@ -2423,13 +2443,18 @@ export async function processMembershipPixelPaySale(app, {
   billing,
   requestId,
   logger,
+  userId,
+  supportsPublic3ds = false,
 } = {}) {
   const safeIntentId = normalizeText(idPaymentIntent);
   const safeClienteId = normalizeText(clienteId);
+  const public3ds = app.config?.publicCommerce?.vipPurchaseEnabled === true ? app.publicPixelPay3ds : null;
   assertPixelPayCardAllowedForEnvironment(card?.number, app.config?.pixelPayEnv);
   const paymentAttemptId = crypto.randomUUID();
-  let claimClient = await app.db.connect();
+  const claimClient = await app.db.connect();
   let intent;
+  let expiryMs;
+  let workerSlot;
   try {
     await claimClient.query("BEGIN");
     await claimClient.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [
@@ -2476,7 +2501,23 @@ export async function processMembershipPixelPaySale(app, {
         code: "MEMBERSHIP_PIXELPAY_SALE_ALREADY_IN_PROGRESS",
       });
     }
-    const expiryMs = Math.min(
+    if (public3ds) {
+      if (supportsPublic3ds !== true) throw publicPixelPay3dsUnavailable();
+      if (!userId || normalizeText(intent.id_usuario) !== normalizeText(userId)) {
+        throw new AppError(403, "La compra no pertenece al cliente autenticado", {
+          code: "MEMBERSHIP_PAYMENT_CONFIRM_FORBIDDEN",
+        });
+      }
+      if (intent.origen_pago_codigo !== "membership" || intent.estado_orden_codigo !== "pendiente_pago"
+        || !(toNumber(intent.monto_hnl, -1) > 0) || toNumber(intent.monto_hnl, -1) !== toNumber(intent.total_hnl, -2)
+        || intent.moneda_codigo !== "HNL" || intent.order_moneda_codigo !== "HNL"
+        || safeText(intent.provider_session_id) || safeText(intent.referencia_externa)) {
+        throw new AppError(409, "La orden de membresia ya no esta disponible para pago", {
+          code: "MEMBERSHIP_PAYMENT_ORDER_STATE_INVALID",
+        });
+      }
+    }
+    expiryMs = Math.min(
       new Date(intent.intent_expires_at).getTime(),
       new Date(intent.order_expires_at).getTime()
     );
@@ -2491,6 +2532,7 @@ export async function processMembershipPixelPaySale(app, {
         code: "MEMBERSHIP_PIXELPAY_CARD_EXPIRE_INVALID",
       });
     }
+    if (public3ds) workerSlot = public3ds.reserve();
     await createPixelPaySaleAttemptRecord(claimClient, {
       idIntent: safeIntentId,
       paymentAttemptId,
@@ -2512,8 +2554,18 @@ export async function processMembershipPixelPaySale(app, {
     if (!updated.rows[0]) throw new AppError(409, "Ya existe un cobro en curso para este intent", {
       code: "MEMBERSHIP_PIXELPAY_SALE_ALREADY_IN_PROGRESS",
     });
+    if (public3ds) {
+      await claimClient.query(
+        `INSERT INTO public.payment_events (
+           id_provider, provider_event_id, evento_tipo, firma_valida, payload_esencial, id_intent
+         ) VALUES ($1::uuid, $2::text, $3::text, FALSE, $4::jsonb, $5::uuid)`,
+        [intent.id_provider, `pixelpay_membership_3ds_${paymentAttemptId}`,
+          MEMBERSHIP_PIXELPAY_3DS_STARTED, { payment_attempt_id: paymentAttemptId }, safeIntentId]
+      );
+    }
     await claimClient.query("COMMIT");
   } catch (error) {
+    workerSlot?.release();
     await claimClient.query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
@@ -2522,11 +2574,15 @@ export async function processMembershipPixelPaySale(app, {
 
   let saleResult;
   const saleStartedAt = Date.now();
+  const settle = result => finalizeMembershipPixelPaySale(app, {
+    intent, saleResult: result, safeIntentId, safeClienteId, paymentAttemptId, requestId, logger, saleStartedAt,
+  });
   try {
     const planSnapshot = typeof intent.plan_snapshot === "string" ? JSON.parse(intent.plan_snapshot) : intent.plan_snapshot;
     const clienteSnapshot = typeof intent.cliente_snapshot === "string" ? JSON.parse(intent.cliente_snapshot) : intent.cliente_snapshot;
     const amount = toNumber(intent.monto_hnl, -1);
-    saleResult = await PaymentProviderFactory.create().sale({
+    const provider = PaymentProviderFactory.create();
+    const input = {
       orderId: `VIP-${intent.id_order}`,
       currency: safeText(intent.moneda_codigo) || "HNL",
       amount,
@@ -2535,8 +2591,29 @@ export async function processMembershipPixelPaySale(app, {
       card,
       billing,
       callbackUrl: app.config?.pixelPayOrderCallbackUrl || null,
-    }, { requestId, idIntent: safeIntentId, paymentAttemptId, logger });
+    };
+    if (public3ds) {
+      try {
+        const started = await public3ds.start({
+          kind: "membership",
+          claim: {
+            idIntent: safeIntentId, idGrupoCita: intent.id_order, paymentAttemptId,
+            protectionExpiresAt: new Date(expiryMs).toISOString(), amount, orderId: input.orderId, currency: input.currency,
+            saleStartedAt,
+          },
+          owner: safeClienteId, input, provider, slot: workerSlot,
+        });
+        if (started.result.final) return settle(started.result.final);
+        const handoff = buildPublicPixelPay3dsHandoff(started);
+        if (handoff) return { ...MEMBERSHIP_PIXELPAY_3DS_PENDING, public_3ds_handoff: handoff };
+      } catch {
+        logger?.warn?.({ event: "pixelpay_public_3ds_membership_uncertain", id_intent: safeIntentId, paymentAttemptId });
+      }
+      return { ...MEMBERSHIP_PIXELPAY_3DS_PENDING, reconciliation_required: true };
+    }
+    saleResult = await provider.sale(input, { requestId, idIntent: safeIntentId, paymentAttemptId, logger });
   } catch (providerError) {
+    if (public3ds) return { ...MEMBERSHIP_PIXELPAY_3DS_PENDING, reconciliation_required: true };
     const diagnostic = buildSafeProviderErrorDiagnostic(providerError, requestId);
     await finalizePixelPaySaleAttemptBestEffort(app.db, {
       ...diagnostic,
@@ -2590,8 +2667,45 @@ export async function processMembershipPixelPaySale(app, {
       if (errorTxStarted) await client.query("ROLLBACK").catch(() => {});
       throw error;
     } finally { client.release(); }
+  } finally {
+    workerSlot?.release();
   }
 
+  return settle(saleResult);
+}
+
+export async function continueMembershipPixelPay3ds(app, {
+  idPaymentIntent, clienteId, userId, token, operation, data, requestId, logger,
+} = {}) {
+  const manager = app.publicPixelPay3ds;
+  if (!manager || app.config?.publicCommerce?.vipPurchaseEnabled !== true) throw publicPixelPay3dsUnavailable();
+  const lost = () => new AppError(409, "El pago sigue pendiente de verificacion", {
+    code: "PIXELPAY_PUBLIC_3DS_CONTEXT_LOST",
+  });
+  const intent = await getMembershipIntentForConfirmation(app.db, idPaymentIntent);
+  if (!intent || !userId || normalizeText(intent.id_cliente) !== normalizeText(clienteId)
+    || normalizeText(intent.id_usuario) !== normalizeText(userId)) throw lost();
+
+  const context = manager.get({
+    kind: "membership", idIntent: idPaymentIntent, idGrupoCita: intent.id_order, owner: clienteId, token,
+  });
+  if (!context || intent.origen_pago_codigo !== "membership" || intent.provider_code !== "pixelpay"
+    || intent.estado_intent_codigo !== "pendiente_confirmacion" || intent.estado_orden_codigo !== "pendiente_pago"
+    || intent.orden_compra !== context.claim.orderId
+    || intent.moneda_codigo !== context.claim.currency || intent.order_moneda_codigo !== context.claim.currency
+    || toNumber(intent.monto_hnl, -1) !== context.claim.amount || toNumber(intent.total_hnl, -1) !== context.claim.amount
+    || !(Math.min(new Date(intent.intent_expires_at).getTime(), new Date(intent.order_expires_at).getTime()) > Date.now())
+    || safeText(intent.provider_session_id) || safeText(intent.referencia_externa)) throw lost();
+
+  return manager.advance(context, operation, data, result => finalizeMembershipPixelPaySale(app, {
+    intent, saleResult: result, safeIntentId: idPaymentIntent, safeClienteId: clienteId,
+    paymentAttemptId: context.claim.paymentAttemptId, requestId, logger, saleStartedAt: context.claim.saleStartedAt,
+  }));
+}
+
+async function finalizeMembershipPixelPaySale(app, {
+  intent, saleResult, safeIntentId, safeClienteId, paymentAttemptId, requestId, logger, saleStartedAt,
+}) {
   const diagnostics = buildSafePixelPaySdkDiagnostics(saleResult.diagnostics);
   await finalizePixelPaySaleAttemptBestEffort(app.db, {
     ...diagnostics,

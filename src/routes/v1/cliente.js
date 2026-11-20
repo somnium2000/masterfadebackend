@@ -1,5 +1,6 @@
 import { AppError, sendError } from "../../utils/errors.js";
 import { sendOk } from "../../utils/response.js";
+import { publicPixelPay3dsUnavailable } from "../../services/payments/publicPixelPay3ds.js";
 import {
   activateAssetForEntity,
   buildAssetReadUrl,
@@ -11,6 +12,7 @@ import {
   createMembershipPurchaseOrder,
   createMembershipOrderPaymentIntent,
   processMembershipPixelPaySale,
+  continueMembershipPixelPay3ds,
   reconcileMembershipPixelPayStatus,
   readMembershipSimulatedPaymentStatus,
   processMembershipSimulatorEvent,
@@ -1222,6 +1224,7 @@ export default async function clienteRoutes(app) {
           required: ["id_payment_intent", "card", "billing"],
           properties: {
             id_payment_intent: { type: "string", format: "uuid" },
+            supports_public_3ds: { type: "boolean" },
             card: {
               type: "object",
               required: ["number", "holder", "expire", "cvv"],
@@ -1266,9 +1269,15 @@ export default async function clienteRoutes(app) {
         });
       }
       try {
+        if (request.publicCommerceAdmission === "vip" && app.config?.pixelPayEnv === "live") {
+          throw publicPixelPay3dsUnavailable();
+        }
+        reply.header("Cache-Control", "private, no-store");
         const result = await processMembershipPixelPaySale(app, {
           idPaymentIntent: request.body.id_payment_intent,
           clienteId: context.clienteId,
+          userId: context.userId,
+          supportsPublic3ds: request.body.supports_public_3ds === true,
           card: request.body.card,
           billing: request.body.billing,
           requestId: request.id,
@@ -1280,6 +1289,40 @@ export default async function clienteRoutes(app) {
         });
       } catch (error) {
         return sendHandled(reply, request, error, "No se pudo procesar el pago de la membresia", "MEMBERSHIP_PIXELPAY_SALE_ERROR");
+      }
+    }
+  );
+
+  app.post(
+    "/planes/pixelpay/3ds/continuar",
+    {
+      preHandler: app.requireRoles(CLIENT_ROLES),
+      bodyLimit: 40000,
+      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+      schema: { body: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id_payment_intent", "token", "operation", "data"],
+        properties: {
+          id_payment_intent: { type: "string", format: "uuid" },
+          token: { type: "string", format: "uuid" },
+          operation: { enum: ["lookup", "retry"] },
+          data: { type: "object", maxProperties: 9, additionalProperties: { type: "string", maxLength: 32768 } },
+        },
+      } },
+    },
+    async (request, reply) => {
+      reply.header("Cache-Control", "private, no-store");
+      const context = ensureClienteContext(request);
+      try {
+        const { id_payment_intent, token, operation, data } = request.body;
+        const response = await continueMembershipPixelPay3ds(app, {
+          idPaymentIntent: id_payment_intent, clienteId: context.clienteId, userId: context.userId,
+          token, operation, data, requestId: request.id, logger: request.log,
+        });
+        return sendOk(reply, response, { requestId: request.id });
+      } catch (error) {
+        return sendHandled(reply, request, error, "El pago sigue pendiente de verificacion", "PIXELPAY_PUBLIC_3DS_CONTEXT_LOST");
       }
     }
   );

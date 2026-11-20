@@ -794,3 +794,24 @@ test('expired diagnostic capability closes Sale while retained target still bloc
   } finally { Date.now=originalNow; }
   assert.deepEqual(f.state,{business:0,unexpectedSql:0});
 });
+
+test('candidato 3DS público en QA conserva identidad, CSRF y permiso VIP separado', async t => {
+  const f = await fixture(t, {
+    env: { ...QA_SANDBOX_SALE_IDENTITY, PIXELPAY_PUBLIC_3DS_ENABLED: 'true' },
+    config: { pixelPayEnv: 'sandbox', publicCommerce: { bookingEnabled: false, vipPurchaseEnabled: true } },
+    roles: ['cliente'],
+  });
+  const headers = f.headers();
+  const get = (headers) => f.app.inject({ url: '/v1/commerce/eligibility', headers });
+  assert.equal((await get(headers)).json().data.pixelpayPublic3ds, true);
+  assert.equal((await get(headers)).json().data.vipPurchase, true);
+  assert.equal((await get(f.headers(OTHER))).json().data.pixelpayPublic3ds, false);
+  for (const url of ['/v1/pagos/reservas/pixelpay/3ds/continuar', '/v1/cliente/planes/pixelpay/3ds/continuar']) {
+    const post = (headers) => f.app.inject({ method: 'POST', url, headers, payload: {} });
+    const noCsrf = { ...headers, 'x-csrf-token': 'wrong' };
+    assert.equal((await post(noCsrf)).json().error.code, 'CSRF_TOKEN_INVALID');
+    assert.equal((await post(f.headers(OTHER))).statusCode, 403);
+    assert.equal((await post(headers)).statusCode, 400);
+  }
+  assert.equal(f.state.unexpectedSql, 0);
+});

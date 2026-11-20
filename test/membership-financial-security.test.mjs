@@ -16,6 +16,8 @@ import {
 } from "../src/services/membershipService.js";
 import { PaymentProviderFactory } from "../src/services/payments/PaymentProviderFactory.js";
 import { PIXELPAY_SALE_OUTCOME } from "../src/services/payments/PixelPayDirectProvider.js";
+import { createPublicPixelPay3dsAttempts } from "../src/services/payments/publicPixelPay3ds.js";
+import { DelegatedAttempt } from "../src/experimental/pixelpayDelegated/attempt.js";
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 
 const CLIENT = "41111111-1111-4111-8111-111111111111";
@@ -469,6 +471,7 @@ function pixelPayProcessHarness({
     subscriptions: 0, payments: 0, subscriptionPayments: 0,
     verifiedEvidenceEvents: 0, verifiedReferenceWrites: 0, subscriptionInsertParams: null,
     statusClaimed: false, dynamicDurableEvidence: null, dynamicVerifiedAt: null,
+    public3dsClaims: 0, orderReference: null, providerSessionId,
     paymentProviderTxIds: [], paymentAmounts: [], paymentPaidAts: [],
     orderPaidAts: [], intentPaidAts: [], subscriptionPaymentPaidAts: [], verifiedEventQueries: [],
   };
@@ -529,7 +532,8 @@ function pixelPayProcessHarness({
         }] : [] };
       }
       if (text.includes("FROM public.payment_intents pi")) {
-        return { rows: [{ ...row, estado_intent_codigo: state.intentState,
+        return { rows: [{ ...row, estado_intent_codigo: state.intentState, orden_compra: state.orderReference,
+          provider_session_id: state.providerSessionId,
           estado_orden_codigo: state.orderState, id_suscripcion: state.idSubscription }], rowCount: 1 };
       }
       if (text.includes("SELECT to_char(min(pe.recibido_at)") && text.includes("FROM public.payment_events pe")) {
@@ -542,9 +546,14 @@ function pixelPayProcessHarness({
       if (text.includes("SET estado_intent_codigo = 'pendiente_confirmacion'")) {
         if (state.intentState !== "link_generado") return { rows: [] };
         state.intentState = "pendiente_confirmacion";
+        state.orderReference = values[1];
         return { rows: [{ id_intent: INTENT }] };
       }
+      if (text.startsWith("SELECT 1 FROM public.payment_events")) {
+        return { rows: state.public3dsClaims ? [{}] : [] };
+      }
       if (text.startsWith("INSERT INTO public.payment_events")) {
+        if (values[2] === "membership.pixelpay.3ds_started") state.public3dsClaims += 1;
         state.verifiedEventQueries.push(text);
         if (text.includes("membership.pixelpay.approved_verified")) state.verifiedEvidenceEvents += 1;
         if (values[2]?.payment_hash_valid === true) {
@@ -624,8 +633,9 @@ function pixelPayProcessHarness({
   };
   const db = {
     connect: async () => client,
-    async query(query) {
+    async query(query, values) {
       const text = String(query?.text || query);
+      if (text.includes("FROM public.payment_intents pi")) return client.query(query, values);
       if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) return { rows: [{ id_sale_attempt: crypto.randomUUID() }] };
       if (text.includes("SET estado_intent_codigo='fallido'")) {
         state.intentState = "fallido";
@@ -678,9 +688,22 @@ async function buildPixelPayRouteApp(t, harnessOptions) {
   server.decorate("config", {
     nodeEnv: "test",
     paymentProvider: "pixelpay",
-    pixelPayEnv: "sandbox",
+    pixelPayEnv: harnessOptions.pixelPayEnv || "sandbox",
+    publicCommerce: { vipPurchaseEnabled: harnessOptions.public3ds === true },
     todoPago: { mode: "disabled", simulatedEnabled: false },
   });
+  if (harnessOptions.publicVipAdmission) server.addHook("onRequest", async request => {
+    request.publicCommerceAdmission = "vip";
+  });
+  if (harnessOptions.makeAttempt) {
+    Object.assign(PaymentProviderFactory._instance, {
+      env: "sandbox", endpoint: "https://pixelpay.dev", appUrl: "https://pixelpay.dev",
+      keyId: "synthetic-key", authHash: "synthetic-hash", secretKey: "synthetic-secret",
+    });
+    const manager = createPublicPixelPay3dsAttempts({ db: harness.app.db, makeAttempt: harnessOptions.makeAttempt });
+    server.decorate("publicPixelPay3ds", manager);
+    server.addHook("onClose", async () => manager.close());
+  }
   if (harnessOptions.privatePilot) server.pilotRequest = await installPrivatePilot(server, t, { userId: USER, clientId: CLIENT });
   await server.register(clienteRoutes, { prefix: "/v1/cliente" });
   await server.ready();
@@ -812,6 +835,95 @@ for (const missingField of ["card", "billing"]) {
   });
 }
 
+
+for (const withChallenge of [false, true]) {
+  test(`HTTP VIP 3DS público usa el intento reclamado y prueba financiera durable (challenge=${withChallenge})`, async t => {
+    const phases = [];
+    const { server, state } = await buildPixelPayRouteApp(t, {
+      public3ds: true,
+      provider: { sale: async () => { throw new Error("Legacy Sale must not execute"); } },
+      makeAttempt: options => {
+        const worker = new DelegatedAttempt({
+          ...options,
+          workerUrl: new URL("./fixtures/delegatedPixelPayWorker.mjs", import.meta.url),
+          context: { ...options.context, application: true, scenario: withChallenge ? "challenge" : "frictionless" },
+        });
+        return {
+          close: () => worker.close(),
+          async call(operation, data) {
+            phases.push(operation);
+            assert.equal(state.public3dsClaims, 1);
+            assert.equal(state.intentState, "pendiente_confirmacion");
+            const response = await worker.call(operation, data);
+            const stats = await worker.call("inspect");
+            assert.equal(stats.externalSockets, 0);
+            assert.equal(stats.initialSales, 1);
+            assert.equal(stats.retries, Number(operation === "retry"));
+            assert.equal(stats.cryptoContextMatches, true);
+            assert.ok(stats.orders.every(order => order === `VIP-${ORDER}`));
+            return response;
+          },
+        };
+      },
+    });
+    const post = (url, payload) => server.inject({ url, method: "POST", payload });
+    const confirm = "/v1/cliente/planes/confirmar-pago";
+    const initial = { id_payment_intent: INTENT, card: validCard, billing: validBilling };
+    assert.equal((await post(confirm, initial)).statusCode, 503);
+    assert.equal(state.public3dsClaims, 0);
+    const started = await post(confirm, { ...initial, supports_public_3ds: true });
+    assert.equal(started.statusCode, 202, started.body);
+    const handoff = started.json().data.public_3ds_handoff;
+    assert.ok(handoff.token);
+    assert.equal(started.headers["cache-control"], "private, no-store");
+    assert.doesNotMatch(started.body, /4111111111111111|"cvv"|"authHash"|"secretKey"/);
+    assert.equal((await post(confirm, { ...initial, supports_public_3ds: true })).statusCode, 409);
+
+    const path = "/v1/cliente/planes/pixelpay/3ds/continuar";
+    const advance = (operation, data = {}, overrides = {}) => post(path, {
+      id_payment_intent: INTENT, token: handoff.token, operation, data, ...overrides,
+    });
+    assert.equal((await advance("retry")).statusCode, 409);
+    assert.equal((await advance("lookup", { reference: "synthetic" }, { token: OTHER_CLIENT })).statusCode, 409);
+    assert.equal((await advance("lookup", { reference: "synthetic" })).statusCode, 200);
+    const final = await advance("retry");
+    assert.equal(final.statusCode, withChallenge ? 409 : 200, final.body);
+    if (withChallenge) {
+      assert.deepEqual(phases, ["start", "lookup"]);
+      assert.equal(state.intentState, "pendiente_confirmacion");
+      server.publicPixelPay3ds.close();
+      state.providerSessionId = "restored-untrusted-id";
+      const status = await post(`/v1/cliente/planes/pago-intent/${INTENT}/estado`);
+      assert.equal(status.statusCode, 200, status.body);
+      assert.equal(status.json().data.reconciliation_required, true);
+    } else {
+      assert.equal(final.json().data.payment.processed, true);
+      assert.deepEqual(phases, ["start", "lookup", "retry"]);
+      assert.equal(state.intentState, "confirmado");
+      assert.equal(state.orderState, "pagada");
+    }
+    assert.equal((await advance("retry")).statusCode, 409);
+    assert.equal(state.payments, Number(!withChallenge));
+    assert.equal(state.subscriptions, Number(!withChallenge));
+    assert.equal(state.subscriptionPayments, Number(!withChallenge));
+    assert.equal(state.saleCalls, 0);
+    assert.equal(state.statusCalls ?? 0, 0);
+  });
+}
+
+test("HTTP VIP público Live devuelve indisponibilidad antes de reclamar la venta", async t => {
+  const { server, state } = await buildPixelPayRouteApp(t, {
+    publicVipAdmission: true, pixelPayEnv: "live", provider: { sale: async () => assert.fail() },
+  });
+  const response = await server.inject({
+    method: "POST", url: "/v1/cliente/planes/confirmar-pago",
+    payload: { id_payment_intent: INTENT, card: validCard, billing: validBilling, supports_public_3ds: true },
+  });
+  assert.equal(response.statusCode, 503, response.body);
+  assert.equal(response.json().error.code, "PIXELPAY_PUBLIC_3DS_UNAVAILABLE");
+  assert.equal(state.intentState, "link_generado");
+  assert.equal(state.saleCalls, 0);
+});
 test("rechazo definitivo no activa y persiste estado fallido", async (t) => {
   t.after(() => PaymentProviderFactory.reset());
   const { app, state } = pixelPayProcessHarness({ provider: { sale: async () => ({

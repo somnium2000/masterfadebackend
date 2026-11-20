@@ -148,21 +148,25 @@ export async function finalizePixelPaySaleAttemptBestEffort(pool, dto, logger) {
   }
 }
 
+export async function recordPixelPay3dsContinuation(pool, { idIntent, paymentAttemptId, paymentUuid }) {
+  // AM: Record the 202 before issuing a handoff. This marker survives context loss.
+  const result = await pool.query(
+    `UPDATE app_private.pixelpay_sale_attempts
+     SET upstream_http_status = 202,
+         observed_payment_uuid_untrusted = COALESCE(observed_payment_uuid_untrusted, $3::varchar(80))
+     WHERE id_intent = $1::uuid AND payment_attempt_id = $2::uuid
+       AND finalized_at IS NULL RETURNING payment_attempt_id`,
+    [requireUuid(idIntent), requireUuid(paymentAttemptId), safeObservedPaymentUuid(paymentUuid)],
+  );
+  return result.rows.length === 1;
+}
+
 export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAttemptId, paymentUuid, liveTest = false }) {
-  const observed = safeObservedPaymentUuid(paymentUuid);
   if (liveTest) {
-    // Persist the HTTP 202 before handing off the browser challenge.
-    // A crash/restart must not make unfinished Live 3DS eligible for external Status.
-    await pool.query(
-      `UPDATE app_private.pixelpay_sale_attempts
-       SET upstream_http_status = 202,
-           observed_payment_uuid_untrusted = COALESCE(observed_payment_uuid_untrusted, $3::varchar(80))
-       WHERE id_intent = $1::uuid AND payment_attempt_id = $2::uuid
-         AND finalized_at IS NULL`,
-      [requireUuid(idIntent), requireUuid(paymentAttemptId), observed],
-    );
+    await recordPixelPay3dsContinuation(pool, { idIntent, paymentAttemptId, paymentUuid });
     return;
   }
+  const observed = safeObservedPaymentUuid(paymentUuid);
   if (!observed) return;
   await pool.query(
     `UPDATE app_private.pixelpay_sale_attempts SET observed_payment_uuid_untrusted = $3::varchar(80)
