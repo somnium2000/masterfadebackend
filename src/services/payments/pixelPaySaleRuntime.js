@@ -86,6 +86,31 @@ export function comparePixelPayContinuationFields(left, right) {
   }));
 }
 
+// AM: Public diagnostics allow only field shape; provider bodies and opaque values cannot reach the log sink.
+export function sanitizePixelPayContinuationDiagnostic(source = {}) {
+  const codes = new Set(['PIXELPAY_3DS_COLLECTION_URL_ABSENT', 'PIXELPAY_3DS_COLLECTION_URL_NULL',
+    'PIXELPAY_3DS_COLLECTION_URL_EMPTY', 'PIXELPAY_3DS_COLLECTION_URL_INVALID',
+    'PIXELPAY_3DS_CONTINUATION_INVALID', 'PIXELPAY_3DS_COLLECTION_READY']);
+  const types = new Set(['absent', 'null', 'empty_string', 'array', 'string', 'object', 'number', 'boolean', 'undefined']);
+  const field = (value, name) => ({ present: safeBoolean(value?.present),
+    type: types.has(value?.type) ? value.type : null,
+    length: Number.isSafeInteger(value?.length) && value.length >= 0 ? value.length : null,
+    ...(name === 'collection_url' ? { origin: safeHttpsOrigin(value?.origin) } : {}) });
+  const data = value => ({ ...Object.fromEntries(CONTINUATION_FIELDS.map(name => [name, field(value?.[name], name)])),
+    transaction_type_kind: safeContinuationType(value?.transaction_type_kind) });
+  const comparison = value => value == null ? null
+    : Object.fromEntries(CONTINUATION_FIELDS.map(name => [name, safeBoolean(value[name])]));
+  return {
+    code: codes.has(source?.code) ? source.code : null,
+    upstream_http_status: safeStatus(source?.upstream_http_status),
+    upstream_cf_ray: safeCfRay(source?.upstream_cf_ray), sale_origin: safeHttpsOrigin(source?.sale_origin),
+    sale_environment: ['sandbox', 'staging', 'live'].includes(source?.sale_environment) ? source.sale_environment : null,
+    raw_top_level_collection_url: field(source?.raw_top_level_collection_url, 'collection_url'),
+    raw_data: data(source?.raw_data), sdk_data: data(source?.sdk_data),
+    raw_to_sdk_equal: comparison(source?.raw_to_sdk_equal), sdk_to_handoff_equal: comparison(source?.sdk_to_handoff_equal),
+  };
+}
+
 export function sanitizePixelPaySaleRuntimeDiagnostics(source = {}) {
   const input = source && typeof source === "object" ? source : {};
   const sdkStackFile = SDK_FILES.has(input.sdkStackFile) ? input.sdkStackFile : null;
