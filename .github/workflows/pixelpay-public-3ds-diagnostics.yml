@@ -1,0 +1,31 @@
+name: Public PixelPay 3DS diagnostics
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/pixelpay-public-3ds-diagnostics.yml
+      - src/services/payments/publicPixelPay3ds.js
+      - src/services/payments/pixelPaySaleRuntime.js
+      - test/public-pixelpay-3ds-diagnostics.test.mjs
+      - test/public-pixelpay-3ds-log-filter.test.mjs
+      - docs/pixelpay-public-3ds.md
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Safe diagnostics and documented SSH filter with synthetic input
+        run: node --test test/public-pixelpay-3ds-diagnostics.test.mjs test/public-pixelpay-3ds-log-filter.test.mjs
+      - name: Lint observability files
+        run: npx --no-install eslint src/services/payments/pixelPaySaleRuntime.js src/services/payments/publicPixelPay3ds.js test/public-pixelpay-3ds-diagnostics.test.mjs test/public-pixelpay-3ds-log-filter.test.mjs
+      - run: git diff --check
