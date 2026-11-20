@@ -741,7 +741,7 @@ async function createPagosApp(client, {
   });
   if (public3dsAttemptFactory) {
     const manager = createPublicPixelPay3dsAttempts({
-      db: app.db, environment: app.config.pixelPayEnv, makeAttempt: public3dsAttemptFactory,
+      db: app.db, logger: app.log, environment: app.config.pixelPayEnv, makeAttempt: public3dsAttemptFactory,
     });
     if (privatePilot) app.publicPixelPay3ds = manager;
     else app.decorate('publicPixelPay3ds', manager);

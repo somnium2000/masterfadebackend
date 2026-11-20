@@ -28,5 +28,7 @@ jobs:
           node --test test/public-pixelpay-3ds.test.mjs test/pixelpay-delegated.test.mjs
           test/microfase2a2-public-pagos-routes.test.mjs test/pixelpay-sdk-3ds-contract.test.mjs
           test/pixelpay-sale-runtime-diagnostics.test.mjs
+          test/public-pixelpay-3ds-diagnostics.test.mjs test/public-pixelpay-3ds-log-filter.test.mjs
+          test/pixelpay-public-3ds-url-contract.test.mjs test/pixelpay-authentication-continue-contract.test.mjs
       - run: npm run lint
       - run: git diff --check
