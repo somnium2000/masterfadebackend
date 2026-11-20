@@ -7,6 +7,7 @@ import { isQa3dsIntent, qa3dsWindowOpen, resolveQaPixelPay3dsDiagnostic } from '
 import { resolveSongbirdBridgeConfig, SongbirdBridge } from '../services/payments/songbirdBridge.js';
 import { SongbirdRepository } from '../services/payments/songbirdRepository.js';
 import { resolveQaDelegatedConfig } from '../experimental/pixelpayDelegated/qaAttempts.js';
+import { resolveLive3dsDirectConfig } from '../experimental/pixelpayDelegated/liveConfig.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -175,7 +176,9 @@ export default fp(async function privateCommerce(app) {
   const qaSale = resolveQaSandboxSaleConfig(process.env);
   const qa3ds = resolveQaPixelPay3dsDiagnostic(process.env, { bookingEnabled: qaBooking.enabled });
   app.decorate('qaPixelPay3dsDiagnostic', qa3ds);
-  const delegated = resolveQaDelegatedConfig(process.env, qa3ds);
+  const live3ds = resolveLive3dsDirectConfig(process.env, config);
+  app.decorate('livePixelPay3ds', live3ds);
+  const delegated = resolveQaDelegatedConfig(process.env, qa3ds) || live3ds;
   app.decorate('qaPixelPayDelegated', delegated);
   // AM: Retire the custom protocol while tolerating legacy flags during the QA rollout.
   const bridgeConfig = resolveSongbirdBridgeConfig({ ...process.env, QA_PIXELPAY_SONGBIRD_BRIDGE_ENABLED: 'false' }, qa3ds);
@@ -305,6 +308,18 @@ export default fp(async function privateCommerce(app) {
     const publicAdmission = (available.publicBooking && PUBLIC_BOOKING_ROUTES.has(route))
       || (available.publicVipPurchase && PUBLIC_VIP_ROUTES.has(route));
     if (publicAdmission ? await publicClient(request, reply) : await eligible(request, reply)) {
+      if (!publicAdmission && live3ds?.enabled && !config.qaCapabilities) {
+        // Live test: permit only booking + one Sale + SDK continuation.
+        // No VIP purchase, simulator, external Status or broad public routes.
+        const allowedLiveRoute = (QA_SANDBOX_BOOKING_ROUTES.has(route)
+          && !route.endsWith('/pixelpay/status'))
+          || QA_SANDBOX_SALE_ROUTES.has(route)
+          || route === 'POST /v1/pagos/reservas/pixelpay/3ds/delegated';
+        if (!allowedLiveRoute) {
+          return sendError(reply, 403, 'Operacion comercial no disponible.',
+            { code: 'PRIVATE_COMMERCE_RESTRICTED' });
+        }
+      }
       if (!publicAdmission && (qaBooking.enabled || config.qaCapabilities)) {
         const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route)
           || route === 'POST /v1/pagos/reservas/pixelpay/3ds/bridge'
@@ -355,6 +370,8 @@ export default fp(async function privateCommerce(app) {
       ...(!config.qaCapabilities ? available : {}),
       ...(qaBooking.enabled ? { pixelpaySale: allowed && qaSale.enabled,
         pixelpay3dsDiagnostic: false,
-        pixelpaySongbirdBridge: false } : {}) } };
+        pixelpaySongbirdBridge: false } : {}),
+      ...(live3ds ? { booking: allowed, vipPurchase: false,
+        pixelpaySale: allowed, pixelpayLive3ds: allowed } : {}) } };
   });
 }, { name: "private-commerce-plugin", dependencies: ["env-plugin"], decorators: { fastify: ["requireRoles"] } });
