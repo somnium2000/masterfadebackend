@@ -20,6 +20,8 @@ export function installSyntheticProvider(context) {
   if (typeof globalThis.window !== 'undefined' || typeof globalThis.document !== 'undefined') throw new Error('NODE_DOM_FORBIDDEN');
   const nativeConnect = net.Socket.prototype.connect, nativeFetch = globalThis.fetch, adapter = axios.defaults.adapter;
   const merchant = nacl.box.keyPair();
+  const songbird = context.scenario.startsWith('songbird');
+  const flowScenario = context.scenario === 'songbird' ? 'challenge' : context.scenario.replace(/^songbird-/, '');
   const stats = { externalSockets: 0, initialSales: 0, retries: 0, lookups: 0, continues: 0,
     cryptoContextMatches: true, credentialsInNode: true, orders: [] };
   if (context.application) stats.directLookupCvvMatches = null;
@@ -44,11 +46,11 @@ export function installSyntheticProvider(context) {
     const body = config.data ? JSON.parse(config.data) : {};
     const reply = (status, data, action = null, success = true) => ({ config, status, headers: {}, data: { success, action, data } });
     const approvedData = {
-      response_approved: context.scenario !== 'declined', response_incomplete: false, response_code: '00',
+      response_approved: flowScenario !== 'declined', response_incomplete: false, response_code: '00',
       transaction_amount: context.input.amount,
-      transaction_approved_amount: context.scenario === 'bad-amount' ? context.input.amount + 1 : context.input.amount,
+      transaction_approved_amount: flowScenario === 'bad-amount' ? context.input.amount + 1 : context.input.amount,
       transaction_id: `tx-${context.input.orderId}`, payment_uuid: `uuid-${context.input.orderId}`,
-      payment_hash: createHash('md5').update([context.scenario === 'bad-hash' ? 'unrelated' : context.input.orderId,
+      payment_hash: createHash('md5').update([flowScenario === 'bad-hash' ? 'unrelated' : context.input.orderId,
         context.config.keyId, context.config.secretKey].join('|')).digest('hex'),
     };
     if (config.url.endsWith('public_key')) return reply(200, { public_key: Buffer.from(merchant.publicKey).toString('base64') });
@@ -62,7 +64,8 @@ export function installSyntheticProvider(context) {
     if (config.url.endsWith('authentication/continue')) {
       stats.continues++;
       if (body.identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
-      return reply(200, {}, null, context.scenario !== 'continue-false');
+      if (flowScenario === 'continue-timeout') throw new Error('SYNTHETIC_TIMEOUT');
+      return reply(200, {}, null, flowScenario !== 'continue-false');
     }
     if (body.order_id !== context.input.orderId || Number(body.order_amount) !== context.input.amount
       || body.order_currency !== context.input.currency) throw new Error('CONTEXT_MISMATCH');
@@ -71,17 +74,20 @@ export function installSyntheticProvider(context) {
     if (config.url.endsWith('lookup')) {
       stats.lookups++;
       if (context.application) {
+        if (songbird && Object.hasOwn(body, 'card_cvv')) throw new Error('SONGBIRD_LOOKUP_CVV_FORBIDDEN');
         const [box, nonce] = String(body.card_cvv).split('|');
         const cvv = nonce && nacl.box.open(decode(box), decode(nonce), decode(config.headers['x-auth-secure']), merchant.secretKey);
         stats.directLookupCvvMatches = Boolean(cvv && Buffer.from(cvv).toString() === context.input.card.cvv);
       }
-      const challengeUrl = context.application ? 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F'
+      const challengeUrl = context.application && !songbird ? 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F'
         : 'https://acs.offline.invalid';
-      return reply(context.application && !context.scenario.startsWith('frictionless') && context.scenario !== 'challenge-http-200' ? 202 : 200, {
-        identifier: context.scenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
-        continue_url: context.scenario === 'invalid-step-up' ? 'https://acs.offline.invalid' : challengeUrl,
-        continue_payload: 'opaque.+/=%ñ', transaction_id: `tx-${body.order_id}`, window_size: '03',
-      }, context.scenario.startsWith('frictionless') ? null : 'continue', context.scenario !== 'lookup-not-successful');
+      return reply(context.application && !flowScenario.startsWith('frictionless') && flowScenario !== 'challenge-http-200' ? 202 : 200, {
+        identifier: flowScenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
+        continue_url: flowScenario === 'invalid-step-up' ? songbird ? 'http://acs.offline.invalid' : 'https://acs.offline.invalid'
+          : flowScenario === 'invalid-step-up-userinfo' ? 'https://user:password@acs.offline.invalid' : challengeUrl,
+        continue_payload: flowScenario === 'invalid-continue-payload' ? {} : 'opaque.+/=%ñ',
+        transaction_id: flowScenario === 'invalid-transaction-id' ? null : `tx-${body.order_id}`, window_size: '03',
+      }, flowScenario.startsWith('frictionless') ? null : 'continue', flowScenario !== 'lookup-not-successful');
     }
     if (!config.url.endsWith('transaction/sale')) throw new Error('UNEXPECTED_ROUTE');
     if (!body.authentication_identifier) {
@@ -94,11 +100,18 @@ export function installSyntheticProvider(context) {
           'collection-empty': '', 'collection-object': { url: collectionUrl },
           'collection-untrusted': 'https://example.invalid/collection',
           'collection-invalid-path': 'https://cas.client.cardinaltrusted.com/other',
+          'collection-uppercase': collectionUrl.replace('cas.client.cardinaltrusted.com', 'CAS.CLIENT.CARDINALTRUSTED.COM'),
+          'collection-port443': collectionUrl.replace('.com/', '.com:443/'),
+          'collection-wrong-port': collectionUrl.replace('.com/', '.com:444/'),
+          'collection-userinfo': collectionUrl.replace('https://', 'https://user:password@'),
+          'collection-fragment': `${collectionUrl}#fragment`,
+          'collection-v3': collectionUrl.replace('/V1/', '/V3/'),
+          'collection-trailing-slash': collectionUrl.replace('/Collect?', '/Collect/?'),
         };
         const collectionValue = Object.hasOwn(collection, context.scenario) ? collection[context.scenario] : collectionUrl;
         const response = reply(202, { transaction_type: 'songbird', payload: `opaque-setup-${body.order_id}`,
-          payment_uuid: context.scenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}`,
-          ...(context.application && collectionValue !== undefined ? { collection_url: collectionValue } : {}) });
+          payment_uuid: flowScenario === 'bad-uuid' ? 'different-uuid' : `uuid-${body.order_id}`,
+          ...(context.application && !songbird && collectionValue !== undefined ? { collection_url: collectionValue } : {}) });
         response.headers['cf-ray'] = '0123456789abcdef-TPA';
         if (context.scenario === 'collection-top-level') response.data.collection_url = collectionUrl;
         return response;
@@ -107,9 +120,9 @@ export function installSyntheticProvider(context) {
       stats.retries++;
       if (body.authentication_identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
       await new Promise(resolve => setTimeout(resolve, 30));
-      if (['retry-timeout', 'frictionless-timeout'].includes(context.scenario)) throw new Error('SYNTHETIC_TIMEOUT');
-      if (context.scenario === 'frictionless-declined') return reply(402, {}, null, false);
-      if (context.scenario === 'frictionless-second202') return reply(202, approvedData);
+      if (['retry-timeout', 'frictionless-timeout'].includes(flowScenario)) throw new Error('SYNTHETIC_TIMEOUT');
+      if (flowScenario === 'frictionless-declined') return reply(402, {}, null, false);
+      if (flowScenario === 'frictionless-second202') return reply(202, approvedData);
     }
     if (context.publicContinuation) {
       // AM: PixelPay's documented approval need not echo order or currency.
@@ -117,8 +130,8 @@ export function installSyntheticProvider(context) {
         'bad-currency': { transaction_currency: 'USD' },
         'bad-order': { order_id: 'other-order' },
       };
-      return reply(200, { ...approvedData, ...contradictions[context.scenario] },
-        context.scenario === 'non-terminal-success' ? 'continue' : null);
+      return reply(200, { ...approvedData, ...contradictions[flowScenario] },
+        flowScenario === 'non-terminal-success' ? 'continue' : null);
     }
     return reply(200, ['nested-status', 'missing-status-currency'].includes(context.scenario) ? approvedData
       : { ...approvedData, order_id: body.order_id,

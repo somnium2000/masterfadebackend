@@ -24,7 +24,19 @@ const CAS_COLLECTION = new Set([
 const CAS_STEP_UP = new Set(['https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp']);
 
 function allowedCasUrl(value, targets) {
-  return opaque(value, 2048) && !/[\s\\#]/.test(value) && targets.has(value.split('?', 1)[0]);
+  if (!opaque(value, 2048) || /[\s\\#]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !url.username && !url.password && targets.has(`${url.origin}${url.pathname}`);
+  } catch { return false; }
+}
+
+function allowedSongbirdUrl(value) {
+  if (!opaque(value, 2048) || /[\s\\#]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password;
+  } catch { return false; }
 }
 
 function collectionError(data) {
@@ -35,11 +47,14 @@ function collectionError(data) {
   return null;
 }
 
-function directLookupAccepted(response) {
+function lookupAccepted(response, mode) {
   const data = response.data;
   if (response.success !== true || !opaque(data?.identifier, 160)) return false;
   if (response.action === 'continue') {
-    return [200, 202].includes(response.status) && allowedCasUrl(data.continue_url, CAS_STEP_UP) && opaque(data.continue_payload);
+    const validUrl = mode === 'direct_api' ? allowedCasUrl(data.continue_url, CAS_STEP_UP)
+      : allowedSongbirdUrl(data.continue_url);
+    return [200, 202].includes(response.status) && validUrl && opaque(data.continue_payload)
+      && (mode === 'direct_api' || opaque(data.transaction_id, 160));
   }
   return response.status === 200 && response.action === null;
 }
@@ -60,7 +75,7 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
   const request = provider.buildSaleRequest(input);
   if (explicitAuthentication) request.withAuthenticationRequest();
   let captured, captureDiagnostic, state = 'new', identifier, finalResponse, evidence;
-  let continuationMode, directLookupVerified = false;
+  let continuationMode, lookupVerified = false, lookupRequiresChallenge = false, continueVerified = false;
   const initial = createPixelPayNodeSaleTransaction(sdk, settings, { onContinuation: (response, diagnostic) => {
     captured = response;
     captureDiagnostic = diagnostic;
@@ -143,11 +158,16 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
     if (operation === 'lookup' && (!opaque(data.reference, 1024) || EMV.some(key => data[key] !== undefined && !opaque(data[key], 2048)))) fail();
     if (operation === 'continue' && (!identifier || !opaque(data.payload))) fail();
     if (operation === 'retry' && !identifier) fail();
-    if (application && operation !== 'start' && continuationMode !== 'direct_api') fail();
+    if (application && operation !== 'start' && !['direct_api', 'songbird'].includes(continuationMode)) fail();
     if (continuationMode === 'direct_api') {
       if (operation === 'continue') fail();
       // AM: Direct API does not use authenticationContinue. Only the worker's lookup can admit a native retry.
-      if (operation === 'retry' && (state !== 'lookup' || !directLookupVerified)) fail();
+      if (operation === 'retry' && (state !== 'lookup' || !lookupVerified)) fail();
+    }
+    if (continuationMode === 'songbird') {
+      if (operation === 'continue' && (state !== 'lookup' || !lookupVerified || !lookupRequiresChallenge)) fail();
+      if (operation === 'retry' && (!lookupVerified || (lookupRequiresChallenge
+        ? state !== 'continued' || !continueVerified : state !== 'lookup'))) fail();
     }
     const promise = (async () => {
       try {
@@ -166,23 +186,30 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
             return { state, evidence, threeDsGuaranteed: false };
           }
           if (application) {
+            const hasCollection = captured.data != null && Object.hasOwn(captured.data, 'collection_url');
+            const misplacedCollection = captureDiagnostic?.raw_top_level_collection_url?.present === true;
             const code = captured.data?.transaction_type !== 'songbird' || !opaque(captured.data?.payload)
-              ? 'PIXELPAY_3DS_CONTINUATION_INVALID' : collectionError(captured.data);
+              ? 'PIXELPAY_3DS_CONTINUATION_INVALID' : hasCollection ? collectionError(captured.data)
+                : misplacedCollection ? 'PIXELPAY_3DS_COLLECTION_URL_ABSENT' : null;
             if (code) {
               state = 'unsupported';
               return { state, observedPaymentUuid: captured.data?.payment_uuid ?? null,
                 continuation_diagnostic: { ...captureDiagnostic, code, sdk_to_handoff_equal: null } };
             }
-            continuationMode = 'direct_api';
+            // AM: A rejected collection URL is never reinterpreted as the SDK's URL-free Songbird contract.
+            continuationMode = hasCollection ? 'direct_api' : 'songbird';
           }
           const continuation = { status: captured.status, transaction_type: captured.data.transaction_type,
-            payload: captured.data.payload, collection_url: application ? captured.data.collection_url : captured.data.collection_url ?? null };
+            payload: captured.data.payload,
+            ...(application ? continuationMode === 'direct_api' ? { collection_url: captured.data.collection_url } : {}
+              : { collection_url: captured.data.collection_url ?? null }) };
           state = 'challenge';
           return { state, attemptId, order: { id: input.orderId, amount: input.amount, currency: input.currency },
             sdk: { endpoint: settings.endpoint, environment: settings.environment }, continuation,
             nodeAuthenticationRequested: request.authentication_request === true, threeDsGuaranteed: false,
             ...(application ? { continuation_mode: continuationMode, observedPaymentUuid: captured.data.payment_uuid ?? null,
-              continuation_diagnostic: { ...captureDiagnostic, code: 'PIXELPAY_3DS_COLLECTION_READY',
+              continuation_diagnostic: { ...captureDiagnostic, code: continuationMode === 'direct_api'
+                ? 'PIXELPAY_3DS_COLLECTION_READY' : 'PIXELPAY_3DS_SONGBIRD_READY',
                 sdk_to_handoff_equal: comparePixelPayContinuationFields(captured.data, continuation) } } : {}) };
         }
         if (operation === 'lookup') {
@@ -192,16 +219,17 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
           if (continuationMode === 'direct_api' || (!application && captured?.data?.collection_url)) lookup.card_cvv = request.card_cvv;
           for (const key of ['reference', ...EMV]) if (data[key] !== undefined) lookup[key] = data[key];
           const response = await service.authenticationLookup(lookup);
-          directLookupVerified = continuationMode === 'direct_api' && directLookupAccepted(response);
-          if (publicContinuation && directLookupVerified) {
-            directLookupVerified = response.status === 202 ? response instanceof sdk.Responses.PayloadResponse
+          lookupVerified = application && lookupAccepted(response, continuationMode);
+          if (publicContinuation && lookupVerified) {
+            lookupVerified = response.status === 202 ? response instanceof sdk.Responses.PayloadResponse
               : response instanceof sdk.Responses.SuccessResponse;
           }
-          identifier = application && !directLookupVerified ? null : response.data?.identifier;
+          lookupRequiresChallenge = response.action === 'continue';
+          identifier = application && !lookupVerified ? null : response.data?.identifier;
           request.authentication_identifier = identifier;
           state = response.status >= 500 ? 'uncertain' : 'lookup';
           if (!application) return wire(response);
-          if (!directLookupVerified) return { status: response.status, success: false, action: null, data: {} };
+          if (!lookupVerified) return { status: response.status, success: false, action: null, data: {} };
           const result = wire(response);
           result.data = Object.fromEntries(Object.entries(result.data)
             .filter(([key]) => ['identifier', 'continue_url', 'continue_payload', 'window_size', 'transaction_id'].includes(key)));
@@ -212,7 +240,10 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
           continuation.identifier = identifier;
           continuation.payload = data.payload;
           const response = await service.authenticationContinue(continuation);
-          state = response.status >= 500 ? 'uncertain' : 'continued';
+          continueVerified = response.status === 200 && response.success === true && response.action === null
+            && (!publicContinuation || response instanceof sdk.Responses.SuccessResponse);
+          state = application ? continueVerified ? 'continued' : 'uncertain'
+            : response.status >= 500 ? 'uncertain' : 'continued';
           return application ? { status: response.status, action: response.action, success: response.success, data: {} }
             : wire(response);
         }
