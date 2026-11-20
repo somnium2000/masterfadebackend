@@ -93,6 +93,35 @@ test('desafío y frictionless conservan intento, titular y fase y solo aplican u
   for (const calls of attempts.values()) assert.deepEqual(calls, ['start', 'lookup', 'retry']);
 });
 
+test('la ventana del desafío dura hasta cuatro minutos pero nunca excede la reserva protegida', async t => {
+  let now = 1_000;
+  const db = { async query() { return { rows: [{}] }; } };
+  const manager = createPublicPixelPay3dsAttempts({
+    db, now: () => now,
+    makeAttempt({ onClose }) {
+      return { close: onClose, async call(operation) {
+        assert.equal(operation, 'start');
+        return { state: 'challenge', continuation_mode: 'direct_api' };
+      } };
+    },
+  });
+  t.after(() => manager.close());
+
+  const long = { ...claim(), protectionExpiresAt: new Date(500_000).toISOString() };
+  const longHandoff = await begin(manager, long, 'owner');
+  assert.equal(longHandoff.deadline, now + 240_000);
+
+  const short = { ...claim(), protectionExpiresAt: new Date(now + 80_000).toISOString() };
+  const shortHandoff = await begin(manager, short, 'owner');
+  assert.equal(shortHandoff.deadline, now + 80_000);
+
+  now = shortHandoff.deadline;
+  assert.equal(contextFor(manager, short, 'owner', shortHandoff.token), null);
+  assert.ok(contextFor(manager, long, 'owner', longHandoff.token));
+  now = longHandoff.deadline;
+  assert.equal(contextFor(manager, long, 'owner', longHandoff.token), null);
+});
+
 test('vencimiento, pérdida de worker y falta del marcador local impiden la continuación', async t => {
   let now = 1, workerClose;
   let update = true;
