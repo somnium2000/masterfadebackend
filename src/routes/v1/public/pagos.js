@@ -2075,8 +2075,8 @@ export default async function publicPagosRoutes(app, options = {}) {
         required: ['id_grupo_cita', 'id_intent', 'titular_email', 'token', 'operation', 'data'],
         properties: { id_grupo_cita: { type: 'string', format: 'uuid' },
           id_intent: { type: 'string', format: 'uuid' }, titular_email: { type: 'string', format: 'email', maxLength: 160 },
-          token: { type: 'string', format: 'uuid' }, operation: { enum: ['lookup', 'retry'] },
-          data: { type: 'object', maxProperties: 9, additionalProperties: { type: 'string', maxLength: 2048 } },
+          token: { type: 'string', format: 'uuid' }, operation: { enum: ['lookup', 'continue', 'retry'] },
+          data: { type: 'object', maxProperties: 9, additionalProperties: { type: 'string', maxLength: 32768 } },
         } } },
     }, async (request, reply) => {
       reply.header('Cache-Control', 'private, no-store');

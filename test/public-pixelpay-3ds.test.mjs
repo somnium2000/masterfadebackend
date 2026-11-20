@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { createPublicPixelPay3dsAttempts, resolvePublicPixelPay3dsConfig } from '../src/services/payments/publicPixelPay3ds.js';
+import { buildPublicPixelPay3dsHandoff, createPublicPixelPay3dsAttempts, resolvePublicPixelPay3dsConfig } from '../src/services/payments/publicPixelPay3ds.js';
 import { claimPixelPay3dsDispatch } from '../src/services/payments/pixelPaySaleAttemptStore.js';
 import { startPostgres17 } from './helpers/postgres17.mjs';
 
@@ -146,6 +146,130 @@ test('una respuesta perdida después del despacho durable conserva el bloqueo', 
   assert.equal(contextFor(manager, a, 'owner-a', token), null);
   assert.deepEqual(calls, ['start', 'record', 'lookup', 'claim', 'retry']);
 });
+
+test('el handoff conserva las dos modalidades y no inventa una URL para Songbird', () => {
+  for (const continuation_mode of ['direct_api', 'songbird']) {
+    const continuation = { status: 202, transaction_type: 'songbird', payload: 'opaque' };
+    if (continuation_mode === 'direct_api') continuation.collection_url = 'https://cas.client.cardinaltrusted.com/centinelapi/V1/Cruise/Collect';
+    const handoff = buildPublicPixelPay3dsHandoff({ result: { state: 'challenge', continuation_mode, continuation },
+      deadline: 100, token: 'token' });
+    assert.equal(handoff.continuation_mode, continuation_mode);
+    assert.equal(Object.hasOwn(handoff.continuation, 'collection_url'), continuation_mode === 'direct_api');
+  }
+  assert.equal(buildPublicPixelPay3dsHandoff({ result: { state: 'challenge', continuation_mode: 'unknown' } }), null);
+  assert.equal(buildPublicPixelPay3dsHandoff({ result: { state: 'unsupported', continuation_mode: 'songbird' } }), null);
+});
+
+for (const continued of [true, false]) {
+  test(`Songbird público exige authenticationContinue backend aceptada=${continued} y conserva duplicados y titular`, async t => {
+    const calls = [], phases = [];
+    let settlements = 0;
+    const db = { async query(sql) {
+      calls.push(sql.includes('3ds_continuation_dispatched') ? 'claim' : 'record');
+      return { rows: [{}] };
+    } };
+    const manager = createPublicPixelPay3dsAttempts({ db, now: () => 1,
+      logger: { info(record) { phases.push(record.phase); } }, makeAttempt({ onClose }) {
+        return { close: onClose, async call(op) {
+          calls.push(op);
+          if (op === 'start') return { state: 'challenge', continuation_mode: 'songbird' };
+          if (op === 'lookup') return { status: 202, success: true, action: 'continue' };
+          if (op === 'continue') {
+            await new Promise(resolve => setTimeout(resolve, 1));
+            return { status: 200, success: continued, action: null, data: {} };
+          }
+          return { sdkResponse: { status: 200 }, final: {} };
+        } };
+      } });
+    t.after(() => manager.close());
+    const a = claim();
+    const { token } = await begin(manager, a, 'owner');
+    assert.equal(contextFor(manager, a, 'other-owner', token), null);
+    const active = contextFor(manager, a, 'owner', token);
+    await assert.rejects(manager.advance(active, 'continue', { payload: 'before-lookup' }), { code: 'PIXELPAY_PUBLIC_3DS_PHASE_INVALID' });
+    await manager.advance(active, 'lookup', {});
+    await assert.rejects(manager.advance(active, 'retry', {}), { code: 'PIXELPAY_PUBLIC_3DS_PHASE_INVALID' });
+    for (const data of [{}, { payload: '' }, { payload: 'a'.repeat(32769) }, { payload: 'jwt', approved: true }]) {
+      await assert.rejects(manager.advance(active, 'continue', data), { code: 'PIXELPAY_PUBLIC_3DS_PHASE_INVALID' });
+    }
+    const [one, duplicate] = await Promise.all([
+      manager.advance(active, 'continue', { payload: 'opaque-jwt' }),
+      manager.advance(active, 'continue', { payload: 'opaque-jwt' }),
+    ]);
+    assert.deepEqual(duplicate, one);
+    if (continued) {
+      await assert.rejects(manager.advance(active, 'continue', { payload: 'conflicting-jwt' }), { code: 'PIXELPAY_PUBLIC_3DS_PHASE_INVALID' });
+      const settle = () => { settlements++; return { paid: true }; };
+      await Promise.all([manager.advance(active, 'retry', {}, settle), manager.advance(active, 'retry', {}, settle)]);
+      assert.equal(settlements, 1);
+      assert.deepEqual(calls, ['start', 'record', 'lookup', 'continue', 'claim', 'retry']);
+      assert.ok(phases.includes('authentication_continue_ready'));
+    } else {
+      await assert.rejects(manager.advance(active, 'retry', {}, () => assert.fail('unexpected settlement')),
+        { code: 'PIXELPAY_PUBLIC_3DS_CONTEXT_LOST' });
+      assert.equal(contextFor(manager, a, 'owner', token), null);
+      assert.deepEqual(calls, ['start', 'record', 'lookup', 'continue']);
+      assert.ok(phases.includes('authentication_continue_incomplete'));
+    }
+  });
+}
+
+test('Songbird frictionless no admite un JWT y Direct API nunca usa authenticationContinue', async t => {
+  const db = { async query() { return { rows: [{}] }; } };
+  for (const mode of ['songbird', 'direct_api']) {
+    const calls = [];
+    const manager = createPublicPixelPay3dsAttempts({ db, now: () => 1, makeAttempt({ onClose }) {
+      return { close: onClose, async call(op) {
+        calls.push(op);
+        if (op === 'start') return { state: 'challenge', continuation_mode: mode };
+        if (op === 'lookup') return { status: 200, success: true, action: null };
+        return { sdkResponse: { status: 200 }, final: {} };
+      } };
+    } });
+    t.after(() => manager.close());
+    const a = claim();
+    const { token } = await begin(manager, a, 'owner');
+    const active = contextFor(manager, a, 'owner', token);
+    await manager.advance(active, 'lookup', {});
+    await assert.rejects(manager.advance(active, 'continue', { payload: 'unexpected' }), { code: 'PIXELPAY_PUBLIC_3DS_PHASE_INVALID' });
+    await manager.advance(active, 'retry', {}, () => ({}));
+    assert.deepEqual(calls, ['start', 'lookup', 'retry']);
+  }
+});
+
+for (const failure of ['lookup', 'continue', 'retry']) {
+  test(`fallo de ${failure} conserva un diagnóstico fijo sin excepción ni payload`, async t => {
+    const records = [];
+    const manager = createPublicPixelPay3dsAttempts({ now: () => 1,
+      db: { async query() { return { rows: [{}] }; } },
+      logger: { info(record) { records.push(record); if (record.phase.endsWith('_failed')) throw new Error('SINK_FAILURE'); } },
+      makeAttempt({ onClose }) {
+        return { close: onClose, async call(op) {
+          if (op === failure) throw new Error('NEVER_LOG_PROVIDER_ERROR');
+          if (op === 'start') return { state: 'challenge', continuation_mode: 'songbird' };
+          if (op === 'lookup') return { status: 202, success: true, action: 'continue' };
+          return { status: 200, success: true, action: null, data: {} };
+        } };
+      } });
+    t.after(() => manager.close());
+    const a = claim();
+    const { token } = await begin(manager, a, 'owner');
+    const active = contextFor(manager, a, 'owner', token);
+    const steps = [['lookup', { reference: 'NEVER_LOG_REFERENCE' }], ['continue', { payload: 'NEVER_LOG_JWT' }], ['retry', {}]];
+    for (const [op, data] of steps) {
+      if (op === failure) {
+        await assert.rejects(manager.advance(active, op, data, () => assert.fail('unexpected settlement')),
+          { code: 'PIXELPAY_PUBLIC_3DS_CONTEXT_LOST' });
+        break;
+      }
+      await manager.advance(active, op, data);
+    }
+    const phase = { lookup: 'lookup_failed', continue: 'authentication_continue_failed', retry: 'continuation_failed' }[failure];
+    assert.ok(records.some(record => record.phase === phase));
+    assert.doesNotMatch(JSON.stringify(records), /NEVER_LOG|SINK_FAILURE|payload|stack|message/);
+    assert.equal(contextFor(manager, a, 'owner', token), null);
+  });
+}
 
 test('PostgreSQL 17 arbitra un único despacho concurrente para el contexto 202 vigente',
   { skip: !process.env.MASTERFADE_TEST_PG_BIN }, async t => {
