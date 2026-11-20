@@ -276,6 +276,29 @@ for (const scenario of ['songbird-continue-false', 'songbird-continue-timeout'])
   });
 }
 
+test('an HTTP 400 from the signed Songbird SDK continuation is sanitized and never authorizes a Sale retry', async t => {
+  const value = attempt(t, 'A', 'songbird', {
+    application: true,
+    publicContinuation: true,
+    continueResponse: { status: 400, body: { success: false, message: 'El valor KEY es inválido' } },
+  });
+  const handoff = await value.call('start');
+  assert.equal(handoff.continuation.status, 202);
+  assert.equal(handoff.continuation_mode, 'songbird');
+  assert.equal((await value.call('lookup', lookup)).action, 'continue');
+  const response = await value.call('continue', { payload: 'opaque-test-value' });
+  assert.deepEqual(response, { status: 400, success: false, action: null, data: {} });
+  await assert.rejects(value.call('retry'));
+  assert.deepEqual(await value.call('start'), handoff);
+  const stats = await value.call('inspect');
+  assert.equal(stats.initialSales, 1);
+  assert.equal(stats.continues, 1);
+  assert.equal(stats.retries, 0);
+  assert.equal(stats.statusQueries, 0);
+  assert.equal(stats.credentialsInNode, true);
+  assert.equal(stats.externalSockets, 0);
+});
+
 for (const suffix of ['invalid-step-up', 'invalid-step-up-userinfo', 'invalid-lookup-identifier',
   'invalid-continue-payload', 'invalid-transaction-id', 'lookup-not-successful']) {
   test(`public Songbird ${suffix} fails closed before authenticationContinue or retry`, async t => {
