@@ -158,7 +158,7 @@ export async function recordDelegatedStatusCandidate(pool, { idIntent, paymentAt
        SET upstream_http_status = 202,
            observed_payment_uuid_untrusted = COALESCE(observed_payment_uuid_untrusted, $3::varchar(80))
        WHERE id_intent = $1::uuid AND payment_attempt_id = $2::uuid
-         AND qa_test_origin IS NULL AND finalized_at IS NULL`,
+         AND finalized_at IS NULL`,
       [requireUuid(idIntent), requireUuid(paymentAttemptId), observed],
     );
     return;
