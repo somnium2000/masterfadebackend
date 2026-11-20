@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { PixelPaySdkProvider } from '../../services/payments/PixelPaySdkProvider.js';
-import { createPixelPaySaleSignature } from '../../services/payments/PixelPayDirectProvider.js';
+import { createPixelPaySaleSignature, PIXELPAY_SALE_OUTCOME } from '../../services/payments/PixelPayDirectProvider.js';
 import { comparePixelPayContinuationFields, createPixelPayNodeSaleTransaction, PixelPayContinuationRequiredError } from '../../services/payments/pixelPaySaleRuntime.js';
 const require = createRequire(import.meta.url);
 const sdk = require('@pixelpay/sdk-core');
@@ -51,7 +51,8 @@ function wire(response) {
 }
 
 // AM: Must live inside its dedicated worker. No transaction/keys are serialized out of this closure.
-export function createDelegatedSession({ config, input, attemptId, explicitAuthentication = false, application = false }) {
+export function createDelegatedSession({ config, input, attemptId, explicitAuthentication = false, application = false, publicContinuation = false }) {
+  if (publicContinuation && (!application || !['sandbox', 'live'].includes(config.env))) fail();
   const provider = new PixelPaySdkProvider(config);
   const signature = createPixelPaySaleSignature({ secretKey: config.secretKey, appKey: config.keyId,
     orderId: input.orderId, appUrl: config.appUrl });
@@ -84,14 +85,25 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
     const matches = (field, expected) => typeof field === 'string' && field === expected;
     const payload = response.data;
     const observedUuid = captured?.data?.payment_uuid;
+    const noConflict = [
+      [payload?.order_id, input.orderId], [payload?.transaction_currency, input.currency],
+      [payload?.order_currency, input.currency],
+      [publicContinuation && !result.paymentUuid ? null : observedUuid, result.paymentUuid],
+    ].every(([value, expected]) => value == null || matches(value, expected));
+    if (publicContinuation) {
+      // AM: The final Sale need not echo order or currency. Use the original request, verified hash and amounts.
+      const approved = noConflict && result.approved && response.status === 200 && response.action === null
+        && response instanceof sdk.Responses.SuccessResponse;
+      const definitive = noConflict && result.definitive && result.outcome === PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED
+        && response.status === 402 && response instanceof sdk.Responses.PaymentDeclinedResponse;
+      return { ...result, approved, definitive,
+        outcome: approved ? PIXELPAY_SALE_OUTCOME.APPROVED
+          : definitive ? PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED : PIXELPAY_SALE_OUTCOME.UNCERTAIN };
+    }
     let corroborated = matches(payload?.order_id, input.orderId)
       && matches(payload?.transaction_currency ?? payload?.order_currency, input.currency)
       && (!payload?.transaction_currency || !payload?.order_currency || payload.transaction_currency === payload.order_currency)
       && (!observedUuid || observedUuid === result.paymentUuid);
-    const noConflict = [
-      [payload?.order_id, input.orderId], [payload?.transaction_currency, input.currency],
-      [payload?.order_currency, input.currency], [observedUuid, result.paymentUuid],
-    ].every(([value, expected]) => value == null || matches(value, expected));
     if (!corroborated && result.approved && noConflict) {
       // AM: Only an independently approved Sale can use Status to corroborate missing identity fields.
       try {
@@ -181,6 +193,10 @@ export function createDelegatedSession({ config, input, attemptId, explicitAuthe
           for (const key of ['reference', ...EMV]) if (data[key] !== undefined) lookup[key] = data[key];
           const response = await service.authenticationLookup(lookup);
           directLookupVerified = continuationMode === 'direct_api' && directLookupAccepted(response);
+          if (publicContinuation && directLookupVerified) {
+            directLookupVerified = response.status === 202 ? response instanceof sdk.Responses.PayloadResponse
+              : response instanceof sdk.Responses.SuccessResponse;
+          }
           identifier = application && !directLookupVerified ? null : response.data?.identifier;
           request.authentication_identifier = identifier;
           state = response.status >= 500 ? 'uncertain' : 'lookup';

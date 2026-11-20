@@ -8,6 +8,7 @@ import { resolveSongbirdBridgeConfig, SongbirdBridge } from '../services/payment
 import { SongbirdRepository } from '../services/payments/songbirdRepository.js';
 import { resolveQaDelegatedConfig } from '../experimental/pixelpayDelegated/qaAttempts.js';
 import { resolveLive3dsDirectConfig } from '../experimental/pixelpayDelegated/liveConfig.js';
+import { createPublicPixelPay3dsAttempts, resolvePublicPixelPay3dsConfig } from '../services/payments/publicPixelPay3ds.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // AM: Maintenance does not create holds/intents or initiate provider charges; original guards remain.
@@ -25,14 +26,18 @@ const MAINTENANCE_ROUTES = new Set([
   "DELETE /v1/admin/citas/dias-inhabilitados/:id", "PATCH /v1/admin/citas/parametros",
 ]);
 // AM: Public admission only covers existing client flows, never admin, simulators or generic prefixes.
+const PUBLIC_BOOKING_3DS_ROUTE = 'POST /v1/pagos/reservas/pixelpay/3ds/continuar';
+const PUBLIC_VIP_3DS_ROUTE = 'POST /v1/cliente/planes/pixelpay/3ds/continuar';
 const PUBLIC_BOOKING_ROUTES = new Set([
   "POST /v1/public/citas/validar-contactos",
   "POST /v1/citas/hold", "POST /v1/citas/hold/:id_grupo_cita/confirmar",
   "POST /v1/citas/pendiente/:id_grupo_cita/retomar",
+  PUBLIC_BOOKING_3DS_ROUTE,
   ...["crear-intent", "pixelpay/sale", "pixelpay/status", "estado"]
     .map(path => `POST /v1/pagos/reservas/${path}`),
 ]);
 const PUBLIC_VIP_ROUTES = new Set([
+  PUBLIC_VIP_3DS_ROUTE,
   "POST /v1/cliente/planes/orden", "POST /v1/cliente/planes/pago-intent",
   "POST /v1/cliente/planes/confirmar-pago", "POST /v1/cliente/planes/pago-intent/:id_payment_intent/estado",
 ]);
@@ -193,6 +198,15 @@ export default fp(async function privateCommerce(app) {
   const diagnosticsEnabled = process.env.PRIVATE_COMMERCE_DIAGNOSTICS_ENABLED === "true";
   const verifyClient = app.requireRoles(["cliente"]);
   const publicConfig = app.config.publicCommerce || resolvePublicCommerceConfig(process.env);
+  const public3dsEnvironment = resolvePublicPixelPay3dsConfig(process.env, {
+    qaBooking, qaSale, delegated: delegated || qa3ds?.enabled, publicCommerce: publicConfig,
+  });
+  const public3ds = public3dsEnvironment
+    ? createPublicPixelPay3dsAttempts({ db: app.db, environment: public3dsEnvironment, logger: app.log }) : null;
+  const public3dsVipEnabled = Boolean(public3ds && publicConfig.vipPurchaseEnabled);
+  app.decorate('publicPixelPay3ds', public3ds);
+  app.decorateRequest('publicCommerceAdmission', null);
+  if (public3ds) app.addHook('onClose', async () => public3ds.close());
   const publicAvailable = () => ({
     publicBooking: !qaBooking.enabled && !config.qaCapabilities && app.config.paymentProvider === "pixelpay" && !app.config.adminDataEntryMode && publicConfig.bookingEnabled === true,
     publicVipPurchase: !qaBooking.enabled && !config.qaCapabilities && app.config.paymentProvider === "pixelpay" && !app.config.adminDataEntryMode && publicConfig.vipPurchaseEnabled === true,
@@ -323,6 +337,8 @@ export default fp(async function privateCommerce(app) {
       }
       if (!publicAdmission && (qaBooking.enabled || config.qaCapabilities)) {
         const routeAllowed = qaBooking.enabled ? QA_SANDBOX_BOOKING_ROUTES.has(route)
+          || (public3ds && route === PUBLIC_BOOKING_3DS_ROUTE)
+          || (public3dsVipEnabled && PUBLIC_VIP_ROUTES.has(route))
           || route === 'POST /v1/pagos/reservas/pixelpay/3ds/bridge'
           || (delegated && ['POST /v1/pagos/reservas/pixelpay/3ds/delegated',
             'POST /v1/pagos/reservas/pixelpay/status'].includes(route))
@@ -332,6 +348,7 @@ export default fp(async function privateCommerce(app) {
           return sendError(reply, 403, 'Operacion comercial no disponible.', { code: 'PRIVATE_COMMERCE_RESTRICTED' });
         }
       }
+      if (publicAdmission) request.publicCommerceAdmission = PUBLIC_BOOKING_ROUTES.has(route) ? 'booking' : 'vip';
       // AM: Public booking now uses a session too; keep it protected against cross-site mutations.
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)
         && (!request.cookies?.mf_csrf || request.cookies.mf_csrf !== request.headers["x-csrf-token"])) {
@@ -364,10 +381,16 @@ export default fp(async function privateCommerce(app) {
     const allowed = publiclyEligible ? false : await eligible(request, reply, code => { reason = code; });
     await diagnose(request, reason);
     if (reply.sent) return;
+    const public3dsRequired = app.config.pixelPayEnv === 'live'
+      && (available.publicBooking || available.publicVipPurchase);
     return { ok: true, data: {
+      ...((public3ds || public3dsRequired) ? {
+        pixelpayPublic3ds: Boolean(public3ds && (public3dsEnvironment === 'live' ? publiclyEligible : allowed)),
+        pixelpayPublic3dsRequired: true,
+      } : {}),
       booking: allowed || (available.publicBooking && publiclyEligible),
       vipPurchase: (available.publicVipPurchase && publiclyEligible)
-        || (allowed && !qaBooking.enabled && !config.qaCapabilities),
+        || (allowed && (public3dsVipEnabled || (!qaBooking.enabled && !config.qaCapabilities))),
       ...(!config.qaCapabilities ? available : {}),
       ...(qaBooking.enabled ? { pixelpaySale: allowed && qaSale.enabled,
         pixelpay3dsDiagnostic: false,

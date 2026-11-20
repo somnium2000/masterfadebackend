@@ -6,7 +6,7 @@ import { createQaDelegatedAttempts, resolveQaDelegatedConfig } from '../src/expe
 const workerUrl = new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url);
 function attempt(t, order = 'A', scenario, extra = {}) {
   const context = { ...desktopContext(order, scenario), ...extra };
-  if (context.application) Object.assign(context.config, {
+  if (context.application && !extra.config) Object.assign(context.config, {
     env: 'sandbox', endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev',
   });
   const value = new DelegatedAttempt({ workerUrl, context });
@@ -231,3 +231,58 @@ test('QA Direct API accepts a 200 challenge lookup and cannot retry after worker
   value.close();
   await assert.rejects(value.call('retry'), /CONTEXT_LOST/);
 });
+
+for (const [scenario, environment, expectedAction] of [
+  ['challenge', 'sandbox', 'continue'],
+  ['challenge-http-200', 'live', 'continue'],
+  ['frictionless', 'sandbox', null],
+]) test(`public Direct API ${scenario} in ${environment} permits one native retry and approves without order/currency echoes`, async t => {
+  const value = attempt(t, 'A', scenario, { application: true, publicContinuation: true,
+    ...(environment === 'live' ? { config: desktopContext().config } : {}) });
+  const start = await value.call('start');
+  assert.equal(start.continuation_mode, 'direct_api');
+  assert.equal(start.sdk.environment, environment);
+  await assert.rejects(value.call('retry'));
+  const providerLookup = await value.call('lookup', lookup);
+  assert.equal(providerLookup.status, scenario === 'challenge' ? 202 : 200);
+  assert.equal(providerLookup.success, true);
+  assert.equal(providerLookup.action, expectedAction);
+  assert.equal((await value.call('inspect')).retries, 0);
+  await assert.rejects(value.call('continue', { payload: 'browser-assertion' }));
+  await assert.rejects(value.call('retry', { identifier: 'auth-A' }));
+  await assert.rejects(value.call('retry', { response_approved: true }));
+  const [result, duplicate] = await Promise.all([value.call('retry'), value.call('retry')]);
+  assert.deepEqual(result, duplicate);
+  assert.equal(result.final.approved, true);
+  assert.equal(result.final.paymentHashValid, true);
+  assert.equal(result.final.amountMatches, true);
+  assert.deepEqual(result.sdkResponse, { status: 200, success: true, action: null, data: {} });
+  assert.deepEqual(await value.call('inspect'), { externalSockets: 0, initialSales: 1, retries: 1,
+    lookups: 1, continues: 0, cryptoContextMatches: true, credentialsInNode: true, orders: ['A', 'A', 'A'],
+    directLookupCvvMatches: true, statusQueries: 0 });
+});
+
+test('public Direct API rejects an invalid provider challenge before any native retry', async t => {
+  const value = attempt(t, 'A', 'invalid-step-up', { application: true, publicContinuation: true });
+  await value.call('start');
+  assert.deepEqual(await value.call('lookup', lookup), { status: 202, success: false, action: null, data: {} });
+  await assert.rejects(value.call('retry'));
+  assert.equal((await value.call('inspect')).retries, 0);
+});
+
+for (const scenario of ['bad-amount', 'bad-hash', 'bad-uuid', 'bad-currency', 'bad-order', 'non-terminal-success']) {
+  test(`public Direct API final ${scenario} remains uncertain and does not fetch Status or resend`, async t => {
+    const value = attempt(t, 'A', scenario, { application: true, publicContinuation: true });
+    await value.call('start');
+    await value.call('lookup', lookup);
+    const result = await value.call('retry');
+    assert.equal(result.final.approved, false);
+    assert.equal(result.final.definitive, false);
+    assert.equal(result.final.outcome, 'uncertain');
+    assert.deepEqual(await value.call('retry'), result);
+    const stats = await value.call('inspect');
+    assert.equal(stats.initialSales, 1);
+    assert.equal(stats.retries, 1);
+    assert.equal(stats.statusQueries, 0);
+  });
+}

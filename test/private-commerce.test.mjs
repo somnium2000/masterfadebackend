@@ -48,7 +48,7 @@ async function fixture(t, options = {}) {
   app.decorate("db", { query: async (sql, params) => {
     if (sql.includes("FROM public.seguridad_sesiones")) return { rows: options.revoked ? [] : [{ estado: "activa", ultimo_uso_at: new Date(), expira_at: new Date(Date.now() + 60000) }] };
     if (sql.includes("UPDATE public.seguridad_sesiones")) return { rows: [] };
-    if (sql.includes("WITH base_user")) return { rows: options.noClaims ? [] : [{ id_usuario: options.claimsMismatch ? OTHER : params[0], cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
+    if (sql.includes("WITH base_user")) return { rows: options.noClaims ? [] : [{ id_usuario: options.claimsMismatch ? OTHER : params[0], id_persona: options.personId, cliente_id: options.clientId === undefined ? OTHER : options.clientId, roles: options.roles || ["super_admin", "cliente"] }] };
     if (options.businessQuery) return options.businessQuery(sql, params);
     state.unexpectedSql++; throw Error("Unexpected business SQL");
   }, connect: async () => { state.unexpectedSql++; throw Error("Business connection prohibited"); } });
@@ -793,4 +793,70 @@ test('expired diagnostic capability closes Sale while retained target still bloc
     assert.equal(status.statusCode,403); assert.equal(status.json().error.code,'QA_3DS_EXTERNAL_STATUS_DISABLED');
   } finally { Date.now=originalNow; }
   assert.deepEqual(f.state,{business:0,unexpectedSql:0});
+});
+
+test('candidato 3DS público en QA conserva identidad, CSRF y permiso VIP separado', async t => {
+  const f = await fixture(t, {
+    env: { ...QA_SANDBOX_SALE_IDENTITY, PIXELPAY_PUBLIC_3DS_ENABLED: 'true' },
+    config: { pixelPayEnv: 'sandbox', publicCommerce: { bookingEnabled: false, vipPurchaseEnabled: true } },
+    roles: ['cliente'],
+  });
+  const headers = f.headers();
+  const get = (headers) => f.app.inject({ url: '/v1/commerce/eligibility', headers });
+  assert.equal((await get(headers)).json().data.pixelpayPublic3ds, true);
+  assert.equal((await get(headers)).json().data.vipPurchase, true);
+  assert.equal((await get(f.headers(OTHER))).json().data.pixelpayPublic3ds, false);
+  for (const url of ['/v1/pagos/reservas/pixelpay/3ds/continuar', '/v1/cliente/planes/pixelpay/3ds/continuar']) {
+    const post = (headers) => f.app.inject({ method: 'POST', url, headers, payload: {} });
+    const noCsrf = { ...headers, 'x-csrf-token': 'wrong' };
+    assert.equal((await post(noCsrf)).json().error.code, 'CSRF_TOKEN_INVALID');
+    assert.equal((await post(f.headers(OTHER))).statusCode, 403);
+    assert.equal((await post(headers)).statusCode, 400);
+  }
+  assert.equal(f.state.unexpectedSql, 0);
+});
+
+test('public Live 3DS advertises capability only to an active client of an enabled surface', async t => {
+  const operations = {
+    booking: '/v1/pagos/reservas/pixelpay/3ds/continuar',
+    membership: '/v1/cliente/planes/pixelpay/3ds/continuar',
+  };
+  for (const route of ['booking', 'membership']) {
+    await t.test(route, async sub => {
+      const f = await fixture(sub, {
+        env: {
+          NODE_ENV: 'production', ENTORNO: 'production', PAYMENT_PROVIDER: 'pixelpay', PIXELPAY_ENV: 'live',
+          PIXELPAY_IMPLEMENTATION: 'sdk', PIXELPAY_PUBLIC_3DS_ENABLED: 'true',
+          PIXELPAY_ENDPOINT: 'https://offline-pixelpay.invalid', PIXELPAY_APP_URL: 'https://offline-shop.invalid',
+          PRIVATE_COMMERCE_PILOT_ENABLED: 'false',
+        },
+        config: { pixelPayEnv: 'live', publicCommerce: { bookingEnabled: route === 'booking', vipPurchaseEnabled: route === 'membership' } },
+        roles: ['cliente'],
+        personId: USER,
+        businessQuery: async (sql, params) => {
+          assert.match(sql, /FROM public.clientes c/);
+          return { rows: params.every((value, index) => value === [OTHER, USER, USER][index]) ? [{ id_cliente: OTHER }] : [] };
+        },
+      });
+      const get = (headers) => f.app.inject({ url: '/v1/commerce/eligibility', remoteAddress: '198.51.100.2', headers });
+      const signedIn = (await get(f.headers())).json().data;
+      assert.deepEqual(signedIn, {
+        booking: route === 'booking', vipPurchase: route === 'membership',
+        publicBooking: route === 'booking', publicVipPurchase: route === 'membership',
+        pixelpayPublic3dsRequired: true, pixelpayPublic3ds: true,
+      });
+      for (const headers of [{}, f.headers(OTHER)]) {
+        const denied = (await get(headers)).json().data;
+        assert.equal(denied.pixelpayPublic3dsRequired, true);
+        assert.equal(denied.pixelpayPublic3ds, false);
+      }
+
+      const post = (url, headers) => f.app.inject({ method: 'POST', url, remoteAddress: '198.51.100.2', headers, payload: {} });
+      assert.equal((await post(operations[route], f.headers())).statusCode, 400);
+      assert.equal((await post(operations[route], { ...f.headers(), 'x-csrf-token': 'wrong' })).json().error.code, 'CSRF_TOKEN_INVALID');
+      const otherRoute = route === 'booking' ? 'membership' : 'booking';
+      assert.equal((await post(operations[otherRoute], f.headers())).statusCode, 403);
+      assert.equal(f.state.unexpectedSql, 0);
+    });
+  }
 });

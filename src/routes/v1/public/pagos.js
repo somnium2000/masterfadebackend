@@ -4,6 +4,7 @@ import { sendOk } from "../../../utils/response.js";
 import { PaymentProviderFactory } from "../../../services/payments/PaymentProviderFactory.js";
 import { createQaDelegatedAttempts } from '../../../experimental/pixelpayDelegated/qaAttempts.js';
 import { assertLive3dsFreshIntent } from '../../../experimental/pixelpayDelegated/liveConfig.js';
+import { buildPublicPixelPay3dsHandoff, publicPixelPay3dsUnavailable } from '../../../services/payments/publicPixelPay3ds.js';
 import { assertQa3dsCardAllowed, assertQa3dsFreshIntent, assertQa3dsInitialPayload, isQa3dsIntent, qa3dsWindowOpen, sanitizeQa3dsObservation } from '../../../services/payments/qaPixelPay3dsDiagnostic.js';
 import { loadPixelPayQaOrigin, pixelPayQaFlags } from '../../../services/payments/pixelPayQaOrigin.js';
 import {
@@ -1990,6 +1991,8 @@ export default async function publicPagosRoutes(app, options = {}) {
   const paymentAccess = (request) => authenticated
     ? { mode: "authenticated", owner: resolveAuthenticatedPaymentOwner(request) }
     : { mode: "public" };
+  const public3dsManager = authenticated ? app.publicPixelPay3ds : null;
+  const livePayments = app.config?.pixelPayEnv === 'live';
   const delegatedConfig = authenticated ? app.qaPixelPayDelegated : null;
   const delegated = delegatedConfig ? createQaDelegatedAttempts({
     config: delegatedConfig, makeAttempt: options.delegatedAttemptFactory,
@@ -2004,11 +2007,13 @@ export default async function publicPagosRoutes(app, options = {}) {
   async function persistDelegatedResult(claim, result, request, owner) {
     const diagnostics = { ...result.diagnostics, idIntent: claim.idIntent, paymentAttemptId: claim.paymentAttemptId,
       outcome: result.outcome, observedPaymentUuidUntrusted: result.observedPaymentUuid };
-    if (!result.approved) {
-      if (delegatedConfig?.liveTest && claim.liveTestHad202) {
+    const publicDecline = claim.public3ds && result.definitive && result.outcome === PIXELPAY_SALE_OUTCOME.PAYMENT_DECLINED;
+    if (!result.approved && !publicDecline) {
+      if ((delegatedConfig?.liveTest && claim.liveTestHad202) || claim.public3dsHad202) {
         // Preserve the durable 202 marker after an uncertain native continuation;
         // otherwise Status could become externally consultable after restart.
-        request.log.warn({ event: 'pixelpay_live_3ds_manual_reconciliation', id_intent: claim.idIntent });
+        request.log.warn({ event: claim.public3ds ? 'pixelpay_public_3ds_manual_reconciliation'
+          : 'pixelpay_live_3ds_manual_reconciliation', id_intent: claim.idIntent });
       } else {
         await finalizePixelPaySaleAttemptBestEffort(app.db, diagnostics, request.log);
       }
@@ -2017,6 +2022,21 @@ export default async function publicPagosRoutes(app, options = {}) {
     const client = await app.db.connect();
     try {
       await client.query('BEGIN');
+      if (publicDecline) {
+        const updated = await client.query(
+          `UPDATE public.payment_intents SET estado_intent_codigo = 'fallido', updated_at = now()
+           WHERE id_intent = $1::uuid AND id_grupo_cita = $2::uuid AND estado_intent_codigo = 'pendiente_confirmacion'
+             AND referencia_externa IS NULL AND provider_session_id IS NULL RETURNING id_intent`,
+          [claim.idIntent, claim.idGrupoCita],
+        );
+        if (!updated.rows[0] || !await finalizePixelPaySaleAttempt(client, diagnostics)) {
+          await client.query('ROLLBACK');
+          return pendingDelegated;
+        }
+        await client.query('COMMIT');
+        return { processed: false, pending_confirmation: false, booking_confirmed: false,
+          estado_intent_codigo: 'fallido', customer_error_code: 'PIXELPAY_PAYMENT_DECLINED' };
+      }
       const updated = await client.query(
         `UPDATE public.payment_intents SET referencia_externa = $3, provider_session_id = $4, updated_at = now()
          WHERE id_intent = $1::uuid AND id_grupo_cita = $2::uuid AND estado_intent_codigo = 'pendiente_confirmacion'
@@ -2040,9 +2060,44 @@ export default async function publicPagosRoutes(app, options = {}) {
       return recovered.booking_confirmed === true ? recovered : pendingDelegated;
     } catch {
       await client.query('ROLLBACK').catch(() => {});
-      request.log.warn({ event: 'pixelpay_qa_delegated_recovery_required', id_intent: claim.idIntent });
+      request.log.warn({ event: claim.public3ds ? 'pixelpay_public_3ds_recovery_required'
+        : 'pixelpay_qa_delegated_recovery_required', id_intent: claim.idIntent });
       return pendingDelegated;
     } finally { client.release(); }
+  }
+
+  if (public3dsManager) {
+    app.post('/pixelpay/3ds/continuar', {
+      ...routeGuard,
+      bodyLimit: 40000,
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+      schema: { body: { type: 'object', additionalProperties: false,
+        required: ['id_grupo_cita', 'id_intent', 'titular_email', 'token', 'operation', 'data'],
+        properties: { id_grupo_cita: { type: 'string', format: 'uuid' },
+          id_intent: { type: 'string', format: 'uuid' }, titular_email: { type: 'string', format: 'email', maxLength: 160 },
+          token: { type: 'string', format: 'uuid' }, operation: { enum: ['lookup', 'retry'] },
+          data: { type: 'object', maxProperties: 9, additionalProperties: { type: 'string', maxLength: 2048 } },
+        } } },
+    }, async (request, reply) => {
+      reply.header('Cache-Control', 'private, no-store');
+      const body = request.body;
+      const access = paymentAccess(request);
+      if (livePayments && request.publicCommerceAdmission !== 'booking') throw publicPixelPay3dsUnavailable();
+      const context = public3dsManager.get({ kind: 'booking', idIntent: body.id_intent, idGrupoCita: body.id_grupo_cita,
+        owner: access.owner.usuarioId, token: body.token });
+      const contextLost = () => new AppError(409, 'El pago sigue pendiente de verificación.', {
+        code: 'PIXELPAY_PUBLIC_3DS_CONTEXT_LOST',
+      });
+      if (!context) throw contextLost();
+      const { intent } = await loadPublicIntentForGroup(app.db, { groupId: body.id_grupo_cita, idIntent: body.id_intent,
+        titularEmail: normalizeEmail(body.titular_email), access, expectedAmountHnl: context.claim.amount });
+      if (intent.estado_intent_codigo !== 'pendiente_confirmacion' || intent.orden_compra !== context.claim.orderId
+        || intent.moneda_codigo !== context.claim.currency || intent.provider_code !== 'pixelpay'
+        || !(Date.parse(intent.expires_at) > Date.now())) throw contextLost();
+      const response = await public3dsManager.advance(context, body.operation, body.data, result =>
+        persistDelegatedResult(context.claim, result, request, access.owner));
+      return sendOk(reply, response);
+    });
   }
 
   if (delegated) {
@@ -2547,6 +2602,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         properties: {
           id_grupo_cita: { type: "string", format: "uuid" },
           id_intent: { type: "string", format: "uuid" },
+          supports_public_3ds: { type: "boolean" },
           titular_email: { type: "string", format: "email", maxLength: 160 },
           card_number: { type: "string", pattern: "^[0-9 ]{13,23}$" },
           card_holder: { type: "string", minLength: 2, maxLength: 120 },
@@ -2566,12 +2622,18 @@ export default async function publicPagosRoutes(app, options = {}) {
     // AM: Stop the retired Node/React protocol before reserving or dispatching a new operation.
     const useDelegated = isDelegatedIntent(request.body?.id_intent);
     const useLiveDelegated = useDelegated && delegatedConfig?.liveTest === true;
+    const publicLiveBooking = livePayments && request.publicCommerceAdmission === 'booking';
+    const public3ds = !livePayments || publicLiveBooking ? public3dsManager : null;
+    if ((publicLiveBooking && !public3ds) || (public3ds && request.body.supports_public_3ds !== true)) {
+      throw publicPixelPay3dsUnavailable();
+    }
     if (!useDelegated && (qa3dsTarget || app.qaPixelPay3dsDiagnostic?.enabled === true)) {
       throw new AppError(503, 'El pago con autenticacion no esta disponible.', { code: 'PIXELPAY_3DS_INTEGRATION_UNAVAILABLE' });
     }
     let dbClient = await app.db.connect();
     let inTransaction = false;
     let claim = null;
+    let workerSlot;
     const diagnosticFields = observation => qa3dsTarget ? { qa_3ds_diagnostic: true,
       ...(app.qaPixelPay3dsDiagnostic?.sessionMode ? { qa_sandbox_session: true } : {}),
       ...(observation ? { qa_3ds_observation: sanitizeQa3dsObservation(observation) } : {}) } : {};
@@ -2663,6 +2725,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         });
       }
       if (!qa3dsTarget) validateSaleCardBeforeClaim(request.body.card_number, app.config?.pixelPayEnv, request.log, request.id, idIntent);
+      if (public3ds) workerSlot = public3ds.reserve();
       const claimed = await dbClient.query(
         `SELECT app_private.proteger_reserva_pago_v1(
            $1::uuid, $2::uuid
@@ -2687,6 +2750,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         customerName: resolveCustomerName(groupRows),
         paymentAttemptId: crypto.randomUUID(),
         protectionExpiresAt: claimed.rows[0].protection_expires_at,
+        public3ds: Boolean(public3ds),
       };
       const expiry = inspectPixelPayCardExpire(request.body.card_expire);
       await createPixelPaySaleAttemptRecord(dbClient, {
@@ -2728,6 +2792,26 @@ export default async function publicPagosRoutes(app, options = {}) {
           callbackUrl: app.config?.pixelPayOrderCallbackUrl || null,
         };
         const provider = PaymentProviderFactory.create();
+        if (public3ds) {
+          reply.header('Cache-Control', 'private, no-store');
+          try {
+            const started = await public3ds.start({
+              kind: 'booking', claim, input, provider, owner: access.owner.usuarioId, slot: workerSlot,
+            });
+            const { result } = started;
+            if (result.final) {
+              const payment = await persistDelegatedResult(claim, result.final, request, access.owner);
+              return sendOk(reply, payment, { statusCode: payment.pending_confirmation ? 202 : 200 });
+            }
+            claim.public3dsHad202 = true;
+            const handoff = buildPublicPixelPay3dsHandoff(started);
+            return sendOk(reply, { ...pendingDelegated, ...(handoff ? { public_3ds_handoff: handoff } : {
+              code: 'PIXELPAY_3DS_AUTH_PENDING',
+            }) }, { statusCode: 202 });
+          } catch {
+            return sendOk(reply, pendingDelegated, { statusCode: 202 });
+          }
+        }
         if (useDelegated) {
           reply.header('Cache-Control', 'private, no-store');
           try {
@@ -2918,6 +3002,7 @@ export default async function publicPagosRoutes(app, options = {}) {
         requestId: request.id,
       });
     } finally {
+      workerSlot?.release();
       if (dbClient) dbClient.release();
     }
   });

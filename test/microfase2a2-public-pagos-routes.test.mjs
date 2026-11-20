@@ -21,6 +21,7 @@ import { loadDurablePixelPayApproval } from "../src/services/payments/pixelPayDu
 import { installPrivatePilot } from "./helpers/privatePilotApp.mjs";
 import { resolveQaPixelPay3dsDiagnostic } from '../src/services/payments/qaPixelPay3dsDiagnostic.js';
 import { QA_PIXELPAY_CASE29_VISA } from './fixtures/qa-pixelpay-case29.mjs';
+import { createPublicPixelPay3dsAttempts } from '../src/services/payments/publicPixelPay3ds.js';
 import { DelegatedAttempt } from '../src/experimental/pixelpayDelegated/attempt.js';
 import { desktopContext } from './fixtures/delegatedPixelPayProvider.mjs';
 
@@ -246,6 +247,7 @@ function createPagosClient({
   groupPersonId = USER_A,
   groupUserId = null,
   groupOrigin = "publico",
+  optionsPublic3ds = false,
 } = {}) {
   const calls = [];
   const statusChecks = [];
@@ -333,6 +335,20 @@ function createPagosClient({
         }
         return { rows: [] };
       }
+      if (text.includes("'pixelpay.sale.3ds_continuation_dispatched'")) {
+        const [idIntent, idAttempt, deadline, order, amount, currency] = params;
+        const providerEventId = `pixelpay_public_3ds_continue_${idIntent}`;
+        const attempt = saleAttempts.find(row => row.id_intent === idIntent && row.payment_attempt_id === idAttempt);
+        if (!attempt || attempt.upstream_http_status !== 202 || attempt.finalized_at
+          || activeIntent?.estado_intent_codigo !== 'pendiente_confirmacion'
+          || activeIntent.orden_compra !== order || Number(activeIntent.monto_hnl) !== amount
+          || activeIntent.moneda_codigo !== currency || activeIntent.provider_session_id || activeIntent.referencia_externa
+          || Date.parse(activeIntent.expires_at) <= Date.now() || Date.parse(deadline) <= Date.now()
+          || paymentEvents.some(row => row.provider_event_id === providerEventId)) return { rows: [] };
+        paymentEvents.push({ id_intent: idIntent, id_provider: activeIntent.id_provider, provider_event_id: providerEventId,
+          evento_tipo: 'pixelpay.sale.3ds_continuation_dispatched', firma_valida: false });
+        return { rows: [{ id_event: providerEventId }] };
+      }
       if (text.includes("INSERT INTO app_private.pixelpay_sale_attempts")) {
         if (failAttemptStart) throw new Error("fixture de fallo en INSERT START");
         assert.ok(transactionSnapshot, "START debe compartir la transaccion del claim");
@@ -355,10 +371,17 @@ function createPagosClient({
       if (text.includes("UPDATE app_private.pixelpay_sale_attempts")) {
         if (!text.includes("SET finalized_at")) {
           const row = saleAttempts.find(entry => entry.id_intent === params[0] && entry.payment_attempt_id === params[1]);
-          if (row) row.observed_payment_uuid_untrusted = params[2];
+          if (row) {
+            row.observed_payment_uuid_untrusted = params[2];
+            if (text.includes('SET upstream_http_status = 202')) {
+              row.upstream_http_status = 202;
+              return { rows: [{ payment_attempt_id: row.payment_attempt_id }] };
+            }
+          }
           return { rows: [] };
         }
-        if (saleAttempts.find(entry => entry.payment_attempt_id === params[0])?.qa_test_origin !== '3ds_diagnostic') {
+        const target = saleAttempts.find(entry => entry.payment_attempt_id === params[0]);
+        if (target?.qa_test_origin !== '3ds_diagnostic' && !optionsPublic3ds) {
           assert.equal(transactionSnapshot, null, "FINAL ordinario debe usar autocommit fuera del claim");
         }
         if (failAttemptFinal) throw new Error("fixture privada 4111111111111111 secretKey-final");
@@ -379,6 +402,10 @@ function createPagosClient({
           final_parameters: structuredClone(params),
         });
         return { rows: [{ id_sale_attempt: row.id_sale_attempt }] };
+      }
+      if (text.includes('AS awaiting_authentication')) {
+        return { rows: [{ awaiting_authentication: saleAttempts.some(row => row.id_intent === params[0]
+          && (row.upstream_http_status === 202 || row.sdk_response_class === 'PayloadResponse')) }] };
       }
       if (text.includes("FROM app_private.pixelpay_sale_attempts")
         && text.includes("observed_payment_uuid_untrusted")) {
@@ -600,6 +627,12 @@ function createPagosClient({
           }],
         };
       }
+      if (text.includes("UPDATE public.payment_intents SET estado_intent_codigo = 'fallido'")) {
+        if (activeIntent?.id_intent !== params[0] || activeIntent?.id_grupo_cita !== params[1]
+          || activeIntent.estado_intent_codigo !== 'pendiente_confirmacion') return { rows: [] };
+        activeIntent.estado_intent_codigo = 'fallido';
+        return { rows: [{ id_intent: params[0] }] };
+      }
       if (text.includes("UPDATE public.payment_intents") && text.includes("orden_compra = $2::text")) {
         if (!activeIntent || activeIntent.estado_intent_codigo !== "creado") return { rows: [] };
         activeIntent = {
@@ -808,6 +841,7 @@ async function createPagosApp(client, {
   qa3dsDiagnostic = null,
   songbirdBridge = null,
   delegatedAttemptFactory = null,
+  public3dsAttemptFactory = null,
 } = {}) {
   PaymentProviderFactory.reset();
   process.env.PAYMENT_PROVIDER = "mock";
@@ -851,6 +885,14 @@ async function createPagosApp(client, {
   if (privatePilot) app.pilotRequest = await installPrivatePilot(app, privatePilot.t, {
     userId: USER_A, clientId: CLIENT_A, enabled: privatePilot.enabled ?? true,
   });
+  if (public3dsAttemptFactory) {
+    const manager = createPublicPixelPay3dsAttempts({
+      db: app.db, environment: app.config.pixelPayEnv, makeAttempt: public3dsAttemptFactory,
+    });
+    if (privatePilot) app.publicPixelPay3ds = manager;
+    else app.decorate('publicPixelPay3ds', manager);
+    app.addHook('onClose', async () => manager.close());
+  }
   await app.register(publicPagosRoutes, {
     prefix: authenticated ? "/v1/pagos/reservas" : "/v1/public/pagos",
     authenticated,
@@ -4596,4 +4638,106 @@ test('Songbird interrupt telemetry accepts fixed reasons only and preserves lega
   const phases=logs.map(line=>JSON.parse(line)).filter(entry=>entry.event==='pixelpay_songbird_phase');
   assert.deepEqual(phases.map(row=>row.interrupt_reason),['PANEL_CLEANUP','UI_CLOSED','SDK_HANDLER_ERROR','UNSPECIFIED']);
   assert.ok(phases.every(row=>row.id_intent===INTENT_A&&row.financial_finalization_enabled===false));
+});
+
+for (const scenario of ['no-3ds', 'frictionless', 'challenge', 'bad-hash', 'frictionless-declined', 'frictionless-timeout', 'frictionless-second202']) {
+  test('public SDK booking securely handles ' + scenario, async t => {
+    const client = diagnosticRouteClient({ optionsPublic3ds: true });
+    const calls = [];
+    const pending = ['bad-hash', 'frictionless-timeout', 'frictionless-second202'].includes(scenario);
+    const live = ['challenge', 'bad-hash'].includes(scenario);
+    const env = live ? 'live' : 'sandbox';
+    const makeAttempt = options => {
+      const fixture = desktopContext(options.context.input.orderId, scenario);
+      const worker = new DelegatedAttempt({ ...options,
+        workerUrl: new URL('./fixtures/delegatedPixelPayWorker.mjs', import.meta.url),
+        context: { ...options.context, scenario, application: true,
+          config: live ? fixture.config : { ...fixture.config, env, endpoint: 'https://pixelpay.dev', appUrl: 'https://pixelpay.dev' } } });
+      return {
+        close: () => worker.close(),
+        async call(operation, data) {
+          calls.push(operation);
+          const dispatches = client.getPaymentEvents().filter(row => row.evento_tipo === 'pixelpay.sale.3ds_continuation_dispatched');
+          assert.equal(dispatches.length, Number(operation === 'retry'));
+          const response = await worker.call(operation, data);
+          const stats = await worker.call('inspect');
+          assert.equal(stats.externalSockets, 0);
+          assert.equal(stats.initialSales, 1);
+          assert.equal(stats.retries, Number(operation === 'retry'));
+          assert.equal(stats.continues, 0);
+          assert.equal(stats.statusQueries, 0);
+          assert.equal(stats.cryptoContextMatches, true);
+          assert.ok(stats.orders.every(order => order === options.context.input.orderId));
+          return response;
+        },
+      };
+    };
+    let statusCalls = 0;
+    const app = await createPagosApp(client, { providerCode: 'pixelpay', authenticated: true,
+      claims: diagnosticOwnerClaims, public3dsAttemptFactory: makeAttempt, config: { pixelPayEnv: env },
+      ...(live ? { privatePilot: { t, enabled: false, publicCommerce: { bookingEnabled: true } } } : {}),
+      providerAdapter: { env, queryPaymentStatus() { statusCalls++; assert.fail('unexpected Status'); },
+        sale() { assert.fail('unexpected legacy Sale'); } } });
+    t.after(() => app.close());
+    const base = '/v1/pagos/reservas/pixelpay';
+    const post = (url, payload) => app.inject({ ...app.pilotRequest, remoteAddress: '198.51.100.2',
+      method: 'POST', url: base + url, payload });
+    const cardPayload = { ...diagnosticPayload(), ...(live ? { card_number: '4000000000000002' } : {}) };
+    const legacy = await post('/sale', cardPayload);
+    assert.equal(legacy.statusCode, 503, legacy.body);
+    assert.equal(client.getSaleAttempts().length, 0);
+    const payload = { ...cardPayload, supports_public_3ds: true };
+    const start = await post('/sale', payload);
+    assert.equal(start.statusCode, scenario === 'no-3ds' ? 200 : 202, start.body);
+    if (scenario !== 'no-3ds') {
+      const { public_3ds_handoff: handoff } = start.json().data;
+      assert.ok(handoff);
+      assert.equal(client.getSaleAttempts()[0].upstream_http_status, 202);
+      const scope = { id_intent: INTENT_A, id_grupo_cita: GROUP_A, titular_email: payload.titular_email, token: handoff.token };
+      const advance = (operation, data, override = {}) => post('/3ds/continuar', { ...scope, operation, data, ...override });
+      assert.equal((await advance('retry', {})).statusCode, 409);
+      assert.equal((await advance('lookup', { reference: 'opaque' }, { token: USER_B })).statusCode, 409);
+      assert.equal((await advance('lookup', { reference: 'opaque' }, { id_grupo_cita: USER_B })).statusCode, 409);
+      const lookup = await advance('lookup', { reference: 'opaque' });
+      assert.equal(lookup.statusCode, 200, lookup.body);
+      assert.equal(lookup.json().data.action, live ? 'continue' : null);
+      assert.equal((await advance('retry', { approved: 'true' })).statusCode, 409);
+      assert.equal(client.getPayments().length, 0);
+      const responses = await Promise.all([advance('retry', {}), advance('retry', {})]);
+      const accepted = responses.find(response => response.statusCode === 200);
+      assert.ok(accepted && responses.every(response => [200, 409].includes(response.statusCode)));
+      const terminal = accepted.json().data.payment;
+      if (pending) {
+        assert.equal(terminal.pending_confirmation, true);
+        assert.equal(client.getSaleAttempts()[0].upstream_http_status, 202);
+        app.publicPixelPay3ds.close();
+        const status = await post('/status', { id_intent: INTENT_A, id_grupo_cita: GROUP_A, titular_email: payload.titular_email });
+        assert.equal(status.statusCode, 202, status.body);
+      } else if (scenario === 'frictionless-declined') {
+        assert.equal(terminal.estado_intent_codigo, 'fallido');
+        assert.equal(client.getActiveIntent().estado_intent_codigo, 'fallido');
+      } else assert.equal(terminal.booking_confirmed, true);
+      assert.equal((await advance('retry', {})).statusCode, 409);
+    }
+    assert.equal((await post('/sale', payload)).statusCode, 409);
+    assert.equal(client.getSaleAttempts().length, 1);
+    assert.equal(client.getPayments().length, ['no-3ds', 'frictionless', 'challenge'].includes(scenario) ? 1 : 0);
+    assert.equal(statusCalls, 0);
+    assert.deepEqual(calls, scenario === 'no-3ds' ? ['start'] : ['start', 'lookup', 'retry']);
+  });
+}
+
+test('public Live reservation admission stops before a durable claim', async t => {
+  const client = diagnosticRouteClient();
+  let saleCalls = 0;
+  const app = await createPagosApp(client, { providerCode: 'pixelpay', authenticated: true, config: { pixelPayEnv: 'live' },
+    privatePilot: { t, enabled: false, publicCommerce: { bookingEnabled: true, vipPurchaseEnabled: false } },
+    providerAdapter: { env: 'live', sale() { saleCalls++; throw new Error('unexpected'); } } });
+  t.after(() => app.close());
+  const response = await app.inject({ ...app.pilotRequest, method: 'POST', url: '/v1/pagos/reservas/pixelpay/sale',
+    payload: { ...diagnosticPayload(), supports_public_3ds: true } });
+  assert.equal(response.statusCode, 503, response.body);
+  assert.equal(response.json().code, 'PIXELPAY_PUBLIC_3DS_UNAVAILABLE');
+  assert.equal(client.getSaleAttempts().length, 0);
+  assert.equal(saleCalls, 0);
 });

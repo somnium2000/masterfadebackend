@@ -23,6 +23,7 @@ export function installSyntheticProvider(context) {
   const stats = { externalSockets: 0, initialSales: 0, retries: 0, lookups: 0, continues: 0,
     cryptoContextMatches: true, credentialsInNode: true, orders: [] };
   if (context.application) stats.directLookupCvvMatches = null;
+  if (context.publicContinuation) stats.statusQueries = 0;
   let initialPublicKey, initialCiphertext;
   net.Socket.prototype.connect = function () { stats.externalSockets++; throw new Error('EXTERNAL_BLOCKED'); };
   globalThis.fetch = async () => { stats.externalSockets++; throw new Error('EXTERNAL_BLOCKED'); };
@@ -47,10 +48,12 @@ export function installSyntheticProvider(context) {
       transaction_amount: context.input.amount,
       transaction_approved_amount: context.scenario === 'bad-amount' ? context.input.amount + 1 : context.input.amount,
       transaction_id: `tx-${context.input.orderId}`, payment_uuid: `uuid-${context.input.orderId}`,
-      payment_hash: createHash('md5').update([context.input.orderId, context.config.keyId, context.config.secretKey].join('|')).digest('hex'),
+      payment_hash: createHash('md5').update([context.scenario === 'bad-hash' ? 'unrelated' : context.input.orderId,
+        context.config.keyId, context.config.secretKey].join('|')).digest('hex'),
     };
     if (config.url.endsWith('public_key')) return reply(200, { public_key: Buffer.from(merchant.publicKey).toString('base64') });
     if (config.url.endsWith('transaction/status')) {
+      if (context.publicContinuation) stats.statusQueries++;
       if (body.payment_uuid !== approvedData.payment_uuid) throw new Error('STATUS_UUID_MISMATCH');
       return reply(200, { status: 'PAID', payment_uuid: approvedData.payment_uuid, order_id: context.input.orderId,
         ...(context.scenario === 'missing-status-currency' ? {} : { order_currency: context.input.currency }),
@@ -74,11 +77,11 @@ export function installSyntheticProvider(context) {
       }
       const challengeUrl = context.application ? 'https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp?n=%2B%2F'
         : 'https://acs.offline.invalid';
-      return reply(context.application && !['frictionless', 'challenge-http-200'].includes(context.scenario) ? 202 : 200, {
+      return reply(context.application && !context.scenario.startsWith('frictionless') && context.scenario !== 'challenge-http-200' ? 202 : 200, {
         identifier: context.scenario === 'invalid-lookup-identifier' ? { unexpected: true } : `auth-${body.order_id}`,
         continue_url: context.scenario === 'invalid-step-up' ? 'https://acs.offline.invalid' : challengeUrl,
         continue_payload: 'opaque.+/=%ñ', transaction_id: `tx-${body.order_id}`, window_size: '03',
-      }, context.scenario === 'frictionless' ? null : 'continue', context.scenario !== 'lookup-not-successful');
+      }, context.scenario.startsWith('frictionless') ? null : 'continue', context.scenario !== 'lookup-not-successful');
     }
     if (!config.url.endsWith('transaction/sale')) throw new Error('UNEXPECTED_ROUTE');
     if (!body.authentication_identifier) {
@@ -104,7 +107,18 @@ export function installSyntheticProvider(context) {
       stats.retries++;
       if (body.authentication_identifier !== `auth-${context.input.orderId}`) throw new Error('CONTEXT_MISMATCH');
       await new Promise(resolve => setTimeout(resolve, 30));
-      if (context.scenario === 'retry-timeout') throw new Error('SYNTHETIC_TIMEOUT');
+      if (['retry-timeout', 'frictionless-timeout'].includes(context.scenario)) throw new Error('SYNTHETIC_TIMEOUT');
+      if (context.scenario === 'frictionless-declined') return reply(402, {}, null, false);
+      if (context.scenario === 'frictionless-second202') return reply(202, approvedData);
+    }
+    if (context.publicContinuation) {
+      // AM: PixelPay's documented approval need not echo order or currency.
+      const contradictions = {
+        'bad-currency': { transaction_currency: 'USD' },
+        'bad-order': { order_id: 'other-order' },
+      };
+      return reply(200, { ...approvedData, ...contradictions[context.scenario] },
+        context.scenario === 'non-terminal-success' ? 'continue' : null);
     }
     return reply(200, ['nested-status', 'missing-status-currency'].includes(context.scenario) ? approvedData
       : { ...approvedData, order_id: body.order_id,
