@@ -178,9 +178,11 @@ test('QA native Direct API retries only after trusted lookup; PAID corroborates 
 });
 
 for (const [suffix, reason, type] of [
-  ['absent', 'ABSENT', 'absent'], ['top-level', 'ABSENT', 'absent'], ['null', 'NULL', 'null'],
+  ['top-level', 'ABSENT', 'absent'], ['null', 'NULL', 'null'],
   ['empty', 'EMPTY', 'empty_string'], ['object', 'INVALID', 'object'],
   ['untrusted', 'INVALID', 'string'], ['invalid-path', 'INVALID', 'string'],
+  ['wrong-port', 'INVALID', 'string'], ['userinfo', 'INVALID', 'string'],
+  ['fragment', 'INVALID', 'string'], ['v3', 'INVALID', 'string'], ['trailing-slash', 'INVALID', 'string'],
 ]) test(`QA collection_url ${suffix} leaves the submitted Sale pending without a handoff or another Sale`, async t => {
   const value = attempt(t, 'A', `collection-${suffix}`, { application: true });
   const result = await value.call('start');
@@ -194,6 +196,120 @@ for (const [suffix, reason, type] of [
   await assert.rejects(value.call('retry'));
   assert.equal((await value.call('inspect')).initialSales, 1);
 });
+
+for (const scenario of ['collection-uppercase', 'collection-port443']) {
+  test(`public Direct API ${scenario} normalizes only the permitted origin and keeps the transport URL intact`, async t => {
+    const value = attempt(t, 'A', scenario, { application: true, publicContinuation: true });
+    const handoff = await value.call('start');
+    assert.equal(handoff.continuation_mode, 'direct_api');
+    assert.equal(new URL(handoff.continuation.collection_url).origin, 'https://cas.client.cardinaltrusted.com');
+    assert.ok(handoff.continuation.collection_url.includes(scenario === 'collection-uppercase' ? 'CAS.CLIENT' : ':443/'));
+    assert.equal(handoff.continuation_diagnostic.sdk_to_handoff_equal.collection_url, true);
+    await value.call('lookup', lookup);
+    await assert.rejects(value.call('continue', { payload: 'not-songbird' }));
+    assert.equal((await value.call('retry')).final.approved, true);
+    const stats = await value.call('inspect');
+    assert.equal(stats.continues, 0);
+    assert.equal(stats.retries, 1);
+    assert.equal(stats.directLookupCvvMatches, true);
+    assert.equal(stats.externalSockets, 0);
+  });
+}
+
+for (const scenario of ['songbird', 'songbird-challenge-http-200', 'songbird-frictionless', 'collection-absent']) {
+  test(`public ${scenario} restores the historical URL-free SDK contract with backend-owned continuation`, async t => {
+    const value = attempt(t, 'A', scenario, { application: true, publicContinuation: true });
+    const handoff = await value.call('start');
+    assert.equal(handoff.state, 'challenge');
+    assert.equal(handoff.continuation_mode, 'songbird');
+    assert.equal(Object.hasOwn(handoff.continuation, 'collection_url'), false);
+    assert.equal(handoff.continuation_diagnostic.code, 'PIXELPAY_3DS_SONGBIRD_READY');
+    assert.deepEqual(handoff.continuation_diagnostic.sdk_to_handoff_equal, {
+      collection_url: true, payload: true, transaction_type: true,
+    });
+    await assert.rejects(value.call('retry'));
+    await assert.rejects(value.call('continue', { payload: 'premature' }));
+    const response = await value.call('lookup', lookup);
+    assert.equal(response.success, true);
+    assert.equal(response.status, ['songbird-challenge-http-200', 'songbird-frictionless'].includes(scenario) ? 200 : 202);
+    const frictionless = scenario === 'songbird-frictionless';
+    assert.equal(response.action, frictionless ? null : 'continue');
+    if (!frictionless) {
+      await assert.rejects(value.call('retry'));
+      const payload = 'opaque-validated-jwt';
+      const [one, duplicate] = await Promise.all([
+        value.call('continue', { payload }), value.call('continue', { payload }),
+      ]);
+      assert.deepEqual(one, { status: 200, action: null, success: true, data: {} });
+      assert.deepEqual(duplicate, one);
+      await assert.rejects(value.call('continue', { payload: 'another-jwt' }));
+    } else await assert.rejects(value.call('continue', { payload: 'not-a-challenge' }));
+    const [result, duplicate] = await Promise.all([value.call('retry'), value.call('retry')]);
+    assert.deepEqual(result, duplicate);
+    assert.equal(result.final.approved, true);
+    assert.equal(result.final.paymentHashValid, true);
+    assert.equal(result.final.amountMatches, true);
+    const stats = await value.call('inspect');
+    assert.equal(stats.initialSales, 1);
+    assert.equal(stats.lookups, 1);
+    assert.equal(stats.continues, frictionless ? 0 : 1);
+    assert.equal(stats.retries, 1);
+    assert.equal(stats.directLookupCvvMatches, false);
+    assert.equal(stats.statusQueries, 0);
+    assert.equal(stats.externalSockets, 0);
+  });
+}
+
+for (const scenario of ['songbird-continue-false', 'songbird-continue-timeout']) {
+  test(`public ${scenario} cannot authorize retry or an approval`, async t => {
+    const value = attempt(t, 'A', scenario, { application: true, publicContinuation: true });
+    await value.call('start');
+    await value.call('lookup', lookup);
+    const response = await value.call('continue', { payload: 'opaque-jwt' });
+    assert.equal(response.success, false);
+    await assert.rejects(value.call('retry'));
+    const stats = await value.call('inspect');
+    assert.equal(stats.continues, 1);
+    assert.equal(stats.retries, 0);
+    assert.equal(stats.statusQueries, 0);
+    assert.equal(stats.externalSockets, 0);
+  });
+}
+
+for (const suffix of ['invalid-step-up', 'invalid-step-up-userinfo', 'invalid-lookup-identifier',
+  'invalid-continue-payload', 'invalid-transaction-id', 'lookup-not-successful']) {
+  test(`public Songbird ${suffix} fails closed before authenticationContinue or retry`, async t => {
+    const value = attempt(t, 'A', `songbird-${suffix}`, { application: true, publicContinuation: true });
+    assert.equal((await value.call('start')).continuation_mode, 'songbird');
+    assert.deepEqual(await value.call('lookup', lookup), { status: 202, success: false, action: null, data: {} });
+    await assert.rejects(value.call('continue', { payload: 'opaque-jwt' }));
+    await assert.rejects(value.call('retry'));
+    const stats = await value.call('inspect');
+    assert.equal(stats.continues, 0);
+    assert.equal(stats.retries, 0);
+    assert.equal(stats.statusQueries, 0);
+    assert.equal(stats.externalSockets, 0);
+  });
+}
+
+for (const suffix of ['bad-amount', 'bad-hash', 'bad-uuid', 'bad-currency', 'bad-order', 'non-terminal-success']) {
+  test(`public Songbird final ${suffix} remains uncertain despite accepted authentication`, async t => {
+    const value = attempt(t, 'A', `songbird-${suffix}`, { application: true, publicContinuation: true });
+    await value.call('start');
+    await value.call('lookup', lookup);
+    assert.equal((await value.call('continue', { payload: 'opaque-jwt' })).success, true);
+    const result = await value.call('retry');
+    assert.equal(result.final.approved, false);
+    assert.equal(result.final.definitive, false);
+    assert.equal(result.final.outcome, 'uncertain');
+    assert.deepEqual(await value.call('retry'), result);
+    const stats = await value.call('inspect');
+    assert.equal(stats.continues, 1);
+    assert.equal(stats.retries, 1);
+    assert.equal(stats.statusQueries, 0);
+    assert.equal(stats.externalSockets, 0);
+  });
+}
 
 for (const scenario of ['invalid-step-up', 'invalid-lookup-identifier', 'lookup-not-successful']) {
   test(`QA Direct API ${scenario} cannot dispatch the native retry`, async t => {
