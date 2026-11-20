@@ -1303,7 +1303,7 @@ export default async function clienteRoutes(app) {
         properties: {
           id_payment_intent: { type: "string", format: "uuid" },
           token: { type: "string", format: "uuid" },
-          operation: { enum: ["lookup", "retry"] },
+          operation: { enum: ["lookup", "continue", "retry"] },
           data: { type: "object", maxProperties: 9, additionalProperties: { type: "string", maxLength: 32768 } },
         },
       } },

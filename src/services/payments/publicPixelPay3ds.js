@@ -1,7 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DelegatedAttempt } from '../../experimental/pixelpayDelegated/attempt.js';
 import { AppError } from '../../utils/errors.js';
 import { claimPixelPay3dsDispatch, recordPixelPay3dsContinuation } from './pixelPaySaleAttemptStore.js';
+import { sanitizePixelPayContinuationDiagnostic } from './pixelPaySaleRuntime.js';
 
 const MAX_ACTIVE_ATTEMPTS = 8;
 const MAX_CONTEXT_MS = 120_000;
@@ -18,6 +19,7 @@ const pending = (code = 'PIXELPAY_PUBLIC_3DS_CONTEXT_LOST') => new AppError(
 );
 
 function isLiveOrigin(value) {
+  if (typeof value !== 'string' || !/^https:\/\/[^/]/i.test(value) || /[\p{Cc}\s\\#]/u.test(value)) return false;
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && url.pathname === '/' && !url.username && !url.password
@@ -43,7 +45,7 @@ export function resolvePublicPixelPay3dsConfig(env, { qaBooking, qaSale, delegat
 }
 
 export function buildPublicPixelPay3dsHandoff({ result, deadline, token }) {
-  if (result.state !== 'challenge' || result.continuation_mode !== 'direct_api') return null;
+  if (result.state !== 'challenge' || !['direct_api', 'songbird'].includes(result.continuation_mode)) return null;
   return { state: result.state, order: result.order, sdk: result.sdk, continuation: result.continuation,
     continuation_mode: result.continuation_mode, token, expiresAt: deadline };
 }
@@ -55,11 +57,20 @@ export function createPublicPixelPay3dsAttempts({
   const reserved = new Set();
   const keyFor = ({ kind, idIntent }) => `${kind}:${idIntent}`;
   const current = context => attempts.get(context.key) === context && now() < context.deadline;
-  const trace = (context, phase, httpStatus) => logger?.info?.({
-    event: 'pixelpay_public_3ds_phase', phase,
-    id_intent: context.claim.idIntent, paymentAttemptId: context.claim.paymentAttemptId,
-    ...(Number.isInteger(httpStatus) && { upstream_status: httpStatus }),
-  });
+  const trace = (context, phase, httpStatus) => {
+    try {
+      logger?.info?.({ event: 'pixelpay_public_3ds_phase', phase,
+        id_intent: context.claim.idIntent, paymentAttemptId: context.claim.paymentAttemptId,
+        ...(Number.isInteger(httpStatus) && { upstream_status: httpStatus }) });
+    } catch { /* AM: Diagnostics cannot determine the payment outcome. */ }
+  };
+  const traceStart = (claim, phase, details) => {
+    // AM: An observability failure must not alter dispatch, persistence or handoff admission.
+    try {
+      logger?.info?.({ event: 'pixelpay_public_3ds_phase', phase,
+        id_intent: claim.idIntent, paymentAttemptId: claim.paymentAttemptId, ...details });
+    } catch { /* AM: Keep all diagnostic failures out of the payment result. */ }
+  };
   function reserve() {
     if (attempts.size + reserved.size >= MAX_ACTIVE_ATTEMPTS) throw publicPixelPay3dsUnavailable();
     const slot = { release: () => reserved.delete(slot) };
@@ -76,31 +87,44 @@ export function createPublicPixelPay3dsAttempts({
       if (provider.env !== environment || !owner || !(deadline > startedAt)
         || attempts.has(key) || !hasSlot) throw pending();
       const token = randomUUID();
-      const worker = makeAttempt({
-        workerUrl: new URL('../../experimental/pixelpayDelegated/applicationWorker.js', import.meta.url),
-        context: { attemptId: claim.paymentAttemptId, input, publicContinuation: true,
-          config: { env: provider.env, endpoint: provider.endpoint, appUrl: provider.appUrl,
-            keyId: provider.keyId, secretKey: provider.secretKey, authHash: provider.authHash } },
-        lifetimeMs: deadline - startedAt,
-        onClose: () => { if (attempts.get(key)?.token === token) attempts.delete(key); },
-      });
-      const context = { key, claim, owner, deadline, token, worker, phase: 'starting' };
-      attempts.set(key, context);
+      let worker, stage = 'worker_construction';
       try {
+        worker = makeAttempt({
+          workerUrl: new URL('../../experimental/pixelpayDelegated/applicationWorker.js', import.meta.url),
+          context: { attemptId: claim.paymentAttemptId, input, publicContinuation: true,
+            config: { env: provider.env, endpoint: provider.endpoint, appUrl: provider.appUrl,
+              keyId: provider.keyId, secretKey: provider.secretKey, authHash: provider.authHash } },
+          lifetimeMs: deadline - startedAt,
+          onClose: () => { if (attempts.get(key)?.token === token) attempts.delete(key); },
+        });
+        const context = { key, claim, owner, deadline, token, worker, phase: 'starting' };
+        attempts.set(key, context);
+        stage = 'worker_start';
         const result = await worker.call('start');
+        traceStart(claim, 'start_result', {
+          state: ['challenge', 'unsupported', 'completed_without_3ds'].includes(result.state) ? result.state : 'unknown',
+          ...(result.continuation_diagnostic ? {
+            continuation_diagnostic: sanitizePixelPayContinuationDiagnostic(result.continuation_diagnostic),
+          } : {}),
+        });
         if (result.state === 'challenge' || result.state === 'unsupported') {
+          stage = 'durable_record';
           if (!await recordPixelPay3dsContinuation(db, { ...claim, paymentUuid: result.observedPaymentUuid })) {
             throw pending();
           }
         }
         if (result.state === 'challenge') {
+          stage = 'context_check';
           if (!current(context)) throw pending();
+          if (!['direct_api', 'songbird'].includes(result.continuation_mode)) throw pending();
+          context.continuationMode = result.continuation_mode;
           context.phase = 'collection';
           trace(context, 'handoff_ready', 202);
         } else worker.close();
         return { result, deadline, token };
       } catch {
-        worker.close();
+        traceStart(claim, 'start_failed', { stage, code: 'PIXELPAY_PUBLIC_3DS_START_UNCERTAIN' });
+        worker?.close();
         throw pending();
       }
     },
@@ -122,13 +146,44 @@ export function createPublicPixelPay3dsAttempts({
           trace(context, LOOKUP_PHASE_EVENTS[context.phase] ?? 'lookup_incomplete', response.status);
           return response;
         } catch {
+          trace(context, 'lookup_failed');
           context.worker.close();
           throw pending();
         }
       }
+      if (operation === 'continue') {
+        if (context.continuationMode !== 'songbird' || Object.keys(data).length !== 1
+          || typeof data.payload !== 'string' || !data.payload.length || data.payload.length > 32768) {
+          throw pending('PIXELPAY_PUBLIC_3DS_PHASE_INVALID');
+        }
+        const hash = createHash('sha256').update(data.payload).digest('hex');
+        if (context.continuePromise) {
+          if (context.continueHash !== hash) throw pending('PIXELPAY_PUBLIC_3DS_PHASE_INVALID');
+          return context.continuePromise;
+        }
+        if (context.phase !== 'challenge') throw pending('PIXELPAY_PUBLIC_3DS_PHASE_INVALID');
+        context.phase = 'continuing';
+        context.continueHash = hash;
+        context.continuePromise = (async () => {
+          try {
+            const response = await context.worker.call('continue', data);
+            const accepted = response.status === 200 && response.success === true && response.action === null;
+            if (accepted) context.phase = 'continued';
+            else context.worker.close();
+            trace(context, accepted ? 'authentication_continue_ready' : 'authentication_continue_incomplete', response.status);
+            return response;
+          } catch {
+            trace(context, 'authentication_continue_failed');
+            context.worker.close();
+            throw pending();
+          }
+        })();
+        return context.continuePromise;
+      }
       if (operation !== 'retry' || Object.keys(data).length) throw pending('PIXELPAY_PUBLIC_3DS_PHASE_INVALID');
       if (context.phase === 'finishing') return context.retryPromise;
-      if (!['challenge', 'frictionless'].includes(context.phase)) throw pending('PIXELPAY_PUBLIC_3DS_PHASE_INVALID');
+      const finishPhases = context.continuationMode === 'songbird' ? ['continued', 'frictionless'] : ['challenge', 'frictionless'];
+      if (!finishPhases.includes(context.phase)) throw pending('PIXELPAY_PUBLIC_3DS_PHASE_INVALID');
       context.phase = 'finishing';
       context.retryPromise = (async () => {
         try {
@@ -140,6 +195,7 @@ export function createPublicPixelPay3dsAttempts({
           trace(context, 'continuation_result', response.sdkResponse.status);
           return { ...response.sdkResponse, payment };
         } catch {
+          trace(context, 'continuation_failed');
           throw pending();
         } finally { context.worker.close(); }
       })();

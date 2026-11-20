@@ -1,0 +1,34 @@
+name: Public PixelPay 3DS modes
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  backend-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MASTERFADE_TEST_PG_BIN: /usr/lib/postgresql/17/bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install local PostgreSQL 17 fixture tooling
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-17
+      - name: Native SDK, public route, phase and durable duplicate regressions
+        run: >-
+          node --test test/public-pixelpay-3ds.test.mjs test/pixelpay-delegated.test.mjs
+          test/microfase2a2-public-pagos-routes.test.mjs test/pixelpay-sdk-3ds-contract.test.mjs
+          test/pixelpay-sale-runtime-diagnostics.test.mjs
+          test/public-pixelpay-3ds-diagnostics.test.mjs test/public-pixelpay-3ds-log-filter.test.mjs
+          test/pixelpay-public-3ds-url-contract.test.mjs test/pixelpay-authentication-continue-contract.test.mjs
+      - run: npm run lint
+      - run: git diff --check
