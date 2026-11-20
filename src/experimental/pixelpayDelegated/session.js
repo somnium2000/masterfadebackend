@@ -24,7 +24,7 @@ const CAS_COLLECTION = new Set([
 const CAS_STEP_UP = new Set(['https://cas.client.cardinaltrusted.com/centinelapi/V2/Cruise/StepUp']);
 
 function allowedCasUrl(value, targets) {
-  if (!opaque(value, 2048) || /[\s\\#]/.test(value)) return false;
+  if (!opaque(value, 2048) || !/^https:\/\/[^/]/i.test(value) || /[\p{Cc}\s\\#]/u.test(value)) return false;
   try {
     const url = new URL(value);
     return !url.username && !url.password && targets.has(`${url.origin}${url.pathname}`);
@@ -32,7 +32,7 @@ function allowedCasUrl(value, targets) {
 }
 
 function allowedSongbirdUrl(value) {
-  if (!opaque(value, 2048) || /[\s\\#]/.test(value)) return false;
+  if (!opaque(value, 2048) || !/^https:\/\/[^/]/i.test(value) || /[\p{Cc}\s\\#]/u.test(value)) return false;
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && !url.username && !url.password;

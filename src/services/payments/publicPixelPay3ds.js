@@ -19,6 +19,7 @@ const pending = (code = 'PIXELPAY_PUBLIC_3DS_CONTEXT_LOST') => new AppError(
 );
 
 function isLiveOrigin(value) {
+  if (typeof value !== 'string' || !/^https:\/\/[^/]/i.test(value) || /[\p{Cc}\s\\#]/u.test(value)) return false;
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && url.pathname === '/' && !url.username && !url.password
