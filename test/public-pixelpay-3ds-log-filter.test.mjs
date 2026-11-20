@@ -10,6 +10,8 @@ test('documented SSH filter preserves start diagnostics while excluding poisoned
   const id = '99999999-9999-4999-8999-999999999999';
   const attempt = '88888888-8888-4888-8888-888888888888';
   const base = { event: 'pixelpay_public_3ds_phase', id_intent: id, paymentAttemptId: attempt };
+  const continuationPhases = ['lookup_failed', 'authentication_continue_ready',
+    'authentication_continue_incomplete', 'authentication_continue_failed', 'continuation_failed'];
   const events = [
     { ...base, phase: 'start_result', state: 'unsupported', continuation_diagnostic: {
       code: 'PIXELPAY_3DS_COLLECTION_URL_ABSENT', upstream_http_status: 202, sale_environment: 'live',
@@ -29,6 +31,11 @@ test('documented SSH filter preserves start diagnostics while excluding poisoned
     } },
     { ...base, phase: 'NEVER_LOG_PHASE' },
     { ...base, id_intent: '00000000-0000-4000-8000-000000000000', phase: 'start_failed' },
+    { ...base, phase: 'start_result', state: 'challenge', continuation_diagnostic: {
+      code: 'PIXELPAY_3DS_SONGBIRD_READY', payload: 'NEVER_LOG_SONGBIRD_JWT',
+      sdk_data: { transaction_type_kind: 'songbird', collection_url: { present: false, type: 'absent' } },
+    } },
+    ...continuationPhases.map(phase => ({ ...base, phase, upstream_status: 202, payload: 'NEVER_LOG_PAYLOAD' })),
   ];
   const runner = `
 import io, json, subprocess, sys
@@ -50,7 +57,7 @@ exec(fixture['source'])
   assert.equal(execution.status, 0, execution.stderr);
   assert.doesNotMatch(execution.stdout, /NEVER_LOG|"error"/);
   const rows = execution.stdout.trim().split(/\r?\n/).map(line => JSON.parse(line));
-  assert.equal(rows.length, 4);
+  assert.equal(rows.length, 10);
   assert.equal(rows[0].phase, 'start_result');
   assert.equal(rows[0].state, 'unsupported');
   assert.equal(rows[0].continuation_diagnostic.code, 'PIXELPAY_3DS_COLLECTION_URL_ABSENT');
@@ -61,5 +68,9 @@ exec(fixture['source'])
   assert.equal(rows[2].state, null);
   assert.equal(rows[2].continuation_diagnostic.code, null);
   assert.deepEqual(rows[2].continuation_diagnostic.sdk_data.payload, { present: null, type: null, length: null });
-  assert.deepEqual(rows[3], { docker_exit_code: 0 });
+  assert.equal(rows[3].continuation_diagnostic.code, 'PIXELPAY_3DS_SONGBIRD_READY');
+  assert.equal(rows[3].continuation_diagnostic.sdk_data.transaction_type_kind, 'songbird');
+  assert.deepEqual(rows.slice(4, 9).map(row => row.phase), continuationPhases);
+  assert.ok(rows.slice(4, 9).every(row => row.http === 202));
+  assert.deepEqual(rows[9], { docker_exit_code: 0 });
 });

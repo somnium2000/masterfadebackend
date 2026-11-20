@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPublicPixelPay3dsAttempts } from '../src/services/payments/publicPixelPay3ds.js';
+import { sanitizePixelPayContinuationDiagnostic } from '../src/services/payments/pixelPaySaleRuntime.js';
 
 const claim = { idIntent: '99999999-9999-4999-8999-999999999999',
   paymentAttemptId: '88888888-8888-4888-8888-888888888888',
@@ -120,4 +121,15 @@ test('unrecognized metadata values and URL credentials cannot reach the diagnost
   assert.equal(logged.sdk_data.collection_url.origin, null);
   assert.deepEqual(logged.raw_data.payload, { present: null, type: null, length: null });
   assert.doesNotMatch(JSON.stringify(records), /NEVER_LOG|private-path|private:/);
+});
+
+test('safe Songbird readiness metadata remains observable without its opaque values', () => {
+  const logged = sanitizePixelPayContinuationDiagnostic({
+    ...unsupported.continuation_diagnostic,
+    code: 'PIXELPAY_3DS_SONGBIRD_READY',
+  });
+  assert.equal(logged.code, 'PIXELPAY_3DS_SONGBIRD_READY');
+  assert.equal(logged.sdk_data.transaction_type_kind, 'songbird');
+  assert.equal(logged.sdk_data.collection_url.type, 'absent');
+  assert.doesNotMatch(JSON.stringify(logged), /NEVER_LOG|card_cvv|"error"|token/);
 });
